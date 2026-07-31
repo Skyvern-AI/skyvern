@@ -130,6 +130,7 @@ from skyvern.forge.sdk.copilot.run_outcome import (
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
+    diagnosis_repair_obligation_open,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.terminal_predicates import (
@@ -172,6 +173,9 @@ POST_INTERMEDIATE_SUCCESS_NUDGE = copilot_config_defaults.POST_INTERMEDIATE_SUCC
 MAX_POST_UPDATE_NUDGES = 2
 MAX_INTERMEDIATE_NUDGES = 8
 MAX_FAILED_TEST_NUDGES = 2
+# Repair rounds the typed obligation may force past the ordinary nudge budget before a turn is
+# allowed to report an unrepairable failure.
+MAX_REPAIR_OBLIGATION_NUDGES = 6
 MAX_FORMAT_NUDGES = 2
 MAX_NO_WORKFLOW_NUDGES = 2
 MAX_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGES = 2
@@ -1155,6 +1159,29 @@ def _needs_explore_without_workflow_nudge(ctx: Any) -> bool:
     return nudge_count < MAX_EXPLORE_WITHOUT_WORKFLOW_NUDGES
 
 
+def _repair_obligation_live(ctx: AgentContext) -> bool:
+    """The typed obligation, bounded. It is discharged by evidence, but must not outlive the
+    evidence that produced it: a failure that looks repairable and is not would otherwise be
+    re-nudged until the turn budget dies, burying the blocker the model is trying to report."""
+    if not diagnosis_repair_obligation_open(ctx):
+        return False
+    return _get_int(ctx, "repair_obligation_nudge_count") < MAX_REPAIR_OBLIGATION_NUDGES
+
+
+def _repair_obligation_blocks_finalize(ctx: AgentContext, result: RunResultStreaming | None) -> bool:
+    """True when the turn is about to end while the typed contract still says the failure is repairable.
+
+    The nudge counters bound *repetition of a nudge*; they were never evidence that the failure had been
+    addressed, so once they ran out a turn could finalize a draft its own build test disproved. Ending is
+    still bounded — by the total-turn timeout and max-turns, both of which exit as WIP rather than as an
+    accept-ready proposal."""
+    if not _repair_obligation_live(ctx):
+        return False
+    parsed = _parse_normalized_final_response(result)
+    # ASK_QUESTION is a legitimate exit: it needs the user, not another repair round.
+    return parsed is not None and parsed.get("type") == "REPLY"
+
+
 def _needs_failed_test_nudge(ctx: Any) -> bool:
     """Return True when the last test failed and the agent hasn't iterated yet."""
     # A permanent nav error cannot be 'fix the workflow and retry' material —
@@ -1345,7 +1372,9 @@ def _check_enforcement(
     ):
         return _nudge(config, "post_update")
 
-    if _post_run_observed_reply_can_finalize(ctx, result):
+    # Observing the reached page is the first repair move, not the last: while the typed contract
+    # still says REPAIR, a reply that reports the failure instead of acting on it re-enters the loop.
+    if not _repair_obligation_live(ctx) and _post_run_observed_reply_can_finalize(ctx, result):
         return None
 
     _maybe_stash_terminal_challenge_halt(ctx)
@@ -1395,6 +1424,12 @@ def _check_enforcement(
         ctx.failed_test_nudge_count += 1
         if _needs_inspect_before_repair_nudge(ctx):
             return _nudge(config, "post_failed_test_inspect_first")
+        return _nudge(config, "post_failed_test")
+
+    # Counters exhausted but the contract still says REPAIR: keep steering rather than finalize a
+    # draft the build test disproved.
+    if _repair_obligation_blocks_finalize(ctx, result):
+        ctx.repair_obligation_nudge_count = _get_int(ctx, "repair_obligation_nudge_count") + 1
         return _nudge(config, "post_failed_test")
 
     # Response-time gate: peek at the model's final output to tell ASK_QUESTION

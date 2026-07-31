@@ -61,6 +61,7 @@ from .scouting import (
     _consume_scout_source_url,
     _mark_page_inspected,
     _mark_pending_browser_interaction_observation,
+    _maybe_attach_observed_download_target,
     _maybe_attach_reached_download_target,
     _prenav_ambiguity_for_selector,
     _prenav_dynamic_row_for_selector,
@@ -69,6 +70,7 @@ from .scouting import (
     _register_scout_interaction_observation,
     _reset_evaluate_tracker,
     _resolve_scout_role_name,
+    _scout_session_download_names,
     _selector_live_match_count,
     _steer_evaluate_result,
     account_no_progress_interaction_click,
@@ -348,6 +350,7 @@ async def _click_pre_hook(
     ctx.pending_scout_click_selector = None
     ctx.pending_scout_ambiguous = None
     ctx.pending_scout_dynamic_row = None
+    ctx.pending_scout_download_snapshot = None
     await _capture_scout_source_url(ctx)
     deterministic_result = _strip_intent_for_code_only_selector_action(params, ctx, tool_name="click")
     if deterministic_result is not None:
@@ -374,6 +377,7 @@ async def _click_pre_hook(
     await _capture_scout_ambiguity(ctx, selector)
     if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         await _capture_scout_dynamic_row(ctx, selector)
+        ctx.pending_scout_download_snapshot = await _scout_session_download_names(ctx)
     return None
 
 
@@ -529,6 +533,10 @@ async def _click_post_hook(
         if observation_step is not None:
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
+        if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+            # A download this click produced is proof the affordance works, so it outranks the
+            # href-shape prediction — and is the only source that sees a command-URL download.
+            await _maybe_attach_observed_download_target(ctx, result, selector=selector, url=url)
         if page_evidence is not None:
             _attach_scout_page_summary(result, page_evidence)
             if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:

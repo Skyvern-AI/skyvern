@@ -61,7 +61,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.files import is_temp_working_dir
+from skyvern.forge.sdk.api.files import is_temp_working_dir, resolve_run_download_id
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import _file_infos_from_download_artifacts
 from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy
@@ -155,6 +155,11 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunResponseBase,
     WorkflowRunStatus,
     is_adaptive_caching,
+)
+from skyvern.forge.sdk.workflow.runtime_completion import (
+    ContractVerdict,
+    grade_completion_contract,
+    parse_completion_contract,
 )
 from skyvern.forge.sdk.workflow.secret_encryption import encrypt_workflow_definition_secrets
 from skyvern.forge.sdk.workflow.status_mapping import (
@@ -530,6 +535,8 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
         "credential_parameter_id",
         "onepassword_credential_parameter_id",
         "azure_vault_credential_parameter_id",
+        # Graded at finalization, not executed: its presence must not invalidate cached scripts.
+        "completion_contract",
         "disable_cache",
         "next_block_label",
         "version",
@@ -3712,6 +3719,7 @@ class WorkflowService:
                         self._finalize_workflow_run_status(
                             workflow_run_id=workflow_run_id,
                             workflow_run=workflow_run,
+                            is_partial_run=bool(block_labels),
                             pre_finally_status=pre_finally_status,
                             pre_finally_failure_reason=pre_finally_failure_reason,
                             pre_finally_failure_category=pre_finally_failure_category,
@@ -7501,6 +7509,7 @@ class WorkflowService:
         pre_finally_status: WorkflowRunStatus,
         pre_finally_failure_reason: str | None,
         pre_finally_failure_category: list[dict] | None = None,
+        is_partial_run: bool = False,
     ) -> WorkflowRun:
         """
         Set final workflow run status based on pre-finally state.
@@ -7517,6 +7526,16 @@ class WorkflowService:
             WorkflowRunStatus.terminated,
             WorkflowRunStatus.timed_out,
         ):
+            contract_verdict = await self._grade_completion_contract(workflow_run, is_partial_run=is_partial_run)
+            if contract_verdict is not None and not contract_verdict.satisfied:
+                updated = await self._update_workflow_run_status_if_not_final(
+                    workflow_run_id=workflow_run_id,
+                    status=WorkflowRunStatus.terminated,
+                    failure_reason=contract_verdict.reason,
+                )
+                if updated is None:
+                    return await self._current_row_after_lost_finalize(workflow_run_id, workflow_run)
+                return updated
             updated = await self._update_workflow_run_status_if_not_final(
                 workflow_run_id=workflow_run_id,
                 status=WorkflowRunStatus.completed,
@@ -7540,6 +7559,81 @@ class WorkflowService:
             return updated
 
         return workflow_run
+
+    async def _session_download_count(self, workflow_run: WorkflowRun, context: object) -> int:
+        """This run's downloads still scoped to the browser session, which cleanup tags with the run
+        id after this grade runs. Failure-tolerant: an unavailable count must not manufacture a
+        shortfall."""
+        browser_session_id = getattr(context, "browser_session_id", None)
+        if not browser_session_id:
+            return 0
+        try:
+            # Scoped to this run's window and to rows finalization has not claimed: a reused session
+            # carries earlier runs' downloads, which would otherwise satisfy the contract for a run
+            # that produced nothing.
+            return await app.DATABASE.artifacts.count_unclaimed_session_download_artifacts(
+                browser_session_id=browser_session_id,
+                organization_id=workflow_run.organization_id,
+                run_started_at=workflow_run.created_at,
+            )
+        except Exception:
+            LOG.warning(
+                "Session download count failed while grading; counting zero from this source",
+                workflow_run_id=workflow_run.workflow_run_id,
+                exc_info=True,
+            )
+            return 0
+
+    async def _grade_completion_contract(
+        self, workflow_run: WorkflowRun, *, is_partial_run: bool = False
+    ) -> ContractVerdict | None:
+        """Grade the workflow's declared completion contract, or None when it declares nothing.
+
+        Runs before the status write and after blocks have registered their files, so the verdict
+        reflects what the run produced rather than what its code reported. Failure-tolerant: a
+        grading error must never turn a good run into a bad one."""
+        if is_partial_run:
+            # A subset run was never asked to produce the whole workflow's deliverable.
+            return None
+        try:
+            # The run is pinned to one workflow version; grading the permanent id would read
+            # whatever version exists now, so an edit mid-run could judge this run by a contract
+            # it never executed.
+            workflow = await self.get_workflow(
+                workflow_id=workflow_run.workflow_id,
+                organization_id=workflow_run.organization_id,
+            )
+            criteria = parse_completion_contract(workflow.workflow_definition if workflow else None)
+            if not criteria:
+                return None
+            context = skyvern_context.current()
+            # Producer and consumer must resolve the same download key: a sub-workflow registers
+            # files under the parent's run id, so the raw workflow_run_id would read an empty dir.
+            files = await app.STORAGE.get_downloaded_files(
+                organization_id=workflow_run.organization_id,
+                run_id=resolve_run_download_id(context, fallback_run_id=workflow_run.workflow_run_id),
+            )
+            # Session-scoped downloads are only tagged with the run id during cleanup, which runs
+            # after this grade. Counting them here keeps a real download from reading as zero;
+            # double-counting one file is harmless because the grader only ever needs a floor.
+            session_files = await self._session_download_count(workflow_run, context)
+            verdict = grade_completion_contract(criteria, registered_download_count=len(files or []) + session_files)
+            LOG.info(
+                "workflow_completion_contract_graded",
+                workflow_run_id=workflow_run.workflow_run_id,
+                satisfied=verdict.satisfied,
+                unmet_criterion_ids=list(verdict.unmet_criterion_ids),
+                registered_download_count=len(files or []),
+                session_download_count=session_files,
+            )
+            return verdict
+        except Exception:
+            LOG.warning(
+                "Completion-contract grading failed; leaving the run status unchanged",
+                workflow_run_id=workflow_run.workflow_run_id,
+                exc_info=True,
+            )
+            return None
 
     async def _current_row_after_lost_finalize(self, workflow_run_id: str, fallback: WorkflowRun) -> WorkflowRun:
         LOG.info(
