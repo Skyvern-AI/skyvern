@@ -21,7 +21,7 @@ import dataclasses
 import time
 import typing as t
 from enum import IntEnum
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import structlog
 import websockets
@@ -30,6 +30,7 @@ from starlette.websockets import WebSocketState
 from websockets import ConnectionClosedError, ConnectionClosedOK, Data
 
 from skyvern.config import settings
+from skyvern.exceptions import MissingRoutedVncAddressError
 from skyvern.forge.sdk.routes.streaming.auth import get_x_api_key
 from skyvern.forge.sdk.routes.streaming.channels.execution import execution_channel
 from skyvern.forge.sdk.routes.streaming.registries import (
@@ -50,6 +51,8 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePer
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.utils.aio import collect
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
+from skyvern.webeye.cdp_connection import redact_cdp_url
+from skyvern.webeye.cdp_credentials import LIVE_VIEW_PATH_PREFIX
 
 LOG = structlog.get_logger()
 
@@ -295,41 +298,50 @@ async def ask_for_clipboard(vnc_channel: VncChannel) -> None:
         LOG.exception(f"{class_name} Failed to ask for clipboard via CDP", **vnc_channel.identity)
 
 
-# TODO(benji): I hate this function. It's messy and gross. Once we remove v1,
-# we should clean this up.
-def _build_vnc_url_from_browser_address(browser_address: str) -> str | None:
-    """
-    Build a routed VNC URL from a V2 K8s routed browser_address.
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
-    V2 K8s routed browser_address format:
-        wss://{domain}/{session_id}/{token}/devtools/browser/{browser_id}
 
-    Returns VNC URL in format:
-        wss://{domain}/vnc/{session_id}/{token}
+def _build_vnc_url_from_browser_address(browser_address: str | None, vnc_port: int) -> str | None:
+    """The routed, credential-bearing VNC address for a session, or None if none can be built.
 
-    Returns None if browser_address is not a V2 routed URL.
+    Both routed shapes carry the same credential their CDP address carries, and both are checked
+    at the edge before any byte reaches the browser:
+
+        router:  wss://{host}/{session_id}?token={token}
+              -> wss://{host}/vnc/{session_id}?token={token}
+        legacy:  wss://{host}/{session_id}/{token}/devtools/browser/{browser_id}
+              -> wss://{host}/vnc/{session_id}/{token}
+
+    Both are shapes ``redact_cdp_url`` knows how to mask; the prefix is shared with it and with
+    the router's own live-view routing so a rename cannot silently unmask the legacy token.
+
+    A loopback address is the single-host case (local dev, single-container self-hosting): the
+    websockify listener is on the API host itself, inside one trust domain, with no edge to route
+    through. Every other address returns None rather than naming the browser directly — reaching
+    a private pod or VPC address would stream a customer live view with no credential on the
+    wire, which is worse than no live view at all (SKY-13287).
     """
     if not browser_address:
         return None
 
     parsed = urlparse(browser_address)
-
-    # Check if this looks like a V2 routed URL (wss:// with token in path)
     if parsed.scheme not in ("wss", "ws"):
         return None
+    if parsed.hostname in LOOPBACK_HOSTS:
+        return f"ws://{parsed.hostname}:{vnc_port}"
 
-    # Parse path: /{session_id}/{token}/devtools/browser/{browser_id}
-    path_parts = parsed.path.strip("/").split("/")
-    if len(path_parts) < 4 or path_parts[2] != "devtools":
-        return None
-
-    session_id = path_parts[0]
-    token = path_parts[1]
-    domain = parsed.netloc
-
-    # Build VNC URL with same domain and token
     scheme = "wss" if parsed.scheme == "wss" else "ws"
-    return f"{scheme}://{domain}/vnc/{session_id}/{token}"
+    path_parts = [part for part in parsed.path.split("/") if part]
+
+    # The query is passed through verbatim rather than re-encoded: it is what the router
+    # re-parses to recover the session token, and re-encoding could alter it.
+    if len(path_parts) == 1 and parse_qs(parsed.query).get("token"):
+        return f"{scheme}://{parsed.netloc}{LIVE_VIEW_PATH_PREFIX}{path_parts[0]}?{parsed.query}"
+
+    if len(path_parts) >= 4 and path_parts[2] == "devtools":
+        return f"{scheme}://{parsed.netloc}{LIVE_VIEW_PATH_PREFIX}{path_parts[0]}/{path_parts[1]}"
+
+    return None
 
 
 async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
@@ -339,36 +351,19 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
     Loops until the task is cleared or the websocket is closed.
     """
 
-    vnc_url: str = ""
     browser_session = vnc_channel.browser_session
     class_name = vnc_channel.class_name
 
     if not browser_session:
         raise Exception(f"{class_name} No browser session associated with vnc channel.")
 
-    # First, check if this is a V2 K8s routed session by examining browser_address
-    # V2 sessions have browser_address like: wss://{domain}/{session_id}/{token}/devtools/...
-    # For these, we need to route VNC through the same nginx proxy
-    routed_vnc_url = _build_vnc_url_from_browser_address(browser_session.browser_address)
-    if routed_vnc_url:
-        vnc_url = routed_vnc_url
-    elif browser_session.ip_address:
-        # V1 ECS sessions: Direct IP connection (ip_address is a public/reachable IP)
-        if ":" in browser_session.ip_address:
-            ip, _ = browser_session.ip_address.split(":")
-            vnc_url = f"ws://{ip}:{vnc_channel.vnc_port}"
-        else:
-            vnc_url = f"ws://{browser_session.ip_address}:{vnc_channel.vnc_port}"
-    else:
-        # Last resort: parse browser_address hostname
-        browser_address = browser_session.browser_address
-        parsed_browser_address = urlparse(browser_address)
-        host = parsed_browser_address.hostname
-        vnc_url = f"ws://{host}:{vnc_channel.vnc_port}"
+    vnc_url = _build_vnc_url_from_browser_address(browser_session.browser_address, vnc_channel.vnc_port)
+    if not vnc_url:
+        raise MissingRoutedVncAddressError(browser_session.persistent_browser_session_id)
 
     LOG.debug(
         f"{class_name} Connecting to vnc url.",
-        vnc_url=vnc_url,
+        vnc_url=redact_cdp_url(vnc_url),
         **vnc_channel.identity,
     )
 

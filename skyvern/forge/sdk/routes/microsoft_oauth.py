@@ -109,6 +109,7 @@ def _require_scopes_from_token(token_data: dict) -> list[str]:
 async def microsoft_oauth_authorize(
     request: CreateMicrosoftOAuthAuthorizeRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
 ) -> MicrosoftOAuthAuthorizeResponse:
     try:
         start = await microsoft_oauth_service.start_authorization(
@@ -117,6 +118,7 @@ async def microsoft_oauth_authorize(
             credential_name=request.credential_name,
             scope_profile=request.scope_profile,
             app_origin=request.app_origin,
+            initiator_id=current_user_id,
         )
     except InvalidAppOriginError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -136,13 +138,18 @@ async def microsoft_oauth_authorize(
 async def microsoft_oauth_callback(
     request: CreateMicrosoftOAuthCallbackRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
 ) -> MicrosoftOAuthCredentialResponse:
     context = await microsoft_oauth_service.load_pending_consent_context(
         organization_id=current_org.organization_id,
-        nonce=request.state,
+        state=request.state,
+        initiator_id=current_user_id,
     )
     if context is None or not context.consent_redirect_uri:
-        raise HTTPException(status_code=400, detail="Unknown or consumed OAuth consent nonce")
+        raise HTTPException(
+            status_code=400,
+            detail="This OAuth consent request is unknown, expired, or was not started by you. Restart the connection.",
+        )
     if not context.consent_code_verifier:
         raise HTTPException(
             status_code=400,
@@ -188,7 +195,8 @@ async def microsoft_oauth_callback(
     try:
         credential = await microsoft_oauth_service.promote_pending_credential(
             organization_id=current_org.organization_id,
-            nonce=request.state,
+            state=request.state,
+            initiator_id=current_user_id,
             refresh_token=refresh_token,
             scopes_granted=scopes_granted,
         )

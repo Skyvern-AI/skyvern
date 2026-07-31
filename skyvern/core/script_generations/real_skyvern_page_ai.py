@@ -27,6 +27,7 @@ from skyvern.services import script_service
 from skyvern.services.otp_service import poll_otp_value
 from skyvern.services.script_reviewer_v3.cohort import is_v3_cohort
 from skyvern.services.script_reviewer_v3.midrun import v3_review_in_flight
+from skyvern.services.script_reviewer_v3.redaction import redact_sensitive_content, redact_sensitive_value
 from skyvern.services.script_reviewer_v3.types import FailureContext, InterceptedActionType
 from skyvern.utils.css_selector import compute_selector_options
 from skyvern.utils.prompt_engine import load_prompt_with_elements, load_prompt_with_elements_tracked
@@ -311,9 +312,11 @@ class RealSkyvernPageAi(SkyvernPageAi):
         failed_selector: str | None = None,
         block_label: str | None = None,
         recoverable_marker_id: int | None = None,
+        value_is_sensitive: bool = False,
         v3_parent_episode_id: str | None = None,
     ) -> str:
         """Input text into an element using AI to determine the value."""
+        sensitive_value = value if value_is_sensitive else None
 
         # v3 mid-run hook — see ai_click for the contract.
         # Never expose an unresolved TOTP value to a reviewer that can write its prompt value directly to the page.
@@ -326,6 +329,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 totp_identifier=totp_identifier,
                 totp_url=totp_url,
                 block_label=block_label,
+                value_is_sensitive=value_is_sensitive,
             )
             if class_a:
                 # v3 mid-run committed the fill on the live page. The
@@ -458,6 +462,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 block_label=block_label,
                 recoverable_marker_id=recoverable_marker_id,
                 v3_parent_episode_id=v3_parent_episode_id,
+                sensitive_value=sensitive_value,
             )
         else:
             if is_unresolved_totp_value(transformed_value):
@@ -791,6 +796,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         totp_identifier: str | None,
         totp_url: str | None,
         block_label: str | None,
+        value_is_sensitive: bool = False,
     ) -> tuple[str | None, bool]:
         """v3 mid-run gate. Called at the top of ai_click / ai_input_text.
 
@@ -843,7 +849,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 block_label=block_label or self.current_label or "unknown",
                 fallback_type="element",
                 script_revision_id=context.script_revision_id,
-                page_url=self.page.url,
+                page_url=redact_sensitive_content(self.page.url, value if value_is_sensitive else None),
                 reviewer_version="v3",
             )
             episode_id_for_cleanup = episode.episode_id
@@ -859,6 +865,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 page=self.page,
                 context=context,
                 episode_id=episode.episode_id,
+                value_is_sensitive=value_is_sensitive,
             )
             result = await v3_review_in_flight(fc)
             return episode.episode_id, result.decision.is_midrun_class_a()
@@ -901,6 +908,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         block_label: str | None = None,
         recoverable_marker_id: int | None = None,
         v3_parent_episode_id: str | None = None,
+        sensitive_value: str | None = None,
     ) -> None:
         """Record an element-level fallback episode when ai_click/ai_input_text fires
         because a CSS selector failed or was missing. Gated on code_version >= 2.
@@ -968,19 +976,24 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         action_data["css_suggestion"] = f"xpath={xpath}"
             if hasattr(action, "reasoning"):
                 action_data["reasoning"] = action.reasoning
+            action_data = json.loads(
+                redact_sensitive_content(json.dumps(action_data, ensure_ascii=False), sensitive_value)
+            )
+            safe_selector = redact_sensitive_content(failed_selector or "", sensitive_value)
+            safe_intention = redact_sensitive_content(intention, sensitive_value)
 
             if recoverable_marker_id is not None and failed_selector is None:
                 error_msg = (
                     f"Proactive recovery on page.{action_type}() (marker={recoverable_marker_id}): "
                     f"generator emitted ai='proactive' (no semantic selector at codegen); "
-                    f"AI picked the element. Intention: {intention}"
+                    f"AI picked the element. Intention: {safe_intention}"
                 )
             else:
                 error_msg = (
                     f"Selector {'failed' if failed_selector else 'missing'} on page.{action_type}(), "
                     f"AI fallback succeeded. "
-                    f"Original selector: {failed_selector or '(none)'}. "
-                    f"Intention: {intention}"
+                    f"Original selector: {safe_selector or '(none)'}. "
+                    f"Intention: {safe_intention}"
                 )
             if v3_parent_episode_id:
                 # v3 mid-run Class B fall-through: episode already exists; update
@@ -1007,14 +1020,14 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     fallback_type="element",
                     script_revision_id=context.script_revision_id,
                     error_message=error_msg,
-                    page_url=self.page.url,
+                    page_url=redact_sensitive_content(self.page.url, sensitive_value),
                     agent_actions=action_data,
                 )
                 LOG.info(
                     "Recorded element fallback episode for selector failure",
                     block_label=block_label or self.current_label,
                     action_type=action_type,
-                    failed_selector=failed_selector,
+                    failed_selector=redact_sensitive_value(safe_selector, sensitive_value),
                 )
         except Exception:
             LOG.warning("Failed to record element fallback episode for selector failure", exc_info=True)

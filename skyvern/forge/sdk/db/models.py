@@ -1316,8 +1316,11 @@ class PersistentBrowserSessionModel(Base):
         ),
         # The orphan sweep (SKY-13158) is deliberately cross-organization, so it matches neither
         # index above. The partial predicate is what does the work: it restricts the index to live
-        # vendor-held rows, a small subset, which is why plain column keys are enough even though
-        # the sweep orders by COALESCE(last_activity_at, started_at).
+        # rows of the shape the sweep can identify from this table alone, a small subset, which is
+        # why plain column keys are enough even though the sweep orders by
+        # COALESCE(last_activity_at, started_at). Rows whose provider is recorded elsewhere are not
+        # identifiable by shape and are swept off that table's own index instead — a partial
+        # predicate cannot reference another table's columns.
         # Do NOT "fix" the keys to that COALESCE expression: alembic cannot reliably compare
         # expression-based indexes, so an expression key here reads as drift and fails `alembic
         # check`. Its postgresql_where is never compared, so the partial predicate is safe.

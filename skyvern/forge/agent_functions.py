@@ -1167,6 +1167,9 @@ class AgentFunction:
         """
         return None
 
+    def get_mcp_request_organization_id(self) -> str | None:
+        return None
+
     async def get_mcp_oauth_jwt_key(self) -> Any | None:
         """Return the current signing key/JWK for MCP OAuth token validation.
 
@@ -1207,6 +1210,9 @@ class AgentFunction:
         del organization_id
         api_key = settings.SKYVERN_API_KEY
         return api_key if api_key and api_key != "PLACEHOLDER" else None
+
+    async def browser_context_route_handlers_allowed(self, **_: Any) -> bool:
+        return True
 
     async def setup_browser_context_extensions(self, browser_context: Any, **kwargs: Any) -> None:
         """Attach cloud-only listeners/route handlers to a fresh BrowserContext. OSS no-op."""

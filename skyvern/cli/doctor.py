@@ -486,6 +486,7 @@ def _check_llm_config() -> CheckResult:
 
     providers: dict[str, dict[str, str | None]] = {
         "OPENAI": {"enable": "ENABLE_OPENAI", "key": "OPENAI_API_KEY"},
+        "XAI": {"enable": "ENABLE_XAI", "key": "XAI_API_KEY"},
         "ANTHROPIC": {"enable": "ENABLE_ANTHROPIC", "key": "ANTHROPIC_API_KEY"},
         "GEMINI": {"enable": "ENABLE_GEMINI", "key": "GEMINI_API_KEY"},
         "AZURE": {"enable": "ENABLE_AZURE", "key": "AZURE_API_KEY"},

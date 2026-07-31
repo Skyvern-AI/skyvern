@@ -27,6 +27,7 @@ import os
 import re
 import ssl
 import time
+import urllib.error
 import urllib.request
 import uuid
 from collections.abc import AsyncIterator, Coroutine
@@ -40,6 +41,14 @@ import structlog
 from playwright.async_api import Browser, BrowserContext, CDPSession, Page
 
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, BROWSER_INTERCEPTOR_DISABLE_TIMEOUT
+from skyvern.exceptions import HttpException, SkyvernHTTPException
+from skyvern.forge.sdk.core.aiohttp_helper import strip_cross_origin_redirect_credentials
+from skyvern.utils.url_validators import (
+    MAX_SAFE_REDIRECTS,
+    SAFE_REDIRECT_STATUS_CODES,
+    validate_fetch_url,
+    validate_redirect_url,
+)
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -355,6 +364,57 @@ def _body_starts_with_html(data: bytes) -> bool:
 
 def _has_control_chars(text: str) -> bool:
     return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text)
+
+
+# A refused destination and an exhausted hop budget both mean "do not fetch this"; callers must
+# treat them as a decision, not as a transport failure worth retrying on another client.
+DOWNLOAD_DESTINATION_ERRORS = (SkyvernHTTPException, HttpException)
+
+
+def _header_value(headers: dict[str, str], name: str) -> str | None:
+    lowered = name.lower()
+    return next((value for key, value in headers.items() if key.lower() == lowered), None)
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+def _urlopen_single_hop(
+    request: urllib.request.Request, ssl_context: ssl.SSLContext
+) -> tuple[int, dict[str, str], bytes]:
+    """Perform one HTTP hop without following redirects, so the next hop can be checked first."""
+    opener = urllib.request.build_opener(_NoRedirectHandler, urllib.request.HTTPSHandler(context=ssl_context))
+    try:
+        with opener.open(request) as response:
+            return response.status, dict(response.headers), response.read()
+    except urllib.error.HTTPError as error:
+        # Suppressing redirects turns them into errors here, so a redirect is returned for the
+        # caller to check. Every other error status stays an error: its body is not the file.
+        if error.code not in SAFE_REDIRECT_STATUS_CODES:
+            raise
+        with error:
+            return error.code, dict(error.headers), error.read()
+
+
+async def fetch_download_through_request_context(request_context: Any, url: str) -> Any:
+    """Return the final response for a page-supplied download URL.
+
+    The destination is checked before the initial request and again before every redirect hop, so
+    no hop carries cookies or headers to a host that has not been cleared. Raises on a refused
+    destination, a redirect without a target, or an exhausted hop budget.
+    """
+    current_url = await asyncio.to_thread(validate_fetch_url, url)
+    for _ in range(MAX_SAFE_REDIRECTS + 1):
+        response = await request_context.get(current_url, max_redirects=0)
+        if response.status not in SAFE_REDIRECT_STATUS_CODES:
+            return response
+        location = _header_value(dict(response.headers), "location")
+        if not location:
+            raise HttpException(response.status, current_url, "Redirected download provided no target")
+        current_url = await asyncio.to_thread(validate_redirect_url, current_url, location)
+    raise HttpException(400, current_url, "Too many redirects while fetching a download")
 
 
 def _payload_is_html_login_masquerade(data: bytes, content_type: str, filename: str) -> bool:
@@ -937,6 +997,32 @@ class CDPDownloadInterceptor:
                 parts.append(f"{name}={value}")
         return "; ".join(parts)
 
+    async def _download_url_via_urllib(self, url: str) -> tuple[bytes, str]:
+        """Fetch a download over urllib, checking the destination before every hop.
+
+        The session cookie rides a normal header and is dropped when a hop crosses origin, so it
+        reaches the original host across a same-host redirect but is never replayed to another one.
+        """
+        current_url = await asyncio.to_thread(validate_fetch_url, url)
+        headers = {"User-Agent": "Mozilla/5.0"}
+        cookie_header = await self._cookie_header_for_url(current_url)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+        ssl_ctx = ssl.create_default_context()
+
+        for _ in range(MAX_SAFE_REDIRECTS + 1):
+            request = urllib.request.Request(current_url, headers=dict(headers))
+            status, response_headers, body = await asyncio.to_thread(_urlopen_single_hop, request, ssl_ctx)
+            if status not in SAFE_REDIRECT_STATUS_CODES:
+                return body, _header_value(response_headers, "content-type") or ""
+            location = _header_value(response_headers, "location")
+            if not location:
+                raise HttpException(status, current_url, "Redirected download provided no target")
+            next_url = await asyncio.to_thread(validate_redirect_url, current_url, location)
+            headers, _ = strip_cross_origin_redirect_credentials(headers, None, current_url, next_url)
+            current_url = next_url
+        raise HttpException(400, current_url, "Too many redirects while fetching a download")
+
     async def _download_url_directly(self, url: str, suggested_filename: str) -> None:
         """Download a URL directly via HTTP and save to the output directory.
 
@@ -956,7 +1042,7 @@ class CDPDownloadInterceptor:
         # We use the BrowserContext (not a Page) so this survives individual page closes.
         if self._browser_context:
             try:
-                response = await self._browser_context.request.get(url)
+                response = await fetch_download_through_request_context(self._browser_context.request, url)
                 if response.ok:
                     data = await response.body()
                     content_type = response.headers.get("content-type", "")
@@ -967,6 +1053,11 @@ class CDPDownloadInterceptor:
                         url=url,
                         status=response.status,
                     )
+            except DOWNLOAD_DESTINATION_ERRORS as e:
+                # A refused destination is a decision about this URL, so the urllib transport must
+                # not be tried as a second chance at the same host.
+                LOG.error("Download destination refused", url=url, reason=str(e))
+                return
             except Exception as e:
                 LOG.debug("Playwright APIRequestContext download failed, trying urllib", url=url, error=str(e))
 
@@ -975,25 +1066,11 @@ class CDPDownloadInterceptor:
         # endpoint answers an unauthenticated request with its login page (saved as a corrupt file).
         if data is None:
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                cookie_header = await self._cookie_header_for_url(url)
-                if cookie_header:
-                    # Unredirected header: urllib's HTTPRedirectHandler copies req.headers but not
-                    # unredirected_hdrs across redirects, so the cookie reaches only the original host
-                    # and is never replayed to another domain (cross-host session-cookie leak).
-                    # Trade-off: a same-host redirect also drops the cookie; if that final hop is
-                    # session-gated it returns a login page, which the HTML-masquerade guard below
-                    # rejects instead of saving a corrupt file. Per-hop cookie replay is intentionally
-                    # not implemented — cross-host safety outweighs that narrow convenience.
-                    req.add_unredirected_header("Cookie", cookie_header)
-                ssl_ctx = ssl.create_default_context()
-
-                def _fetch() -> tuple[bytes, str]:
-                    with urllib.request.urlopen(req, context=ssl_ctx) as resp:
-                        return resp.read(), resp.headers.get("content-type", "")
-
-                data, content_type = await asyncio.to_thread(_fetch)
+                data, content_type = await self._download_url_via_urllib(url)
                 method = "urllib"
+            except DOWNLOAD_DESTINATION_ERRORS as e:
+                LOG.error("Download destination refused", url=url, reason=str(e))
+                return
             except Exception as e:
                 LOG.error("Direct HTTP download failed", url=url, error=str(e), exc_info=True)
                 return
