@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.forge.sdk.artifact.storage.recording_test_helpers import fake_prepared_recording
 from skyvern.webeye import real_browser_manager
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
@@ -443,17 +444,22 @@ def _make_browser_state_with_video(video_path: str) -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_get_video_artifacts_finalize_true_invokes_ffmpeg(tmp_path) -> None:
-    """The default (finalize=True) path remuxes via ffmpeg so the final upload has Duration + Cues."""
+async def test_get_video_artifacts_finalize_true_prepares_upload(tmp_path) -> None:
+    """The default (finalize=True) path prepares finalized recording bytes and extension."""
     src = tmp_path / "recording.webm"
     src.write_bytes(b"raw-webm-bytes")
+    prepared = tmp_path / "recording.mp4"
+    prepared.write_bytes(b"compressed-mp4-bytes")
     browser_state = _make_browser_state_with_video(str(src))
 
-    with patch("skyvern.webeye.real_browser_manager.finalize_webm", new=AsyncMock(return_value=b"remuxed")) as m:
+    with patch(
+        "skyvern.webeye.real_browser_manager.prepare_recording_for_upload",
+        lambda path: fake_prepared_recording(path, str(prepared)),
+    ):
         artifacts = await RealBrowserManager().get_video_artifacts(browser_state=browser_state)
 
-    m.assert_awaited_once_with(str(src))
-    assert artifacts[0].video_data == b"remuxed"
+    assert artifacts[0].video_data == b"compressed-mp4-bytes"
+    assert artifacts[0].video_file_extension == "mp4"
 
 
 @pytest.mark.asyncio
@@ -467,26 +473,26 @@ async def test_get_video_artifacts_finalize_false_skips_ffmpeg(tmp_path) -> None
     src.write_bytes(b"partial-webm-bytes")
     browser_state = _make_browser_state_with_video(str(src))
 
-    with patch("skyvern.webeye.real_browser_manager.finalize_webm", new=AsyncMock()) as m:
+    with patch("skyvern.webeye.real_browser_manager.prepare_recording_for_upload") as m:
         artifacts = await RealBrowserManager().get_video_artifacts(browser_state=browser_state, finalize=False)
 
-    m.assert_not_awaited()
+    m.assert_not_called()
     assert artifacts[0].video_data == b"partial-webm-bytes"
+    assert artifacts[0].video_file_extension == "webm"
 
 
 @pytest.mark.asyncio
 async def test_get_video_artifacts_non_webm_skips_ffmpeg(tmp_path) -> None:
     """Non-WebM container files (e.g. fully-formed MP4 from a remote source)
-    are container-valid already; remuxing them through ``finalize_webm`` would
-    corrupt the file. The extension-based short-circuit reads them raw."""
+    are container-valid already; the extension-based short-circuit reads them raw."""
     src = tmp_path / "recording.mp4"
     src.write_bytes(b"mp4-bytes")
     browser_state = _make_browser_state_with_video(str(src))
 
-    with patch("skyvern.webeye.real_browser_manager.finalize_webm", new=AsyncMock()) as m:
+    with patch.object(real_browser_manager, "prepare_recording_for_upload", new=AsyncMock()) as m:
         artifacts = await RealBrowserManager().get_video_artifacts(browser_state=browser_state)
 
-    m.assert_not_awaited()
+    m.assert_not_called()
     assert artifacts[0].video_data == b"mp4-bytes"
 
 
@@ -689,9 +695,16 @@ async def test_popup_video_listener_timeout_url_error_safe() -> None:
     assert len(artifacts.video_artifacts) == 0
 
 
+@pytest.mark.parametrize(
+    ("shared_with_parent", "expected_deferred_close", "expected_release_driver"),
+    [(False, True, None), (True, False, False)],
+)
 @pytest.mark.asyncio
 async def test_cleanup_persists_session_cookies_when_close_deferred_for_streams(
     monkeypatch: pytest.MonkeyPatch,
+    shared_with_parent: bool,
+    expected_deferred_close: bool,
+    expected_release_driver: bool | None,
 ) -> None:
     """Active CDP streams defer the browser close, so cleanup must snapshot session cookies before
     store_browser_session archives the dir — the deferred close runs too late."""
@@ -701,16 +714,66 @@ async def test_cleanup_persists_session_cookies_when_close_deferred_for_streams(
     browser_state.browser_artifacts.browser_session_dir = "/tmp/fake_profile"
     browser_state.close = AsyncMock()
     manager.pages["wfr_streamed"] = browser_state
+    manager.pages["tsk_streamed"] = browser_state
+    if shared_with_parent:
+        manager.pages["wfr_parent"] = browser_state
 
     persist_mock = AsyncMock()
+    defer_mock = MagicMock(return_value=True)
     monkeypatch.setattr("skyvern.webeye.real_browser_manager.persist_session_cookies", persist_mock)
     monkeypatch.setattr("skyvern.webeye.real_browser_manager.stream_ref_active", lambda wrid: True)
-    monkeypatch.setattr("skyvern.webeye.real_browser_manager.set_deferred_close_params", lambda *a, **k: None)
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.set_deferred_close_params", defer_mock)
 
-    await manager.cleanup_for_workflow_run("wfr_streamed", task_ids=[], close_browser_on_completion=True)
+    result = await manager.cleanup_for_workflow_run(
+        "wfr_streamed",
+        task_ids=["tsk_streamed"],
+        close_browser_on_completion=True,
+    )
 
     persist_mock.assert_awaited_once_with(browser_state.browser_context, "/tmp/fake_profile")
+    defer_mock.assert_called_once_with(
+        "wfr_streamed",
+        expected_deferred_close,
+        release_driver=expected_release_driver,
+    )
     browser_state.close.assert_not_awaited()
+    assert "tsk_streamed" not in manager.pages
+    assert result.recording_finalized is False
+
+
+@pytest.mark.parametrize("close_succeeded", [True, False])
+@pytest.mark.asyncio
+async def test_cleanup_closes_when_stream_disconnects_before_deferral(
+    monkeypatch: pytest.MonkeyPatch,
+    close_succeeded: bool,
+) -> None:
+    manager = RealBrowserManager()
+    browser_state = MagicMock()
+    browser_state.browser_artifacts.traces_dir = None
+    browser_state.browser_artifacts.browser_session_dir = "/tmp/fake_profile"
+    browser_state.close = AsyncMock(return_value=close_succeeded)
+    manager.pages["wfr_streamed"] = browser_state
+    manager.pages["tsk_streamed"] = browser_state
+
+    monkeypatch.setattr(
+        "skyvern.webeye.real_browser_manager.persist_session_cookies",
+        AsyncMock(),
+    )
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.stream_ref_active", lambda wrid: True)
+    monkeypatch.setattr(
+        "skyvern.webeye.real_browser_manager.set_deferred_close_params",
+        lambda *args, **kwargs: False,
+    )
+
+    result = await manager.cleanup_for_workflow_run(
+        "wfr_streamed",
+        task_ids=["tsk_streamed"],
+        close_browser_on_completion=True,
+    )
+
+    browser_state.close.assert_awaited_once_with(close_browser_on_completion=True, release_driver=None)
+    assert "tsk_streamed" not in manager.pages
+    assert result.recording_finalized is close_succeeded
 
 
 @pytest.mark.asyncio

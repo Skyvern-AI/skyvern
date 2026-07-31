@@ -46,6 +46,15 @@ def test_smoke_test_pr_evidence_markers_present() -> None:
     assert ".qa/latest-smoke-report.md" in skill_text
 
 
+def test_smoke_test_sticky_comment_lookup_is_owned_anchored_and_paginated() -> None:
+    """The lookup must not be able to PATCH a comment this user did not author (SKY-13090)."""
+    skill_text = BUNDLED_SMOKE_TEST_SKILL.read_text(encoding="utf-8")
+    assert 'test("skyvern-smoke-test-report")' not in skill_text
+    assert "select(.user.login == $ENV.GH_LOGIN)" in skill_text
+    assert 'select(.body | startswith("<!-- skyvern-smoke-test-report -->"))' in skill_text
+    assert "gh api --paginate" in skill_text
+
+
 def test_smoke_test_browser_session_lifecycle() -> None:
     skill_text = BUNDLED_SMOKE_TEST_SKILL.read_text(encoding="utf-8")
     assert "skyvern_browser_session_create" in skill_text
