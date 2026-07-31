@@ -2743,6 +2743,7 @@ async def test_load_credential_secrets_decrypts_repo_payload(monkeypatch: pytest
     assert secrets.scopes == ["https://a", "https://b"]
     assert secrets.client_id == "client-1"
     assert secrets.credential_version == credential_version
+    assert secrets.encrypted_refresh_token == "ENC::rt"
     decrypt_mock.assert_awaited_once_with("ENC::rt", EncryptMethod.AES)
 
 
@@ -2946,6 +2947,128 @@ async def test_access_token_from_secrets_missing_access_token_raises(monkeypatch
 
     with pytest.raises(google_oauth_service.MissingAccessTokenError):
         await google_oauth_service.access_token_from_secrets(secrets)
+
+
+@pytest.mark.asyncio
+async def test_refresh_and_rotate_persists_google_refresh_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential_version = datetime.datetime(2026, 7, 30, 12, 0, 0)
+    secrets = google_oauth_service.GoogleCredentialSecrets(
+        refresh_token="rt-original",
+        scopes=["https://a"],
+        credential_version=credential_version,
+        encrypted_refresh_token="encrypted-rt-original",
+    )
+    monkeypatch.setattr(
+        google_oauth_service,
+        "credentials_from_secrets",
+        AsyncMock(return_value=SimpleNamespace(token="at-refreshed", refresh_token="rt-rotated")),
+    )
+    update_active_refresh_token = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(
+            google_oauth=SimpleNamespace(update_active_refresh_token=update_active_refresh_token),
+        ),
+        raising=False,
+    )
+    encrypt = AsyncMock(return_value="encrypted-rt-rotated")
+    monkeypatch.setattr(google_oauth_service, "encryptor", SimpleNamespace(encrypt=encrypt))
+
+    result = await google_oauth_service.refresh_and_rotate(
+        organization_id="org_1",
+        credential_id="goac_1",
+        credential_secrets=secrets,
+    )
+
+    assert result.access_token == "at-refreshed"
+    encrypt.assert_awaited_once_with("rt-rotated", EncryptMethod.AES)
+    assert update_active_refresh_token.await_args is not None
+    assert update_active_refresh_token.await_args.kwargs["expected_encrypted_refresh_token"] == "encrypted-rt-original"
+    assert result.credential_version == update_active_refresh_token.await_args.kwargs["now"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_and_rotate_preserves_version_without_refresh_token_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential_version = datetime.datetime(2026, 7, 30, 12, 0, 0)
+    secrets = google_oauth_service.GoogleCredentialSecrets(
+        refresh_token="rt-original",
+        scopes=["https://a"],
+        credential_version=credential_version,
+        encrypted_refresh_token="encrypted-rt-original",
+    )
+    monkeypatch.setattr(
+        google_oauth_service,
+        "credentials_from_secrets",
+        AsyncMock(return_value=SimpleNamespace(token="at-refreshed", refresh_token="rt-original")),
+    )
+    update_active_refresh_token = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(
+            google_oauth=SimpleNamespace(update_active_refresh_token=update_active_refresh_token),
+        ),
+        raising=False,
+    )
+
+    result = await google_oauth_service.refresh_and_rotate(
+        organization_id="org_1",
+        credential_id="goac_1",
+        credential_secrets=secrets,
+    )
+
+    assert result == google_oauth_service.GoogleRefreshResult(
+        access_token="at-refreshed",
+        credential_version=credential_version,
+    )
+    update_active_refresh_token.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refresh_and_rotate_rejects_failed_google_token_persistence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets = google_oauth_service.GoogleCredentialSecrets(
+        refresh_token="rt-original",
+        credential_version=datetime.datetime(2026, 7, 30, 12, 0, 0),
+        encrypted_refresh_token="encrypted-rt-original",
+    )
+    monkeypatch.setattr(
+        google_oauth_service,
+        "credentials_from_secrets",
+        AsyncMock(return_value=SimpleNamespace(token="at-refreshed", refresh_token="rt-rotated")),
+    )
+    update_active_refresh_token = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(
+            google_oauth=SimpleNamespace(update_active_refresh_token=update_active_refresh_token),
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        google_oauth_service,
+        "encryptor",
+        SimpleNamespace(encrypt=AsyncMock(return_value="encrypted-rt-rotated")),
+    )
+
+    with pytest.raises(
+        google_oauth_service.RotatedRefreshTokenPersistenceError,
+        match="reconnect the Google account",
+    ):
+        await google_oauth_service.refresh_and_rotate(
+            organization_id="org_1",
+            credential_id="goac_1",
+            credential_secrets=secrets,
+        )
+
+    update_active_refresh_token.assert_awaited_once()
 
 
 def test_validate_redirect_uri_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3365,6 +3488,324 @@ async def test_google_oauth_callback_allows_matching_or_legacy_client(
         refresh_token="refresh-token",
         scopes_granted=["https://www.googleapis.com/auth/spreadsheets"],
     )
+
+
+@pytest.mark.asyncio
+async def test_google_oauth_callback_email_capture_is_authoritative(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.forge.sdk.db.repositories.google_oauth import PendingConsentContext
+
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    gmail_scope = google_oauth_service.GOOGLE_GMAIL_SCOPES[0]
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    credential = GoogleOAuthCredentialBase(
+        id="goac_1",
+        organization_id="org_1",
+        credential_name="Default",
+        provider="google",
+        state="active",
+        scopes_requested=[gmail_scope],
+        scopes_granted=[gmail_scope],
+        email_address="old@example.test",
+        created_at=now,
+        modified_at=now,
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "load_pending_consent_context",
+        AsyncMock(
+            return_value=PendingConsentContext(
+                credential_id=credential.id,
+                consent_redirect_uri="https://x/cb",
+                consent_code_verifier="verifier",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "resolve_client_config",
+        AsyncMock(
+            return_value=google_oauth_service.GoogleOAuthClientConfigResolution(
+                config=None,
+                source="missing",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "exchange_code_for_tokens",
+        AsyncMock(
+            return_value={
+                "refresh_token": "refresh-token",
+                "access_token": "access-token",
+                "scope": gmail_scope,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "promote_pending_credential",
+        AsyncMock(return_value=credential),
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_gmail_service,
+        "fetch_profile_email",
+        AsyncMock(return_value="Fresh@Example.Test"),
+    )
+    update_email_address = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "update_email_address",
+        update_email_address,
+    )
+
+    response = await google_oauth_routes.google_oauth_callback(
+        CreateGoogleOAuthCallbackRequest(code="code", state="nonce"),
+        current_org=SimpleNamespace(organization_id="org_1"),
+    )
+
+    assert response.credential.email_address == "fresh@example.test"
+    update_email_address.assert_awaited_once_with(
+        organization_id="org_1",
+        credential_id="goac_1",
+        email_address="fresh@example.test",
+        only_if_null=False,
+        expected_version=now,
+    )
+
+
+@pytest.mark.asyncio
+async def test_google_email_backfill_uses_post_rotation_version_and_normalizes_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pre_rotation_version = datetime.datetime(2026, 7, 30, 12, 0, 0)
+    post_rotation_version = datetime.datetime(2026, 7, 30, 12, 1, 0)
+    credential = GoogleOAuthCredentialBase(
+        id="goac_rotated",
+        organization_id="org_1",
+        credential_name="Default",
+        provider="google",
+        state="active",
+        scopes_requested=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+        scopes_granted=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+        created_at=pre_rotation_version,
+        modified_at=pre_rotation_version,
+    )
+    monkeypatch.setattr(google_oauth_routes, "_EMAIL_BACKFILL_FAILURES", {})
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "load_credential_secrets",
+        AsyncMock(return_value="secrets"),
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "refresh_and_rotate",
+        AsyncMock(
+            return_value=google_oauth_service.GoogleRefreshResult(
+                access_token="access-token",
+                credential_version=post_rotation_version,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_gmail_service,
+        "fetch_profile_email",
+        AsyncMock(return_value="Rotated@Example.Test"),
+    )
+    update_email_address = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "update_email_address",
+        update_email_address,
+    )
+
+    await google_oauth_routes._backfill_google_email_addresses(
+        organization_id="org_1",
+        credentials=[credential],
+    )
+
+    update_email_address.assert_awaited_once_with(
+        organization_id="org_1",
+        credential_id="goac_rotated",
+        email_address="rotated@example.test",
+        only_if_null=True,
+        expected_version=post_rotation_version,
+    )
+    assert credential.email_address == "rotated@example.test"
+
+
+@pytest.mark.asyncio
+async def test_google_email_backfill_randomizes_candidates_and_uses_null_and_version_guards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    credentials = [
+        GoogleOAuthCredentialBase(
+            id=f"goac_{index}",
+            organization_id="org_1",
+            credential_name="Default",
+            provider="google",
+            state="active",
+            scopes_requested=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+            scopes_granted=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+            created_at=now,
+            modified_at=now + datetime.timedelta(seconds=index),
+        )
+        for index in range(5)
+    ]
+    selected = [credentials[4], credentials[2], credentials[0]]
+    sample = MagicMock(return_value=selected)
+    monkeypatch.setattr(google_oauth_routes, "_EMAIL_BACKFILL_FAILURES", {})
+    monkeypatch.setattr(google_oauth_routes.random, "sample", sample)
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "load_credential_secrets",
+        AsyncMock(side_effect=lambda **kwargs: kwargs["credential_id"]),
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "refresh_and_rotate",
+        AsyncMock(
+            side_effect=lambda *, organization_id, credential_id, credential_secrets: (
+                google_oauth_service.GoogleRefreshResult(
+                    access_token=f"token-{credential_secrets}",
+                    credential_version=next(item.modified_at for item in selected if item.id == credential_id),
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_gmail_service,
+        "fetch_profile_email",
+        AsyncMock(side_effect=lambda access_token: f"{access_token}@example.test"),
+    )
+    update_email_address = AsyncMock(side_effect=[True, False, True])
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "update_email_address",
+        update_email_address,
+    )
+
+    await google_oauth_routes._backfill_google_email_addresses(
+        organization_id="org_1",
+        credentials=credentials,
+    )
+
+    sample.assert_called_once_with(credentials, k=3)
+    assert [awaited.kwargs["credential_id"] for awaited in update_email_address.await_args_list] == [
+        credential.id for credential in selected
+    ]
+    assert all(awaited.kwargs["only_if_null"] is True for awaited in update_email_address.await_args_list)
+    assert [awaited.kwargs["expected_version"] for awaited in update_email_address.await_args_list] == [
+        credential.modified_at for credential in selected
+    ]
+    assert selected[0].email_address == "token-goac_4@example.test"
+    assert selected[1].email_address is None
+    assert selected[2].email_address == "token-goac_0@example.test"
+    assert google_oauth_routes._EMAIL_BACKFILL_FAILURES == {}
+
+
+@pytest.mark.asyncio
+async def test_google_email_backfill_does_not_retry_failed_resolution_within_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    credential = GoogleOAuthCredentialBase(
+        id="goac_failed",
+        organization_id="org_1",
+        credential_name="Default",
+        provider="google",
+        state="active",
+        scopes_requested=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+        scopes_granted=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+        created_at=now,
+        modified_at=now,
+    )
+    monkeypatch.setattr(google_oauth_routes, "_EMAIL_BACKFILL_FAILURES", {})
+    monotonic_time = [100.0]
+    monkeypatch.setattr(google_oauth_routes.time, "monotonic", lambda: monotonic_time[0])
+    load_secrets = AsyncMock(return_value="secrets")
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "load_credential_secrets",
+        load_secrets,
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "refresh_and_rotate",
+        AsyncMock(
+            return_value=google_oauth_service.GoogleRefreshResult(
+                access_token="access-token",
+                credential_version=now,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_gmail_service,
+        "fetch_profile_email",
+        AsyncMock(return_value=None),
+    )
+
+    await google_oauth_routes._backfill_google_email_addresses(
+        organization_id="org_1",
+        credentials=[credential],
+    )
+    await google_oauth_routes._backfill_google_email_addresses(
+        organization_id="org_1",
+        credentials=[credential],
+    )
+
+    load_secrets.assert_awaited_once()
+
+    monotonic_time[0] = 3701.0
+    await google_oauth_routes._backfill_google_email_addresses(
+        organization_id="org_1",
+        credentials=[credential],
+    )
+
+    assert load_secrets.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_google_email_backfill_caches_cancelled_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    credential = GoogleOAuthCredentialBase(
+        id="goac_slow",
+        organization_id="org_1",
+        credential_name="Default",
+        provider="google",
+        state="active",
+        scopes_requested=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+        scopes_granted=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+        created_at=now,
+        modified_at=now,
+    )
+    monkeypatch.setattr(google_oauth_routes, "_EMAIL_BACKFILL_FAILURES", {})
+    load_secrets = AsyncMock(side_effect=asyncio.CancelledError)
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "load_credential_secrets",
+        load_secrets,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await google_oauth_routes._backfill_google_email_addresses(
+            organization_id="org_1",
+            credentials=[credential],
+        )
+    await google_oauth_routes._backfill_google_email_addresses(
+        organization_id="org_1",
+        credentials=[credential],
+    )
+
+    load_secrets.assert_awaited_once()
 
 
 @pytest.mark.asyncio

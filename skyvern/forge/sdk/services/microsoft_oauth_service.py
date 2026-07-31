@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import datetime
 import hashlib
+import json
 import secrets
 from dataclasses import dataclass, field
 from urllib.parse import urlencode, urlparse
@@ -24,6 +25,7 @@ from skyvern.forge.sdk.db.repositories.microsoft_oauth import (  # noqa: F401
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
+from skyvern.utils.email_validation import SAFE_EMAIL_ADDRESS_PATTERN
 
 LOG = structlog.get_logger()
 
@@ -37,6 +39,7 @@ MICROSOFT_OAUTH_SCOPE_PROFILES: dict[str, tuple[str, ...]] = {
 }
 
 CONSENT_TTL_SECONDS = 600
+_SAFE_EMAIL_ADDRESS = SAFE_EMAIL_ADDRESS_PATTERN
 
 
 def microsoft_access_token_cache_key(organization_id: str, credential_id: str) -> str:
@@ -131,6 +134,30 @@ def has_required_scopes(
 ) -> bool:
     granted = {_scope_segment(scope) for scope in (granted_scopes or [])}
     return all(_scope_segment(scope) in granted for scope in required_scopes)
+
+
+def email_from_id_token(id_token: str) -> str | None:
+    if not isinstance(id_token, str):
+        return None
+    segments = id_token.split(".")
+    if len(segments) != 3:
+        return None
+    try:
+        payload_segment = segments[1]
+        payload_bytes = base64.urlsafe_b64decode(f"{payload_segment}{'=' * (-len(payload_segment) % 4)}")
+        # Signature verification is omitted because this token comes directly from Microsoft's token endpoint over TLS.
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except (IndexError, UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    for claim in ("email", "preferred_username"):
+        value = payload.get(claim)
+        if isinstance(value, str):
+            candidate = value.strip()
+            if _SAFE_EMAIL_ADDRESS.fullmatch(candidate):
+                return candidate
+    return None
 
 
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -436,6 +463,21 @@ async def refresh_and_rotate(
 
 async def get_credentials_for_org(organization_id: str) -> list[MicrosoftOAuthCredentialBase]:
     return await app.DATABASE.microsoft_oauth.list_active_for_org(organization_id=organization_id)
+
+
+async def update_email_address(
+    *,
+    organization_id: str,
+    credential_id: str,
+    email_address: str,
+    only_if_null: bool,
+) -> bool:
+    return await app.DATABASE.microsoft_oauth.update_email_address(
+        organization_id=organization_id,
+        credential_id=credential_id,
+        email_address=email_address,
+        only_if_null=only_if_null,
+    )
 
 
 async def rename_credential(

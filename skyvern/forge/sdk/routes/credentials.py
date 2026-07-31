@@ -153,6 +153,7 @@ from skyvern.services.otp_service import (
     redact_otp_identifier_for_log,
 )
 from skyvern.services.run_service import cancel_workflow_run
+from skyvern.utils.email_validation import normalize_identifier_if_email
 from skyvern.utils.url_validators import validate_url
 
 LOG = structlog.get_logger()
@@ -446,6 +447,7 @@ async def send_totp_code(
     data: TOTPCodeCreate,
     curr_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> TOTPCode:
+    totp_identifier = normalize_identifier_if_email(data.totp_identifier)
     redacted_totp_identifier = redact_otp_identifier_for_log(data.totp_identifier)
     LOG.info(
         "Saving OTP code",
@@ -514,7 +516,7 @@ async def send_totp_code(
             raise HTTPException(status_code=400, detail="Failed to parse otp login")
         raw_row = await app.DATABASE.otp.create_raw_otp_code(
             organization_id=curr_org.organization_id,
-            totp_identifier=data.totp_identifier,
+            totp_identifier=totp_identifier,
             content=data.content,
             task_id=data.task_id,
             workflow_id=data.workflow_id,
@@ -536,7 +538,7 @@ async def send_totp_code(
 
     return await app.DATABASE.otp.create_otp_code(
         organization_id=curr_org.organization_id,
-        totp_identifier=data.totp_identifier,
+        totp_identifier=totp_identifier,
         content=data.content,
         code=otp_value.value,
         task_id=data.task_id,

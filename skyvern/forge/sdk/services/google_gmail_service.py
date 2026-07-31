@@ -1,4 +1,3 @@
-import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from math import ceil
@@ -9,13 +8,14 @@ import httpx
 import structlog
 
 from skyvern.services.email import gmail_client
+from skyvern.utils.email_validation import SAFE_EMAIL_ADDRESS_PATTERN
 
 GMAIL_API_BASE = gmail_client.GMAIL_API_BASE
 GmailAPIError = gmail_client.GmailAPIError
 LOG = structlog.get_logger()
 
 _OTP_QUERY_TERMS = "(verification OR verify OR code OR passcode OR otp OR 2fa OR one-time OR password)"
-_SAFE_EMAIL_QUERY_IDENTIFIER = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+$")
+_SAFE_EMAIL_QUERY_IDENTIFIER = SAFE_EMAIL_ADDRESS_PATTERN
 _decode = gmail_client.decode
 _get_json = gmail_client.get_json
 _payload_text = gmail_client.payload_text
@@ -26,6 +26,34 @@ class GmailMessageCandidate:
     message_id: str
     content: str
     internal_date: datetime | None = None
+
+
+async def fetch_profile_email(
+    *,
+    access_token: str,
+    client: httpx.AsyncClient | None = None,
+) -> str | None:
+    async def _fetch(client_: httpx.AsyncClient) -> str | None:
+        payload = await _get_json(
+            client_,
+            f"{GMAIL_API_BASE}/users/me/profile",
+            access_token=access_token,
+        )
+        if not isinstance(payload, dict):
+            return None
+        value = payload.get("emailAddress")
+        if not isinstance(value, str):
+            return None
+        candidate = value.strip()
+        return candidate if _SAFE_EMAIL_QUERY_IDENTIFIER.fullmatch(candidate) else None
+
+    try:
+        if client is not None:
+            return await _fetch(client)
+        async with httpx.AsyncClient(timeout=20.0) as owned_client:
+            return await _fetch(owned_client)
+    except (GmailAPIError, ValueError):
+        return None
 
 
 def _as_utc(value: datetime) -> datetime:

@@ -294,6 +294,33 @@ class MicrosoftOAuthRepository(BaseRepository):
             await session.execute(stmt)
             await session.commit()
 
+    @db_operation("update_email_address")
+    async def update_email_address(
+        self,
+        *,
+        organization_id: str,
+        credential_id: str,
+        email_address: str,
+        only_if_null: bool,
+    ) -> bool:
+        now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+        async with self.Session() as session:
+            filters = [
+                MicrosoftOAuthCredentialModel.id == credential_id,
+                MicrosoftOAuthCredentialModel.organization_id == organization_id,
+                MicrosoftOAuthCredentialModel.state == STATE_ACTIVE,
+            ]
+            if only_if_null:
+                filters.append(MicrosoftOAuthCredentialModel.email_address.is_(None))
+            stmt = (
+                update(MicrosoftOAuthCredentialModel)
+                .where(*filters)
+                .values(email_address=email_address, modified_at=now)
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            return result.rowcount > 0
+
     @db_operation("mark_revoked_and_scrub")
     async def mark_revoked_and_scrub(
         self,
@@ -313,6 +340,7 @@ class MicrosoftOAuthRepository(BaseRepository):
                     state=STATE_REVOKED,
                     encrypted_refresh_token=None,
                     encrypted_method=None,
+                    email_address=None,
                     consent_nonce=None,
                     consent_redirect_uri=None,
                     consent_expires_at=None,

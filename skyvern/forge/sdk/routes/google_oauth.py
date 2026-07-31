@@ -1,3 +1,6 @@
+import asyncio
+import random
+import time
 from typing import Annotated
 
 import httpx
@@ -13,19 +16,83 @@ from skyvern.forge.sdk.schemas.google_oauth import (
     GoogleOAuthAuthorizeResponse,
     GoogleOAuthClientConfig,
     GoogleOAuthClientConfigResponse,
+    GoogleOAuthCredentialBase,
     GoogleOAuthCredentialListResponse,
     GoogleOAuthCredentialResponse,
     UpdateGoogleOAuthClientConfigRequest,
     UpdateGoogleOAuthCredentialRequest,
 )
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.services import google_oauth_service, org_auth_service
+from skyvern.forge.sdk.services import google_gmail_service, google_oauth_service, org_auth_service
 from skyvern.forge.sdk.services.google_oauth_service import InvalidAppOriginError
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.utils.email_validation import normalize_email_address
 
 LOG = structlog.get_logger()
 
 google_oauth_router = APIRouter()
+
+_EMAIL_BACKFILL_FAILURE_TTL_SECONDS = 3600.0
+# Per-process cache bounds provider spend, not correctness.
+_EMAIL_BACKFILL_FAILURES: dict[str, float] = {}
+
+
+async def _backfill_google_email_addresses(
+    *,
+    organization_id: str,
+    credentials: list[GoogleOAuthCredentialBase],
+) -> None:
+    now = time.monotonic()
+    for credential_id, deadline in list(_EMAIL_BACKFILL_FAILURES.items()):
+        if deadline <= now:
+            _EMAIL_BACKFILL_FAILURES.pop(credential_id, None)
+    eligible_candidates = [
+        credential
+        for credential in credentials
+        if credential.email_address is None
+        and credential.id not in _EMAIL_BACKFILL_FAILURES
+        and credential.state == google_oauth_service.STATE_ACTIVE
+        and google_oauth_service.has_required_scopes(
+            credential.scopes_granted,
+            google_oauth_service.GOOGLE_GMAIL_SCOPES,
+        )
+    ]
+    candidates = random.sample(eligible_candidates, k=min(3, len(eligible_candidates)))
+    for credential in candidates:
+        try:
+            secrets = await google_oauth_service.load_credential_secrets(
+                organization_id=organization_id,
+                credential_id=credential.id,
+            )
+            refresh_result = await google_oauth_service.refresh_and_rotate(
+                organization_id=organization_id,
+                credential_id=credential.id,
+                credential_secrets=secrets,
+            )
+            email_address = await google_gmail_service.fetch_profile_email(access_token=refresh_result.access_token)
+            if email_address is None:
+                _EMAIL_BACKFILL_FAILURES[credential.id] = time.monotonic() + _EMAIL_BACKFILL_FAILURE_TTL_SECONDS
+                continue
+            email_address = normalize_email_address(email_address)
+            updated = await google_oauth_service.update_email_address(
+                organization_id=organization_id,
+                credential_id=credential.id,
+                email_address=email_address,
+                only_if_null=True,
+                expected_version=refresh_result.credential_version,
+            )
+            if updated:
+                credential.email_address = email_address
+        except asyncio.CancelledError:
+            _EMAIL_BACKFILL_FAILURES[credential.id] = time.monotonic() + _EMAIL_BACKFILL_FAILURE_TTL_SECONDS
+            raise
+        except Exception:
+            _EMAIL_BACKFILL_FAILURES[credential.id] = time.monotonic() + _EMAIL_BACKFILL_FAILURE_TTL_SECONDS
+            LOG.warning(
+                "Failed to backfill Google account email",
+                credential_id=credential.id,
+                exc_info=True,
+            )
 
 
 def _require_organization_client_config_enabled() -> None:
@@ -166,6 +233,33 @@ async def google_oauth_callback(
     except google_oauth_service.EncryptionNotConfiguredError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
+    try:
+        if google_oauth_service.has_required_scopes(
+            scopes_granted,
+            google_oauth_service.GOOGLE_GMAIL_SCOPES,
+        ):
+            email_address = await google_gmail_service.fetch_profile_email(
+                access_token=token_data["access_token"],
+            )
+            if email_address is not None:
+                email_address = normalize_email_address(email_address)
+                updated = await google_oauth_service.update_email_address(
+                    organization_id=current_org.organization_id,
+                    credential_id=credential.id,
+                    email_address=email_address,
+                    only_if_null=False,
+                    expected_version=credential.modified_at,
+                )
+                if updated:
+                    credential.email_address = email_address
+                else:
+                    LOG.debug(
+                        "Skipped Google account email update after credential changed",
+                        credential_id=credential.id,
+                    )
+    except Exception:
+        LOG.warning("Failed to resolve Google account email", exc_info=True)
+
     # ``consent_app_origin`` was validated against ``GOOGLE_OAUTH_APP_ORIGINS`` in
     # ``start_authorization`` before being persisted to the pending row, so reading
     # it back here is safe. A future refactor that bypasses that pre-storage check
@@ -240,11 +334,23 @@ async def delete_google_oauth_client_config(
 @google_oauth_router.get("/oauth/credentials")
 async def list_google_oauth_credentials(
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    include_email: bool = False,
 ) -> GoogleOAuthCredentialListResponse:
     """Fetch a list of Google OAuth credentials associated with an organization."""
     credentials = await google_oauth_service.get_visible_credentials_for_org(
         organization_id=current_org.organization_id,
     )
+    if include_email:
+        try:
+            async with asyncio.timeout(10):
+                await _backfill_google_email_addresses(
+                    organization_id=current_org.organization_id,
+                    credentials=credentials,
+                )
+        except TimeoutError:
+            LOG.warning("Timed out backfilling Google account emails")
+        except Exception:
+            LOG.warning("Failed to backfill Google account emails", exc_info=True)
     return GoogleOAuthCredentialListResponse(credentials=credentials)
 
 

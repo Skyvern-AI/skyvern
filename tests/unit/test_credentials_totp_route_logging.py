@@ -45,10 +45,10 @@ def _assert_raw_values_not_logged(logs: list[dict[str, object]], *raw_values: st
 
 
 @pytest.mark.asyncio
-async def test_send_totp_code_save_log_redacts_identifier_but_stores_raw_values(
+async def test_send_totp_code_save_log_redacts_identifier_and_normalizes_email_for_storage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    raw_identifier = "qa-email-otp@example.test"
+    raw_identifier = " QA-Email-OTP@Example.Test "
     raw_content = "135790"
     create_otp_code = AsyncMock(return_value=SimpleNamespace(totp_code_id="otp_1"))
     monkeypatch.setattr(credentials.app, "DATABASE", _database_with_otp_create(create_otp_code))
@@ -66,10 +66,28 @@ async def test_send_totp_code_save_log_redacts_identifier_but_stores_raw_values(
     _assert_raw_values_not_logged(logs, raw_identifier, raw_content)
 
     create_otp_code.assert_awaited_once()
+    assert create_otp_code.await_args is not None
     storage_kwargs = create_otp_code.await_args.kwargs
-    assert storage_kwargs["totp_identifier"] == raw_identifier
+    assert storage_kwargs["totp_identifier"] == "qa-email-otp@example.test"
     assert storage_kwargs["content"] == raw_content
     assert storage_kwargs["code"] == raw_content
+
+
+@pytest.mark.asyncio
+async def test_send_totp_code_preserves_phone_identifier_for_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    phone_identifier = "+1 (555) 555-0123"
+    create_otp_code = AsyncMock(return_value=SimpleNamespace(totp_code_id="otp_1"))
+    monkeypatch.setattr(credentials.app, "DATABASE", _database_with_otp_create(create_otp_code))
+
+    await credentials.send_totp_code(
+        TOTPCodeCreate(totp_identifier=phone_identifier, content="135790"),
+        curr_org=SimpleNamespace(organization_id="o_test"),
+    )
+
+    assert create_otp_code.await_args is not None
+    assert create_otp_code.await_args.kwargs["totp_identifier"] == phone_identifier
 
 
 @pytest.mark.asyncio
@@ -102,6 +120,7 @@ async def test_send_totp_code_auto_detects_long_content_despite_submitted_type(
     )
 
     assert result.totp_code_id == "otp_1"
+    assert create_otp_code.await_args is not None
     storage_kwargs = create_otp_code.await_args.kwargs
     assert storage_kwargs["code"] == magic_link
     assert storage_kwargs["otp_type"] == OTPType.MAGIC_LINK
@@ -124,6 +143,7 @@ async def test_send_totp_code_infers_short_content_type_despite_submitted_type(
     )
 
     assert result.totp_code_id == "otp_1"
+    assert create_otp_code.await_args is not None
     storage_kwargs = create_otp_code.await_args.kwargs
     assert storage_kwargs["code"] == "135790"
     assert storage_kwargs["otp_type"] == OTPType.TOTP

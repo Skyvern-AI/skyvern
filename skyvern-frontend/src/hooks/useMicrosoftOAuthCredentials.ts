@@ -127,7 +127,8 @@ function extractApiErrorMessage(error: unknown, fallback: string): string {
 
 export function useMicrosoftOAuthCredentials({
   enabled = true,
-}: { enabled?: boolean } = {}) {
+  includeEmail = false,
+}: { enabled?: boolean; includeEmail?: boolean } = {}) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -151,11 +152,17 @@ export function useMicrosoftOAuthCredentials({
     isFetching,
     error,
   } = useQuery<MicrosoftOAuthCredential[]>({
-    queryKey: ["microsoftOAuthCredentials"],
+    queryKey: includeEmail
+      ? ["microsoftOAuthCredentials", "includeEmail"]
+      : ["microsoftOAuthCredentials"],
     enabled,
     queryFn: async () => {
       const client = await getClient(credentialGetter);
-      const response = await client.get("/microsoft/oauth/credentials");
+      const response = await client.get(
+        includeEmail
+          ? "/microsoft/oauth/credentials?include_email=true"
+          : "/microsoft/oauth/credentials",
+      );
       return (response.data as MicrosoftOAuthCredentialListResponse)
         .credentials;
     },

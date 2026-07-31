@@ -73,6 +73,7 @@ class GoogleOAuthCredentialBase(BaseModel):
     id: str
     organization_id: str
     credential_name: str
+    email_address: str | None = None
     provider: str = "google"
     state: str
     scopes_requested: list[str] = Field(default_factory=list)

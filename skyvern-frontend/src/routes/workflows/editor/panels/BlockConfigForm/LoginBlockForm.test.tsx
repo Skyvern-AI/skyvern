@@ -5,6 +5,29 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import type { LoginNode } from "../../nodes/LoginNode/types";
 
+const mockEmailCredentials = vi.hoisted(() => ({
+  google: vi.fn(),
+  microsoft: vi.fn(),
+}));
+
+vi.mock("@/hooks/useGoogleOAuthCredentials", async (importActual) => {
+  const actual =
+    await importActual<typeof import("@/hooks/useGoogleOAuthCredentials")>();
+  return {
+    ...actual,
+    useGoogleOAuthCredentials: mockEmailCredentials.google,
+  };
+});
+
+vi.mock("@/hooks/useMicrosoftOAuthCredentials", async (importActual) => {
+  const actual =
+    await importActual<typeof import("@/hooks/useMicrosoftOAuthCredentials")>();
+  return {
+    ...actual,
+    useMicrosoftOAuthCredentials: mockEmailCredentials.microsoft,
+  };
+});
+
 // Heavy subcomponents pull in network/data layers (workflow params store,
 // credentials query, etc.) that are out of scope for a unit test of the
 // form's own composition. Replace each with a typed stub that surfaces the
@@ -222,6 +245,27 @@ function makeLoginFixture(
 beforeEach(() => {
   mockNodeFixtures.clear();
   mockCredentialTotp.value = null;
+  mockEmailCredentials.google.mockReturnValue({
+    credentials: [
+      {
+        id: "google-mail",
+        organization_id: "org_1",
+        credential_name: "Default",
+        state: "active",
+        scopes_granted: ["https://www.googleapis.com/auth/gmail.readonly"],
+        email_address: "workflow@gmail.test",
+        created_at: "2026-07-30T00:00:00Z",
+        modified_at: "2026-07-30T00:00:00Z",
+      },
+    ],
+    isLoading: false,
+    isFetching: false,
+  });
+  mockEmailCredentials.microsoft.mockReturnValue({
+    credentials: [],
+    isLoading: false,
+    isFetching: false,
+  });
   usePendingCommitsStore.setState({ commits: {} });
   updateNodeDataMock.mockReset();
   useDebouncedSidebarSaveMock.mockReset();
@@ -272,9 +316,29 @@ describe("LoginBlockForm (SKY-9374)", () => {
       screen.getByRole("button", { name: "Add two-factor authentication" }),
     );
 
-    expect(screen.getAllByTestId("wbi-textarea")).toHaveLength(4);
+    expect(screen.getAllByTestId("wbi-textarea")).toHaveLength(3);
     expect(screen.getByText("2FA Identifier")).toBeDefined();
     expect(screen.getByText("2FA Verification URL")).toBeDefined();
+    expect(
+      screen.getByRole("combobox", { name: "Connected email account" }),
+    ).toBeDefined();
+  });
+
+  test("picking a connected account updates the block's 2FA identifier", () => {
+    mockNodeFixtures.set("b1", makeLoginFixture("b1"));
+    render(<LoginBlockForm blockId="b1" />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Add two-factor authentication" }),
+    );
+    fireEvent.click(
+      screen.getByRole("combobox", { name: "Connected email account" }),
+    );
+    fireEvent.click(screen.getByText("workflow@gmail.test"));
+
+    expect(updateNodeDataMock).toHaveBeenCalledWith("b1", {
+      totpIdentifier: "workflow@gmail.test",
+    });
   });
 
   test("auto-expands 2FA when the block already has a totp value", () => {
