@@ -190,7 +190,11 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     flush_goal_satisfied_tool_result,
     maybe_emit_design_end,
 )
-from skyvern.forge.sdk.copilot.terminal_envelope import assemble_terminal_envelope, reason_in_reply_shadow
+from skyvern.forge.sdk.copilot.terminal_envelope import (
+    TerminalCause,
+    assemble_terminal_envelope,
+    reason_in_reply_shadow,
+)
 from skyvern.forge.sdk.copilot.todo_list import todo_list_prompt
 from skyvern.forge.sdk.copilot.tools.guardrails import _record_output_policy_guardrail_churn
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
@@ -395,22 +399,22 @@ async def _resolve_live_browser_session_id(
             return None
 
         persistent = await app.PERSISTENT_SESSIONS_MANAGER.get_session(requested, organization_id)
-        has_browser_address = bool(persistent.browser_address) if persistent else False
+        has_live_browser = persistent.is_browser_ready if persistent else False
         has_registered_browser_state = False
-        if persistent is not None and not is_final_status(persistent.status) and not has_browser_address:
+        if persistent is not None and not is_final_status(persistent.status) and not has_live_browser:
             has_registered_browser_state = await _registered_browser_state_is_usable(requested, organization_id)
 
         if (
             persistent is None
             or is_final_status(persistent.status)
-            or (not has_browser_address and not has_registered_browser_state)
+            or (not has_live_browser and not has_registered_browser_state)
         ):
             LOG.warning(
                 "Copilot live browser session is not yet usable; falling back to auto-create",
                 organization_id=organization_id,
                 requested_session_id=requested,
                 status=persistent.status if persistent else None,
-                has_browser_address=has_browser_address,
+                has_live_browser=has_live_browser,
                 has_registered_browser_state=has_registered_browser_state,
             )
             return None
@@ -1824,6 +1828,7 @@ def _assemble_terminal_envelope_safe(
     workflow_mutated: bool,
     turn_outcome_response_kind: str | None,
     final_message: str,
+    terminal_cause: TerminalCause | None = None,
 ) -> dict[str, Any] | None:
     try:
         envelope = assemble_terminal_envelope(
@@ -1837,6 +1842,7 @@ def _assemble_terminal_envelope_safe(
             attempted=attempted,
             workflow_mutated=workflow_mutated,
             turn_outcome_response_kind=turn_outcome_response_kind,
+            terminal_cause=terminal_cause,
         )
     except Exception:
         LOG.warning("copilot terminal envelope assembly failed", exc_info=True)
@@ -1963,6 +1969,7 @@ def _make_agent_result(
             workflow_mutated=bool(kwargs.get("workflow_was_persisted")) or kwargs.get("updated_workflow") is not None,
             turn_outcome_response_kind=turn_outcome_response_kind,
             final_message=str(kwargs.get("user_response") or ""),
+            terminal_cause="deadline_expired" if ctx.copilot_total_timeout_exceeded is True else None,
         )
     kwargs["terminal_envelope"] = terminal_envelope
     result = AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
@@ -2937,6 +2944,18 @@ def _last_good_failure_reply(ctx: CopilotContext, tested_reply: str) -> str:
     return f"{tested_reply} The latest attempted change did not verify: {reason}.{status_sentence}"
 
 
+def _deadline_failure_reply(ctx: CopilotContext, deadline_reply: str, *, halted_mid_progress: bool) -> str:
+    # A guard-halted or budget-paced run was interrupted, not disproven, and the deadline copy
+    # already says the work is unverified -- appending a failure verdict would mis-attribute the
+    # stop a second time, which is the defect this precedence exists to remove.
+    if halted_mid_progress:
+        return deadline_reply
+    reason, status_sentence = _recorded_failure_summary(ctx)
+    if not reason:
+        return deadline_reply
+    return f"{deadline_reply} The last test did not verify: {reason}.{status_sentence}"
+
+
 def _recorded_failure_reply(
     ctx: CopilotContext, *, cancelled: bool = False, internal_tool_instruction_failure: bool | None = None
 ) -> str | None:
@@ -3005,6 +3024,19 @@ def _build_wip_exit_result(
         ctx, cancelled=cancelled, internal_tool_instruction_failure=internal_tool_instruction_failure
     )
     effective_terminal = terminal_reason or ("cancel" if cancelled else None)
+    # Deadline expiry and a recorded failure both want to author the reply. The
+    # deadline owns it -- the failed test is what spent the budget, so naming the
+    # test as the cause mis-attributes the stop. Same latch the envelope's
+    # terminal_cause reads, so the rendered text and the typed cause cannot diverge.
+    deadline_owns_reply = ctx.copilot_total_timeout_exceeded is True and not cancelled
+
+    # An interrupted run was not disproven, so a deadline-expired turn appends no failure verdict.
+    deadline_suppresses_failure_detail = deadline_owns_reply and halted_mid_progress
+
+    def _deadline_owned_or(base_reply: str, failure_reply: str | None) -> str | None:
+        if deadline_owns_reply and failure_reply:
+            return _deadline_failure_reply(ctx, base_reply, halted_mid_progress=halted_mid_progress)
+        return failure_reply
 
     def _guard(text: str) -> tuple[str, TurnOutcome]:
         if contains_internal_machinery_leak(text):
@@ -3061,7 +3093,8 @@ def _build_wip_exit_result(
         and ctx.last_workflow is not ctx.last_good_workflow
         and not ctx.last_test_suspicious_success
     ):
-        reply = _last_good_failure_reply(ctx, tested_reply) if recorded_failure_reply else tested_reply
+        append_failure_detail = recorded_failure_reply and not deadline_suppresses_failure_detail
+        reply = _last_good_failure_reply(ctx, tested_reply) if append_failure_detail else tested_reply
         final_text, outcome = _guard(reply)
         return _finalize_result_with_blocker_override(
             ctx,
@@ -3100,7 +3133,7 @@ def _build_wip_exit_result(
         full_test_ok = ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True
         unvalidated = not full_test_ok
         if unvalidated and recorded_failure_reply:
-            reply = recorded_failure_reply
+            reply = _deadline_owned_or(unvalidated_reply, recorded_failure_reply) or unvalidated_reply
         else:
             reply = unvalidated_reply if unvalidated else tested_reply
         final_text, outcome = _guard(reply)
@@ -3137,7 +3170,7 @@ def _build_wip_exit_result(
         )
     return _build_exit_result(
         ctx,
-        recorded_failure_reply or default_reply,
+        _deadline_owned_or(default_reply, recorded_failure_reply) or default_reply,
         global_llm_context,
         cancelled=cancelled,
         terminal_reason=effective_terminal,
