@@ -495,14 +495,14 @@ describe("BrowserTab pills and selection sync", () => {
     renderBrowserPane(STUDIO_PATH);
 
     expect(screen.getByLabelText("Turn off browser").className).toContain(
-      "badge-destructive",
+      "text-destructive",
     );
     for (const name of [
       "Reconnect browser stream",
       "Open browser in new tab",
     ]) {
       expect(screen.getByLabelText(name).className).not.toContain(
-        "badge-destructive",
+        "text-destructive",
       );
     }
   });
