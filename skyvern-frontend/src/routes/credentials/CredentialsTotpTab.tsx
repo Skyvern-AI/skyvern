@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useContext, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { ArrowRightIcon } from "@radix-ui/react-icons";
@@ -32,6 +32,8 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { GmailIcon } from "@/components/icons/GmailIcon";
+import { OutlookIcon } from "@/components/icons/OutlookIcon";
+import CloudContext from "@/store/CloudContext";
 
 type OtpTypeFilter = "all" | OtpTypeValue;
 
@@ -87,6 +89,7 @@ function renderCodeContent(code: TotpCode) {
 }
 
 function CredentialsTotpTab() {
+  const isCloud = useContext(CloudContext);
   const [identifierFilter, setIdentifierFilter] = useState("");
   const [otpTypeFilter, setOtpTypeFilter] = useState<OtpTypeFilter>("all");
   const [limit, setLimit] = useState<(typeof LIMIT_OPTIONS)[number]>(50);
@@ -121,22 +124,24 @@ function CredentialsTotpTab() {
       <div className="rounded-lg border border-slate-700 bg-slate-elevation1 p-5">
         <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
           <div className="flex items-start gap-3">
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-neutral-200 bg-white dark:border-slate-700">
-              <GmailIcon className="size-7" />
+            <div className="flex h-10 shrink-0 items-center justify-center gap-0.5 rounded-md border border-neutral-200 bg-white px-1.5 dark:border-slate-700">
+              <GmailIcon className={isCloud ? "size-6" : "size-7"} />
+              {isCloud && <OutlookIcon className="size-6" />}
             </div>
             <div>
               <h2 className="text-base font-semibold">
-                Connect Gmail for automatic 2FA
+                Automatic 2FA from your inbox
               </h2>
               <p className="mt-1 max-w-2xl text-sm text-neutral-600 dark:text-slate-400">
-                Skyvern can find verification codes and magic links in a
-                connected Gmail inbox without manual forwarding.
+                {isCloud
+                  ? "Skyvern can find verification codes and magic links in a connected Gmail or Outlook inbox without manual forwarding."
+                  : "Skyvern can find verification codes and magic links in a connected Gmail inbox without manual forwarding."}
               </p>
             </div>
           </div>
           <Button asChild size="sm" className="shrink-0">
-            <Link to="/integrations?query=gmail">
-              Connect Gmail <ArrowRightIcon className="ml-1.5 size-4" />
+            <Link to="/integrations">
+              Connect an inbox <ArrowRightIcon className="ml-1.5 size-4" />
             </Link>
           </Button>
         </div>
