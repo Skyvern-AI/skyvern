@@ -12,6 +12,8 @@ import keyword
 import re
 import sys
 import textwrap
+from collections import Counter
+from collections.abc import Mapping
 from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -19,6 +21,7 @@ from typing import Any
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.copilot import code_block_synthesis as code_block_synthesis_module
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     _SELECTION_MATCH_BASES,
     AuthoringParameterBindingCandidate,
@@ -50,7 +53,6 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     SCOUTED_SPINE_TRUNCATED_REASON_CODE,
     TRUNCATED_FINDING,
     UNFORGIVEN_DROP_FINDING,
-    UNRECORDED_INDEX_FINDING,
     ProducedStaticReturnEnvelope,
     SynthesisDiagnostics,
     _get_by_role_expr_strict,
@@ -3826,6 +3828,107 @@ class TestEmittedInteractionPartition:
             {"tool_name": "press_key", "selector": "#name", "key": "Enter"},
         ]
 
+    def _login_otp_trajectory(self) -> list[dict[str, Any]]:
+        login_url = "https://example.com/login"
+        return [
+            _interaction(
+                CREDENTIAL_FILL_TOOL_NAME,
+                selector="#username",
+                source_url=login_url,
+                credential_id="cred_1",
+                credential_field="username",
+                typed_length=20,
+            ),
+            _interaction(
+                CREDENTIAL_FILL_TOOL_NAME,
+                selector="#password",
+                source_url=login_url,
+                credential_id="cred_1",
+                credential_field="password",
+                typed_length=14,
+            ),
+            _interaction("click", selector=".btn-login", role="button", accessible_name="Log in"),
+            _interaction("press_key", selector="button", key="Enter"),
+            _interaction(
+                "read_value",
+                read_expression='document.querySelector("#otp-hint").innerText',
+                read_output_path="output.otp_hint",
+            ),
+            _interaction(
+                CREDENTIAL_FILL_TOOL_NAME,
+                selector="#totp",
+                credential_id="cred_1",
+                credential_field="totp",
+                typed_length=6,
+            ),
+            _interaction("click", selector=".btn-primary-submit", role="button", accessible_name="Login"),
+        ]
+
+    def _lane_index_counts(self, diagnostics: SynthesisDiagnostics) -> Counter[int]:
+        return Counter(
+            record["trajectory_index"]
+            for group in (
+                diagnostics.emitted_interactions,
+                diagnostics.dropped_interactions,
+                diagnostics.forgiven_interactions,
+            )
+            for record in group
+        )
+
+    def test_login_otp_trajectory_puts_every_retained_index_in_exactly_one_lane(self) -> None:
+        trajectory = self._login_otp_trajectory()
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        diagnostics = result.diagnostics
+        assert diagnostics.truncated is False
+        emitted = {record["trajectory_index"] for record in diagnostics.emitted_interactions}
+        dropped = {record["trajectory_index"] for record in diagnostics.dropped_interactions}
+        forgiven = {record["trajectory_index"] for record in diagnostics.forgiven_interactions}
+        assert emitted | dropped | forgiven == set(range(len(trajectory)))
+        assert emitted & dropped == set()
+        assert emitted & forgiven == set()
+        assert dropped & forgiven == set()
+        assert set(self._lane_index_counts(diagnostics).values()) == {1}
+
+    def test_captured_read_and_wait_records_carry_a_lane(self) -> None:
+        trajectory = self._login_otp_trajectory()
+        trajectory.insert(5, _interaction("wait", duration_ms=2000))
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        by_index = {record["trajectory_index"]: record for record in result.diagnostics.emitted_interactions}
+        assert by_index[4]["method"] == "evaluate"
+        assert by_index[4]["lane"] == "page_read"
+        assert by_index[5]["method"] == "wait_for_timeout"
+        assert by_index[5]["lane"] == "page_wait"
+        assert set(self._lane_index_counts(result.diagnostics).values()) == {1}
+        uncovered = uncovered_required_emitted_interactions(result.diagnostics.emitted_interactions, [])
+        assert {record["trajectory_index"] for record in uncovered}.isdisjoint({4, 5})
+
+    def test_non_strict_hover_and_anchorless_interaction_stay_in_exactly_one_lane(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open", source_url="https://example.com/start"),
+            _interaction("hover", selector="#menu"),
+            _interaction("click"),
+        ]
+
+        result = synthesize_code_block(trajectory, strict_selectors=False)
+
+        assert result is not None
+        diagnostics = result.diagnostics
+        hover_record = next(record for record in diagnostics.emitted_interactions if record["trajectory_index"] == 1)
+        assert hover_record["method"] == "hover"
+        assert hover_record["lane"] == "recording_hover"
+        dropped_reasons = {
+            record["trajectory_index"]: record["reason_code"] for record in diagnostics.dropped_interactions
+        }
+        assert dropped_reasons[2] == "missing_selector_and_role_name"
+        assert set(self._lane_index_counts(diagnostics)) == set(diagnostics.retained_trajectory_indices)
+        assert set(self._lane_index_counts(diagnostics).values()) == {1}
+
     def test_every_retained_index_in_exactly_one_partition(self) -> None:
         trajectory = self._mixed_trajectory()
 
@@ -3907,6 +4010,58 @@ class TestEmittedInteractionPartition:
             {"trajectory_index": 1, "tool_name": "click", "lane": "entry_replay_prefix"}
         ]
 
+    def test_deferred_readonly_index_lands_in_exactly_one_lane(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
+            _readonly_type(control_readonly=True, control_value_satisfied=False),
+        ]
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        assert self._lane_index_counts(result.diagnostics) == Counter({0: 1, 1: 1})
+        by_index = {record["trajectory_index"]: record for record in result.diagnostics.emitted_interactions}
+        assert by_index[1]["lane"] == "readonly_skip"
+
+    def test_branch_yielding_no_locator_without_a_record_still_lands_in_one_lane(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
+            {"tool_name": "click", "selector": "#stage-b"},
+        ]
+
+        def forgetful_locator_expr(
+            interaction: Mapping[str, Any],
+            notes: list[str],
+            *,
+            diagnostics: SynthesisDiagnostics | None = None,
+            trajectory_index: int | None = None,
+            tool_name: str = "",
+            strict_selectors: bool = False,
+        ) -> str:
+            selector = str(interaction.get("selector") or "")
+            return "" if selector == "#stage-b" else f'page.locator("{selector}")'
+
+        monkeypatch.setattr(code_block_synthesis_module, "_locator_expr", forgetful_locator_expr)
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        diagnostics = result.diagnostics
+        assert self._lane_index_counts(diagnostics) == Counter({0: 1, 1: 1})
+        assert diagnostics.dropped_interactions == [
+            {
+                "trajectory_index": 1,
+                "tool_name": "click",
+                "selector": "#stage-b",
+                "reason_code": "unaccounted_branch",
+            }
+        ]
+        findings = spine_partition_findings(diagnostics, _covering_draft_calls(diagnostics), trajectory)
+        assert [finding.kind for finding in findings] == [UNFORGIVEN_DROP_FINDING]
+        assert obligation_finding_reason_code(findings[0]) == SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE
+
 
 def _covering_draft_calls(diagnostics: SynthesisDiagnostics) -> list[tuple[str, str]]:
     return [
@@ -3940,6 +4095,16 @@ class TestSpinePartitionFindings:
         assert result is not None
         draft_calls = _covering_draft_calls(result.diagnostics)
         assert spine_partition_findings(result.diagnostics, draft_calls, self._spine_trajectory()) == []
+
+    def test_deferred_readonly_trajectory_has_no_findings(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
+            _readonly_type(control_readonly=True, control_value_satisfied=False),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        draft_calls = _covering_draft_calls(result.diagnostics)
+        assert spine_partition_findings(result.diagnostics, draft_calls, trajectory) == []
 
     def test_omitted_demonstrated_totp_fill_is_an_uncovered_rung_finding(self) -> None:
         login_url = "https://example.com/login"
@@ -3999,7 +4164,7 @@ class TestSpinePartitionFindings:
         findings = spine_partition_findings(result.diagnostics, draft_calls, trajectory)
         assert all(finding.kind != UNFORGIVEN_DROP_FINDING for finding in findings)
 
-    def test_truncation_leaves_post_break_indices_in_manifest_only(self) -> None:
+    def test_truncation_reports_once_and_leaves_the_tail_unlaned(self) -> None:
         trajectory = [
             {"tool_name": "click", "selector": f"#stage-{index}", "source_url": "https://example.com/records"}
             for index in range(_MAX_STEPS + 3)
@@ -4010,14 +4175,11 @@ class TestSpinePartitionFindings:
         assert diagnostics.truncated is True
         assert diagnostics.retained_trajectory_indices == list(range(len(trajectory)))
         recorded = {record["trajectory_index"] for record in diagnostics.emitted_interactions}
-        post_break = set(diagnostics.retained_trajectory_indices) - recorded
-        assert post_break
+        assert set(diagnostics.retained_trajectory_indices) - recorded
+        assert diagnostics.dropped_interactions == []
         findings = spine_partition_findings(diagnostics, _covering_draft_calls(diagnostics), trajectory)
-        kinds = {finding.kind for finding in findings}
-        assert TRUNCATED_FINDING in kinds
-        assert UNRECORDED_INDEX_FINDING in kinds
-        truncated_finding = next(finding for finding in findings if finding.kind == TRUNCATED_FINDING)
-        assert obligation_finding_reason_code(truncated_finding) == SCOUTED_SPINE_TRUNCATED_REASON_CODE
+        assert [finding.kind for finding in findings] == [TRUNCATED_FINDING]
+        assert obligation_finding_reason_code(findings[0]) == SCOUTED_SPINE_TRUNCATED_REASON_CODE
 
 
 _STRUCTURAL_BUTTON_XPATH = 'xpath=/*[name()="body"][1]/*[name()="button"][3]'
