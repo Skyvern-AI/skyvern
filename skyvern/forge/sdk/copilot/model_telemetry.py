@@ -118,6 +118,13 @@ def _model_call_cost(telemetry: CopilotModelCallTelemetry, model: str) -> float 
     return float(input_cost + output_cost)
 
 
+def _is_azure_openai_host(base_url: str) -> bool:
+    # Match on the parsed host, not a substring: "https://evil.test/?x=.openai.azure.com"
+    # and "https://openai.azure.com.evil.test" both contain the domain but are not Azure.
+    host = (urlparse(base_url).hostname or "").lower()
+    return host == "openai.azure.com" or host.endswith(".openai.azure.com")
+
+
 def _otel_provider_name(model: str, base_url: str | None) -> str | None:
     normalized = model.lower()
     provider, separator, _ = normalized.partition("/")
@@ -131,10 +138,8 @@ def _otel_provider_name(model: str, base_url: str | None) -> str | None:
     }.get(provider)
     if separator and explicit_provider is not None:
         return explicit_provider
-    if base_url:
-        hostname = urlparse(base_url).hostname
-        if hostname and hostname.lower().endswith(".openai.azure.com"):
-            return "azure.ai.openai"
+    if base_url and _is_azure_openai_host(base_url):
+        return "azure.ai.openai"
     if normalized.startswith(("gpt-", "o1", "o3", "o4")):
         return "openai"
     return None
