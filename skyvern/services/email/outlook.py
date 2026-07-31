@@ -1,6 +1,9 @@
 import asyncio
+import re
+from collections.abc import Collection
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from email.utils import parsedate_to_datetime
+from email.utils import getaddresses, parsedate_to_datetime
 from typing import Any
 from urllib.parse import quote, urlparse
 
@@ -27,6 +30,28 @@ _RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 _MAX_ATTEMPTS = 3
 _MAX_BACKOFF_SECONDS = 5.0
 _WELL_KNOWN_FOLDERS = {"inbox", "drafts", "sentitems", "deleteditems", "junkemail", "archive", "clutter", "outbox"}
+_MAX_OTP_SEARCH_PAGES = 4
+_MAX_OTP_SEARCH_FETCHED = 100
+_OTP_EXCLUDED_FOLDER_IDS_STATE_KEY = "otp_excluded_folder_ids"
+_OTP_MAILBOX_IDENTITIES_STATE_KEY = "otp_mailbox_identities"
+_SAFE_EMAIL_IDENTIFIER = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+$")
+_OTP_KEYWORD_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:verification|verify|code|passcode|otp|2fa|one(?:[\s-]+)time|password)(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+# Only EOP-stripped headers are trusted for recipient matching.
+_DELIVERY_HEADER_NAMES = {
+    "x-ms-exchange-organization-originalenveloperecipient",
+    "x-ms-exchange-organization-originalenveloperecipients",
+    "x-ms-exchange-organization-originalto",
+}
+
+
+@dataclass(frozen=True)
+class OutlookMessageCandidate:
+    message_id: str
+    content: str
+    received_datetime: datetime
 
 
 class OutlookAPIError(RuntimeError):
@@ -62,14 +87,18 @@ async def _get_json(
     *,
     access_token: str,
     params: dict[str, Any] | None = None,
+    prefer: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     response: httpx.Response | None = None
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
+            headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+            if prefer:
+                headers["Prefer"] = ", ".join(prefer)
             response = await client.get(
                 url,
                 params=params,
-                headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+                headers=headers,
             )
         except (httpx.TransportError, httpx.TimeoutException) as exc:
             if attempt == _MAX_ATTEMPTS:
@@ -250,6 +279,394 @@ def _recipient_addresses(recipients: list[Any] | None) -> list[str]:
         if address:
             addresses.append(address)
     return addresses
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _graph_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return _as_utc(parsed)
+
+
+def _graph_datetime_parameter(value: datetime) -> str:
+    return _as_utc(value).isoformat().replace("+00:00", "Z")
+
+
+def _normalize_email_address(value: str) -> str:
+    normalized = value.strip()
+    if normalized[:5].casefold() == "smtp:":
+        normalized = normalized[5:].strip()
+    return normalized.casefold()
+
+
+def _message_recipient_addresses(message: dict[str, Any]) -> set[str]:
+    addresses: set[str] = set()
+    for field in ("toRecipients", "ccRecipients", "bccRecipients"):
+        raw_recipients = message.get(field)
+        recipients = raw_recipients if isinstance(raw_recipients, list) else []
+        addresses.update(
+            normalized
+            for address in _recipient_addresses(recipients)
+            if (normalized := _normalize_email_address(address))
+        )
+
+    raw_headers = message.get("internetMessageHeaders")
+    headers = raw_headers if isinstance(raw_headers, list) else []
+    for header in headers:
+        if not isinstance(header, dict):
+            continue
+        name = header.get("name")
+        value = header.get("value")
+        if not isinstance(name, str) or name.casefold() not in _DELIVERY_HEADER_NAMES or not isinstance(value, str):
+            continue
+        addresses.update(
+            normalized for _, address in getaddresses([value]) if (normalized := _normalize_email_address(address))
+        )
+    return addresses
+
+
+def _mailbox_identity_set(payload: dict[str, Any]) -> set[str]:
+    raw_values: list[str] = []
+    for field in ("mail", "userPrincipalName"):
+        value = payload.get(field)
+        if isinstance(value, str):
+            raw_values.append(value)
+    for field in ("proxyAddresses",):
+        values = payload.get(field)
+        if isinstance(values, list):
+            raw_values.extend(value for value in values if isinstance(value, str))
+    return {normalized for value in raw_values if (normalized := _normalize_email_address(value))}
+
+
+async def _load_mailbox_identities(client: httpx.AsyncClient, access_token: str) -> tuple[set[str], bool]:
+    try:
+        payload = await _get_json(
+            client,
+            f"{GRAPH_API_BASE}/me",
+            access_token=access_token,
+            params={"$select": "mail,userPrincipalName,proxyAddresses"},
+        )
+    except (OutlookAPIError, ValueError) as exc:
+        if isinstance(exc, OutlookAPIError) and exc.code == "reconnect_required":
+            raise
+        LOG.warning(
+            "Failed to resolve Outlook mailbox identities for OTP search",
+            status=exc.status if isinstance(exc, OutlookAPIError) else None,
+            code=exc.code if isinstance(exc, OutlookAPIError) else None,
+        )
+        return set(), False
+    return _mailbox_identity_set(payload), True
+
+
+async def _load_well_known_folder_id(
+    client: httpx.AsyncClient,
+    access_token: str,
+    folder: str,
+) -> tuple[str | None, bool]:
+    try:
+        payload = await _get_json(
+            client,
+            f"{GRAPH_API_BASE}/me/mailFolders/{folder}",
+            access_token=access_token,
+            params={"$select": "id"},
+        )
+    except (OutlookAPIError, ValueError) as exc:
+        if isinstance(exc, OutlookAPIError) and exc.code == "reconnect_required":
+            raise
+        LOG.warning(
+            "Failed to resolve excluded Outlook folder for OTP search",
+            folder=folder,
+            status=exc.status if isinstance(exc, OutlookAPIError) else None,
+            code=exc.code if isinstance(exc, OutlookAPIError) else None,
+        )
+        return None, False
+    folder_id = payload.get("id")
+    resolved_folder_id = folder_id if isinstance(folder_id, str) and folder_id else None
+    return resolved_folder_id, resolved_folder_id is not None
+
+
+async def _load_excluded_folder_ids(client: httpx.AsyncClient, access_token: str) -> tuple[set[str], bool]:
+    folder_results = await asyncio.gather(
+        _load_well_known_folder_id(client, access_token, "junkemail"),
+        _load_well_known_folder_id(client, access_token, "deleteditems"),
+        _load_well_known_folder_id(client, access_token, "sentitems"),
+    )
+    return (
+        {folder_id for folder_id, _ in folder_results if folder_id},
+        all(succeeded for _, succeeded in folder_results),
+    )
+
+
+def _cached_string_set(state: dict, key: str) -> set[str] | None:
+    if key not in state:
+        return None
+    value = state[key]
+    if not isinstance(value, (list, set, tuple)):
+        return set()
+    return {item for item in value if isinstance(item, str)}
+
+
+async def _otp_search_state(
+    client: httpx.AsyncClient,
+    access_token: str,
+    state: dict,
+) -> tuple[set[str], set[str], bool]:
+    excluded_folder_ids = _cached_string_set(state, _OTP_EXCLUDED_FOLDER_IDS_STATE_KEY)
+    mailbox_identities = _cached_string_set(state, _OTP_MAILBOX_IDENTITIES_STATE_KEY)
+    exclusions_resolved = excluded_folder_ids is not None
+    if excluded_folder_ids is None:
+        excluded_folder_ids, exclusions_resolved = await _load_excluded_folder_ids(client, access_token)
+        if exclusions_resolved:
+            state[_OTP_EXCLUDED_FOLDER_IDS_STATE_KEY] = excluded_folder_ids
+    if mailbox_identities is None:
+        mailbox_identities, succeeded = await _load_mailbox_identities(client, access_token)
+        if succeeded:
+            state[_OTP_MAILBOX_IDENTITIES_STATE_KEY] = mailbox_identities
+    return excluded_folder_ids, mailbox_identities, exclusions_resolved
+
+
+def _otp_scan_metadata(
+    message: dict[str, Any],
+    *,
+    cutoff: datetime,
+    excluded_folder_ids: set[str],
+) -> tuple[str, datetime] | None:
+    message_id = message.get("id")
+    if not isinstance(message_id, str) or not message_id:
+        return None
+    received_datetime = _graph_datetime(message.get("receivedDateTime"))
+    if received_datetime is None or received_datetime < cutoff or message.get("isDraft") is True:
+        return None
+    parent_folder_id = message.get("parentFolderId")
+    if isinstance(parent_folder_id, str) and parent_folder_id in excluded_folder_ids:
+        return None
+    return message_id, received_datetime
+
+
+def _otp_candidate(
+    message: dict[str, Any],
+    *,
+    message_id: str,
+    received_datetime: datetime,
+) -> tuple[OutlookMessageCandidate, set[str]] | None:
+    raw_subject = message.get("subject")
+    subject = raw_subject if isinstance(raw_subject, str) else ""
+    raw_preview = message.get("bodyPreview")
+    preview = raw_preview if isinstance(raw_preview, str) else ""
+    raw_body = message.get("body")
+    body = raw_body.get("content") if isinstance(raw_body, dict) else ""
+    body_content = body if isinstance(body, str) else ""
+    if not _OTP_KEYWORD_PATTERN.search("\n".join((subject, preview, body_content))):
+        return None
+    content = "\n".join(
+        part
+        for part in (
+            f"Subject: {subject}" if subject else "",
+            f"Snippet: {preview}" if preview else "",
+            f"Body:\n{body_content}" if body_content else "",
+        )
+        if part
+    ).strip()
+    if not content:
+        return None
+    return (
+        OutlookMessageCandidate(
+            message_id=message_id,
+            content=content,
+            received_datetime=received_datetime,
+        ),
+        _message_recipient_addresses(message),
+    )
+
+
+def _otp_message_has_body_content(message: dict[str, Any]) -> bool:
+    body = message.get("body")
+    if not isinstance(body, dict):
+        return False
+    content = body.get("content")
+    return isinstance(content, str) and bool(content)
+
+
+async def _hydrate_otp_message_body(
+    client: httpx.AsyncClient,
+    *,
+    access_token: str,
+    message: dict[str, Any],
+    prefer: tuple[str, ...],
+) -> dict[str, Any] | None:
+    if _otp_message_has_body_content(message):
+        return message
+    message_id = message.get("id")
+    if not isinstance(message_id, str) or not message_id:
+        return message
+    payload = await _get_json(
+        client,
+        f"{GRAPH_API_BASE}/me/messages/{quote(message_id, safe='')}",
+        access_token=access_token,
+        params={"$select": "id,subject,bodyPreview,body,receivedDateTime"},
+        prefer=prefer,
+    )
+    if not isinstance(payload.get("body"), dict):
+        return None
+    hydrated = dict(message)
+    for field in ("subject", "bodyPreview", "body", "receivedDateTime"):
+        if field in payload:
+            hydrated[field] = payload[field]
+    return hydrated
+
+
+async def search_recent_otp_messages(
+    *,
+    access_token: str,
+    totp_identifier: str,
+    created_after: datetime | None = None,
+    max_results: int = 10,
+    client: httpx.AsyncClient | None = None,
+    state: dict | None = None,
+    excluded_message_ids: Collection[str] | None = None,
+) -> list[OutlookMessageCandidate]:
+    identifier = totp_identifier.strip()
+    if not _SAFE_EMAIL_IDENTIFIER.fullmatch(identifier):
+        return []
+    cutoff = _as_utc(created_after) if created_after else datetime.now(UTC) - timedelta(hours=24)
+    excluded_ids = set(excluded_message_ids or ())
+    max_results_clamped = max(1, min(max_results, 20))
+    page_size = max(25, min(50, max_results_clamped * 5))
+    params: dict[str, Any] = {
+        "$filter": f"receivedDateTime ge {_graph_datetime_parameter(cutoff - timedelta(seconds=1))}",
+        "$orderby": "receivedDateTime desc",
+        "$select": (
+            "id,parentFolderId,isDraft,subject,bodyPreview,receivedDateTime,"
+            "toRecipients,ccRecipients,bccRecipients,internetMessageHeaders"
+        ),
+        "$top": page_size,
+    }
+    prefer = ('IdType="ImmutableId"', 'outlook.body-content-type="html"')
+
+    async def _search(client_: httpx.AsyncClient) -> list[OutlookMessageCandidate]:
+        lookup_state = state if state is not None else {}
+        excluded_folder_ids, mailbox_identities, exclusions_resolved = await _otp_search_state(
+            client_, access_token, lookup_state
+        )
+        if not exclusions_resolved:
+            # Scanning without exclusions would parse attacker-influenceable junk mail.
+            LOG.warning("Skipping Outlook OTP scan; folder exclusions unresolved")
+            return []
+        normalized_identifier = _normalize_email_address(identifier)
+        strong_candidates: list[OutlookMessageCandidate] = []
+        fallback_candidates: list[OutlookMessageCandidate] = []
+        request_url: str | None = f"{GRAPH_API_BASE}/me/messages"
+        request_params: dict[str, Any] | None = params
+        page_count = 0
+        fetched_count = 0
+        truncated = False
+
+        while request_url and len(strong_candidates) < max_results_clamped:
+            payload = await _get_json(
+                client_,
+                request_url,
+                access_token=access_token,
+                params=request_params,
+                prefer=prefer,
+            )
+            page_count += 1
+            raw_items = payload.get("value")
+            items = raw_items if isinstance(raw_items, list) else []
+            for index, item in enumerate(items):
+                if fetched_count >= _MAX_OTP_SEARCH_FETCHED:
+                    truncated = True
+                    break
+                fetched_count += 1
+                if not isinstance(item, dict):
+                    continue
+                scan_metadata = _otp_scan_metadata(
+                    item,
+                    cutoff=cutoff,
+                    excluded_folder_ids=excluded_folder_ids,
+                )
+                if scan_metadata is None:
+                    continue
+                message_id, received_datetime = scan_metadata
+                if message_id in excluded_ids:
+                    continue
+                observable_recipients = _message_recipient_addresses(item)
+                could_match = normalized_identifier in observable_recipients or (
+                    normalized_identifier in mailbox_identities and not observable_recipients
+                )
+                if could_match and not _otp_message_has_body_content(item):
+                    try:
+                        hydrated_item = await _hydrate_otp_message_body(
+                            client_,
+                            access_token=access_token,
+                            message=item,
+                            prefer=prefer,
+                        )
+                    except (OutlookAPIError, ValueError) as exc:
+                        if isinstance(exc, OutlookAPIError) and exc.code == "reconnect_required":
+                            raise
+                        LOG.warning(
+                            "Failed to hydrate Outlook OTP message body",
+                            status=exc.status if isinstance(exc, OutlookAPIError) else None,
+                            code=exc.code if isinstance(exc, OutlookAPIError) else None,
+                        )
+                        # Skipping avoids burning the candidate's one-shot seen-key on a bodyless parse.
+                        continue
+                    if hydrated_item is None:
+                        LOG.warning("Failed to hydrate Outlook OTP message body")
+                        # Skipping avoids burning the candidate's one-shot seen-key on a bodyless parse.
+                        continue
+                    item = hydrated_item
+                candidate_match = _otp_candidate(
+                    item,
+                    message_id=message_id,
+                    received_datetime=received_datetime,
+                )
+                if candidate_match is None:
+                    continue
+                candidate, observable_recipients = candidate_match
+                if normalized_identifier in observable_recipients:
+                    strong_candidates.append(candidate)
+                    if len(strong_candidates) >= max_results_clamped:
+                        break
+                elif normalized_identifier in mailbox_identities and not observable_recipients:
+                    fallback_candidates.append(candidate)
+                if index + 1 < len(items) and fetched_count >= _MAX_OTP_SEARCH_FETCHED:
+                    truncated = True
+                    break
+            if len(strong_candidates) >= max_results_clamped:
+                break
+            next_link = _validated_next_link(payload.get("@odata.nextLink"))
+            if next_link is None:
+                break
+            if page_count >= _MAX_OTP_SEARCH_PAGES or fetched_count >= _MAX_OTP_SEARCH_FETCHED:
+                truncated = True
+                break
+            request_url = next_link
+            request_params = None
+
+        if truncated:
+            LOG.debug(
+                "Truncated Outlook OTP pagination",
+                pages=page_count,
+                fetched=fetched_count,
+                max_pages=_MAX_OTP_SEARCH_PAGES,
+                max_fetched=_MAX_OTP_SEARCH_FETCHED,
+            )
+        strong_candidates.sort(key=lambda item: item.received_datetime, reverse=True)
+        fallback_candidates.sort(key=lambda item: item.received_datetime, reverse=True)
+        return (strong_candidates + fallback_candidates)[:max_results_clamped]
+
+    if client is None:
+        async with httpx.AsyncClient(timeout=20.0) as owned_client:
+            return await _search(owned_client)
+    return await _search(client)
 
 
 async def _attachments(

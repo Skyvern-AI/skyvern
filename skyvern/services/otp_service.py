@@ -23,7 +23,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import OrganizationAuthToken
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCode
 from skyvern.forge.sdk.services.credentials import generate_totp_code, is_unresolved_totp_placeholder
-from skyvern.services.otp_gmail import GmailOTPVerificationContext
+from skyvern.services.otp_email import EmailOTPVerificationContext
 
 LOG = structlog.get_logger()
 
@@ -463,7 +463,7 @@ async def poll_otp_value(
     timeout = timedelta(minutes=settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
     start_datetime = datetime.utcnow()
     timeout_datetime = start_datetime + timeout
-    gmail_created_after = created_after or start_datetime
+    email_created_after = created_after or start_datetime
     db_created_after = created_after
     LOG.info(
         "Polling otp value",
@@ -474,7 +474,7 @@ async def poll_otp_value(
     consecutive_failures = 0
     last_error_reason: str | None = None
     org_token: OrganizationAuthToken | None = None
-    gmail_otp_context = GmailOTPVerificationContext()
+    email_otp_context = EmailOTPVerificationContext()
     raw_otp_context = RawOTPVerificationContext()
     while True:
         await asyncio.sleep(10)
@@ -499,11 +499,11 @@ async def poll_otp_value(
             )
         otp_value: OTPValue | None = None
         try:
-            # Keep an explicit webhook as the primary source. Gmail and DB are
-            # intentional backstops only when the webhook has no code yet.
+            # Keep an explicit webhook as the primary source. Email sources and
+            # DB are intentional backstops only when the webhook has no code yet.
             if totp_verification_url:
                 if org_token is None:
-                    # The org token is only needed for webhook polling. Gmail
+                    # The org token is only needed for webhook polling. Email
                     # and DB-only polling should not fail on missing webhook auth.
                     org_token = await app.DATABASE.organizations.get_valid_org_auth_token(
                         organization_id, OrganizationAuthTokenType.api.value
@@ -520,13 +520,13 @@ async def poll_otp_value(
                     workflow_permanent_id=workflow_permanent_id,
                 )
             if otp_value is None and totp_identifier:
-                otp_value = await _get_otp_value_from_gmail(
+                otp_value = await _get_otp_value_from_email(
                     organization_id=organization_id,
                     totp_identifier=totp_identifier,
                     workflow_id=workflow_permanent_id,
                     workflow_run_id=workflow_run_id,
-                    created_after=gmail_created_after,
-                    context=gmail_otp_context,
+                    created_after=email_created_after,
+                    context=email_otp_context,
                 )
             if otp_value is None and totp_identifier:
                 # Preserve the historical DB behavior: callers that omit
@@ -678,15 +678,15 @@ async def _get_otp_value_from_url(
     return otp_value
 
 
-async def _get_otp_value_from_gmail(
+async def _get_otp_value_from_email(
     organization_id: str,
     totp_identifier: str,
     workflow_id: str | None = None,
     workflow_run_id: str | None = None,
     created_after: datetime | None = None,
-    context: GmailOTPVerificationContext | None = None,
+    context: EmailOTPVerificationContext | None = None,
 ) -> OTPValue | None:
-    return await app.AGENT_FUNCTION.get_otp_value_from_gmail(
+    return await app.AGENT_FUNCTION.get_otp_value_from_email(
         organization_id=organization_id,
         totp_identifier=totp_identifier,
         workflow_id=workflow_id,
