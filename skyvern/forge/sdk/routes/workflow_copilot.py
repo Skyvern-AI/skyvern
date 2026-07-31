@@ -108,6 +108,7 @@ from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.forge.sdk.workflow.runtime_completion import contract_from_request_criteria
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.workflows import (
     WorkflowCreateYAMLRequest,
@@ -1086,6 +1087,9 @@ async def _finalise_normal_turn(
             restore_failed = True
 
     if _should_commit_staged_workflow(chat.auto_accept, agent_result):
+        # Both acceptance paths must carry the same contract, or the obligation depends on which
+        # button the user pressed.
+        await _attach_requested_completion_contract(chat, agent_result.staged_workflow, agent_result)
         try:
             await _commit_staged_workflow(
                 organization_id=organization_id,
@@ -2891,6 +2895,44 @@ async def workflow_copilot_clear_proposed_workflow(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
 
 
+async def _turn_completion_criteria(chat: Any, agent_result: Any) -> object | None:
+    """This turn's typed criteria, preferring the in-memory turn state over the stored snapshot.
+
+    Auto-accept commits before the turn's criteria are persisted, so a turn that first mints a
+    download criterion would otherwise read a pre-turn snapshot and commit with no contract."""
+    turn_state = getattr(agent_result, "completion_criteria_turn_state", None)
+    decision = getattr(turn_state, "decision", None)
+    criteria = getattr(decision, "criteria", None)
+    if criteria:
+        return criteria
+    snapshot = await _load_completion_criteria_snapshot(chat)
+    active = snapshot.active if snapshot is not None else None
+    return active.criteria if active is not None else None
+
+
+async def _attach_requested_completion_contract(chat: Any, target: Any, agent_result: Any = None) -> None:
+    """Carry the request's typed completion criteria onto the version being accepted.
+
+    Read at accept time so the contract binds to the definition being accepted, and skipped silently
+    when the chat has no active criteria — a workflow that promised nothing is graded as before.
+    Applied on both acceptance paths so the obligation cannot depend on which one ran."""
+    try:
+        definition = getattr(target, "workflow_definition", None)
+        if definition is None:
+            return
+        contract = contract_from_request_criteria(await _turn_completion_criteria(chat, agent_result))
+        if contract is None:
+            return
+        definition.completion_contract = contract
+        LOG.info(
+            "copilot_completion_contract_attached_from_request",
+            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+            workflow_permanent_id=chat.workflow_permanent_id,
+        )
+    except Exception:
+        LOG.warning("copilot_completion_contract_attach_failed", exc_info=True)
+
+
 @base_router.post("/workflow/copilot/apply-proposed-workflow", include_in_schema=False)
 async def workflow_copilot_apply_proposed_workflow(
     apply_request: WorkflowCopilotApplyProposedWorkflowRequest,
@@ -2924,6 +2966,8 @@ async def workflow_copilot_apply_proposed_workflow(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Proposed copilot YAML is invalid: {e}",
         )
+
+    await _attach_requested_completion_contract(chat, yaml_request)
 
     current_workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
         workflow_permanent_id=chat.workflow_permanent_id,

@@ -148,10 +148,12 @@ from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelectio
 from skyvern.webeye.browser_factory import initialize_download_dir, resolve_artifact_path
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
+    DOWNLOAD_DESTINATION_ERRORS,
     DOWNLOAD_MIME_TYPES,
     MAX_FILE_SIZE_BYTES,
     download_filename_from_suffix,
     extract_filename,
+    fetch_download_through_request_context,
     is_download_response,
     normalize_download_filename,
     settle_browser_downloads_for_context,
@@ -934,7 +936,7 @@ async def _save_adopted_session_download(
         return download_target
 
     try:
-        response = await page.context.request.get(download.url)
+        response = await fetch_download_through_request_context(page.context.request, download.url)
         if response.status != 200:
             LOG.error(
                 "Adopted-session download url re-fetch returned non-200 status",
@@ -952,6 +954,14 @@ async def _save_adopted_session_download(
             return None
         download_target.write_bytes(body)
         return download_target
+    except DOWNLOAD_DESTINATION_ERRORS as e:
+        LOG.error(
+            "Adopted-session download destination refused",
+            download_dir=str(download_dir),
+            workflow_run_id=workflow_run_id,
+            reason=str(e),
+        )
+        return None
     except Exception:
         LOG.error(
             "Adopted-session download url re-fetch failed",
