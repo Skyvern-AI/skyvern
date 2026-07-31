@@ -173,10 +173,10 @@ export function BrowserPaneActions() {
             // capture and the mounted RecordingPanel commits the recorded steps.
             const stopButton = (
               <Button
-                variant="outline"
+                variant="ghost"
                 size="sm"
                 className={cn(
-                  "h-7 shrink-0 gap-1.5 border-border bg-transparent px-2 text-xs shadow-none",
+                  "h-7 shrink-0 gap-1.5 px-2",
                   manualCapturePaused ? "text-amber-500" : "text-red-500",
                 )}
                 aria-label="Stop recording"
