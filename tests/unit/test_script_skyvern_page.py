@@ -19,8 +19,13 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from skyvern.config import settings
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
-from skyvern.core.script_generations.skyvern_page import SkyvernPage
-from skyvern.exceptions import IllegitCompleteScriptTermination, NoTOTPSecretFound, ScriptTerminationException
+from skyvern.core.script_generations.skyvern_page import ResolvedSensitiveValue, SkyvernPage
+from skyvern.exceptions import (
+    IllegitCompleteScriptTermination,
+    NoTOTPSecretFound,
+    ScriptTerminationException,
+    SkyvernActionFailed,
+)
 
 
 class _KeyboardStub:
@@ -43,6 +48,11 @@ def create_mock_page() -> _PageStub:
 
 class _AiStub:
     pass
+
+
+def _make_script_page(scraped_page, ai) -> ScriptSkyvernPage:
+    with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
+        return ScriptSkyvernPage(scraped_page=scraped_page, page=create_mock_page(), ai=ai)
 
 
 class _SelectedEngineError(Exception):
@@ -986,6 +996,28 @@ async def test_fill_autocomplete_proactive_validates_totp_without_exposing_code_
 
 
 @pytest.mark.asyncio
+async def test_fill_autocomplete_secret_failure_is_sanitized(mock_scraped_page, mock_ai) -> None:
+    sentinel_secret = "sentinel-secret-SKY-13079"
+    script_page = _make_script_page(mock_scraped_page, mock_ai)
+    script_page._is_secret_reference = MagicMock(return_value=sentinel_secret != "1")
+    script_page.get_actual_value = AsyncMock(return_value=sentinel_secret)
+    script_page._do_autocomplete = AsyncMock(side_effect=RuntimeError(f"failed for {sentinel_secret}"))
+    script_page._ai.ai_input_text = AsyncMock(return_value="fallback complete")
+    with patch("skyvern.core.script_generations.skyvern_page.LOG.info") as info:
+        await script_page.fill_autocomplete(
+            selector="#secret",
+            value=sentinel_secret,
+            prompt="Fill the secret-bearing field",
+        )
+    assert script_page._ai.ai_input_text.await_args.kwargs["value_is_sensitive"] is True
+    assert sentinel_secret not in repr(info.call_args_list)
+    with pytest.raises(SkyvernActionFailed) as exc_info:
+        await script_page.fill_autocomplete(selector="#secret", value=sentinel_secret)
+    assert sentinel_secret not in str(exc_info.value)
+    assert exc_info.value.__context__ is None
+
+
+@pytest.mark.asyncio
 async def test_input_text_does_not_send_unresolved_totp_placeholder_to_ai_fallback(mock_scraped_page, mock_ai):
     mock_page = create_mock_page()
 
@@ -1011,6 +1043,85 @@ async def test_input_text_does_not_send_unresolved_totp_placeholder_to_ai_fallba
             )
 
         script_page._ai.ai_input_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sentinel_secret", ["sentinel-secret-SKY-13079", ResolvedSensitiveValue("1")])
+async def test_input_text_secret_failure_is_sanitized(mock_scraped_page, mock_ai, sentinel_secret) -> None:
+    script_page = _make_script_page(mock_scraped_page, mock_ai)
+    script_page._is_secret_reference = MagicMock(return_value=len(sentinel_secret) > 1)
+    script_page.get_actual_value = AsyncMock(return_value=sentinel_secret)
+    script_page._wait_for_selector_with_retry = AsyncMock(
+        side_effect=RuntimeError(f"selector failed after resolving {sentinel_secret}")
+    )
+    script_page._ai.ai_input_text = AsyncMock(return_value="fallback complete")
+    with patch("skyvern.core.script_generations.skyvern_page.LOG.warning") as warning:
+        result = await script_page._input_text(
+            selector=f"[data-secret='{sentinel_secret}']",
+            value=sentinel_secret,
+            ai="fallback",
+            intention="Fill the secret-bearing field",
+        )
+    assert result == "fallback complete"
+    assert script_page._ai.ai_input_text.await_args.kwargs["value_is_sensitive"] is True
+    assert sentinel_secret not in repr(warning.call_args)
+
+
+@pytest.mark.asyncio
+async def test_input_text_selector_failure_redacts_resolved_value_from_raised_exception(
+    mock_scraped_page,
+    mock_ai,
+) -> None:
+    sentinel_secret = "sentinel-secret-SKY-13079"
+    script_page = _make_script_page(mock_scraped_page, mock_ai)
+    script_page.get_actual_value = AsyncMock(return_value=sentinel_secret)
+    script_page._wait_for_selector_with_retry = AsyncMock(
+        side_effect=RuntimeError(f"selector failed after resolving {sentinel_secret}")
+    )
+
+    with pytest.raises(SkyvernActionFailed) as exc_info:
+        await script_page._input_text(
+            selector="#secret",
+            value="secret_parameter",
+            ai="fallback",
+        )
+
+    assert sentinel_secret not in str(exc_info.value) and "[REDACTED_SECRET]" in str(exc_info.value)
+    assert exc_info.value.__context__ is None
+    script_page._is_secret_reference = MagicMock(return_value=False)
+    script_page.get_actual_value = AsyncMock(return_value="0")
+    script_page._wait_for_selector_with_retry = AsyncMock(side_effect=RuntimeError("Timeout 3000ms exceeded"))
+    with pytest.raises(SkyvernActionFailed) as ordinary_exc:
+        await script_page._input_text(selector="#ordinary", value="0", ai="fallback")
+    assert str(ordinary_exc.value) == "Timeout 3000ms exceeded"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sentinel_secret", ["sentinel-secret-SKY-13079", "sentinel-sécrét-SKY-13079"])
+async def test_fallback_episode_redacts_sensitive_metadata(sentinel_secret: str) -> None:
+    page_ai = RealSkyvernPageAi.__new__(RealSkyvernPageAi)
+    page_ai.page = SimpleNamespace(url=f"https://example.com/{sentinel_secret}")
+    page_ai.current_label = "Login"
+    context = SimpleNamespace(
+        code_version=2,
+        organization_id="org_1",
+        workflow_permanent_id="wpid_1",
+        workflow_run_id="wr_1",
+        script_revision_id="rev_1",
+    )
+    with patch("skyvern.core.script_generations.real_skyvern_page_ai.app.DATABASE.scripts") as scripts:
+        scripts.create_fallback_episode = AsyncMock()
+        await page_ai._record_element_fallback_episode(
+            context=context,
+            action_type="fill",
+            failed_selector=f"[data-secret='{sentinel_secret}']",
+            intention=f"Fill {sentinel_secret}",
+            action=SimpleNamespace(reasoning=f"Resolved {sentinel_secret}"),
+            sensitive_value=sentinel_secret,
+        )
+    assert sentinel_secret not in repr(scripts.create_fallback_episode.await_args)
+    persisted = scripts.create_fallback_episode.await_args.kwargs
+    assert persisted["agent_actions"]["reasoning"] == "Resolved [REDACTED_SECRET]"
 
 
 @pytest.mark.asyncio

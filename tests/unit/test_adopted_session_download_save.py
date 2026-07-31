@@ -88,7 +88,7 @@ async def test_save_as_raises_target_closed_falls_back_to_refetch(tmp_path) -> N
 
     assert saved is not None and saved.exists()
     assert saved.read_bytes() == PDF_BODY
-    page.context.request.get.assert_awaited_once_with(download.url)
+    page.context.request.get.assert_awaited_once_with(download.url, max_redirects=0)
 
 
 @pytest.mark.asyncio
@@ -105,7 +105,7 @@ async def test_zero_byte_save_as_falls_back_to_refetch(tmp_path) -> None:
 
     assert saved is not None and saved.exists()
     assert saved.read_bytes() == PDF_BODY
-    page.context.request.get.assert_awaited_once_with(download.url)
+    page.context.request.get.assert_awaited_once_with(download.url, max_redirects=0)
     # the empty placeholder must not survive alongside the recovered file
     assert sorted(p.name for p in tmp_path.iterdir()) == [saved.name]
 
@@ -714,3 +714,62 @@ async def test_read_adopted_session_blob_bytes_oversized_returns_none() -> None:
         AsyncMock(return_value=None),
     ):
         assert await _read_adopted_session_blob_bytes(download, click_page, workflow_run_id="wr") is None
+
+
+@pytest.fixture(autouse=True)
+def _resolvable_example_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the module's ``example.com`` fixtures off real DNS once destinations are checked."""
+    import socket
+
+    real_getaddrinfo = socket.getaddrinfo
+
+    def fake_getaddrinfo(host: str, port: object = None, *args: object, **kwargs: object) -> list:
+        if host == "example.com":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 0))]
+        return real_getaddrinfo(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+
+@pytest.mark.asyncio
+async def test_refetch_refuses_internal_destination(tmp_path, download_destinations, fake_api_request_context) -> None:
+    download = _download(url=f"{download_destinations.internal_base}/internal")
+    download.save_as.side_effect = Exception("Target page, context or browser has been closed")
+    page = _page_with_refetch()
+    page.context.request = fake_api_request_context()
+
+    saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+
+    assert saved is None
+    assert download_destinations.reached_internal() is False
+    assert all(path.read_bytes() != download_destinations.INTERNAL_BODY for path in tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_refetch_refuses_redirect_hop_to_internal_destination(
+    tmp_path, download_destinations, fake_api_request_context
+) -> None:
+    download = _download(url=f"{download_destinations.public_base}/redirect-to-internal")
+    download.save_as.side_effect = Exception("Target page, context or browser has been closed")
+    page = _page_with_refetch()
+    page.context.request = fake_api_request_context()
+
+    saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+
+    assert saved is None
+    assert download_destinations.reached_internal() is False
+    assert all(path.read_bytes() != download_destinations.INTERNAL_BODY for path in tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_refetch_allows_permitted_destination(tmp_path, download_destinations, fake_api_request_context) -> None:
+    # Non-vacuity: a permitted destination must still round-trip through the re-fetch path.
+    download = _download(url=f"{download_destinations.public_base}/attachment")
+    download.save_as.side_effect = Exception("Target page, context or browser has been closed")
+    page = _page_with_refetch()
+    page.context.request = fake_api_request_context()
+
+    saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+
+    assert saved is not None and saved.exists()
+    assert saved.read_bytes() == download_destinations.PUBLIC_BODY
