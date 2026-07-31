@@ -48,7 +48,7 @@ Most browser automation breaks down at authentication, CAPTCHAs, or dynamic cont
 
 **Proxy and geolocation.** Residential proxies route through real IPs in 30+ countries. Set `proxy_location` per task when you need to appear from a specific region.
 
-**Browser state persistence.** Sessions keep a live browser open across multiple tasks for up to 24 hours, useful when you need to chain tasks that share login state. Profiles snapshot cookies, auth tokens, and local storage into a reusable package you can restore on future runs, so you don't re-authenticate every time.
+**Browser state persistence.** Sessions keep a live browser open across multiple tasks for up to 4 hours, useful when you need to chain tasks that share login state. Profiles snapshot cookies, auth tokens, and local storage into a reusable package you can restore on future runs, so you don't re-authenticate every time.
 
 **Multi-step agents.** When a single task isn't enough, Agents let you chain blocks together: navigate, login, loop through a list, extract data, branch on conditions, send emails. Agents are parameterized and version-controlled. You can build them visually in the dashboard or define them through the API.
 
