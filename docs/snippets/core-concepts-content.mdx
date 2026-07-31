@@ -243,7 +243,7 @@ flowchart LR
     B -- "restore" --> A
 ```
 
-**Browser Sessions** are live browser instances that maintain state across multiple operations. Cookies, storage, and page context persist for the duration of the session (up to 4 hours). They're useful for chaining operations in real-time or allowing human intervention between steps.
+**Browser Sessions** are live browser instances that maintain state across multiple operations. Cookies, storage, and page context persist for the duration of the session (up to 24 hours). They're useful for chaining operations in real-time or allowing human intervention between steps.
 
 ```python
 browser = await skyvern.launch_cloud_browser()
