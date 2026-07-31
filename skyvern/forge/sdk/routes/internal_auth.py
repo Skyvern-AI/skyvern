@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.sdk.services.local_org_auth_token_service import fingerprint_token, regenerate_local_api_key
+from skyvern.forge.sdk.services.local_org_auth_token_service import fingerprint_token
 from skyvern.forge.sdk.services.org_auth_service import resolve_org_from_api_key
 
 router = APIRouter(prefix="/internal/auth", tags=["internal"])
@@ -41,14 +41,11 @@ def _is_local_request(request: Request) -> bool:
     except ValueError:
         LOG.warning("Invalid IP address in request", host=host)
         return False
-    # Check if request is from Docker host (gateway IP)
-    # Docker typically uses 172.x.x.x or 192.168.x.x for bridge networks
-    is_local = addr.is_loopback or addr.is_private
+    is_local = addr.is_loopback
     LOG.info(
         "Checking if request is local",
         host=host,
         is_loopback=addr.is_loopback,
-        is_private=addr.is_private,
         is_local=is_local,
     )
     return is_local
@@ -72,10 +69,7 @@ async def _evaluate_local_api_key(token: str) -> DiagnosticsResult:
             ),
             validation=None,
             token=None,
-            next_step=(
-                "Send the local API key in the x-api-key header, or call POST /api/v1/internal/auth/repair "
-                "from localhost to regenerate a local key and update the env files."
-            ),
+            next_step="Run skyvern doctor --fix to regenerate the local key and update the env files.",
         )
 
     try:
@@ -114,12 +108,9 @@ def _emit_diagnostics(result: DiagnosticsResult) -> dict[str, object]:
             fingerprint=fingerprint,
             expires_at=result.validation.payload.exp,
         )
-        return {
-            "status": status_value,
-            "organization_id": result.validation.organization.organization_id,
-            "fingerprint": fingerprint,
-            "expires_at": result.validation.payload.exp,
-        }
+        # The organization id, fingerprint and expiry stay in the log. The response body carries only
+        # the status, so this endpoint discloses nothing beyond it to whoever reaches the address gate.
+        return {"status": status_value}
 
     log_kwargs: dict[str, object] = {"status": status_value}
     if result.detail:
@@ -137,28 +128,9 @@ def _emit_diagnostics(result: DiagnosticsResult) -> dict[str, object]:
     return payload
 
 
-@router.post("/repair", include_in_schema=False)
-async def repair_api_key(request: Request) -> dict[str, object]:
-    _require_local_access(request)
-
-    token, organization_id, backend_env_path, frontend_env_path = await regenerate_local_api_key()
-
-    response: dict[str, object] = {
-        "status": AuthStatus.ok.value,
-        "organization_id": organization_id,
-        "fingerprint": fingerprint_token(token),
-        "api_key": token,
-        "backend_env_path": backend_env_path,
-    }
-
-    if frontend_env_path:
-        response["frontend_env_path"] = frontend_env_path
-
-    return response
-
-
 @router.get("/status", include_in_schema=False)
 async def auth_status(request: Request) -> dict[str, object]:
+    _require_local_access(request)
     token_candidate = request.headers.get("x-api-key") or ""
     result = await _evaluate_local_api_key(token_candidate)
     return _emit_diagnostics(result)
