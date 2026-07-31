@@ -88,7 +88,7 @@ async def verify_browser_session(
             )
             return None
 
-    browser_address = browser_session.browser_address
+    browser_address = browser_session.browser_address if browser_session.is_browser_ready else None
 
     if not browser_address:
         if settings.BROWSER_STREAMING_MODE == "cdp":
@@ -170,7 +170,7 @@ async def verify_task(
         LOG.info("No browser session found for task.", task_id=task_id, organization_id=organization_id)
         return task, None
 
-    if not browser_session.browser_address:
+    if not browser_session.is_browser_ready or not browser_session.browser_address:
         LOG.info("Browser session address not found for task.", task_id=task_id, organization_id=organization_id)
         return task, None
 
@@ -241,7 +241,7 @@ async def verify_workflow_run(
         )
         return workflow_run, None
 
-    browser_address = browser_session.browser_address
+    browser_address = browser_session.browser_address if browser_session.is_browser_ready else None
 
     if not browser_address:
         LOG.info(
