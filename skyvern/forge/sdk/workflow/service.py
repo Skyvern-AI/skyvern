@@ -8622,7 +8622,7 @@ class WorkflowService:
         close_browser_on_completion = (
             close_browser_on_completion and browser_session_id is None and not workflow_run.browser_address
         )
-        browser_state = await app.BROWSER_MANAGER.cleanup_for_workflow_run(
+        browser_cleanup_result = await app.BROWSER_MANAGER.cleanup_for_workflow_run(
             workflow_run.workflow_run_id,
             all_workflow_task_ids,
             close_browser_on_completion=close_browser_on_completion,
@@ -8631,11 +8631,11 @@ class WorkflowService:
             child_workflow_run_ids=child_workflow_run_ids,
         )
         return WorkflowBrowserCleanupResult(
-            browser_state=browser_state,
+            browser_state=browser_cleanup_result.browser_state,
             tasks=tasks,
             all_workflow_task_ids=all_workflow_task_ids,
             child_workflow_run_ids=child_workflow_run_ids,
-            close_browser_on_completion=close_browser_on_completion,
+            close_browser_on_completion=browser_cleanup_result.recording_finalized,
         )
 
     async def _persist_workflow_browser_session_if_needed(
