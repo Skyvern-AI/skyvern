@@ -37,7 +37,7 @@ describe("paneAccessibleName", () => {
 
   test("the run pane's controls keep the stable name 'Run'", () => {
     // The pane's own controls (region/close/drag) announce "Run", matching the
-    // "Run: wr_…" content; "Past Runs" is the rail selector's name (railLabel).
+    // "Run: wr_…" content; "Past Runs" is the idle run control's label.
     expect(paneAccessibleName("overview")).toBe("Run");
     expect(paneLabel("overview", "wr_5538abcdef")).toBe("Run: wr_5538…");
   });

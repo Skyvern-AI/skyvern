@@ -442,7 +442,7 @@ export function StudioTopBar() {
       {workflowDeletedAt ? (
         // Legacy run-header tag idiom; every workflow-mutating action (save,
         // schedule, inputs, run) is gone with the agent. Run history stays
-        // reachable from the Past Runs rail tab.
+        // reachable from the run control.
         <span
           title={basicTimeFormat(workflowDeletedAt)}
           className="shrink-0 text-xs text-muted-foreground"
