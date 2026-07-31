@@ -15,7 +15,13 @@ from playwright.async_api import Page
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, NAVIGATION_MAX_RETRY_TIME
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi, render_template
-from skyvern.core.script_generations.skyvern_page import ActionCall, ActionMetadata, RunContext, SkyvernPage
+from skyvern.core.script_generations.skyvern_page import (
+    ActionCall,
+    ActionMetadata,
+    ResolvedSensitiveValue,
+    RunContext,
+    SkyvernPage,
+)
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import (
@@ -884,6 +890,13 @@ class ScriptSkyvernPage(SkyvernPage):
 
         return value
 
+    def _is_secret_reference(self, value: str) -> bool:
+        context = skyvern_context.current()
+        if context is None or not context.workflow_run_id:
+            return False
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
+        return bool(workflow_run_context and workflow_run_context.get_original_secret_value_or_none(value) is not None)
+
     # Class-level cache for TOTP codes to ensure all digits in a sequence use the same code
     # Key: (workflow_run_id, credential_key), Value: totp_code
     # Uses TTLCache with 30-second expiry (aligned with TOTP rotation period)
@@ -993,7 +1006,7 @@ class ScriptSkyvernPage(SkyvernPage):
 
         # Return the specific digit
         if digit_index < len(totp_code):
-            return totp_code[digit_index]
+            return ResolvedSensitiveValue(totp_code[digit_index])
         LOG.warning(
             "TOTP digit index out of range",
             field_name=field_name,

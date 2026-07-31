@@ -43,6 +43,7 @@ from skyvern.services.script_reviewer_v3.prompts import (
     MIDRUN_SYSTEM_PROMPT,
     build_midrun_user_prompt,
 )
+from skyvern.services.script_reviewer_v3.redaction import redact_sensitive_content, redact_sensitive_value
 from skyvern.services.script_reviewer_v3.registry_builder import build_registry
 from skyvern.services.script_reviewer_v3.types import FailureContext, V3MidRunResult
 
@@ -58,6 +59,7 @@ def _summarize_failure_context(fc: FailureContext) -> dict:
         "failed_selector": fc.failed_selector,
         "intention": fc.intention,
         "value": fc.value,
+        "value_is_sensitive": fc.value_is_sensitive,
         "totp_identifier": fc.totp_identifier,
         "page_url": getattr(fc.page, "url", None) if fc.page is not None else None,
     }
@@ -74,12 +76,14 @@ async def _persist_midrun_terminal(
     Class A: mark_episode_reviewed atomically with the new script revision id.
     Class B: update with reviewer_output but leave reviewed=False.
     """
+    sensitive_value = fc.value if fc.value_is_sensitive else None
+    reviewer_output = redact_sensitive_content(decision.investigation_summary or decision.reason, sensitive_value)
     try:
         if decision.is_midrun_class_a():
             await app.DATABASE.scripts.mark_episode_reviewed(
                 episode_id=fc.episode_id,
                 organization_id=organization_id,
-                reviewer_output=decision.investigation_summary or decision.reason,
+                reviewer_output=reviewer_output,
                 new_script_revision_id=decision.new_script_revision_id,
                 reviewer_version="v3",
             )
@@ -87,7 +91,7 @@ async def _persist_midrun_terminal(
             await app.DATABASE.scripts.update_fallback_episode(
                 episode_id=fc.episode_id,
                 organization_id=organization_id,
-                reviewer_output=f"v3_midrun_{decision.type}: {decision.reason}",
+                reviewer_output=f"v3_midrun_{decision.type}: {reviewer_output}",
                 reviewer_version="v3",
             )
     except Exception:
@@ -166,7 +170,9 @@ async def v3_review_in_flight(
             episode_id=fc.episode_id,
             workflow_run_id=getattr(fc.context, "workflow_run_id", None),
             action_type=fc.action_type,
-            failed_selector=fc.failed_selector,
+            failed_selector=redact_sensitive_value(
+                fc.failed_selector or "", fc.value if fc.value_is_sensitive else None
+            ),
             budget_max_cycles=budget.max_cycles,
             budget_max_cost_usd=budget.max_cost_usd,
         )
@@ -203,8 +209,10 @@ async def v3_review_in_flight(
             episode_id=fc.episode_id,
             workflow_run_id=getattr(fc.context, "workflow_run_id", None),
             decision_type=final_decision.type,
-            decision_reason=final_decision.reason,
-            investigation_summary=(final_decision.investigation_summary or "")[:300],
+            decision_reason=redact_sensitive_value(final_decision.reason, fc.value if fc.value_is_sensitive else None),
+            investigation_summary=redact_sensitive_value(
+                final_decision.investigation_summary or "", fc.value if fc.value_is_sensitive else None
+            )[:300],
             new_script_revision_id=final_decision.new_script_revision_id,
             class_a=final_decision.is_midrun_class_a(),
             class_b=final_decision.is_midrun_class_b(),
