@@ -395,22 +395,22 @@ async def _resolve_live_browser_session_id(
             return None
 
         persistent = await app.PERSISTENT_SESSIONS_MANAGER.get_session(requested, organization_id)
-        has_browser_address = bool(persistent.browser_address) if persistent else False
+        has_live_browser = persistent.is_browser_ready if persistent else False
         has_registered_browser_state = False
-        if persistent is not None and not is_final_status(persistent.status) and not has_browser_address:
+        if persistent is not None and not is_final_status(persistent.status) and not has_live_browser:
             has_registered_browser_state = await _registered_browser_state_is_usable(requested, organization_id)
 
         if (
             persistent is None
             or is_final_status(persistent.status)
-            or (not has_browser_address and not has_registered_browser_state)
+            or (not has_live_browser and not has_registered_browser_state)
         ):
             LOG.warning(
                 "Copilot live browser session is not yet usable; falling back to auto-create",
                 organization_id=organization_id,
                 requested_session_id=requested,
                 status=persistent.status if persistent else None,
-                has_browser_address=has_browser_address,
+                has_live_browser=has_live_browser,
                 has_registered_browser_state=has_registered_browser_state,
             )
             return None
