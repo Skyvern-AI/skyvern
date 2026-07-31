@@ -622,7 +622,7 @@ class MCPAPIKeyMiddleware:
             AccessToken(
                 token="mcp-http-session-owner",
                 client_id=organization_id,
-                subject=hashlib.sha256(api_key.encode("utf-8")).hexdigest(),
+                subject=hash_api_key_for_cache(api_key),
                 scopes=[],
             )
         )
