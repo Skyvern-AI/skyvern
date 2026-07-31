@@ -43,6 +43,7 @@ from skyvern.forge.sdk.workflow.browser_action_policy_enrollment import (
 from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock, WhileLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
+from skyvern.forge.sdk.workflow.runtime_completion import carried_contract, with_contract
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.schemas.workflows import WorkflowStatus
 
@@ -1165,8 +1166,11 @@ class WorkflowsRepository(BaseRepository):
                 # not depend on caller-side object identity between the
                 # top-level parameters list and each block's field.
                 _align_block_output_parameters(workflow_definition)
+                definition_json = with_contract(
+                    workflow_definition.model_dump(mode="json"), carried_contract(workflow.workflow_definition)
+                )
                 workflow.workflow_definition = with_policy(
-                    workflow_definition.model_dump(mode="json"), carried_policy(workflow.workflow_definition)
+                    definition_json, carried_policy(workflow.workflow_definition)
                 )
             if version is not None:
                 workflow.version = version

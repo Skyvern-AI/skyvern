@@ -58,6 +58,7 @@ from skyvern.forge.sdk.copilot.output_utils import iter_failure_reasons
 from skyvern.forge.sdk.copilot.reached_download_target import (
     DOWNLOAD_KIND_ATTRIBUTE,
     DOWNLOAD_KIND_EXTENSION,
+    DOWNLOAD_KIND_OBSERVED,
     DOWNLOAD_KIND_REGISTERED,
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS,
@@ -97,7 +98,9 @@ from .blockers import (
 
 LOG = structlog.get_logger()
 
-_TYPED_DOWNLOAD_KINDS = frozenset({DOWNLOAD_KIND_REGISTERED, DOWNLOAD_KIND_ATTRIBUTE, DOWNLOAD_KIND_EXTENSION})
+_TYPED_DOWNLOAD_KINDS = frozenset(
+    {DOWNLOAD_KIND_REGISTERED, DOWNLOAD_KIND_ATTRIBUTE, DOWNLOAD_KIND_EXTENSION, DOWNLOAD_KIND_OBSERVED}
+)
 _POST_RUN_PAGE_OBSERVATION_LABEL = "post_run_page_observation"
 _REGISTERED_ARTIFACT_OBSERVATION_LABEL = "registered_artifact_observation"
 # Stamp keys the same-run gate reads; they are dropped from the graded payload so the run id

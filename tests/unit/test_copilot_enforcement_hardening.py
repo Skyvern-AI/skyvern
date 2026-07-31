@@ -491,3 +491,101 @@ def test_reject_count_resets_only_on_non_repeat_without_frontier_unchanged() -> 
     assert _code_authoring_reject_count_resets(False, True) is False
     assert _code_authoring_reject_count_resets(None, False) is False
     assert _code_authoring_reject_count_resets(True, False) is False
+
+
+# ---------------------------------------------------------------------------
+# Repair obligation — a turn may not finalize a draft its own build test disproved
+# ---------------------------------------------------------------------------
+
+
+class _FakeFinalResult:
+    """Minimal stand-in for RunResultStreaming carrying one final model response."""
+
+    def __init__(self, response_type: str, user_response: str) -> None:
+        self._payload = json.dumps({"type": response_type, "user_response": user_response})
+
+    @property
+    def final_output(self) -> str:
+        return self._payload
+
+
+def _failed_run_ctx(next_action: Any, *, observed: bool = True) -> Any:
+    ctx = _fresh_context()
+    ctx.test_after_update_done = True
+    ctx.last_test_ok = False
+    ctx.latest_diagnosis_repair_contract = _repair_contract(next_action)
+    if observed:
+        ctx.post_run_page_observation_after_failed_test = True
+        ctx.post_run_page_observation_tool = "inspect_page_for_composition"
+        ctx.post_run_page_observation_workflow_run_id = "wr_x"
+        ctx.last_run_blocks_workflow_run_id = "wr_x"
+    return ctx
+
+
+def test_observed_reply_cannot_finalize_while_repair_is_owed() -> None:
+    """The production shape: failed run -> inspect once -> report the blocker -> turn ends."""
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+
+    ctx = _failed_run_ctx(RepairNextAction.REPAIR)
+    result = _FakeFinalResult("REPLY", "The latest bill link opens an email-delivery form.")
+
+    assert _check_enforcement(ctx, result) is not None
+
+
+def test_observed_reply_finalizes_once_repair_is_discharged() -> None:
+    """A contract that no longer asks for repair releases the turn — the obligation is typed."""
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+
+    ctx = _failed_run_ctx(RepairNextAction.NO_CHANGE)
+    result = _FakeFinalResult("REPLY", "Downloaded the latest invoice.")
+
+    assert _check_enforcement(ctx, result) is None
+
+
+def test_ask_question_still_finalizes_while_repair_is_owed() -> None:
+    """Needing the user is a legitimate exit; another repair round cannot supply the answer."""
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+
+    ctx = _failed_run_ctx(RepairNextAction.REPAIR)
+    ctx.failed_test_nudge_count = 99  # counters exhausted
+    result = _FakeFinalResult("ASK_QUESTION", "Which account should I use?")
+
+    assert _check_enforcement(ctx, result) is None
+
+
+def test_exhausted_nudge_counters_do_not_release_an_open_repair_obligation() -> None:
+    """Counters bound nudge repetition; they were never evidence the failure was addressed."""
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+
+    ctx = _failed_run_ctx(RepairNextAction.REPAIR)
+    ctx.failed_test_nudge_count = 99
+    result = _FakeFinalResult("REPLY", "I drafted the workflow; it attempts to download the bill.")
+
+    assert _check_enforcement(ctx, result) == POST_FAILED_TEST_NUDGE
+
+
+def test_stop_decision_releases_the_turn_even_with_counters_exhausted() -> None:
+    """Typed terminal evidence, not a counter, is what ends a repairable failure."""
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+
+    ctx = _failed_run_ctx(RepairNextAction.STOP)
+    ctx.failed_test_nudge_count = 99
+    result = _FakeFinalResult("REPLY", "This site requires a mailed statement request.")
+
+    assert _check_enforcement(ctx, result) is None
+
+
+def test_repair_obligation_releases_the_turn_once_its_rounds_are_spent() -> None:
+    """A failure that looks repairable but is not must still be reportable, not re-nudged forever."""
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+    from skyvern.forge.sdk.copilot.enforcement import MAX_REPAIR_OBLIGATION_NUDGES
+
+    ctx = _failed_run_ctx(RepairNextAction.REPAIR)
+    ctx.failed_test_nudge_count = 99
+    result = _FakeFinalResult("REPLY", "This site offers no downloadable statement.")
+
+    # Held open while rounds remain.
+    assert _check_enforcement(ctx, result) == POST_FAILED_TEST_NUDGE
+
+    ctx.repair_obligation_nudge_count = MAX_REPAIR_OBLIGATION_NUDGES
+    assert _check_enforcement(ctx, result) is None
