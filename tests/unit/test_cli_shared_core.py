@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -353,7 +354,9 @@ async def test_do_session_list() -> None:
     session = MagicMock()
     session.browser_session_id = "pbs_1"
     session.status = "active"
-    session.started_at = None
+    # Set together with the address by the session worker; an address alone can be minted before
+    # the browser exists, so availability needs both.
+    session.started_at = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
     session.timeout = 60
     session.runnable_id = None
     session.browser_address = "ws://localhost:1234"
