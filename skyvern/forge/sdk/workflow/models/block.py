@@ -153,7 +153,9 @@ from skyvern.forge.sdk.workflow.models._jinja import (
     _JSON_TYPE_MARKER,
     _json_type_filter,
     jinja_json_finalize_strict_env,
+    mask_jinja_in_python_comments,
     render_templates_in_json_value,
+    restore_jinja_masked_comments,
 )
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     CODE_BLOCK_FILENAME,
@@ -4251,7 +4253,11 @@ async def wrapper({default_args}):
         return self.parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        self.code = self.format_block_parameter_template_from_workflow_run_context(self.code, workflow_run_context)
+        masked_code, masked_comments = mask_jinja_in_python_comments(self.code)
+        rendered_code = self.format_block_parameter_template_from_workflow_run_context(
+            masked_code, workflow_run_context
+        )
+        self.code = restore_jinja_masked_comments(rendered_code, masked_comments)
         if self.prompt:
             self.prompt = self.format_block_parameter_template_from_workflow_run_context(
                 self.prompt, workflow_run_context
