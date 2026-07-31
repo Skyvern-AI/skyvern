@@ -2,13 +2,22 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, asc, or_, select, update
+from sqlalchemy import and_, asc, func, or_, select, update
+from sqlalchemy.sql.elements import ColumnElement
 
 from skyvern.config import settings
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.models import TOTPCodeModel
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCode
+from skyvern.utils.email_validation import SAFE_EMAIL_ADDRESS_PATTERN, normalize_email_address
+
+
+def _identifier_filter(totp_identifier: str) -> ColumnElement[bool]:
+    stripped_identifier = totp_identifier.strip()
+    if SAFE_EMAIL_ADDRESS_PATTERN.fullmatch(stripped_identifier):
+        return func.lower(TOTPCodeModel.totp_identifier) == normalize_email_address(totp_identifier)
+    return TOTPCodeModel.totp_identifier == totp_identifier
 
 
 class OTPRepository(BaseRepository):
@@ -45,7 +54,7 @@ class OTPRepository(BaseRepository):
             query = (
                 select(TOTPCodeModel)
                 .filter_by(organization_id=organization_id)
-                .filter_by(totp_identifier=totp_identifier)
+                .filter(_identifier_filter(totp_identifier))
                 .filter_by(parse_status="parsed")
                 .filter(
                     TOTPCodeModel.created_at > datetime.now(timezone.utc) - timedelta(minutes=valid_lifespan_minutes)
@@ -127,7 +136,7 @@ class OTPRepository(BaseRepository):
             if workflow_run_id is not None:
                 query = query.filter(TOTPCodeModel.workflow_run_id == workflow_run_id)
             if totp_identifier:
-                query = query.filter(TOTPCodeModel.totp_identifier == totp_identifier)
+                query = query.filter(_identifier_filter(totp_identifier))
             query = query.order_by(TOTPCodeModel.created_at.desc()).limit(limit)
             totp_codes = (await session.scalars(query)).all()
             return [TOTPCode.model_validate(totp_code) for totp_code in totp_codes]
@@ -214,9 +223,9 @@ class OTPRepository(BaseRepository):
                 select(TOTPCodeModel)
                 .filter_by(
                     organization_id=organization_id,
-                    totp_identifier=totp_identifier,
                     parse_status="raw",
                 )
+                .filter(_identifier_filter(totp_identifier))
                 .filter(
                     TOTPCodeModel.created_at > datetime.now(timezone.utc) - timedelta(minutes=valid_lifespan_minutes)
                 )

@@ -128,6 +128,10 @@ class ExpiredRefreshTokenError(MissingAccessTokenError):
     (as opposed to a transient transport error)."""
 
 
+class RotatedRefreshTokenPersistenceError(RuntimeError):
+    pass
+
+
 class CredentialNotReauthorizableError(ValueError):
     """Raised when an in-place re-auth targets a credential that does not exist for the org or is
     not in a re-authorizable (active/error) state."""
@@ -172,6 +176,13 @@ class GoogleCredentialSecrets:
     scopes: list[str] = field(default_factory=list)
     client_id: str | None = None
     credential_version: datetime.datetime | None = None
+    encrypted_refresh_token: str | None = None
+
+
+@dataclass(frozen=True)
+class GoogleRefreshResult:
+    access_token: str
+    credential_version: datetime.datetime | None
 
 
 @dataclass(frozen=True)
@@ -758,6 +769,7 @@ async def load_credential_secrets(
         scopes=payload.scopes_granted,
         client_id=payload.client_id,
         credential_version=payload.credential_version,
+        encrypted_refresh_token=payload.encrypted_refresh_token,
     )
 
 
@@ -823,6 +835,52 @@ async def credentials_from_secrets(
     return creds
 
 
+async def refresh_and_rotate(
+    *,
+    organization_id: str,
+    credential_id: str,
+    credential_secrets: GoogleCredentialSecrets,
+) -> GoogleRefreshResult:
+    creds = await credentials_from_secrets(credential_secrets, organization_id)
+    access_token = creds.token
+    if not isinstance(access_token, str) or not access_token:
+        raise MissingAccessTokenError("Google token response did not include access_token")
+
+    credential_version = credential_secrets.credential_version
+    new_refresh_token = creds.refresh_token
+    if (
+        isinstance(new_refresh_token, str)
+        and new_refresh_token
+        and new_refresh_token != credential_secrets.refresh_token
+    ):
+        try:
+            if credential_secrets.encrypted_refresh_token is None:
+                raise ValueError("Google OAuth credential is missing its encrypted refresh token")
+            encrypted_refresh_token = await encryptor.encrypt(new_refresh_token, EncryptMethod.AES)
+            now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+            updated = await app.DATABASE.google_oauth.update_active_refresh_token(
+                organization_id=organization_id,
+                credential_id=credential_id,
+                encrypted_refresh_token=encrypted_refresh_token,
+                encrypted_method=EncryptMethod.AES,
+                now=now,
+                expected_encrypted_refresh_token=credential_secrets.encrypted_refresh_token,
+            )
+            if not updated:
+                raise ValueError("Google OAuth credential changed during refresh-token rotation")
+            credential_version = now
+        except Exception as exc:
+            LOG.exception(
+                "Failed to persist rotated Google refresh token",
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            raise RotatedRefreshTokenPersistenceError(
+                "Failed to persist rotated Google refresh token; reconnect the Google account"
+            ) from exc
+    return GoogleRefreshResult(access_token=access_token, credential_version=credential_version)
+
+
 async def get_credentials_for_org(organization_id: str) -> list[GoogleOAuthCredentialBase]:
     """List all active Google OAuth credentials for an organization (metadata only)."""
     return await app.DATABASE.google_oauth.list_active_for_org(organization_id=organization_id)
@@ -830,6 +888,23 @@ async def get_credentials_for_org(organization_id: str) -> list[GoogleOAuthCrede
 
 async def get_visible_credentials_for_org(organization_id: str) -> list[GoogleOAuthCredentialBase]:
     return await app.DATABASE.google_oauth.list_visible_for_org(organization_id=organization_id)
+
+
+async def update_email_address(
+    *,
+    organization_id: str,
+    credential_id: str,
+    email_address: str,
+    only_if_null: bool,
+    expected_version: datetime.datetime | None = None,
+) -> bool:
+    return await app.DATABASE.google_oauth.update_email_address(
+        organization_id=organization_id,
+        credential_id=credential_id,
+        email_address=email_address,
+        only_if_null=only_if_null,
+        expected_version=expected_version,
+    )
 
 
 # google-auth 2.x has no first-class async revoke helper; keep the 10-line httpx POST.

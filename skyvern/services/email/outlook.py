@@ -11,6 +11,7 @@ import httpx
 import structlog
 
 from skyvern.services.email.types import EmailAttachment, EmailMessage
+from skyvern.utils.email_validation import SAFE_EMAIL_ADDRESS_PATTERN
 
 GRAPH_API_BASE = "https://graph.microsoft.com/v1.0"
 LOG = structlog.get_logger()
@@ -34,7 +35,7 @@ _MAX_OTP_SEARCH_PAGES = 4
 _MAX_OTP_SEARCH_FETCHED = 100
 _OTP_EXCLUDED_FOLDER_IDS_STATE_KEY = "otp_excluded_folder_ids"
 _OTP_MAILBOX_IDENTITIES_STATE_KEY = "otp_mailbox_identities"
-_SAFE_EMAIL_IDENTIFIER = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+$")
+_SAFE_EMAIL_IDENTIFIER = SAFE_EMAIL_ADDRESS_PATTERN
 _OTP_KEYWORD_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])(?:verification|verify|code|passcode|otp|2fa|one(?:[\s-]+)time|password)(?![A-Za-z0-9])",
     re.IGNORECASE,
@@ -132,6 +133,33 @@ async def _get_json(
     ):
         code = "reconnect_required"
     raise OutlookAPIError(status=response.status_code, code=code, message=message)
+
+
+async def fetch_primary_account_email(
+    *,
+    access_token: str,
+    client: httpx.AsyncClient | None = None,
+) -> str | None:
+    async def _fetch(client_: httpx.AsyncClient) -> str | None:
+        payload = await _get_json(
+            client_,
+            f"{GRAPH_API_BASE}/me",
+            access_token=access_token,
+            params={"$select": "mail"},
+        )
+        if not isinstance(payload, dict):
+            return None
+        value = payload.get("mail")
+        if isinstance(value, str):
+            candidate = value.strip()
+            if _SAFE_EMAIL_IDENTIFIER.fullmatch(candidate):
+                return candidate
+        return None
+
+    if client is not None:
+        return await _fetch(client)
+    async with httpx.AsyncClient(timeout=20.0) as owned_client:
+        return await _fetch(owned_client)
 
 
 def _clamp_max_results(max_results: int) -> int:
