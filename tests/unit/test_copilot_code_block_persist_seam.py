@@ -5974,6 +5974,88 @@ class TestCompiledAuthoringImposition:
         assert 'records = [{"number": "REC-001", "status": "credentialed"}]' in output_code
         assert 'return {"records": records}' in output_code
 
+    def _login_otp_ctx(self) -> CopilotContext:
+        login_url = "https://example.com/login"
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            _credential_fill_interaction("username", credential_id="cred_1", source_url=login_url),
+            _credential_fill_interaction("password", credential_id="cred_1", source_url=login_url),
+            {
+                "tool_name": "click",
+                "selector": ".btn-login",
+                "source_url": login_url,
+                "role": "button",
+                "accessible_name": "Log in",
+            },
+            {
+                "tool_name": "press_key",
+                "selector": "input[type='password']",
+                "key": "Enter",
+                "source_url": login_url,
+            },
+            {
+                "tool_name": "read_value",
+                "read_expression": 'document.querySelector("#otp-hint").innerText',
+                "read_output_path": "output.otp_hint",
+                "source_url": login_url,
+            },
+            _credential_fill_interaction("totp", credential_id="cred_1", source_url=login_url),
+            {
+                "tool_name": "click",
+                "selector": ".btn-primary-submit",
+                "source_url": login_url,
+                "role": "button",
+                "accessible_name": "Login",
+            },
+        ]
+        return ctx
+
+    _INVENTED_SUBMIT_NAME_YAML = _credential_code_yaml(
+        credential_id="cred_1",
+        code="""
+        await page.locator("#email").fill(login_credential.username)
+        await page.locator("input[type='password']").fill(login_credential.password)
+        await page.locator(".btn-login").click()
+        await page.locator("#totpmfa").fill(await login_credential.otp())
+        await page.get_by_role("button", name="Continue", exact=True).click()
+        """,
+    )
+
+    @pytest.mark.asyncio
+    async def test_login_otp_persist_imposes_demonstrated_submit_over_invented_role_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._login_otp_ctx()
+
+        result = await _update_workflow(
+            {"workflow_yaml": self._INVENTED_SUBMIT_NAME_YAML}, ctx, allow_missing_credentials=True
+        )
+
+        assert result["ok"] is True
+        assert result["data"]["imposed_substitutions"] is not None
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        code = str(_single_code_block(parsed)["code"])
+        assert 'await page.locator(".btn-primary-submit").click()' in code
+        assert "Continue" not in code
+
+    @pytest.mark.asyncio
+    async def test_login_otp_persist_retains_the_captured_output_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._login_otp_ctx()
+
+        result = await _update_workflow(
+            {"workflow_yaml": self._INVENTED_SUBMIT_NAME_YAML}, ctx, allow_missing_credentials=True
+        )
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        code = str(_single_code_block(parsed)["code"])
+        assert "await page.evaluate('document.querySelector(\"#otp-hint\").innerText')" in code
+
     def _download_ctx(self) -> CopilotContext:
         from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 
@@ -9845,6 +9927,16 @@ class TestBrowserSurfaceRejectionProvenance:
         assert provenance.nearest_selector == "#gone"
         assert not any("never_captured" in violation for violation in validation.violations)
 
+    def test_unaccounted_branch_drop_does_not_relabel_an_unrelated_mutation(self) -> None:
+        diagnostics = _spine_emission_diagnostics()
+        diagnostics.dropped_interactions.append(
+            {"trajectory_index": 2, "tool_name": "click", "selector": "#skipped", "reason_code": "unaccounted_branch"}
+        )
+
+        validation = _gate_validation('await page.locator("#hallucinated").click()\n', diagnostics)
+
+        assert [provenance.kind for provenance in validation.provenance] == ["never_captured"]
+
     def test_locator_form_divergence_matches_emitted_record(self) -> None:
         diagnostics = SynthesisDiagnostics(
             emitted_interaction_count=1,
@@ -10183,6 +10275,48 @@ class TestScoutedSpineUnderBuild:
         assert len(events) == 1
         assert events[0]["required_rung_count"] == 2
         assert events[0]["covered_rung_count"] == 1
+
+    def test_retained_index_in_no_lane_still_declines_imposition(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        diagnostics = _spine_emission_diagnostics()
+        diagnostics.retained_trajectory_indices = [0, 1, 2]
+        monkeypatch.setattr(
+            workflow_update_module,
+            "synthesize_code_block",
+            lambda *a, **k: _fake_spine_synthesized(diagnostics=diagnostics),
+        )
+        ctx = _quote_ctx()
+
+        with capture_logs() as logs:
+            result = workflow_update_module._maybe_impose_synthesized_code_block(
+                _records_block_yaml(_SPINE_SYNTH_CODE), ctx
+            )
+
+        assert result.substitutions is None
+        assert any("scouted_spine_unrecorded_index" in violation for violation in result.violations)
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "scouted_spine_unrecorded_index"
+        events = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
+        assert [event["reason_code"] for event in events] == ["scouted_spine_unrecorded_index"]
+
+    def test_unaccounted_branch_drop_still_declines_imposition(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        diagnostics = _spine_emission_diagnostics()
+        diagnostics.retained_trajectory_indices = [0, 1, 2]
+        diagnostics.dropped_interactions.append(
+            {"trajectory_index": 2, "tool_name": "click", "selector": "#gone", "reason_code": "unaccounted_branch"}
+        )
+        monkeypatch.setattr(
+            workflow_update_module,
+            "synthesize_code_block",
+            lambda *a, **k: _fake_spine_synthesized(diagnostics=diagnostics),
+        )
+        ctx = _quote_ctx()
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(
+            _records_block_yaml(_SPINE_SYNTH_CODE), ctx
+        )
+
+        assert result.substitutions is None
+        assert any("unaccounted_branch" in violation for violation in result.violations)
 
     def test_lane_flagged_emissions_do_not_trigger_under_build(self, monkeypatch: pytest.MonkeyPatch) -> None:
         diagnostics = SynthesisDiagnostics(
@@ -11442,6 +11576,25 @@ class TestAdmittedImpositionOwnsSpineCoverage:
         assert any("scouted_spine_under_build" in violation for violation in guarded.violations)
         events = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
         assert events and events[0]["site"] == "pre_persist"
+
+    def test_pre_persist_observation_is_gated_on_the_repeated_omission_latch(self) -> None:
+        ctx = _records_spine_ctx()
+        ctx.update_workflow_called = True
+        under_built = _records_block_yaml('await page.locator("#stage-a").click()')
+
+        with capture_logs() as unlatched_logs:
+            assert workflow_update_module._current_draft_repeats_prior_scouted_spine_omission(under_built, ctx) is False
+        assert not [log for log in unlatched_logs if log["event"] == "copilot_scouted_spine_under_build"]
+
+        probe = workflow_update_module._pre_persist_scouted_spine_result(under_built, ctx)
+        assert probe is not None
+        ctx.scouted_spine_repeated_identical_missing_steps = True
+        ctx.scouted_spine_previous_omission_digest = probe.omission_digest
+
+        with capture_logs() as latched_logs:
+            assert workflow_update_module._current_draft_repeats_prior_scouted_spine_omission(under_built, ctx) is True
+        events = [log for log in latched_logs if log["event"] == "copilot_scouted_spine_under_build"]
+        assert [event["site"] for event in events] == ["pre_persist"]
 
     def test_ungrounded_sibling_mixing_ambiguous_and_concrete_calls_is_replaced_by_the_spine(self) -> None:
         ctx = _quote_ctx()
