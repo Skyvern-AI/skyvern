@@ -19,7 +19,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from skyvern.config import settings
 from skyvern.core.script_generations.fuzzy_matcher import match_option as _match_option
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
-from skyvern.exceptions import NoTOTPSecretFound, ScriptTerminationException
+from skyvern.exceptions import NoTOTPSecretFound, ScriptTerminationException, SkyvernActionFailed
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import download_file as download_file_from_url
@@ -27,6 +27,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.services.credentials import is_unresolved_totp_value
 from skyvern.library.ai_locator import AILocator
+from skyvern.services.script_reviewer_v3.redaction import redact_sensitive_value
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.browser_engine import BrowserEngineSelection
@@ -39,6 +40,10 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 _EXTRACT_FORM_FIELDS_JS: str | None = None
+
+
+class ResolvedSensitiveValue(str):
+    """String value whose resolved credential provenance must survive."""
 
 
 def _is_pointer_interception_error(exc: Exception) -> bool:
@@ -174,6 +179,9 @@ class SkyvernPage(Page):
     ) -> str:
         return value
 
+    def _is_secret_reference(self, value: str) -> bool:
+        return False
+
     async def _resolve_totp_placeholder_or_raise(
         self,
         value: str,
@@ -227,7 +235,7 @@ class SkyvernPage(Page):
         totp_code = await self.get_actual_value(raw_value, totp_identifier, totp_url)
         # Return the specific digit
         if digit_index < len(totp_code):
-            return totp_code[digit_index]
+            return ResolvedSensitiveValue(totp_code[digit_index])
         return ""
 
     @staticmethod
@@ -796,6 +804,12 @@ class SkyvernPage(Page):
         if context and context.ai_mode_override:
             ai = context.ai_mode_override
 
+        original_value = value or ""
+        value_is_sensitive = isinstance(original_value, ResolvedSensitiveValue)
+        try:
+            value_is_sensitive = value_is_sensitive or self._is_secret_reference(original_value)
+        except Exception:
+            pass
         resolved_totp_value: str | None = None
         if value is not None and is_unresolved_totp_value(value):
             resolved_totp_value = await self._resolve_totp_placeholder_or_raise(
@@ -803,6 +817,7 @@ class SkyvernPage(Page):
                 totp_identifier=kwargs.get("totp_identifier"),
                 totp_url=kwargs.get("totp_url"),
             )
+            value_is_sensitive = True
 
         timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
         data = kwargs.pop("data", None)
@@ -816,6 +831,7 @@ class SkyvernPage(Page):
                 intention=prompt,
                 data=data,
                 timeout=timeout,
+                value_is_sensitive=value_is_sensitive,
             )
 
         # --- Selector-based autocomplete flow ---
@@ -828,6 +844,7 @@ class SkyvernPage(Page):
                     intention=prompt,
                     data=data,
                     timeout=timeout,
+                    value_is_sensitive=value_is_sensitive,
                 )
             raise ValueError("Selector is required but was not provided")
 
@@ -843,6 +860,7 @@ class SkyvernPage(Page):
                 raise
             except Exception:
                 pass  # use original value
+        value_is_sensitive = value_is_sensitive or actual_value != original_value
         if is_unresolved_totp_value(actual_value):
             raise NoTOTPSecretFound()
 
@@ -856,10 +874,11 @@ class SkyvernPage(Page):
             )
             return result
         except Exception as e:
+            redaction_value = actual_value if value_is_sensitive else None
             LOG.info(
                 "fill_autocomplete selector path failed, trying AI fallback",
-                selector=selector,
-                error=str(e),
+                selector=redact_sensitive_value(selector, redaction_value),
+                error=redact_sensitive_value(str(e), redaction_value),
             )
             if prompt:
                 return await self._ai.ai_input_text(
@@ -868,8 +887,10 @@ class SkyvernPage(Page):
                     intention=prompt,
                     data=data,
                     timeout=timeout,
+                    value_is_sensitive=value_is_sensitive,
                 )
-            raise
+            error_to_raise = SkyvernActionFailed(redact_sensitive_value(str(e), redaction_value))
+        raise error_to_raise
 
     # Common selectors for autocomplete dropdown options, tried in order.
     _AUTOCOMPLETE_OPTION_SELECTORS = [
@@ -915,8 +936,6 @@ class SkyvernPage(Page):
             # commit, then verify the value stuck.
             LOG.info(
                 "fill_autocomplete: no dropdown options found, trying Enter to commit",
-                selector=selector,
-                value=value,
             )
             await locator.press("Enter", timeout=timeout)
             await asyncio.sleep(0.5)
@@ -926,8 +945,6 @@ class SkyvernPage(Page):
             if current_value.strip():
                 LOG.info(
                     "fill_autocomplete: value committed via Enter",
-                    selector=selector,
-                    value=current_value,
                 )
                 return current_value
 
@@ -935,8 +952,6 @@ class SkyvernPage(Page):
             # Re-type and try clicking the first available option after a longer wait.
             LOG.info(
                 "fill_autocomplete: value cleared after Enter, retrying with longer wait",
-                selector=selector,
-                value=value,
             )
             await locator.clear(timeout=timeout)
             await handler_utils.input_sequentially(locator, value, timeout=timeout)
@@ -946,8 +961,6 @@ class SkyvernPage(Page):
                 # Last resort: just fill the raw value and hope it sticks
                 LOG.warning(
                     "fill_autocomplete: no dropdown after retry, filling raw value",
-                    selector=selector,
-                    value=value,
                 )
                 await locator.fill(value, timeout=timeout)
                 return value
@@ -958,8 +971,6 @@ class SkyvernPage(Page):
             await best_match.click(timeout=timeout)
             LOG.info(
                 "fill_autocomplete: clicked matching dropdown option",
-                selector=selector,
-                value=value,
             )
         else:
             # No close text match — click the first option as best guess
@@ -967,8 +978,6 @@ class SkyvernPage(Page):
             await first.click(timeout=timeout)
             LOG.info(
                 "fill_autocomplete: no close text match, clicked first option",
-                selector=selector,
-                value=value,
             )
 
         # Wait for the selection to register in the UI
@@ -1060,15 +1069,19 @@ class SkyvernPage(Page):
 
         # For single-digit TOTP values (from multi-field TOTP inputs), force fallback mode
         # so that we use the exact digit value instead of having AI generate a new one
-        if value and len(value) == 1 and value.isdigit() and ai == "proactive":
+        if isinstance(value, ResolvedSensitiveValue) and ai == "proactive":
             ai = "fallback"
 
         # format the text with the actual value of the parameter if it's a secret when running a workflow
         if ai == "fallback":
             error_to_raise = None
+            value_is_sensitive = False
             original_selector = selector  # preserve for fallback episode recording
             if selector:
                 try:
+                    value_is_sensitive = isinstance(
+                        original_value, ResolvedSensitiveValue
+                    ) or self._is_secret_reference(original_value)
                     if resolved_totp_value is not None:
                         value = resolved_totp_value
                     else:
@@ -1077,6 +1090,7 @@ class SkyvernPage(Page):
                             totp_identifier=totp_identifier,
                             totp_url=totp_url,
                         )
+                    value_is_sensitive = value_is_sensitive or value != original_value
                     if is_unresolved_totp_value(value):
                         raise NoTOTPSecretFound()
                     # Retry selector lookup to handle page transitions (redirects,
@@ -1101,12 +1115,14 @@ class SkyvernPage(Page):
                 except NoTOTPSecretFound:
                     raise
                 except Exception as e:
+                    redaction_value = value if value_is_sensitive else None
+                    redacted_error = redact_sensitive_value(str(e), redaction_value)
                     LOG.warning(
                         "CSS selector fill failed, falling back to AI",
-                        selector=selector,
-                        error=str(e),
+                        selector=redact_sensitive_value(selector, redaction_value),
+                        error=redacted_error,
                     )
-                    error_to_raise = e
+                    error_to_raise = SkyvernActionFailed(redacted_error)
                     selector = None
 
             if intention:
@@ -1121,6 +1137,7 @@ class SkyvernPage(Page):
                     failed_selector=original_selector or "",
                     block_label=self.current_label,
                     recoverable_marker_id=recoverable_marker_id,
+                    value_is_sensitive=value_is_sensitive,
                 )
             if error_to_raise:
                 raise error_to_raise

@@ -6,13 +6,14 @@ import re
 import socket
 from collections.abc import Iterable
 from dataclasses import dataclass
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qsl, urlparse, urlsplit, urlunparse, urlunsplit
 
 import structlog
 from playwright.async_api import Browser, Playwright
 
 from skyvern.config import settings
 from skyvern.exceptions import CdpConnectionConfigurationError
+from skyvern.webeye.cdp_credentials import LIVE_VIEW_PATH_SEGMENT, marked_credential_segment
 
 LOG = structlog.get_logger()
 DEFAULT_CDP_CONNECT_TIMEOUT_MS = 30_000
@@ -88,6 +89,60 @@ def strip_browser_address_discriminator(url: str) -> str:
     if parsed.fragment.startswith("pbs_"):
         return urlunparse(parsed._replace(fragment=""))
     return url
+
+
+REDACTED = "[REDACTED]"
+
+
+def redact_cdp_url(url: str | None) -> str:
+    """A CDP or live-view address with every credential position masked.
+
+    The single place that decides what of an address may be written down. Five positions carry a
+    secret, and each is one an edge reads back out:
+
+    - the query (a session token, a vendor api key) and userinfo;
+    - the segment after a path credential marker, ``/<marker>/<secret>/<session_id>``, which is
+      how a header-less client authenticates to the router;
+    - the routing token in ``/{session_id}/{token}/devtools/...`` (legacy CDP);
+    - the token trailing ``/vnc/{session_id}`` (legacy live view).
+
+    The markers and the live-view prefix come from ``cdp_credentials``, which owns them; the
+    router's ``_parse_request`` restates them (it may not import this package) and a contract
+    test pins the two equal, so this cannot fall behind what the router will accept. Scheme,
+    host, port, parameter names and the session id survive, so a redacted line still identifies
+    the session and the endpoint it was dialing.
+    """
+    if not url:
+        return ""
+    try:
+        split = urlsplit(url)
+    except ValueError:
+        return REDACTED
+
+    netloc = split.netloc
+    if "@" in netloc:
+        netloc = f"{REDACTED}@{netloc.rsplit('@', 1)[1]}"
+
+    query = "&".join(f"{name}={REDACTED}" for name, _ in parse_qsl(split.query, keep_blank_values=True))
+
+    path = split.path
+    segments = [segment for segment in path.split("/") if segment]
+    credential_indices: set[int] = set()
+    marked = marked_credential_segment(segments)
+    if marked is not None:
+        credential_indices.add(marked)
+    if len(segments) >= 4 and segments[2] == "devtools":
+        credential_indices.add(1)
+    if segments and segments[0].lower() == LIVE_VIEW_PATH_SEGMENT:
+        # /vnc/{session_id} carries its token in the query; anything past the session id is the
+        # legacy edge's trailing token.
+        credential_indices.update(range(2, len(segments)))
+    if credential_indices:
+        path = "/" + "/".join(
+            REDACTED if index in credential_indices else segment for index, segment in enumerate(segments)
+        )
+
+    return urlunsplit((split.scheme, netloc, path, query, split.fragment))
 
 
 _LOCAL_CONTAINER_CDP_PORT = 9222
@@ -228,8 +283,8 @@ def build_cdp_configuration_error(
         return None
 
     guidance = (
-        f"Skyvern reached the configured CDP address ({remote_browser_url}), but "
-        f"{discovery_url} returned HTTP {status_code}. Skyvern cdp-connect requires "
+        f"Skyvern reached the configured CDP address ({redact_cdp_url(remote_browser_url)}), but "
+        f"{redact_cdp_url(discovery_url)} returned HTTP {status_code}. Skyvern cdp-connect requires "
         "Chrome's classic DevTools Protocol endpoint, where /json/version returns JSON "
         "with webSocketDebuggerUrl. If you enabled chrome://inspect/#remote-debugging, "
         "set BROWSER_REMOTE_DEBUGGING_URL to the direct full "
@@ -272,8 +327,8 @@ async def connect_over_cdp_with_diagnostics(
             LOG.warning(
                 message,
                 reason=candidate.label,
-                remote_browser_url=remote_browser_url,
-                fallback_url=candidate.url,
+                remote_browser_url=redact_cdp_url(remote_browser_url),
+                fallback_url=redact_cdp_url(candidate.url),
             )
             try:
                 return await playwright.chromium.connect_over_cdp(

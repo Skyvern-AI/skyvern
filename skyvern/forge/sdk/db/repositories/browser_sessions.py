@@ -891,12 +891,18 @@ class BrowserSessionsRepository(BaseRepository):
         organization_id: str | None = None,
         upstream_cdp_url: str | None = None,
         browser_vendor: str | None = None,
+        mark_started: bool = False,
     ) -> None:
         """Set the browser address for a persistent browser session.
 
         browser_address is the client-facing (proxied) URL; upstream_cdp_url is the endpoint the
         CDP proxy dials and must never be handed to a client. It is never a long-lived operator
         credential, though it may carry a session-scoped token.
+
+        mark_started starts the session's timeout clock, which is not implied by writing an
+        address: an address naming the session rather than the browser is publishable before
+        anything is provisioned, and starting the clock there would bill and expire a session
+        that has no browser yet.
         """
         async with self.Session() as session:
             persistent_browser_session = (
@@ -910,7 +916,7 @@ class BrowserSessionsRepository(BaseRepository):
             if persistent_browser_session:
                 if browser_address:
                     persistent_browser_session.browser_address = browser_address
-                    # once the address is set, the session is started
+                if mark_started:
                     persistent_browser_session.started_at = naive_utc_now()
                 if ip_address:
                     persistent_browser_session.ip_address = ip_address
