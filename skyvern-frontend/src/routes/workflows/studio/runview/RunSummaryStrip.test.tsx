@@ -7,7 +7,6 @@ import {
   screen,
   within,
 } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, test } from "vitest";
 
 import {
@@ -31,64 +30,18 @@ function makeRun(
     started_at: "2026-07-01T00:00:00Z",
     finished_at: "2026-07-01T00:05:00Z",
     failure_category: null,
-    browser_session_id: null,
-    browser_profile_id: null,
     ...overrides,
   } as WorkflowRunStatusApiResponseWithWorkflow;
 }
 
 function renderStrip(run: WorkflowRunStatusApiResponseWithWorkflow) {
   return render(
-    <MemoryRouter>
-      {/* The studio shell provides this in production (StudioShell root). */}
-      <TooltipProvider delayDuration={0}>
-        <RunSummaryStrip workflowRun={run} />
-      </TooltipProvider>
-    </MemoryRouter>,
+    // The studio shell provides this in production (StudioShell root).
+    <TooltipProvider delayDuration={0}>
+      <RunSummaryStrip workflowRun={run} />
+    </TooltipProvider>,
   );
 }
-
-describe("RunSummaryStrip browser session/profile links", () => {
-  test("links the run's browser session and profile at the legacy targets", () => {
-    renderStrip(
-      makeRun({
-        browser_session_id: "pbs_abc",
-        browser_profile_id: "bp_def",
-      }),
-    );
-    expect(
-      screen.getByRole("link", { name: "pbs_abc" }).getAttribute("href"),
-    ).toBe("/browser-session/pbs_abc/stream");
-    expect(
-      screen.getByRole("link", { name: "bp_def" }).getAttribute("href"),
-    ).toBe("/browser-profiles/bp_def");
-  });
-
-  test("renders only the id the run has", () => {
-    renderStrip(makeRun({ browser_session_id: "pbs_abc" }));
-    expect(screen.getByRole("link", { name: "pbs_abc" })).toBeTruthy();
-    expect(screen.queryByTitle("Browser profile")).toBeNull();
-  });
-
-  test("renders no id chips at all when the run has neither", () => {
-    // The run id itself lives in the top bar's "View Run" tab, not the strip.
-    renderStrip(makeRun());
-    expect(screen.queryByText("wr_123")).toBeNull();
-    expect(screen.queryByRole("link")).toBeNull();
-  });
-
-  test("groups the session and profile chips without the run id", () => {
-    renderStrip(
-      makeRun({
-        browser_session_id: "pbs_abc",
-        browser_profile_id: "bp_def",
-      }),
-    );
-    expect(screen.queryByText("wr_123")).toBeNull();
-    expect(screen.getByText("pbs_abc")).toBeTruthy();
-    expect(screen.getByText("bp_def")).toBeTruthy();
-  });
-});
 
 describe("RunSummaryStrip duration", () => {
   test("shows a single elapsed chip for a finalized run", () => {
@@ -137,5 +90,10 @@ describe("RunSummaryStrip status badge", () => {
     ).not.toBeNull();
     // aria-label is only present in the badge's collapsible mode
     expect(container.querySelector('[aria-label="completed"]')).not.toBeNull();
+  });
+
+  test("renders no links — ids live in the top bar and the Inputs view", () => {
+    renderStrip(makeRun());
+    expect(screen.queryByRole("link")).toBeNull();
   });
 });

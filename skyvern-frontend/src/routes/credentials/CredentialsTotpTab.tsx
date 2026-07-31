@@ -34,21 +34,16 @@ import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { GmailIcon } from "@/components/icons/GmailIcon";
 import { OutlookIcon } from "@/components/icons/OutlookIcon";
 import CloudContext from "@/store/CloudContext";
+import { safeHttpUrl } from "@/util/httpUrl";
 
 type OtpTypeFilter = "all" | OtpTypeValue;
+type CredentialsTotpTabVariant = "twoFactor" | "magicLink";
+
+type Props = {
+  variant?: CredentialsTotpTabVariant;
+};
 
 const LIMIT_OPTIONS = [25, 50, 100] as const;
-
-function safeHttpUrl(value: string): string | null {
-  try {
-    const url = new URL(value);
-    return url.protocol === "http:" || url.protocol === "https:"
-      ? url.toString()
-      : null;
-  } catch {
-    return null;
-  }
-}
 
 function otpTypeLabel(otpType: OtpTypeValue | null): string {
   switch (otpType) {
@@ -88,21 +83,39 @@ function renderCodeContent(code: TotpCode) {
   return code.code;
 }
 
-function CredentialsTotpTab() {
+function CredentialsTotpTab({ variant = "twoFactor" }: Props) {
   const isCloud = useContext(CloudContext);
   const [identifierFilter, setIdentifierFilter] = useState("");
   const [otpTypeFilter, setOtpTypeFilter] = useState<OtpTypeFilter>("all");
   const [limit, setLimit] = useState<(typeof LIMIT_OPTIONS)[number]>(50);
+  const [selectedPushOtpType, setSelectedPushOtpType] = useState<OtpTypeValue>(
+    OtpType.Totp,
+  );
+  const isMagicLink = variant === "magicLink";
+  const effectivePushOtpType = isMagicLink
+    ? OtpType.MagicLink
+    : selectedPushOtpType;
+  const isPushMagicLink = effectivePushOtpType === OtpType.MagicLink;
+  const variantArtifactPlural = isMagicLink ? "magic links" : "codes";
+  const automaticInboxArtifact = isMagicLink
+    ? variantArtifactPlural
+    : "verification codes and magic links";
+  const inboxProviders = isCloud ? "Gmail or Outlook" : "Gmail";
+  const automaticInboxDescription = `Skyvern can find ${automaticInboxArtifact} in a connected ${inboxProviders} inbox without manual forwarding.`;
 
   const queryClient = useQueryClient();
 
   const queryParams = useMemo(() => {
     return {
       totp_identifier: identifierFilter.trim() || undefined,
-      otp_type: otpTypeFilter === "all" ? undefined : otpTypeFilter,
+      otp_type: isMagicLink
+        ? OtpType.MagicLink
+        : otpTypeFilter === "all"
+          ? undefined
+          : otpTypeFilter,
       limit,
     };
-  }, [identifierFilter, limit, otpTypeFilter]);
+  }, [identifierFilter, isMagicLink, limit, otpTypeFilter]);
 
   const { data, isLoading, isFetching, isFeatureUnavailable } =
     useTotpCodesQuery({
@@ -130,12 +143,12 @@ function CredentialsTotpTab() {
             </div>
             <div>
               <h2 className="text-base font-semibold">
-                Automatic 2FA from your inbox
+                {isMagicLink
+                  ? "Automatic magic links from your inbox"
+                  : "Automatic 2FA from your inbox"}
               </h2>
               <p className="mt-1 max-w-2xl text-sm text-neutral-600 dark:text-slate-400">
-                {isCloud
-                  ? "Skyvern can find verification codes and magic links in a connected Gmail or Outlook inbox without manual forwarding."
-                  : "Skyvern can find verification codes and magic links in a connected Gmail inbox without manual forwarding."}
+                {automaticInboxDescription}
               </p>
             </div>
           </div>
@@ -148,13 +161,16 @@ function CredentialsTotpTab() {
       </div>
 
       <div className="rounded-lg border border-slate-700 bg-slate-elevation1 p-6">
-        <h2 className="text-lg font-semibold">Push a 2FA Code</h2>
+        <h2 className="text-lg font-semibold">
+          {isPushMagicLink ? "Push a Magic Link" : "Push a 2FA Code"}
+        </h2>
         <p className="mt-1 text-sm text-neutral-600 dark:text-slate-400">
-          Paste the verification message you received. Skyvern extracts the code
-          and attaches it to the relevant run.
+          {isPushMagicLink
+            ? "Paste the magic link message you received. Skyvern extracts the link and attaches it to the relevant run."
+            : "Paste the verification message you received. Skyvern extracts the code and attaches it to the relevant run."}
         </p>
         <p className="mt-2 text-sm text-neutral-600 dark:text-slate-400">
-          Prefer to send codes programmatically? See the{" "}
+          {`Prefer to send ${isPushMagicLink ? "magic links" : "codes"} programmatically? See the `}
           <a
             href="https://docs.skyvern.com/api-reference/credentials/send-totp-code"
             target="_blank"
@@ -167,7 +183,9 @@ function CredentialsTotpTab() {
         </p>
         <PushTotpCodeForm
           className="mt-4"
+          fixedOtpType={isMagicLink ? OtpType.MagicLink : undefined}
           showAdvancedFields
+          onOtpTypeChange={setSelectedPushOtpType}
           onSuccess={handleFormSuccess}
         />
       </div>
@@ -184,24 +202,28 @@ function CredentialsTotpTab() {
                 onChange={(event) => setIdentifierFilter(event.target.value)}
               />
             </div>
-            <div className="space-y-1">
-              <Label htmlFor="totp-type-filter">OTP Type</Label>
-              <Select
-                value={otpTypeFilter}
-                onValueChange={(value: OtpTypeFilter) =>
-                  setOtpTypeFilter(value)
-                }
-              >
-                <SelectTrigger id="totp-type-filter" className="w-40">
-                  <SelectValue placeholder="All types" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All types</SelectItem>
-                  <SelectItem value={OtpType.Totp}>Numeric code</SelectItem>
-                  <SelectItem value={OtpType.MagicLink}>Magic link</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
+            {!isMagicLink && (
+              <div className="space-y-1">
+                <Label htmlFor="totp-type-filter">OTP Type</Label>
+                <Select
+                  value={otpTypeFilter}
+                  onValueChange={(value: OtpTypeFilter) =>
+                    setOtpTypeFilter(value)
+                  }
+                >
+                  <SelectTrigger id="totp-type-filter" className="w-40">
+                    <SelectValue placeholder="All types" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All types</SelectItem>
+                    <SelectItem value={OtpType.Totp}>Numeric code</SelectItem>
+                    <SelectItem value={OtpType.MagicLink}>
+                      Magic link
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
             <div className="space-y-1">
               <Label htmlFor="totp-limit-filter">Limit</Label>
               <Select
@@ -240,11 +262,15 @@ function CredentialsTotpTab() {
 
         {isFeatureUnavailable && (
           <Alert variant="destructive">
-            <AlertTitle>2FA listing unavailable</AlertTitle>
+            <AlertTitle>
+              {isMagicLink
+                ? "Magic link listing unavailable"
+                : "2FA listing unavailable"}
+            </AlertTitle>
             <AlertDescription>
               Upgrade the backend to include{" "}
               <code>GET /v1/credentials/totp</code>. Once available, this tab
-              will automatically populate with codes.
+              will automatically populate with {variantArtifactPlural}.
             </AlertDescription>
           </Alert>
         )}
@@ -281,8 +307,9 @@ function CredentialsTotpTab() {
                       colSpan={6}
                       className="text-center text-sm text-neutral-600 dark:text-slate-300"
                     >
-                      No 2FA codes yet. Paste a verification message above or
-                      configure automatic forwarding.
+                      {isMagicLink
+                        ? "No magic links yet. Paste a magic link message above or connect an email account."
+                        : "No 2FA codes yet. Paste a verification message above or configure automatic forwarding."}
                     </TableCell>
                   </TableRow>
                 ) : null}
