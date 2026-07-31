@@ -124,6 +124,7 @@ from skyvern.forge.sdk.services.credentials import (
     normalize_totp_config,
     parse_totp_config,
 )
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
@@ -3332,6 +3333,7 @@ async def test_custom_credential_service_connection(
 async def _get_credential_vault_service(
     vault_type_override: CredentialVaultType | None = None,
 ) -> CredentialVaultService:
+    settings = SettingsManager.get_settings()
     vault_type = vault_type_override or settings.CREDENTIAL_VAULT_TYPE
     if vault_type == CredentialVaultType.SKYVERN:
         if not settings.is_local_credential_vault_enabled():

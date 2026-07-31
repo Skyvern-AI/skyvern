@@ -104,6 +104,17 @@ class PersistentBrowserSession(BaseModel):
     # so teardown exported under the session id rather than the bp_ id.
     browser_profile_loaded: bool = True
 
+    @property
+    def is_browser_ready(self) -> bool:
+        """Whether a browser exists for this session and can be connected to.
+
+        Keyed on upstream_cdp_url and NOT on browser_address: a client-facing address can be
+        minted when the session is created, before anything is provisioned, so its presence says
+        only that an address was issued. The session worker writes this column in the same call
+        that starts the session clock, which is what makes it the readiness signal.
+        """
+        return bool(self.upstream_cdp_url)
+
     @field_validator("proxy_location", mode="before")
     @classmethod
     def deserialize_proxy_location_field(cls, value: object) -> object:
