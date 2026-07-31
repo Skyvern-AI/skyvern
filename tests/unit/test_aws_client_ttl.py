@@ -83,6 +83,42 @@ def test_refresh_session_creates_new_session():
     assert client.session is not old_session
 
 
+def test_client_session_reused_within_ttl():
+    with patch.object(aws.aioboto3, "Session", side_effect=lambda **_: MagicMock()) as mock_session:
+        client = aws.AsyncAWSClient()
+        first = client.session
+        second = client.session
+
+    assert first is second
+    assert mock_session.call_count == 1
+
+
+def test_client_session_recreated_after_ttl():
+    """Any holder of AsyncAWSClient (e.g. the storage singleton on a long-lived worker) gets a
+    fresh session past the TTL, not just callers of the module-level get_aws_client() factory."""
+    with patch.object(aws.aioboto3, "Session", side_effect=lambda **_: MagicMock()) as mock_session:
+        client = aws.AsyncAWSClient()
+        first = client.session
+        client._session_created_at = time.monotonic() - (aws._SESSION_TTL_SECONDS + 1)
+        second = client.session
+
+    assert first is not second
+    assert mock_session.call_count == 2
+
+
+def test_setter_stamps_session_ttl_clock():
+    """A backdated clock plus a setter-installed session must not trigger recreation: the setter
+    stamps the TTL clock. Deterministic regardless of host uptime, unlike the compat test."""
+    client = aws.AsyncAWSClient()
+    client._session_created_at = -(aws._SESSION_TTL_SECONDS + 1)
+    session = MagicMock()
+
+    client.session = session
+
+    assert client._session_created_at > 0
+    assert client.session is session
+
+
 def test_no_profile_session_creation_uses_default_credential_chain(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("AWS_PROFILE", raising=False)
     session = MagicMock()
