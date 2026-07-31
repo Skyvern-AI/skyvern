@@ -27487,6 +27487,19 @@
               }
             ],
             "title": "Workflow System Prompt"
+          },
+          "completion_contract": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completion Contract",
+            "description": "Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand."
           }
         },
         "type": "object",
@@ -27730,6 +27743,19 @@
               }
             ],
             "title": "Workflow System Prompt"
+          },
+          "completion_contract": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completion Contract",
+            "description": "Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand."
           }
         },
         "type": "object",
