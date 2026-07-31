@@ -63,6 +63,7 @@ from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
 from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
+from skyvern.utils.email_validation import normalize_identifier_if_email
 from skyvern.utils.url_validators import pinned_ip_client
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
@@ -1756,7 +1757,7 @@ class AgentFunction:
                                 # Persist only the resolved OTP value to avoid retaining raw email bodies.
                                 await app.DATABASE.otp.create_otp_code(
                                     organization_id,
-                                    totp_identifier,
+                                    normalize_identifier_if_email(totp_identifier),
                                     otp_value.value,
                                     otp_value.value,
                                     otp_value.get_otp_type(),
