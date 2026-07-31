@@ -15,7 +15,7 @@ from skyvern.webeye.browser_errors import (
     BrowserTargetClosedError,
     BrowserTimeoutError,
 )
-from skyvern.webeye.cdp_connection import strip_browser_address_discriminator
+from skyvern.webeye.cdp_connection import redact_cdp_url, strip_browser_address_discriminator
 
 if TYPE_CHECKING:
     from skyvern.webeye.browser_engine import BrowserEngineSelection
@@ -106,7 +106,7 @@ async def connect_over_cdp_with_retry(
     selection: BrowserEngineSelection | None = None,
 ) -> Browser:
     browser_address = strip_browser_address_discriminator(browser_address)
-    browser_address_for_logs = log_browser_address or browser_address
+    browser_address_for_logs = log_browser_address or redact_cdp_url(browser_address)
     max_attempts, backoff_schedule = _resolve_retry_budget()
     for attempt in range(1, max_attempts + 1):
         try:
