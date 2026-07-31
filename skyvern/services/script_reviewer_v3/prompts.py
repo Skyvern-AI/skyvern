@@ -13,6 +13,8 @@ a short instruction-of-the-moment ("tell me what to do next").
 
 from __future__ import annotations
 
+from skyvern.services.script_reviewer_v3.redaction import REDACTED_SECRET_PLACEHOLDER, redact_sensitive_value
+
 MIDRUN_SYSTEM_PROMPT = """\
 You are the Skyvern v3 mid-run script reviewer. A cached script just failed \
 to find or use an element on a live page. You have a live Playwright browser \
@@ -22,6 +24,10 @@ Goal: apply an in-flight fix (live_try_click / live_try_fill) that lets the \
 workflow continue, then call declare_success. If you cannot reliably fix it, \
 call give_up — the workflow will fall through to the agent fallback and the \
 post-run reviewer will analyze this episode later.
+
+The failed fill value is redacted from your context when it is sensitive. \
+live_try_fill refuses resolved credentials; for ordinary fills, pass a \
+corrected value only when the failure was caused by its format.
 
 Operating principles:
 
@@ -265,8 +271,11 @@ def build_midrun_user_prompt(*, episode_id: str, fc_summary: dict) -> str:
         f"failed_selector: {fc_summary.get('failed_selector')!r}",
         f"intention: {fc_summary.get('intention')!r}",
     ]
-    if fc_summary.get("value") is not None:
-        lines.append(f"value: {fc_summary['value']!r}")
+    value = fc_summary.get("value")
+    value_is_sensitive = bool(fc_summary.get("value_is_sensitive"))
+    if value is not None:
+        display_value = REDACTED_SECRET_PLACEHOLDER if value_is_sensitive else value
+        lines.append(f"value: {display_value!r}")
     if fc_summary.get("totp_identifier"):
         lines.append(f"totp_identifier: {fc_summary['totp_identifier']!r}")
     if fc_summary.get("page_url"):
@@ -276,7 +285,8 @@ def build_midrun_user_prompt(*, episode_id: str, fc_summary: dict) -> str:
         "Plan your investigation. The live browser is at the moment-of-failure state.",
         "Start with live_get_url and live_get_dom. End with declare_success or give_up.",
     ]
-    return "\n".join(lines)
+    prompt = "\n".join(lines)
+    return redact_sensitive_value(prompt, value if value_is_sensitive and isinstance(value, str) else None)
 
 
 def build_postrun_user_prompt(*, prc_summary: dict) -> str:

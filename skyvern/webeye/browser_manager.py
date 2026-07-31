@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Protocol
 
 import structlog
@@ -10,6 +11,12 @@ from skyvern.webeye.browser_artifacts import VideoArtifact
 from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
+
+
+@dataclass(frozen=True)
+class BrowserCleanupResult:
+    browser_state: BrowserState | None
+    recording_finalized: bool
 
 
 class BrowserManager(Protocol):
@@ -42,7 +49,7 @@ class BrowserManager(Protocol):
         browser_session_id: str | None = None,
         organization_id: str | None = None,
         child_workflow_run_ids: list[str] | None = None,
-    ) -> BrowserState | None: ...
+    ) -> BrowserCleanupResult: ...
 
     async def get_or_create_for_script(
         self,
