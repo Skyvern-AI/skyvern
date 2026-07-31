@@ -1406,6 +1406,10 @@ class WorkflowDefinitionYAML(BaseModel):
     finally_block_label: str | None = None
     error_code_mapping: dict[str, str] | None = None
     workflow_system_prompt: str | None = None
+    completion_contract: dict[str, Any] | None = Field(
+        default=None,
+        description="Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand.",
+    )
 
     @model_validator(mode="after")
     def validate_unique_block_labels(self) -> "WorkflowDefinitionYAML":

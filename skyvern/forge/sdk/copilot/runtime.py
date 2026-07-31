@@ -528,6 +528,10 @@ class AgentContext:
     # Selector of an in-flight click, captured pre-dispatch so a failed/timed-out click can gate a
     # settle re-perception on whether that selector still resolves to a live element.
     pending_scout_click_selector: str | None = None
+    # Browser-session download filenames snapshotted before a scout click, so the post-hook can tell
+    # a download this click produced from one an earlier click left behind.
+    pending_scout_download_snapshot: frozenset[str] | None = None
+    repair_obligation_nudge_count: int = 0
     # (selector, ambiguous) verdict from a pre-dispatch live count probe, applied to the recorded
     # interaction only when the post-action resolved selector matches the probed one.
     pending_scout_ambiguous: tuple[str, bool] | None = None
@@ -567,6 +571,23 @@ class AgentContext:
     # Claimant whose owned claim stashed the current blocker_signal; the stash choke-point clears
     # it whenever the held signal changes identity, so a plain stash can never alias a stale owner.
     blocker_signal_claimant: TurnClaimant | None = None
+
+
+def diagnosis_repair_obligation_open(ctx: AgentContext) -> bool:
+    """True while the latest diagnosis contract says the failed run is repairable and no later run has
+    discharged it. The build-test oracle already reported the failure; this keeps the loop on the hook for
+    consuming it, so a turn cannot observe the reached page once and then finalize a draft the run disproved.
+
+    Keyed on the typed decision, never on a nudge count: the contract's own ASK/STOP/NO_CHANGE transitions
+    discharge it, and the operational total-turn timeout bounds it."""
+    # Deferred: diagnosis_repair_contract reaches this module through context, so a module-level
+    # import cycles.
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+
+    contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
+    if contract is None:
+        return False
+    return contract.repair_decision.next_action is RepairNextAction.REPAIR
 
 
 def output_contract_ladder_unresolved(ctx: AgentContext) -> bool:

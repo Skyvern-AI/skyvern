@@ -70,6 +70,7 @@ from skyvern.exceptions import (
     MissingStarterUrl,
     NoTOTPVerificationCodeFound,
     PDFParsingError,
+    ScriptTerminationException,
     SkyvernException,
     SyncTriggeredSequentialCredentialUnsupported,
     TaskNotFound,
@@ -104,6 +105,10 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
+from skyvern.forge.sdk.copilot.reached_download_target import (
+    block_output_has_registered_download,
+    code_is_download_intent,
+)
 from skyvern.forge.sdk.copilot.runtime import _browser_context_is_attachable
 from skyvern.forge.sdk.copilot.self_heal_recovery import SelfHealRecoveryResult, run_self_heal_recovery
 from skyvern.forge.sdk.copilot.turn_origin import HealAdoptionFailed, TurnOrigin
@@ -4500,6 +4505,61 @@ async def wrapper({default_args}):
         )
         return compose_mini_goal(main_goal=safe_main, mini_goal=safe_mini)
 
+    async def _record_unregistered_download_intent(
+        self,
+        *,
+        engine: str,
+        registered: bool,
+        output: object,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+    ) -> None:
+        """Record a block that authors a browser download but registered no file.
+
+        Telemetry only, and deliberately not outcome authority: the AST shape is evadable and
+        authorship is not a promise. The outcome belongs to the workflow's persisted completion
+        contract, graded at run finalization; this record's deletion condition is that coverage.
+        Emitted from every execution engine so the prevalence it measures is not engine-biased.
+        """
+        if registered or not code_is_download_intent(self.code):
+            return
+        LOG.warning(
+            "codeblock.download_intent_unregistered",
+            engine=engine,
+            copilot_authored=await self._workflow_is_copilot_authored(workflow_run_context),
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            block_label=self.label,
+            code_sha256=hashlib.sha256(self.code.encode()).hexdigest(),
+            result_keys=sorted(output.keys()) if isinstance(output, dict) else None,
+            organization_id=organization_id,
+        )
+
+    async def _workflow_is_copilot_authored(self, workflow_run_context: WorkflowRunContext) -> bool:
+        workflow = workflow_run_context.workflow
+        if workflow is None:
+            return False
+        if "copilot" in (workflow.created_by, workflow.edited_by):
+            return True
+        # User saves re-stamp both fields with the user id, so the current version alone is
+        # not durable; fall back to lineage (copilot stamps every version it writes and
+        # back-stamps v1 on copilot-born workflows). A lookup failure must fail closed —
+        # callers gate copilot-only behavior on this, and it must never mask a block failure.
+        try:
+            return await app.DATABASE.workflows.is_workflow_copilot_authored(
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=workflow.organization_id,
+            )
+        except Exception:
+            LOG.warning(
+                "Copilot-lineage lookup failed; failing closed",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                exc_info=True,
+            )
+            return False
+
     async def _self_heal_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
         # User-facing per-workflow setting, restricted to copilot-authored workflows —
         # pre-copilot code blocks must never gain agentic recovery from the toggle alone.
@@ -4509,24 +4569,7 @@ async def wrapper({default_args}):
         workflow = workflow_run_context.workflow
         if workflow is None or not workflow.enable_self_healing:
             return False
-        if "copilot" in (workflow.created_by, workflow.edited_by):
-            return True
-        # User saves re-stamp both fields with the user id, so the current version alone is
-        # not durable; fall back to lineage (copilot stamps every version it writes and
-        # back-stamps v1 on copilot-born workflows). This runs inside the block's exception
-        # handler — a lookup failure must fail closed, never mask the original block failure.
-        try:
-            return await app.DATABASE.workflows.is_workflow_copilot_authored(
-                workflow_permanent_id=workflow.workflow_permanent_id,
-                organization_id=workflow.organization_id,
-            )
-        except Exception:
-            LOG.warning(
-                "Self-heal copilot-lineage lookup failed; failing closed (no heal)",
-                workflow_permanent_id=workflow.workflow_permanent_id,
-                exc_info=True,
-            )
-            return False
+        return await self._workflow_is_copilot_authored(workflow_run_context)
 
     def _is_healable_page_failure(
         self,
@@ -4841,9 +4884,9 @@ async def wrapper({default_args}):
             or failure.healability_hint is not None
         )
         if not has_structured:
-            # No healability_hint to disambiguate, so only the page-class code heals blind;
+            # No healability_hint to disambiguate, so only the page-class codes heal blind;
             # user_code_error is ambiguous (could be a bare `raise`) and stays fail-closed.
-            if failure.error_code == "unsupported_page_operation":
+            if failure.error_code in {"unsupported_page_operation", "browser_operation_failed"}:
                 return HealClassification(healable=True, skip_reason=None)
             return HealClassification(
                 healable=False,
@@ -5542,10 +5585,22 @@ async def wrapper({default_args}):
                         await recorder.finalize(success=False)
                         return secure_code_block_result.block_result
                     await recorder.finalize(success=True)
+                    secure_output = secure_code_block_result.block_result.output_parameter_value
+                    await self._record_unregistered_download_intent(
+                        engine="secure_runner",
+                        # The sidecar registers into the block output, so that payload is the
+                        # registration evidence here — the inline directory diff never runs.
+                        registered=block_output_has_registered_download(secure_output),
+                        output=secure_output,
+                        workflow_run_context=workflow_run_context,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
                     await self.record_output_parameter_value(
                         workflow_run_context,
                         workflow_run_id,
-                        secure_code_block_result.block_result.output_parameter_value,
+                        secure_output,
                     )
                     return secure_code_block_result.block_result
                 LOG.warning(
@@ -5594,6 +5649,19 @@ async def wrapper({default_args}):
                 organization_id=organization_id,
             )
         except Exception as e:
+            # Exact type, not isinstance: the IllegitCompleteScriptTermination subclass means the
+            # complete-verifier rejected the block, which is a failure to heal, not an intentional stop.
+            if type(e) is ScriptTerminationException:
+                await recorder.persist(recorder.recorded_actions())
+                await recorder.finalize(success=False)
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=workflow_run_context.mask_secrets_in_data(str(e)),
+                    output_parameter_value=None,
+                    status=BlockStatus.terminated,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
             exc = CustomizedCodeException(e)
             failing_line = user_code_line_from_exception(e)
             # User code can raise an exception carrying a resolved secret (e.g.
@@ -5691,6 +5759,16 @@ async def wrapper({default_args}):
             result["downloaded_files"] = [fi.model_dump() for fi in downloaded_files]
             result["downloaded_file_urls"] = [fi.url for fi in downloaded_files]
             result["downloaded_file_artifact_ids"] = [fi.artifact_id for fi in downloaded_files if fi.artifact_id]
+
+        await self._record_unregistered_download_intent(
+            engine="inline",
+            registered=bool(downloaded_files),
+            output=result,
+            workflow_run_context=workflow_run_context,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
 
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result)
         return await self.build_block_result(
