@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import json
 import socket
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import structlog.testing
 from playwright.async_api import Playwright
 
 import skyvern.webeye.browser_factory as browser_factory
 import skyvern.webeye.cdp_connection as cdp_connection
 from skyvern.webeye.cdp_connection import (
+    REDACTED,
     build_cdp_connect_headers,
     build_cdp_connection_candidates,
     connect_over_cdp_with_diagnostics,
@@ -262,3 +266,30 @@ async def test_connect_over_cdp_accepts_direct_websocket_with_host_header() -> N
     assert fake_playwright.chromium.calls == [
         ("ws://host.docker.internal:9223/devtools/browser/abc", 120000, headers),
     ]
+
+
+@pytest.mark.asyncio
+async def test_cdp_connect_never_logs_a_credential_bearing_remote_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SKY-13287: `remote_browser_url` here is caller-supplied — a routed session address whose
+    query carries the session token, or a vendor endpoint carrying an api key. Both the connect
+    line and the launched line have to be readable without handing the reader that credential."""
+    secret = "pbs_routed.minted-secret"
+    routed_url = f"wss://session-router.skyvern.com/pbs_routed?token={secret}"
+
+    fake_context = object()
+    fake_browser = cast(Any, SimpleNamespace(contexts=[fake_context]))
+
+    async def fake_connect(*_args: Any, **_kwargs: Any) -> Any:
+        return fake_browser
+
+    monkeypatch.setattr(browser_factory, "_connect_over_cdp_with_diagnostics", fake_connect)
+
+    with structlog.testing.capture_logs() as logs:
+        await browser_factory._connect_to_cdp_browser(cast(Playwright, object()), routed_url)
+
+    rendered = json.dumps(logs, default=str)
+    assert secret not in rendered
+    assert "minted-secret" not in rendered
+    # Redacted, not dropped: the session it dialed still has to be identifiable.
+    assert "pbs_routed" in rendered
+    assert REDACTED in rendered
