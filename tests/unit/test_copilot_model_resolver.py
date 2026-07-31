@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
+from skyvern.forge.sdk.copilot.model_resolver import CopilotLitellmProvider, resolve_model_config
 
 
 def _install_config(monkeypatch: pytest.MonkeyPatch, config: Any, llm_key: str) -> MagicMock:
@@ -23,6 +23,21 @@ def _install_config(monkeypatch: pytest.MonkeyPatch, config: Any, llm_key: str) 
 
 
 class TestModelResolver:
+    def test_provider_returns_copilot_usage_adapter_with_per_provider_indices(self) -> None:
+        from skyvern.forge.sdk.copilot.model_telemetry import CopilotLitellmModel
+
+        provider = CopilotLitellmProvider(base_url="https://example.test", api_key="test-key")
+
+        first = provider.get_model("openai/gpt-5.6")
+        second = provider.get_model("openai/gpt-5.6")
+
+        assert isinstance(first, CopilotLitellmModel)
+        assert isinstance(second, CopilotLitellmModel)
+        assert first.base_url == second.base_url == "https://example.test"
+        assert first.api_key == second.api_key == "test-key"
+        assert first.next_model_call_index() == 1
+        assert second.next_model_call_index() == 2
+
     def test_router_config_empty_model_list_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError
         from skyvern.schemas.llm import LLMRouterConfig
