@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -7,7 +8,10 @@ import pytest
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.agent import _resolve_live_browser_session_id
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
+
+_UNSET_UPSTREAM = "<unset>"
 
 
 class _FakeBrowser:
@@ -32,8 +36,30 @@ def _request(browser_session_id: str | None = None, wpid: str = "wpid-1") -> Wor
     )
 
 
-def _running_session(browser_address: str = "wss://example/cdp") -> SimpleNamespace:
-    return SimpleNamespace(status="running", browser_address=browser_address)
+def _session(
+    *,
+    status: str = "running",
+    browser_address: str | None = "wss://example/cdp",
+    upstream_cdp_url: str | None = _UNSET_UPSTREAM,
+) -> PersistentBrowserSession:
+    """The real model rather than a stand-in: whether a session is usable is decided by its
+    upstream endpoint, which the session worker writes together with the address."""
+    now = datetime.now(timezone.utc)
+    return PersistentBrowserSession(
+        persistent_browser_session_id="pbs_test",
+        organization_id="org-1",
+        status=status,
+        browser_address=browser_address,
+        upstream_cdp_url=("ws://10.0.0.7:9223/devtools/browser/b-1" if browser_address else None)
+        if upstream_cdp_url is _UNSET_UPSTREAM
+        else upstream_cdp_url,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def _running_session(browser_address: str = "wss://example/cdp") -> PersistentBrowserSession:
+    return _session(browser_address=browser_address)
 
 
 @pytest.mark.asyncio
@@ -128,7 +154,7 @@ async def test_status_in_final_state_falls_back(monkeypatch: pytest.MonkeyPatch)
         "PERSISTENT_SESSIONS_MANAGER",
         SimpleNamespace(
             get_session=AsyncMock(
-                return_value=SimpleNamespace(status="completed", browser_address="wss://example/cdp"),
+                return_value=_session(status="completed"),
             ),
             can_probe_registered_browser_state=lambda: False,
         ),
@@ -158,7 +184,7 @@ async def test_browser_address_unset_falls_back(monkeypatch: pytest.MonkeyPatch)
         "PERSISTENT_SESSIONS_MANAGER",
         SimpleNamespace(
             get_session=AsyncMock(
-                return_value=SimpleNamespace(status="running", browser_address=None),
+                return_value=_session(browser_address=None),
             ),
             can_probe_registered_browser_state=lambda: False,
         ),
@@ -187,7 +213,7 @@ async def test_default_manager_registered_browser_state_allows_missing_browser_a
     )
     get_browser_state = AsyncMock(return_value=SimpleNamespace(browser_context=_FakeBrowserContext()))
     manager = SimpleNamespace(
-        get_session=AsyncMock(return_value=SimpleNamespace(status="running", browser_address=None)),
+        get_session=AsyncMock(return_value=_session(browser_address=None)),
         get_browser_state=get_browser_state,
         can_probe_registered_browser_state=lambda: True,
     )
@@ -217,7 +243,7 @@ async def test_default_manager_unattachable_registered_browser_state_falls_back(
     )
     get_browser_state = AsyncMock(return_value=SimpleNamespace(browser_context=None))
     manager = SimpleNamespace(
-        get_session=AsyncMock(return_value=SimpleNamespace(status="running", browser_address=None)),
+        get_session=AsyncMock(return_value=_session(browser_address=None)),
         get_browser_state=get_browser_state,
         can_probe_registered_browser_state=lambda: True,
     )
