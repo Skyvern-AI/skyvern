@@ -1814,6 +1814,14 @@ def _locator_expr(
         return _get_by_role_expr(role, name)
 
     notes.append("dropped an interaction with no selector and no role/name")
+    if diagnostics is not None:
+        diagnostics.dropped_interactions.append(
+            {
+                "trajectory_index": trajectory_index if trajectory_index is not None else -1,
+                "tool_name": tool_name,
+                "reason_code": "missing_selector_and_role_name",
+            }
+        )
     return ""
 
 
@@ -2300,6 +2308,12 @@ def synthesize_code_block(
             record["lane"] = lane
         diagnostics.emitted_interactions.append(record)
 
+    def already_recorded(trajectory_index: int) -> bool:
+        return any(
+            record.get("trajectory_index") == trajectory_index
+            for record in (*diagnostics.emitted_interactions, *diagnostics.dropped_interactions)
+        )
+
     entry_url = ""
     entry_index = -1
     entry_replay_condition_active = False
@@ -2519,17 +2533,15 @@ def synthesize_code_block(
         diagnostics.grounded_submit_binding_fingerprints.append(parameter_binding_snapshot.fingerprint)
         snapshot_recovery_emitted = True
 
+    truncated_at_index = len(trajectory)
     for trajectory_index, interaction in enumerate(trajectory):
         if emitted >= _MAX_STEPS:
             diagnostics.truncated = True
             notes.append(f"trajectory truncated at {_MAX_STEPS} steps")
+            truncated_at_index = trajectory_index
             break
         if entry_replay_start_index and trajectory_index < entry_replay_start_index:
-            already_recorded = any(
-                record.get("trajectory_index") == trajectory_index
-                for record in (*diagnostics.emitted_interactions, *diagnostics.dropped_interactions)
-            )
-            if not already_recorded:
+            if not already_recorded(trajectory_index):
                 diagnostics.forgiven_interactions.append(
                     {
                         "trajectory_index": trajectory_index,
@@ -2567,13 +2579,14 @@ def synthesize_code_block(
                 record_emission(trajectory_index, tool_name, "press", locator, line_start=line_start)
             else:
                 if strict_selectors:
-                    diagnostics.dropped_interactions.append(
-                        {
-                            "trajectory_index": trajectory_index,
-                            "tool_name": tool_name,
-                            "reason_code": "missing_selector",
-                        }
-                    )
+                    if not already_recorded(trajectory_index):
+                        diagnostics.dropped_interactions.append(
+                            {
+                                "trajectory_index": trajectory_index,
+                                "tool_name": tool_name,
+                                "reason_code": "missing_selector",
+                            }
+                        )
                     continue
                 lines.append(f"{action_indent}await page.keyboard.press({_py_str(key)})")
                 record_emission(trajectory_index, tool_name, "press", "page.keyboard", line_start=line_start)
@@ -2602,6 +2615,7 @@ def synthesize_code_block(
             lines.append(f"{action_indent}{_INDENT}await page.wait_for_timeout(1000)")
             lines.append(f"{action_indent}{_INDENT}{variable} = await page.evaluate({expression!r})")
             read_bindings.append((output_path, variable))
+            record_emission(trajectory_index, tool_name, "evaluate", "page", line_start=line_start, lane="page_read")
             append_step(f"Read {output_path.removeprefix('output.')}", "read", line_start)
             emitted += 1
             continue
@@ -2618,6 +2632,9 @@ def synthesize_code_block(
                 continue
             line_start = len(lines) + 1
             lines.append(f"{action_indent}await page.wait_for_timeout({duration_ms})")
+            record_emission(
+                trajectory_index, tool_name, "wait_for_timeout", "page", line_start=line_start, lane="page_wait"
+            )
             append_step(f"Wait {max(duration_ms // 1000, 1)}s", "wait", line_start)
             emitted += 1
             continue
@@ -2773,6 +2790,9 @@ def synthesize_code_block(
             # Non-strict only: recording trajectories carry deliberate hovers; the
             # strict-imposition envelope keeps treating hover as unsupported.
             lines.append(f"{action_indent}await {locator}.hover()")
+            record_emission(
+                trajectory_index, tool_name, "hover", locator, line_start=line_start, lane="recording_hover"
+            )
             append_step(f"Hover over {_step_target(interaction)}", "hover", line_start)
         else:
             notes.append(f"skipped unsupported interaction tool_name={tool_name!r}")
@@ -2853,6 +2873,22 @@ def synthesize_code_block(
                     line_start=deferred_line_start,
                     lane="readonly_skip",
                 )
+
+    # Single reconciliation point for the retained manifest: a branch that neither emits, drops, nor forgives
+    # its index lands here as a drop. The post-truncation tail is unvisited, so the truncation finding owns it.
+    laned_indices = _recorded_partition_indices(diagnostics)
+    for trajectory_index in diagnostics.retained_trajectory_indices:
+        if trajectory_index >= truncated_at_index or trajectory_index in laned_indices:
+            continue
+        unaccounted = trajectory[trajectory_index]
+        diagnostics.dropped_interactions.append(
+            {
+                "trajectory_index": trajectory_index,
+                "tool_name": str(unaccounted.get("tool_name") or ""),
+                "selector": str(unaccounted.get("selector") or "").strip(),
+                "reason_code": "unaccounted_branch",
+            }
+        )
 
     if compile_download_target and reached_download_target is not None:
         # The download affordance is observed in nav_targets, not necessarily a trajectory click, so the
@@ -3189,7 +3225,8 @@ def spine_partition_findings(
 ) -> list[ObligationFinding]:
     """Partition-exhaustiveness obligation over the full retained-index manifest: an uncovered required
     rung, a dropped interaction the allowlist does not forgive, a retained index in no record lane, or a
-    truncation are each a typed under-build finding. Forgiveness names the reason; it never absolves."""
+    truncation are each a typed under-build finding. Forgiveness names the reason; it never absolves.
+    Truncation supersedes the per-index lane check — the tail was never visited, so it reports once."""
     findings: list[ObligationFinding] = []
     for record in uncovered_required_emitted_interactions(diagnostics.emitted_interactions, draft_calls):
         index = record.get("trajectory_index")
@@ -3212,12 +3249,13 @@ def spine_partition_findings(
                 trajectory_index=index if isinstance(index, int) else None,
             )
         )
+    if diagnostics.truncated:
+        findings.append(ObligationFinding(kind=TRUNCATED_FINDING))
+        return findings
     recorded = _recorded_partition_indices(diagnostics)
     for index in diagnostics.retained_trajectory_indices:
         if index not in recorded:
             findings.append(ObligationFinding(kind=UNRECORDED_INDEX_FINDING, trajectory_index=index))
-    if diagnostics.truncated:
-        findings.append(ObligationFinding(kind=TRUNCATED_FINDING))
     return findings
 
 

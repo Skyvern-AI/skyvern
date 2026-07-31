@@ -733,13 +733,14 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             browser=skyvern_browser,
             context=mcp_ctx,
             api_key_hash=hash_api_key_for_cache(active_key) if active_key else None,
+            organization_id=ctx.organization_id,
         )
         if working_page is not None:
             # Seed the tab pin from the already-probed page (mirrors what skyvern_tab_switch
             # sets interactively) so self-heal tools land on the adopted tab instead of the
             # new SkyvernBrowser's pages[-1] fallback.
             state._active_page = working_page
-        register_copilot_session(browser_session_id, state)
+        register_copilot_session(browser_session_id, state, organization_id=ctx.organization_id)
         if is_self_heal_session_id(browser_session_id):
             LOG.info(
                 "registered self-heal browser session",
@@ -756,7 +757,7 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
                 )
             else:
                 ctx.sdk_action_workflow_run_ids_by_browser_session.pop(sdk_action_workflow_run_cache_key, None)
-            unregister_copilot_session(browser_session_id)
+            unregister_copilot_session(browser_session_id, organization_id=ctx.organization_id)
             if is_self_heal_session_id(browser_session_id):
                 LOG.info("unregistered self-heal browser session", session_id=browser_session_id)
     finally:

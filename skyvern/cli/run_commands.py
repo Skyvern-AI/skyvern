@@ -65,13 +65,13 @@ async def _cleanup_mcp_resources() -> None:
     from skyvern.cli.core.action_log import shutdown_action_log_worker  # noqa: PLC0415
     from skyvern.cli.core.client import close_skyvern  # noqa: PLC0415
     from skyvern.cli.core.mcp_http_auth import close_auth_db  # noqa: PLC0415
-    from skyvern.cli.core.session_manager import close_current_session  # noqa: PLC0415
+    from skyvern.cli.core.session_manager import close_all_sessions  # noqa: PLC0415
 
     try:
         await shutdown_action_log_worker()
     finally:
         try:
-            await close_current_session()
+            await close_all_sessions()
         finally:
             try:
                 await close_skyvern()
