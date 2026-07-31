@@ -15,6 +15,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 import structlog
 from fastapi import HTTPException
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from mcp.server.auth.provider import AccessToken
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -28,6 +30,7 @@ from skyvern.forge.sdk.services.org_auth_service import resolve_org_from_api_key
 
 from .api_key_hash import hash_api_key_for_cache
 from .client import reset_api_key_override, set_api_key_override
+from .session_manager import request_session_scope
 
 LOG = structlog.get_logger(__name__)
 API_KEY_HEADER = "x-api-key"
@@ -604,6 +607,32 @@ class MCPAPIKeyMiddleware:
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
+    async def _forward_authenticated_request(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        *,
+        organization_id: str,
+        api_key: str,
+    ) -> None:
+        scope.setdefault("state", {})
+        scope["state"]["organization_id"] = organization_id
+        scope["user"] = AuthenticatedUser(
+            AccessToken(
+                token="mcp-http-session-owner",
+                client_id=organization_id,
+                subject=hashlib.sha256(api_key.encode("utf-8")).hexdigest(),
+                scopes=[],
+            )
+        )
+        token = set_api_key_override(api_key)
+        try:
+            with request_session_scope(organization_id):
+                await self.app(scope, receive, send)
+        finally:
+            reset_api_key_override(token)
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
@@ -657,13 +686,13 @@ class MCPAPIKeyMiddleware:
 
         try:
             resolution = await validate_mcp_oauth_token(bearer_token)
-            scope.setdefault("state", {})
-            scope["state"]["organization_id"] = resolution.validation.organization_id
-            token = set_api_key_override(resolution.api_key)
-            try:
-                await self.app(scope, receive, send)
-            finally:
-                reset_api_key_override(token)
+            await self._forward_authenticated_request(
+                scope,
+                receive,
+                send,
+                organization_id=resolution.validation.organization_id,
+                api_key=resolution.api_key,
+            )
             return
         except HTTPException as e:
             if e.status_code == 503:
@@ -682,8 +711,6 @@ class MCPAPIKeyMiddleware:
         # Fall back: treat Bearer value as a raw API key
         try:
             validation = await validate_mcp_api_key(bearer_token)
-            scope.setdefault("state", {})
-            scope["state"]["organization_id"] = validation.organization_id
         except HTTPException as e:
             if e.status_code in {401, 403}:
                 if oauth_service_error is not None:
@@ -705,18 +732,18 @@ class MCPAPIKeyMiddleware:
             await response(scope, receive, send)
             return
 
-        token = set_api_key_override(bearer_token)
-        try:
-            await self.app(scope, receive, send)
-        finally:
-            reset_api_key_override(token)
+        await self._forward_authenticated_request(
+            scope,
+            receive,
+            send,
+            organization_id=validation.organization_id,
+            api_key=bearer_token,
+        )
 
     async def _handle_api_key(self, scope: Scope, receive: Receive, send: Send, api_key: str) -> None:
         """Validate x-api-key header and forward the request (original flow)."""
         try:
             validation = await validate_mcp_api_key(api_key)
-            scope.setdefault("state", {})
-            scope["state"]["organization_id"] = validation.organization_id
         except HTTPException as e:
             if e.status_code in {401, 403}:
                 response = _unauthorized_response(_INVALID_API_KEY_MESSAGE, include_oauth_challenge=False)
@@ -733,8 +760,10 @@ class MCPAPIKeyMiddleware:
             await response(scope, receive, send)
             return
 
-        token = set_api_key_override(api_key)
-        try:
-            await self.app(scope, receive, send)
-        finally:
-            reset_api_key_override(token)
+        await self._forward_authenticated_request(
+            scope,
+            receive,
+            send,
+            organization_id=validation.organization_id,
+            api_key=api_key,
+        )

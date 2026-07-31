@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import copy
 import hashlib
 import io
@@ -64,6 +65,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     recorded_outcome_from_author_time_reject,
     recorded_outcome_from_authoring_repair_context,
 )
+from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
 from skyvern.forge.sdk.copilot.code_block_preflight import (
     SANDBOX_UNRESOLVED_NAME_REASON_CODE,
     author_time_code_block_diagnostics,
@@ -10155,6 +10157,31 @@ def _enrich_scout_trajectory_input_correspondences(workflow_yaml: str, ctx: Agen
             interaction.pop("input_correspondences", None)
 
 
+async def _record_canonical_write_ownership(ctx: CopilotContext, workflow: Workflow) -> None:
+    """Stamp the turn's marker with what it just left canonical as.
+
+    Best-effort: a missed stamp only costs this turn its rollback claim, while raising here
+    would fail a write that already succeeded. Canonical is re-read rather than fingerprinted
+    from the in-memory object so the value matches what reconcile computes.
+    """
+    with contextlib.suppress(Exception):
+        workflow_permanent_id = workflow.workflow_permanent_id
+        if not (ctx.workflow_copilot_chat_id and ctx.turn_id and workflow_permanent_id and ctx.organization_id):
+            return
+        persisted = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=ctx.organization_id,
+        )
+        if persisted is None:
+            return
+        await app.DATABASE.workflow_params.record_pending_copilot_turn_canonical_write(
+            organization_id=ctx.organization_id,
+            workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
+            turn_id=ctx.turn_id,
+            fingerprint=workflow_content_fingerprint(persisted.model_dump(mode="json")),
+        )
+
+
 async def _update_workflow(
     params: dict[str, Any],
     ctx: AgentContext,
@@ -10537,6 +10564,10 @@ async def _update_workflow(
                 edited_by="copilot",
             )
             ctx.canonical_was_persisted_due_to_param_change = True
+            # isinstance narrows the declared ``AgentContext`` to the marker-aware
+            # ``CopilotContext`` for mypy, matching the narrative-emit seam below.
+            if isinstance(ctx, CopilotContext):
+                await _record_canonical_write_ownership(ctx, workflow)
         ctx.staged_workflow_yaml = workflow_yaml
         ctx.staged_workflow = workflow
         ctx.has_staged_proposal = True
