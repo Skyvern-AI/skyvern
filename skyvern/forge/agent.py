@@ -5325,27 +5325,59 @@ class ForgeAgent:
             LOG.debug("Uploading video artifacts", number_of_video_artifacts=len(video_artifacts))
             for video_artifact in video_artifacts:
                 if video_artifact.video_artifact_id:
-                    await app.ARTIFACT_MANAGER.update_artifact_data(
-                        artifact_id=video_artifact.video_artifact_id,
-                        organization_id=task.organization_id,
-                        data=video_artifact.video_data,
-                    )
+                    try:
+                        if video_artifact.video_file_extension:
+                            await app.ARTIFACT_MANAGER.update_artifact_data(
+                                artifact_id=video_artifact.video_artifact_id,
+                                organization_id=task.organization_id,
+                                data=video_artifact.video_data,
+                                file_extension=video_artifact.video_file_extension,
+                            )
+                        else:
+                            await app.ARTIFACT_MANAGER.update_artifact_data(
+                                artifact_id=video_artifact.video_artifact_id,
+                                organization_id=task.organization_id,
+                                data=video_artifact.video_data,
+                            )
+                    except Exception:
+                        LOG.warning(
+                            "Failed to upload task video artifact",
+                            task_id=task.task_id,
+                            organization_id=task.organization_id,
+                            video_artifact_id=video_artifact.video_artifact_id,
+                            exc_info=True,
+                        )
                     continue
-                # A teardown-attached recording has no pre-registered artifact row.
-                # Prefer collected video bytes; use the on-disk path only when no bytes were returned.
+
                 video_path = video_artifact.video_path
                 if video_artifact.video_data:
-                    video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                        step=last_step,
-                        artifact_type=ArtifactType.RECORDING,
-                        data=video_artifact.video_data,
-                    )
+                    if video_artifact.video_file_extension:
+                        video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                            step=last_step,
+                            artifact_type=ArtifactType.RECORDING,
+                            data=video_artifact.video_data,
+                            file_extension=video_artifact.video_file_extension,
+                        )
+                    else:
+                        video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                            step=last_step,
+                            artifact_type=ArtifactType.RECORDING,
+                            data=video_artifact.video_data,
+                        )
                 elif video_path and os.path.exists(video_path):
-                    video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                        step=last_step,
-                        artifact_type=ArtifactType.RECORDING,
-                        path=video_path,
-                    )
+                    if video_artifact.video_file_extension:
+                        video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                            step=last_step,
+                            artifact_type=ArtifactType.RECORDING,
+                            path=video_path,
+                            file_extension=video_artifact.video_file_extension,
+                        )
+                    else:
+                        video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                            step=last_step,
+                            artifact_type=ArtifactType.RECORDING,
+                            path=video_path,
+                        )
                 else:
                     continue
 

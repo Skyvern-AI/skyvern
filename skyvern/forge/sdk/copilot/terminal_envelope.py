@@ -12,6 +12,7 @@ LOG = structlog.get_logger(__name__)
 
 TerminalNextState = Literal["completed", "proposal_pending", "awaiting_user_input", "stopped"]
 TerminalResponseKind = Literal["question", "update", "answer", "stopped"]
+TerminalCause = Literal["deadline_expired"]
 _FINAL_RUN_VERDICTS = frozenset({"demonstrated", "not_demonstrated", "not_evaluated"})
 _REVIEW_PROPOSAL_DISPOSITIONS = frozenset({"review_untested", "review_tested"})
 _SHADOW_REASON_TRAILING_PUNCTUATION = ".,;:!?"
@@ -34,6 +35,7 @@ class TerminalOutcomeEnvelope(BaseModel):
     user_action_required: bool = False
     attempted: str | None = None
     response_kind: TerminalResponseKind
+    terminal_cause: TerminalCause | None = None
     rendered_from_envelope: bool = False
     envelope_version: int = 1
 
@@ -50,6 +52,7 @@ def assemble_terminal_envelope(
     attempted: str | None,
     workflow_mutated: bool,
     turn_outcome_response_kind: str | None,
+    terminal_cause: TerminalCause | None = None,
 ) -> TerminalOutcomeEnvelope | None:
     run_outcome = _select_run_outcome_anchor(run_outcomes)
     superseding_outcome = _later_demonstrated_after_anchor(run_outcomes, run_outcome)
@@ -86,6 +89,7 @@ def assemble_terminal_envelope(
         user_action_required=user_action_required,
         attempted=_clean_text(attempted),
         response_kind=response_kind,
+        terminal_cause=terminal_cause,
     )
 
 
@@ -125,6 +129,15 @@ def interrupted_terminal_envelope() -> TerminalOutcomeEnvelope:
 
 
 def render_terminal_message(envelope: TerminalOutcomeEnvelope, agent_message: str, cancelled: bool) -> tuple[str, bool]:
+    # A deadline-expired turn already authored copy naming time and the draft's
+    # state; replaced=True is what syncs it to the surfaces hydration prefers.
+    # "completed" is excluded because replaced=True also overwrites a distinct
+    # narrativeSummary, and an applied turn's summary is not the terminal text.
+    # "awaiting_user_input" needs no exclusion: it requires ASK_QUESTION, and a deadline
+    # always exits through _build_wip_exit_result, which only ever builds REPLY results.
+    if envelope.terminal_cause == "deadline_expired" and not cancelled and envelope.next_state != "completed":
+        return agent_message, True
+
     # Diagnose/refuse answers share next_state="stopped" but their text IS the
     # deliverable — only stopped-kind turns get the honest-stop replacement.
     if cancelled or envelope.next_state != "stopped" or envelope.response_kind != "stopped":

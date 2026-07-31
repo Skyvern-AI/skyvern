@@ -100,7 +100,7 @@ def del_message_channel(client_id: str, *, expected: MessageChannel | None = Non
 
 # Stream reference counts per workflow_run_id.
 _stream_refcounts: dict[str, int] = {}
-_deferred_close_params: dict[str, bool] = {}
+_deferred_close_params: dict[str, tuple[bool, bool | None]] = {}
 
 
 def stream_ref_inc(workflow_run_id: str) -> None:
@@ -111,14 +111,18 @@ async def stream_ref_dec(workflow_run_id: str) -> None:
     count = _stream_refcounts.get(workflow_run_id, 0) - 1
     if count <= 0:
         _stream_refcounts.pop(workflow_run_id, None)
-        close_on_completion = _deferred_close_params.pop(workflow_run_id, None)
-        if close_on_completion is not None:
+        close_params = _deferred_close_params.pop(workflow_run_id, None)
+        if close_params is not None:
             from skyvern.forge import app
 
+            close_on_completion, release_driver = close_params
             browser_state = app.BROWSER_MANAGER.pages.get(workflow_run_id)
             if browser_state is not None:
                 try:
-                    await browser_state.close(close_browser_on_completion=close_on_completion)
+                    await browser_state.close(
+                        close_browser_on_completion=close_on_completion,
+                        release_driver=release_driver,
+                    )
                 except Exception:
                     LOG.warning(
                         "stream_ref_dec: error closing deferred browser state",
@@ -134,8 +138,15 @@ def stream_ref_active(workflow_run_id: str) -> bool:
     return _stream_refcounts.get(workflow_run_id, 0) > 0
 
 
-def set_deferred_close_params(workflow_run_id: str, close_browser_on_completion: bool) -> None:
-    _deferred_close_params[workflow_run_id] = close_browser_on_completion
+def set_deferred_close_params(
+    workflow_run_id: str,
+    close_browser_on_completion: bool,
+    release_driver: bool | None = None,
+) -> bool:
+    if not stream_ref_active(workflow_run_id):
+        return False
+    _deferred_close_params[workflow_run_id] = (close_browser_on_completion, release_driver)
+    return True
 
 
 # a registry for CDP input channels, keyed by `client_id`

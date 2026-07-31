@@ -1907,6 +1907,7 @@ def _tool_visible_result_after_completion_verification(
     result: dict[str, Any],
     completion_verification: CompletionVerificationResult | None,
 ) -> dict[str, Any]:
+    result["turn_seconds_remaining"] = _copilot_seconds_remaining(copilot_ctx)
     if outcome_fully_verified(copilot_ctx):
         return result
     outcome_unverified_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)

@@ -22,6 +22,7 @@ from skyvern.forge.sdk.artifact.signing import (
     parse_keyring,
     sign_artifact_url,
 )
+from skyvern.forge.sdk.artifact.utils import replace_file_extension
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.db.models import ArtifactModel
@@ -40,6 +41,29 @@ ARCHIVE_AGE_THRESHOLD = timedelta(days=90)
 
 def _ensure_aware_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _log_artifact_store_task_failure(task: asyncio.Future[None], artifact: Artifact) -> None:
+    if task.cancelled():
+        LOG.warning(
+            "Artifact store task cancelled",
+            artifact_id=artifact.artifact_id,
+            artifact_type=artifact.artifact_type,
+            uri=artifact.uri,
+        )
+        return
+
+    exception = task.exception()
+    if not exception:
+        return
+
+    LOG.warning(
+        "Artifact store task failed",
+        artifact_id=artifact.artifact_id,
+        artifact_type=artifact.artifact_type,
+        uri=artifact.uri,
+        exc_info=(type(exception), exception, exception.__traceback__),
+    )
 
 
 _SCREENSHOT_PREFIX_MAP: dict[ArtifactType, str] = {
@@ -141,7 +165,12 @@ class ArtifactManager:
         # step_id -> accumulator for step archive artifacts
         self._step_archives: dict[str, StepArchiveAccumulator] = {}
 
-    def _track_upload_aiotask(self, primary_key: str, aio_task: asyncio.Task[None]) -> None:
+    def _track_upload_aiotask(
+        self,
+        primary_key: str,
+        aio_task: asyncio.Task[None],
+        artifact: Artifact | None = None,
+    ) -> None:
         """Track a fire-and-forget upload so wait_for_upload_aiotasks can barrier on it.
 
         Tasks self-discard on completion: writers key this map by ids no lifecycle ever
@@ -152,7 +181,9 @@ class ArtifactManager:
         self.upload_aiotasks_map[primary_key].append(aio_task)
 
         def _discard(task: asyncio.Task[None]) -> None:
-            if not task.cancelled() and (exc := task.exception()) is not None:
+            if artifact is not None:
+                _log_artifact_store_task_failure(task, artifact)
+            elif not task.cancelled() and (exc := task.exception()) is not None:
                 LOG.warning(
                     "Artifact upload task failed",
                     primary_key=primary_key,
@@ -296,11 +327,18 @@ class ArtifactManager:
         artifact_type: ArtifactType,
         data: bytes | None = None,
         path: str | None = None,
+        file_extension: str | None = None,
     ) -> str:
         artifact_id = generate_artifact_id()
         uri = app.STORAGE.build_uri(
             organization_id=step.organization_id, artifact_id=artifact_id, step=step, artifact_type=artifact_type
         )
+        if artifact_type == ArtifactType.RECORDING:
+            recording_extension = file_extension
+            if not recording_extension and path:
+                recording_extension = os.path.splitext(path)[1].lstrip(".").lower()
+            if recording_extension:
+                uri = replace_file_extension(uri, recording_extension)
         file_size = len(data) if data is not None else _safe_file_size_from_path(path)
         return await self._create_artifact(
             aio_task_primary_key=step.task_id,
@@ -1160,12 +1198,31 @@ class ArtifactManager:
         organization_id: str | None,
         data: bytes,
         primary_key: str = "task_id",
+        file_extension: str | None = None,
     ) -> str | None:
         if not artifact_id or not organization_id:
             return None
         artifact = await app.DATABASE.artifacts.get_artifact_by_id(artifact_id, organization_id)
         if not artifact:
             return None
+        if file_extension and artifact.artifact_type == ArtifactType.RECORDING:
+            next_uri = replace_file_extension(artifact.uri, file_extension)
+            file_size = len(data)
+            if next_uri != artifact.uri or artifact.file_size != file_size:
+                updated_artifact = await app.DATABASE.artifacts.update_artifact_uri(
+                    artifact_id=artifact.artifact_id,
+                    organization_id=organization_id,
+                    uri=next_uri,
+                    file_size=file_size,
+                )
+                if not updated_artifact:
+                    # Avoid writing prepared bytes under stale metadata, which can create
+                    # content/extension mismatches for recording artifacts.
+                    raise RuntimeError(
+                        f"Failed to update recording artifact metadata before upload: {artifact.artifact_id}"
+                    )
+                artifact = updated_artifact
+
         # Fire and forget
         aio_task = asyncio.create_task(app.STORAGE.store_artifact(artifact, data))
 
@@ -1174,7 +1231,7 @@ class ArtifactManager:
         aio_task_key = artifact[primary_key] or artifact["workflow_run_block_id"] or artifact["run_id"]
         if not aio_task_key:
             raise ValueError("artifact must have a task_id, workflow_run_block_id, or run_id to track its upload.")
-        self._track_upload_aiotask(aio_task_key, aio_task)
+        self._track_upload_aiotask(aio_task_key, aio_task, artifact=artifact)
         return aio_task_key
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:

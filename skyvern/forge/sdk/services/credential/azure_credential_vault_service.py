@@ -117,13 +117,16 @@ class AzureCredentialVaultService(CredentialVaultService):
         self,
         credential: Credential,
     ) -> None:
-        await app.DATABASE.credentials.delete_credential(credential.credential_id, credential.organization_id)
-        # Deleting takes several seconds, so we empty the value and delete async so customers do not have to wait
+        # Empty the secret value before deleting the DB row: a transient vault failure then aborts the whole
+        # delete with the row (and its item_id) intact for a retry, instead of orphaning a still-readable
+        # secret with no DB pointer left to scrub it. The slow full-vault delete is deferred to
+        # post_delete_credential_item so customers do not have to wait.
         await self._client.create_or_update_secret(
             vault_name=self._vault_name,
             secret_name=credential.item_id,
             secret_value="",
         )
+        await app.DATABASE.credentials.delete_credential(credential.credential_id, credential.organization_id)
 
     async def post_delete_credential_item(self, item_id: str, _organization_id: str | None = None) -> bool:
         """
