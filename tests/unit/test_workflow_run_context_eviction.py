@@ -13,6 +13,7 @@ import pytest
 from skyvern.forge import app
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.webeye.browser_manager import BrowserCleanupResult
 
 
 def _context_manager_with(run_ids: list[str]) -> WorkflowContextManager:
@@ -49,7 +50,12 @@ async def test_clean_up_workflow_evicts_run_and_child_contexts(monkeypatch: pyte
         AsyncMock(return_value=[child_run]),
         raising=False,
     )
-    monkeypatch.setattr(app.BROWSER_MANAGER, "cleanup_for_workflow_run", AsyncMock(return_value=None), raising=False)
+    monkeypatch.setattr(
+        app.BROWSER_MANAGER,
+        "cleanup_for_workflow_run",
+        AsyncMock(return_value=BrowserCleanupResult(browser_state=None, recording_finalized=False)),
+        raising=False,
+    )
     monkeypatch.setattr(app.ARTIFACT_MANAGER, "wait_for_upload_aiotasks", AsyncMock(), raising=False)
     monkeypatch.setattr(app.STORAGE, "save_downloaded_files", AsyncMock(), raising=False)
 
