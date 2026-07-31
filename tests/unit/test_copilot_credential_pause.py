@@ -71,6 +71,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     credential_prompt_reason,
 )
+from skyvern.forge.sdk.copilot.tools._shared import TOTAL_TIMEOUT_SECONDS, _copilot_seconds_remaining
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 from skyvern.forge.sdk.routes.workflow_copilot import (
     WorkflowCopilotCredentialResponseRequest,
@@ -1593,15 +1594,13 @@ async def test_last_run_skipped_flag_stays_false_when_update_workflow_fails_befo
 
 
 def test_copilot_seconds_remaining_credits_pause_time() -> None:
-    from skyvern.forge.sdk.copilot.tools._shared import _copilot_seconds_remaining
-
     ctx = SimpleNamespace(copilot_run_start_monotonic=time.monotonic() - 1000.0, copilot_credential_pause_seconds=300.0)
 
     remaining = _copilot_seconds_remaining(ctx)
 
-    # Uncredited: 900 - 1000 = -100s (would forbid). Credited: 900 - 700 = 200s.
+    # Uncredited, the budget would be spent against 1000s rather than the 700s of counted work.
     assert remaining is not None
-    assert remaining > 150.0
+    assert remaining == pytest.approx(TOTAL_TIMEOUT_SECONDS - 700.0, abs=1.0)
 
 
 # ---------------------------------------------------------------------------

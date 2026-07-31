@@ -297,6 +297,36 @@ async def test_skyvern_credential_vault_enqueues_durable_cleanup_when_inline_unl
 
 
 @pytest.mark.asyncio
+async def test_skyvern_credential_vault_reclaim_cancellation_survives_durable_enqueue_failure(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_PATH", str(tmp_path))
+    monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_KEY", None)
+    monkeypatch.setattr(app.DATABASE, "credentials", _CancelledUpdateCredentialRepository())
+
+    orphaned_hook = AsyncMock(side_effect=RuntimeError("enqueue backend down"))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "on_credential_item_orphaned", orphaned_hook)
+
+    service = SkyvernCredentialVaultService()
+    credential = await service.create_credential("org_test", _password_request(password="old-password"))
+    old_item_path = tmp_path / f"{credential.item_id}.bin"
+
+    unlink = MagicMock(side_effect=OSError("unlink blew up"))
+    monkeypatch.setattr(service, "_unlink_item_file", unlink)
+
+    # Inline cleanup failed and the durable enqueue then failed too; the reclaim must still complete without
+    # replacing the in-flight CancelledError (write-lease cancellation) with the enqueue's RuntimeError.
+    with pytest.raises(asyncio.CancelledError):
+        await service.update_credential(
+            credential,
+            _password_request(name="Login Updated", password="new-password"),
+        )
+
+    orphaned_hook.assert_awaited_once()
+    assert old_item_path.exists()
+
+
+@pytest.mark.asyncio
 async def test_skyvern_credential_vault_post_delete_reports_unlink_failure(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_PATH", str(tmp_path))
     monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_KEY", None)
