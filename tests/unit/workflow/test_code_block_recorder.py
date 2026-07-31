@@ -6,7 +6,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -148,11 +148,13 @@ async def _record_timed_action() -> Action:
 async def test_recorded_action_has_wall_clock_timestamps_and_duration() -> None:
     action = await _record_timed_action()
 
-    assert action.created_at is not None
-    assert action.modified_at is not None
-    assert action.created_at < action.modified_at
-    assert action.created_at.tzinfo is None
-    assert action.modified_at.tzinfo is None
+    assert action.started_at is not None
+    assert action.finished_at is not None
+    assert action.started_at < action.finished_at
+    assert action.started_at.tzinfo is None
+    assert action.finished_at.tzinfo is None
+    assert action.created_at is None
+    assert action.modified_at is None
     assert isinstance(action.output, dict)
     assert "duration_ms" in action.output
 
@@ -940,7 +942,7 @@ async def test_streamed_write_precedes_screenshot_backfilled_by_batch(monkeypatc
 async def test_reupsert_preserves_action_end_timestamp_and_backfills_screenshot() -> None:
     async with _recorded_action_db() as db:
         action = await _record_timed_action()
-        stamped_end = action.modified_at
+        stamped_end = action.finished_at
         await db.workflow_params.upsert_recorded_action(action)
 
         await asyncio.sleep(0.01)
@@ -950,8 +952,64 @@ async def test_reupsert_preserves_action_end_timestamp_and_backfills_screenshot(
         async with db.Session() as session:
             row = (await session.scalars(select(ActionModel).where(ActionModel.action_id == action.action_id))).one()
 
-    assert row.modified_at == stamped_end
+    assert row.finished_at == stamped_end
     assert row.screenshot_artifact_id == "artifact_timing"
+
+
+@pytest.mark.asyncio
+async def test_unstamped_reupsert_does_not_null_execution_timestamps() -> None:
+    """The synthetic non-executed error row upserts with no execution timestamps; it must not
+    overwrite a previously stamped row's started_at/finished_at with NULL."""
+    async with _recorded_action_db() as db:
+        action = await _record_timed_action()
+        stamped_start, stamped_end = action.started_at, action.finished_at
+        await db.workflow_params.upsert_recorded_action(action)
+
+        unstamped = action.model_copy(update={"started_at": None, "finished_at": None})
+        await db.workflow_params.upsert_recorded_action(unstamped)
+
+        async with db.Session() as session:
+            row = (await session.scalars(select(ActionModel).where(ActionModel.action_id == action.action_id))).one()
+
+    assert row.started_at == stamped_start
+    assert row.finished_at == stamped_end
+
+
+@pytest.mark.asyncio
+async def test_restamped_reupsert_takes_the_new_execution_timestamps() -> None:
+    """The batch refresh re-upserts with newer stamps; the incoming values must win over the
+    stored ones (this is the case that discriminates the coalesce argument order)."""
+    async with _recorded_action_db() as db:
+        action = await _record_timed_action()
+        await db.workflow_params.upsert_recorded_action(action)
+
+        newer_start = action.started_at + timedelta(seconds=5)
+        newer_end = action.finished_at + timedelta(seconds=9)
+        restamped = action.model_copy(update={"started_at": newer_start, "finished_at": newer_end})
+        await db.workflow_params.upsert_recorded_action(restamped)
+
+        async with db.Session() as session:
+            row = (await session.scalars(select(ActionModel).where(ActionModel.action_id == action.action_id))).one()
+
+    assert row.started_at == newer_start
+    assert row.finished_at == newer_end
+
+
+@pytest.mark.asyncio
+async def test_unstamped_row_backfills_from_a_later_stamped_upsert() -> None:
+    async with _recorded_action_db() as db:
+        action = await _record_timed_action()
+        stamped_start, stamped_end = action.started_at, action.finished_at
+        unstamped = action.model_copy(update={"started_at": None, "finished_at": None})
+        await db.workflow_params.upsert_recorded_action(unstamped)
+
+        await db.workflow_params.upsert_recorded_action(action)
+
+        async with db.Session() as session:
+            row = (await session.scalars(select(ActionModel).where(ActionModel.action_id == action.action_id))).one()
+
+    assert row.started_at == stamped_start
+    assert row.finished_at == stamped_end
 
 
 @pytest.mark.asyncio
@@ -964,10 +1022,12 @@ async def test_recorded_action_timestamps_round_trip_through_hydration() -> None
             row = (await session.scalars(select(ActionModel).where(ActionModel.action_id == action.action_id))).one()
             hydrated = hydrate_action(row)
 
-    assert row.created_at == action.created_at
-    assert row.modified_at == action.modified_at
-    assert hydrated.created_at == action.created_at
-    assert hydrated.modified_at == action.modified_at
+    assert row.started_at == action.started_at
+    assert row.finished_at == action.finished_at
+    assert hydrated.started_at == action.started_at
+    assert hydrated.finished_at == action.finished_at
+    assert row.created_at >= action.finished_at
+    assert row.modified_at >= action.finished_at
 
 
 @pytest.mark.asyncio

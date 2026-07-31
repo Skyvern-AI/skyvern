@@ -435,6 +435,7 @@ async def test_callback_rejects_missing_mail_read_before_promoting(monkeypatch: 
         await microsoft_oauth_routes.microsoft_oauth_callback(
             CreateMicrosoftOAuthCallbackRequest(code="code", state="state"),
             SimpleNamespace(organization_id="org_1"),
+            "user_1",
         )
 
     assert exc_info.value.status_code == 400
@@ -521,6 +522,7 @@ async def test_microsoft_oauth_callback_prefers_graph_mail_then_falls_back_to_cl
     response = await microsoft_oauth_routes.microsoft_oauth_callback(
         CreateMicrosoftOAuthCallbackRequest(code="code", state="state"),
         SimpleNamespace(organization_id="org_1"),
+        "user_1",
     )
 
     assert response.credential.email_address == expected_email
@@ -611,6 +613,7 @@ async def test_microsoft_oauth_callback_preserves_email_on_transient_graph_failu
     response = await microsoft_oauth_routes.microsoft_oauth_callback(
         CreateMicrosoftOAuthCallbackRequest(code="code", state="state"),
         SimpleNamespace(organization_id="org_1"),
+        "user_1",
     )
 
     assert response.credential.email_address == "correct@example.test"
@@ -690,6 +693,7 @@ async def test_microsoft_oauth_callback_falls_back_to_claim_on_non_transient_gra
     response = await microsoft_oauth_routes.microsoft_oauth_callback(
         CreateMicrosoftOAuthCallbackRequest(code="code", state="state"),
         SimpleNamespace(organization_id="org_1"),
+        "user_1",
     )
 
     assert response.credential.email_address == "claim@example.test"
@@ -924,3 +928,63 @@ async def test_microsoft_email_backfill_caches_cancelled_resolution(
     )
 
     load_secrets.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_microsoft_oauth_callback_rejects_state_redeemed_by_another_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A consent challenge is redeemable only by the caller that started it."""
+    rows: dict[str, dict[str, Any]] = {}
+
+    async def insert_pending_credential(**kwargs: Any) -> SimpleNamespace:
+        rows[kwargs["consent_nonce"]] = kwargs
+        return SimpleNamespace(id=kwargs["credential_id"])
+
+    async def load_pending_by_nonce(organization_id: str, nonce: str, **_: Any) -> Any:
+        row = rows.get(nonce)
+        if row is None or row["organization_id"] != organization_id:
+            return None
+        return PendingConsentContext(
+            credential_id=row["credential_id"],
+            consent_redirect_uri=row["consent_redirect_uri"],
+            consent_code_verifier=row["consent_code_verifier"],
+            scopes_requested=row["scopes_requested"],
+        )
+
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_ID", "cid", raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_SECRET", "csecret", raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_REDIRECT_HOSTS", ["app"], raising=False)
+    monkeypatch.setattr(
+        microsoft_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(
+            microsoft_oauth=SimpleNamespace(
+                insert_pending_credential=insert_pending_credential,
+                load_pending_by_nonce=load_pending_by_nonce,
+            )
+        ),
+        raising=False,
+    )
+    exchange_mock = AsyncMock()
+    monkeypatch.setattr(microsoft_oauth_routes.microsoft_oauth_service, "exchange_code_for_tokens", exchange_mock)
+
+    start = await microsoft_oauth_service.start_authorization(
+        organization_id="org_1",
+        redirect_uri="https://app/cb",
+        initiator_id="user_initiator",
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await microsoft_oauth_routes.microsoft_oauth_callback(
+            CreateMicrosoftOAuthCallbackRequest(code="code", state=start.state),
+            SimpleNamespace(organization_id="org_1"),
+            "user_other",
+        )
+
+    assert exc_info.value.status_code == 400
+    # Reject before spending the one-time authorization code.
+    exchange_mock.assert_not_awaited()
+    # The challenge stays redeemable by the caller that started it.
+    assert len(rows) == 1

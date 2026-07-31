@@ -22,7 +22,7 @@ from skyvern.forge.sdk.schemas.google_oauth import (
     UpdateGoogleOAuthClientConfigRequest,
     UpdateGoogleOAuthCredentialRequest,
 )
-from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
+from skyvern.forge.sdk.services import google_drive_service, google_oauth_service, oauth_consent
 from skyvern.schemas.workflows import FileStorageType, FileUploadDestination
 
 
@@ -2040,10 +2040,12 @@ async def test_authorize_route_forwards_credential_id_for_reconnect(monkeypatch:
     response = await google_oauth_routes.google_oauth_authorize(
         request=request,
         current_org=SimpleNamespace(organization_id="org_1"),
+        current_user_id="user_1",
     )
 
     assert response.authorize_url == "https://auth"
     assert start_mock.await_args.kwargs["credential_id"] == "goac_existing"
+    assert start_mock.await_args.kwargs["initiator_id"] == "user_1"
 
 
 @pytest.mark.asyncio
@@ -2061,6 +2063,7 @@ async def test_authorize_route_returns_404_when_credential_not_reauthorizable(
         await google_oauth_routes.google_oauth_authorize(
             request=request,
             current_org=SimpleNamespace(organization_id="org_1"),
+            current_user_id="user_1",
         )
     assert exc_info.value.status_code == 404
 
@@ -2197,6 +2200,7 @@ async def test_start_authorization_persists_verifier_and_returns_url(monkeypatch
         organization_id="org_1",
         redirect_uri="https://x/cb",
         credential_name="my-cred",
+        initiator_id="user_1",
     )
 
     assert result.authorize_url.startswith(google_oauth_service.GOOGLE_AUTHORIZE_ENDPOINT)
@@ -2206,7 +2210,9 @@ async def test_start_authorization_persists_verifier_and_returns_url(monkeypatch
     assert insert_kwargs["organization_id"] == "org_1"
     assert insert_kwargs["credential_name"] == "my-cred"
     assert insert_kwargs["consent_redirect_uri"] == "https://x/cb"
-    assert insert_kwargs["consent_nonce"] == result.state
+    assert insert_kwargs["consent_nonce"] == oauth_consent.consent_nonce(result.state, "user_1")
+    # The value handed to Google must never be the value we look rows up by.
+    assert insert_kwargs["consent_nonce"] != result.state
     assert insert_kwargs["client_id"] == "cid"
     # The verifier must be in the same insert as everything else — no second
     # round-trip — so a crash mid-flow can't leave a verifier-less pending row.
@@ -2260,6 +2266,7 @@ async def test_start_authorization_reconnect_reauthorizes_in_place(monkeypatch: 
         organization_id="org_1",
         redirect_uri="https://x/cb",
         credential_id="goac_existing",
+        initiator_id="user_1",
     )
 
     assert result.authorize_url.startswith(google_oauth_service.GOOGLE_AUTHORIZE_ENDPOINT)
@@ -2269,7 +2276,8 @@ async def test_start_authorization_reconnect_reauthorizes_in_place(monkeypatch: 
     reauth_mock.assert_awaited_once()
     kwargs = reauth_mock.await_args.kwargs
     assert kwargs["credential_id"] == "goac_existing"
-    assert kwargs["consent_nonce"] == result.state
+    assert kwargs["consent_nonce"] == oauth_consent.consent_nonce(result.state, "user_1")
+    assert kwargs["consent_nonce"] != result.state
     assert kwargs["client_id"] == "cid"
     # The originally granted scopes are re-requested so the reconnected credential stays usable.
     assert "scope=" in result.authorize_url
@@ -2423,7 +2431,8 @@ async def test_promote_pending_credential_encrypts_and_calls_repo(monkeypatch: p
 
     result = await google_oauth_service.promote_pending_credential(
         organization_id="org_1",
-        nonce="nonce-xyz",
+        state="state-xyz",
+        initiator_id="user_1",
         refresh_token="rt-plain",
         scopes_granted="https://a https://b",
     )
@@ -2433,7 +2442,8 @@ async def test_promote_pending_credential_encrypts_and_calls_repo(monkeypatch: p
     promote_mock.assert_awaited_once()
     kwargs = promote_mock.await_args.kwargs
     assert kwargs["organization_id"] == "org_1"
-    assert kwargs["nonce"] == "nonce-xyz"
+    assert kwargs["nonce"] == oauth_consent.consent_nonce("state-xyz", "user_1")
+    assert kwargs["nonce"] != "state-xyz"
     assert kwargs["encrypted_refresh_token"] == "ENC::rt"
     assert kwargs["encrypted_method"] == EncryptMethod.AES
     assert kwargs["scopes_granted"] == ["https://a", "https://b"]
@@ -2457,10 +2467,14 @@ async def test_load_pending_consent_context_delegates_to_repo(monkeypatch: pytes
 
     result = await google_oauth_service.load_pending_consent_context(
         organization_id="org_1",
-        nonce="nonce-xyz",
+        state="state-xyz",
+        initiator_id="user_1",
     )
     assert result is expected
-    fake_repo.load_pending_by_nonce.assert_awaited_once_with(organization_id="org_1", nonce="nonce-xyz")
+    fake_repo.load_pending_by_nonce.assert_awaited_once_with(
+        organization_id="org_1",
+        nonce=oauth_consent.consent_nonce("state-xyz", "user_1"),
+    )
 
 
 class _FakeOAuth2Session:
@@ -3395,6 +3409,7 @@ async def test_google_oauth_callback_rejects_changed_client_before_exchange(
         await google_oauth_routes.google_oauth_callback(
             CreateGoogleOAuthCallbackRequest(code="code", state="nonce"),
             current_org=SimpleNamespace(organization_id="org_1"),
+            current_user_id="user_1",
         )
 
     assert exc_info.value.status_code == 409
@@ -3402,7 +3417,7 @@ async def test_google_oauth_callback_rejects_changed_client_before_exchange(
         exc_info.value.detail
         == "Google OAuth client configuration changed since consent started; restart the connection"
     )
-    load_mock.assert_awaited_once_with(organization_id="org_1", nonce="nonce")
+    load_mock.assert_awaited_once_with(organization_id="org_1", state="nonce", initiator_id="user_1")
     resolve_mock.assert_awaited_once_with("org_1")
     exchange_mock.assert_not_awaited()
 
@@ -3472,6 +3487,7 @@ async def test_google_oauth_callback_allows_matching_or_legacy_client(
     response = await google_oauth_routes.google_oauth_callback(
         CreateGoogleOAuthCallbackRequest(code="code", state="nonce"),
         current_org=SimpleNamespace(organization_id="org_1"),
+        current_user_id="user_1",
     )
 
     assert response.credential.id == "goac_1"
@@ -3484,7 +3500,8 @@ async def test_google_oauth_callback_allows_matching_or_legacy_client(
     )
     promote_mock.assert_awaited_once_with(
         organization_id="org_1",
-        nonce="nonce",
+        state="nonce",
+        initiator_id="user_1",
         refresh_token="refresh-token",
         scopes_granted=["https://www.googleapis.com/auth/spreadsheets"],
     )
@@ -3567,6 +3584,7 @@ async def test_google_oauth_callback_email_capture_is_authoritative(
     response = await google_oauth_routes.google_oauth_callback(
         CreateGoogleOAuthCallbackRequest(code="code", state="nonce"),
         current_org=SimpleNamespace(organization_id="org_1"),
+        current_user_id="user_1",
     )
 
     assert response.credential.email_address == "fresh@example.test"
@@ -4094,3 +4112,165 @@ def test_google_oauth_credential_response_exposes_app_origin() -> None:
 
     resp_no_origin = GoogleOAuthCredentialResponse(credential=cred)
     assert resp_no_origin.app_origin is None
+
+
+class _ConsentRepoDouble:
+    """In-memory stand-in for the consent-nonce lifecycle: insert, look up, consume once."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, dict[str, Any]] = {}
+
+    async def insert_pending_credential(self, **kwargs: Any) -> SimpleNamespace:
+        self.rows[kwargs["consent_nonce"]] = kwargs
+        return SimpleNamespace(id=kwargs["credential_id"], organization_id=kwargs["organization_id"])
+
+    async def load_pending_by_nonce(
+        self,
+        organization_id: str,
+        nonce: str,
+        now: datetime.datetime | None = None,
+    ) -> Any:
+        from skyvern.forge.sdk.db.repositories.google_oauth import PendingConsentContext
+
+        row = self.rows.get(nonce)
+        if row is None or row["organization_id"] != organization_id:
+            return None
+        return PendingConsentContext(
+            credential_id=row["credential_id"],
+            consent_redirect_uri=row["consent_redirect_uri"],
+            consent_code_verifier=row["consent_code_verifier"],
+            consent_app_origin=row.get("consent_app_origin"),
+            client_id=row.get("client_id"),
+        )
+
+    async def promote_pending_to_active(
+        self,
+        organization_id: str,
+        nonce: str,
+        **kwargs: Any,
+    ) -> GoogleOAuthCredentialBase:
+        row = self.rows.pop(nonce, None)
+        if row is None or row["organization_id"] != organization_id:
+            raise google_oauth_service.InvalidConsentNonceError("Unknown or already consumed OAuth consent nonce")
+        return GoogleOAuthCredentialBase(
+            id=row["credential_id"],
+            organization_id=organization_id,
+            credential_name=row["credential_name"],
+            provider="google",
+            state=google_oauth_service.STATE_ACTIVE,
+            scopes_requested=row["scopes_requested"],
+            scopes_granted=list(kwargs["scopes_granted"]),
+            created_at=datetime.datetime.utcnow(),
+            modified_at=datetime.datetime.utcnow(),
+        )
+
+
+def _install_consent_flow_doubles(monkeypatch: pytest.MonkeyPatch, repo: _ConsentRepoDouble) -> AsyncMock:
+    monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["x"], raising=False)
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=False),
+    )
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(google_oauth=repo, organizations=SimpleNamespace(get_valid_org_auth_token=AsyncMock())),
+        raising=False,
+    )
+    monkeypatch.setattr(google_oauth_service, "encryptor", SimpleNamespace(encrypt=AsyncMock(return_value="ENC::rt")))
+    monkeypatch.setattr(google_oauth_service.app, "CACHE", SimpleNamespace(set=AsyncMock()), raising=False)
+    exchange_mock = AsyncMock(
+        return_value={
+            "access_token": "at",
+            "refresh_token": "rt",
+            "scope": "https://www.googleapis.com/auth/spreadsheets",
+        }
+    )
+    monkeypatch.setattr(google_oauth_routes.google_oauth_service, "exchange_code_for_tokens", exchange_mock)
+    return exchange_mock
+
+
+@pytest.mark.asyncio
+async def test_google_oauth_callback_rejects_state_redeemed_by_another_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A consent challenge is redeemable only by the caller that started it."""
+    repo = _ConsentRepoDouble()
+    exchange_mock = _install_consent_flow_doubles(monkeypatch, repo)
+
+    start = await google_oauth_service.start_authorization(
+        organization_id="org_1",
+        redirect_uri="https://x/cb",
+        initiator_id="user_initiator",
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await google_oauth_routes.google_oauth_callback(
+            CreateGoogleOAuthCallbackRequest(code="code", state=start.state),
+            current_org=SimpleNamespace(organization_id="org_1"),
+            current_user_id="user_other",
+        )
+
+    assert exc_info.value.status_code == 400
+    # Reject before spending the one-time authorization code.
+    exchange_mock.assert_not_awaited()
+    # The challenge stays redeemable by the caller that started it.
+    assert len(repo.rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_google_oauth_callback_consumes_state_and_rejects_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _ConsentRepoDouble()
+    _install_consent_flow_doubles(monkeypatch, repo)
+
+    start = await google_oauth_service.start_authorization(
+        organization_id="org_1",
+        redirect_uri="https://x/cb",
+        initiator_id="user_initiator",
+    )
+
+    response = await google_oauth_routes.google_oauth_callback(
+        CreateGoogleOAuthCallbackRequest(code="code", state=start.state),
+        current_org=SimpleNamespace(organization_id="org_1"),
+        current_user_id="user_initiator",
+    )
+    assert response.credential.state == google_oauth_service.STATE_ACTIVE
+
+    with pytest.raises(HTTPException) as exc_info:
+        await google_oauth_routes.google_oauth_callback(
+            CreateGoogleOAuthCallbackRequest(code="code", state=start.state),
+            current_org=SimpleNamespace(organization_id="org_1"),
+            current_user_id="user_initiator",
+        )
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["", "not-a-real-state"])
+async def test_google_oauth_callback_rejects_unusable_state(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    repo = _ConsentRepoDouble()
+    exchange_mock = _install_consent_flow_doubles(monkeypatch, repo)
+    await google_oauth_service.start_authorization(
+        organization_id="org_1",
+        redirect_uri="https://x/cb",
+        initiator_id="user_initiator",
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await google_oauth_routes.google_oauth_callback(
+            CreateGoogleOAuthCallbackRequest(code="code", state=state),
+            current_org=SimpleNamespace(organization_id="org_1"),
+            current_user_id="user_initiator",
+        )
+
+    assert exc_info.value.status_code == 400
+    exchange_mock.assert_not_awaited()

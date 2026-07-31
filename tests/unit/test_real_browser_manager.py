@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.forge.sdk.artifact.storage.recording_test_helpers import fake_prepared_recording
 from skyvern.webeye import real_browser_manager
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
@@ -443,17 +444,22 @@ def _make_browser_state_with_video(video_path: str) -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_get_video_artifacts_finalize_true_invokes_ffmpeg(tmp_path) -> None:
-    """The default (finalize=True) path remuxes via ffmpeg so the final upload has Duration + Cues."""
+async def test_get_video_artifacts_finalize_true_prepares_upload(tmp_path) -> None:
+    """The default (finalize=True) path prepares finalized recording bytes and extension."""
     src = tmp_path / "recording.webm"
     src.write_bytes(b"raw-webm-bytes")
+    prepared = tmp_path / "recording.mp4"
+    prepared.write_bytes(b"compressed-mp4-bytes")
     browser_state = _make_browser_state_with_video(str(src))
 
-    with patch("skyvern.webeye.real_browser_manager.finalize_webm", new=AsyncMock(return_value=b"remuxed")) as m:
+    with patch(
+        "skyvern.webeye.real_browser_manager.prepare_recording_for_upload",
+        lambda path: fake_prepared_recording(path, str(prepared)),
+    ):
         artifacts = await RealBrowserManager().get_video_artifacts(browser_state=browser_state)
 
-    m.assert_awaited_once_with(str(src))
-    assert artifacts[0].video_data == b"remuxed"
+    assert artifacts[0].video_data == b"compressed-mp4-bytes"
+    assert artifacts[0].video_file_extension == "mp4"
 
 
 @pytest.mark.asyncio
@@ -467,26 +473,26 @@ async def test_get_video_artifacts_finalize_false_skips_ffmpeg(tmp_path) -> None
     src.write_bytes(b"partial-webm-bytes")
     browser_state = _make_browser_state_with_video(str(src))
 
-    with patch("skyvern.webeye.real_browser_manager.finalize_webm", new=AsyncMock()) as m:
+    with patch("skyvern.webeye.real_browser_manager.prepare_recording_for_upload") as m:
         artifacts = await RealBrowserManager().get_video_artifacts(browser_state=browser_state, finalize=False)
 
-    m.assert_not_awaited()
+    m.assert_not_called()
     assert artifacts[0].video_data == b"partial-webm-bytes"
+    assert artifacts[0].video_file_extension == "webm"
 
 
 @pytest.mark.asyncio
 async def test_get_video_artifacts_non_webm_skips_ffmpeg(tmp_path) -> None:
     """Non-WebM container files (e.g. fully-formed MP4 from a remote source)
-    are container-valid already; remuxing them through ``finalize_webm`` would
-    corrupt the file. The extension-based short-circuit reads them raw."""
+    are container-valid already; the extension-based short-circuit reads them raw."""
     src = tmp_path / "recording.mp4"
     src.write_bytes(b"mp4-bytes")
     browser_state = _make_browser_state_with_video(str(src))
 
-    with patch("skyvern.webeye.real_browser_manager.finalize_webm", new=AsyncMock()) as m:
+    with patch.object(real_browser_manager, "prepare_recording_for_upload", new=AsyncMock()) as m:
         artifacts = await RealBrowserManager().get_video_artifacts(browser_state=browser_state)
 
-    m.assert_not_awaited()
+    m.assert_not_called()
     assert artifacts[0].video_data == b"mp4-bytes"
 
 
