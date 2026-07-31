@@ -40,21 +40,18 @@ export function paneLabel(id: StudioPaneId, runId?: string | null): string {
 
 // The stable accessible name for a pane's OWN controls (region, header, drag,
 // close, resize) and announcements. The run pane keeps "Run" so a screen reader
-// hears "Close Run pane", matching its "Run: wr_…" content — "Past Runs" is the
-// selector trigger's name (railLabel), not the pane's. The run id never enters
-// this name: a truncated id is ambiguous and would rename the control on every
-// run switch.
+// hears "Close Run pane", matching its "Run: wr_…" content. The run id never
+// enters this name: a truncated id is ambiguous and would rename the control
+// on every run switch.
 export function paneAccessibleName(id: StudioPaneId): string {
   return paneLabel(id);
 }
 
-// The rail tab / stage-launcher tile label. The run pane's tab is the run
-// selector (it opens the run history rather than toggling a pane): it names the
-// inspected run with its FULL id ("View Run: wr_55380…" — the top bar is where
-// people read and copy run ids, so no truncation) when callers pass one, and
-// reads "Past Runs" otherwise (no run inspected, or surfaces like the stage
-// launcher that don't resolve a run). Every other tab matches its pane's
-// accessible name.
+// The rail control / stage-launcher tile label. The inspected run's primary
+// control uses its FULL id ("View Run: wr_55380…" — the top bar is where people
+// read and copy run ids, so no truncation), while empty-state surfaces that
+// cannot open a run yet read "Past Runs". Every other control matches its
+// pane's accessible name.
 export function railLabel(id: StudioPaneId, runId?: string | null): string {
   if (id === "overview") {
     return runId ? `View Run: ${runId}` : "Past Runs";
