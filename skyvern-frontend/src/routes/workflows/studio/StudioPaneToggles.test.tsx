@@ -86,10 +86,14 @@ function tab(name: RegExp | string): HTMLButtonElement {
   return screen.getByRole("button", { name }) as HTMLButtonElement;
 }
 
-// The run selector tab reads "View Run: <id>" once a run is inspected and
-// "Past Runs" otherwise; match either so tests survive both states.
+// The primary run control reads "View Run: <id>" once a run is inspected and
+// "Past Runs" otherwise.
 function runsTab(): HTMLButtonElement {
-  return tab(/^(Past Runs|View Run)/);
+  return (
+    (screen.queryByRole("button", {
+      name: /^View Run/,
+    }) as HTMLButtonElement | null) ?? tab(/^Past Runs/)
+  );
 }
 
 function currentPanes(): string | null {
@@ -127,12 +131,19 @@ describe("StudioPaneToggles structure", () => {
     expect(tab(/^Browser/).getAttribute("aria-expanded")).toBe("false");
   });
 
+  test("the empty Past Runs control exposes its popover state and target", () => {
+    renderAt();
+    const trigger = tab(/^Past Runs/);
+
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    expect(trigger.getAttribute("aria-controls")).toBeTruthy();
+  });
+
   test("explicit ?panes= wins over a run deep link", () => {
     runsQueryMock.mockReturnValue({ data: [{ status: Status.Completed }] });
     renderAt("/workflows/wpid_abc/studio?wr=run_1&panes=copilot");
     expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("true");
-    // The Past Runs tab is a popover trigger; its active state (run pane open)
-    // is aria-pressed, not aria-expanded.
+    // The inspected-run control reports whether its pane is open.
     expect(runsTab().getAttribute("aria-pressed")).toBe("false");
   });
 
@@ -232,6 +243,32 @@ describe("StudioPaneToggles run selector", () => {
     expect(currentPanes()).toBe("copilot");
   });
 
+  test("clicking the current run tab reopens its closed pane directly", () => {
+    renderAt("/workflows/wpid_abc/studio?panes=copilot&wr=wr_current");
+
+    fireEvent.click(tab("View Run: wr_current"));
+
+    expect(currentPanes()?.split(",")).toContain("overview");
+    expect(screen.queryByText("Past runs")).toBeNull();
+  });
+
+  test("clicking the current run tab closes its open pane", () => {
+    renderAt("/workflows/wpid_abc/studio?panes=copilot,overview&wr=wr_current");
+
+    fireEvent.click(tab("View Run: wr_current"));
+
+    expect(currentPanes()?.split(",")).not.toContain("overview");
+  });
+
+  test("the separate Past runs button opens the selector without toggling the run pane", async () => {
+    renderAt("/workflows/wpid_abc/studio?panes=copilot&wr=wr_current");
+
+    fireEvent.click(tab("Past Runs"));
+
+    expect(await screen.findByText("Past runs")).toBeTruthy();
+    expect(currentPanes()).toBe("copilot");
+  });
+
   test("selecting a run opens the run pane and closes the popover", async () => {
     infiniteRunsMock.mockReturnValue(
       infiniteRuns([
@@ -244,7 +281,7 @@ describe("StudioPaneToggles run selector", () => {
     );
     // A different current run so the picked row is clickable (not the current).
     renderAt("/workflows/wpid_abc/studio?panes=copilot&wr=wr_other");
-    fireEvent.click(runsTab());
+    fireEvent.click(tab("Past Runs"));
     fireEvent.click(await screen.findByText("wr_pick"));
 
     // Selecting opens the run pane (overview). The row's switchRun also sets
@@ -268,7 +305,7 @@ describe("StudioPaneToggles run selector", () => {
       ]),
     );
     renderAt("/workflows/wpid_abc/studio?panes=copilot&wr=wr_same");
-    fireEvent.click(runsTab());
+    fireEvent.click(tab("Past Runs"));
     fireEvent.click(await screen.findByText("wr_same"));
 
     expect(currentPanes()?.split(",")).toContain("overview");
@@ -349,6 +386,18 @@ describe("StudioPaneToggles keyboard navigation", () => {
     fireEvent.keyDown(tab(/^Browser/), { key: "ArrowRight" });
     expect(document.activeElement).toBe(runsTab());
     fireEvent.keyDown(runsTab(), { key: "ArrowRight" });
+    expect(document.activeElement).toBe(tab(/^Copilot/));
+  });
+
+  test("ArrowRight includes the separate Past runs control while inspecting a run", () => {
+    renderAt("/workflows/wpid_abc/studio?wr=wr_current");
+    fireEvent.focus(tab(/^Browser/));
+
+    fireEvent.keyDown(tab(/^Browser/), { key: "ArrowRight" });
+    expect(document.activeElement).toBe(tab("View Run: wr_current"));
+    fireEvent.keyDown(tab("View Run: wr_current"), { key: "ArrowRight" });
+    expect(document.activeElement).toBe(tab("Past Runs"));
+    fireEvent.keyDown(tab("Past Runs"), { key: "ArrowRight" });
     expect(document.activeElement).toBe(tab(/^Copilot/));
   });
 
