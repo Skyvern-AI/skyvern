@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useDebounce } from "use-debounce";
 import { Button } from "@/components/ui/button";
 import { TableSearchInput } from "@/components/TableSearchInput";
@@ -32,13 +39,14 @@ import { ViewAllCredentialFoldersDialog } from "./ViewAllCredentialFoldersDialog
 import type { CredentialFolder } from "./types/credentialFolderTypes";
 
 const subHeaderText =
-  "Securely store your passwords, credit cards, secrets, and manage incoming 2FA codes for your agents.";
+  "Securely store your passwords, credit cards, secrets, and manage incoming 2FA codes and magic links for your agents.";
 
 const TAB_VALUES = [
   "passwords",
   "creditCards",
   "secrets",
   "twoFactor",
+  "magicLinks",
 ] as const;
 type TabValue = (typeof TAB_VALUES)[number];
 const DEFAULT_TAB: TabValue = "passwords";
@@ -52,6 +60,78 @@ function CredentialsPage() {
   const tabParam = searchParams.get("tab");
   const matchedTab = TAB_VALUES.find((tab) => tab === tabParam);
   const activeTab: TabValue = matchedTab ?? DEFAULT_TAB;
+  const isIncomingCodesTab =
+    activeTab === "twoFactor" || activeTab === "magicLinks";
+  const tabScrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const tabTriggerRefs = useRef<Record<TabValue, HTMLButtonElement | null>>({
+    passwords: null,
+    creditCards: null,
+    secrets: null,
+    twoFactor: null,
+    magicLinks: null,
+  });
+
+  const scrollActiveTabIntoView = useCallback(() => {
+    const activeTabTrigger = tabTriggerRefs.current[activeTab];
+    const scrollContainer = tabScrollContainerRef.current;
+    if (!activeTabTrigger || !scrollContainer) {
+      return;
+    }
+
+    const triggerRect = activeTabTrigger.getBoundingClientRect();
+    const containerRect = scrollContainer.getBoundingClientRect();
+    const triggerLeft =
+      triggerRect.left - containerRect.left + scrollContainer.scrollLeft;
+    const triggerRight = triggerLeft + triggerRect.width;
+    const visibleLeft = scrollContainer.scrollLeft;
+    const visibleRight = visibleLeft + containerRect.width;
+
+    if (triggerLeft < visibleLeft) {
+      scrollContainer.scrollLeft = triggerLeft;
+    } else if (triggerRight > visibleRight) {
+      scrollContainer.scrollLeft = triggerRight - containerRect.width;
+    }
+  }, [activeTab]);
+
+  useLayoutEffect(() => {
+    scrollActiveTabIntoView();
+  }, [scrollActiveTabIntoView]);
+
+  useEffect(() => {
+    if (
+      typeof window === "undefined" ||
+      typeof window.requestAnimationFrame !== "function"
+    ) {
+      return;
+    }
+
+    let animationFrameId: number | null = null;
+    const handleResize = () => {
+      if (animationFrameId !== null) {
+        window.cancelAnimationFrame(animationFrameId);
+      }
+
+      animationFrameId = window.requestAnimationFrame(() => {
+        animationFrameId = null;
+        const scrollContainer = tabScrollContainerRef.current;
+        if (
+          !scrollContainer ||
+          scrollContainer.scrollWidth <= scrollContainer.clientWidth
+        ) {
+          return;
+        }
+        scrollActiveTabIntoView();
+      });
+    };
+
+    window.addEventListener("resize", handleResize);
+    return () => {
+      window.removeEventListener("resize", handleResize);
+      if (animationFrameId !== null) {
+        window.cancelAnimationFrame(animationFrameId);
+      }
+    };
+  }, [scrollActiveTabIntoView]);
 
   useEffect(() => {
     if (tabParam && !matchedTab) {
@@ -199,7 +279,7 @@ function CredentialsPage() {
         </DropdownMenu>
       </div>
 
-      <div className={cn("space-y-4", activeTab === "twoFactor" && "hidden")}>
+      <div className={cn("space-y-4", isIncomingCodesTab && "hidden")}>
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <h2 className="text-lg font-semibold">Folders</h2>
@@ -282,14 +362,55 @@ function CredentialsPage() {
         onValueChange={handleTabChange}
       >
         <div className="flex flex-wrap items-center justify-between gap-4">
-          <TabsList className="bg-slate-elevation1">
-            <TabsTrigger value="passwords">Passwords</TabsTrigger>
-            <TabsTrigger value="creditCards">Credit Cards</TabsTrigger>
-            <TabsTrigger value="secrets">Secrets</TabsTrigger>
-            <TabsTrigger value="twoFactor">2FA</TabsTrigger>
-          </TabsList>
+          <div
+            ref={tabScrollContainerRef}
+            className="-mx-1 flex w-full max-w-full overflow-x-auto px-1 pb-1 md:m-0 md:w-auto md:max-w-none md:overflow-visible md:p-0"
+          >
+            <TabsList className="bg-slate-elevation1">
+              <TabsTrigger
+                ref={(trigger) => {
+                  tabTriggerRefs.current.passwords = trigger;
+                }}
+                value="passwords"
+              >
+                Passwords
+              </TabsTrigger>
+              <TabsTrigger
+                ref={(trigger) => {
+                  tabTriggerRefs.current.creditCards = trigger;
+                }}
+                value="creditCards"
+              >
+                Credit Cards
+              </TabsTrigger>
+              <TabsTrigger
+                ref={(trigger) => {
+                  tabTriggerRefs.current.secrets = trigger;
+                }}
+                value="secrets"
+              >
+                Secrets
+              </TabsTrigger>
+              <TabsTrigger
+                ref={(trigger) => {
+                  tabTriggerRefs.current.twoFactor = trigger;
+                }}
+                value="twoFactor"
+              >
+                2FA
+              </TabsTrigger>
+              <TabsTrigger
+                ref={(trigger) => {
+                  tabTriggerRefs.current.magicLinks = trigger;
+                }}
+                value="magicLinks"
+              >
+                Magic Links
+              </TabsTrigger>
+            </TabsList>
+          </div>
           <div className="flex items-center gap-3">
-            {selectedFolderId && activeTab !== "twoFactor" && (
+            {selectedFolderId && !isIncomingCodesTab && (
               <Button
                 variant="link"
                 size="sm"
@@ -299,7 +420,7 @@ function CredentialsPage() {
                 View all credentials
               </Button>
             )}
-            {activeTab !== "twoFactor" && (
+            {!isIncomingCodesTab && (
               <TableSearchInput
                 value={search}
                 onChange={setSearch}
@@ -352,6 +473,10 @@ function CredentialsPage() {
         <TabsContent value="twoFactor" className="space-y-4">
           <CredentialsTotpTab />
         </TabsContent>
+
+        <TabsContent value="magicLinks" className="space-y-4">
+          <CredentialsTotpTab variant="magicLink" />
+        </TabsContent>
       </Tabs>
       <CredentialsModal onStartBackgroundTest={startBackgroundTest} />
 
@@ -367,7 +492,7 @@ function CredentialsPage() {
       />
 
       {/* Footer note - only for Passwords and Credit Cards tabs */}
-      {activeTab !== "twoFactor" && (
+      {!isIncomingCodesTab && (
         <div className="mt-8 border-t border-slate-700 pt-4">
           <div className="text-sm italic text-neutral-600 dark:text-slate-400">
             <strong>Note:</strong> This feature requires a Bitwarden-compatible
