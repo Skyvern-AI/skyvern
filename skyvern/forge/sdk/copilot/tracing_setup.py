@@ -11,7 +11,7 @@ import contextvars
 import json
 import os
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import structlog
 
@@ -21,6 +21,9 @@ from skyvern.config import settings
 # one exact-match sensitive-key policy.
 from skyvern.forge.request_logging import redact_sensitive_fields
 from skyvern.forge.sdk.core import skyvern_context
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.model_telemetry import CopilotModelCallTelemetry
 
 LOG = structlog.get_logger()
 
@@ -40,6 +43,18 @@ _LOGFIRE_PATCH_SYMBOLS = ("attributes_from_span_data", "LogfireTraceProviderWrap
 
 # Set by agent.py before running the agent so the span patch can read it.
 _copilot_model_name: contextvars.ContextVar[str | None] = contextvars.ContextVar("_copilot_model_name", default=None)
+
+
+class _LogfireOTelSpan(Protocol):
+    _span_name: str
+
+
+class _LogfireSpanHelper(Protocol):
+    span: _LogfireOTelSpan
+
+
+class _LogfireAgentSpan(Protocol):
+    span_helper: _LogfireSpanHelper
 
 
 def is_tracing_enabled() -> bool:
@@ -140,7 +155,22 @@ def _calculate_price(calc_price: Any, usage: Any, model: str) -> Any:
         return calc_price(usage, model_ref=model_ref, provider_id=provider)
 
 
-def _attach_cost_attr(attrs: dict[str, Any], usage: Any, model: str | None) -> None:
+def _model_call_cost(telemetry: CopilotModelCallTelemetry, model: str) -> float | None:
+    # ``tracing_setup`` is imported by lightweight CLI/browser modules that do
+    # not install the server-only OpenAI Agents SDK. Keep the model adapter
+    # behind the runtime Copilot seam instead of importing it at module load.
+    from skyvern.forge.sdk.copilot.model_telemetry import _model_call_cost as calculate_model_call_cost
+
+    return calculate_model_call_cost(telemetry, model)
+
+
+def current_model_call_telemetry() -> CopilotModelCallTelemetry | None:
+    from skyvern.forge.sdk.copilot.model_telemetry import current_model_call_telemetry as get_model_call_telemetry
+
+    return get_model_call_telemetry()
+
+
+def _attach_legacy_cost_attr(attrs: dict[str, Any], usage: Any, model: str | None) -> None:
     """Stamp ``operation.cost`` (USD) on a GenerationSpanData span.
 
     Matches the attribute Logfire's native ``instrument_openai`` / ``instrument_anthropic``
@@ -174,6 +204,59 @@ def _attach_cost_attr(attrs: dict[str, Any], usage: Any, model: str | None) -> N
     except Exception:
         return
     attrs["operation.cost"] = float(price.total_price)
+
+
+def _attach_cost_attr(
+    attrs: dict[str, Any],
+    telemetry: CopilotModelCallTelemetry,
+    model: str | None,
+) -> None:
+    if model is None or telemetry.input_tokens is None or telemetry.output_tokens is None:
+        return
+    try:
+        from genai_prices import Usage, calc_price
+
+        price_usage = Usage(
+            input_tokens=telemetry.input_tokens,
+            output_tokens=telemetry.output_tokens,
+            cache_read_tokens=telemetry.cache_read_tokens,
+            cache_write_tokens=telemetry.cache_write_tokens,
+        )
+        price = _calculate_price(calc_price, price_usage, model)
+    except Exception:
+        fallback_cost = _model_call_cost(telemetry, model)
+        if fallback_cost is not None:
+            attrs["operation.cost"] = fallback_cost
+    else:
+        attrs["operation.cost"] = float(price.total_price)
+
+
+def _attach_copilot_model_call_attrs(
+    attrs: dict[str, Any],
+    telemetry: CopilotModelCallTelemetry,
+    model: str | None,
+) -> None:
+    attrs["copilot.model_call_index"] = telemetry.model_call_index
+    attrs["copilot.cache.mode"] = telemetry.cache_mode
+    attrs["copilot.cache.breakpoint_count"] = telemetry.cache_breakpoint_count
+    if telemetry.cache_stable_prefix_chars is not None:
+        attrs["copilot.cache.stable_prefix_chars"] = telemetry.cache_stable_prefix_chars
+
+    if telemetry.input_tokens is not None:
+        attrs["gen_ai.usage.input_tokens"] = telemetry.input_tokens
+    if telemetry.output_tokens is not None:
+        attrs["gen_ai.usage.output_tokens"] = telemetry.output_tokens
+    if telemetry.cache_read_tokens is not None:
+        attrs["gen_ai.usage.cache_read_tokens"] = telemetry.cache_read_tokens
+        attrs["gen_ai.usage.cached_tokens"] = telemetry.cache_read_tokens
+        attrs["gen_ai.usage.cache_read.input_tokens"] = telemetry.cache_read_tokens
+    if telemetry.cache_write_tokens is not None:
+        attrs["gen_ai.usage.cache_write_tokens"] = telemetry.cache_write_tokens
+        attrs["gen_ai.usage.cache_creation.input_tokens"] = telemetry.cache_write_tokens
+    if telemetry.response_model is not None:
+        attrs["gen_ai.response.model"] = telemetry.response_model
+
+    _attach_cost_attr(attrs, telemetry, telemetry.response_model or model)
 
 
 def _patch_agent_span_attributes() -> None:
@@ -220,7 +303,17 @@ def _patch_agent_span_attributes() -> None:
                     attrs["gen_ai.request.model"] = model
             elif isinstance(span_data, GenerationSpanData):
                 attrs.setdefault("gen_ai.operation.name", "chat")
-                _attach_cost_attr(attrs, getattr(span_data, "usage", None), getattr(span_data, "model", None))
+                telemetry = current_model_call_telemetry()
+                if telemetry is None:
+                    # Third-party tracing adapters can supply a reduced
+                    # GenerationSpanData-compatible object without usage.
+                    _attach_legacy_cost_attr(
+                        attrs,
+                        getattr(span_data, "usage", None),
+                        getattr(span_data, "model", None),
+                    )
+                else:
+                    _attach_copilot_model_call_attrs(attrs, telemetry, span_data.model)
             elif isinstance(span_data, FunctionSpanData):
                 attrs.setdefault("gen_ai.operation.name", "execute_tool")
                 if "name" in attrs:
@@ -271,7 +364,7 @@ def _patch_agent_span_attributes() -> None:
             result = _original_create(self, span_data, span_id, parent, disabled)
             if isinstance(span_data, AgentSpanData) and getattr(span_data, "name", None):
                 try:
-                    logfire_span = result.span_helper.span
+                    logfire_span = cast(_LogfireAgentSpan, result).span_helper.span
                     logfire_span._span_name = f"invoke_agent {span_data.name}"
                 except AttributeError as exc:
                     _warn_span_rename_once(exc)

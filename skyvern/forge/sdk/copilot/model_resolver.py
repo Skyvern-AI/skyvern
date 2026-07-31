@@ -17,6 +17,7 @@ Known limitations:
 from __future__ import annotations
 
 import re
+from itertools import count
 from typing import Any
 
 import structlog
@@ -288,13 +289,16 @@ class CopilotLitellmProvider(LitellmProvider):
         super().__init__()
         self._base_url = base_url
         self._api_key = api_key
+        self._model_call_indices = count(1)
 
     def get_model(self, model_name: str | None) -> Model:
-        from agents.extensions.models.litellm_model import LitellmModel
         from agents.models.default_models import get_default_model
 
-        return LitellmModel(
+        from skyvern.forge.sdk.copilot.model_telemetry import CopilotLitellmModel
+
+        return CopilotLitellmModel(
             model=model_name or get_default_model(),
             base_url=self._base_url,
             api_key=self._api_key,
+            next_model_call_index=self._model_call_indices.__next__,
         )

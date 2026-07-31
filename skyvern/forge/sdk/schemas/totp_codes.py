@@ -66,8 +66,9 @@ class TOTPCodeCreate(TOTPCodeBase):
     )
     type: OTPType | None = Field(
         default=None,
-        description="Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.",
+        description="Deprecated compatibility field. Skyvern auto-detects the OTP type from content, so this value does not constrain extraction.",
         examples=["totp", "magic_link"],
+        deprecated=True,
     )
 
     @field_validator("content")
