@@ -640,7 +640,7 @@ class RealBrowserState(BrowserState):
             allow_transient_ui_suppression=allow_transient_ui_suppression,
         )
 
-    async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> None:
+    async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> bool:
         # ``release_driver`` decouples the local Playwright driver's lifetime
         # from the remote browser's: callers that retain this state for reuse
         # (persistent sessions, parent/child sharing) must pass False; None
@@ -657,6 +657,7 @@ class RealBrowserState(BrowserState):
         # even when interceptor disable, cookie persistence, or context close hangs or fails.
         # Worst-case wall time is the sum of the per-phase budgets:
         # BROWSER_INTERCEPTOR_DISABLE_TIMEOUT + 3 * BROWSER_CLOSE_TIMEOUT.
+        recording_finalized = False
         if close_browser_on_completion:
             if self.browser_context is not None:
                 await self._run_bounded_detachable(
@@ -664,7 +665,7 @@ class RealBrowserState(BrowserState):
                     BROWSER_INTERCEPTOR_DISABLE_TIMEOUT,
                     "download interceptor disable",
                 )
-            await self._run_bounded_detachable(
+            recording_finalized = await self._run_bounded_detachable(
                 self._teardown_context(),
                 BROWSER_CLOSE_TIMEOUT,
                 "browser context teardown",
@@ -672,8 +673,9 @@ class RealBrowserState(BrowserState):
             await self._run_browser_cleanup_bounded()
 
         await self._stop_driver_bounded(release_driver)
+        return recording_finalized
 
-    async def _run_bounded_detachable(self, coro: Awaitable[None], timeout: float, description: str) -> None:
+    async def _run_bounded_detachable(self, coro: Awaitable[None], timeout: float, description: str) -> bool:
         # Bound a teardown phase WITHOUT relying on cancellation: a stuck download drain or a real
         # Playwright ``context.close`` blocked by an unresolved paused request can ignore the cancel a
         # plain ``asyncio.timeout`` delivers. We race the phase against ``timeout`` and, if it does not
@@ -695,12 +697,14 @@ class RealBrowserState(BrowserState):
             )
             task.cancel()
             self._own_detached_task(task, description)
-            return
+            return False
         if task.cancelled():
-            return
+            return False
         error = task.exception()
         if error is not None:
             LOG.warning("Teardown phase failed", phase=description, error_type=type(error).__name__)
+            return False
+        return True
 
     def _own_detached_task(self, task: asyncio.Task[None], description: str) -> None:
         # A cancellation-resistant phase can outlive close(). We hold a strong reference until it
@@ -738,10 +742,7 @@ class RealBrowserState(BrowserState):
             await persist_session_cookies(self.browser_context, session_dir)
         except Exception:
             LOG.warning("Failed to persist session cookies during teardown", exc_info=True)
-        try:
-            await self.browser_context.close()
-        except Exception:
-            LOG.warning("Failed to close browser context", exc_info=True)
+        await self.browser_context.close()
         LOG.info("Main browser context and all its pages are closed")
 
     async def _run_browser_cleanup_bounded(self) -> None:

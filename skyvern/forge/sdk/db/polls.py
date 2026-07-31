@@ -36,12 +36,12 @@ async def await_browser_session(
                     raise Exception(f"Persistent browser session not found for {session_id}")
 
                 LOG.debug(
-                    "Checking browser address",
+                    "Checking browser readiness",
                     session_id=session_id,
-                    address=persistent_browser_session.browser_address,
+                    is_browser_ready=persistent_browser_session.is_browser_ready,
                 )
 
-                if persistent_browser_session.browser_address:
+                if persistent_browser_session.is_browser_ready:
                     return persistent_browser_session
 
                 await asyncio.sleep(poll_interval)

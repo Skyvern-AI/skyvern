@@ -5,7 +5,7 @@ from mimetypes import add_type, guess_type
 from typing import IO, Self
 
 import structlog
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
 from azure.identity.aio import ClientSecretCredential, DefaultAzureCredential
 from azure.keyvault.secrets.aio import SecretClient
 from azure.storage.blob import BlobSasPermissions, ContentSettings, StandardBlobTier, generate_blob_sas
@@ -57,16 +57,28 @@ class RealAsyncAzureVaultClient(AsyncAzureVaultClient):
         secret_client = await self._get_secret_client(vault_name)
         try:
             previous_versions: list[str] = []
+            enumerated_any = False
             try:
                 async for properties in secret_client.list_properties_of_secret_versions(secret_name):
+                    enumerated_any = True
                     if properties.enabled is not False and properties.version is not None:
                         previous_versions.append(properties.version)
             except ResourceNotFoundError:
-                pass
-            except Exception:
-                # An identity permitted to set but not list secret versions raises an authorization
-                # error here. Disabling prior versions is best-effort, so log and continue rather than
-                # failing every write (and, via delete_credential, orphaning material after the row is gone).
+                # A brand-new secret has no version history, so a not-found before any version is
+                # enumerated is expected — proceed with the create. But a not-found *after* some versions
+                # were already listed means pagination was interrupted, leaving the un-enumerated priors
+                # enabled and readable; fail the write so it retries instead of silently orphaning them.
+                if enumerated_any:
+                    raise
+            except HttpResponseError as e:
+                # An identity permitted to set but not list secret versions raises a 401/403 here, and
+                # disabling priors is best-effort, so proceed rather than failing every write. Re-raise any
+                # other status, or a failure after enumerating any versions (a first page of only
+                # current/already-disabled versions leaves `previous_versions` empty yet still means the
+                # error is partial), so the write fails and retries instead of silently leaving the
+                # un-enumerated prior versions enabled and readable.
+                if enumerated_any or e.status_code not in (401, 403):
+                    raise
                 LOG.warning(
                     "Could not enumerate prior Azure secret versions to disable; proceeding with the write",
                     secret_name=secret_name,

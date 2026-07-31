@@ -1349,6 +1349,17 @@ class MissingBrowserAddressError(SkyvernException):
         super().__init__(f"Browser session {browser_session_id} does not have an address.")
 
 
+class MissingRoutedVncAddressError(SkyvernException):
+    """No credential-bearing VNC address can be built for a session.
+
+    Raised instead of falling back to the browser's own network address: a live view served
+    over an unauthenticated internal address is worse than no live view (SKY-13287).
+    """
+
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(f"Browser session {browser_session_id} has no routed VNC address.")
+
+
 class BrowserSessionClosed(SkyvernHTTPException):
     def __init__(self, browser_session_id: str) -> None:
         super().__init__(
