@@ -36,6 +36,7 @@ def _reset_auth_context() -> None:
     session_manager.set_stateless_http_mode(False)
     mcp_http_auth._auth_db = None
     mcp_http_auth._api_key_validation_cache.clear()
+    mcp_http_auth._transport_session_owners.clear()
     mcp_http_auth._API_KEY_CACHE_TTL_SECONDS = 30.0
     mcp_http_auth._API_KEY_CACHE_MAX_SIZE = 1024
     mcp_http_auth._MAX_VALIDATION_RETRIES = 2
