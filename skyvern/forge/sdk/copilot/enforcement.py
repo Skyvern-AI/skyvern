@@ -16,6 +16,7 @@ import structlog
 from agents import ModelSettings, RunConfig
 from agents.run import Runner
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot import config as copilot_config_defaults
 from skyvern.forge.sdk.copilot import streaming_adapter
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -24,7 +25,11 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     clear_tool_blocker_signals_for_reason_codes,
     stash_blocker_signal,
 )
-from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD, DISCOVERY_PERMITTED_PHASES
+from skyvern.forge.sdk.copilot.build_phase import (
+    DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD,
+    DISCOVERY_PERMITTED_PHASES,
+    BuildPhase,
+)
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     latest_recorded_build_test_outcome_repeated,
 )
@@ -197,7 +202,7 @@ REPEATED_FRONTIER_STREAK_STOP_AT = 3
 MAX_PER_TOOL_BUDGET_NUDGES = 2
 _NO_PROGRESS_INTERACTION_REASON_CODES = frozenset({"loop_detected_no_forward_progress_interaction"})
 MIN_BLOCKS_FOR_AUTO_COMPLETE = 10
-TOTAL_TIMEOUT_SECONDS = 900
+TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
 # Floor for the per-iteration ``wait_for`` deadline so an already-spent budget
 # never yields ``wait_for(timeout=0)`` (which raises immediately). Kept as a
 # constant so tests can shrink it instead of paying a full second per deadline.
@@ -686,8 +691,20 @@ def _verified_goal_likely_needs_more_work(ctx: CopilotContext) -> bool:
     return _goal_likely_needs_more_blocks(user_message, block_count, completion_contract)
 
 
-def _mark_copilot_total_timeout(ctx: Any) -> None:
+def _mark_copilot_total_timeout(ctx: Any, *, elapsed_seconds: float, iteration: int) -> None:
+    already_marked = ctx.copilot_total_timeout_exceeded is True
     ctx.copilot_total_timeout_exceeded = True
+    if already_marked:
+        return
+    # Only CopilotContext carries build_phase; the self-heal path passes a bare AgentContext,
+    # and an AttributeError here would replace the timeout with a crash.
+    build_phase = getattr(ctx, "build_phase", None)
+    LOG.warning(
+        "copilot_turn_deadline_expired",
+        elapsed_seconds=round(elapsed_seconds, 3),
+        iteration=iteration,
+        build_phase=build_phase.value if isinstance(build_phase, BuildPhase) else None,
+    )
 
 
 def _elapsed_run_seconds(ctx: Any, start_time: float) -> float:
@@ -706,9 +723,10 @@ def _elapsed_run_seconds(ctx: Any, start_time: float) -> float:
     return time.monotonic() - start_time - pause_seconds
 
 
-def _mark_copilot_total_timeout_if_elapsed(ctx: Any, start_time: float) -> None:
-    if _elapsed_run_seconds(ctx, start_time) >= TOTAL_TIMEOUT_SECONDS:
-        _mark_copilot_total_timeout(ctx)
+def _mark_copilot_total_timeout_if_elapsed(ctx: Any, start_time: float, iteration: int) -> None:
+    elapsed = _elapsed_run_seconds(ctx, start_time)
+    if elapsed >= TOTAL_TIMEOUT_SECONDS:
+        _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
 
 
 class CopilotNonRetriableNavError(Exception):
@@ -1939,12 +1957,7 @@ async def _run_streamed_with_deadline(
         finally:
             _accumulate_usage(result, ctx)
     except asyncio.TimeoutError:
-        _mark_copilot_total_timeout(ctx)
-        LOG.warning(
-            "Copilot total timeout exceeded mid-iteration",
-            elapsed_seconds=round(time.monotonic() - start_time, 3),
-            iteration=iteration,
-        )
+        _mark_copilot_total_timeout(ctx, elapsed_seconds=_elapsed_run_seconds(ctx, start_time), iteration=iteration)
         raise CopilotTotalTimeoutError() from None
     return result
 
@@ -3002,7 +3015,7 @@ async def run_with_enforcement(
         # chat history on the server side (see SKY-8986).
         elapsed = _elapsed_run_seconds(ctx, start_time)
         if elapsed > TOTAL_TIMEOUT_SECONDS:
-            _mark_copilot_total_timeout(ctx)
+            _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
             raise CopilotTotalTimeoutError()
 
         # When the current turn contains image payloads, the session-backed
@@ -3076,7 +3089,7 @@ async def run_with_enforcement(
                     iteration,
                 )
             except asyncio.CancelledError:
-                _mark_copilot_total_timeout_if_elapsed(ctx, start_time)
+                _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
                 raise
             except Exception as e:
                 if not _is_context_window_error(e):
@@ -3100,7 +3113,7 @@ async def run_with_enforcement(
                 try:
                     current_input, images_stripped = await _recover_from_context_overflow(session, current_input)
                 except asyncio.CancelledError:
-                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time)
+                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
                     raise
                 if images_stripped:
                     # The agent could otherwise reason about the page from
@@ -3119,7 +3132,7 @@ async def run_with_enforcement(
                         iteration,
                     )
                 except asyncio.CancelledError:
-                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time)
+                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
                     raise
                 except Exception as retry_err:
                     # Never retry twice; even a second overflow surfaces as a

@@ -19,7 +19,7 @@ from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.types import ASGIApp, Message, Receive, Scope, Send
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -37,7 +37,6 @@ API_KEY_HEADER = "x-api-key"
 AUTHORIZATION_HEADER = "authorization"
 BEARER_PREFIX = "Bearer "
 HEALTH_PATHS = {"/health", "/healthz"}
-MCP_SESSION_ID_HEADER = "mcp-session-id"
 # Keep in sync with skyvern-frontend/cloud/mcp-auth-constants.ts::SKYVERN_AUTH_TEMPLATE_NAME.
 # Names the JWT template the frontend uses to mint bearer tokens for
 # /oauth/callback and the CLI signup flow. A divergence silently breaks auth.
@@ -51,12 +50,10 @@ _MCP_ALLOWED_TOKEN_TYPES = (OrganizationAuthTokenType.api,)
 _auth_db: AgentDB | None = None
 _auth_db_lock = RLock()
 _api_key_cache_lock = RLock()
-_transport_session_owner_lock = RLock()
 # Cache entries are namespace-separated by key prefix:
 # `cache_key(...)` stores MCPAPIKeyValidation, `_oauth_cache_key(...)` stores
 # _OAuthResolution. Keep those prefixes distinct if this cache evolves.
 _api_key_validation_cache: OrderedDict[str, tuple[MCPAPIKeyValidation | _OAuthResolution | None, float]] = OrderedDict()
-_transport_session_owners: dict[str, str] = {}
 _OAUTH_CACHE_TTL_SECONDS = 30.0
 _NEGATIVE_CACHE_TTL_SECONDS = 5.0
 _VALIDATION_RETRY_EXHAUSTED_MESSAGE = "API key validation temporarily unavailable"
@@ -619,59 +616,22 @@ class MCPAPIKeyMiddleware:
         organization_id: str,
         api_key: str,
     ) -> None:
-        request = Request(scope)
-        request_session_id = request.headers.get(MCP_SESSION_ID_HEADER)
-        owner_fingerprint = hash_api_key_for_cache(api_key)
-        if request_session_id is not None:
-            with _transport_session_owner_lock:
-                expected_owner = _transport_session_owners.get(request_session_id)
-            if expected_owner is not None and expected_owner != owner_fingerprint:
-                response = JSONResponse(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": "server-error",
-                        "error": {"code": -32600, "message": "Session not found"},
-                    },
-                    status_code=404,
-                )
-                await response(scope, receive, send)
-                return
-
         scope.setdefault("state", {})
         scope["state"]["organization_id"] = organization_id
         scope["user"] = AuthenticatedUser(
             AccessToken(
                 token="mcp-http-session-owner",
                 client_id=organization_id,
-                subject=owner_fingerprint,
+                subject=hash_api_key_for_cache(api_key),
                 scopes=[],
             )
         )
-
-        response_session_id: str | None = None
-        response_status: int | None = None
-
-        async def owner_bound_send(message: Message) -> None:
-            nonlocal response_session_id, response_status
-            if message["type"] == "http.response.start":
-                response_status = message["status"]
-                for name, value in message.get("headers", []):
-                    if name.lower() == MCP_SESSION_ID_HEADER.encode("ascii"):
-                        response_session_id = value.decode("ascii")
-                        with _transport_session_owner_lock:
-                            _transport_session_owners[response_session_id] = owner_fingerprint
-                        break
-            await send(message)
-
         token = set_api_key_override(api_key)
         try:
             with request_session_scope(organization_id):
-                await self.app(scope, receive, owner_bound_send)
+                await self.app(scope, receive, send)
         finally:
             reset_api_key_override(token)
-        if request.method == "DELETE" and request_session_id is not None and (response_status or 500) < 400:
-            with _transport_session_owner_lock:
-                _transport_session_owners.pop(request_session_id, None)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":

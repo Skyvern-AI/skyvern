@@ -76,11 +76,24 @@ class CredentialVaultService(ABC):
                     vault_type=vault_type,
                     exc_info=True,
                 )
-            await app.AGENT_FUNCTION.on_credential_item_orphaned(
-                organization_id=organization_id,
-                item_id=item_id,
-                vault_type=vault_type,
-            )
+            # The caller invokes this inside `except BaseException: ... ; raise`, so a durable-enqueue
+            # failure must not escape _run(): it would replace the in-flight exception (e.g. the
+            # write-lease cancellation the caller is re-raising) with an unrelated one. Log and swallow so
+            # the caller's bare `raise` always re-raises the original.
+            try:
+                await app.AGENT_FUNCTION.on_credential_item_orphaned(
+                    organization_id=organization_id,
+                    item_id=item_id,
+                    vault_type=vault_type,
+                )
+            except Exception:
+                LOG.error(
+                    "Durable vault-item cleanup enqueue failed; item may stay orphaned until the reaper reclaims it",
+                    organization_id=organization_id,
+                    item_id=item_id,
+                    vault_type=vault_type,
+                    exc_info=True,
+                )
 
         reclaim = asyncio.ensure_future(_run())
         while not reclaim.done():

@@ -689,9 +689,16 @@ async def test_popup_video_listener_timeout_url_error_safe() -> None:
     assert len(artifacts.video_artifacts) == 0
 
 
+@pytest.mark.parametrize(
+    ("shared_with_parent", "expected_deferred_close", "expected_release_driver"),
+    [(False, True, None), (True, False, False)],
+)
 @pytest.mark.asyncio
 async def test_cleanup_persists_session_cookies_when_close_deferred_for_streams(
     monkeypatch: pytest.MonkeyPatch,
+    shared_with_parent: bool,
+    expected_deferred_close: bool,
+    expected_release_driver: bool | None,
 ) -> None:
     """Active CDP streams defer the browser close, so cleanup must snapshot session cookies before
     store_browser_session archives the dir — the deferred close runs too late."""
@@ -701,16 +708,66 @@ async def test_cleanup_persists_session_cookies_when_close_deferred_for_streams(
     browser_state.browser_artifacts.browser_session_dir = "/tmp/fake_profile"
     browser_state.close = AsyncMock()
     manager.pages["wfr_streamed"] = browser_state
+    manager.pages["tsk_streamed"] = browser_state
+    if shared_with_parent:
+        manager.pages["wfr_parent"] = browser_state
 
     persist_mock = AsyncMock()
+    defer_mock = MagicMock(return_value=True)
     monkeypatch.setattr("skyvern.webeye.real_browser_manager.persist_session_cookies", persist_mock)
     monkeypatch.setattr("skyvern.webeye.real_browser_manager.stream_ref_active", lambda wrid: True)
-    monkeypatch.setattr("skyvern.webeye.real_browser_manager.set_deferred_close_params", lambda *a, **k: None)
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.set_deferred_close_params", defer_mock)
 
-    await manager.cleanup_for_workflow_run("wfr_streamed", task_ids=[], close_browser_on_completion=True)
+    result = await manager.cleanup_for_workflow_run(
+        "wfr_streamed",
+        task_ids=["tsk_streamed"],
+        close_browser_on_completion=True,
+    )
 
     persist_mock.assert_awaited_once_with(browser_state.browser_context, "/tmp/fake_profile")
+    defer_mock.assert_called_once_with(
+        "wfr_streamed",
+        expected_deferred_close,
+        release_driver=expected_release_driver,
+    )
     browser_state.close.assert_not_awaited()
+    assert "tsk_streamed" not in manager.pages
+    assert result.recording_finalized is False
+
+
+@pytest.mark.parametrize("close_succeeded", [True, False])
+@pytest.mark.asyncio
+async def test_cleanup_closes_when_stream_disconnects_before_deferral(
+    monkeypatch: pytest.MonkeyPatch,
+    close_succeeded: bool,
+) -> None:
+    manager = RealBrowserManager()
+    browser_state = MagicMock()
+    browser_state.browser_artifacts.traces_dir = None
+    browser_state.browser_artifacts.browser_session_dir = "/tmp/fake_profile"
+    browser_state.close = AsyncMock(return_value=close_succeeded)
+    manager.pages["wfr_streamed"] = browser_state
+    manager.pages["tsk_streamed"] = browser_state
+
+    monkeypatch.setattr(
+        "skyvern.webeye.real_browser_manager.persist_session_cookies",
+        AsyncMock(),
+    )
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.stream_ref_active", lambda wrid: True)
+    monkeypatch.setattr(
+        "skyvern.webeye.real_browser_manager.set_deferred_close_params",
+        lambda *args, **kwargs: False,
+    )
+
+    result = await manager.cleanup_for_workflow_run(
+        "wfr_streamed",
+        task_ids=["tsk_streamed"],
+        close_browser_on_completion=True,
+    )
+
+    browser_state.close.assert_awaited_once_with(close_browser_on_completion=True, release_driver=None)
+    assert "tsk_streamed" not in manager.pages
+    assert result.recording_finalized is close_succeeded
 
 
 @pytest.mark.asyncio
