@@ -3,14 +3,17 @@ import { CheckIcon, CopyIcon } from "@radix-ui/react-icons";
 
 import { Button } from "@/components/ui/button";
 import { copyText } from "@/util/copyText";
-import { cn } from "@/util/utils";
 
 function CopyButton({
   value,
   className,
+  ariaLabel,
 }: {
-  value: string;
+  // A getter defers building the copied text until click, so callers rendering
+  // many buttons (e.g. per JSON-tree row) don't serialize on every render.
+  value: string | (() => string);
   className?: string;
+  ariaLabel?: string;
 }) {
   const [copied, setCopied] = useState(false);
 
@@ -18,7 +21,7 @@ function CopyButton({
     if (copied) {
       return;
     }
-    await copyText(value);
+    await copyText(typeof value === "function" ? value() : value);
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
   };
@@ -28,8 +31,8 @@ function CopyButton({
       size="icon"
       variant="ghost"
       onClick={handleCopy}
-      className={cn(className)}
-      aria-label="Copy to clipboard"
+      className={className}
+      aria-label={ariaLabel ?? "Copy to clipboard"}
     >
       {copied ? <CheckIcon /> : <CopyIcon />}
     </Button>

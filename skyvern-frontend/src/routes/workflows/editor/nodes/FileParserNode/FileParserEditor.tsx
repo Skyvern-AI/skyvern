@@ -150,12 +150,22 @@ function FileParserEditorBody({
           </SelectContent>
         </Select>
       </div>
-      <WorkflowDataSchemaInputGroup
-        exampleValue={dataSchemaExampleForFileExtraction}
-        value={data.jsonSchema}
-        onChange={(value) => update({ jsonSchema: value })}
-        suggestionContext={{ current_schema: data.jsonSchema }}
-      />
+      <div className="space-y-2">
+        <WorkflowDataSchemaInputGroup
+          exampleValue={dataSchemaExampleForFileExtraction}
+          value={data.jsonSchema}
+          onChange={(value) => update({ jsonSchema: value })}
+          suggestionContext={{ current_schema: data.jsonSchema }}
+        />
+        {(data.fileType === "zip" ||
+          ((data.fileType === "auto_detect" || data.fileType === "csv") &&
+            detectFileTypeFromUrl(data.fileUrl ?? "") === "zip")) && (
+          <p className="text-xs text-muted-foreground dark:text-slate-500">
+            Data Schema is ignored for ZIP archives. This block outputs the
+            extracted file list.
+          </p>
+        )}
+      </div>
       <ModelSelector
         className="nopan w-52 text-xs"
         value={data.model}
