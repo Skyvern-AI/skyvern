@@ -702,6 +702,19 @@ class WorkflowRunModel(Base):
             postgresql_where=text("status IN ('queued', 'running', 'paused') AND browser_session_id IS NULL"),
         ),
         Index(
+            "ix_workflow_runs_sequential_credential_gate",
+            "organization_id",
+            "sequential_credential_id",
+            "queued_at",
+            postgresql_where=text("sequential_credential_id IS NOT NULL AND status IN ('queued', 'running', 'paused')"),
+        ),
+        Index(
+            "ix_workflow_runs_serialized_ticket",
+            "organization_id",
+            text("queued_at DESC"),
+            postgresql_where=text("status IN ('queued', 'running', 'paused')"),
+        ),
+        Index(
             "ix_workflow_runs_retried_from_workflow_run_id",
             "retried_from_workflow_run_id",
             unique=True,
@@ -737,6 +750,7 @@ class WorkflowRunModel(Base):
     job_id = Column(String, nullable=True, index=True)
     depends_on_workflow_run_id = Column(String, nullable=True, index=True)
     sequential_key = Column(String, nullable=True)
+    sequential_credential_id = Column(String, nullable=True)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
     debug_session_id: Column = Column(String, nullable=True)
     trigger_type = Column(String, nullable=True)
@@ -1534,6 +1548,7 @@ class CredentialModel(Base):
     user_context = Column(String(1000), nullable=True)
     save_browser_session_intent = Column(Boolean, nullable=True, default=False)
     pin_saved_session_ip = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
+    run_sequentially = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
     proxy_location = Column(String, nullable=True)
     proxy_session_id = Column(String, nullable=True)
     folder_id = Column(String, ForeignKey("credential_folders.folder_id", ondelete="SET NULL"), nullable=True)

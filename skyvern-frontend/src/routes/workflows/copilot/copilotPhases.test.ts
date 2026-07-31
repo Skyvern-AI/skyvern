@@ -77,6 +77,12 @@ describe("toolActivityDisplayLabel — discovery tools (SKY-12385)", () => {
     );
   });
 
+  it("labels fill_credential_field without naming any credential", () => {
+    expect(toolActivityDisplayLabel("fill_credential_field")).toBe(
+      "Entering saved credentials",
+    );
+  });
+
   it("still falls back to Working for unmapped tools", () => {
     expect(toolActivityDisplayLabel("some_unmapped_tool")).toBe("Working");
   });
@@ -154,6 +160,31 @@ describe("derivePhases — condenses each phase's entries (SKY-11971)", () => {
       success: true,
       attempts: 2,
     });
+  });
+
+  it("does not fold a failed edit of one block into a later edit of a different block", () => {
+    const t = turn({
+      designActivity: [
+        entry({
+          id: "tr-1",
+          kind: "tool_result",
+          toolName: "edit_block",
+          displayLabel: 'Editing block "Login Form"',
+          success: false,
+        }),
+        entry({
+          id: "tr-2",
+          kind: "tool_result",
+          toolName: "edit_block",
+          displayLabel: 'Editing block "Search Box"',
+          success: true,
+        }),
+      ],
+    });
+    const rows = derivePhases(t);
+    const exploreEntries = phase(rows, "explore").entries;
+    expect(exploreEntries).toHaveLength(2);
+    expect(exploreEntries.some((e) => e.attempts !== undefined)).toBe(false);
   });
 
   it("REGRESSION PIN: the explore 'N steps' stub matches the condensed row count, not the raw event count (Claude catch)", () => {

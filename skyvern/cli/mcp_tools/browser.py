@@ -3,13 +3,18 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import mimetypes
 import os
 import re
+import stat
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
 from uuid import uuid4
 
 import structlog
+from playwright.async_api import FilePayload
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import Field
 
@@ -54,8 +59,11 @@ from skyvern.cli.core.guards import (
 )
 from skyvern.cli.core.session_manager import is_stateless_http_mode
 from skyvern.cli.core.trajectory_store import append_trajectory_entry
+from skyvern.config import settings
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
+from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.copilot.typed_value_policy import typed_text_looks_secret
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.schemas.action_log import ActionLogOutcome, project_action_event
 from skyvern.schemas.run_blocks import CredentialType
 
@@ -88,6 +96,7 @@ from ._session import (
     get_current_session,
     get_page,
     get_session_ref,
+    is_stdio_local_file_access_enabled,
     no_browser_error,
     page_ref_key,
     replace_session_ref_map,
@@ -101,6 +110,71 @@ _AWAIT_RE = re.compile(r"\bawait\b")
 _SINGLE_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
 _ERROR_MESSAGE_MAX_CHARS = 500
 _ERROR_BODY_MESSAGE_KEYS = ("detail", "error", "message")
+_LOCAL_UPLOAD_MAX_FILES = 20
+_LOCAL_UPLOAD_MAX_BYTES = 50 * 1024 * 1024
+_LOCAL_UPLOAD_SUPPORTS_DIR_FD = os.open in getattr(os, "supports_dir_fd", set())
+
+
+def _read_run_owned_upload(candidate_path: str, run_id: str, max_bytes: int) -> FilePayload:
+    nofollow_flag = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    nonblocking_flag = getattr(os, "O_NONBLOCK", None)
+    if nofollow_flag is None or directory_flag is None or nonblocking_flag is None or not _LOCAL_UPLOAD_SUPPORTS_DIR_FD:
+        raise PermissionError("Secure local file access is not supported on this platform")
+
+    allowed_root = (Path(settings.DOWNLOAD_PATH) / run_id).resolve(strict=True)
+    resolved_candidate = Path(candidate_path).resolve(strict=True)
+    try:
+        relative_path = resolved_candidate.relative_to(allowed_root)
+    except ValueError as exc:
+        raise PermissionError("Local file is outside the run upload directory") from exc
+    if not relative_path.parts:
+        raise PermissionError("Local upload path must identify a file")
+
+    close_on_exec = getattr(os, "O_CLOEXEC", 0)
+    directory_open_flags = os.O_RDONLY | close_on_exec | nofollow_flag | directory_flag
+    file_open_flags = os.O_RDONLY | close_on_exec | nofollow_flag | nonblocking_flag
+    directory_fds: list[int] = []
+    file_fd: int | None = None
+    try:
+        directory_fds.append(os.open(allowed_root, directory_open_flags))
+        for component in relative_path.parts[:-1]:
+            directory_fds.append(os.open(component, directory_open_flags, dir_fd=directory_fds[-1]))
+        file_fd = os.open(relative_path.parts[-1], file_open_flags, dir_fd=directory_fds[-1])
+        file_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise PermissionError("Local upload path must identify a regular file")
+        if file_stat.st_size > max_bytes:
+            raise ValueError("Local upload file exceeds the size limit")
+
+        with os.fdopen(file_fd, "rb") as upload_file:
+            file_fd = None
+            content = upload_file.read(max_bytes + 1)
+        if len(content) > max_bytes:
+            raise ValueError("Local upload file exceeds the size limit")
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
+
+    mime_type = mimetypes.guess_type(resolved_candidate.name)[0] or "application/octet-stream"
+    return FilePayload(name=resolved_candidate.name, mimeType=mime_type, buffer=content)
+
+
+def _read_run_owned_uploads(file_paths: list[str], run_id: str | None) -> list[FilePayload]:
+    if run_id is None:
+        raise PermissionError("Local file upload requires an allowed download scope")
+    if len(file_paths) > _LOCAL_UPLOAD_MAX_FILES:
+        raise ValueError("Too many local upload files")
+
+    payloads: list[FilePayload] = []
+    remaining_bytes = _LOCAL_UPLOAD_MAX_BYTES
+    for file_path in file_paths:
+        payload = _read_run_owned_upload(file_path, run_id, remaining_bytes)
+        payloads.append(payload)
+        remaining_bytes -= len(payload["buffer"])
+    return payloads
 
 
 def _trajectory_source_url(page: Any) -> str | None:
@@ -747,7 +821,11 @@ async def skyvern_file_upload(
     file_paths: Annotated[
         list[str],
         Field(
-            description="List of file paths or URLs to upload. URLs are downloaded automatically. Max 50MB per file."
+            description=(
+                "List of file paths or URLs to upload. Local files must be in the active run's download directory, "
+                "or the local server download directory for stdio, and require a selector, with at most 20 files "
+                "and 50MB total. URLs are downloaded automatically."
+            )
         ),
     ],
     selector: Annotated[
@@ -763,7 +841,7 @@ async def skyvern_file_upload(
     intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
 ) -> dict[str, Any]:
     """Upload files to a file input element. Accepts local paths or URLs (auto-downloaded).
-    Supports AI intent, CSS/XPath selector, or both to find the input.
+    Local paths must be in an allowed download scope and use a CSS/XPath selector.
     """
     if not file_paths:
         return make_result(
@@ -826,10 +904,40 @@ async def skyvern_file_upload(
             ),
         )
 
+    if has_local and not selector:
+        return make_result(
+            "skyvern_file_upload",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Local file upload requires a selector",
+                "Provide selector='input[type=file]' for local file uploads",
+            ),
+        )
+
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_file_upload", ok=False, error=no_browser_error())
+
+    local_uploads: list[FilePayload] | None = None
+    if has_local:
+        run_id = resolve_run_download_id(skyvern_context.current())
+        if run_id is None and is_stdio_local_file_access_enabled():
+            run_id = str(None)
+        try:
+            local_uploads = await asyncio.to_thread(_read_run_owned_uploads, file_paths, run_id)
+        except (OSError, RuntimeError, ValueError):
+            return make_result(
+                "skyvern_file_upload",
+                ok=False,
+                browser_context=ctx,
+                error=make_error(
+                    ErrorCode.INVALID_INPUT,
+                    "Local file access denied",
+                    "Use a regular file from an allowed download directory",
+                ),
+            )
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
 
@@ -849,20 +957,11 @@ async def skyvern_file_upload(
                 else:
                     assert selector is not None
                     await page.upload_file(selector=selector, files=fp, timeout=action_timeout)
-            elif ai_mode is not None and len(file_paths) == 1:
-                # Single local file + intent: use SDK for AI element resolution
-                await page.upload_file(
-                    selector=selector,  # type: ignore[arg-type]
-                    files=file_paths[0],
-                    prompt=intent,
-                    ai=ai_mode,
-                    timeout=action_timeout,
-                )
             else:
-                # Local files + selector: set directly via Playwright
                 assert selector is not None
+                assert local_uploads is not None
                 locator = page.page.locator(selector).first
-                await locator.set_input_files(file_paths, timeout=action_timeout)
+                await locator.set_input_files(local_uploads, timeout=action_timeout)
 
             timer.mark("sdk")
         except PlaywrightTimeoutError as e:
@@ -1202,22 +1301,6 @@ async def skyvern_screenshot(
                 error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the page or element is visible"),
             )
 
-    if inline:
-        data_b64 = base64.b64encode(result.data).decode("utf-8")
-        return action_result(
-            "skyvern_screenshot",
-            browser_context=ctx,
-            data={
-                "inline": True,
-                "data": data_b64,
-                "mime": "image/png",
-                "bytes": len(result.data),
-                "sdk_equivalent": "await page.screenshot()",
-            },
-            timing_ms=timer.timing_ms,
-            warnings=["Inline mode increases token usage"],
-        )
-
     ts = datetime.now(timezone.utc).strftime("%H%M%S_%f")
     filename = f"screenshot_{ts}.png"
     artifact = save_artifact(
@@ -1227,6 +1310,24 @@ async def skyvern_screenshot(
         mime="image/png",
         session_id=ctx.session_id,
     )
+
+    if inline:
+        data_b64 = base64.b64encode(result.data).decode("utf-8")
+        return action_result(
+            "skyvern_screenshot",
+            browser_context=ctx,
+            data={
+                "path": artifact.path,
+                "inline": True,
+                "data": data_b64,
+                "mime": "image/png",
+                "bytes": len(result.data),
+                "sdk_equivalent": "await page.screenshot()",
+            },
+            artifacts=[artifact],
+            timing_ms=timer.timing_ms,
+            warnings=["Inline mode increases token usage"],
+        )
 
     return action_result(
         "skyvern_screenshot",
@@ -2015,6 +2116,224 @@ async def skyvern_extract(
             "sdk_equivalent": f"await page.extract(prompt={prompt!r})",
         },
         timing_ms=timer.timing_ms,
+    )
+
+
+async def _run_paired_capture(
+    action: str,
+    operations: list[tuple[str, dict[str, Any]]],
+    session_id: str | None,
+    cdp_url: str | None,
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result(action, ok=False, error=no_browser_error())
+    action_result = _action_result_factory(ctx=ctx, page=page)
+    operation_functions: dict[str, Callable[..., Any]] = {
+        "navigate": skyvern_navigate,
+        "extract": skyvern_extract,
+        "evaluate": skyvern_evaluate,
+        "screenshot": skyvern_screenshot,
+    }
+    data: dict[str, Any] = {}
+    artifacts: list[dict[str, Any]] = []
+    sdk_equivalents: list[str] = []
+    error: dict[str, Any] | None = None
+    skip_to_screenshot = False
+
+    for operation, params in operations:
+        if skip_to_screenshot and operation != "screenshot":
+            continue
+        operation_result = await operation_functions[operation](**params, session_id=session_id, cdp_url=cdp_url)
+        operation_data = operation_result.get("data")
+        if isinstance(operation_data, dict) and isinstance(operation_data.get("sdk_equivalent"), str):
+            sdk_equivalents.append(operation_data["sdk_equivalent"])
+        if operation == "screenshot":
+            if isinstance(operation_data, dict):
+                data["screenshot"] = operation_data
+            raw_artifacts = operation_result.get("artifacts")
+            if isinstance(raw_artifacts, list):
+                artifacts.extend(item for item in raw_artifacts if isinstance(item, dict))
+        elif isinstance(operation_data, dict):
+            data.update({key: value for key, value in operation_data.items() if key != "sdk_equivalent"})
+
+        if operation_result.get("ok") is False:
+            raw_error = operation_result.get("error")
+            if error is None:
+                error = (
+                    raw_error
+                    if isinstance(raw_error, dict)
+                    else make_error(ErrorCode.ACTION_FAILED, f"{operation} failed", "Retry the operation")
+                )
+            if operation == "extract":
+                data.setdefault("extracted", None)
+            elif operation == "evaluate":
+                data.setdefault("result", None)
+            if isinstance(raw_error, dict) and raw_error.get("code") == ErrorCode.INVALID_INPUT:
+                break
+            if operation == "navigate":
+                skip_to_screenshot = True
+    if sdk_equivalents:
+        data["sdk_equivalent"] = f"{'; '.join(sdk_equivalents)}"
+    result = action_result(
+        action,
+        ok=error is None,
+        browser_context=ctx,
+        data=data,
+        error=error,
+        timing_ms={"total": int((time.perf_counter() - started_at) * 1000)},
+    )
+    if artifacts:
+        result["artifacts"] = artifacts
+    return result
+
+
+async def skyvern_extract_and_screenshot(
+    prompt: Annotated[str, "Natural language description of what data to extract from the page"],
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    schema: Annotated[
+        str | None, Field(description="JSON Schema string defining the expected output structure")
+    ] = None,
+    full_page: Annotated[bool, Field(description="Capture the full scrollable page instead of the viewport")] = False,
+    inline: Annotated[
+        bool,
+        Field(
+            description="Return the screenshot as inline base64 instead of a saved file path. Off by default; "
+            "a full-resolution inline screenshot can overflow the tool-result size limit."
+        ),
+    ] = False,
+) -> dict[str, Any]:
+    """Extract structured data AND capture a screenshot of the page in ONE call.
+
+    Use this to record a finding together with its visual proof in a single step, instead of a
+    separate skyvern_extract + skyvern_screenshot. The screenshot is saved to a file path by default
+    (pass inline=true for base64) and returned alongside the extracted data, so a reviewer that only
+    credits visible evidence can see it.
+    """
+    return await _run_paired_capture(
+        "skyvern_extract_and_screenshot",
+        [
+            ("extract", {"prompt": prompt, "schema": schema}),
+            ("screenshot", {"full_page": full_page, "inline": inline}),
+        ],
+        session_id,
+        cdp_url,
+    )
+
+
+async def skyvern_evaluate_and_screenshot(
+    expression: Annotated[str, "JavaScript expression to evaluate (scrape data / read the DOM)"],
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    full_page: Annotated[bool, Field(description="Capture the full scrollable page instead of the viewport")] = False,
+    inline: Annotated[
+        bool,
+        Field(
+            description="Return the screenshot as inline base64 instead of a saved file path. Off by default; "
+            "a full-resolution inline screenshot can overflow the tool-result size limit."
+        ),
+    ] = False,
+) -> dict[str, Any]:
+    """Run JavaScript to read the page AND capture a screenshot in ONE call.
+
+    A single "do it and prove it" primitive: your JS returns the scraped values and the tool returns
+    them together with a screenshot of the page as visual proof, so every fact you read is backed by
+    an image without a second tool call. The screenshot is saved to a file path by default (pass
+    inline=true for base64). Supports await (auto-wrapped in an async IIFE); for multi-line await use
+    an explicit return. Security: JS executes in page context — use only with trusted expressions.
+    """
+    return await _run_paired_capture(
+        "skyvern_evaluate_and_screenshot",
+        [
+            ("evaluate", {"expression": expression}),
+            ("screenshot", {"full_page": full_page, "inline": inline}),
+        ],
+        session_id,
+        cdp_url,
+    )
+
+
+async def skyvern_navigate_and_screenshot(
+    url: Annotated[str, "The URL to navigate to"],
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    timeout: Annotated[
+        int,
+        Field(description="Max time to wait for page load in ms. Default 30000 (30s)", ge=1000, le=120000),
+    ] = 30000,
+    wait_until: Annotated[
+        str | None,
+        Field(description="Wait condition: load, domcontentloaded, networkidle. Use networkidle for JS-heavy pages"),
+    ] = None,
+    full_page: Annotated[bool, Field(description="Capture the full scrollable page instead of the viewport")] = False,
+    inline: Annotated[
+        bool,
+        Field(
+            description="Return the screenshot as inline base64 instead of a saved file path. Off by default; "
+            "a full-resolution inline screenshot can overflow the tool-result size limit."
+        ),
+    ] = False,
+) -> dict[str, Any]:
+    """Open a URL AND capture a screenshot of the loaded page in ONE call.
+
+    Use this to arrive at a page and prove you got there in a single step: it returns the final URL
+    and title plus a screenshot of the loaded page as visual evidence. The screenshot is saved to a
+    file path by default (pass inline=true for base64).
+    """
+    return await _run_paired_capture(
+        "skyvern_navigate_and_screenshot",
+        [
+            ("navigate", {"url": url, "timeout": timeout, "wait_until": wait_until}),
+            ("screenshot", {"full_page": full_page, "inline": inline}),
+        ],
+        session_id,
+        cdp_url,
+    )
+
+
+async def skyvern_navigate_extract_and_screenshot(
+    url: Annotated[str, "The URL to navigate to"],
+    prompt: Annotated[str, "Natural language description of the structured data to extract from the page"],
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    schema: Annotated[
+        str | None, Field(description="JSON Schema string defining the expected output structure")
+    ] = None,
+    timeout: Annotated[
+        int,
+        Field(description="Max time to wait for page load in ms. Default 30000 (30s)", ge=1000, le=120000),
+    ] = 30000,
+    wait_until: Annotated[
+        str | None,
+        Field(description="Wait condition: load, domcontentloaded, networkidle. Use networkidle for JS-heavy pages"),
+    ] = None,
+    full_page: Annotated[bool, Field(description="Capture the full scrollable page instead of the viewport")] = False,
+    inline: Annotated[
+        bool,
+        Field(
+            description="Return the screenshot as inline base64 instead of a saved file path. Off by default; "
+            "a full-resolution inline screenshot can overflow the tool-result size limit."
+        ),
+    ] = False,
+) -> dict[str, Any]:
+    """Open a URL, AI-extract structured data, AND capture a screenshot — all in ONE call.
+
+    The most step-efficient way to process one source page: it navigates, extracts the fields you ask
+    for, and saves a screenshot as proof, so a whole page becomes a single tool call instead of three.
+    The screenshot is saved to a file path by default (pass inline=true for base64).
+    """
+    return await _run_paired_capture(
+        "skyvern_navigate_extract_and_screenshot",
+        [
+            ("navigate", {"url": url, "timeout": timeout, "wait_until": wait_until}),
+            ("extract", {"prompt": prompt, "schema": schema}),
+            ("screenshot", {"full_page": full_page, "inline": inline}),
+        ],
+        session_id,
+        cdp_url,
     )
 
 

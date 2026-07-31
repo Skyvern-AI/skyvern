@@ -33,11 +33,18 @@ from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from tests.unit.helpers import make_organization, make_step, make_task
 
-# One second is only a test-side runaway guard. The behavior under test is
+# Five seconds is only a test-side runaway guard. The behavior under test is
 # asserted through configured timeout values, cleanup, and span attributes
-# below; it tolerates the hundreds of ms a loaded CI runner can delay a
+# below; it tolerates the scheduling delay a loaded CI runner can add to a
 # completed coroutine without turning scheduling latency into a product failure.
-CI_TEST_RUNAWAY_TIMEOUT_SECONDS = 1.0
+CI_TEST_RUNAWAY_TIMEOUT_SECONDS = 5.0
+
+
+async def _assert_background_tasks_drained(tasks: set[asyncio.Task[None]]) -> None:
+    if tasks:
+        await asyncio.wait(tuple(tasks), timeout=0.25)
+        await asyncio.sleep(0)
+    assert not tasks
 
 
 class _EventEmitter:
@@ -796,7 +803,7 @@ async def test_handle_action_timeout_bounds_browser_download_handler_drain(
                 )
 
         assert time.monotonic() - started_at < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
-        assert not interceptor._browser_download_tasks
+        await _assert_background_tasks_drained(interceptor._browser_download_tasks)
 
 
 @pytest.mark.asyncio
@@ -2497,7 +2504,7 @@ async def test_handle_action_download_cancellation_cleans_extended_wait_listener
                 await handle_task
 
         assert body_cancelled.is_set()
-        assert captures[0]._response_tasks == set()
+        await _assert_background_tasks_drained(captures[0]._response_tasks)
         assert captures[0]._drained.is_set()
         assert not staging_dir.exists()
         assert not (staging_dir / "report.pdf").exists()

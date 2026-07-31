@@ -1,12 +1,22 @@
+import pytest
+from pydantic import ValidationError
+
 from skyvern.schemas.browser_session_timeouts import (
+    DEFAULT_TIMEOUT,
     MAX_LIFETIME_SECONDS,
+    MAX_TIMEOUT,
+    MIN_TIMEOUT,
     seconds_until_expiry,
     session_is_active,
 )
+from skyvern.schemas.browser_sessions import CreateBrowserSessionRequest
 
 _BASE = 60 * 60  # 1h base timeout
 _IDLE = 60 * 60  # idle out 1h after last activity
 _CAP = MAX_LIFETIME_SECONDS
+# Past the base timeout but well under the lifetime cap, so activity-renewal cases
+# are decided by activity rather than by the cap.
+_PAST_BASE = _BASE * 2
 
 
 def _active(**overrides: float | None) -> bool:
@@ -35,19 +45,19 @@ def test_base_timeout_boundary_is_inactive_without_activity() -> None:
 
 
 def test_past_base_timeout_with_recent_activity_stays_active() -> None:
-    assert _active(seconds_since_start=_BASE * 5, seconds_since_last_activity=_IDLE - 1) is True
+    assert _active(seconds_since_start=_PAST_BASE, seconds_since_last_activity=_IDLE - 1) is True
 
 
 def test_past_base_timeout_with_stale_activity_is_inactive() -> None:
-    assert _active(seconds_since_start=_BASE * 5, seconds_since_last_activity=_IDLE + 1) is False
+    assert _active(seconds_since_start=_PAST_BASE, seconds_since_last_activity=_IDLE + 1) is False
 
 
 def test_idle_boundary_is_inactive() -> None:
-    assert _active(seconds_since_start=_BASE * 5, seconds_since_last_activity=_IDLE) is False
+    assert _active(seconds_since_start=_PAST_BASE, seconds_since_last_activity=_IDLE) is False
 
 
 def test_hard_cap_overrides_recent_activity() -> None:
-    # Actively driven, but past the 24h lifetime cap -> reaped regardless.
+    # Actively driven, but past the lifetime cap -> reaped regardless.
     assert _active(seconds_since_start=_CAP, seconds_since_last_activity=0.0) is False
 
 
@@ -58,11 +68,11 @@ def test_just_under_hard_cap_with_activity_stays_active() -> None:
 def test_future_activity_timestamp_counts_as_recent() -> None:
     # Clock skew can make last_activity slightly ahead of now -> negative elapsed.
     # Treated as very recent (active), never as stale.
-    assert _active(seconds_since_start=_BASE * 5, seconds_since_last_activity=-5.0) is True
+    assert _active(seconds_since_start=_PAST_BASE, seconds_since_last_activity=-5.0) is True
 
 
 def test_default_cap_is_max_timeout() -> None:
-    # Omitting max_lifetime_seconds falls back to the 24h MAX_TIMEOUT ceiling.
+    # Omitting max_lifetime_seconds falls back to the 4h MAX_TIMEOUT ceiling.
     assert (
         session_is_active(
             seconds_since_start=_CAP,
@@ -102,8 +112,8 @@ def test_session_is_active_matches_positive_remaining_time() -> None:
     cases = (
         (_BASE - 1, None),
         (_BASE, None),
-        (_BASE * 5, _IDLE - 1),
-        (_BASE * 5, _IDLE),
+        (_PAST_BASE, _IDLE - 1),
+        (_PAST_BASE, _IDLE),
         (_CAP, 0),
     )
 
@@ -118,3 +128,25 @@ def test_session_is_active_matches_positive_remaining_time() -> None:
             seconds_since_start=seconds_since_start,
             seconds_since_last_activity=seconds_since_last_activity,
         ) is (remaining > 0)
+
+
+def test_requested_timeout_above_the_cap_is_clamped() -> None:
+    # Callers that still send the old 24h ceiling get the cap, not a 422.
+    assert CreateBrowserSessionRequest(timeout=1440).timeout == MAX_TIMEOUT
+    assert CreateBrowserSessionRequest(timeout=MAX_TIMEOUT + 1).timeout == MAX_TIMEOUT
+
+
+def test_requested_timeout_at_or_below_the_cap_is_preserved() -> None:
+    assert CreateBrowserSessionRequest(timeout=MAX_TIMEOUT).timeout == MAX_TIMEOUT
+    assert CreateBrowserSessionRequest(timeout=MIN_TIMEOUT).timeout == MIN_TIMEOUT
+    assert CreateBrowserSessionRequest(timeout=90).timeout == 90
+
+
+def test_requested_timeout_below_the_minimum_is_still_rejected() -> None:
+    with pytest.raises(ValidationError):
+        CreateBrowserSessionRequest(timeout=MIN_TIMEOUT - 1)
+
+
+def test_timeout_defaults_and_explicit_none_are_untouched() -> None:
+    assert CreateBrowserSessionRequest().timeout == DEFAULT_TIMEOUT
+    assert CreateBrowserSessionRequest(timeout=None).timeout is None

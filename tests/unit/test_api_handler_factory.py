@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from asyncio import CancelledError
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -25,6 +26,94 @@ from tests.unit.helpers import DummyLogger, FakeLLMResponse
 
 def _custom_llm_config(model_name: str, api_base: str = "https://llm.example.test/v1") -> LLMConfig:
     return LLMConfig(model_name, [], False, False, {"api_key": "test-key", "api_base": api_base})
+
+
+def test_render_hashed_href_map_blocks_lipsum_globals_command(tmp_path: Path) -> None:
+    marker = tmp_path / "ssti_canary"
+    payload = "{{ lipsum.__globals__['os'].popen('touch " + str(marker) + "').read() }}"
+
+    result = api_handler_factory._render_hashed_href_map(payload, {})
+
+    assert not marker.exists()
+    assert result == payload
+
+
+def test_render_hashed_href_map_blocks_string_class_subclasses_gadget(tmp_path: Path) -> None:
+    marker = tmp_path / "ssti_canary"
+    payload = (
+        "{% for cls in ''.__class__.__mro__[1].__subclasses__() %}"
+        "{% if cls.__name__ == 'catch_warnings' %}"
+        f"{{{{ cls()._module.__builtins__['__import__']('os').system('touch {marker}') }}}}"
+        "{% endif %}{% endfor %}"
+    )
+
+    result = api_handler_factory._render_hashed_href_map(payload, {})
+
+    assert not marker.exists()
+    assert result == payload
+
+
+def test_render_hashed_href_map_blocks_cycler_globals_gadget(tmp_path: Path) -> None:
+    marker = tmp_path / "ssti_canary"
+    payload = f"{{{{ cycler.__init__.__globals__['os'].popen('touch {marker}').read() }}}}"
+
+    result = api_handler_factory._render_hashed_href_map(payload, {})
+
+    assert not marker.exists()
+    assert result == payload
+
+
+def test_render_hashed_href_map_replaces_only_hashed_url_placeholders_with_optional_spaces() -> None:
+    first_key = f"_{'a' * 64}"
+    second_key = f"_{'b' * 64}"
+    first_url = "https://example.test/a/very/long/path?with=query&and=more-query-parameters"
+    second_url = "https://example.test/another/path"
+    hashed_href_map = {first_key: first_url, second_key: second_url}
+    payload = (
+        '{"message":"Use the links without changing ordinary prose.",'
+        f'"links":["{{{{{first_key}}}}}","{{{{ {second_key} }}}}","{{{{{first_key}}}}}"],'
+        '"template":"{{ unknown_key }}"}'
+    )
+    expected = (
+        '{"message":"Use the links without changing ordinary prose.",'
+        f'"links":["{first_url}","{second_url}","{first_url}"],'
+        '"template":"{{ unknown_key }}"}'
+    )
+
+    assert api_handler_factory._render_hashed_href_map(f"{{{{{first_key}}}}}", hashed_href_map) == first_url
+    assert api_handler_factory._render_hashed_href_map(payload, hashed_href_map) == expected
+
+
+def test_render_hashed_href_map_removes_unknown_hash_and_preserves_other_placeholder() -> None:
+    unknown_hash = f"_{'c' * 64}"
+    other_placeholder = "ordinary prose with {{ unknown_key }} left intact"
+
+    assert api_handler_factory._render_hashed_href_map(f"{{{{{unknown_hash}}}}}", {}) == ""
+    assert api_handler_factory._render_hashed_href_map(other_placeholder, {}) == other_placeholder
+
+
+def test_render_hashed_href_map_returns_malformed_template_unchanged() -> None:
+    payload = "response with stray {{"
+
+    result = api_handler_factory._render_hashed_href_map(payload, {})
+
+    assert result == payload
+
+
+def test_render_hashed_href_map_returns_self_calling_macro_unchanged() -> None:
+    payload = "{% macro m() %}{{ m() }}{% endmacro %}{{ m() }}"
+
+    result = api_handler_factory._render_hashed_href_map(payload, {})
+
+    assert result == payload
+
+
+def test_render_hashed_href_map_returns_expensive_templates_unchanged() -> None:
+    range_payload = "{% for i in range(10000000) %}x{% endfor %}"
+    multiplication_payload = "{{ 'a' * 1000000000 }}"
+
+    assert api_handler_factory._render_hashed_href_map(range_payload, {}) == range_payload
+    assert api_handler_factory._render_hashed_href_map(multiplication_payload, {}) == multiplication_payload
 
 
 @pytest.mark.parametrize(

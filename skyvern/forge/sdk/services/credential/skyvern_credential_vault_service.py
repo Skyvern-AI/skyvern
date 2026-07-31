@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -18,6 +19,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialType,
     CredentialVaultType,
     CreditCardCredential,
+    PasswordCredential,
 )
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 
@@ -49,13 +51,23 @@ class SkyvernCredentialVaultService(CredentialVaultService):
                 item_id=item_id,
                 vault_type=CredentialVaultType.SKYVERN,
             )
-        except Exception:
-            self._delete_item_file(item_id)
+        except BaseException:
+            await self._reclaim_orphaned_vault_item(
+                delete=lambda: asyncio.to_thread(self._unlink_item_file, item_id),
+                organization_id=organization_id,
+                item_id=item_id,
+                vault_type=CredentialVaultType.SKYVERN,
+            )
             raise
 
     async def update_credential(self, credential: Credential, data: CreateCredentialRequest) -> Credential:
         credential_data = data.credential
-        if data.credential_type == CredentialType.CREDIT_CARD and isinstance(credential_data, CreditCardCredential):
+        if data.credential_type == CredentialType.PASSWORD and isinstance(credential_data, PasswordCredential):
+            credential_data = await self._preserve_omitted_password_metadata(
+                credential=credential,
+                updated_credential=credential_data,
+            )
+        elif data.credential_type == CredentialType.CREDIT_CARD and isinstance(credential_data, CreditCardCredential):
             credential_data = await self._preserve_omitted_credit_card_fields(
                 credential=credential,
                 updated_credential=credential_data,
@@ -76,16 +88,21 @@ class SkyvernCredentialVaultService(CredentialVaultService):
                 data=data,
                 item_id=new_item_id,
             )
-        except Exception:
-            self._delete_item_file(new_item_id)
+        except BaseException:
+            await self._reclaim_orphaned_vault_item(
+                delete=lambda: asyncio.to_thread(self._unlink_item_file, new_item_id),
+                organization_id=credential.organization_id,
+                item_id=new_item_id,
+                vault_type=CredentialVaultType.SKYVERN,
+            )
             raise
 
     async def delete_credential(self, credential: Credential) -> None:
         await app.DATABASE.credentials.delete_credential(credential.credential_id, credential.organization_id)
         self._delete_item_file(credential.item_id)
 
-    async def post_delete_credential_item(self, item_id: str, organization_id: str | None = None) -> None:
-        self._delete_item_file(item_id)
+    async def post_delete_credential_item(self, item_id: str, organization_id: str | None = None) -> bool:
+        return self._delete_item_file(item_id)
 
     async def get_credential_item(self, db_credential: Credential) -> CredentialItem:
         item_path = self._item_path(db_credential.item_id)
@@ -168,13 +185,18 @@ class SkyvernCredentialVaultService(CredentialVaultService):
             raise HTTPException(status_code=400, detail="Invalid credential vault item ID")
         return self._vault_dir() / f"{item_id}.bin"
 
-    def _delete_item_file(self, item_id: str) -> None:
+    def _unlink_item_file(self, item_id: str) -> None:
+        self._item_path(item_id).unlink(missing_ok=True)
+
+    def _delete_item_file(self, item_id: str) -> bool:
         try:
-            self._item_path(item_id).unlink(missing_ok=True)
+            self._unlink_item_file(item_id)
+            return True
         except HTTPException:
             raise
         except Exception:
             LOG.warning("Failed to delete local credential vault item", item_id=item_id, exc_info=True)
+            return False
 
     @staticmethod
     def _generate_item_id() -> str:

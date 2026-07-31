@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 import structlog
 
+from skyvern.exceptions import CopilotInlineSequentialCredentialUnsupported
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -120,6 +121,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
 )
 from skyvern.forge.sdk.copilot.typed_value_policy import should_reject_type_text_value
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotRunOutcomeUpdate, WorkflowCopilotStreamMessageType
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -128,6 +130,7 @@ from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
+from skyvern.utils.files import initialize_skyvern_state_file
 from skyvern.webeye.navigation import is_skip_inner_retry_error
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -222,6 +225,8 @@ RUN_BLOCKS_STAGNATION_WINDOW_SECONDS = 90
 # 5 s balances responsiveness (18 samples inside the stagnation window) against
 # DB load (240 polls worst case at the safety ceiling).
 RUN_BLOCKS_POLL_INTERVAL_SECONDS = 5.0
+
+COPILOT_SANDBOX_UNAVAILABLE_ERROR = "Sandboxed worker is unavailable; execution was not started."
 
 # Detached cleanup tasks held here so the garbage collector does not drop them
 # while they still have work to do, and so the "task exception was never
@@ -411,6 +416,10 @@ def _maybe_clear_reconciliation_flag(copilot_ctx: Any, result: Any) -> None:
                 blocked_tool=original_blocked_tool,
             ),
         )
+
+
+def _copilot_sandbox_unavailable_result() -> dict[str, Any]:
+    return {"ok": False, "error": COPILOT_SANDBOX_UNAVAILABLE_ERROR}
 
 
 def _mark_pending_reconciliation_run(copilot_ctx: Any, workflow_run_id: str) -> None:
@@ -839,6 +848,40 @@ def _runtime_code_security_failure_for_selected_labels(
             "blocks": [],
             "failure_categories": [error.to_failure_category() for error in errors],
             "failure_category": COPILOT_CODE_SECURITY_FAILURE_CATEGORY,
+        },
+    }
+
+
+def _inline_sequential_credential_fence_failure(
+    *,
+    workflow_run_id: str,
+    sequential_credential_id: str | None,
+    dispatch_to_worker: bool,
+    block_labels: list[str],
+    labels_to_execute: list[str],
+    frontier_start_label: str | None,
+) -> dict[str, Any] | None:
+    # The copilot inline path runs execute_workflow in-process: the run never queues, never gets a
+    # queued_at, and never reaches the Temporal V2 serialization gate, yet setup stamped its
+    # sequential_credential_id. The gate filters queued_at IS NOT NULL, so a concurrent run sharing the
+    # credential would neither see this run nor be waited on by it. Fail closed before it uses the
+    # credential — the same fence the scheduled and sync-trigger paths apply. The dispatch path enqueues
+    # through the executor (stamped queued_at, gated), so it is exempt.
+    if dispatch_to_worker or not sequential_credential_id:
+        return None
+    failure_reason = str(CopilotInlineSequentialCredentialUnsupported(workflow_run_id))
+    return {
+        "ok": False,
+        "error": failure_reason,
+        "data": {
+            "workflow_run_id": workflow_run_id,
+            "overall_status": "failed",
+            "failure_reason": failure_reason,
+            "requested_block_labels": list(block_labels),
+            "executed_block_labels": [],
+            "planned_block_labels": list(labels_to_execute),
+            "frontier_start_label": frontier_start_label,
+            "blocks": [],
         },
     }
 
@@ -1524,13 +1567,17 @@ async def _run_blocks_and_collect_debug(
         return {"ok": False, "error": "Organization not found"}
 
     organization = Organization.model_validate(org)
-    # Copilot-only gate, default OFF (flag-off is byte-for-byte the inline path below). When ON,
-    # the block test run is persisted as a draft and dispatched to the -ui worker tier instead
-    # of running inline on the API service.
+    # Retain the per-org rollout, but never use its negative decision as permission to execute
+    # workflow code in the API process.
     dispatch_to_worker = await app.AGENT_FUNCTION.should_dispatch_copilot_block_run_to_worker(
         organization_id=ctx.organization_id,
         workflow_permanent_id=ctx.workflow_permanent_id,
     )
+    # Compared against the literal True so anything other than an explicit opt-in — including a
+    # test double that auto-mocks the hook into a truthy object — still fails closed.
+    if not dispatch_to_worker and app.AGENT_FUNCTION.allow_copilot_inline_code_execution() is not True:
+        return _copilot_sandbox_unavailable_result()
+
     runtime_workflow = _workflow_with_runtime_block_goal_context(workflow, ctx)
     runtime_workflow, runtime_frontier_anchor_url = _workflow_with_runtime_frontier_anchor(
         runtime_workflow,
@@ -1645,17 +1692,16 @@ async def _run_blocks_and_collect_debug(
     # Snapshot version persisted for a dispatched run; the run is created against its exact
     # workflow_id so the worker resolves the wrapped definition via run.workflow_id, and it is
     # soft-deleted once the run resolves so it never lingers as the latest-by-permanent-id pointer
-    # for edit/view. None for the inline path.
+    # for edit/view. None for the inline dev path.
     dispatch_draft_workflow_id: str | None = None
     # The persisted dispatch version (its own regenerated parameter ids) used for post-run output
     # mapping on the dispatch path; runtime_workflow / ctx.staged_workflow is left unmutated.
     dispatch_workflow: Workflow | None = None
     if dispatch_to_worker:
-        # Persist the wrapped runtime workflow as a real new version (with its own
-        # parameter / output-parameter rows) through the normal create machinery. The run is
-        # then created against this version so the worker resolves it by run.workflow_id and
-        # registers block outputs from the version's own rows. On any persistence failure, fall
-        # back to the inline path for this run so flag-on degrades safely.
+        # Persist the wrapped runtime workflow as a real new version (with its own parameter /
+        # output-parameter rows) through the normal create machinery. The run is then created
+        # against this version so the worker resolves it by run.workflow_id and registers block
+        # outputs from the version's own rows.
         try:
             dispatch_workflow = await app.WORKFLOW_SERVICE.create_copilot_dispatch_draft_version(
                 runtime_workflow=runtime_workflow,
@@ -1664,15 +1710,15 @@ async def _run_blocks_and_collect_debug(
             dispatch_draft_workflow_id = dispatch_workflow.workflow_id
         except Exception:
             LOG.warning(
-                "Failed to persist copilot dispatch version; falling back to inline run",
+                "Failed to persist copilot dispatch version; blocking execution",
                 workflow_permanent_id=ctx.workflow_permanent_id,
                 exc_info=True,
             )
-            dispatch_to_worker = False
-            dispatch_workflow = None
+            return _copilot_sandbox_unavailable_result()
 
-    # run_task is the in-process inline execution task. For dispatched runs it stays None: the
-    # worker owns execution and the watchdog observes purely via DB polling.
+    # run_task is the in-process inline execution task, only ever set on the dev-only inline path.
+    # For dispatched runs it stays None: the worker owns execution and the watchdog observes purely
+    # via DB polling.
     run_task: asyncio.Task | None = None
     try:
         workflow_run = await workflow_service.prepare_workflow(
@@ -1680,9 +1726,9 @@ async def _run_blocks_and_collect_debug(
             organization=organization,
             workflow_request=workflow_request,
             template=False,
-            # Dispatched runs pin the exact persisted snapshot version by workflow_id (the
-            # (permanent_id, version) index is non-unique); inline runs use the latest version
-            # and pass the runtime workflow in-process via workflow_override.
+            # Dispatched runs pin the exact persisted snapshot version by workflow_id because the
+            # (permanent_id, version) index is non-unique; inline runs use the latest version and
+            # pass the runtime workflow in-process via workflow_override.
             resolved_workflow_id=dispatch_draft_workflow_id,
             max_steps=None,
             request_id=None,
@@ -1696,8 +1742,8 @@ async def _run_blocks_and_collect_debug(
         if dispatch_to_worker:
             # Submit through the cloud executor (Temporal). The run was created against the
             # snapshot version, so the worker resolves the exact wrapped definition via
-            # run.workflow_id — no workflow_override over the wire. block_labels/block_outputs and
-            # the shared browser session reproduce the frontier re-run on the worker.
+            # run.workflow_id — no workflow_override crosses the wire. block_labels/block_outputs
+            # and the shared browser session reproduce the frontier re-run on the worker.
             await AsyncExecutorFactory.get_executor().execute_workflow(
                 request=None,
                 background_tasks=None,
@@ -1712,7 +1758,34 @@ async def _run_blocks_and_collect_debug(
                 block_outputs=block_outputs_to_seed or None,
             )
         else:
-            from skyvern.utils.files import initialize_skyvern_state_file
+            LOG.error(
+                "UNSANDBOXED: executing copilot workflow code in the API process because "
+                "COPILOT_ALLOW_INLINE_CODE_EXECUTION is enabled. This is a local-development path "
+                "with no sandbox isolation; the run below is NOT a sandboxed run.",
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_permanent_id=ctx.workflow_permanent_id,
+                organization_id=ctx.organization_id,
+            )
+            # prepare_workflow replaced the ambient context with this run's own, so the marker is
+            # scoped to this run and is inherited by the execution task created below.
+            inline_run_context = skyvern_context.current()
+            if inline_run_context is not None:
+                inline_run_context.copilot_inline_execution = True
+
+            inline_fence_failure = _inline_sequential_credential_fence_failure(
+                workflow_run_id=workflow_run.workflow_run_id,
+                sequential_credential_id=workflow_run.sequential_credential_id,
+                dispatch_to_worker=dispatch_to_worker,
+                block_labels=block_labels,
+                labels_to_execute=labels_to_execute,
+                frontier_start_label=frontier_start_label,
+            )
+            if inline_fence_failure is not None:
+                await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    failure_reason=inline_fence_failure["error"],
+                )
+                return inline_fence_failure
 
             await initialize_skyvern_state_file(
                 workflow_run_id=workflow_run.workflow_run_id,
@@ -1861,7 +1934,7 @@ async def _run_blocks_and_collect_debug(
                     if run_task is not None:
                         await _cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id)
                     else:
-                        # Phase 4: dispatched run — cooperative DB cancel so the worker stops.
+                        # Dispatched run — cooperative DB cancel so the worker stops.
                         await _cooperative_cancel_dispatched_run(workflow_run.workflow_run_id)
                     run_cancelled_by_watchdog = True
                     run = await _safe_read_workflow_run(
@@ -1944,10 +2017,9 @@ async def _run_blocks_and_collect_debug(
             fallback.add_done_callback(_log_detached_cleanup_failure)
         raise
     finally:
-        # Belt and braces. If any exit path above missed a cancel — e.g. an
-        # unexpected exception bubbling out of the poll loop — make sure the
-        # run_task is at least signaled to cancel so we don't leak it. Dispatched
-        # runs have no in-process task, so there is nothing to signal here.
+        # If any exit path above missed a cancel — e.g. an unexpected exception bubbling out of the
+        # poll loop — signal the run_task so we don't leak it. Dispatched runs have no in-process
+        # task, so there is nothing to signal.
         if run_task is not None and not run_task.done():
             run_task.cancel()
         # Soft-delete the pinned draft so it never lingers as the latest version. Gated on a final
@@ -2570,7 +2642,11 @@ def _record_run_blocks_result(
     copilot_ctx.last_artifact_health_blocker_labels = []
     copilot_ctx.last_artifact_health_failure_classes = []
     if completion_verification is not None and completion_verification.status == "evaluated":
-        copilot_ctx.last_outcome_gate_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
+        # Every unverified-outcome reason asserts a run that completed, so a run that
+        # raised has no outcome-gate reason and must report its own failure instead.
+        copilot_ctx.last_outcome_gate_reason = (
+            _outcome_unverified_reason(copilot_ctx, completion_verification) if run_ok else None
+        )
         copilot_ctx.last_outcome_gate_workflow_run_id = copilot_ctx.last_run_blocks_workflow_run_id
     copilot_ctx.last_test_suspicious_success = False
     if prior_committed_outcome is None:

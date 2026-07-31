@@ -636,9 +636,22 @@ describe("condenseActivityEntries", () => {
 
   it("leaves a still-pending retry visible, tagged with the attempt count", () => {
     const s = reduceEvents([
-      toolCall({ tool_call_id: "c1", tool_name: "extract" }),
-      toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
-      toolCall({ tool_call_id: "c2", tool_name: "extract" }),
+      toolCall({
+        tool_call_id: "c1",
+        tool_name: "extract",
+        display_label: "Extracting",
+      }),
+      toolResult({
+        tool_call_id: "c1",
+        tool_name: "extract",
+        success: false,
+        display_label: "Extracting",
+      }),
+      toolCall({
+        tool_call_id: "c2",
+        tool_name: "extract",
+        display_label: "Extracting",
+      }),
     ]);
     const condensed = condenseActivityEntries(s.designActivity);
     expect(condensed).toHaveLength(1);

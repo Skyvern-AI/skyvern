@@ -6,7 +6,7 @@ import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.errors.errors import UserDefinedError
-from skyvern.utils.action_redaction import redact_input_text_payload_for_log
+from skyvern.utils.action_redaction import redact_action_payload_for_log, redact_input_text_payload_for_log
 from skyvern.webeye.actions.action_types import ActionType
 
 LOG = structlog.get_logger()
@@ -324,6 +324,20 @@ class InputTextAction(WebAction):
         return (
             f"InputTextAction(element_id={self.element_id}, text={payload['text']}, "
             f"context={self.input_or_select_context}, tool_call_id={self.tool_call_id})"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+class PasteTextAction(WebAction):
+    action_type: ActionType = ActionType.PASTE_TEXT
+    text: str
+
+    def __repr__(self) -> str:
+        payload = redact_action_payload_for_log({"action_type": self.action_type, "text": self.text})
+        return (
+            f"PasteTextAction(element_id={self.element_id}, text={payload['text']}, tool_call_id={self.tool_call_id})"
         )
 
     def __str__(self) -> str:

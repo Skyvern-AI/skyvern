@@ -10,3 +10,10 @@ export const studioPanelId = (tab: string) => `studio-panel-${tab}`;
 // (cloud_docs/frontend/studio-button-system.md).
 export const PANE_HEADER_ICON_BUTTON_CLASS =
   "inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40";
+
+// Same icon-square footprint as PANE_HEADER_ICON_BUTTON_CLASS, reserved for
+// the one control that actually ends the live browser session (documented
+// exception in studio-button-system.md, SKY-12247) — do not reuse for
+// Reconnect/Open-in-new-tab/pane-close, which don't carry that consequence.
+export const PANE_HEADER_ICON_BUTTON_DESTRUCTIVE_CLASS =
+  "inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-badge-destructive bg-badge-destructive text-foreground hover:bg-badge-destructive/80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40";

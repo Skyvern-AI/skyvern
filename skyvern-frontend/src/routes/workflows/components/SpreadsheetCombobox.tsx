@@ -25,6 +25,7 @@ import {
   type SheetsBlockType,
 } from "@/util/sheetsTelemetry";
 import { InlineCreateRow } from "./InlineCreateRow";
+import { TemplateExpressionRow } from "./TemplateExpressionRow";
 
 type Selection = {
   url: string;
@@ -41,6 +42,8 @@ type Props = {
   placeholder?: string;
   allowCreate: boolean;
   blockType: SheetsBlockType;
+  templateMode: boolean;
+  onTemplateModeChange: (enabled: boolean) => void;
   onChange: (value: string) => void;
   onSelect: (selection: Selection) => void;
 };
@@ -54,6 +57,8 @@ function SpreadsheetCombobox({
   placeholder,
   allowCreate,
   blockType,
+  templateMode,
+  onTemplateModeChange,
   onChange,
   onSelect,
 }: Props) {
@@ -61,7 +66,9 @@ function SpreadsheetCombobox({
   const anchorRef = useRef<HTMLDivElement>(null);
   const postHog = usePostHog();
   const orgId = useCurrentOrgId();
-  const renderedValue = displayName ?? value;
+  // Re-derived locally so the field renders template values correctly even if a caller forgets to OR them into templateMode.
+  const effectiveTemplateMode = templateMode || isTemplateExpression(value);
+  const renderedValue = effectiveTemplateMode ? value : (displayName ?? value);
   // Skip the Drive search whenever we already have a resolved selection
   // (displayName) or the input is a parseable URL/ID. Drive `q` searches by
   // title, so URLs and post-selection titles only generate wasted requests.
@@ -70,24 +77,35 @@ function SpreadsheetCombobox({
       ? ""
       : renderedValue;
   const [debouncedQuery] = useDebounce(queryForSearch, 300);
+  // The debounced value can lag a just-cleared template by 300ms; a template
+  // is never a meaningful Drive title search, so drop it instead of querying.
+  const searchQuery = isTemplateExpression(debouncedQuery)
+    ? ""
+    : debouncedQuery;
 
   const isTypeable =
     hasSelectedAccount &&
     Boolean(credentialId) &&
     !isTemplateExpression(credentialId) &&
     !isTemplateExpression(value);
+  const canPick = isTypeable && !effectiveTemplateMode;
 
   const handleChange = (nextValue: string) => {
     onChange(nextValue);
   };
 
   const handleFocus = () => {
-    if (isTypeable) {
+    if (canPick) {
       setIsOpen(true);
     }
   };
 
-  const popoverOpen = isOpen && isTypeable;
+  const handleUseTemplateExpression = () => {
+    setIsOpen(false);
+    onTemplateModeChange(true);
+  };
+
+  const popoverOpen = isOpen && canPick;
   useEffect(() => {
     if (popoverOpen) {
       postHog?.capture("sheets.spreadsheet.picker.opened", {
@@ -114,7 +132,7 @@ function SpreadsheetCombobox({
   };
 
   return (
-    <Popover open={isOpen && isTypeable} onOpenChange={setIsOpen}>
+    <Popover open={popoverOpen} onOpenChange={setIsOpen}>
       <PopoverAnchor asChild>
         <div ref={anchorRef} className="relative">
           <WorkflowBlockInputTextarea
@@ -122,7 +140,11 @@ function SpreadsheetCombobox({
             value={renderedValue}
             onChange={handleChange}
             onFocus={handleFocus}
-            placeholder={placeholder}
+            placeholder={
+              effectiveTemplateMode
+                ? "{{ target_spreadsheet_url }}"
+                : placeholder
+            }
             hideActions={!hasSelectedAccount}
             className="nopan text-xs"
           />
@@ -141,11 +163,12 @@ function SpreadsheetCombobox({
       >
         <SpreadsheetListPanel
           credentialId={credentialId}
-          query={debouncedQuery}
+          query={searchQuery}
           allowCreate={allowCreate}
           blockType={blockType}
           onPick={handlePick}
         />
+        <TemplateExpressionRow onClick={handleUseTemplateExpression} />
       </PopoverContent>
     </Popover>
   );

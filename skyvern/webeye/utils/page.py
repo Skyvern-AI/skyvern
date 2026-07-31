@@ -25,6 +25,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.webeye.browser_engine import BrowserEngineSelection
+from skyvern.webeye.browser_errors import BrowserTargetClosedError
 from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
 
@@ -34,6 +35,14 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 _SCREENSHOT_TARGET_CLOSED_MESSAGE = "Target page, context or browser has been closed"
+_SELECTED_SCREENSHOT_TARGET_CLOSED_MESSAGES = (
+    "target page, context or browser has been closed",
+    "target closed",
+    "target is closed",
+    "target was closed",
+    "target has been closed",
+    "target was disposed",
+)
 
 
 async def _safe_tab_title(page: Page) -> str:
@@ -73,6 +82,58 @@ async def build_open_tabs_context(
             entry += f" ({title})"
         lines.append(entry)
     return "\n".join(lines)
+
+
+async def capture_open_tab_screenshots(
+    browser_state: BrowserState,
+    *,
+    persist: Callable[[bytes], Awaitable[None]],
+    skip_single_tab: bool = False,
+) -> int:
+    """Screenshot every open tab and persist each frame via ``persist``; returns the count.
+
+    Shared end-state per-tab capture. The caller's ``persist`` owns the artifact sink and type.
+    ``skip_single_tab`` returns 0 when only one tab is open, for callers that already capture the
+    active page separately. Best-effort: runs post-success, never raises.
+    """
+    config = SettingsManager.get_settings()
+    captured = 0
+    try:
+        # max_pages=0 enumerates without list_valid_pages' close-oldest behavior, so we never
+        # close the very tabs we are trying to capture.
+        pages = await browser_state.list_valid_pages(max_pages=0)
+        if not pages or (skip_single_tab and len(pages) <= 1):
+            return 0
+        per_tab_timeout = config.BROWSER_SCREENSHOT_TIMEOUT_MS / 1000
+        # Overall budget so a few still-loading tabs can't stall the post-success path.
+        async with asyncio.timeout(config.COMPLETION_TAB_SCREENSHOTS_TOTAL_TIMEOUT_SECONDS):
+            # The cap setting is task_v2-named but governs every caller here.
+            for page in pages[: config.MAX_COMPLETION_TAB_SCREENSHOTS_PER_TASK_V2]:
+                frames: list[bytes] = []
+                try:
+                    async with asyncio.timeout(per_tab_timeout):
+                        try:
+                            # Front each tab so Chromium paints lazily-rendered background content.
+                            await page.bring_to_front()
+                        except Exception:
+                            LOG.debug("Failed to bring tab to front before screenshot", exc_info=True)
+                        frames = await SkyvernFrame.take_split_screenshots(
+                            page=page,
+                            scroll=False,
+                            engine_selection=browser_state.engine_selection,
+                        )
+                except Exception:
+                    LOG.warning("Failed to capture screenshot for an open tab", exc_info=True)
+                    continue
+                for frame in frames:
+                    try:
+                        await persist(frame)
+                        captured += 1
+                    except Exception:
+                        LOG.warning("Failed to persist open-tab screenshot", exc_info=True)
+    except Exception:
+        LOG.warning("Aborted capturing open-tab screenshots", captured=captured, exc_info=True)
+    return captured
 
 
 _JS_TOP_LEVEL_DECL_RE = re.compile(
@@ -119,6 +180,18 @@ def _is_engine_error(exc: BaseException, engine_selection: BrowserEngineSelectio
     return engine_selection.is_engine_error(exc) if engine_selection is not None else isinstance(exc, PlaywrightError)
 
 
+def _is_engine_timeout(exc: BaseException, engine_selection: BrowserEngineSelection | None) -> bool:
+    return (
+        engine_selection.is_engine_timeout_error(exc) if engine_selection is not None else isinstance(exc, TimeoutError)
+    )
+
+
+def _is_readiness_timeout(exc: BaseException, engine_selection: BrowserEngineSelection | None) -> bool:
+    return isinstance(exc, (asyncio.TimeoutError, SkyvernPageAnalysisTimeout)) or _is_engine_timeout(
+        exc, engine_selection
+    )
+
+
 def _is_navigation_context_lost(error_msg: str) -> bool:
     if "Execution context was destroyed" in error_msg:
         return True
@@ -137,7 +210,16 @@ def _is_json_inlinable(arg: Any) -> bool:
     return True
 
 
-async def _dispatch_evaluate(frame: Page | Frame, expression: str, arg: Any | None) -> Any:
+async def _dispatch_evaluate(frame: Page | Frame, expression: str, arg: Any | None, *, force_cdp: bool = False) -> Any:
+    # force_cdp callers require the CDP main-world path regardless of prefix, so
+    # short-circuit before the page/frame/JSON heuristics below. That path
+    # dereferences page-only APIs (``page.context``); a Frame here is a caller
+    # contract violation, so reject it explicitly instead of failing with an
+    # incidental AttributeError deep inside the main-world hook.
+    if force_cdp:
+        if not is_page_like(frame):
+            raise TypeError("force_cdp evaluation requires a top-level Page, not a Frame")
+        return await evaluate_in_main_world(frame, expression, arg, force_cdp=True)
     # Page + prefix + JSON-safe arg → main-world hook (preserves the marker).
     # Iframe Frames and non-JSON args fall back to per-frame evaluate so iframe
     # contexts and Playwright handle-marshalling keep working.
@@ -169,7 +251,11 @@ async def _wait_for_navigation_settle(
         return
 
 
-async def _wait_for_screenshot_load_state(page: Page, timeout_ms: float) -> None:
+async def _wait_for_screenshot_load_state(
+    page: Page,
+    timeout_ms: float,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> None:
     # Best-effort readiness guard before capturing. 'domcontentloaded' fires far
     # earlier than 'load'; pages with streaming/long-polling/SSE/websockets or a
     # persistent spinner may never fire 'load', so a timeout here must be
@@ -178,12 +264,29 @@ async def _wait_for_screenshot_load_state(page: Page, timeout_ms: float) -> None
         return
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
-    except (PlaywrightError, TimeoutError):
+    except Exception as exc:
+        if not _is_engine_error(exc, engine_selection):
+            raise
         LOG.warning("Page did not reach domcontentloaded before screenshot; capturing current state anyway")
 
 
-def _is_screenshot_target_closed(error: BaseException) -> bool:
-    return isinstance(error, PlaywrightError) and _SCREENSHOT_TARGET_CLOSED_MESSAGE in str(error)
+def _is_screenshot_target_closed(
+    error: BaseException,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> bool:
+    if engine_selection is not None:
+        error_message = str(error).lower()
+        if "crash" in error_message:
+            return False
+        if isinstance(engine_selection.classify_error(error), BrowserTargetClosedError) and any(
+            message in error_message for message in _SELECTED_SCREENSHOT_TARGET_CLOSED_MESSAGES
+        ):
+            return True
+        # A bound stock-Playwright selection surfaces its canonical target-close as a base Error, not the
+        # rich TargetClosedError family, so classify_error returns BrowserAutomationError above. Fall back to
+        # the single canonical message only — never a broad substring — so renderer crashes stay generic.
+        return _is_engine_error(error, engine_selection) and _SCREENSHOT_TARGET_CLOSED_MESSAGE.lower() in error_message
+    return _is_engine_error(error, engine_selection) and _SCREENSHOT_TARGET_CLOSED_MESSAGE in str(error)
 
 
 def _load_cursor_overlay_js() -> str:
@@ -205,6 +308,7 @@ async def _page_screenshot_helper(
     file_path: str | None = None,
     full_page: bool = False,
     timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
+    engine_selection: BrowserEngineSelection | None = None,
 ) -> bytes:
     if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
         try:
@@ -218,7 +322,9 @@ async def _page_screenshot_helper(
             full_page=full_page,
             animations="disabled",
         )
-    except TimeoutError as timeout_error:
+    except Exception as timeout_error:
+        if not _is_engine_timeout(timeout_error, engine_selection):
+            raise
         LOG.info(
             f"Timeout error while taking screenshot: {str(timeout_error)}. Going to take a screenshot again with animation allowed."
         )
@@ -242,6 +348,7 @@ async def _current_viewpoint_screenshot_helper(
     full_page: bool = False,
     timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
     mode: ScreenshotMode = ScreenshotMode.DETAILED,
+    engine_selection: BrowserEngineSelection | None = None,
 ) -> bytes:
     if page.is_closed():
         LOG.info(
@@ -262,16 +369,27 @@ async def _current_viewpoint_screenshot_helper(
     try:
         if mode == ScreenshotMode.DETAILED:
             await _wait_for_screenshot_load_state(
-                page, timeout_ms=SettingsManager.get_settings().BROWSER_SCREENSHOT_LOAD_STATE_TIMEOUT_MS
+                page,
+                timeout_ms=SettingsManager.get_settings().BROWSER_SCREENSHOT_LOAD_STATE_TIMEOUT_MS,
+                engine_selection=engine_selection,
             )
         start_time = time.time()
         screenshot: bytes = b""
         if file_path:
             screenshot = await _page_screenshot_helper(
-                page=page, file_path=file_path, full_page=full_page, timeout=timeout
+                page=page,
+                file_path=file_path,
+                full_page=full_page,
+                timeout=timeout,
+                engine_selection=engine_selection,
             )
         else:
-            screenshot = await _page_screenshot_helper(page=page, full_page=full_page, timeout=timeout)
+            screenshot = await _page_screenshot_helper(
+                page=page,
+                full_page=full_page,
+                timeout=timeout,
+                engine_selection=engine_selection,
+            )
         end_time = time.time()
         LOG.debug(
             "Screenshot taking time",
@@ -279,19 +397,21 @@ async def _current_viewpoint_screenshot_helper(
             file_path=file_path,
         )
         return screenshot
-    except TimeoutError as e:
-        LOG.warning(
-            "Screenshot timeout",
-            timeout_ms=timeout,
-            url=url,
-            viewport=viewport_info,
-            full_page=full_page,
-            mode=mode.value if hasattr(mode, "value") else str(mode),
-            error=str(e),
-        )
-        raise FailedToTakeScreenshot(error_message=str(e)) from e
     except Exception as e:
-        if _is_screenshot_target_closed(e):
+        if engine_selection is not None and not _is_engine_error(e, engine_selection):
+            raise
+        if _is_engine_timeout(e, engine_selection):
+            LOG.warning(
+                "Screenshot timeout",
+                timeout_ms=timeout,
+                url=url,
+                viewport=viewport_info,
+                full_page=full_page,
+                mode=mode.value if hasattr(mode, "value") else str(mode),
+                error=str(e),
+            )
+            raise FailedToTakeScreenshot(error_message=str(e)) from e
+        if _is_screenshot_target_closed(e, engine_selection):
             LOG.info(
                 "Skipping screenshot because target closed during capture",
                 url=url,
@@ -314,6 +434,7 @@ async def _current_viewpoint_screenshot_helper(
 async def take_element_screenshot(
     locator: Locator,
     timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
+    engine_selection: BrowserEngineSelection | None = None,
 ) -> bytes:
     try:
         page = locator.page
@@ -324,13 +445,17 @@ async def take_element_screenshot(
         raise FailedToTakeScreenshot(error_message="Page is closed")
     try:
         return await locator.screenshot(timeout=timeout, animations="disabled")
-    except TimeoutError:
+    except Exception as error:
+        if not _is_engine_error(error, engine_selection):
+            raise
+        if not _is_engine_timeout(error, engine_selection):
+            raise FailedToTakeScreenshot(error_message=str(error)) from error
         try:
             return await locator.screenshot(timeout=timeout, animations="allow")
-        except PlaywrightError as retry_error:
+        except Exception as retry_error:
+            if not _is_engine_error(retry_error, engine_selection):
+                raise
             raise FailedToTakeScreenshot(error_message=str(retry_error)) from retry_error
-    except PlaywrightError as e:
-        raise FailedToTakeScreenshot(error_message=str(e)) from e
 
 
 async def _scrolling_screenshots_helper(
@@ -339,9 +464,10 @@ async def _scrolling_screenshots_helper(
     draw_boxes: bool = False,
     max_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
     mode: ScreenshotMode = ScreenshotMode.DETAILED,
+    engine_selection: BrowserEngineSelection | None = None,
 ) -> tuple[list[bytes], list[int]]:
     # page is the main frame and the index must be 0
-    skyvern_page = await SkyvernFrame.create_instance(frame=page)
+    skyvern_page = await SkyvernFrame.create_instance(frame=page, engine_selection=engine_selection)
     frame = "main.frame"
     frame_index = 0
 
@@ -373,7 +499,11 @@ async def _scrolling_screenshots_helper(
                 await skyvern_page.build_tree_from_body(frame_name=frame, frame_index=frame_index)
                 initial_scroll_height = scroll_height
 
-            screenshot = await _current_viewpoint_screenshot_helper(page=page, mode=mode)
+            screenshot = await _current_viewpoint_screenshot_helper(
+                page=page,
+                mode=mode,
+                engine_selection=engine_selection,
+            )
             screenshots.append(screenshot)
             positions.append(int(scroll_y_px))
             scroll_y_px_old = scroll_y_px
@@ -401,7 +531,11 @@ async def _scrolling_screenshots_helper(
             await skyvern_page.build_elements_and_draw_bounding_boxes(frame=frame, frame_index=frame_index)
 
         LOG.debug("Page is not scrollable", url=url, num_screenshots=len(screenshots))
-        screenshot = await _current_viewpoint_screenshot_helper(page=page, mode=mode)
+        screenshot = await _current_viewpoint_screenshot_helper(
+            page=page,
+            mode=mode,
+            engine_selection=engine_selection,
+        )
         screenshots.append(screenshot)
         positions.append(0)
 
@@ -599,9 +733,11 @@ class SkyvernFrame:
         arg: Any | None = None,
         timeout_ms: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
         engine_selection: BrowserEngineSelection | None = None,
+        *,
+        force_cdp: bool = False,
     ) -> Any:
         async def evaluate_expression() -> Any:
-            return await _dispatch_evaluate(frame, expression, arg)
+            return await _dispatch_evaluate(frame, expression, arg, force_cdp=force_cdp)
 
         return await SkyvernFrame._evaluate_expression(
             frame=frame,
@@ -956,10 +1092,15 @@ class SkyvernFrame:
         timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
         mode: ScreenshotMode = ScreenshotMode.DETAILED,
         scrolling_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
+        engine_selection: BrowserEngineSelection | None = None,
     ) -> bytes:
         if scrolling_number <= 0:
             return await _current_viewpoint_screenshot_helper(
-                page=page, file_path=file_path, timeout=timeout, mode=mode
+                page=page,
+                file_path=file_path,
+                timeout=timeout,
+                mode=mode,
+                engine_selection=engine_selection,
             )
 
         if scrolling_number > SettingsManager.get_settings().MAX_NUM_SCREENSHOTS:
@@ -973,14 +1114,17 @@ class SkyvernFrame:
         # use spilt screenshot with lite mode, isntead of fullpage screenshot from playwright
         LOG.debug("Page is fully loaded, agent is about to generate the full page screenshot")
         start_time = time.time()
-        skyvern_frame = await SkyvernFrame.create_instance(frame=page)
+        skyvern_frame = await SkyvernFrame.create_instance(frame=page, engine_selection=engine_selection)
         x: int | None = None
         y: int | None = None
         try:
             x, y = await skyvern_frame.get_scroll_x_y()
             async with asyncio.timeout(timeout):
                 screenshots, positions = await _scrolling_screenshots_helper(
-                    page=page, mode=mode, max_number=scrolling_number
+                    page=page,
+                    mode=mode,
+                    max_number=scrolling_number,
+                    engine_selection=engine_selection,
                 )
                 images = []
 
@@ -1016,7 +1160,11 @@ class SkyvernFrame:
             x = None
             y = None
             return await _current_viewpoint_screenshot_helper(
-                page=page, file_path=file_path, timeout=timeout, full_page=True
+                page=page,
+                file_path=file_path,
+                timeout=timeout,
+                full_page=True,
+                engine_selection=engine_selection,
             )
         finally:
             if x is not None and y is not None:
@@ -1030,9 +1178,16 @@ class SkyvernFrame:
         draw_boxes: bool = False,
         max_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
         scroll: bool = True,
+        engine_selection: BrowserEngineSelection | None = None,
     ) -> list[bytes]:
         if not scroll:
-            return [await _current_viewpoint_screenshot_helper(page=page, mode=ScreenshotMode.DETAILED)]
+            return [
+                await _current_viewpoint_screenshot_helper(
+                    page=page,
+                    mode=ScreenshotMode.DETAILED,
+                    engine_selection=engine_selection,
+                )
+            ]
 
         screenshots, _ = await _scrolling_screenshots_helper(
             page=page,
@@ -1040,6 +1195,7 @@ class SkyvernFrame:
             max_number=max_number,
             draw_boxes=draw_boxes,
             mode=ScreenshotMode.DETAILED,
+            engine_selection=engine_selection,
         )
         return screenshots
 
@@ -1419,11 +1575,11 @@ class SkyvernFrame:
             await self.frame.wait_for_load_state("load", timeout=timeout_ms)
             await self.wait_for_animation_end(timeout_ms=timeout_ms)
             _span.set_attribute("animation_result", "finished")
-        except (TimeoutError, asyncio.TimeoutError, SkyvernPageAnalysisTimeout):
-            _span.set_attribute("animation_result", "timeout")
-            LOG.debug("Timed out waiting for animation end, but ignore it", exc_info=True)
-            return
-        except Exception:
+        except Exception as exc:
+            if _is_readiness_timeout(exc, self.engine_selection):
+                _span.set_attribute("animation_result", "timeout")
+                LOG.debug("Timed out waiting for animation end, but ignore it", exc_info=True)
+                return
             _span.set_attribute("animation_result", "error")
             LOG.debug("Failed to wait for animation end, but ignore it", exc_info=True)
             return
@@ -1470,12 +1626,15 @@ class SkyvernFrame:
             _li_span.set_attribute("timeout_ms", loading_indicator_timeout_ms)
             try:
                 await self._wait_for_loading_indicators_gone(timeout_ms=loading_indicator_timeout_ms)
-            except (TimeoutError, asyncio.TimeoutError, SkyvernPageAnalysisTimeout):
-                loading_indicator_result = "timeout"
-                LOG.info("Loading indicator timeout - some indicators may still be present, proceeding", sampling=True)
-            except Exception:
-                loading_indicator_result = "error"
-                LOG.warning("Failed to check loading indicators, proceeding", exc_info=True)
+            except Exception as exc:
+                if _is_readiness_timeout(exc, self.engine_selection):
+                    loading_indicator_result = "timeout"
+                    LOG.info(
+                        "Loading indicator timeout - some indicators may still be present, proceeding", sampling=True
+                    )
+                else:
+                    loading_indicator_result = "error"
+                    LOG.warning("Failed to check loading indicators, proceeding", exc_info=True)
             finally:
                 _li_span.set_attribute("result", loading_indicator_result)
 
@@ -1486,12 +1645,13 @@ class SkyvernFrame:
             _ni_span.set_attribute("timeout_ms", network_idle_timeout_ms)
             try:
                 await self.frame.wait_for_load_state("networkidle", timeout=network_idle_timeout_ms)
-            except (TimeoutError, asyncio.TimeoutError):
-                network_idle_result = "timeout"
-                LOG.info("Network idle timeout - page may have constant activity, proceeding", sampling=True)
-            except Exception:
-                network_idle_result = "error"
-                LOG.warning("Failed to check network idle, proceeding", exc_info=True)
+            except Exception as exc:
+                if _is_readiness_timeout(exc, self.engine_selection):
+                    network_idle_result = "timeout"
+                    LOG.info("Network idle timeout - page may have constant activity, proceeding", sampling=True)
+                else:
+                    network_idle_result = "error"
+                    LOG.warning("Failed to check network idle, proceeding", exc_info=True)
             finally:
                 _ni_span.set_attribute("result", network_idle_result)
 
@@ -1503,12 +1663,13 @@ class SkyvernFrame:
             _ds_span.set_attribute("stable_ms", dom_stable_ms)
             try:
                 await self._wait_for_dom_stable(stable_ms=dom_stable_ms, timeout_ms=dom_stability_timeout_ms)
-            except (TimeoutError, asyncio.TimeoutError, SkyvernPageAnalysisTimeout):
-                dom_stability_result = "timeout"
-                LOG.warning("DOM stability timeout - DOM may still be changing, proceeding")
-            except Exception:
-                dom_stability_result = "error"
-                LOG.warning("Failed to check DOM stability, proceeding", exc_info=True)
+            except Exception as exc:
+                if _is_readiness_timeout(exc, self.engine_selection):
+                    dom_stability_result = "timeout"
+                    LOG.warning("DOM stability timeout - DOM may still be changing, proceeding")
+                else:
+                    dom_stability_result = "error"
+                    LOG.warning("Failed to check DOM stability, proceeding", exc_info=True)
             finally:
                 _ds_span.set_attribute("result", dom_stability_result)
 

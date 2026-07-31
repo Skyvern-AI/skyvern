@@ -1042,6 +1042,7 @@ class NavigationBlockYAML(BlockYAML):
     totp_identifier: str | None = None
     disable_cache: bool = False
     complete_criterion: str | None = None
+    complete_criterion_is_untrusted: bool = False
     terminate_criterion: str | None = None
     complete_verification: bool = True
     include_action_history_in_verification: bool = False
@@ -1153,8 +1154,16 @@ class TaskV2BlockYAML(BlockYAML):
     url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    max_iterations: int = settings.MAX_ITERATIONS_PER_TASK_V2
-    max_steps: int = settings.MAX_STEPS_PER_TASK_V2
+    # These documented defaults must stay literals; reading the setting here would put an
+    # environment value back into the published OpenAPI document.
+    max_iterations: int = Field(
+        default_factory=lambda: settings.MAX_ITERATIONS_PER_TASK_V2,
+        json_schema_extra={"default": 50},
+    )
+    max_steps: int = Field(
+        default_factory=lambda: settings.MAX_STEPS_PER_TASK_V2,
+        json_schema_extra={"default": 25},
+    )
     disable_cache: bool = False
 
 

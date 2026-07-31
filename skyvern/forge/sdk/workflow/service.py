@@ -49,6 +49,7 @@ from skyvern.exceptions import (
     InvalidWorkflowParameter,
     MissingValueForParameter,
     ScriptTerminationException,
+    SequentialCredentialLimitExceeded,
     SkyvernException,
     SkyvernHTTPException,
     WorkflowNotFound,
@@ -77,6 +78,7 @@ from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_fo
 from skyvern.forge.sdk.experimentation.transient_ui_capture import resolve_transient_ui_capture_arm
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
+from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
@@ -93,7 +95,7 @@ from skyvern.forge.sdk.workflow.browser_profile_key import (
     build_workflow_browser_session_storage_key,
     render_browser_profile_key,
 )
-from skyvern.forge.sdk.workflow.context_manager import jinja_sandbox_env
+from skyvern.forge.sdk.workflow.context_manager import jinja_sandbox_env, resolve_credential_parameter_binding
 from skyvern.forge.sdk.workflow.credential_fallback import (
     VALID_FALLBACK_TRIGGERS,
     maybe_start_credential_fallback_retry,
@@ -1200,9 +1202,9 @@ class WorkflowService:
                 )
         return value
 
-    async def _validate_credential_ids(self, credential_ids: list[str], organization: Organization) -> None:
+    async def _validate_credential_ids(self, credential_ids: list[str], organization: Organization) -> list[Credential]:
         if not credential_ids:
-            return
+            return []
         unique_ids = list(dict.fromkeys(credential_ids))
         existing = await app.DATABASE.credentials.get_credentials_by_ids(
             unique_ids, organization_id=organization.organization_id
@@ -1211,6 +1213,65 @@ class WorkflowService:
         missing = [credential_id for credential_id in unique_ids if credential_id not in found]
         if missing:
             raise InvalidCredentialId(", ".join(missing))
+        return existing
+
+    async def _resolve_sequential_credential_id(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        organization: Organization,
+        parameter_values: dict[str, Any],
+        credential_selections: dict[str, str],
+    ) -> str | None:
+        """Resolve the run's single sequential credential from the actually-selected credential of
+        every credential-bearing parameter. Persist the one id when present; leave it NULL (no write)
+        for a credential-less run; fail closed before publication when 2+ distinct opted-in credentials
+        resolve — the MVP serializes at most one credential per run. The id is a carried identity, never
+        a setup-completion sentinel."""
+        bound_credential_ids: list[str] = []
+        runtime_only_parameter_keys = {
+            parameter.key
+            for parameter in workflow.workflow_definition.parameters
+            if isinstance(parameter, (ContextParameter, OutputParameter))
+        }
+        for parameter in workflow.workflow_definition.parameters:
+            credential_id: Any
+            if isinstance(parameter, CredentialParameter):
+                if (
+                    parameter.key not in credential_selections
+                    and parameter.credential_id in runtime_only_parameter_keys
+                    and parameter.credential_id not in parameter_values
+                ):
+                    continue
+                credential_id = resolve_credential_parameter_binding(
+                    parameter,
+                    parameter_values,
+                    credential_selections.get(parameter.key),
+                )
+            elif (
+                isinstance(parameter, WorkflowParameter)
+                and parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+            ):
+                credential_id = parameter_values.get(parameter.key)
+            else:
+                continue
+            if isinstance(credential_id, str) and credential_id:
+                bound_credential_ids.append(credential_id)
+        validated_bound_credentials = await self._validate_credential_ids(bound_credential_ids, organization)
+        sequential_ids = sorted(
+            {credential.credential_id for credential in validated_bound_credentials if credential.run_sequentially}
+        )
+        if not sequential_ids:
+            return None
+        if len(sequential_ids) > 1:
+            raise SequentialCredentialLimitExceeded(sequential_ids)
+        sequential_credential_id = sequential_ids[0]
+        await app.DATABASE.workflow_runs.update_workflow_run(
+            workflow_run_id=workflow_run.workflow_run_id,
+            sequential_credential_id=sequential_credential_id,
+        )
+        return sequential_credential_id
 
     async def _validate_and_normalize_credential_rotation_parameters(
         self,
@@ -1397,6 +1458,28 @@ class WorkflowService:
 
         return overrides
 
+    async def _rotation_candidates_may_require_serialization(self, workflow: Workflow, organization_id: str) -> bool:
+        """Conservatively decide whether a failed rotating-credential selection could still have
+        resolved to a credential opted into sequential execution. Any candidate flagged
+        run_sequentially — or any candidate we cannot verify — fails closed so a serialized lane is
+        never silently skipped. A pool that is provably all non-sequential preserves the legacy
+        best-effort partial selection for keyless workflows outside the serialization feature."""
+        candidate_ids: set[str] = set()
+        for parameter in self._get_credential_parameters_with_configured_selection(workflow):
+            candidate_ids.update(parameter.credential_ids or [])
+            candidate_ids.update(parameter.fallback_credential_ids or [])
+        if not candidate_ids:
+            return False
+        organization = await app.DATABASE.organizations.get_organization(organization_id)
+        if organization is None:
+            return True
+        try:
+            credentials = await self._validate_credential_ids(sorted(candidate_ids), organization)
+        except Exception:
+            # Cannot verify the candidate pool (missing/invalid id or lookup error) — fail closed.
+            return True
+        return any(credential.run_sequentially for credential in credentials)
+
     async def _select_rotating_credential_parameters_for_render(
         self,
         *,
@@ -1447,7 +1530,13 @@ class WorkflowService:
                 workflow_permanent_id=workflow.workflow_permanent_id,
                 exc_info=True,
             )
-            if workflow.browser_profile_key:
+            # Scope fail-closed to runs that could actually resolve to a sequential credential: a keyed
+            # workflow (browser_profile_key), or a rotation pool with any opted-in or unverifiable
+            # candidate. A keyless workflow whose pool is provably non-sequential keeps the legacy
+            # best-effort partial selection — the pre-feature behavior for runs outside serialization.
+            if workflow.browser_profile_key or await self._rotation_candidates_may_require_serialization(
+                workflow, organization_id
+            ):
                 raise
             return selections
 
@@ -1818,6 +1907,13 @@ class WorkflowService:
                     parameter_values=parameter_values,
                 )
                 parameter_values.update(rotating_credential_selections)
+                workflow_run.sequential_credential_id = await self._resolve_sequential_credential_id(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    organization=organization,
+                    parameter_values=parameter_values,
+                    credential_selections=rotating_credential_selections,
+                )
                 workflow_run = await self._resolve_and_stamp_run_seed(
                     workflow=workflow,
                     workflow_run=workflow_run,
@@ -1825,10 +1921,6 @@ class WorkflowService:
                     explicit_request_browser_profile_id=explicit_request_browser_profile_id,
                     start_fresh=resolve_start_fresh(
                         workflow_request.start_fresh_browser, explicit_request_browser_profile_id
-                    ),
-                    # Keyless workflows keep best-effort rotation selection; keyed workflows re-raise above.
-                    allow_missing_browser_profile_key=(
-                        bool(self._get_rotating_credential_parameters(workflow)) and not rotating_credential_selections
                     ),
                 )
 
@@ -7229,6 +7321,26 @@ class WorkflowService:
                 steps_updated=steps_updated,
             )
 
+    def _schedule_workflow_run_terminal_hooks(
+        self,
+        *,
+        workflow_run_id: str,
+        workflow_id: str,
+        organization_id: str,
+        status: WorkflowRunStatus,
+    ) -> None:
+        hook_coroutines = (
+            app.AGENT_FUNCTION.on_workflow_run_completed(
+                organization_id=organization_id,
+                workflow_id=workflow_id,
+                status=status,
+            ),
+        )
+        for hook_coroutine in hook_coroutines:
+            task = asyncio.create_task(hook_coroutine)
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
     async def _update_workflow_run_status(
         self,
         workflow_run_id: str,
@@ -7317,15 +7429,12 @@ class WorkflowService:
                 workflow_schedule_id=workflow_run.workflow_schedule_id,
             )
             await self._apply_completion_run_tags_best_effort(workflow_run)
-            run_completed_task = asyncio.create_task(
-                app.AGENT_FUNCTION.on_workflow_run_completed(
-                    organization_id=workflow_run.organization_id,
-                    workflow_id=workflow_run.workflow_id,
-                    status=status,
-                ),
+            self._schedule_workflow_run_terminal_hooks(
+                workflow_run_id=workflow_run_id,
+                organization_id=workflow_run.organization_id,
+                workflow_id=workflow_run.workflow_id,
+                status=status,
             )
-            self._background_tasks.add(run_completed_task)
-            run_completed_task.add_done_callback(self._background_tasks.discard)
         # Best-effort fire-and-forget write-through to task_runs table.
         # Runs off the hot path so workflow status transitions stay fast.
         bg = asyncio.create_task(
@@ -7711,6 +7820,13 @@ class WorkflowService:
             workflow_schedule_id=updated.workflow_schedule_id,
         )
         await self._apply_completion_run_tags_best_effort(updated)
+
+        self._schedule_workflow_run_terminal_hooks(
+            workflow_run_id=workflow_run_id,
+            organization_id=updated.organization_id,
+            workflow_id=updated.workflow_id,
+            status=WorkflowRunStatus.canceled,
+        )
 
         bg = asyncio.create_task(
             self._sync_task_run_from_workflow_run(updated, workflow_run_id, WorkflowRunStatus.canceled),
@@ -8781,6 +8897,12 @@ class WorkflowService:
         schedule_credential_fallback_retry: bool = True,
     ) -> None:
         analytics.capture("skyvern-oss-agent-workflow-status", {"status": workflow_run.status})
+        # Tear down passkey material in the worker, after the finally block, while the context is still alive.
+        await app.AGENT_FUNCTION.on_workflow_run_terminal(
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=workflow_run.organization_id,
+            status=workflow_run.status,
+        )
         if browser_cleanup_result is None:
             browser_cleanup_result = await self._clean_up_workflow_browser(
                 workflow_run=workflow_run,

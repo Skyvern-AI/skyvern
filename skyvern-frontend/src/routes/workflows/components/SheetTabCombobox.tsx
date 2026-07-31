@@ -21,6 +21,7 @@ import {
   type SheetsBlockType,
 } from "@/util/sheetsTelemetry";
 import { InlineCreateRow } from "./InlineCreateRow";
+import { TemplateExpressionRow } from "./TemplateExpressionRow";
 
 type Props = {
   nodeId: string;
@@ -31,6 +32,8 @@ type Props = {
   placeholder?: string;
   allowCreate: boolean;
   blockType: SheetsBlockType;
+  templateMode: boolean;
+  onTemplateModeChange: (enabled: boolean) => void;
   onChange: (value: string) => void;
   onSelect: (tabName: string) => void;
 };
@@ -44,6 +47,8 @@ function SheetTabCombobox({
   placeholder,
   allowCreate,
   blockType,
+  templateMode,
+  onTemplateModeChange,
   onChange,
   onSelect,
 }: Props) {
@@ -51,6 +56,8 @@ function SheetTabCombobox({
   const anchorRef = useRef<HTMLDivElement>(null);
   const postHog = usePostHog();
   const orgId = useCurrentOrgId();
+  // Re-derived locally so the field renders template values correctly even if a caller forgets to OR them into templateMode.
+  const effectiveTemplateMode = templateMode || isTemplateExpression(value);
 
   const isTypeable =
     hasSelectedAccount &&
@@ -59,19 +66,27 @@ function SheetTabCombobox({
     !isTemplateExpression(spreadsheetUrl) &&
     extractSpreadsheetIdFromUrl(spreadsheetUrl) !== null &&
     !isTemplateExpression(value);
+  const canPick = isTypeable && !effectiveTemplateMode;
 
   const handleChange = (nextValue: string) => {
     onChange(nextValue);
   };
 
   const handleFocus = () => {
-    if (isTypeable) {
+    if (canPick) {
       setIsOpen(true);
     }
   };
 
+  const handleUseTemplateExpression = () => {
+    setIsOpen(false);
+    onTemplateModeChange(true);
+  };
+
+  const popoverOpen = isOpen && canPick;
+
   return (
-    <Popover open={isOpen && isTypeable} onOpenChange={setIsOpen}>
+    <Popover open={popoverOpen} onOpenChange={setIsOpen}>
       <PopoverAnchor asChild>
         <div ref={anchorRef} className="relative">
           <WorkflowBlockInputTextarea
@@ -79,7 +94,9 @@ function SheetTabCombobox({
             value={value}
             onChange={handleChange}
             onFocus={handleFocus}
-            placeholder={placeholder}
+            placeholder={
+              effectiveTemplateMode ? "sheet_{{ current_index }}" : placeholder
+            }
             hideActions={!hasSelectedAccount}
             className="nopan text-xs"
           />
@@ -112,6 +129,7 @@ function SheetTabCombobox({
             setIsOpen(false);
           }}
         />
+        <TemplateExpressionRow onClick={handleUseTemplateExpression} />
       </PopoverContent>
     </Popover>
   );

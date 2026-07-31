@@ -57,7 +57,9 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedOutcomeBindingConstraint,
     RecordedOutcomeGroundingRequirement,
     observed_value_extraction_scaffold_lines,
+    unresolved_runtime_block_failure,
 )
+from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     freeze_requested_output_extraction_candidate,
@@ -220,7 +222,7 @@ from skyvern.forge.sdk.copilot.turn_outcome import (
     with_copilot_code_mode_diagnostics,
 )
 from skyvern.forge.sdk.copilot.turn_ownership import blocker_signal_render_allowed
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome, UnresolvedRuntimeFailure
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -654,16 +656,26 @@ def _build_system_prompt(
     copilot_config = config or CopilotConfig(security_rules=security_rules or "")
     template = copilot_config.prompt_template.removesuffix(".j2")
     workflow_knowledge_base = WORKFLOW_KNOWLEDGE_BASE_PATH.read_text(encoding="utf-8")
-    prompt = prompt_engine.load_prompt(
+    current_datetime = datetime.now(timezone.utc).isoformat()
+    datetime_boundary = "__SKYVERN_COPILOT_DYNAMIC_DATETIME_BOUNDARY__"
+    prompt_with_boundary = prompt_engine.load_prompt(
         template=template,
         workflow_knowledge_base=workflow_knowledge_base,
-        current_datetime=datetime.now(timezone.utc).isoformat(),
+        current_datetime=datetime_boundary,
         tool_usage_guide=tool_usage_guide,
         security_rules=copilot_config.security_rules,
     )
+    stable_prefix, boundary, dynamic_suffix = prompt_with_boundary.partition(datetime_boundary)
+    if boundary:
+        dynamic_suffix = current_datetime + dynamic_suffix
+    else:
+        # A custom template without the datetime has no variable base-prompt
+        # suffix, so its complete rendered prompt is safe to mark stable.
+        stable_prefix = prompt_with_boundary
+        dynamic_suffix = ""
     if copilot_config.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        prompt = f"{prompt}\n\n{_render_code_only_browser_authoring_prompt()}"
-    return prompt
+        dynamic_suffix = f"{dynamic_suffix}\n\n{_render_code_only_browser_authoring_prompt()}"
+    return CacheableSystemInstructions(stable_prefix, dynamic_suffix)
 
 
 def _runtime_verification_evidence_prompt(ctx: CopilotContext | None) -> str:
@@ -1225,9 +1237,8 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
         if not isinstance(policy, RequestPolicy):
             return base_system_prompt
         policy_summary = escape_code_fences(redact_raw_secrets_for_prompt(policy.prompt_summary()))
-        prompt = (
-            base_system_prompt
-            + "\n\nREQUEST POLICY:\n```yaml\n"
+        dynamic_context = (
+            "\n\nREQUEST POLICY:\n```yaml\n"
             + policy_summary
             + "\n```\nFollow this policy. If `allow_run_blocks` is false, do not call block-running tools. "
             + "Exception: when `clarification_reason` is `workflow_credential_inputs_unbound` or "
@@ -1241,8 +1252,8 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + "workflow input parameter with that value as the default, so the saved workflow can be re-run "
             + "under a different address, and do not ask for a saved password credential for that login."
         )
-        return (
-            prompt
+        dynamic_context = (
+            dynamic_context
             + _runtime_verification_evidence_prompt(ctx)
             + _recorded_build_test_outcome_prompt(ctx)
             + _code_authoring_repair_context_prompt(ctx)
@@ -1250,6 +1261,13 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + todo_list_prompt(ctx)
             + _docs_answer_turn_directive(ctx.turn_intent)
         )
+        if isinstance(base_system_prompt, CacheableSystemInstructions):
+            return CacheableSystemInstructions(
+                base_system_prompt.stable_prefix,
+                base_system_prompt.dynamic_suffix + dynamic_context,
+                cache_namespace=ctx.workflow_copilot_chat_id,
+            )
+        return base_system_prompt + dynamic_context
 
     return instructions
 
@@ -1838,6 +1856,16 @@ def _assemble_terminal_envelope_safe(
     return payload
 
 
+def _with_unresolved_runtime_failure_note(user_response: str, failure: UnresolvedRuntimeFailure) -> str:
+    label = failure.block_label or "an earlier step"
+    note = (
+        f"One thing to flag: an earlier test run ({failure.workflow_run_id}) failed at "
+        f'"{label}", the failing call is still in the draft, and no later run '
+        "verifiably re-exercised it — so that step is still unproven."
+    )
+    return f"{user_response.rstrip()}\n\n{note}" if user_response.strip() else note
+
+
 def _make_agent_result(
     ctx: CopilotContext | None,
     *,
@@ -1887,8 +1915,8 @@ def _make_agent_result(
             pause_outcome = ctx.credential_pause_outcome
             if pause_outcome:
                 pause_payload = {"outcome": pause_outcome}
-                if pause_outcome == "connected" and ctx.request_policy and ctx.request_policy.resolved_credentials:
-                    pause_payload["credentialId"] = ctx.request_policy.resolved_credentials[-1].credential_id
+                if pause_outcome == "connected" and ctx.credential_pause_connected_credential_id:
+                    pause_payload["credentialId"] = ctx.credential_pause_connected_credential_id
                 payload_updates["credentialPause"] = pause_payload
         if ctx is not None and "verifiedSuccess" not in narrative_payload:
             payload_updates["verifiedSuccess"] = bool(verified_goal_claim_authorized(ctx))
@@ -1898,6 +1926,26 @@ def _make_agent_result(
                 payload_updates["outcomeAdjudication"] = adjudication
         if payload_updates or len(payload_base) != len(narrative_payload):
             kwargs["narrative_payload"] = {**payload_base, **payload_updates}
+    if ctx is not None and turn_outcome is not None and turn_outcome.response_kind == ResponseKind.BUILD:
+        unresolved_failure = unresolved_runtime_block_failure(ctx)
+        if unresolved_failure is not None:
+            turn_outcome = turn_outcome.model_copy(update={"unresolved_runtime_failure": unresolved_failure})
+            kwargs["user_response"] = _with_unresolved_runtime_failure_note(
+                str(kwargs.get("user_response") or ""), unresolved_failure
+            )
+            # A reloaded chat renders the narrative card, and hydration prefers narrativeSummary over
+            # terminalMessage, so the qualification has to ride every surface or it survives the
+            # turn and disappears on refresh.
+            narrative = kwargs.get("narrative_payload")
+            if isinstance(narrative, dict):
+                kwargs["narrative_payload"] = {
+                    **narrative,
+                    **{
+                        key: _with_unresolved_runtime_failure_note(narrative[key], unresolved_failure)
+                        for key in ("terminalMessage", "narrativeSummary")
+                        if isinstance(narrative.get(key), str) and narrative[key].strip()
+                    },
+                }
     terminal_envelope: dict[str, Any] | None = None
     if ctx is not None:
         blocker_reason, halt_kind = _terminal_halt_fields(ctx)

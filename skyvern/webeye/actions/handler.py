@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import copy
 import json
 import os
@@ -135,6 +136,7 @@ from skyvern.webeye.actions.actions import (
     DownloadFileAction,
     InputOrSelectContext,
     InputTextAction,
+    PasteTextAction,
     ScrapeResult,
     SelectOption,
     SelectOptionAction,
@@ -142,7 +144,7 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
-from skyvern.webeye.browser_engine import BrowserEngineSelection, resolve_engine_selection_for_task
+from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_factory import initialize_download_dir, resolve_artifact_path
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
@@ -186,6 +188,11 @@ DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE = (
     "No file download was observed or credited after this action. "
     "If the goal still requires this file, keep trying to download it rather than reporting the goal complete."
 )
+SENSITIVE_CLIPBOARD_CLEAR_FAILED_FOLLOWUP_MESSAGE = (
+    "The sensitive paste completed, but the clipboard could not be cleared. "
+    "Do not repeat the paste; stop and report the clipboard safety failure."
+)
+_PASTE_TEXT_CLIPBOARD_LOCK = asyncio.Lock()
 
 FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
 COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
@@ -556,12 +563,16 @@ async def _reset_autocomplete_for_llm_fallback(
     text: str,
     task: Task,
     step: Step,
+    engine_selection: BrowserEngineSelection | None = UNSET_SELECTION,
 ) -> tuple[IncrementalScrapePage, list[dict], list[dict], str, list[str]]:
+    if engine_selection is UNSET_SELECTION:
+        engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
     await current_incremental_scraped.stop_listen_dom_increment()
     await skyvern_element.input_clear()
 
     incremental_scraped = IncrementalScrapePage(
-        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
+        skyvern_frame=skyvern_frame,
+        engine_selection=engine_selection,
     )
     await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
     await skyvern_element.press_fill(text)
@@ -571,6 +582,7 @@ async def _reset_autocomplete_for_llm_fallback(
             task=task,
             step=step,
             check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+            engine_selection=engine_selection,
         ),
     )
 
@@ -1333,12 +1345,15 @@ async def filter_out_elements(
 
 
 def clean_and_remove_element_tree_factory(
-    task: Task, step: Step, check_filter_funcs: list[CheckFilterOutElementIDFunc]
+    task: Task,
+    step: Step,
+    check_filter_funcs: list[CheckFilterOutElementIDFunc],
+    engine_selection: BrowserEngineSelection | None = UNSET_SELECTION,
 ) -> CleanupElementTreeFunc:
     async def helper_func(frame: Page | Frame, url: str, element_tree: list[dict]) -> list[dict]:
-        element_tree = await app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step)(
-            frame, url, element_tree
-        )
+        element_tree = await app.AGENT_FUNCTION.cleanup_element_tree_factory(
+            task=task, step=step, engine_selection=engine_selection
+        )(frame, url, element_tree)
         for check_filter in check_filter_funcs:
             element_tree = await filter_out_elements(frame=frame, element_tree=element_tree, check_filter=check_filter)
 
@@ -3269,6 +3284,10 @@ class ActionHandler:
         try:
             async with asyncio.timeout(execution_timeout_seconds) as execution_timeout_scope:
                 if action.action_type in ActionHandler._handled_action_types:
+                    if isinstance(action, PasteTextAction) and not await _is_paste_text_action_enabled(task):
+                        actions_result.append(ActionFailure(Exception("PASTE_TEXT action is disabled")))
+                        return actions_result
+
                     invalid_web_action_check = check_for_invalid_web_action(action, page, scraped_page, task, step)
                     if invalid_web_action_check:
                         actions_result.extend(invalid_web_action_check)
@@ -3381,6 +3400,24 @@ def _resolve_action_execution_timeout(action: actions.Action) -> float:
     return base
 
 
+async def _is_paste_text_action_enabled(task: Task) -> bool:
+    if settings.PLANNER_MINI_GOAL_IMPROVEMENTS:
+        return True
+    try:
+        return await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            "PLANNER_MINI_GOAL_IMPROVEMENTS",
+            task.organization_id,
+            properties={"organization_id": task.organization_id},
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to resolve PASTE_TEXT execution gate; refusing execution",
+            organization_id=task.organization_id,
+            exc_info=True,
+        )
+        return False
+
+
 def check_for_invalid_web_action(
     action: actions.Action,
     page: Page,
@@ -3391,7 +3428,7 @@ def check_for_invalid_web_action(
     if isinstance(action, ClickAction) and action.x is not None and action.y is not None:
         return []
 
-    if isinstance(action, InputTextAction) and not action.element_id:
+    if isinstance(action, (InputTextAction, PasteTextAction)) and not action.element_id:
         return []
 
     if isinstance(action, WebAction) and action.element_id not in scraped_page.id_to_element_dict:
@@ -3562,10 +3599,13 @@ async def handle_click_action(
     else:
         incremental_scraped: IncrementalScrapePage | None = None
         try:
-            skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
+            engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
+            skyvern_frame = await SkyvernFrame.create_instance(
+                skyvern_element.get_frame(), engine_selection=engine_selection
+            )
             incremental_scraped = IncrementalScrapePage(
                 skyvern_frame=skyvern_frame,
-                engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER),
+                engine_selection=engine_selection,
             )
             await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
@@ -3692,7 +3732,10 @@ async def handle_sequential_click_for_dropdown(
 
     incremental_elements = await incremental_scraped.get_incremental_element_tree(
         clean_and_remove_element_tree_factory(
-            task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
+            task=task,
+            step=step,
+            check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+            engine_selection=skyvern_frame.engine_selection,
         ),
     )
 
@@ -3755,7 +3798,9 @@ async def handle_sequential_click_for_dropdown(
         ),
         skyvern_element=anchor_element,
         element_tree_builder=scraped_page,
+        task=task,
         step=step,
+        engine_selection=skyvern_frame.engine_selection,
     )
 
     if dropdown_select_context.is_date_related:
@@ -3784,6 +3829,7 @@ async def handle_sequential_click_for_dropdown(
         scraped_page=scraped_page,
         step=step,
         task=task,
+        engine_selection=skyvern_frame.engine_selection,
         entry_action_type="click",
         scraped_page_after_open=scraped_page_after_open,
         new_interactable_element_ids=new_interactable_element_ids,
@@ -4147,7 +4193,7 @@ async def handle_input_text_action(
                 can_input_text = True
 
     engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
-    skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
+    skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame(), engine_selection=engine_selection)
     incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame, engine_selection=engine_selection)
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
 
@@ -4219,7 +4265,9 @@ async def handle_input_text_action(
         action=action,
         element_tree_builder=scraped_page,
         skyvern_element=skyvern_element,
+        task=task,
         step=step,
+        engine_selection=engine_selection,
     )
     if not can_input_text:
         target_is_hidden = target_hidden if target_hidden is not None else await skyvern_element.has_hidden_attr()
@@ -4303,7 +4351,10 @@ async def handle_input_text_action(
         await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=wait_sec, caller="input_text.autocomplete")
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
-                task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
+                task=task,
+                step=step,
+                check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+                engine_selection=engine_selection,
             ),
         )
         if len(incremental_element) == 0:
@@ -4705,6 +4756,7 @@ async def handle_input_text_action(
                     task=task,
                     step=step,
                     check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+                    engine_selection=engine_selection,
                 ),
             )
             if len(incremental_element) > 0:
@@ -4909,7 +4961,7 @@ async def _wait_for_upload_processing(page: Page, engine_selection: BrowserEngin
         # Settle delay: let the page react to the file-input change and mount
         # upload UI (spinner, progress bar, XHR) before polling for readiness.
         await asyncio.sleep(0.5)
-        skyvern_frame = await SkyvernFrame.create_instance(page)
+        skyvern_frame = await SkyvernFrame.create_instance(page, engine_selection=engine_selection)
         await skyvern_frame.wait_for_page_ready(
             loading_indicator_timeout_ms=3000,
             network_idle_timeout_ms=3000,
@@ -5002,14 +5054,13 @@ async def handle_upload_file_action(
     if is_file_input:
         LOG.info("Taking UploadFileAction. Found file input tag", action=action)
         if file_path:
+            engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
             await locator.set_input_files(
                 file_path,
                 timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
             )
 
-            await _wait_for_upload_processing(
-                page, engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
-            )
+            await _wait_for_upload_processing(page, engine_selection=engine_selection)
 
             return [ActionSuccess()]
         else:
@@ -5116,6 +5167,7 @@ async def handle_select_option_action(
 ) -> list[ActionResult]:
     dom = DomUtil(scraped_page, page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
+    engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
 
     tag_name = skyvern_element.get_tag_name()
     element_dict = scraped_page.id_to_element_dict[action.element_id]
@@ -5216,7 +5268,12 @@ async def handle_select_option_action(
         if select_is_visible:
             try:
                 normal_select_result = await normal_select(
-                    action=action, skyvern_element=skyvern_element, builder=dom.scraped_page, task=task, step=step
+                    action=action,
+                    skyvern_element=skyvern_element,
+                    builder=dom.scraped_page,
+                    task=task,
+                    step=step,
+                    engine_selection=engine_selection,
                 )
             except Exception as e:
                 # normal_select can raise before returning (e.g. an LLM/provider error). Don't lose
@@ -5314,10 +5371,8 @@ async def handle_select_option_action(
     )
 
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
-    skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
-    incremental_scraped = IncrementalScrapePage(
-        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
-    )
+    skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame(), engine_selection=engine_selection)
+    incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame, engine_selection=engine_selection)
     is_open = False
     suggested_value: str | None = None
     results: list[ActionResult] = []
@@ -5331,7 +5386,7 @@ async def handle_select_option_action(
             page=page,
             dom=dom,
             timeout=timeout,
-            engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER),
+            engine_selection=engine_selection,
         )
         # The click opens the widget: mark it open now (not only on the incremental path below) so the
         # finally cleanup dismisses it on every exit — including an emerging-path optional miss that
@@ -5342,7 +5397,10 @@ async def handle_select_option_action(
 
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
-                task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
+                task=task,
+                step=step,
+                check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+                engine_selection=engine_selection,
             ),
         )
 
@@ -5357,12 +5415,20 @@ async def handle_select_option_action(
             await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="select_option.arrowdown")
             incremental_element = await incremental_scraped.get_incremental_element_tree(
                 clean_and_remove_element_tree_factory(
-                    task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
+                    task=task,
+                    step=step,
+                    check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+                    engine_selection=engine_selection,
                 ),
             )
 
         input_or_select_context = await _get_input_or_select_context(
-            action=action, element_tree_builder=scraped_page, step=step, skyvern_element=skyvern_element
+            action=action,
+            element_tree_builder=scraped_page,
+            task=task,
+            step=step,
+            skyvern_element=skyvern_element,
+            engine_selection=engine_selection,
         )
 
         if len(incremental_element) == 0:
@@ -5383,6 +5449,7 @@ async def handle_select_option_action(
                     task=task,
                     step=step,
                     entry_action_type=entry_action_type,
+                    engine_selection=engine_selection,
                 )
             )
             return results
@@ -5709,6 +5776,7 @@ async def handle_extract_action(
             scraped_page=scraped_page,
             task=task,
             step=step,
+            page=page,
         )
         extracted_data = scrape_action_result.scraped_data
         return [ActionSuccess(data=extracted_data)]
@@ -5842,6 +5910,182 @@ async def handle_keypress_action(
     step: Step,
 ) -> list[ActionResult]:
     await handler_utils.keypress(page, action.keys, hold=action.hold, duration=action.duration, repeat=action.repeat)
+    return [ActionSuccess()]
+
+
+async def _write_clipboard_text_in_isolated_world(page: Page, text: str) -> None:
+    cdp_session = await page.context.new_cdp_session(page)
+    try:
+        frame_tree = await cdp_session.send("Page.getFrameTree")
+        frame_id = frame_tree["frameTree"]["frame"]["id"]
+        isolated_world = await cdp_session.send(
+            "Page.createIsolatedWorld",
+            {"frameId": frame_id, "worldName": "skyvern-paste-text"},
+        )
+        result = await cdp_session.send(
+            "Runtime.callFunctionOn",
+            {
+                "functionDeclaration": (
+                    "function(text) {"
+                    "if (!navigator.clipboard) { throw new Error('navigator.clipboard is undefined'); }"
+                    "return navigator.clipboard.writeText(text);"
+                    "}"
+                ),
+                "arguments": [{"value": text}],
+                "executionContextId": isolated_world["executionContextId"],
+                "awaitPromise": True,
+                "returnByValue": True,
+            },
+        )
+        if "exceptionDetails" in result:
+            exception_details = result["exceptionDetails"]
+            description = (
+                (exception_details.get("exception") or {}).get("description")
+                or result.get("result", {}).get("description")
+                or exception_details.get("text")
+            )
+            raise RuntimeError(description or "clipboard write failed")
+    finally:
+        with contextlib.suppress(Exception):
+            await cdp_session.detach()
+
+
+async def _clear_clipboard_after_paste(page: Page) -> bool:
+    try:
+        await _write_clipboard_text_in_isolated_world(page, "")
+        return True
+    except Exception:
+        LOG.warning("paste_text: clipboard clear failed; retrying after navigation settles", exc_info=True)
+
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+    except Exception:
+        LOG.debug("paste_text: page did not settle before clipboard clear retry", exc_info=True)
+
+    try:
+        parsed = urllib.parse.urlparse(page.url)
+        origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else None
+        if origin is not None:
+            await page.context.grant_permissions(["clipboard-write"], origin=origin)
+        await _write_clipboard_text_in_isolated_world(page, "")
+        return True
+    except Exception:
+        LOG.error(
+            "paste_text: clipboard clear failed after navigation-aware retry; pasted text may remain on the clipboard",
+            exc_info=True,
+        )
+        return False
+
+
+@traced(name="skyvern.agent.action.paste_text")
+async def handle_paste_text_action(
+    action: actions.PasteTextAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    resolved_sensitive_text = False
+    text_result = get_actual_value_of_parameter_if_secret_with_task(task, action.text)
+    if text_result is None:
+        return [ActionFailure(FailedToFetchSecret())]
+    paste_text = text_result
+    if task.workflow_run_id is not None:
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
+        if workflow_run_context is not None:
+            resolved_sensitive_text = workflow_run_context.get_original_secret_value_or_none(action.text) is not None
+            placeholder_tokens = workflow_run_context.find_embedded_placeholder_tokens(action.text)
+            if placeholder_tokens:
+                paste_text = action.text
+                for token in placeholder_tokens:
+                    if workflow_run_context.get_original_secret_value_or_none(token) is not None:
+                        resolved_sensitive_text = True
+                    token_value = get_actual_value_of_parameter_if_secret_with_task(task, token)
+                    if token_value is None:
+                        return [ActionFailure(FailedToFetchSecret())]
+                    if is_unresolved_totp_placeholder(token_value):
+                        return [ActionFailure(NoTOTPSecretFound())]
+                    if is_unresolved_totp_value(token_value):
+                        resolved_sensitive_text = True
+                        try:
+                            token_value = generate_totp_value_with_task(task, token)
+                        except NoTOTPSecretFound as exc:
+                            return [ActionFailure(exc)]
+                    paste_text = paste_text.replace(token, token_value, 1)
+
+    if is_unresolved_totp_placeholder(paste_text):
+        return [ActionFailure(NoTOTPSecretFound())]
+    if is_unresolved_totp_value(paste_text):
+        resolved_sensitive_text = True
+        try:
+            paste_text = generate_totp_value_with_task(task, action.text)
+        except NoTOTPSecretFound as exc:
+            return [ActionFailure(exc)]
+
+    if resolved_sensitive_text and not action.element_id:
+        return [ActionFailure(MissingElement(element_id=action.element_id))]
+
+    # Focus the anchor cell so the paste lands at the intended top-left position.
+    if action.element_id:
+        dom = DomUtil(scraped_page, page)
+        skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
+        locator = skyvern_element.get_locator()
+        try:
+            await locator.scroll_into_view_if_needed(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        except Exception:
+            LOG.debug("paste_text: scroll_into_view_if_needed failed", exc_info=True)
+        # Best-effort focus: a grid's inline cell-editing box intercepts pointer events, so a strict
+        # click times out. force clicks through, and a failure still lets the paste land at the
+        # current selection.
+        try:
+            await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS, force=True)
+        except Exception as exc:
+            if resolved_sensitive_text:
+                LOG.warning("paste_text: refusing sensitive paste because target focus failed", exc_info=True)
+                return [ActionFailure(exc)]
+            LOG.debug("paste_text: focus click failed; pasting at current selection", exc_info=True)
+        # Exit any inline cell editor the focus opened, then anchor the grid selection at the
+        # top-left cell (Ctrl+Home) so the block distributes across cells from A1, rather than
+        # landing in the formula/name bar as a single merged value.
+        await handler_utils.keypress(page, ["Escape"])
+        await handler_utils.keypress(page, ["ctrl", "Home"])
+
+    # Canvas grid editors expose no per-cell DOM, so cell-by-cell typing truncates.
+    # Set the clipboard and paste so a tab/newline-separated block fills the grid in one atomic operation.
+    # Grant only clipboard write and scope it to this page's origin; skip when no origin can be determined
+    # so later navigations in the same context never inherit a context-wide clipboard grant.
+    try:
+        parsed = urllib.parse.urlparse(page.url)
+        origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else None
+        if origin is None:
+            LOG.debug(
+                "paste_text: skipping clipboard permissions grant because page origin is unavailable", url=page.url
+            )
+        else:
+            await page.context.grant_permissions(["clipboard-write"], origin=origin)
+    except Exception:
+        LOG.debug("paste_text: grant clipboard permissions failed (may already be granted)", exc_info=True)
+    async with _PASTE_TEXT_CLIPBOARD_LOCK:
+        # navigator.clipboard is undefined outside a secure context, so this throws on plain-http pages.
+        try:
+            await _write_clipboard_text_in_isolated_world(page, paste_text)
+        except Exception as e:
+            LOG.info("paste_text: clipboard write unavailable on this page", exc_info=True)
+            return [ActionFailure(e)]
+        try:
+            await handler_utils.keypress(page, ["ControlOrMeta", "v"])
+        finally:
+            clipboard_cleared = await _clear_clipboard_after_paste(page)
+
+    if resolved_sensitive_text and not clipboard_cleared:
+        return [
+            ActionResult(
+                success=True,
+                needs_followup=True,
+                followup_message=SENSITIVE_CLIPBOARD_CLEAR_FAILED_FOLLOWUP_MESSAGE,
+                skip_remaining_actions=True,
+            )
+        ]
     return [ActionSuccess()]
 
 
@@ -6070,6 +6314,7 @@ async def handle_execute_js_action(
 ActionHandler.register_action_type(ActionType.SOLVE_CAPTCHA, handle_solve_captcha_action)
 ActionHandler.register_action_type(ActionType.CLICK, handle_click_action)
 ActionHandler.register_action_type(ActionType.INPUT_TEXT, handle_input_text_action)
+ActionHandler.register_action_type(ActionType.PASTE_TEXT, handle_paste_text_action)
 ActionHandler.register_action_type(ActionType.UPLOAD_FILE, handle_upload_file_action)
 ActionHandler.register_action_type(ActionType.DOWNLOAD_FILE, handle_download_file_action)
 ActionHandler.register_action_type(ActionType.NULL_ACTION, handle_null_action)
@@ -6692,7 +6937,7 @@ async def choose_auto_completion_dropdown(
     engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
 
     current_frame = skyvern_element.get_frame()
-    skyvern_frame = await SkyvernFrame.create_instance(current_frame)
+    skyvern_frame = await SkyvernFrame.create_instance(current_frame, engine_selection=engine_selection)
     incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame, engine_selection=engine_selection)
     await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
@@ -6702,7 +6947,10 @@ async def choose_auto_completion_dropdown(
         await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="autocomplete.fill")
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
-                task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
+                task=task,
+                step=step,
+                check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+                engine_selection=engine_selection,
             ),
         )
 
@@ -6729,9 +6977,9 @@ async def choose_auto_completion_dropdown(
             confirmed_preserved_list.append(current_element)
 
         if len(confirmed_preserved_list) > 0:
-            confirmed_preserved_list = await app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step)(
-                skyvern_frame.get_frame(), skyvern_frame.get_frame().url, copy.deepcopy(confirmed_preserved_list)
-            )
+            confirmed_preserved_list = await app.AGENT_FUNCTION.cleanup_element_tree_factory(
+                task=task, step=step, engine_selection=engine_selection
+            )(skyvern_frame.get_frame(), skyvern_frame.get_frame().url, copy.deepcopy(confirmed_preserved_list))
             confirmed_preserved_list = trim_element_tree(copy.deepcopy(confirmed_preserved_list))
 
         incremental_element.extend(confirmed_preserved_list)
@@ -6783,6 +7031,7 @@ async def choose_auto_completion_dropdown(
                                 text=text,
                                 task=task,
                                 step=step,
+                                engine_selection=engine_selection,
                             )
                             result.incremental_elements = copy.deepcopy(fallback_incremental_elements)
                             cleaned_incremental_element = shadow_candidate_elements
@@ -6835,6 +7084,7 @@ async def choose_auto_completion_dropdown(
                                 text=text,
                                 task=task,
                                 step=step,
+                                engine_selection=engine_selection,
                             )
                             result.incremental_elements = copy.deepcopy(fallback_incremental_elements)
                             cleaned_incremental_element = shadow_candidate_elements
@@ -6864,6 +7114,7 @@ async def choose_auto_completion_dropdown(
                             text=text,
                             task=task,
                             step=step,
+                            engine_selection=engine_selection,
                         )
                         result.incremental_elements = copy.deepcopy(fallback_incremental_elements)
                         cleaned_incremental_element = shadow_candidate_elements
@@ -7239,9 +7490,11 @@ async def discover_and_select_from_full_dropdown(
         return None
 
     current_frame = skyvern_element.get_frame()
-    skyvern_frame = await SkyvernFrame.create_instance(current_frame)
+    engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
+    skyvern_frame = await SkyvernFrame.create_instance(current_frame, engine_selection=engine_selection)
     incremental_scraped = IncrementalScrapePage(
-        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
+        skyvern_frame=skyvern_frame,
+        engine_selection=engine_selection,
     )
     await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
@@ -7264,6 +7517,7 @@ async def discover_and_select_from_full_dropdown(
             task=task,
             step=step,
             check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+            engine_selection=engine_selection,
         )
         incremental_element = await incremental_scraped.get_incremental_element_tree(cleanup_func)
 
@@ -7276,7 +7530,7 @@ async def discover_and_select_from_full_dropdown(
             try:
                 await skyvern_element.press_key("ArrowDown")
             except Exception as exc:
-                if not _is_selected_engine_timeout(exc, resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)):
+                if not _is_selected_engine_timeout(exc, engine_selection):
                     raise
                 LOG.info(
                     "Timeout pressing ArrowDown in discover fallback, continuing",
@@ -7507,6 +7761,7 @@ async def sequentially_select_from_dropdown(
                 task=task,
                 step=step,
                 check_filter_funcs=check_filter_funcs,
+                engine_selection=skyvern_frame.engine_selection,
             )
         )
         if len(secondary_increment_element) == 0:
@@ -8135,7 +8390,11 @@ async def _select_deterministic_custom_option(
     selection_group_id: str | None = None,
     select_depth: int = 0,
     on_click_attempted: Callable[[], None] | None = None,
+    engine_selection: BrowserEngineSelection | None = UNSET_SELECTION,
 ) -> tuple[ActionResult, str | None] | None:
+    if engine_selection is UNSET_SELECTION:
+        engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
+
     started_at = time.monotonic()
     selection_group_id = selection_group_id or str(uuid.uuid4())
     option_count: int | None = None
@@ -8289,9 +8548,7 @@ async def _select_deterministic_custom_option(
         click_attempted = True
         if on_click_attempted is not None:
             on_click_attempted()
-        await selected_element.click(
-            page=page, engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
-        )
+        await selected_element.click(page=page, engine_selection=engine_selection)
         verified = await _verify_custom_select_option_with_settle(
             matched_element=selected_element,
             readback_scope_element=readback_scope_element,
@@ -8329,7 +8586,7 @@ async def _select_deterministic_custom_option(
         reset_verified = await _reset_custom_select_combobox_input(
             readback_scope_element,
             page,
-            engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER),
+            engine_selection=engine_selection,
         )
         if reset_verified:
             LOG.info(
@@ -8445,12 +8702,15 @@ async def select_from_emerging_elements(
     entry_action_type: str = "select_option",
     scraped_page_after_open: ScrapedPage | None = None,
     new_interactable_element_ids: list[str] | None = None,
+    engine_selection: BrowserEngineSelection | None = UNSET_SELECTION,
 ) -> ActionResult:
     """
     This is the function to select an element from the new showing elements.
     Currently mainly used for the dropdown menu selection.
     """
 
+    if engine_selection is UNSET_SELECTION:
+        engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
     selection_group_id = str(uuid.uuid4())
     # TODO: support to handle the case when options are loaded by scroll
     scraped_page_after_open = scraped_page_after_open or await scraped_page.generate_scraped_page_without_screenshots()
@@ -8531,6 +8791,7 @@ async def select_from_emerging_elements(
         selection_group_id=selection_group_id,
         select_depth=0,
         on_click_attempted=_mark_widget_mutated,
+        engine_selection=engine_selection,
     )
     if deterministic_result is not None:
         action_result, _matched_label = deterministic_result
@@ -8603,7 +8864,7 @@ async def select_from_emerging_elements(
         current_text = await get_input_value(
             input_element.get_tag_name(),
             input_element.get_locator(),
-            engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER),
+            engine_selection=engine_selection,
         )
         if current_text == actual_value:
             return ActionSuccess()
@@ -8625,9 +8886,7 @@ async def select_from_emerging_elements(
             return ActionFailure(exception=InteractWithDropdownContainer(element_id=element_id))
 
     await selected_element.scroll_into_view()
-    await selected_element.click(
-        page=page, engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
-    )
+    await selected_element.click(page=page, engine_selection=engine_selection)
     return ActionSuccess()
 
 
@@ -8691,7 +8950,12 @@ async def select_from_dropdown(
             )
 
     trimmed_element_tree = await incremental_scraped.get_incremental_element_tree(
-        clean_and_remove_element_tree_factory(task=task, step=step, check_filter_funcs=check_filter_funcs),
+        clean_and_remove_element_tree_factory(
+            task=task,
+            step=step,
+            check_filter_funcs=check_filter_funcs,
+            engine_selection=skyvern_frame.engine_selection,
+        ),
     )
     incremental_scraped.set_element_tree_trimmed(trimmed_element_tree)
     html = incremental_scraped.build_element_tree(html_need_skyvern_attrs=True)
@@ -8716,6 +8980,7 @@ async def select_from_dropdown(
         selection_group_id=selection_group_id or str(uuid.uuid4()),
         select_depth=len(select_history),
         on_click_attempted=_mark_widget_mutated,
+        engine_selection=skyvern_frame.engine_selection,
     )
     if deterministic_result is not None:
         action_result, matched_label = deterministic_result
@@ -8801,7 +9066,7 @@ async def select_from_dropdown(
             current_text = await get_input_value(
                 input_element.get_tag_name(),
                 input_element.get_locator(),
-                engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER),
+                engine_selection=skyvern_frame.engine_selection,
             )
             if current_text == actual_value:
                 single_select_result.action_result = ActionSuccess()
@@ -8837,7 +9102,12 @@ async def select_from_dropdown(
                 input_or_select_context=context,
             )
             results = await normal_select(
-                action=action, skyvern_element=selected_element, task=task, step=step, builder=incremental_scraped
+                action=action,
+                skyvern_element=selected_element,
+                task=task,
+                step=step,
+                builder=incremental_scraped,
+                engine_selection=skyvern_frame.engine_selection,
             )
             assert len(results) > 0
             single_select_result.action_result = results[0]
@@ -8853,7 +9123,7 @@ async def select_from_dropdown(
         await selected_element.click(
             page=page,
             timeout=timeout,
-            engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER),
+            engine_selection=skyvern_frame.engine_selection,
         )
         single_select_result.action_result = ActionSuccess()
         return single_select_result
@@ -8906,7 +9176,10 @@ async def select_from_dropdown_by_value(
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
     await incremental_scraped.get_incremental_element_tree(
         clean_and_remove_element_tree_factory(
-            task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
+            task=task,
+            step=step,
+            check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+            engine_selection=skyvern_frame.engine_selection,
         ),
     )
 
@@ -8943,7 +9216,10 @@ async def select_from_dropdown_by_value(
     async def continue_callback(incre_scraped: IncrementalScrapePage) -> bool:
         await incre_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
-                task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
+                task=task,
+                step=step,
+                check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+                engine_selection=skyvern_frame.engine_selection,
             ),
         )
 
@@ -9069,7 +9345,9 @@ async def locate_dropdown_menu(
         x, y = await skyvern_frame.get_scroll_x_y()
         try:
             screenshot = await take_element_screenshot(
-                head_element.get_locator(), timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS
+                head_element.get_locator(),
+                timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS,
+                engine_selection=skyvern_frame.engine_selection,
             )
         except FailedToTakeScreenshot:
             LOG.debug(
@@ -9209,6 +9487,7 @@ async def normal_select(
     task: Task,
     step: Step,
     builder: ElementTreeBuilder,
+    engine_selection: BrowserEngineSelection | None = UNSET_SELECTION,
 ) -> List[ActionResult]:
     collapse_select_fanout_enabled = await _is_collapse_select_fanout_enabled(task)
     if not collapse_select_fanout_enabled:
@@ -9228,8 +9507,10 @@ async def normal_select(
     input_or_select_context = await _get_input_or_select_context(
         action=action,
         element_tree_builder=builder,
+        task=task,
         step=step,
         skyvern_element=skyvern_element,
+        engine_selection=engine_selection,
     )
     LOG.debug(
         "Parsed input/select context",
@@ -9494,6 +9775,8 @@ async def extract_information_for_navigation_goal(
     task: Task,
     step: Step,
     scraped_page: ScrapedPage,
+    *,
+    page: Page,
 ) -> ScrapeResult:
     """
     Scrapes a webpage and returns the scraped response, including:
@@ -9512,6 +9795,15 @@ async def extract_information_for_navigation_goal(
     context.scrape_trigger = "extraction"
     context.scrape_screenshots_consumed = True
     scraped_page_refreshed = await scraped_page.refresh()
+    # Complete-row harvest for a server-windowed virtualized data grid, injected into
+    # the prompt below. Behind an AgentFunction seam (framework-specific collectors are
+    # deployment overrides) and a fail-open boundary so collection never blocks extraction.
+    virtualized_grid_rows: str | None = None
+    try:
+        virtualized_grid_rows = await app.AGENT_FUNCTION.collect_virtualized_grid_rows(task=task, page=page)
+    except Exception:
+        virtualized_grid_rows = None
+        LOG.warning("virtualized_grid_collection_failed")
 
     # task.workflow_permanent_id is None on most fetch paths (tasks table has
     # no such column); fall back to context. SKY-8992.
@@ -9557,7 +9849,11 @@ async def extract_information_for_navigation_goal(
         extracted_text=extracted_text_for_prompt,
         error_code_mapping_str=error_code_mapping_str,
         local_datetime=local_datetime_str,
+        virtualized_grid_rows=virtualized_grid_rows,
     )
+    post_ceiling_grid_rows = post_ceiling_kwargs.get("virtualized_grid_rows")
+    if virtualized_grid_rows is not None and post_ceiling_grid_rows is None:
+        LOG.warning("virtualized_grid_rows_dropped_from_prompt")
 
     # Self-heal guard: on the second retry onward (``retry_index > 1``) the
     # previous attempts' cached result is suspect — the first retry already
@@ -9606,6 +9902,7 @@ async def extract_information_for_navigation_goal(
             previous_extracted_information=post_ceiling_kwargs["previous_extracted_information"],
             llm_key=llm_key_override,
             workflow_system_prompt=task.workflow_system_prompt,
+            virtualized_grid_rows=post_ceiling_grid_rows,
         )
         if is_retry_step:
             # Proactively evict the in-run entry. The cross-run tier will be
@@ -9950,13 +10247,17 @@ async def _get_input_or_select_context(
     element_tree_builder: ElementTreeBuilder,
     step: Step,
     ancestor_depth: int = 5,
+    task: Task | None = None,
+    engine_selection: BrowserEngineSelection | None = UNSET_SELECTION,
 ) -> InputOrSelectContext:
     # Early return optimization: if action already has input_or_select_context, use it
     if not isinstance(action, AbstractActionForContextParse) and action.input_or_select_context is not None:
         return action.input_or_select_context
 
     # Ancestor depth optimization: use ancestor element for deep DOM structures
-    skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
+    if engine_selection is UNSET_SELECTION:
+        engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
+    skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame(), engine_selection=engine_selection)
     try:
         depth = await skyvern_frame.get_element_dom_depth(await skyvern_element.get_element_handler())
     except Exception:
@@ -9974,7 +10275,9 @@ async def _get_input_or_select_context(
                     starter=element_handle,
                     frame=skyvern_element.get_frame_id(),
                 )
-                clean_up_func = app.AGENT_FUNCTION.cleanup_element_tree_factory(step=step)
+                clean_up_func = app.AGENT_FUNCTION.cleanup_element_tree_factory(
+                    step=step, engine_selection=engine_selection
+                )
                 element_tree = await clean_up_func(skyvern_element.get_frame(), "", copy.deepcopy(element_tree))
                 element_tree_trimmed = trim_element_tree(copy.deepcopy(element_tree))
                 element_tree_builder = ScrapedPage(

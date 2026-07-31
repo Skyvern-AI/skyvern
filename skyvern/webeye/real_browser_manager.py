@@ -75,6 +75,16 @@ async def _rebind_pbs_download_dir(
         )
 
 
+async def _on_browser_state_acquired(
+    browser_state: BrowserState,
+    workflow_run_id: str | None,
+) -> BrowserState:
+    browser_context = browser_state.browser_context
+    if browser_context is not None:
+        await app.AGENT_FUNCTION.on_browser_context_acquired(browser_context, workflow_run_id)
+    return browser_state
+
+
 def _merge_proxy_session_headers(
     extra_http_headers: dict[str, str] | None,
     proxy_session_id: str | None,
@@ -442,7 +452,7 @@ class RealBrowserManager(BrowserManager):
     ) -> BrowserState:
         browser_state = self.get_for_task(task_id=task.task_id, workflow_run_id=task.workflow_run_id)
         if browser_state is not None:
-            return browser_state
+            return await _on_browser_state_acquired(browser_state, task.workflow_run_id)
 
         if browser_session_id:
             LOG.info(
@@ -524,7 +534,7 @@ class RealBrowserManager(BrowserManager):
             task_id=task.task_id,
             organization_id=task.organization_id,
         )
-        return browser_state
+        return await _on_browser_state_acquired(browser_state, task.workflow_run_id)
 
     async def get_or_create_for_workflow_run(
         self,
@@ -545,7 +555,7 @@ class RealBrowserManager(BrowserManager):
         browser_state = self.get_for_workflow_run(workflow_run_id=workflow_run_id)
         if browser_state:
             LOG.debug("Returning cached browser state for workflow run", workflow_run_id=workflow_run_id)
-            return browser_state
+            return await _on_browser_state_acquired(browser_state, workflow_run_id)
 
         # When an explicit browser_session_id is provided (e.g. from a workflow
         # trigger block), skip the parent workflow lookup so the child uses the
@@ -577,7 +587,7 @@ class RealBrowserManager(BrowserManager):
                         workflow_run_id=workflow_run_id,
                         organization_id=workflow_run.organization_id,
                     )
-                    return browser_state
+                    return await _on_browser_state_acquired(browser_state, workflow_run_id)
                 LOG.warning(
                     "Inherited parent browser state has no working page; creating a fresh browser",
                     workflow_run_id=workflow_run_id,
@@ -718,7 +728,7 @@ class RealBrowserManager(BrowserManager):
             workflow_run_id=workflow_run.workflow_run_id,
             organization_id=workflow_run.organization_id,
         )
-        return browser_state
+        return await _on_browser_state_acquired(browser_state, workflow_run_id)
 
     def get_for_workflow_run(
         self, workflow_run_id: str, parent_workflow_run_id: str | None = None
@@ -1029,9 +1039,11 @@ class RealBrowserManager(BrowserManager):
         browser_session_id: str | None = None,
         organization_id: str | None = None,
     ) -> BrowserState:
+        context = skyvern_context.current()
+        workflow_run_id = context.workflow_run_id if context else None
         browser_state = self.get_for_script(script_id=script_id)
         if browser_state:
-            return browser_state
+            return await _on_browser_state_acquired(browser_state, workflow_run_id)
 
         if browser_session_id:
             # Fail closed: look the session up under its real organization_id (release's symmetric key).
@@ -1057,6 +1069,7 @@ class RealBrowserManager(BrowserManager):
             browser_state = await self._create_browser_state(
                 proxy_location=proxy_location,
                 script_id=script_id,
+                organization_id=organization_id,
             )
 
         if script_id:
@@ -1066,7 +1079,7 @@ class RealBrowserManager(BrowserManager):
             script_id=script_id,
         )
 
-        return browser_state
+        return await _on_browser_state_acquired(browser_state, workflow_run_id)
 
     async def cleanup_for_script(
         self,

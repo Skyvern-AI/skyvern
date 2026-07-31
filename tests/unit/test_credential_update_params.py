@@ -9,6 +9,7 @@ import pytest
 from fastapi import BackgroundTasks, HTTPException
 
 from skyvern.forge import app as forge_app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
 from skyvern.forge.sdk.routes import credentials as credentials_routes
@@ -18,6 +19,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialType,
     CredentialVaultType,
     TotpType,
+    UpdateCredentialRequest,
 )
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -402,6 +404,7 @@ async def test_route_pin_only_update_does_not_pass_browser_profile_id(monkeypatc
     fake_app = SimpleNamespace(
         DATABASE=SimpleNamespace(credentials=SimpleNamespace(get_credential=AsyncMock(return_value=existing))),
         CREDENTIAL_VAULT_SERVICES={CredentialVaultType.BITWARDEN: vault_service},
+        AGENT_FUNCTION=AgentFunction(),
     )
     monkeypatch.setattr(credentials_routes, "app", fake_app)
     monkeypatch.setattr(credentials_routes, "_update_credential_or_profile_conflict", conflict)
@@ -1499,3 +1502,67 @@ async def test_create_credential_profile_alone_does_not_reset_pin(monkeypatch: p
     )
 
     assert update_credential.await_args.kwargs["pin_saved_session_ip"] is None
+
+
+def test_update_run_sequentially_documents_drain_before_enable_window() -> None:
+    # The false->true toggle does not retroactively serialize runs that were already active when the
+    # flag flipped on (they were never stamped with the credential). That adoption-window limitation is
+    # documented on the field rather than enforced with a broad active-run scan; pin the warning so the
+    # contract is not silently dropped.
+    description = UpdateCredentialRequest.model_fields["run_sequentially"].description or ""
+    assert "after this flag is enabled" in description
+    assert "Drain" in description
+
+
+def test_oss_agent_function_does_not_support_sequential_credentials() -> None:
+    assert AgentFunction().supports_sequential_credentials() is False
+
+
+@pytest.mark.asyncio
+async def test_oss_route_rejects_enabling_sequential_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    existing = _make_password_credential(run_sequentially=False)
+    update_credential = AsyncMock(return_value=_make_password_credential(run_sequentially=True))
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "get_credential", AsyncMock(return_value=existing))
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+    monkeypatch.setattr(
+        forge_app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(supports_sequential_credentials=lambda: False),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await credentials_routes.rename_credential(
+            credential_id="cred_123",
+            data=UpdateCredentialRequest(run_sequentially=True),
+            current_org=SimpleNamespace(organization_id="org_123"),
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "Sequential credential execution is not supported by this deployment"
+    update_credential.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_oss_route_allows_disabling_sequential_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    existing = _make_password_credential(run_sequentially=True)
+    updated = _make_password_credential(run_sequentially=False)
+    update_credential = AsyncMock(return_value=updated)
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "get_credential", AsyncMock(return_value=existing))
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+    monkeypatch.setattr(
+        forge_app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            supports_sequential_credentials=lambda: False,
+            should_lock_credential_write=AsyncMock(return_value=False),
+        ),
+    )
+
+    response = await credentials_routes.rename_credential(
+        credential_id="cred_123",
+        data=UpdateCredentialRequest(run_sequentially=False),
+        current_org=SimpleNamespace(organization_id="org_123"),
+    )
+
+    assert response.run_sequentially is False
+    assert update_credential.await_args.kwargs["run_sequentially"] is False

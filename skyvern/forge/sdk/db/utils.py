@@ -91,6 +91,7 @@ from skyvern.webeye.actions.actions import (
     MoveAction,
     NewTabAction,
     NullAction,
+    PasteTextAction,
     ReloadPageAction,
     ScrollAction,
     SelectOptionAction,
@@ -226,6 +227,7 @@ def serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
 ACTION_TYPE_TO_CLASS = {
     ActionType.CLICK: ClickAction,
     ActionType.INPUT_TEXT: InputTextAction,
+    ActionType.PASTE_TEXT: PasteTextAction,
     ActionType.UPLOAD_FILE: UploadFileAction,
     ActionType.DOWNLOAD_FILE: DownloadFileAction,
     ActionType.NULL_ACTION: NullAction,
@@ -637,6 +639,7 @@ def convert_to_workflow_run(
         job_id=workflow_run_model.job_id,
         depends_on_workflow_run_id=workflow_run_model.depends_on_workflow_run_id,
         sequential_key=workflow_run_model.sequential_key,
+        sequential_credential_id=workflow_run_model.sequential_credential_id,
         script_run=ScriptRunResponse.model_validate(workflow_run_model.script_run)
         if workflow_run_model.script_run
         else None,

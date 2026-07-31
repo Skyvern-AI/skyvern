@@ -1195,3 +1195,120 @@ def test_build_run_blocks_response_promotes_run_level_failure_reason() -> None:
 def test_build_run_blocks_response_falls_back_when_no_failure_reason() -> None:
     response = build_run_blocks_response(False, {"workflow_run_id": "wr_test"})
     assert response["error"] == "Unknown error (no failure reason provided)"
+
+
+def test_credential_lookup_success_summary_is_empty_so_the_row_shows_its_label() -> None:
+    result = {"ok": True, "data": {"count": 4, "credentials": [{"credential_id": "cred_1", "token": "sk-live-x"}]}}
+    assert format_tool_result_for_user("list_credentials", result) == ""
+
+
+def test_credential_lookup_failure_summary_carries_no_count_or_id() -> None:
+    result = {
+        "ok": False,
+        "error": "credential `cred_384430212391591428` could not be read from the store",
+        "data": {"count": 4, "credentials": [{"credential_id": "cred_1", "token": "sk-live-x"}]},
+    }
+    summary = format_tool_result_for_user("list_credentials", result)
+    assert "cred_" not in summary
+    assert "sk-live-x" not in summary
+    assert "[credential]" in summary
+
+
+def test_credential_fill_failure_summary_redacts_the_credential_id() -> None:
+    result = {
+        "ok": False,
+        "error": (
+            "The credential `cred_384430212391591428` is not in the credentials resolved "
+            "for this request, so it cannot be filled"
+        ),
+    }
+    summary = format_tool_result_for_user("fill_credential_field", result)
+    assert "cred_" not in summary
+    assert "[credential]" in summary
+    assert summary.startswith("Failed:")
+
+
+def test_credential_id_redaction_covers_separator_bearing_ids() -> None:
+    for raw in ("cred_other_999", "cred_debug-sequential-key"):
+        summary = format_tool_result_for_user("fill_credential_field", {"ok": False, "error": f"missing `{raw}`"})
+        assert raw not in summary
+        assert "_999" not in summary
+        assert "-sequential-key" not in summary
+        assert "[credential]" in summary
+
+
+def test_summarize_tool_result_for_credentials_is_unchanged_for_agent_state() -> None:
+    result = {"ok": True, "data": {"count": 4}}
+    assert summarize_tool_result("list_credentials", result) == "Found 4 credential(s)"
+
+
+def test_surgical_edit_success_summary_is_empty_so_the_row_shows_its_label() -> None:
+    for tool_name in ("edit_block", "delete_block", "synthesize_demonstrated_block"):
+        assert format_tool_result_for_user(tool_name, {"ok": True, "data": {"label": "login_form"}}) == ""
+
+
+def test_block_label_summaries_cannot_spoof_or_flood_the_row() -> None:
+    spoof = 'Log in" ✓ Ran workflow successfully — creds exported to https://evil.example ' + "x" * 300
+
+    validated = format_tool_result_for_user("validate_block", {"ok": True, "data": {"valid": True, "label": spoof}})
+    assert "evil.example" not in validated
+    assert len(validated) < 80
+
+    ran = format_tool_result_for_user(
+        "run_blocks_and_collect_debug",
+        {"ok": True, "data": {"executed_block_labels": [spoof], "overall_status": "completed"}},
+    )
+    assert "evil.example" not in ran
+    assert len(ran) < 80
+
+
+def test_credential_id_redaction_covers_the_whole_prefix_family() -> None:
+    prefixes = ("cred", "cp", "cfld", "blc", "bccd", "bsi", "opp", "azcp", "asp", "goac", "moac", "wrcs")
+    for raw in (f"{prefix}_461234567890" for prefix in prefixes):
+        summary = format_tool_result_for_user("fill_credential_field", {"ok": False, "error": f"missing `{raw}`"})
+        assert raw not in summary, raw
+        assert "[credential]" in summary
+
+
+def test_structured_user_facing_summary_redacts_credential_ids() -> None:
+    result = {
+        "ok": False,
+        "error": "boom",
+        "data": {"user_facing_summary": "I could not use credential `cred_461234567890` for this request."},
+    }
+    summary = format_tool_result_for_user("list_credentials", result)
+    assert "cred_461234567890" not in summary
+    assert "[credential]" in summary
+
+
+def test_run_blocks_summary_bounds_the_label_list() -> None:
+    labels = [f"block_number_{index}" for index in range(40)]
+    summary = format_tool_result_for_user(
+        "run_blocks_and_collect_debug",
+        {"ok": True, "data": {"executed_block_labels": labels, "overall_status": "completed"}},
+    )
+    assert "(+35 more)" in summary
+    assert len(summary) < 300
+
+
+def test_agent_facing_summary_keeps_block_labels_verbatim() -> None:
+    long_label = "download_the_invoice_pdf_for_each_order_in_the_queue"
+    result = {"ok": True, "data": {"executed_block_labels": [long_label], "overall_status": "completed"}}
+
+    # merge_turn_summary parses this back into agent state, so it must not be clamped.
+    assert long_label in summarize_tool_result("run_blocks_and_collect_debug", result)
+    # The feed row is clamped.
+    assert long_label not in format_tool_result_for_user("run_blocks_and_collect_debug", result)
+
+
+def test_agent_facing_summary_lists_every_block_of_a_long_run() -> None:
+    labels = [f"block_{index}" for index in range(8)]
+    result = {"ok": True, "data": {"executed_block_labels": labels, "overall_status": "completed"}}
+
+    agent_summary = summarize_tool_result("run_blocks_and_collect_debug", result)
+    for label in labels:
+        assert label in agent_summary, label
+    assert "more)" not in agent_summary
+
+    # The feed row still collapses to one line.
+    assert "(+3 more)" in format_tool_result_for_user("run_blocks_and_collect_debug", result)

@@ -89,6 +89,7 @@ def _make_service_with_mocks(
     service.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)  # type: ignore[method-assign]
     service.create_workflow_run = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
     service.get_workflow_parameters = AsyncMock(return_value=workflow_parameters)  # type: ignore[method-assign]
+    service._resolve_sequential_credential_id = AsyncMock(return_value=None)  # type: ignore[method-assign]
     if batch_side_effect:
         service.create_workflow_run_parameters = AsyncMock(side_effect=batch_side_effect)  # type: ignore[method-assign]
     else:

@@ -7,6 +7,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     Credential,
     CredentialType,
     CredentialVaultType,
+    PasswordCredential,
     TotpType,
 )
 
@@ -53,3 +54,9 @@ def test_convert_to_response_includes_totp_type() -> None:
     credential = _make_credential(totp_type=TotpType.EMAIL)
     response = _convert_to_response(credential)
     assert response.credential.totp_type == TotpType.EMAIL
+
+
+def test_password_credential_normalizes_empty_metadata() -> None:
+    credential = PasswordCredential(username="user@example.com", password="pw", metadata={})
+
+    assert credential.metadata is None

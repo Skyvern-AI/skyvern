@@ -63,6 +63,7 @@ def _patch_minimal_run_mcp_dependencies(monkeypatch, events: list[str], run_mcp_
 
     fake_session_manager = types.ModuleType("skyvern.cli.core.session_manager")
     fake_session_manager.set_stateless_http_mode = lambda _enabled: None
+    fake_session_manager.set_stdio_local_file_access_enabled = lambda _enabled: None
 
     fake_telemetry = types.ModuleType("skyvern.cli.mcp_tools.telemetry")
     fake_telemetry.configure_mcp_telemetry_runtime = lambda **_kwargs: None
@@ -304,6 +305,7 @@ def test_run_mcp_prepares_cloud_env_before_starting_mcp(tmp_path, monkeypatch) -
 
     fake_session_manager = types.ModuleType("skyvern.cli.core.session_manager")
     fake_session_manager.set_stateless_http_mode = lambda enabled: events.append(f"stateless:{enabled}")
+    fake_session_manager.set_stdio_local_file_access_enabled = lambda enabled: events.append(f"stdio_local:{enabled}")
 
     fake_telemetry = types.ModuleType("skyvern.cli.mcp_tools.telemetry")
 
@@ -357,9 +359,11 @@ def test_run_mcp_prepares_cloud_env_before_starting_mcp(tmp_path, monkeypatch) -
         "sweep",
         "telemetry:local_cli:stdio",
         "stateless:False",
+        "stdio_local:True",
         "run:stdio",
         "cleanup",
         "stateless:False",
+        "stdio_local:False",
     ]
 
 

@@ -9,7 +9,9 @@ import {
   mapMouseCoordinates,
 } from "./cdpInputUtils";
 
-const RECONNECTABLE_CODES = new Set([1006, 1011, 4408, 4410]);
+// 4411 is emitted mid-session (page resolution or dispatch failed), so unlike a setup-time close it
+// leaves a channel the user still believes is live; without a reconnect, input is dead until reload.
+const RECONNECTABLE_CODES = new Set([1006, 1011, 4408, 4410, 4411]);
 
 interface UseCdpInputOptions {
   inputWsUrl: string | null;

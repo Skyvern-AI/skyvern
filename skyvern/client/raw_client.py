@@ -3208,7 +3208,7 @@ class RawSkyvern:
         Parameters
         ----------
         timeout : typing.Optional[int]
-            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.
+            Timeout in minutes for the session. Timeout is applied after the session is started. Must be at least 5; values above 240 are capped at 240. Defaults to 60.
 
         proxy_location : typing.Optional[CreateBrowserSessionRequestProxyLocation]
 
@@ -3621,7 +3621,7 @@ class RawSkyvern:
             The timestamp when the TOTP code expires
 
         type : typing.Optional[OtpType]
-            Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.
+            Deprecated compatibility field. Skyvern auto-detects the OTP type from content, so this value does not constrain extraction.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -8808,7 +8808,7 @@ class AsyncRawSkyvern:
         Parameters
         ----------
         timeout : typing.Optional[int]
-            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.
+            Timeout in minutes for the session. Timeout is applied after the session is started. Must be at least 5; values above 240 are capped at 240. Defaults to 60.
 
         proxy_location : typing.Optional[CreateBrowserSessionRequestProxyLocation]
 
@@ -9221,7 +9221,7 @@ class AsyncRawSkyvern:
             The timestamp when the TOTP code expires
 
         type : typing.Optional[OtpType]
-            Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.
+            Deprecated compatibility field. Skyvern auto-detects the OTP type from content, so this value does not constrain extraction.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.

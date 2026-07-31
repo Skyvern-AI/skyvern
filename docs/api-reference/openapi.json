@@ -4247,6 +4247,9 @@
               }
             }
           },
+          "402": {
+            "description": "Insufficient credits to parse OTP content"
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -8141,6 +8144,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -8564,6 +8572,7 @@
         "enum": [
           "click",
           "input_text",
+          "paste_text",
           "upload_file",
           "download_file",
           "select_option",
@@ -11097,7 +11106,6 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 1440.0,
                 "minimum": 5.0
               },
               {
@@ -11105,7 +11113,7 @@
               }
             ],
             "title": "Timeout",
-            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.",
+            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be at least 5; values above 240 are capped at 240. Defaults to 60.",
             "default": 60
           },
           "proxy_location": {
@@ -11741,6 +11749,11 @@
             ],
             "title": "Save Browser Session Intent",
             "description": "Whether the user intends to save a browser session, regardless of test outcome"
+          },
+          "run_sequentially": {
+            "type": "boolean",
+            "title": "Run Sequentially",
+            "default": false
           },
           "folder_id": {
             "anyOf": [
@@ -13113,6 +13126,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -13768,6 +13786,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -17107,6 +17130,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -17795,6 +17823,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -18593,6 +18626,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -18973,6 +19011,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -19179,6 +19222,21 @@
               "user@example.com",
               "+14155550123"
             ]
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata",
+            "description": "Optional additional password credential metadata fields"
           }
         },
         "type": "object",
@@ -21693,7 +21751,8 @@
                 "type": "null"
               }
             ],
-            "description": "Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.",
+            "description": "Deprecated compatibility field. Skyvern auto-detects the OTP type from content, so this value does not constrain extraction.",
+            "deprecated": true,
             "examples": [
               "totp",
               "magic_link"
@@ -21857,7 +21916,8 @@
                 "type": "null"
               }
             ],
-            "description": "Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.",
+            "description": "Deprecated compatibility field. Skyvern auto-detects the OTP type from content, so this value does not constrain extraction.",
+            "deprecated": true,
             "examples": [
               "totp",
               "magic_link"
@@ -22503,6 +22563,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -24732,6 +24797,7 @@
           "authenticator",
           "email",
           "text",
+          "passkey",
           "none"
         ],
         "title": "TotpType",
@@ -25162,6 +25228,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -25600,6 +25671,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -28195,6 +28271,17 @@
               }
             ],
             "title": "Sequential Key"
+          },
+          "sequential_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sequential Credential Id"
           },
           "ai_fallback": {
             "anyOf": [

@@ -71,6 +71,7 @@ from skyvern.exceptions import (
     NoTOTPVerificationCodeFound,
     PDFParsingError,
     SkyvernException,
+    SyncTriggeredSequentialCredentialUnsupported,
     TaskNotFound,
     UnexpectedTaskStatus,
     get_user_facing_exception_message,
@@ -198,6 +199,7 @@ from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
 from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
 if TYPE_CHECKING:
@@ -1105,6 +1107,7 @@ class BaseTaskBlock(Block):
     title: str = ""
     engine: RunEngine = RunEngine.skyvern_v1
     complete_criterion: str | None = None
+    complete_criterion_is_untrusted: bool = False
     terminate_criterion: str | None = None
     navigation_goal: str | None = None
     data_extraction_goal: str | None = None
@@ -1557,6 +1560,8 @@ class BaseTaskBlock(Block):
             try:
                 current_context = skyvern_context.ensure_context()
                 current_context.task_id = task.task_id
+                previous_complete_criterion_is_untrusted = current_context.complete_criterion_is_untrusted
+                current_context.complete_criterion_is_untrusted = self.complete_criterion_is_untrusted
                 close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
                 await app.agent.execute_step(
                     organization=organization,
@@ -1580,6 +1585,7 @@ class BaseTaskBlock(Block):
                 raise e
             finally:
                 current_context.task_id = None
+                current_context.complete_criterion_is_untrusted = previous_complete_criterion_is_untrusted
 
             # Check task status
             updated_task = await app.DATABASE.tasks.get_task(
@@ -2443,6 +2449,61 @@ class ForLoopBlock(Block):
                 exc_info=True,
             )
 
+    async def _get_loop_browser_state(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None,
+    ) -> BrowserState | None:
+        if browser_session_id:
+            return await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
+        return app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+
+    async def _snapshot_loop_baseline_pages(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None,
+    ) -> set[Page] | None:
+        """Pre-loop tabs to preserve, or None when they could not be determined.
+
+        None and an empty set must stay distinct: closing everything opened after an empty
+        baseline closes every tab, so a failed snapshot has to suppress the reset entirely.
+        """
+        if not settings.RESET_BROWSER_TABS_BETWEEN_LOOP_ITERATIONS:
+            return None
+        try:
+            browser_state = await self._get_loop_browser_state(workflow_run_id, organization_id, browser_session_id)
+            if isinstance(browser_state, RealBrowserState):
+                return set(browser_state.open_pages())
+        except Exception:
+            LOG.warning(
+                "Failed to snapshot baseline browser tabs for loop",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+        return None
+
+    async def _reset_browser_tabs_for_iteration(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None,
+        baseline_pages: set[Page] | None,
+    ) -> None:
+        if not settings.RESET_BROWSER_TABS_BETWEEN_LOOP_ITERATIONS or baseline_pages is None:
+            return
+        try:
+            browser_state = await self._get_loop_browser_state(workflow_run_id, organization_id, browser_session_id)
+            if isinstance(browser_state, RealBrowserState):
+                await browser_state.close_pages_opened_after(baseline_pages)
+        except Exception:
+            LOG.warning(
+                "Failed to reset browser tabs between loop iterations",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+
     async def execute_loop_helper(
         self,
         workflow_run_id: str,
@@ -2458,6 +2519,10 @@ class ForLoopBlock(Block):
 
         start_label, label_to_block, default_next_map = self._build_loop_graph(self.loop_blocks)
         conditional_scopes = compute_conditional_scopes(label_to_block, default_next_map)
+
+        loop_baseline_pages = await self._snapshot_loop_baseline_pages(
+            workflow_run_id, organization_id, browser_session_id
+        )
 
         for loop_idx, loop_over_value in enumerate(loop_over_values):
             # Check max_iterations limit
@@ -2490,6 +2555,11 @@ class ForLoopBlock(Block):
                     + f"...[truncated, original size: {len(loop_over_value_repr)}]"
                 )
             LOG.info("Starting loop iteration", loop_idx=loop_idx, loop_over_value=loop_over_value_repr)
+
+            if loop_idx > 0:
+                await self._reset_browser_tabs_for_iteration(
+                    workflow_run_id, organization_id, browser_session_id, loop_baseline_pages
+                )
 
             # Capture baseline downloaded files for per-iteration scoping (SKY-7005).
             # Download-producing child blocks re-capture their own per-block baseline
@@ -9684,8 +9754,16 @@ class TaskV2Block(Block):
     url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    max_iterations: int = settings.MAX_ITERATIONS_PER_TASK_V2
-    max_steps: int = settings.MAX_STEPS_PER_TASK_V2
+    # These documented defaults must stay literals; reading the setting here would put an
+    # environment value back into the published OpenAPI document.
+    max_iterations: int = Field(
+        default_factory=lambda: settings.MAX_ITERATIONS_PER_TASK_V2,
+        json_schema_extra={"default": 50},
+    )
+    max_steps: int = Field(
+        default_factory=lambda: settings.MAX_STEPS_PER_TASK_V2,
+        json_schema_extra={"default": 25},
+    )
 
     def _resolve_totp_identifier(self, workflow_run_context: WorkflowRunContext) -> str | None:
         if self.totp_identifier:
@@ -12385,86 +12463,105 @@ class WorkflowTriggerBlock(Block):
                     trigger_type=inherited_trigger_type,
                 )
             ):
+                # A self-created fresh session must be closed on every exit from this block —
+                # including the setup-failure and sequential-credential fence early returns — so the
+                # cleanup lives in a finally rather than only on the normal execute path below.
+                triggered_run_id: str | None = None
                 try:
-                    triggered_workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
-                        request_id=None,
-                        workflow_request=workflow_request,
-                        workflow_permanent_id=resolved_workflow_permanent_id,
-                        organization=organization,
+                    try:
+                        triggered_workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
+                            request_id=None,
+                            workflow_request=workflow_request,
+                            workflow_permanent_id=resolved_workflow_permanent_id,
+                            organization=organization,
+                            parent_workflow_run_id=workflow_run_id,
+                            ignore_inherited_workflow_system_prompt=self.ignore_workflow_system_prompt,
+                            trigger_type=inherited_trigger_type,
+                        )
+                    except Exception as e:
+                        error_msg = get_user_facing_exception_message(e)
+                        return await _fail(f"Failed to setup triggered workflow run: {error_msg}")
+
+                    triggered_run_id = triggered_workflow_run.workflow_run_id
+
+                    # A synchronous child runs inline via execute_workflow below: it never queues, never
+                    # gets a queued_at, and never reaches the Temporal V2 serialization gate. setup stamped
+                    # its sequential_credential_id, but the gate filters queued_at IS NOT NULL, so a
+                    # concurrent run sharing that credential would not see this child as a blocker. Fail
+                    # closed before it uses the credential — the same fence the scheduled path applies.
+                    if triggered_workflow_run.sequential_credential_id:
+                        fence = SyncTriggeredSequentialCredentialUnsupported(triggered_run_id)
+                        await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+                            workflow_run_id=triggered_run_id,
+                            failure_reason=str(fence),
+                        )
+                        return await _fail(str(fence))
+
+                    LOG.info(
+                        "Triggered workflow run (sync)",
                         parent_workflow_run_id=workflow_run_id,
-                        ignore_inherited_workflow_system_prompt=self.ignore_workflow_system_prompt,
-                        trigger_type=inherited_trigger_type,
+                        triggered_workflow_run_id=triggered_run_id,
+                        triggered_workflow_permanent_id=resolved_workflow_permanent_id,
                     )
-                except Exception as e:
-                    error_msg = get_user_facing_exception_message(e)
-                    return await _fail(f"Failed to setup triggered workflow run: {error_msg}")
 
-                triggered_run_id = triggered_workflow_run.workflow_run_id
-
-                LOG.info(
-                    "Triggered workflow run (sync)",
-                    parent_workflow_run_id=workflow_run_id,
-                    triggered_workflow_run_id=triggered_run_id,
-                    triggered_workflow_permanent_id=resolved_workflow_permanent_id,
-                )
-
-                try:
-                    # The opt-out flag is persisted on the child's workflow_run row at
-                    # spawn time (setup_workflow_run above), so execute_workflow reads
-                    # it from the DB. This works identically for sync and async triggers.
-                    final_run = await app.WORKFLOW_SERVICE.execute_workflow(
-                        workflow_run_id=triggered_run_id,
-                        api_key=None,
-                        organization=organization,
-                        browser_session_id=resolved_browser_session_id,
-                    )
-                    success = final_run.status == WorkflowRunStatus.completed
-                    output_data = {
-                        "workflow_run_id": triggered_run_id,
-                        "workflow_permanent_id": resolved_workflow_permanent_id,
-                        "status": str(final_run.status),
-                        "failure_reason": final_run.failure_reason,
-                    }
-                    # Include the child workflow's output parameters so downstream
-                    # blocks can reference them (e.g. block_3_output.outputs.block_2_output)
                     try:
-                        child_output_params = (
-                            await app.WORKFLOW_SERVICE.get_output_parameter_workflow_run_output_parameter_tuples(
-                                workflow_id=final_run.workflow_id,
-                                workflow_run_id=triggered_run_id,
+                        # The opt-out flag is persisted on the child's workflow_run row at
+                        # spawn time (setup_workflow_run above), so execute_workflow reads
+                        # it from the DB. This works identically for sync and async triggers.
+                        final_run = await app.WORKFLOW_SERVICE.execute_workflow(
+                            workflow_run_id=triggered_run_id,
+                            api_key=None,
+                            organization=organization,
+                            browser_session_id=resolved_browser_session_id,
+                        )
+                        success = final_run.status == WorkflowRunStatus.completed
+                        output_data = {
+                            "workflow_run_id": triggered_run_id,
+                            "workflow_permanent_id": resolved_workflow_permanent_id,
+                            "status": str(final_run.status),
+                            "failure_reason": final_run.failure_reason,
+                        }
+                        # Include the child workflow's output parameters so downstream
+                        # blocks can reference them (e.g. block_3_output.outputs.block_2_output)
+                        try:
+                            child_output_params = (
+                                await app.WORKFLOW_SERVICE.get_output_parameter_workflow_run_output_parameter_tuples(
+                                    workflow_id=final_run.workflow_id,
+                                    workflow_run_id=triggered_run_id,
+                                )
                             )
-                        )
-                        child_outputs: dict[str, Any] = {}
-                        for output_param, run_output_param in child_output_params:
-                            child_outputs[output_param.key] = run_output_param.value
-                        output_data["outputs"] = child_outputs
-                    except Exception:
-                        LOG.warning(
-                            "Failed to fetch child workflow outputs",
-                            triggered_workflow_run_id=triggered_run_id,
-                            exc_info=True,
-                        )
-                except Exception as e:
-                    error_msg = get_user_facing_exception_message(e)
-                    output_data = {
-                        "workflow_run_id": triggered_run_id,
-                        "workflow_permanent_id": resolved_workflow_permanent_id,
-                        "status": "failed",
-                        "failure_reason": f"Triggered workflow execution failed: {error_msg}",
-                    }
-                    success = False
-                if created_fresh_session and resolved_browser_session_id:
-                    try:
-                        await app.PERSISTENT_SESSIONS_MANAGER.close_session(
-                            organization_id, resolved_browser_session_id
-                        )
-                    except Exception:
-                        LOG.warning(
-                            "Failed to close child browser session",
-                            child_browser_session_id=resolved_browser_session_id,
-                            triggered_workflow_run_id=triggered_run_id,
-                            exc_info=True,
-                        )
+                            child_outputs: dict[str, Any] = {}
+                            for output_param, run_output_param in child_output_params:
+                                child_outputs[output_param.key] = run_output_param.value
+                            output_data["outputs"] = child_outputs
+                        except Exception:
+                            LOG.warning(
+                                "Failed to fetch child workflow outputs",
+                                triggered_workflow_run_id=triggered_run_id,
+                                exc_info=True,
+                            )
+                    except Exception as e:
+                        error_msg = get_user_facing_exception_message(e)
+                        output_data = {
+                            "workflow_run_id": triggered_run_id,
+                            "workflow_permanent_id": resolved_workflow_permanent_id,
+                            "status": "failed",
+                            "failure_reason": f"Triggered workflow execution failed: {error_msg}",
+                        }
+                        success = False
+                finally:
+                    if created_fresh_session and resolved_browser_session_id:
+                        try:
+                            await app.PERSISTENT_SESSIONS_MANAGER.close_session(
+                                organization_id, resolved_browser_session_id
+                            )
+                        except Exception:
+                            LOG.warning(
+                                "Failed to close child browser session",
+                                child_browser_session_id=resolved_browser_session_id,
+                                triggered_workflow_run_id=triggered_run_id,
+                                exc_info=True,
+                            )
         else:
             # Fire and forget: dispatch the child workflow via Temporal so it
             # gets its own independent worker process. This ensures the child
