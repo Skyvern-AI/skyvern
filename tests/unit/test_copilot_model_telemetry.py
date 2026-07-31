@@ -541,22 +541,6 @@ def test_datadog_usage_preserves_missing_cache_write_as_absent(
     assert "operation.cost" not in events[0]
 
 
-@pytest.mark.parametrize(
-    ("base_url", "expected_provider"),
-    [
-        ("https://example.openai.azure.com", "azure.ai.openai"),
-        ("https://EXAMPLE.OPENAI.AZURE.COM/openai", "azure.ai.openai"),
-        ("https://example.com/.openai.azure.com", None),
-        ("https://openai.azure.com.attacker.example", None),
-    ],
-)
-def test_otel_provider_name_validates_azure_hostname(
-    base_url: str,
-    expected_provider: str | None,
-) -> None:
-    assert model_telemetry_module._otel_provider_name("custom-model", base_url) == expected_provider
-
-
 def test_datadog_usage_attributes_fallback_spend_to_response_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -680,3 +664,29 @@ async def test_stream_cancellation_resets_context_without_changing_stream_owners
 
     assert current_model_call_telemetry() is None
     assert stream.closed is False
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://example.openai.azure.com",
+        "https://example.openai.azure.com/openai/deployments/x",
+        "https://OPENAI.AZURE.COM",
+    ],
+)
+def test_otel_provider_name_detects_azure_hosts(base_url: str) -> None:
+    assert model_telemetry_module._otel_provider_name("gpt-5.6-sol", base_url) == "azure.ai.openai"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://evil.test/?redirect=.openai.azure.com",
+        "https://openai.azure.com.evil.test",
+        "https://evil.test/.openai.azure.com",
+        "https://notopenai.azure.com.attacker.test/v1",
+    ],
+)
+def test_otel_provider_name_rejects_lookalike_azure_urls(base_url: str) -> None:
+    # A bare substring check labelled all of these as Azure; the host check must not.
+    assert model_telemetry_module._otel_provider_name("some-model", base_url) is None

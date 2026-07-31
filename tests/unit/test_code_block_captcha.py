@@ -519,3 +519,36 @@ async def test_real_sandbox_solve_captcha_raises_constant_sanitized_error(
 
 def test_solve_captcha_is_reserved_in_sandbox_namespace() -> None:
     assert "solve_captcha" in CodeBlock.build_safe_vars()
+
+
+@pytest.mark.asyncio
+async def test_extension_arm_is_bounded_and_falls_through_on_hang(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The copilot scout calls this builtin with no enclosing timeout, so a solver extension that
+    never answers must not stall the turn — the arm is bounded and the ladder continues."""
+
+    async def _never_returns(*_args: object, **_kwargs: object) -> bool:
+        await asyncio.Event().wait()
+        raise AssertionError("should be cancelled before this point")
+
+    agent_function = type(
+        "AgentFunctionStub",
+        (),
+        {
+            "auto_solve_captchas": AsyncMock(side_effect=_never_returns),
+            "solve_recaptcha_token": AsyncMock(return_value=False),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    monkeypatch.setattr(block_module, "_CODE_BLOCK_EXTENSION_ARM_TIMEOUT_SECONDS", 0.01)
+    page = FakePage(recaptcha=True)
+    block = CodeBlock.model_construct(code="await solve_captcha(page)", label="captcha_ext_hang")
+
+    # wait_for makes an ablated (unbounded) arm fail this test cleanly instead of
+    # hanging it until the CI job timeout.
+    with pytest.raises(CodeBlockCaptchaError):
+        await asyncio.wait_for(block.generate_async_user_function(block.code, page)(), timeout=5)
+
+    agent_function.auto_solve_captchas.assert_awaited_once()
+    agent_function.solve_recaptcha_token.assert_awaited_once()

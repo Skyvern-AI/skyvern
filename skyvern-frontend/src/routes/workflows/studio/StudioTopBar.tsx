@@ -138,9 +138,9 @@ export function SaveButton() {
     <>
       <ControlTooltip content="Save workflow" blocked={isRecording}>
         <Button
-          variant="outline"
+          variant="ghost"
           size="icon"
-          className="relative h-8 w-8 border-border bg-transparent shadow-none"
+          className="relative h-8 w-8 text-muted-foreground"
           disabled={isRecording}
           onClick={() => {
             // Recompute dirtiness synchronously from the same source as the
@@ -233,12 +233,12 @@ function PanelToggle({
   const isOpen = state.active && state.content === content;
   const button = (
     <Button
-      variant="outline"
+      variant="ghost"
       size={icon ? "icon" : "default"}
       disabled={isRecording}
       aria-pressed={isOpen}
       className={cn(
-        "border-border bg-transparent shadow-none",
+        "text-muted-foreground",
         icon ? "h-8 w-8" : "h-8 px-3 text-xs",
         isOpen && "bg-accent text-accent-foreground hover:bg-accent/80",
       )}
@@ -442,7 +442,7 @@ export function StudioTopBar() {
       {workflowDeletedAt ? (
         // Legacy run-header tag idiom; every workflow-mutating action (save,
         // schedule, inputs, run) is gone with the agent. Run history stays
-        // reachable from the Past Runs rail tab.
+        // reachable from the run control.
         <span
           title={basicTimeFormat(workflowDeletedAt)}
           className="shrink-0 text-xs text-muted-foreground"
@@ -464,7 +464,7 @@ export function StudioTopBar() {
               icon={<CalendarIcon className="size-4" />}
             />
             <EditorOverflowMenu
-              triggerClassName="h-8 w-8 rounded-md border border-border bg-transparent shadow-none"
+              triggerClassName="h-8 w-8 rounded-md border-0 bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground"
               onVersionHistory={openVersionHistory}
               embedded
             />
