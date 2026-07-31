@@ -1,4 +1,5 @@
 import googleAuthenticatorIcon from "@/assets/authenticators/google-authenticator.jpg";
+import { ConnectedEmailAccountPicker } from "@/components/ConnectedEmailAccountPicker";
 import { QRCodeIcon } from "@/components/icons/QRCodeIcon";
 import {
   Accordion,
@@ -883,24 +884,73 @@ function PasswordCredentialContent({
                       <div className="w-40 shrink-0">
                         <Label>{totpIdentifierLabel}</Label>
                       </div>
-                      <div className="relative w-full">
-                        <Input
-                          value={totp_identifier}
-                          onChange={(e) =>
-                            updateValues({ totp_identifier: e.target.value })
-                          }
-                          readOnly={valuesReadOnly}
-                          className={cn({ "pr-9 opacity-70": valuesReadOnly })}
-                        />
-                        {valuesReadOnly && (
-                          <button
-                            type="button"
-                            className="absolute right-0 top-0 flex size-9 cursor-pointer items-center justify-center text-muted-foreground hover:text-foreground"
-                            onClick={onEnableEditValues}
-                            aria-label="Edit credential values"
+                      <div className="w-full">
+                        {totpMethod === "email" ? (
+                          <div
+                            className={cn(
+                              "relative w-full",
+                              valuesReadOnly &&
+                                "[&_[role=combobox]>svg]:hidden [&_[role=combobox]]:pr-9",
+                            )}
                           >
-                            <Pencil1Icon className="size-4" />
-                          </button>
+                            <ConnectedEmailAccountPicker
+                              value={totp_identifier}
+                              onChange={(value) =>
+                                updateValues({ totp_identifier: value })
+                              }
+                              disabled={valuesReadOnly}
+                              renderCustomInput={({
+                                value,
+                                onChange: onCustomChange,
+                              }) => (
+                                <Input
+                                  value={value}
+                                  onChange={(event) =>
+                                    onCustomChange(event.target.value)
+                                  }
+                                  readOnly={valuesReadOnly}
+                                  className={cn({
+                                    "pr-9 opacity-70": valuesReadOnly,
+                                  })}
+                                />
+                              )}
+                            />
+                            {valuesReadOnly && (
+                              <button
+                                type="button"
+                                className="absolute bottom-0 right-0 flex size-9 cursor-pointer items-center justify-center text-muted-foreground hover:text-foreground"
+                                onClick={onEnableEditValues}
+                                aria-label="Edit credential values"
+                              >
+                                <Pencil1Icon className="size-4" />
+                              </button>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="relative w-full">
+                            <Input
+                              value={totp_identifier}
+                              onChange={(event) =>
+                                updateValues({
+                                  totp_identifier: event.target.value,
+                                })
+                              }
+                              readOnly={valuesReadOnly}
+                              className={cn({
+                                "pr-9 opacity-70": valuesReadOnly,
+                              })}
+                            />
+                            {valuesReadOnly && (
+                              <button
+                                type="button"
+                                className="absolute right-0 top-0 flex size-9 cursor-pointer items-center justify-center text-muted-foreground hover:text-foreground"
+                                onClick={onEnableEditValues}
+                                aria-label="Edit credential values"
+                              >
+                                <Pencil1Icon className="size-4" />
+                              </button>
+                            )}
+                          </div>
                         )}
                       </div>
                     </div>
