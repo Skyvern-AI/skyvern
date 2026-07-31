@@ -2,18 +2,29 @@
 
 import { fireEvent, render, screen } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { copyText } from "@/util/copyText";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { StudioPane } from "./StudioShell";
+
+vi.mock("@/util/copyText", () => ({ copyText: vi.fn() }));
+
+const mockedCopyText = vi.mocked(copyText);
 
 // Chromium aborts a native drag when the DOM mutates inside the dragstart
 // task, so the reorder state (drop overlays, source dim) must engage on a
 // later task. These tests pin that timing contract; only a real mouse drag
 // can prove the native drag itself survives.
-describe("StudioPane header drag", () => {
+describe("StudioPane header", () => {
   const dataTransfer = () => ({ setData: vi.fn(), effectAllowed: "" });
 
-  const renderPane = () => {
+  const renderPane = ({
+    id = "copilot",
+    runId,
+  }: {
+    id?: "copilot" | "overview";
+    runId?: string;
+  } = {}) => {
     const reorder = {
       draggingId: null,
       placement: null,
@@ -25,7 +36,8 @@ describe("StudioPane header drag", () => {
     render(
       <TooltipProvider delayDuration={0}>
         <StudioPane
-          id="copilot"
+          id={id}
+          runId={runId}
           open
           order={0}
           flex={undefined}
@@ -38,7 +50,9 @@ describe("StudioPane header drag", () => {
     );
     return {
       reorder,
-      header: screen.getByRole("group", { name: "Copilot pane header" }),
+      header: screen.getByRole("group", {
+        name: `${id === "overview" ? "Run" : "Copilot"} pane header`,
+      }),
     };
   };
 
@@ -48,6 +62,7 @@ describe("StudioPane header drag", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.clearAllMocks();
   });
 
   test("dragstart sets the drag payload synchronously but engages reorder on a later task", () => {
@@ -90,5 +105,37 @@ describe("StudioPane header drag", () => {
     expect(notPrevented).toBe(false);
     vi.runAllTimers();
     expect(reorder.onStart).not.toHaveBeenCalled();
+  });
+
+  test("a drag starting on the run id copy control is prevented", () => {
+    const { reorder, header } = renderPane({
+      id: "overview",
+      runId: "wr_5574abcdef",
+    });
+
+    fireEvent.pointerDown(
+      screen.getByRole("button", { name: "Copy to clipboard" }),
+    );
+    const notPrevented = fireEvent.dragStart(header, {
+      dataTransfer: dataTransfer(),
+    });
+
+    expect(notPrevented).toBe(false);
+    vi.runAllTimers();
+    expect(reorder.onStart).not.toHaveBeenCalled();
+  });
+
+  test("shows the full run id on hover and copies it from the header control", () => {
+    const runId = "wr_5574abcdef";
+    renderPane({ id: "overview", runId });
+
+    expect(screen.getByText("Run: wr_5574…")).toBeTruthy();
+    const fullRunId = screen.getByText(`Run: ${runId}`);
+    expect(fullRunId.getAttribute("title")).toBe(`Run: ${runId}`);
+    expect(fullRunId.className).toContain("truncate");
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy to clipboard" }));
+
+    expect(mockedCopyText).toHaveBeenCalledWith(runId);
   });
 });

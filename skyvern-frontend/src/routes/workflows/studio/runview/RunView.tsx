@@ -336,14 +336,16 @@ export function RunView({
       runParameters,
     );
     const meta: RunInputMeta[] = [];
-    const pushMeta = (label: string, value: unknown) => {
+    const pushMeta = (
+      label: string,
+      value: unknown,
+      href?: (value: string) => string,
+    ) => {
       if (value === null || value === undefined || value === "") {
         return;
       }
-      meta.push({
-        label,
-        value: typeof value === "string" ? value : JSON.stringify(value),
-      });
+      const text = typeof value === "string" ? value : JSON.stringify(value);
+      meta.push({ label, value: text, to: href?.(text) });
     };
     pushMeta("Webhook URL", workflowRun?.webhook_callback_url);
     // Task 2.0 runs store TOTP config on task_v2, not the top-level run.
@@ -358,7 +360,16 @@ export function RunView({
     );
     pushMeta("Proxy", workflowRun?.proxy_location);
     pushMeta("Extra HTTP headers", workflowRun?.extra_http_headers);
-    pushMeta("Browser session", workflowRun?.browser_session_id);
+    pushMeta(
+      "Browser session",
+      workflowRun?.browser_session_id,
+      (id) => `/browser-session/${id}/stream`,
+    );
+    pushMeta(
+      "Browser profile",
+      workflowRun?.browser_profile_id,
+      (id) => `/browser-profiles/${id}`,
+    );
     pushMeta("Run with", workflowRun?.run_with);
     pushMeta("Max screenshot scrolls", workflowRun?.max_screenshot_scrolls);
     return { parameters, blockPrompts, meta };

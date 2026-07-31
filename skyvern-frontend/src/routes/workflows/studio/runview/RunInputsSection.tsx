@@ -1,3 +1,5 @@
+import { Link } from "react-router-dom";
+
 import { CopyButton } from "@/components/CopyButton";
 import { workflowBlockTitle } from "@/routes/workflows/editor/nodes/types";
 
@@ -6,7 +8,9 @@ import type { BlockPrompt } from "./blockPrompts";
 import { OverviewField } from "./OverviewField";
 import { ClampedProse, RunFieldValue } from "./RunFieldValue";
 
-export type RunInputMeta = { label: string; value: string };
+export type RunInputMeta = { label: string; value: string; to?: string };
+
+const metaValueClassName = "min-w-0 flex-1 break-words text-sm text-foreground";
 
 type RunInputsSectionProps = {
   // Ordered [key, value, definition] entries for the agent (workflow) inputs this run used.
@@ -104,8 +108,17 @@ export function RunInputsSection({
                 <span className="w-32 shrink-0 pt-px text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
                   {entry.label}
                 </span>
-                <span className="min-w-0 flex-1 break-words text-sm text-foreground">
-                  {entry.value}
+                <span className={metaValueClassName}>
+                  {entry.to ? (
+                    <Link
+                      to={entry.to}
+                      className="underline decoration-muted-foreground/50 underline-offset-4 hover:decoration-current"
+                    >
+                      {entry.value}
+                    </Link>
+                  ) : (
+                    entry.value
+                  )}
                 </span>
                 <CopyButton
                   value={entry.value}

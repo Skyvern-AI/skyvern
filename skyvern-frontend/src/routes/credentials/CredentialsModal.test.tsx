@@ -27,6 +27,10 @@ const patchMock = vi.hoisted(() => vi.fn());
 const deleteMock = vi.hoisted(() => vi.fn());
 const getMock = vi.hoisted(() => vi.fn());
 const toastMock = vi.hoisted(() => vi.fn());
+const mockEmailCredentials = vi.hoisted(() => ({
+  google: vi.fn(),
+  microsoft: vi.fn(),
+}));
 
 vi.mock("@/api/AxiosClient", () => ({
   getClient: vi.fn(async () => ({
@@ -49,6 +53,24 @@ vi.mock("@/hooks/useCustomCredentialServiceConfig", () => ({
   useCustomCredentialServiceConfig: () => ({ parsedConfig: null }),
 }));
 
+vi.mock("@/hooks/useGoogleOAuthCredentials", async (importActual) => {
+  const actual =
+    await importActual<typeof import("@/hooks/useGoogleOAuthCredentials")>();
+  return {
+    ...actual,
+    useGoogleOAuthCredentials: mockEmailCredentials.google,
+  };
+});
+
+vi.mock("@/hooks/useMicrosoftOAuthCredentials", async (importActual) => {
+  const actual =
+    await importActual<typeof import("@/hooks/useMicrosoftOAuthCredentials")>();
+  return {
+    ...actual,
+    useMicrosoftOAuthCredentials: mockEmailCredentials.microsoft,
+  };
+});
+
 vi.mock("@/routes/workflows/hooks/useCredentialsQuery", () => ({
   useCredentialsQuery: () => ({ data: [] }),
 }));
@@ -59,6 +81,30 @@ const useFeatureFlagMock = vi.hoisted(() => vi.fn(() => false));
 vi.mock("@/hooks/useFeatureFlag", () => ({
   useFeatureFlag: useFeatureFlagMock,
 }));
+
+function installEmailCredentialHooks() {
+  mockEmailCredentials.google.mockReturnValue({
+    credentials: [
+      {
+        id: "google-mail",
+        organization_id: "org_1",
+        credential_name: "Default",
+        state: "active",
+        scopes_granted: ["https://www.googleapis.com/auth/gmail.readonly"],
+        email_address: "connected@gmail.test",
+        created_at: "2026-07-30T00:00:00Z",
+        modified_at: "2026-07-30T00:00:00Z",
+      },
+    ],
+    isLoading: false,
+    isFetching: false,
+  });
+  mockEmailCredentials.microsoft.mockReturnValue({
+    credentials: [],
+    isLoading: false,
+    isFetching: false,
+  });
+}
 
 function axiosErrorWithDetail(detail: unknown): AxiosError {
   const error = new AxiosError("Request failed");
@@ -201,6 +247,10 @@ describe("getAuthenticatorKeyError", () => {
 });
 
 describe("CredentialsModal additional two-factor methods", () => {
+  beforeEach(() => {
+    installEmailCredentialHooks();
+  });
+
   it("validates extension state and runs its post-save callback with the created id", async () => {
     const onSaved = vi.fn().mockResolvedValue(undefined);
     const additionalMethod: CredentialAdditionalTwoFactorMethod = {

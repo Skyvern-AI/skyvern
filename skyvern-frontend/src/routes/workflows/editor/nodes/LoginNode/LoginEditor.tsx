@@ -8,6 +8,7 @@ import {
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 
 import { HelpTooltip } from "@/components/HelpTooltip";
+import { ConnectedEmailAccountPicker } from "@/components/ConnectedEmailAccountPicker";
 import {
   Accordion,
   AccordionContent,
@@ -205,16 +206,23 @@ function LoginEditorBody({
                   content={helpTooltips["login"]["totpIdentifier"]}
                 />
               </div>
-              <WorkflowBlockInputTextarea
-                nodeId={blockId}
-                onChange={(value) => update({ totpIdentifier: value })}
+              <ConnectedEmailAccountPicker
                 value={data.totpIdentifier ?? ""}
-                placeholder={
-                  !data.totpIdentifier?.trim() && credentialTotpIdentifier
-                    ? `${credentialTotpIdentifier} (from credential)`
-                    : placeholders["login"]["totpIdentifier"]
-                }
-                className="nopan text-xs"
+                onChange={(value) => update({ totpIdentifier: value })}
+                disabled={!editable}
+                renderCustomInput={({ value, onChange }) => (
+                  <WorkflowBlockInputTextarea
+                    nodeId={blockId}
+                    onChange={onChange}
+                    value={value}
+                    placeholder={
+                      !data.totpIdentifier?.trim() && credentialTotpIdentifier
+                        ? `${credentialTotpIdentifier} (from credential)`
+                        : placeholders["login"]["totpIdentifier"]
+                    }
+                    className="nopan text-xs"
+                  />
+                )}
               />
               {!data.totpIdentifier?.trim() && credentialTotpIdentifier ? (
                 <p className="text-xs text-muted-foreground dark:text-slate-500">

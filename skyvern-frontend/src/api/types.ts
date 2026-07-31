@@ -361,6 +361,7 @@ export interface GoogleOAuthCredential {
   id: string;
   organization_id: string;
   credential_name: string;
+  email_address?: string | null;
   provider?: string;
   state?: string;
   scopes_requested?: string[] | string | null;
@@ -425,6 +426,7 @@ export interface MicrosoftOAuthCredential {
   id: string;
   organization_id: string;
   credential_name: string;
+  email_address?: string | null;
   state?: string;
   scopes_requested?: string[] | string | null;
   scopes_granted?: string[] | string | null;
