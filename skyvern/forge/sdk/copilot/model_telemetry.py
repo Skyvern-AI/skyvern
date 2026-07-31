@@ -8,7 +8,6 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Literal, cast, overload
-from urllib.parse import urlparse
 
 import litellm
 import structlog
@@ -131,10 +130,8 @@ def _otel_provider_name(model: str, base_url: str | None) -> str | None:
     }.get(provider)
     if separator and explicit_provider is not None:
         return explicit_provider
-    if base_url:
-        hostname = urlparse(base_url).hostname
-        if hostname and hostname.lower().endswith(".openai.azure.com"):
-            return "azure.ai.openai"
+    if base_url and ".openai.azure.com" in base_url.lower():
+        return "azure.ai.openai"
     if normalized.startswith(("gpt-", "o1", "o3", "o4")):
         return "openai"
     return None
