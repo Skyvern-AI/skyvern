@@ -1,5 +1,5 @@
 import { useEffect, useState, type KeyboardEvent } from "react";
-import { CheckIcon, CopyIcon } from "@radix-ui/react-icons";
+import { CheckIcon, ChevronDownIcon, CopyIcon } from "@radix-ui/react-icons";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { Status } from "@/api/types";
@@ -73,11 +73,11 @@ function useLabelsCollapsed(): boolean {
 /**
  * The studio's pane toggles, top-center in the top bar. Copilot, Editor and
  * Browser are peer TOGGLES (multi-active — each opens or closes its pane). The
- * run pane's tab is different: it's the run selector — labeled with the
- * inspected run ("View Run: wr_…", falling back to "Past Runs"), clicking
- * always opens a run-history popover (it never toggles the pane), and picking
- * a run opens/retargets the run pane. Labels collapse to icons below xl so the
- * cluster never crowds the title or the run actions.
+ * run pane uses a split control while a run is inspected: its labeled button
+ * toggles that run's pane, and the adjacent chevron opens the Past Runs
+ * selector. With no run to inspect, the single Past Runs button opens the
+ * selector. Labels collapse to icons below xl so the cluster never crowds the
+ * title or the run actions.
  */
 export function StudioPaneToggles() {
   const { panes, togglePane, openPane } = useStudioPanes();
@@ -124,10 +124,19 @@ export function StudioPaneToggles() {
   const paneBlockedByDeletion = (id: StudioPaneId) =>
     workflowDeleted && DELETED_WORKFLOW_BLOCKED_PANES.includes(id);
 
+  type StudioControlId = StudioPaneId | "past-runs";
+  const controlIds: StudioControlId[] = STUDIO_PANE_IDS.flatMap((id) =>
+    id === "overview" && runId ? [id, "past-runs"] : [id],
+  );
+
   // Roving tabindex (WAI-ARIA toolbar): the cluster is one tab stop; arrow
   // keys move focus across the enabled toggles, Enter/Space toggles/opens.
-  const [focusedId, setFocusedId] = useState<StudioPaneId>(STUDIO_PANE_IDS[0]!);
-  const enabledIds = STUDIO_PANE_IDS.filter((id) => !paneBlockedByDeletion(id));
+  const [focusedId, setFocusedId] = useState<StudioControlId>(
+    STUDIO_PANE_IDS[0]!,
+  );
+  const enabledIds = controlIds.filter(
+    (id) => id === "past-runs" || !paneBlockedByDeletion(id),
+  );
   const tabStopId = enabledIds.includes(focusedId) ? focusedId : enabledIds[0];
   const onKeyDown = (event: KeyboardEvent<HTMLElement>) => {
     const keys = ["ArrowRight", "ArrowLeft", "Home", "End"];
@@ -165,14 +174,14 @@ export function StudioPaneToggles() {
         const label = railLabel(id, runId);
         const open = panes.includes(id);
         const blockedByDeletion = paneBlockedByDeletion(id);
-        const isRunSelector = id === "overview";
+        const isRunControl = id === "overview";
         const disabled = blockedByDeletion;
         const showActivityDot =
           id === "browser" && hasUnseenBrowserActivity && !open;
-        const showRunStatusDot = isRunSelector && Boolean(runStatus);
+        const showRunStatusDot = isRunControl && Boolean(runStatus);
         const ariaLabel = showActivityDot
           ? "Browser, new activity"
-          : isRunSelector && runStatus
+          : isRunControl && runStatus
             ? `${label}, ${runStatusLabel(runStatus)}`
             : label;
         const iconAndDot = (
@@ -208,62 +217,86 @@ export function StudioPaneToggles() {
           disabled && "pointer-events-none opacity-50",
         );
 
-        // The run pane's tab is a popover trigger: clicking opens the run
-        // selector (Radix manages aria-haspopup/expanded/controls). Its
-        // active state still reflects whether the run pane is open.
-        if (isRunSelector) {
-          const trigger = (
-            <PopoverTrigger asChild>
-              <button
-                id={studioTabId(id)}
-                type="button"
-                aria-pressed={open}
-                aria-label={ariaLabel}
-                tabIndex={id === tabStopId ? 0 : -1}
-                onFocus={() => setFocusedId(id)}
-                className={cn(buttonClassName, "group")}
-              >
-                {iconAndDot}
-                {runId ? (
-                  // Hover affordance beside the (fully visible) run id: copy
-                  // the run's URL without opening the selector popover. A span
-                  // because buttons can't nest; stopPropagation keeps the
-                  // popover closed.
-                  <span
-                    role="button"
-                    tabIndex={0}
-                    aria-label="Copy run link"
-                    title="Copy run link"
-                    onPointerDown={(event) => event.stopPropagation()}
-                    onClick={(event) => {
+        if (isRunControl) {
+          const runButton = (
+            <button
+              id={studioTabId(id)}
+              type="button"
+              aria-pressed={open}
+              {...(runId
+                ? {
+                    "aria-expanded": open,
+                    "aria-controls": studioPanelId(id),
+                  }
+                : {})}
+              aria-label={ariaLabel}
+              tabIndex={id === tabStopId ? 0 : -1}
+              onFocus={() => setFocusedId(id)}
+              onClick={runId ? () => onToggle(id) : undefined}
+              className={cn(
+                buttonClassName,
+                "group",
+                runId && "rounded-r-none pr-2",
+              )}
+            >
+              {iconAndDot}
+              {runId ? (
+                <span
+                  role="button"
+                  tabIndex={0}
+                  aria-label="Copy run link"
+                  title="Copy run link"
+                  onPointerDown={(event) => event.stopPropagation()}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    event.preventDefault();
+                    void copyRunLink();
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
                       event.stopPropagation();
                       event.preventDefault();
                       void copyRunLink();
-                    }}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.stopPropagation();
-                        event.preventDefault();
-                        void copyRunLink();
-                      }
-                    }}
-                    className={cn(
-                      "hidden rounded p-0.5 opacity-0 transition-opacity xl:inline-flex",
-                      "text-muted-foreground hover:text-foreground",
-                      "group-focus-within:opacity-100 group-hover:opacity-100",
-                      "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-                      runLinkCopied && "text-foreground opacity-100",
-                    )}
-                  >
-                    {runLinkCopied ? (
-                      <CheckIcon className="size-3" aria-hidden />
-                    ) : (
-                      <CopyIcon className="size-3" aria-hidden />
-                    )}
-                  </span>
-                ) : null}
+                    }
+                  }}
+                  className={cn(
+                    "hidden rounded p-0.5 opacity-0 transition-opacity xl:inline-flex",
+                    "text-muted-foreground hover:text-foreground",
+                    "group-focus-within:opacity-100 group-hover:opacity-100",
+                    "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                    runLinkCopied && "text-foreground opacity-100",
+                  )}
+                >
+                  {runLinkCopied ? (
+                    <CheckIcon className="size-3" aria-hidden />
+                  ) : (
+                    <CopyIcon className="size-3" aria-hidden />
+                  )}
+                </span>
+              ) : null}
+            </button>
+          );
+          const selectorTrigger = runId ? (
+            <PopoverTrigger asChild>
+              <button
+                id={studioTabId("past-runs")}
+                type="button"
+                aria-label="Past Runs"
+                tabIndex={"past-runs" === tabStopId ? 0 : -1}
+                onFocus={() => setFocusedId("past-runs")}
+                className={cn(
+                  "inline-flex h-8 w-7 items-center justify-center rounded-l-none rounded-r-md border-l border-border/60 transition-colors",
+                  "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                  open || runsSelectorOpen
+                    ? "bg-accent text-foreground"
+                    : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+                )}
+              >
+                <ChevronDownIcon className="size-3.5" aria-hidden />
               </button>
             </PopoverTrigger>
+          ) : (
+            <PopoverTrigger asChild>{runButton}</PopoverTrigger>
           );
           const tip = runId
             ? `View Run: ${runId}${
@@ -278,19 +311,33 @@ export function StudioPaneToggles() {
               open={runsSelectorOpen}
               onOpenChange={setRunsSelectorOpen}
             >
-              {/* Icon-collapsed keeps a label tooltip, composed straight onto
-                  the (never-disabled) button so aria-describedby reaches it;
-                  with labels visible the full id is already in the tab. */}
-              {labelsCollapsed ? (
-                <Tooltip>
-                  <TooltipTrigger asChild>{trigger}</TooltipTrigger>
-                  <TooltipContent side="bottom">{tip}</TooltipContent>
-                </Tooltip>
-              ) : (
-                trigger
-              )}
+              <span className="inline-flex items-center">
+                {runId ? (
+                  labelsCollapsed ? (
+                    <Tooltip>
+                      <TooltipTrigger asChild>{runButton}</TooltipTrigger>
+                      <TooltipContent side="bottom">{tip}</TooltipContent>
+                    </Tooltip>
+                  ) : (
+                    runButton
+                  )
+                ) : null}
+                {runId ? (
+                  <Tooltip>
+                    <TooltipTrigger asChild>{selectorTrigger}</TooltipTrigger>
+                    <TooltipContent side="bottom">Past Runs</TooltipContent>
+                  </Tooltip>
+                ) : labelsCollapsed ? (
+                  <Tooltip>
+                    <TooltipTrigger asChild>{selectorTrigger}</TooltipTrigger>
+                    <TooltipContent side="bottom">{tip}</TooltipContent>
+                  </Tooltip>
+                ) : (
+                  selectorTrigger
+                )}
+              </span>
               <PopoverContent
-                align="start"
+                align={runId ? "end" : "start"}
                 sideOffset={8}
                 className="w-[22rem] p-0"
               >
