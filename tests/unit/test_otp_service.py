@@ -745,17 +745,17 @@ class TestPollOtpValueRetry:
     @pytest.mark.asyncio
     @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service._get_otp_value_from_db", new_callable=AsyncMock)
-    @patch("skyvern.services.otp_service._get_otp_value_from_gmail", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_email", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service.settings")
-    async def test_falls_back_to_db_when_gmail_has_no_code(
+    async def test_falls_back_to_db_when_email_has_no_code(
         self,
         mock_settings: MagicMock,
-        mock_gmail: AsyncMock,
+        mock_email: AsyncMock,
         mock_db: AsyncMock,
         mock_sleep: AsyncMock,
     ) -> None:
         mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
-        mock_gmail.return_value = None
+        mock_email.return_value = None
         otp = OTPValue(value="123456", type=OTPType.TOTP)
         mock_db.return_value = otp
 
@@ -768,21 +768,21 @@ class TestPollOtpValueRetry:
         )
 
         assert result == otp
-        mock_gmail.assert_awaited_once()
+        mock_email.assert_awaited_once()
         mock_db.assert_awaited_once()
 
     @pytest.mark.asyncio
     @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service._get_otp_value_from_db", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
-    @patch("skyvern.services.otp_service._get_otp_value_from_gmail", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_email", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service.app")
     @patch("skyvern.services.otp_service.settings")
-    async def test_prefers_url_before_gmail_and_db_when_url_has_code(
+    async def test_prefers_url_before_email_and_db_when_url_has_code(
         self,
         mock_settings: MagicMock,
         mock_app: MagicMock,
-        mock_gmail: AsyncMock,
+        mock_email: AsyncMock,
         mock_url: AsyncMock,
         mock_db: AsyncMock,
         mock_sleep: AsyncMock,
@@ -791,7 +791,7 @@ class TestPollOtpValueRetry:
         mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
         otp = OTPValue(value="123456", type=OTPType.TOTP)
         mock_url.return_value = otp
-        mock_gmail.return_value = OTPValue(value="654321", type=OTPType.TOTP)
+        mock_email.return_value = OTPValue(value="654321", type=OTPType.TOTP)
 
         result = await poll_otp_value(
             organization_id="o_test",
@@ -804,21 +804,21 @@ class TestPollOtpValueRetry:
 
         assert result == otp
         mock_url.assert_awaited_once()
-        mock_gmail.assert_not_awaited()
+        mock_email.assert_not_awaited()
         mock_db.assert_not_awaited()
 
     @pytest.mark.asyncio
     @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service._get_otp_value_from_db", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
-    @patch("skyvern.services.otp_service._get_otp_value_from_gmail", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_email", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service.app")
     @patch("skyvern.services.otp_service.settings")
-    async def test_falls_back_to_gmail_before_db_when_url_has_no_code(
+    async def test_falls_back_to_email_before_db_when_url_has_no_code(
         self,
         mock_settings: MagicMock,
         mock_app: MagicMock,
-        mock_gmail: AsyncMock,
+        mock_email: AsyncMock,
         mock_url: AsyncMock,
         mock_db: AsyncMock,
         mock_sleep: AsyncMock,
@@ -827,7 +827,7 @@ class TestPollOtpValueRetry:
         mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
         mock_url.return_value = None
         otp = OTPValue(value="123456", type=OTPType.TOTP)
-        mock_gmail.return_value = otp
+        mock_email.return_value = otp
 
         result = await poll_otp_value(
             organization_id="o_test",
@@ -840,23 +840,23 @@ class TestPollOtpValueRetry:
 
         assert result == otp
         mock_url.assert_awaited_once()
-        mock_gmail.assert_awaited_once()
+        mock_email.assert_awaited_once()
         mock_db.assert_not_awaited()
 
     @pytest.mark.asyncio
     @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service._get_otp_value_from_db", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
-    @patch("skyvern.services.otp_service._get_otp_value_from_gmail", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_email", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service.app")
     @patch("skyvern.services.otp_service.settings")
     @patch("skyvern.services.otp_service.datetime")
-    async def test_falls_back_to_db_after_url_and_gmail_preserves_db_cutoff_default(
+    async def test_falls_back_to_db_after_url_and_email_preserves_db_cutoff_default(
         self,
         mock_datetime: MagicMock,
         mock_settings: MagicMock,
         mock_app: MagicMock,
-        mock_gmail: AsyncMock,
+        mock_email: AsyncMock,
         mock_url: AsyncMock,
         mock_db: AsyncMock,
         mock_sleep: AsyncMock,
@@ -866,7 +866,7 @@ class TestPollOtpValueRetry:
         mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
         mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
         mock_url.return_value = None
-        mock_gmail.return_value = None
+        mock_email.return_value = None
         otp = OTPValue(value="123456", type=OTPType.TOTP)
         mock_db.return_value = otp
 
@@ -881,9 +881,9 @@ class TestPollOtpValueRetry:
 
         assert result == otp
         mock_url.assert_awaited_once()
-        mock_gmail.assert_awaited_once()
+        mock_email.assert_awaited_once()
         mock_db.assert_awaited_once()
-        assert mock_gmail.await_args.kwargs["created_after"] == start
+        assert mock_email.await_args.kwargs["created_after"] == start
         assert mock_db.await_args.kwargs["created_after"] is None
 
     @pytest.mark.asyncio

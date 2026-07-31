@@ -53,7 +53,6 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.services import (
     google_drive_service,
-    google_gmail_service,
     google_oauth_service,
     google_sheets_service,
     microsoft_oauth_service,
@@ -63,7 +62,7 @@ from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
 from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
-from skyvern.services.otp_gmail import GmailOTPVerificationContext
+from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
 from skyvern.utils.url_validators import pinned_ip_client
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
@@ -87,9 +86,9 @@ LOG = structlog.get_logger()
 # Playwright's always-on ffmpeg VP8 encoder scales CPU with pixel count; 720p is the
 # legibility / CPU tradeoff point that the BROWSER_RECORDING_720P flag opts a run into.
 RECORDING_VIDEO_SIZE_720P: dict[str, int] = {"width": 1280, "height": 720}
-GMAIL_OTP_CREDENTIAL_REFRESH_INTERVAL_SECONDS = 30
-GMAIL_OTP_MAX_RESULTS = 5
-GMAIL_OTP_SEARCH_INTERVAL_SECONDS = 30
+EMAIL_OTP_CREDENTIAL_REFRESH_INTERVAL_SECONDS = 30
+EMAIL_OTP_MAX_RESULTS = 5
+EMAIL_OTP_SEARCH_INTERVAL_SECONDS = 30
 
 _LLM_CALL_TIMEOUT_SECONDS = 30  # 30s
 
@@ -1659,7 +1658,7 @@ class AgentFunction:
             )
             return None
 
-    async def get_otp_value_from_gmail(
+    async def get_otp_value_from_email(
         self,
         *,
         organization_id: str,
@@ -1667,109 +1666,112 @@ class AgentFunction:
         workflow_id: str | None = None,
         workflow_run_id: str | None = None,
         created_after: datetime | None = None,
-        context: GmailOTPVerificationContext | None = None,
+        context: EmailOTPVerificationContext | None = None,
     ) -> OTPValue | None:
-        """Find an OTP in connected Gmail inboxes for a single polling window."""
+        """Find an OTP in connected email inboxes (all configured sources) for a single polling window."""
         if "@" not in totp_identifier:
             return None
 
         from skyvern.services.otp_service import InsufficientCreditsForOTPParse, parse_otp_login
 
-        lookup_context = context or GmailOTPVerificationContext()
-        now = datetime.now(timezone.utc)
-        required_scopes = list(google_oauth_service.GOOGLE_GMAIL_SCOPES)
-        credential_cache_age = (
-            (now - lookup_context.credential_ids_loaded_at).total_seconds()
-            if lookup_context.credential_ids_loaded_at
-            else None
-        )
-        if (
-            lookup_context.credential_ids is None
-            or credential_cache_age is None
-            or credential_cache_age >= GMAIL_OTP_CREDENTIAL_REFRESH_INTERVAL_SECONDS
-        ):
-            try:
-                lookup_context.credential_ids = [
-                    credential.id
-                    for credential in await google_oauth_service.get_credentials_for_org(organization_id)
-                    if google_oauth_service.has_required_scopes(credential.scopes_granted, required_scopes)
-                ]
-                lookup_context.credential_ids_loaded_at = now
-            except Exception:
-                LOG.warning("Failed to list Google OAuth credentials for Gmail OTP lookup", exc_info=True)
-                return None
-
-        async with httpx.AsyncClient(timeout=20.0) as gmail_client:
-            for credential_id in lookup_context.credential_ids or []:
-                last_searched_at = lookup_context.last_searched_at_by_credential.get(credential_id)
-                if last_searched_at and (now - last_searched_at).total_seconds() < GMAIL_OTP_SEARCH_INTERVAL_SECONDS:
-                    continue
-                lookup_context.last_searched_at_by_credential[credential_id] = now
-                try:
-                    google_credentials = await self.get_google_workspace_credentials(
-                        organization_id=organization_id,
-                        credential_id=credential_id,
-                        required_scopes=required_scopes,
-                    )
-                    if not google_credentials or not google_credentials.token:
-                        continue
-                    candidates = await google_gmail_service.search_recent_otp_messages(
-                        access_token=google_credentials.token,
-                        totp_identifier=totp_identifier,
-                        created_after=created_after,
-                        max_results=GMAIL_OTP_MAX_RESULTS,
-                        client=gmail_client,
-                    )
-                except google_gmail_service.GmailAPIError as exc:
-                    LOG.warning(
-                        "Gmail OTP lookup failed",
-                        credential_id=credential_id,
-                        status=exc.status,
-                        code=exc.code,
-                    )
-                    continue
-                except Exception:
-                    LOG.warning(
-                        "Unexpected Gmail OTP lookup failure",
-                        credential_id=credential_id,
-                        exc_info=True,
-                    )
-                    continue
-
-                for candidate in candidates:
-                    if lookup_context.has_seen_message_id(candidate.message_id):
-                        continue
+        lookup_context = context or EmailOTPVerificationContext()
+        sources = build_email_otp_sources(self)
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            for source in sources:
+                source_context = lookup_context.for_source(source.name)
+                now = datetime.now(timezone.utc)
+                credential_cache_age = (
+                    (now - source_context.credential_ids_loaded_at).total_seconds()
+                    if source_context.credential_ids_loaded_at
+                    else None
+                )
+                if (
+                    source_context.credential_ids is None
+                    or credential_cache_age is None
+                    or credential_cache_age >= EMAIL_OTP_CREDENTIAL_REFRESH_INTERVAL_SECONDS
+                ):
                     try:
-                        otp_value = await parse_otp_login(candidate.content, organization_id)
-                    except InsufficientCreditsForOTPParse:
-                        # Credit eligibility is organization-wide, so stop this scan.
-                        # Remember the candidate so later polls do not retry the same material.
-                        lookup_context.remember_message_id(candidate.message_id)
-                        return None
+                        source_context.credential_ids = await source.list_credential_ids(organization_id)
+                        source_context.credential_ids_loaded_at = now
+                    except Exception:
+                        LOG.warning("Failed to list email OTP credentials", source=source.name, exc_info=True)
+                        continue
+
+                for credential_id in source_context.credential_ids or []:
+                    last_searched_at = source_context.last_searched_at_by_credential.get(credential_id)
+                    if (
+                        last_searched_at
+                        and (now - last_searched_at).total_seconds() < EMAIL_OTP_SEARCH_INTERVAL_SECONDS
+                    ):
+                        continue
+                    source_context.last_searched_at_by_credential[credential_id] = now
+                    try:
+                        candidates = await source.search_recent_otp_messages(
+                            organization_id=organization_id,
+                            credential_id=credential_id,
+                            totp_identifier=totp_identifier,
+                            created_after=created_after,
+                            max_results=EMAIL_OTP_MAX_RESULTS,
+                            context=source_context,
+                            client=client,
+                        )
+                    except EmailOTPSearchError as exc:
+                        LOG.warning(
+                            "Email OTP lookup failed",
+                            source=source.name,
+                            credential_id=credential_id,
+                            status=exc.status,
+                            code=exc.code,
+                        )
+                        continue
                     except Exception:
                         LOG.warning(
-                            "Failed to parse Gmail OTP candidate",
+                            "Unexpected email OTP lookup failure",
+                            source=source.name,
                             credential_id=credential_id,
-                            message_id=candidate.message_id,
                             exc_info=True,
                         )
                         continue
-                    lookup_context.remember_message_id(candidate.message_id)
-                    if otp_value:
+
+                    for candidate in candidates:
+                        if source_context.has_seen_message(credential_id, candidate.message_id):
+                            continue
                         try:
-                            await app.DATABASE.otp.create_otp_code(
-                                organization_id,
-                                totp_identifier,
-                                otp_value.value,
-                                otp_value.value,
-                                otp_value.get_otp_type(),
-                                workflow_id=workflow_id,
-                                workflow_run_id=workflow_run_id,
-                                source="gmail",
-                            )
+                            otp_value = await parse_otp_login(candidate.content, organization_id)
+                        except InsufficientCreditsForOTPParse:
+                            source_context.remember_message(credential_id, candidate.message_id)
+                            return None
                         except Exception:
-                            LOG.warning("Failed to persist Gmail OTP code", credential_id=credential_id, exc_info=True)
-                        return otp_value
+                            LOG.warning(
+                                "Failed to parse email OTP candidate",
+                                source=source.name,
+                                credential_id=credential_id,
+                                message_id=candidate.message_id,
+                                exc_info=True,
+                            )
+                            continue
+                        source_context.remember_message(credential_id, candidate.message_id)
+                        if otp_value:
+                            try:
+                                # Persist only the resolved OTP value to avoid retaining raw email bodies.
+                                await app.DATABASE.otp.create_otp_code(
+                                    organization_id,
+                                    totp_identifier,
+                                    otp_value.value,
+                                    otp_value.value,
+                                    otp_value.get_otp_type(),
+                                    workflow_id=workflow_id,
+                                    workflow_run_id=workflow_run_id,
+                                    source=source.name,
+                                )
+                            except Exception:
+                                LOG.warning(
+                                    "Failed to persist email OTP code",
+                                    source=source.name,
+                                    credential_id=credential_id,
+                                    exc_info=True,
+                                )
+                            return otp_value
 
         return None
 
