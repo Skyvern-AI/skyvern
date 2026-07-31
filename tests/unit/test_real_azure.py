@@ -2,7 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from azure.core.exceptions import ClientAuthenticationError, ResourceNotFoundError
+from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
 
 from skyvern.forge.sdk.api.real_azure import RealAsyncAzureVaultClient
 
@@ -28,12 +28,52 @@ class _RaisingVersionIterator:
         raise ResourceNotFoundError("no prior versions")
 
 
+def _http_error(status_code: int) -> HttpResponseError:
+    error = HttpResponseError(f"status {status_code}")
+    error.status_code = status_code
+    return error
+
+
 class _UnauthorizedVersionIterator:
     def __aiter__(self) -> "_UnauthorizedVersionIterator":
         return self
 
     async def __anext__(self) -> object:
-        raise ClientAuthenticationError("caller lacks secrets/list permission")
+        raise _http_error(403)  # caller lacks secrets/list permission
+
+
+class _NonAuthErrorVersionIterator:
+    def __aiter__(self) -> "_NonAuthErrorVersionIterator":
+        return self
+
+    async def __anext__(self) -> object:
+        raise _http_error(500)
+
+
+class _PartialThenErrorVersionIterator:
+    def __init__(self, items: list[object]) -> None:
+        self._items = list(items)
+
+    def __aiter__(self) -> "_PartialThenErrorVersionIterator":
+        return self
+
+    async def __anext__(self) -> object:
+        if self._items:
+            return self._items.pop(0)
+        raise _http_error(403)
+
+
+class _PartialThenNotFoundVersionIterator:
+    def __init__(self, items: list[object]) -> None:
+        self._items = list(items)
+
+    def __aiter__(self) -> "_PartialThenNotFoundVersionIterator":
+        return self
+
+    async def __anext__(self) -> object:
+        if self._items:
+            return self._items.pop(0)
+        raise ResourceNotFoundError("versions vanished mid-pagination")
 
 
 def _secret_client(versions_iterator: object, *, disable_error: Exception | None = None) -> MagicMock:
@@ -145,4 +185,74 @@ async def test_create_or_update_secret_writes_when_version_listing_is_unauthoriz
     assert result == "my-secret"
     secret_client.set_secret.assert_awaited_once_with("my-secret", "new-value")
     secret_client.update_secret_properties.assert_not_awaited()
+    secret_client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_or_update_secret_fails_when_version_listing_errors_non_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret_client = _secret_client(_NonAuthErrorVersionIterator())
+    client = _vault_client(monkeypatch, secret_client)
+
+    with pytest.raises(HttpResponseError):
+        await client.create_or_update_secret("my-secret", "new-value", "vault")
+
+    # A non-authorization enumeration failure must fail the write so it retries, not proceed and leave
+    # prior versions enabled.
+    secret_client.set_secret.assert_not_awaited()
+    secret_client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_or_update_secret_fails_when_version_listing_fails_after_partial_enumeration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret_client = _secret_client(_PartialThenErrorVersionIterator([SimpleNamespace(version="v-old", enabled=True)]))
+    client = _vault_client(monkeypatch, secret_client)
+
+    with pytest.raises(HttpResponseError):
+        await client.create_or_update_secret("my-secret", "new-value", "vault")
+
+    # A failure mid-enumeration must fail the write rather than proceed with a half-built version list
+    # that would leave the un-enumerated prior versions enabled and readable.
+    secret_client.set_secret.assert_not_awaited()
+    secret_client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_or_update_secret_fails_when_versions_disappear_after_partial_enumeration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A not-found *before* any version is enumerated means a brand-new secret (see
+    # test_create_or_update_secret_handles_missing_prior_versions). A not-found *after* some versions were
+    # enumerated means pagination was interrupted, so the write must fail rather than leave the
+    # un-enumerated priors enabled and readable. ResourceNotFoundError subclasses HttpResponseError, so it
+    # must be handled by its own gated branch, not swallowed unconditionally.
+    secret_client = _secret_client(
+        _PartialThenNotFoundVersionIterator([SimpleNamespace(version="v-old", enabled=True)])
+    )
+    client = _vault_client(monkeypatch, secret_client)
+
+    with pytest.raises(ResourceNotFoundError):
+        await client.create_or_update_secret("my-secret", "new-value", "vault")
+
+    secret_client.set_secret.assert_not_awaited()
+    secret_client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_or_update_secret_fails_when_auth_error_follows_only_skipped_versions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The first page yields only an already-disabled version (skipped, so `previous_versions` stays empty),
+    # then a later page raises 401/403. An empty disable list must not be mistaken for a clean "cannot list
+    # at all" auth failure: enumeration started, so the un-enumerated later versions may still be readable.
+    secret_client = _secret_client(_PartialThenErrorVersionIterator([SimpleNamespace(version="v-old", enabled=False)]))
+    client = _vault_client(monkeypatch, secret_client)
+
+    with pytest.raises(HttpResponseError):
+        await client.create_or_update_secret("my-secret", "new-value", "vault")
+
+    secret_client.set_secret.assert_not_awaited()
     secret_client.close.assert_awaited_once()

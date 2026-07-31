@@ -30,7 +30,7 @@ async def test_stream_ref_dec_does_not_touch_publisher_on_deferred_close(
 ) -> None:
     workflow_run_id = "wr_no_api_publisher_access"
     registries.stream_ref_inc(workflow_run_id)
-    registries.set_deferred_close_params(workflow_run_id, True)
+    assert registries.set_deferred_close_params(workflow_run_id, False, release_driver=False) is True
 
     close_mock = AsyncMock()
     fake_state = SimpleNamespace(close=close_mock)
@@ -55,8 +55,15 @@ async def test_stream_ref_dec_does_not_touch_publisher_on_deferred_close(
     # read it at all, so this must succeed.
     await registries.stream_ref_dec(workflow_run_id)
 
-    close_mock.assert_awaited_once_with(close_browser_on_completion=True)
+    close_mock.assert_awaited_once_with(close_browser_on_completion=False, release_driver=False)
     fake_manager.evict_page.assert_called_once_with(workflow_run_id)
+
+
+def test_deferred_close_requires_an_active_stream() -> None:
+    workflow_run_id = "wr_no_active_stream"
+
+    assert registries.set_deferred_close_params(workflow_run_id, True) is False
+    assert workflow_run_id not in registries._deferred_close_params
 
 
 @pytest.mark.asyncio

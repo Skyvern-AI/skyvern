@@ -3638,7 +3638,7 @@ async def test_handle_action_adopted_session_refetches_when_save_as_target_close
     assert landed_bytes == refetched_bytes
     assert results[-1].downloaded_files == landed
     download.save_as.assert_awaited_once()
-    page.context.request.get.assert_awaited_once_with(download.url)
+    page.context.request.get.assert_awaited_once_with(download.url, max_redirects=0)
     span_attrs = _download_wait_span_attrs(span_exporter)
     assert span_attrs["download_event_fallback_used"] is True
 
@@ -3753,7 +3753,7 @@ async def test_handle_action_adopted_session_falls_through_to_session_folder_whe
     assert action.download_triggered is True
     # helper attempted and failed; recovery came from the browser-session folder poll
     download.save_as.assert_awaited_once()
-    page.context.request.get.assert_awaited_once_with(download.url)
+    page.context.request.get.assert_awaited_once_with(download.url, max_redirects=0)
     # storage was polled at least twice: once before the action, again on a later loop iteration
     assert mock_app.STORAGE.list_downloaded_files_in_browser_session.await_count >= 2
     span_attrs = _download_wait_span_attrs(span_exporter)
@@ -3975,7 +3975,7 @@ async def test_handle_action_adopted_session_xhr_staging_recovered_when_helper_f
             timeout_seconds=download_timeout if download_timeout is not None else BROWSER_DOWNLOAD_TIMEOUT,
         )
         download.save_as.assert_awaited_once()
-        page.context.request.get.assert_awaited_once_with(download.url)
+        page.context.request.get.assert_awaited_once_with(download.url, max_redirects=0)
         # file moved from staging to download dir
         landed_files = sorted(os.listdir(primary_dir))
         assert landed_files == ["xhr-captured.pdf"]
