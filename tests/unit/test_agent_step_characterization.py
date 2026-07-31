@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -357,6 +358,29 @@ async def test_refresh_working_page_signal_reloads_and_skips_batch(monkeypatch: 
     assert output.actions_and_results is not None
     assert output.actions_and_results[0][0].action_type == ActionType.RELOAD_PAGE
     assert rig.context.refresh_working_page is False
+
+
+@pytest.mark.asyncio
+async def test_reload_action_window_encloses_the_reload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """started_at is captured BEFORE the reload, so the recorded window encloses it instead of
+    collapsing to a zero-duration stamp taken after the reload already finished."""
+    rig = make_agent_step_rig(monkeypatch)
+    rig.context.refresh_working_page = True
+    during_reload: list[datetime] = []
+
+    async def observed_reload() -> None:
+        await asyncio.sleep(0.01)
+        during_reload.append(datetime.now(UTC).replace(tzinfo=None))
+
+    rig.browser_state.reload_page = AsyncMock(side_effect=observed_reload)
+
+    _step, output = await rig.run()
+
+    assert during_reload, "reload side effect never ran; the test is not exercising the reload path"
+    assert output.actions_and_results is not None
+    reload_action = output.actions_and_results[0][0]
+    assert reload_action.started_at is not None and reload_action.finished_at is not None
+    assert reload_action.started_at <= during_reload[0] <= reload_action.finished_at
 
 
 @pytest.mark.asyncio
