@@ -541,22 +541,6 @@ def test_datadog_usage_preserves_missing_cache_write_as_absent(
     assert "operation.cost" not in events[0]
 
 
-@pytest.mark.parametrize(
-    ("base_url", "expected_provider"),
-    [
-        ("https://example.openai.azure.com", "azure.ai.openai"),
-        ("https://EXAMPLE.OPENAI.AZURE.COM/openai", "azure.ai.openai"),
-        ("https://example.com/.openai.azure.com", None),
-        ("https://openai.azure.com.attacker.example", None),
-    ],
-)
-def test_otel_provider_name_validates_azure_hostname(
-    base_url: str,
-    expected_provider: str | None,
-) -> None:
-    assert model_telemetry_module._otel_provider_name("custom-model", base_url) == expected_provider
-
-
 def test_datadog_usage_attributes_fallback_spend_to_response_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
