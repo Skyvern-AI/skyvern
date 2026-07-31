@@ -168,6 +168,40 @@ describe("FileParserBlockForm (SKY-9381)", () => {
     ).toBeTruthy();
   });
 
+  test("shows the ZIP output hint without hiding the schema input", () => {
+    mockNodeFixtures.set("fp1", {
+      id: "fp1",
+      type: "fileParser",
+      data: { ...baseFileParserData, fileType: "zip" as const },
+    });
+    render(<FileParserBlockForm blockId="fp1" />);
+
+    expect(
+      screen.getByText(/Data Schema is ignored for ZIP archives/),
+    ).toBeDefined();
+    expect(screen.getByTestId("json-schema-input")).toBeDefined();
+  });
+
+  test.each(["csv", "auto_detect"] as const)(
+    "shows the ZIP output hint for %s blocks with a ZIP URL",
+    (fileType) => {
+      mockNodeFixtures.set("fp1", {
+        id: "fp1",
+        type: "fileParser",
+        data: {
+          ...baseFileParserData,
+          fileType,
+          fileUrl: "https://example.com/archive.zip",
+        },
+      });
+      render(<FileParserBlockForm blockId="fp1" />);
+
+      expect(
+        screen.getByText(/Data Schema is ignored for ZIP archives/),
+      ).toBeDefined();
+    },
+  );
+
   test("File URL onChange dispatches updateNodeData via useUpdate (byte-identical write)", () => {
     mockNodeFixtures.set("fp1", {
       id: "fp1",
