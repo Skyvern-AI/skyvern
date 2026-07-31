@@ -134,7 +134,7 @@ async def test_close_true_timeout_bounds_interceptor_drain_and_cleans_suspended_
     result = await asyncio.wait_for(state.close(True), timeout=0.5)
     elapsed = time.monotonic() - start
 
-    assert result is None
+    assert result is True
     assert elapsed < 0.5
     await asyncio.wait_for(cancelled.wait(), timeout=0.5)
     assert not cleaned.is_set()
@@ -169,8 +169,9 @@ async def test_close_true_still_stops_driver_and_context() -> None:
     context.cookies = AsyncMock(return_value=[])
     state = RealBrowserState(pw=pw, browser_context=context, browser_artifacts=BrowserArtifacts())
 
-    await state.close(close_browser_on_completion=True)
+    result = await state.close(close_browser_on_completion=True)
 
+    assert result is True
     pw.stop.assert_awaited_once()
     context.close.assert_awaited_once()
 
@@ -297,8 +298,9 @@ async def test_close_true_context_close_hang_does_not_suppress_provider_cleanup(
     cleanup = AsyncMock()
     state = RealBrowserState(pw=pw, browser_context=context, browser_cleanup=cleanup)
 
-    await asyncio.wait_for(state.close(True), timeout=1.0)
+    result = await asyncio.wait_for(state.close(True), timeout=1.0)
 
+    assert result is False
     cleanup.assert_awaited_once()
     pw.stop.assert_awaited_once()
 
@@ -568,7 +570,7 @@ async def test_cleanup_for_workflow_run_keeps_driver_while_shared() -> None:
     await manager.cleanup_for_workflow_run(
         "wr_child",
         ["tsk_1"],
-        close_browser_on_completion=False,
+        close_browser_on_completion=True,
     )
 
     # Both the workflow-run-level close and the task-level close observe the
@@ -579,20 +581,65 @@ async def test_cleanup_for_workflow_run_keeps_driver_while_shared() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cleanup_for_workflow_run_final_close_lets_state_decide() -> None:
+async def test_cleanup_for_workflow_run_reports_recording_not_finalized_while_shared() -> None:
+    manager = RealBrowserManager()
+    state = _fake_browser_state()
+    manager.pages["wr_child"] = state
+    manager.pages["wr_parent"] = state
+
+    result = await manager.cleanup_for_workflow_run(
+        "wr_child",
+        [],
+        close_browser_on_completion=True,
+    )
+
+    assert result.browser_state is state
+    assert result.recording_finalized is False
+    state.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=False)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_workflow_run_closes_sole_browser_state() -> None:
+    manager = RealBrowserManager()
+    state = _fake_browser_state()
+    manager.pages["wr_1"] = state
+
+    result = await manager.cleanup_for_workflow_run("wr_1", [], close_browser_on_completion=True)
+
+    state.close.assert_awaited_once_with(close_browser_on_completion=True, release_driver=None)
+    assert result.recording_finalized is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_workflow_run_reports_failed_finalization() -> None:
+    manager = RealBrowserManager()
+    state = _fake_browser_state()
+    state.close.return_value = False
+    manager.pages["wr_1"] = state
+
+    result = await manager.cleanup_for_workflow_run("wr_1", [], close_browser_on_completion=True)
+
+    assert result.recording_finalized is False
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_workflow_run_final_close_reports_recording_finalized() -> None:
     manager = RealBrowserManager()
     state = _fake_browser_state()
     manager.pages["wr_1"] = state
     manager.pages["tsk_1"] = state
 
-    await manager.cleanup_for_workflow_run(
+    result = await manager.cleanup_for_workflow_run(
         "wr_1",
         ["tsk_1"],
-        close_browser_on_completion=False,
+        close_browser_on_completion=True,
     )
 
     final_call = state.close.await_args_list[-1]
+    assert final_call.kwargs["close_browser_on_completion"] is True
     assert final_call.kwargs["release_driver"] is None
+    assert result.browser_state is state
+    assert result.recording_finalized is True
     assert "wr_1" not in manager.pages
     assert "tsk_1" not in manager.pages
 
