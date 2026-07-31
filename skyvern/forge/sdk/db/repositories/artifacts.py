@@ -4,7 +4,7 @@ import datetime
 from typing import TYPE_CHECKING, Callable
 
 import structlog
-from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
@@ -543,6 +543,30 @@ class ArtifactsRepository(BaseRepository):
             )
             await session.commit()
             return result.rowcount or 0
+
+    @db_operation("count_unclaimed_session_download_artifacts")
+    async def count_unclaimed_session_download_artifacts(
+        self,
+        browser_session_id: str,
+        organization_id: str,
+        run_started_at: datetime.datetime,
+    ) -> int:
+        """Session-scoped DOWNLOAD artifacts this run produced but finalization has not claimed yet.
+
+        Read-only counterpart of :meth:`claim_session_download_artifacts_for_run`, matched on the
+        same filter so a grader reading before the claim sees this run's files and not a reused
+        session's earlier ones."""
+        async with self.Session() as session:
+            result = await session.execute(
+                select(func.count())
+                .select_from(ArtifactModel)
+                .where(ArtifactModel.browser_session_id == browser_session_id)
+                .where(ArtifactModel.organization_id == organization_id)
+                .where(ArtifactModel.artifact_type == ArtifactType.DOWNLOAD)
+                .where(ArtifactModel.run_id.is_(None))
+                .where(ArtifactModel.created_at >= run_started_at)
+            )
+            return int(result.scalar() or 0)
 
     @db_operation("delete_artifact_for_browser_session")
     async def delete_artifact_for_browser_session(
