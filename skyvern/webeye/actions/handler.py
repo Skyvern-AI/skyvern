@@ -249,6 +249,9 @@ class CustomSelectFamilyOutcome(StrEnum):
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_IN_FLIGHT_EXTENSION_MAX_SECONDS = 120
 DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS = 1.0
+# Cap the event-time blob read so a stalled read never consumes the whole download-wait budget;
+# on timeout the save_as + fan-out fallback still gets its chance.
+EAGER_BLOB_READ_TIMEOUT_SECONDS = 5.0
 DOWNLOAD_DUPLICATE_STEM_SUFFIX_RE = re.compile(r"(?:\s+\(\d{1,3}\)|_\d{1,3})$")
 SELECT_SHADOW_MATCH_APOSTROPHE_RE = re.compile(r"['`‘’]")
 SELECT_SHADOW_MATCH_WORD_RE = re.compile(r"\w+")
@@ -764,11 +767,115 @@ def _blob_download_candidate_pages(download: Download, page: Page) -> list[Page]
     return candidates
 
 
+async def _read_adopted_session_blob_bytes(
+    download: Download,
+    page: Page,
+    workflow_run_id: str | None = None,
+) -> bytes | None:
+    """Read a blob: download's bytes by fanning out over its candidate pages, owner first.
+
+    Returns the bytes from the first page that owns the blob (``b""`` is a valid zero-byte
+    read), or ``None`` when no open page can resolve it.
+    """
+    for candidate in _blob_download_candidate_pages(download, page):
+        blob_bytes = await SkyvernFrame.read_blob_url_bytes(
+            page=candidate,
+            blob_url=download.url,
+            workflow_run_id=workflow_run_id,
+            max_size_bytes=MAX_FILE_SIZE_BYTES,
+            probe=True,
+        )
+        if blob_bytes is not None:
+            return blob_bytes
+    return None
+
+
+class _EagerAdoptedBlobCapture:
+    """Read an adopted-session blob download's bytes the instant the download event fires.
+
+    A blob: URL only resolves inside the document that minted it, and that document is
+    frequently torn down (navigation, ``revokeObjectURL``, tab close) before the ~1s download
+    poll runs ``_save_adopted_session_download`` — so the post-hoc fan-out reads a context in
+    which the owner is already gone. Reading here, at the download event, captures the bytes
+    while the owner is still live. Armed only for adopted/persistent sessions and blob: URLs.
+    """
+
+    def __init__(self, *, enabled: bool, clicked_page: Page, workflow_run_id: str | None) -> None:
+        self._enabled = enabled
+        self._clicked_page = clicked_page
+        self._workflow_run_id = workflow_run_id
+        self._task: asyncio.Task[None] | None = None
+        self._bytes: bytes | None = None
+
+    def maybe_start(self, download: Download) -> None:
+        if not self._enabled or self._task is not None:
+            return
+        if not (download.url or "").startswith("blob:"):
+            return
+        self._task = asyncio.create_task(self._run(download))
+
+    async def _run(self, download: Download) -> None:
+        try:
+            self._bytes = await _read_adopted_session_blob_bytes(
+                download, self._clicked_page, workflow_run_id=self._workflow_run_id
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOG.debug(
+                "Eager adopted-session blob capture failed",
+                workflow_run_id=self._workflow_run_id,
+                exc_info=True,
+            )
+
+    async def result(self, timeout: float) -> bytes | None:
+        if self._task is None:
+            return None
+        try:
+            # Shield so the timeout unblocks us without tearing the read down mid-flight; on timeout
+            # we then cancel+drain below so save_as/fan-out never run while the read still holds bytes.
+            await asyncio.wait_for(asyncio.shield(self._task), timeout=timeout)
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Eager adopted-session blob capture did not finish before it was needed",
+                workflow_run_id=self._workflow_run_id,
+            )
+            await self.aclose()
+        except Exception:
+            LOG.debug(
+                "Eager adopted-session blob capture result raised",
+                workflow_run_id=self._workflow_run_id,
+                exc_info=True,
+            )
+        return self._bytes
+
+    async def aclose(self) -> None:
+        task = self._task
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            # Swallow the cancellation we requested, but if this coroutine is itself being
+            # cancelled, re-raise so the enclosing timeout/cancel scope still observes it.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+        except Exception:
+            LOG.debug(
+                "Eager adopted-session blob capture cleanup raised",
+                workflow_run_id=self._workflow_run_id,
+                exc_info=True,
+            )
+
+
 async def _save_adopted_session_download(
     download: Download,
     page: Page,
     download_dir: Path,
     workflow_run_id: str | None = None,
+    eager_blob_bytes: bytes | None = None,
 ) -> Path | None:
     """Land an adopted-session download's bytes into download_dir, returning the file path or None.
 
@@ -776,6 +883,19 @@ async def _save_adopted_session_download(
     deferred save_as runs.
     """
     download_target = _download_target_path(download_dir, download.suggested_filename)
+    # Non-empty bytes captured at download-event time (blob owner still alive) win outright: skip
+    # save_as, which returns empty for blobs anyway. A zero-byte eager capture is indistinguishable
+    # from an unreadable one and would be a false success, so fall through to save_as + fan-out
+    # (matching _persist_captured_download's empty-file handling and the CDP interceptor).
+    if download.url.startswith("blob:") and eager_blob_bytes:
+        download_target.write_bytes(eager_blob_bytes)
+        return download_target
+    if download.url.startswith("blob:") and eager_blob_bytes == b"":
+        LOG.warning(
+            "Eager adopted-session blob capture returned zero bytes; falling through to save_as/fan-out",
+            download_dir=str(download_dir),
+            workflow_run_id=workflow_run_id,
+        )
     persisted = await _persist_captured_download(
         download, target=download_target, timeout=BROWSER_DOWNLOAD_MAX_WAIT_TIME
     )
@@ -801,20 +921,13 @@ async def _save_adopted_session_download(
     # owns the blob. That document may be a different tab than the one clicked, so
     # probe every open page (owner first) rather than reading from ``page`` alone.
     if download.url.startswith("blob:"):
-        candidate_pages = _blob_download_candidate_pages(download, page)
-        blob_bytes: bytes | None = None
-        for candidate in candidate_pages:
-            blob_bytes = await SkyvernFrame.read_blob_url_bytes(
-                page=candidate, blob_url=download.url, workflow_run_id=workflow_run_id, probe=True
-            )
-            if blob_bytes is not None:
-                break
+        blob_bytes = await _read_adopted_session_blob_bytes(download, page, workflow_run_id=workflow_run_id)
         if blob_bytes is None:
             LOG.warning(
                 "Adopted-session blob download could not be read from any open page",
                 download_dir=str(download_dir),
                 workflow_run_id=workflow_run_id,
-                candidate_page_count=len(candidate_pages),
+                candidate_page_count=len(_blob_download_candidate_pages(download, page)),
             )
             return None
         download_target.write_bytes(blob_bytes)
@@ -2773,10 +2886,23 @@ class ActionHandler:
         run_id = resolve_run_download_id(context, fallback_run_id=task.workflow_run_id or task.task_id)
         download_dir = Path(get_download_dir(run_id=run_id))
         download_event: asyncio.Future[Download] = asyncio.get_running_loop().create_future()
+        eager_blob_capture = _EagerAdoptedBlobCapture(
+            enabled=bool(task.browser_session_id),
+            clicked_page=page,
+            workflow_run_id=task.workflow_run_id,
+        )
+        download_popup_callbacks: list[tuple[Page, Callable[[Download], None]]] = []
 
         def _capture_download_event(download: Download) -> None:
             if not download_event.done():
                 download_event.set_result(download)
+            eager_blob_capture.maybe_start(download)
+
+        def _register_download_popup(popup_page: Page) -> None:
+            # A blob download frequently mints its document in a new tab, so the download event
+            # fires on the popup, not the clicked page. Capture there too so the owner is read live.
+            popup_page.on("download", _capture_download_event)
+            download_popup_callbacks.append((popup_page, _capture_download_event))
 
         def _download_signal_identity(file: str) -> str:
             return file.removesuffix(BROWSER_DOWNLOADING_SUFFIX)
@@ -2870,6 +2996,10 @@ class ActionHandler:
             workflow_run_id=task.workflow_run_id,
         )
         page.on("download", _capture_download_event)
+        # Popup-owned blob downloads only matter for adopted/persistent sessions; managed sessions
+        # keep their existing single-page download behavior with no popup-download wiring.
+        if task.browser_session_id:
+            page.on("popup", _register_download_popup)
         try:
             await transient_text_observer.start(scan_initial_visible_state=False)
             xhr_capture.enable()
@@ -2970,6 +3100,12 @@ class ActionHandler:
                                     page,
                                     download_dir,
                                     workflow_run_id=task.workflow_run_id,
+                                    eager_blob_bytes=await eager_blob_capture.result(
+                                        timeout=min(
+                                            EAGER_BLOB_READ_TIMEOUT_SECONDS,
+                                            _remaining_download_wait_seconds(),
+                                        )
+                                    ),
                                 )
                                 if saved_path is not None:
                                     download_event_fallback_used = True
@@ -3206,6 +3342,17 @@ class ActionHandler:
                     )
             return results
         finally:
+            await eager_blob_capture.aclose()
+            for observed_popup, popup_callback in download_popup_callbacks:
+                try:
+                    _remove_download_listener(observed_popup, popup_callback)
+                except Exception:
+                    LOG.warning("Failed to remove download popup listener", exc_info=True)
+            if task.browser_session_id:
+                try:
+                    _remove_popup_listener(page, _register_download_popup)
+                except Exception:
+                    LOG.warning("Failed to remove download popup registrar", exc_info=True)
             try:
                 await transient_text_observer.stop()
             finally:
