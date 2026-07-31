@@ -469,13 +469,13 @@ async def send_totp_code(
         if not workflow_run:
             raise HTTPException(status_code=400, detail=f"Invalid workflow run id: {data.workflow_run_id}")
     content = data.content.strip()
-    otp_value: OTPValue | None = OTPValue(value=content, type=data.type or OTPType.TOTP)
+    otp_value: OTPValue | None = OTPValue(value=content)
     otp_parse_skipped_for_insufficient_credits = False
     parse_exception_type_name: str | None = None
     # We assume the user is sending the code directly when the length of code is less than or equal to 10
     if len(content) > 10:
         try:
-            otp_value = await parse_otp_login(content, curr_org.organization_id, enforced_otp_type=data.type)
+            otp_value = await parse_otp_login(content, curr_org.organization_id)
         except InsufficientCreditsForOTPParse:
             otp_value = None
             otp_parse_skipped_for_insufficient_credits = True

@@ -3719,6 +3719,8 @@ _CODE_BLOCK_RECAPTCHA_RESPONSE_SELECTOR = 'textarea[name="g-recaptcha-response"]
 _CODE_BLOCK_RECAPTCHA_ANCHOR_HOSTS = ("www.google.com", "www.recaptcha.net")
 _CODE_BLOCK_RECAPTCHA_ANCHOR_PATHS = ("/recaptcha/api2/anchor", "/recaptcha/enterprise/anchor")
 _CODE_BLOCK_RECAPTCHA_ANCHOR_ARM_TIMEOUT_SECONDS = 5
+# The extension arm polls a solver over the network; the scout caller has no enclosing bound.
+_CODE_BLOCK_EXTENSION_ARM_TIMEOUT_SECONDS = 12
 # Google's widget flips aria-checked after its own animation; a shorter wait reads as unsolved.
 _CODE_BLOCK_RECAPTCHA_ANCHOR_SETTLE_MS = 2_000
 _CODE_BLOCK_CAPTCHA_CONTINUE_SELECTOR = ", ".join(
@@ -3848,8 +3850,9 @@ async def _code_block_solve_captcha_builtin(
         LOG.info("code block CAPTCHA anchor frame arm did not solve", arm="recaptcha_anchor_frame")
 
     try:
-        if await app.AGENT_FUNCTION.auto_solve_captchas(page):
-            return
+        async with asyncio.timeout(_CODE_BLOCK_EXTENSION_ARM_TIMEOUT_SECONDS):
+            if await app.AGENT_FUNCTION.auto_solve_captchas(page):
+                return
     except Exception:
         LOG.info("code block CAPTCHA extension arm did not solve", arm="extension")
 
@@ -8570,77 +8573,6 @@ class FileParserBlock(Block):
             return await self._parse_docx_file(file_path)
         return None
 
-    async def _parse_zip_contents(
-        self,
-        extracted_files: list[dict[str, Any]],
-        workflow_run_block_id: str | None = None,
-        organization_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Parse every supported file extracted from a ZIP for combined AI extraction.
-
-        Returns [{"file_name", "content"}, ...]. Unsupported or unparseable files are skipped;
-        total content is truncated at a file boundary once MAX_FILE_PARSE_INPUT_TOKENS is reached.
-        """
-        content_entries: list[dict[str, Any]] = []
-        current_tokens = 0
-        for file_info in extracted_files:
-            inner_path: str = file_info["file_path"]
-            file_name: str = file_info["file_name"]
-            try:
-                inner_file_type = self._detect_file_type_from_url(inner_path, file_path=inner_path)
-            except InvalidFileType as e:
-                LOG.warning("FileParserBlock Skipping unsupported file in ZIP", file_name=file_name, error=str(e))
-                continue
-            if inner_file_type == FileType.ZIP:
-                LOG.warning("FileParserBlock Skipping nested ZIP archive", file_name=file_name)
-                continue
-            try:
-                content = await self._parse_file_of_type(
-                    inner_file_type,
-                    inner_path,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
-            except Exception as e:
-                LOG.warning(
-                    "FileParserBlock Failed to parse file in ZIP, skipping it", file_name=file_name, error=str(e)
-                )
-                continue
-            if content is None:
-                LOG.warning(
-                    "FileParserBlock Skipping file with unsupported type in ZIP",
-                    file_name=file_name,
-                    detected_file_type=inner_file_type,
-                )
-                continue
-            entry = {"file_name": file_name, "content": content}
-            entry_tokens = count_tokens(json.dumps(entry, separators=(",", ":"), default=str))
-            if current_tokens + entry_tokens > MAX_FILE_PARSE_INPUT_TOKENS:
-                if not content_entries:
-                    raise InvalidFileType(
-                        file_url=self.file_url,
-                        file_type=self.file_type,
-                        error=f"File '{file_name}' in the ZIP archive alone exceeds the maximum extraction input size",
-                    )
-                LOG.warning(
-                    "FileParserBlock ZIP content exceeds token limit, truncating at file boundary",
-                    file_url=self.file_url,
-                    files_included=len(content_entries),
-                    total_files=len(extracted_files),
-                    max_tokens=MAX_FILE_PARSE_INPUT_TOKENS,
-                )
-                break
-            current_tokens += entry_tokens
-            content_entries.append(entry)
-
-        if not content_entries:
-            raise InvalidFileType(
-                file_url=self.file_url,
-                file_type=self.file_type,
-                error="ZIP archive contains no parseable files (supported: CSV, Excel, PDF, image, DOCX)",
-            )
-        return content_entries
-
     async def _extract_with_ai(
         self,
         content: str | list[dict[str, Any]],
@@ -8859,14 +8791,7 @@ class FileParserBlock(Block):
                 extracted_zip_files = await asyncio.to_thread(
                     self._extract_zip_file, file_path, workflow_run_id, workflow_run_block_id
                 )
-                if self.json_schema:
-                    parsed_data = await self._parse_zip_contents(
-                        extracted_zip_files,
-                        workflow_run_block_id=workflow_run_block_id,
-                        organization_id=organization_id,
-                    )
-                else:
-                    parsed_data = extracted_zip_files
+                parsed_data = extracted_zip_files
             else:
                 maybe_parsed = await self._parse_file_of_type(
                     self.file_type,
@@ -8892,7 +8817,6 @@ class FileParserBlock(Block):
                 f"Failed to parse {self.file_type} file: {str(e)}",
             )
 
-        # If json_schema is provided, use AI to extract structured data
         final_data: Any
         LOG.debug(
             "FileParserBlock JSON schema check",
@@ -8901,7 +8825,14 @@ class FileParserBlock(Block):
             json_schema=self.json_schema,
         )
 
-        if self.json_schema:
+        if self.file_type == FileType.ZIP:
+            if self.json_schema:
+                LOG.warning(
+                    "FileParserBlock json_schema is ignored for ZIP archives; returning extracted file list",
+                    file_url=self.file_url,
+                )
+            final_data = parsed_data
+        elif self.json_schema:
             try:
                 ai_extracted_data = await self._extract_with_ai(
                     parsed_data,

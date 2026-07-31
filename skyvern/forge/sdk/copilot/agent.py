@@ -59,6 +59,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     observed_value_extraction_scaffold_lines,
     unresolved_runtime_block_failure,
 )
+from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     freeze_requested_output_extraction_candidate,
@@ -655,16 +656,26 @@ def _build_system_prompt(
     copilot_config = config or CopilotConfig(security_rules=security_rules or "")
     template = copilot_config.prompt_template.removesuffix(".j2")
     workflow_knowledge_base = WORKFLOW_KNOWLEDGE_BASE_PATH.read_text(encoding="utf-8")
-    prompt = prompt_engine.load_prompt(
+    current_datetime = datetime.now(timezone.utc).isoformat()
+    datetime_boundary = "__SKYVERN_COPILOT_DYNAMIC_DATETIME_BOUNDARY__"
+    prompt_with_boundary = prompt_engine.load_prompt(
         template=template,
         workflow_knowledge_base=workflow_knowledge_base,
-        current_datetime=datetime.now(timezone.utc).isoformat(),
+        current_datetime=datetime_boundary,
         tool_usage_guide=tool_usage_guide,
         security_rules=copilot_config.security_rules,
     )
+    stable_prefix, boundary, dynamic_suffix = prompt_with_boundary.partition(datetime_boundary)
+    if boundary:
+        dynamic_suffix = current_datetime + dynamic_suffix
+    else:
+        # A custom template without the datetime has no variable base-prompt
+        # suffix, so its complete rendered prompt is safe to mark stable.
+        stable_prefix = prompt_with_boundary
+        dynamic_suffix = ""
     if copilot_config.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        prompt = f"{prompt}\n\n{_render_code_only_browser_authoring_prompt()}"
-    return prompt
+        dynamic_suffix = f"{dynamic_suffix}\n\n{_render_code_only_browser_authoring_prompt()}"
+    return CacheableSystemInstructions(stable_prefix, dynamic_suffix)
 
 
 def _runtime_verification_evidence_prompt(ctx: CopilotContext | None) -> str:
@@ -1226,9 +1237,8 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
         if not isinstance(policy, RequestPolicy):
             return base_system_prompt
         policy_summary = escape_code_fences(redact_raw_secrets_for_prompt(policy.prompt_summary()))
-        prompt = (
-            base_system_prompt
-            + "\n\nREQUEST POLICY:\n```yaml\n"
+        dynamic_context = (
+            "\n\nREQUEST POLICY:\n```yaml\n"
             + policy_summary
             + "\n```\nFollow this policy. If `allow_run_blocks` is false, do not call block-running tools. "
             + "Exception: when `clarification_reason` is `workflow_credential_inputs_unbound` or "
@@ -1242,8 +1252,8 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + "workflow input parameter with that value as the default, so the saved workflow can be re-run "
             + "under a different address, and do not ask for a saved password credential for that login."
         )
-        return (
-            prompt
+        dynamic_context = (
+            dynamic_context
             + _runtime_verification_evidence_prompt(ctx)
             + _recorded_build_test_outcome_prompt(ctx)
             + _code_authoring_repair_context_prompt(ctx)
@@ -1251,6 +1261,13 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + todo_list_prompt(ctx)
             + _docs_answer_turn_directive(ctx.turn_intent)
         )
+        if isinstance(base_system_prompt, CacheableSystemInstructions):
+            return CacheableSystemInstructions(
+                base_system_prompt.stable_prefix,
+                base_system_prompt.dynamic_suffix + dynamic_context,
+                cache_namespace=ctx.workflow_copilot_chat_id,
+            )
+        return base_system_prompt + dynamic_context
 
     return instructions
 

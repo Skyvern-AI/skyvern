@@ -115,7 +115,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "goto_url": "Navigate directly to a URL without additional instructions",
     "download_to_s3": "Download a URL directly to S3 storage",
     "upload_to_s3": "Upload local content to S3",
-    "file_url_parser": "Parse a file (CSV/Excel/PDF/image) from a URL",
+    "file_url_parser": "Parse a file (CSV/Excel/PDF/image/DOCX) from a URL; ZIP archives are unzipped to a file list",
     "pdf_parser": "Extract structured data from a PDF document",
     "human_interaction": "Pause workflow for human approval via email",
     "print_page": "Print the current page to PDF",

@@ -1537,6 +1537,7 @@ async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided(
     unscoped = SimpleNamespace(
         code="111111",
         otp_type=OTPType.TOTP,
+        created_at=datetime(2026, 6, 8, 20, 4, 0),
         workflow_run_id=None,
         workflow_id=None,
         task_id=None,
@@ -1545,6 +1546,7 @@ async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided(
     other_run = SimpleNamespace(
         code="333333",
         otp_type=OTPType.TOTP,
+        created_at=datetime(2026, 6, 8, 20, 5, 0),
         workflow_run_id="wr_other",
         workflow_id=None,
         task_id=None,
@@ -1553,6 +1555,7 @@ async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided(
     scoped = SimpleNamespace(
         code="222222",
         otp_type=OTPType.TOTP,
+        created_at=datetime(2026, 6, 8, 20, 6, 0),
         workflow_run_id="wr_test",
         workflow_id=None,
         task_id=None,
@@ -1584,6 +1587,7 @@ async def test_get_otp_value_from_db_allows_unscoped_code_for_run_scoped_poll() 
     unscoped = SimpleNamespace(
         code="111111",
         otp_type=OTPType.TOTP,
+        created_at=datetime(2026, 6, 8, 20, 4, 0),
         workflow_run_id=None,
         workflow_id=None,
         task_id=None,
@@ -1592,6 +1596,7 @@ async def test_get_otp_value_from_db_allows_unscoped_code_for_run_scoped_poll() 
     other_run = SimpleNamespace(
         code="333333",
         otp_type=OTPType.TOTP,
+        created_at=datetime(2026, 6, 8, 20, 5, 0),
         workflow_run_id="wr_other",
         workflow_id=None,
         task_id=None,
@@ -1618,6 +1623,7 @@ async def test_get_otp_value_from_db_preserves_unscoped_lookup_without_workflow_
     unscoped = SimpleNamespace(
         code="111111",
         otp_type=OTPType.TOTP,
+        created_at=datetime(2026, 6, 8, 20, 4, 0),
         workflow_run_id=None,
         workflow_id=None,
         task_id=None,
@@ -1634,14 +1640,305 @@ async def test_get_otp_value_from_db_preserves_unscoped_lookup_without_workflow_
     assert get_otp_codes.await_args.kwargs["include_unscoped_workflow_run"] is False
 
 
-def _raw_otp_row(totp_code_id: str = "otp_raw", task_id: str | None = None) -> SimpleNamespace:
+def _parsed_otp_row(
+    *,
+    totp_code_id: str,
+    content: str,
+    code: str,
+    otp_type: OTPType,
+    created_at: datetime = datetime(2026, 7, 30, 12, 0, 0),
+    workflow_run_id: str | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        totp_code_id=totp_code_id,
+        content=content,
+        code=code,
+        otp_type=otp_type,
+        created_at=created_at,
+        workflow_run_id=workflow_run_id,
+        workflow_id=None,
+        task_id=None,
+        expired_at=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_otp_value_from_db_reparses_mismatched_parsed_content_for_expected_type() -> None:
+    mixed_content = "Your code is 123456. Or verify at https://example.test/login"
+    parsed = _parsed_otp_row(
+        totp_code_id="otp_parsed",
+        content=mixed_content,
+        code="123456",
+        otp_type=OTPType.TOTP,
+    )
+    expected = OTPValue(value="https://example.test/login", type=OTPType.MAGIC_LINK)
+    with (
+        patch("skyvern.services.otp_service.app") as mock_app,
+        patch("skyvern.services.otp_service.parse_otp_login", new=AsyncMock(return_value=expected)) as parse,
+    ):
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=[parsed])
+        mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock(return_value=[])
+        mock_app.DATABASE.otp.promote_raw_otp_code = AsyncMock()
+        result = await _get_otp_value_from_db(
+            "o_test",
+            "otp@example.test",
+            expected_otp_type=OTPType.MAGIC_LINK,
+            raw_context=otp_service.RawOTPVerificationContext(),
+        )
+
+    assert result == expected
+    parse.assert_awaited_once_with(mixed_content, "o_test", enforced_otp_type=OTPType.MAGIC_LINK)
+    mock_app.DATABASE.otp.get_raw_otp_codes.assert_awaited_once()
+    mock_app.DATABASE.otp.promote_raw_otp_code.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_otp_value_from_db_reparses_newer_mismatch_before_older_matching_type() -> None:
+    newest_content = "Your new code is 123456. Or verify at https://example.test/new-login"
+    newest = _parsed_otp_row(
+        totp_code_id="otp_totp",
+        content=newest_content,
+        code="123456",
+        otp_type=OTPType.TOTP,
+    )
+    older = _parsed_otp_row(
+        totp_code_id="otp_magic_link",
+        content="https://example.test/old-login",
+        code="https://example.test/old-login",
+        otp_type=OTPType.MAGIC_LINK,
+    )
+    expected = OTPValue(value="https://example.test/new-login", type=OTPType.MAGIC_LINK)
+    with (
+        patch("skyvern.services.otp_service.app") as mock_app,
+        patch("skyvern.services.otp_service.parse_otp_login", new=AsyncMock(return_value=expected)) as parse,
+    ):
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=[newest, older])
+        mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock(return_value=[])
+        result = await _get_otp_value_from_db(
+            "o_test",
+            "otp@example.test",
+            expected_otp_type=OTPType.MAGIC_LINK,
+            raw_context=otp_service.RawOTPVerificationContext(),
+        )
+
+    assert result == expected
+    parse.assert_awaited_once_with(newest_content, "o_test", enforced_otp_type=OTPType.MAGIC_LINK)
+    mock_app.DATABASE.otp.get_raw_otp_codes.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_otp_value_from_db_uses_actual_recency_across_scoped_and_unscoped_rows() -> None:
+    older_scoped = _parsed_otp_row(
+        totp_code_id="otp_old_scoped",
+        content="https://example.test/old-login",
+        code="https://example.test/old-login",
+        otp_type=OTPType.MAGIC_LINK,
+        created_at=datetime(2026, 7, 30, 12, 0, 0),
+        workflow_run_id="wr_test",
+    )
+    newer_unscoped_content = "Your new code is 123456. Or verify at https://example.test/new-login"
+    newer_unscoped = _parsed_otp_row(
+        totp_code_id="otp_new_unscoped",
+        content=newer_unscoped_content,
+        code="123456",
+        otp_type=OTPType.TOTP,
+        created_at=datetime(2026, 7, 30, 12, 1, 0),
+    )
+    expected = OTPValue(value="https://example.test/new-login", type=OTPType.MAGIC_LINK)
+    with (
+        patch("skyvern.services.otp_service.app") as mock_app,
+        patch("skyvern.services.otp_service.parse_otp_login", new=AsyncMock(return_value=expected)) as parse,
+    ):
+        # The repository prioritizes scoped rows before unscoped rows, even
+        # when the unscoped forwarded message is newer.
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=[older_scoped, newer_unscoped])
+        mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock(return_value=[])
+        result = await _get_otp_value_from_db(
+            "o_test",
+            "otp@example.test",
+            workflow_run_id="wr_test",
+            expected_otp_type=OTPType.MAGIC_LINK,
+            raw_context=otp_service.RawOTPVerificationContext(),
+        )
+
+    assert result == expected
+    parse.assert_awaited_once_with(newer_unscoped_content, "o_test", enforced_otp_type=OTPType.MAGIC_LINK)
+    mock_app.DATABASE.otp.get_raw_otp_codes.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_otp_value_from_db_falls_back_after_newer_content_lacks_expected_type() -> None:
+    newest = _parsed_otp_row(
+        totp_code_id="otp_totp",
+        content="Your new code is 123456.",
+        code="123456",
+        otp_type=OTPType.TOTP,
+    )
+    older = _parsed_otp_row(
+        totp_code_id="otp_magic_link",
+        content="https://example.test/old-login",
+        code="https://example.test/old-login",
+        otp_type=OTPType.MAGIC_LINK,
+    )
+    context = otp_service.RawOTPVerificationContext()
+    with (
+        patch("skyvern.services.otp_service.app") as mock_app,
+        patch(
+            "skyvern.services.otp_service.parse_otp_login",
+            new=AsyncMock(return_value=OTPValue(value="123456", type=OTPType.TOTP)),
+        ) as parse,
+    ):
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=[newest, older])
+        mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock(return_value=[])
+        result = await _get_otp_value_from_db(
+            "o_test",
+            "otp@example.test",
+            expected_otp_type=OTPType.MAGIC_LINK,
+            raw_context=context,
+        )
+
+    assert result == OTPValue(value="https://example.test/old-login", type=OTPType.MAGIC_LINK)
+    parse.assert_awaited_once_with(newest.content, "o_test", enforced_otp_type=OTPType.MAGIC_LINK)
+    assert context.misses == {("otp_totp", OTPType.MAGIC_LINK)}
+    mock_app.DATABASE.otp.get_raw_otp_codes.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_otp_value_from_db_retries_newer_content_after_transient_parse_failure() -> None:
+    newest = _parsed_otp_row(
+        totp_code_id="otp_totp",
+        content="Your new code is 123456. Or verify at https://example.test/new-login",
+        code="123456",
+        otp_type=OTPType.TOTP,
+    )
+    older = _parsed_otp_row(
+        totp_code_id="otp_magic_link",
+        content="https://example.test/old-login",
+        code="https://example.test/old-login",
+        otp_type=OTPType.MAGIC_LINK,
+    )
+    context = otp_service.RawOTPVerificationContext()
+    with (
+        patch("skyvern.services.otp_service.app") as mock_app,
+        patch("skyvern.services.otp_service.parse_otp_login", new=AsyncMock(side_effect=RuntimeError)),
+        structlog.testing.capture_logs() as logs,
+    ):
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=[newest, older])
+        mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock(return_value=[])
+        result = await _get_otp_value_from_db(
+            "o_test",
+            "otp@example.test",
+            expected_otp_type=OTPType.MAGIC_LINK,
+            raw_context=context,
+        )
+
+    assert result is None
+    assert context.misses == set()
+    mock_app.DATABASE.otp.get_raw_otp_codes.assert_awaited_once()
+    failure_log = next(record for record in logs if record.get("event") == "Parsed OTP content reparse failed")
+    assert failure_log["exception_type"] == "RuntimeError"
+    assert "exc_info" not in failure_log
+
+
+@pytest.mark.asyncio
+async def test_get_otp_value_from_db_retries_unchecked_newer_content_after_attempt_limit() -> None:
+    newer = [
+        _parsed_otp_row(
+            totp_code_id=f"otp_totp_{index}",
+            content=f"Your new code is 12345{index}.",
+            code=f"12345{index}",
+            otp_type=OTPType.TOTP,
+        )
+        for index in range(4)
+    ]
+    older = _parsed_otp_row(
+        totp_code_id="otp_magic_link",
+        content="https://example.test/old-login",
+        code="https://example.test/old-login",
+        otp_type=OTPType.MAGIC_LINK,
+    )
+    expected = OTPValue(value="https://example.test/new-login", type=OTPType.MAGIC_LINK)
+    context = otp_service.RawOTPVerificationContext()
+    parse = AsyncMock(
+        side_effect=[OTPValue(value=f"12345{index}", type=OTPType.TOTP) for index in range(3)] + [expected]
+    )
+    with (
+        patch("skyvern.services.otp_service.app") as mock_app,
+        patch("skyvern.services.otp_service.parse_otp_login", new=parse),
+    ):
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=[*newer, older])
+        mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock(return_value=[])
+        first_result = await _get_otp_value_from_db(
+            "o_test",
+            "otp@example.test",
+            expected_otp_type=OTPType.MAGIC_LINK,
+            raw_context=context,
+        )
+        second_result = await _get_otp_value_from_db(
+            "o_test",
+            "otp@example.test",
+            expected_otp_type=OTPType.MAGIC_LINK,
+            raw_context=context,
+        )
+
+    assert first_result is None
+    assert second_result == expected
+    assert parse.await_count == 4
+    assert context.misses == {(f"otp_totp_{index}", OTPType.MAGIC_LINK) for index in range(3)}
+    assert mock_app.DATABASE.otp.get_raw_otp_codes.await_count == 2
+
+
+def _raw_otp_row(
+    totp_code_id: str = "otp_raw",
+    task_id: str | None = None,
+    created_at: datetime = datetime(2026, 7, 30, 12, 0, 0),
+) -> SimpleNamespace:
     return SimpleNamespace(
         totp_code_id=totp_code_id,
         content="open the sign-in link",
+        created_at=created_at,
         workflow_run_id=None,
         workflow_id=None,
         task_id=task_id,
         expired_at=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_newer_raw_message_is_reparsed_before_older_parsed_value() -> None:
+    older_parsed = _parsed_otp_row(
+        totp_code_id="otp_old_parsed",
+        content="https://example.test/old-login",
+        code="https://example.test/old-login",
+        otp_type=OTPType.MAGIC_LINK,
+        created_at=datetime(2026, 7, 30, 12, 0, 0),
+    )
+    newer_raw = _raw_otp_row(
+        totp_code_id="otp_new_raw",
+        created_at=datetime(2026, 7, 30, 12, 1, 0),
+    )
+    expected = OTPValue(value="https://example.test/new-login", type=OTPType.MAGIC_LINK)
+    with (
+        patch("skyvern.services.otp_service.app") as mock_app,
+        patch("skyvern.services.otp_service.parse_otp_login", new=AsyncMock(return_value=expected)) as parse,
+    ):
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=[older_parsed])
+        mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock(return_value=[newer_raw])
+        mock_app.DATABASE.otp.promote_raw_otp_code = AsyncMock(return_value=SimpleNamespace())
+        result = await _get_otp_value_from_db(
+            "o_test",
+            "otp@example.test",
+            expected_otp_type=OTPType.MAGIC_LINK,
+            raw_context=otp_service.RawOTPVerificationContext(),
+        )
+
+    assert result == expected
+    parse.assert_awaited_once_with(newer_raw.content, "o_test", enforced_otp_type=OTPType.MAGIC_LINK)
+    mock_app.DATABASE.otp.promote_raw_otp_code.assert_awaited_once_with(
+        totp_code_id=newer_raw.totp_code_id,
+        organization_id="o_test",
+        code=expected.value,
+        otp_type=OTPType.MAGIC_LINK,
     )
 
 
@@ -1678,6 +1975,7 @@ async def test_raw_otp_reparse_exception_retries_without_negative_cache() -> Non
     with (
         patch("skyvern.services.otp_service.app") as mock_app,
         patch("skyvern.services.otp_service.parse_otp_login", new=AsyncMock(side_effect=[RuntimeError, parsed])),
+        structlog.testing.capture_logs() as logs,
     ):
         mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=[])
         mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock(return_value=[raw])
@@ -1686,6 +1984,9 @@ async def test_raw_otp_reparse_exception_retries_without_negative_cache() -> Non
         assert context.misses == set()
         assert await _get_otp_value_from_db("o_test", "otp@example.test", **kwargs) == parsed
     mock_app.DATABASE.otp.promote_raw_otp_code.assert_awaited_once()
+    failure_log = next(record for record in logs if record.get("event") == "Raw OTP reparse failed")
+    assert failure_log["exception_type"] == "RuntimeError"
+    assert "exc_info" not in failure_log
 
 
 @pytest.mark.asyncio
