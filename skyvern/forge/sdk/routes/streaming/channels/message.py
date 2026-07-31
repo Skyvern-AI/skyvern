@@ -565,7 +565,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                 vnc_channel = get_vnc_channel(message_channel.client_id)
 
                 if not vnc_channel:
-                    LOG.error(
+                    LOG.warning(
                         f"{class_name} no vnc channel client found for message channel - cannot exfiltrate.",
                         message=message,
                         **message_channel.identity,
@@ -669,7 +669,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                 vnc_channel = get_vnc_channel(message_channel.client_id)
 
                 if not vnc_channel:
-                    LOG.error(
+                    LOG.warning(
                         f"{class_name} no vnc channel client found for message channel.",
                         message=message,
                         **message_channel.identity,
@@ -875,7 +875,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                 vnc_channel = get_vnc_channel(message_channel.client_id)
 
                 if not vnc_channel:
-                    LOG.error(
+                    LOG.warning(
                         f"{class_name} no vnc channel client found for message channel.",
                         message=message,
                         **message_channel.identity,

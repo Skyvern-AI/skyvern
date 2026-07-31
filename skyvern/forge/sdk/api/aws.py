@@ -29,6 +29,9 @@ add_type("application/zstd", ".zst")
 _S3_OPERATION_RETRIES = 2
 # get_object on a missing key raises NoSuchKey; head-style paths use 404/NotFound.
 _S3_NOT_FOUND_ERROR_CODES = frozenset({"NoSuchKey", "NotFound", "404"})
+# Long-lived holders (e.g. the storage singleton on persistent-sessions workers) must not reuse a
+# session past the 1-hour projected web-identity token expiry (SKY-8743, SKY-13210).
+_SESSION_TTL_SECONDS: float = 45 * 60
 LOG = structlog.get_logger()
 
 
@@ -72,6 +75,7 @@ class AsyncAWSClient:
         self._aws_secret_access_key = aws_secret_access_key
         self._profile_name = profile_name
         self._session: aioboto3.Session | None = None
+        self._session_created_at: float = 0.0
 
     @property
     def session(self) -> aioboto3.Session:
@@ -80,6 +84,7 @@ class AsyncAWSClient:
     @session.setter
     def session(self, session: aioboto3.Session) -> None:
         self._session = session
+        self._session_created_at = time.monotonic()
 
     def _create_session(self, client_type_hint: AWSClientType | None = None) -> None:
         try:
@@ -88,6 +93,7 @@ class AsyncAWSClient:
                 aws_secret_access_key=self._aws_secret_access_key,
                 profile_name=self._profile_name,
             )
+            self._session_created_at = time.monotonic()
         except ProfileNotFound as e:
             profile_name = self._profile_name or os.environ.get("AWS_PROFILE") or "default"
             client_scope = f" while creating the {client_type_hint.value} client" if client_type_hint else ""
@@ -98,6 +104,9 @@ class AsyncAWSClient:
 
     def _get_session(self, client_type_hint: AWSClientType | None = None) -> aioboto3.Session:
         if self._session is None:
+            self._create_session(client_type_hint)
+        elif (time.monotonic() - self._session_created_at) > _SESSION_TTL_SECONDS:
+            LOG.info("Recreating AWS session (TTL expired)", ttl_seconds=_SESSION_TTL_SECONDS)
             self._create_session(client_type_hint)
         return self._session
 
@@ -669,7 +678,7 @@ def tag_set_to_dict(tag_set: list[dict[str, str]]) -> dict[str, str]:
 
 _aws_client: AsyncAWSClient | None = None
 _aws_client_created_at: float = 0.0
-_AWS_CLIENT_TTL_SECONDS: float = 45 * 60  # 45 mins - before the 1-hour projected token expiry
+_AWS_CLIENT_TTL_SECONDS: float = _SESSION_TTL_SECONDS
 
 
 def get_aws_client() -> AsyncAWSClient:

@@ -3719,6 +3719,8 @@ _CODE_BLOCK_RECAPTCHA_RESPONSE_SELECTOR = 'textarea[name="g-recaptcha-response"]
 _CODE_BLOCK_RECAPTCHA_ANCHOR_HOSTS = ("www.google.com", "www.recaptcha.net")
 _CODE_BLOCK_RECAPTCHA_ANCHOR_PATHS = ("/recaptcha/api2/anchor", "/recaptcha/enterprise/anchor")
 _CODE_BLOCK_RECAPTCHA_ANCHOR_ARM_TIMEOUT_SECONDS = 5
+# The extension arm polls a solver over the network; the scout caller has no enclosing bound.
+_CODE_BLOCK_EXTENSION_ARM_TIMEOUT_SECONDS = 12
 # Google's widget flips aria-checked after its own animation; a shorter wait reads as unsolved.
 _CODE_BLOCK_RECAPTCHA_ANCHOR_SETTLE_MS = 2_000
 _CODE_BLOCK_CAPTCHA_CONTINUE_SELECTOR = ", ".join(
@@ -3848,8 +3850,9 @@ async def _code_block_solve_captcha_builtin(
         LOG.info("code block CAPTCHA anchor frame arm did not solve", arm="recaptcha_anchor_frame")
 
     try:
-        if await app.AGENT_FUNCTION.auto_solve_captchas(page):
-            return
+        async with asyncio.timeout(_CODE_BLOCK_EXTENSION_ARM_TIMEOUT_SECONDS):
+            if await app.AGENT_FUNCTION.auto_solve_captchas(page):
+                return
     except Exception:
         LOG.info("code block CAPTCHA extension arm did not solve", arm="extension")
 
