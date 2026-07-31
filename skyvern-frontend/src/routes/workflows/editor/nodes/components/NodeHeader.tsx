@@ -957,32 +957,37 @@ function NodeHeader({
         </div>
       ) : null}
 
-      <header className="group !mt-0 flex h-[2.75rem] justify-between gap-2">
+      <header className="group relative !mt-0 flex h-[2.75rem] justify-between gap-2">
         <div
           className={cn("flex min-w-0 gap-2", {
             "opacity-50": thisBlockIsPlaying,
           })}
         >
-          {!isReadOnlyScope &&
-            (isBlockFinallyGated(
-              blockLabel,
-              workflowSettingsStore.finallyBlockLabel,
-            ) ? (
-              <TooltipProvider delayDuration={300}>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <div>
-                      <NodeGripHandle blockLabel={blockLabel} disabled />
-                    </div>
-                  </TooltipTrigger>
-                  <TooltipContent>
-                    Finally block runs last - reorder to a different position
-                  </TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
-            ) : (
-              gripHandle
-            ))}
+          {/* Overlays the node cards' px-6 gutter instead of reserving flex
+          space for the hover-only grip. */}
+          {!isReadOnlyScope && (
+            <div className="absolute -left-6 top-0 flex w-6 justify-center">
+              {isBlockFinallyGated(
+                blockLabel,
+                workflowSettingsStore.finallyBlockLabel,
+              ) ? (
+                <TooltipProvider delayDuration={300}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <div>
+                        <NodeGripHandle blockLabel={blockLabel} disabled />
+                      </div>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      Finally block runs last - reorder to a different position
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              ) : (
+                gripHandle
+              )}
+            </div>
+          )}
           <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-border dark:border-slate-600">
             {/* Without shrink-0, a long label or subtitle in the sibling
             column steals width from this box before its own min-content. */}
