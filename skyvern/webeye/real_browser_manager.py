@@ -38,7 +38,7 @@ from skyvern.webeye.cdp_frame_publisher import (
 )
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.session_cookies import persist_session_cookies
-from skyvern.webeye.video_utils import finalize_webm
+from skyvern.webeye.video_utils import prepare_recording_for_upload
 
 LOG = structlog.get_logger()
 
@@ -774,20 +774,21 @@ class RealBrowserManager(BrowserManager):
         for i, video_artifact in enumerate(browser_state.browser_artifacts.video_artifacts):
             path = video_artifact.video_path
             if path and os.path.exists(path=path):
-                # Only the local Playwright-launched recording path produces WebM
-                # that needs the remux fix-up. Other producers (e.g. fully formed
-                # MP4 downloaded from a remote source) are already container-valid
-                # and would be corrupted by ``finalize_webm`` — read those raw.
                 is_webm = path.lower().endswith(".webm")
                 if finalize and is_webm:
-                    # Remux via ffmpeg so the WebM container has a valid Duration + Cues,
-                    # even when browser_context.close() was killed mid-finalization.
-                    browser_state.browser_artifacts.video_artifacts[i].video_data = await finalize_webm(path)
+                    async with prepare_recording_for_upload(path) as prepared:
+                        with open(prepared.path, "rb") as f:
+                            browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
+                        browser_state.browser_artifacts.video_artifacts[
+                            i
+                        ].video_file_extension = prepared.file_extension
                 else:
-                    # Per-step snapshot while recording is still open — skip ffmpeg: the file is
-                    # partial, so remux would either fail or be thrown away by the final pass.
+                    # Non-WebM sources are already container-valid; per-step WebM snapshots are still incomplete.
                     with open(path, "rb") as f:
                         browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
+                    browser_state.browser_artifacts.video_artifacts[i].video_file_extension = (
+                        os.path.splitext(path)[1].lstrip(".").lower() or "webm"
+                    )
             else:
                 LOG.debug(
                     "Video path not found",

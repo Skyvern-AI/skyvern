@@ -110,6 +110,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
@@ -1856,6 +1857,7 @@ class ForgeAgent:
                     "Detected the signal to reload the page, going to reload and skip the rest of the actions",
                     step_order=step.order,
                 )
+                reload_started_at = naive_utc_now()
                 await browser_state.reload_page()
                 context.refresh_working_page = False
                 action_result = ActionSuccess()
@@ -1876,6 +1878,8 @@ class ForgeAgent:
                 # _generate_step_actions stamps, and this action never went through it.
                 preflight_action(action, observed_page(), site="internal_refresh")
                 detailed_agent_step_output.actions_and_results[action_idx] = (action, [action_result])
+                action.started_at = reload_started_at
+                action.finished_at = naive_utc_now()
                 action.action_id = (await app.DATABASE.workflow_params.create_action(action=action)).action_id
                 artifact_tracker.task = asyncio.create_task(
                     self.record_artifacts_after_action(task, step, browser_state, engine, action)
@@ -5325,27 +5329,59 @@ class ForgeAgent:
             LOG.debug("Uploading video artifacts", number_of_video_artifacts=len(video_artifacts))
             for video_artifact in video_artifacts:
                 if video_artifact.video_artifact_id:
-                    await app.ARTIFACT_MANAGER.update_artifact_data(
-                        artifact_id=video_artifact.video_artifact_id,
-                        organization_id=task.organization_id,
-                        data=video_artifact.video_data,
-                    )
+                    try:
+                        if video_artifact.video_file_extension:
+                            await app.ARTIFACT_MANAGER.update_artifact_data(
+                                artifact_id=video_artifact.video_artifact_id,
+                                organization_id=task.organization_id,
+                                data=video_artifact.video_data,
+                                file_extension=video_artifact.video_file_extension,
+                            )
+                        else:
+                            await app.ARTIFACT_MANAGER.update_artifact_data(
+                                artifact_id=video_artifact.video_artifact_id,
+                                organization_id=task.organization_id,
+                                data=video_artifact.video_data,
+                            )
+                    except Exception:
+                        LOG.warning(
+                            "Failed to upload task video artifact",
+                            task_id=task.task_id,
+                            organization_id=task.organization_id,
+                            video_artifact_id=video_artifact.video_artifact_id,
+                            exc_info=True,
+                        )
                     continue
-                # A teardown-attached recording has no pre-registered artifact row.
-                # Prefer collected video bytes; use the on-disk path only when no bytes were returned.
+
                 video_path = video_artifact.video_path
                 if video_artifact.video_data:
-                    video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                        step=last_step,
-                        artifact_type=ArtifactType.RECORDING,
-                        data=video_artifact.video_data,
-                    )
+                    if video_artifact.video_file_extension:
+                        video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                            step=last_step,
+                            artifact_type=ArtifactType.RECORDING,
+                            data=video_artifact.video_data,
+                            file_extension=video_artifact.video_file_extension,
+                        )
+                    else:
+                        video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                            step=last_step,
+                            artifact_type=ArtifactType.RECORDING,
+                            data=video_artifact.video_data,
+                        )
                 elif video_path and os.path.exists(video_path):
-                    video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                        step=last_step,
-                        artifact_type=ArtifactType.RECORDING,
-                        path=video_path,
-                    )
+                    if video_artifact.video_file_extension:
+                        video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                            step=last_step,
+                            artifact_type=ArtifactType.RECORDING,
+                            path=video_path,
+                            file_extension=video_artifact.video_file_extension,
+                        )
+                    else:
+                        video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                            step=last_step,
+                            artifact_type=ArtifactType.RECORDING,
+                            path=video_path,
+                        )
                 else:
                     continue
 

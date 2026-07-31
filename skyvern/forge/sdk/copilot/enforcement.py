@@ -39,11 +39,22 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     LIVE_SCOUT_CREDENTIAL_FIELDS,
     ObligationFinding,
     credential_scout_gap,
+    credential_submit_boundary_index,
     first_matched_post_fill_submit_index,
+)
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    first_stable_login_submit_index as _first_stable_login_submit_index,
+)
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
     freeze_requested_output_extraction_candidate,
     is_durable_fallback_entry_target,
     is_generic_entry_opener_click,
     is_optional_dismissal_only_trajectory,
+)
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    last_scout_credential_fill_index as _last_scout_credential_fill_index,
+)
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
     missing_rung_text,
     render_obligation_findings,
     render_synthesized_offer_text,
@@ -224,15 +235,6 @@ _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS = frozenset(
 _SYNTHESIZED_BLOCK_REAUTHORING_TOOLS = frozenset({SYNTHESIZED_BLOCK_PERSISTENCE_TOOL, "update_workflow"})
 _SYNTHESIZED_BLOCK_COMMIT_TOOLS = frozenset({"click", "press_key"})
 _POST_RUN_PAGE_PATH_INTERACTION_BUDGET = 4
-_LOGIN_SUBMIT_NAME_PATTERN = re.compile(
-    r"^(?:log in|login|sign in|authenticate)(?: now| securely| to continue)?$",
-    re.I,
-)
-_LOGIN_SUBMIT_SELECTOR_PATTERN = re.compile(
-    r"^(?:(?:log in|login|sign in|authenticate)(?: submit| button| btn)?|"
-    r"(?:submit|button|btn) (?:log in|login|sign in|authenticate))$",
-    re.I,
-)
 # Evidence sources confirmable only after a run — excluded from the pre-run scout-coverage gate.
 _PRE_RUN_UNGATED_EVIDENCE_SOURCES = frozenset(
     {"independent_run_evidence", "registered_output_parameter", "registered_artifact_content"}
@@ -2451,20 +2453,6 @@ def _credential_password_demand_holds(ctx: Any, interactions: list[dict[str, Any
     return bool(getattr(ctx, "last_scout_observation_has_password_control", False))
 
 
-def _first_stable_login_submit_index(interactions: Sequence[Mapping[str, Any]], credential_index: int) -> int | None:
-    for index, interaction in enumerate(interactions[credential_index + 1 :], start=credential_index + 1):
-        tool_name = str(interaction.get("tool_name") or "").strip()
-        if tool_name == "press_key" and str(interaction.get("key") or "").strip() == "Enter":
-            return index
-        if tool_name != "click":
-            continue
-        accessible_name = re.sub(r"[^a-z0-9]+", " ", str(interaction.get("accessible_name") or "").lower()).strip()
-        selector = re.sub(r"[^a-z0-9]+", " ", str(interaction.get("selector") or "").lower()).strip()
-        if _LOGIN_SUBMIT_NAME_PATTERN.fullmatch(accessible_name) or _LOGIN_SUBMIT_SELECTOR_PATTERN.fullmatch(selector):
-            return index
-    return None
-
-
 def _credential_flow_scout_gap_incomplete(ctx: Any, trajectory: list[Any]) -> bool:
     """Trajectory- and inventory-scoped mirror of the persist seam's credential scout gate: engaged
     credentials (username/password fills) must have every required field filled plus a post-fill
@@ -2627,17 +2615,6 @@ def _request_expects_unreached_download(ctx: AgentContext) -> bool:
     return any(criterion.deliverable_kind == "registered_download" for criterion in _active_completion_criteria(ctx))
 
 
-def _last_scout_credential_fill_index(trajectory: list[Any]) -> int | None:
-    # Boundary past the ENTIRE credential flow, including a runtime-only OTP/MFA fill. Keying only on
-    # username/password let an MFA step (fill totp -> verify-click) form a durable entry->commit past
-    # the boundary and falsely release the terminal-action gate on a login-only trajectory.
-    last_index: int | None = None
-    for index, item in enumerate(trajectory):
-        if isinstance(item, dict) and str(item.get("tool_name") or "").strip() == CREDENTIAL_FILL_TOOL_NAME:
-            last_index = index
-    return last_index
-
-
 def _trajectory_reaches_post_credential_commit(ctx: AgentContext) -> bool:
     """Apply the ordinary reach shapes only to the business spine after the credential submit."""
     trajectory = ctx.scout_trajectory
@@ -2652,14 +2629,7 @@ def _trajectory_reaches_post_credential_commit(ctx: AgentContext) -> bool:
             include_download=False,
             allow_intermediate_interactions=True,
         )
-    credential_submit_index = _first_stable_login_submit_index(interactions, credential_index)
-    latest_fill_source_url = str(interactions[credential_index].get("source_url") or "").strip()
-    if credential_submit_index is None and latest_fill_source_url:
-        credential_submit_index = first_matched_post_fill_submit_index(
-            interactions,
-            credential_index,
-            {latest_fill_source_url},
-        )
+    credential_submit_index = credential_submit_boundary_index(interactions, credential_index)
     if credential_submit_index is None:
         return False
     return _trajectory_reaches_generic_goal(

@@ -1,3 +1,4 @@
+import litellm
 import structlog
 
 from skyvern.config import settings
@@ -11,6 +12,53 @@ from skyvern.schemas.llm import LiteLLMParams, LLMConfig, LLMRouterConfig
 LOG = structlog.get_logger()
 
 FLEX_EXECUTION_TIMEOUT_SECONDS = 180.0
+XAI_GROK_4_5_MODEL = "xai/grok-4.5"
+XAI_GROK_4_5_CONTEXT_WINDOW = 500_000
+# xAI publishes no output cap for grok-4.5; match the bound used by the other large reasoning
+# models here so LiteLLM's context bookkeeping never assumes 500k of output.
+XAI_GROK_4_5_MAX_OUTPUT_TOKENS = 128_000
+
+
+def _register_model_cost_overrides() -> None:
+    # The pinned LiteLLM version can route xai/grok-4.5, but its price map predates the model.
+    litellm.register_model(
+        {
+            XAI_GROK_4_5_MODEL: {
+                "litellm_provider": "xai",
+                "mode": "chat",
+                "max_input_tokens": XAI_GROK_4_5_CONTEXT_WINDOW,
+                "max_output_tokens": XAI_GROK_4_5_MAX_OUTPUT_TOKENS,
+                "max_tokens": XAI_GROK_4_5_MAX_OUTPUT_TOKENS,
+                "input_cost_per_token": 2e-06,
+                "output_cost_per_token": 6e-06,
+                "output_cost_per_reasoning_token": 6e-06,
+                "supports_function_calling": True,
+                "supports_prompt_caching": True,
+                "supports_reasoning": True,
+                "supports_vision": True,
+                "supports_tool_choice": True,
+                "supports_web_search": True,
+            }
+        }
+    )
+
+
+def _build_xai_grok_4_5_config() -> LLMConfig:
+    return LLMConfig(
+        XAI_GROK_4_5_MODEL,
+        ["XAI_API_KEY"],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        max_completion_tokens=XAI_GROK_4_5_MAX_OUTPUT_TOKENS,
+        temperature=settings.LLM_CONFIG_TEMPERATURE,
+        reasoning_effort=settings.XAI_REASONING_EFFORT or None,
+        litellm_params=LiteLLMParams(
+            api_key=settings.XAI_API_KEY,
+            api_base=settings.XAI_API_BASE,
+            api_version=None,
+            model_info={"model_name": XAI_GROK_4_5_MODEL},
+        ),
+    )
 
 
 class LLMConfigRegistry:
@@ -418,6 +466,11 @@ if settings.ENABLE_OPENAI:
             reasoning_effort="high",
         ),
     )
+
+if settings.ENABLE_XAI:
+    _register_model_cost_overrides()
+
+    LLMConfigRegistry.register_config("XAI_GROK_4_5", _build_xai_grok_4_5_config())
 
 if settings.ENABLE_ANTHROPIC:
     # All Claude 4+ models require temperature=1 when extended thinking is enabled.

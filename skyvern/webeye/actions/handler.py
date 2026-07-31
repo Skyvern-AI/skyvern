@@ -94,6 +94,7 @@ from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener, ensure_context
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.experimentation.llm_prompt_config import (
     resolve_check_user_goal_handler,
@@ -2730,6 +2731,10 @@ class ActionHandler:
         # Re-evaluated here, against the page as it is now, before anything downstream looks up a
         # browser, chooses the download-capturing path or persists a row.
         preflight_action(action, page, site="handle_action")
+        action.started_at = naive_utc_now()
+        # Hydrated/cached actions can arrive with a prior finished_at; clear it so the
+        # exceptional-exit fallback below stamps this execution, not the previous one.
+        action.finished_at = None
         browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
         # TODO: maybe support all action types in the future(?)
         trigger_download_action = (
@@ -2888,6 +2893,7 @@ class ActionHandler:
                                 LOG.warning("Failed to remove captured download listener", exc_info=True)
                         if not false_click_download_event.done():
                             false_click_download_event.cancel()
+            action.finished_at = naive_utc_now()
             persisted_action = await app.DATABASE.workflow_params.create_action(action=action)
             action.action_id = persisted_action.action_id
             return results
@@ -2998,6 +3004,7 @@ class ActionHandler:
             else BROWSER_DOWNLOAD_TIMEOUT,
         )
         download_triggered = False
+        working_page_replaced_after_close = False
         xhr_fallback_moved_paths: set[str] = set()
         transient_text_observer = TransientPageTextObserver(
             page,
@@ -3022,12 +3029,65 @@ class ActionHandler:
                     page=page,
                     action=action,
                 )
+            # The execution window ends when the inner action completes: the download wait
+            # below (up to BROWSER_DOWNLOAD_TIMEOUT) is settle observation, excluded to match
+            # the cached-script writer's semantics.
+            action.finished_at = naive_utc_now()
             if not results:
                 return results
             # Let request events already queued by the action enter before closing admission.
             await asyncio.sleep(0)
             xhr_capture.seal_in_flight_requests()
-            # Deliberately reinstall and rescan in case the action replaced the document or exposed initial visible text.
+            if browser_state is not None and page.is_closed():
+                LOG.warning(
+                    "Working page closed during download action; recreating it before continuing",
+                    workflow_run_id=task.workflow_run_id,
+                )
+                xhr_capture.disable()
+                recovered_page: Page | None = None
+                recovery_timeout_seconds = (
+                    float(task.download_timeout) if task.download_timeout is not None else BROWSER_DOWNLOAD_TIMEOUT
+                )
+                try:
+                    async with asyncio.timeout(recovery_timeout_seconds):
+                        recovered_page = await browser_state.new_page()
+                        await browser_state.navigate_to_url(page=recovered_page, url=page_url_before_download)
+                        await browser_state.set_active_page(recovered_page)
+                except Exception:
+                    LOG.warning(
+                        "Failed to recreate working page after download action closed it",
+                        workflow_run_id=task.workflow_run_id,
+                        exc_info=True,
+                    )
+                    if recovered_page is not None:
+                        try:
+                            await recovered_page.close()
+                        except Exception:
+                            LOG.warning(
+                                "Failed to close replacement page after working page recovery failed",
+                                workflow_run_id=task.workflow_run_id,
+                                exc_info=True,
+                            )
+                else:
+                    assert recovered_page is not None
+                    working_page_replaced_after_close = True
+                    try:
+                        _remove_download_listener(page, _capture_download_event)
+                    except Exception:
+                        LOG.warning("Failed to remove download listener from closed page", exc_info=True)
+                    page = recovered_page
+                    page.on("download", _capture_download_event)
+                    recovered_text_observer = TransientPageTextObserver(
+                        page,
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        workflow_run_id=task.workflow_run_id,
+                    )
+                    recovered_text_observer.events.extend(transient_text_observer.events)
+                    await transient_text_observer.stop()
+                    transient_text_observer = recovered_text_observer
+            # Deliberately reinstall and rescan in case the action replaced the document or exposed initial
+            # visible text.
             await transient_text_observer.start(scan_initial_visible_state=True)
             if task.download_timeout is not None:
                 download_wait_hard_timeout_seconds = float(task.download_timeout)
@@ -3323,6 +3383,8 @@ class ActionHandler:
                     if isinstance(results[-1], ActionSuccess):
                         results[-1].needs_followup = True
                         results[-1].followup_message = DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE
+                if working_page_replaced_after_close:
+                    results[-1].skip_remaining_actions = True
                 action.download_triggered = False
                 return results
             results[-1].download_triggered = True
@@ -3350,8 +3412,13 @@ class ActionHandler:
                         post_settle_extra_file_count=len(post_settle_extra_paths),
                         post_settle_extra_files=sorted(os.path.basename(fp) for fp in post_settle_extra_paths),
                     )
+            if working_page_replaced_after_close:
+                results[-1].skip_remaining_actions = True
             return results
         finally:
+            # Fallback for exceptional exits that never reached the post-action stamp.
+            if action.finished_at is None:
+                action.finished_at = naive_utc_now()
             await eager_blob_capture.aclose()
             for observed_popup, popup_callback in download_popup_callbacks:
                 try:
@@ -3381,15 +3448,20 @@ class ActionHandler:
                     initial_page_count=initial_page_count,
                     page_count_after_download=page_count_after_download,
                 )
-                if page_count_after_download > initial_page_count:
+                extra_page_count = page_count_after_download - initial_page_count
+                if extra_page_count > 0:
                     LOG.info(
-                        "Download triggered, closing the extra page",
+                        "Download triggered, closing extra pages",
+                        extra_page_count=extra_page_count,
                     )
 
-                    if page == pages_after_download[-1]:
-                        LOG.warning("The extra page is the current page, closing it")
-                    # close the extra page
-                    await pages_after_download[-1].close()
+                    for extra_page in reversed(pages_after_download):
+                        if extra_page_count <= 0:
+                            break
+                        if extra_page == page:
+                            continue
+                        await extra_page.close()
+                        extra_page_count -= 1
 
                 blank_page_urls = {"about:blank", ":"}
                 if page.url in blank_page_urls and page_url_before_download not in blank_page_urls:
