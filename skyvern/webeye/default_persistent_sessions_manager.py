@@ -275,7 +275,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         )
         if browser_session is None or is_final_status(browser_session.status):
             return None
-        if browser_session.browser_address:
+        if browser_session.is_browser_ready and browser_session.browser_address:
             return browser_session.browser_address
         if timeout <= 0:
             return None

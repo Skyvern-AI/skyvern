@@ -248,11 +248,9 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
     try:
         response = await call_next(request)
 
-        # Skip successful reads before buffering the response body: they are
-        # the bulk of request volume (health checks, status polling) and the
-        # 4xx/5xx and mutating paths below retain all audit/debugging value.
-        # Sensitive endpoints (credential/TOTP reads) always keep their
-        # redacted audit line.
+        # Skip successful reads before buffering the response body; 4xx/5xx and
+        # mutating paths keep logging, and sensitive endpoints always keep
+        # their redacted audit line.
         if (
             response.status_code < 400
             and http_method in _READ_METHODS

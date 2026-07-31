@@ -53,11 +53,6 @@ _VISIBLE_TO_CUSTOMER = or_(
     PersistentBrowserSessionModel.browser_address.isnot(None),
 )
 
-_VENDOR_HELD = and_(
-    PersistentBrowserSessionModel.upstream_cdp_url.isnot(None),
-    PersistentBrowserSessionModel.browser_address.is_(None),
-)
-
 
 class BrowserSessionsRepository(BaseRepository):
     """Database operations for browser profiles and persistent browser sessions."""
@@ -702,38 +697,6 @@ class BrowserSessionsRepository(BaseRepository):
             await session.refresh(browser_session)
             return PersistentBrowserSession.model_validate(browser_session)
 
-    @db_operation("get_stale_vendor_held_browser_sessions")
-    async def get_stale_vendor_held_browser_sessions(
-        self,
-        *,
-        stale_before: datetime,
-        limit: int,
-    ) -> list[PersistentBrowserSession]:
-        """Vendor-held rows whose proxy lease has aged past ``stale_before``, oldest first.
-
-        The lease is ``last_activity_at`` — the proxy restamps it while it relays client commands,
-        so it ages by itself the moment the owning process stops, whether that was graceful or a
-        SIGKILL. ``started_at`` covers a session that died before its first relayed command. When
-        both are NULL the COALESCE comparison is NULL and the row is excluded: a row that cannot be
-        dated is never reaped.
-        """
-        async with self.Session() as session:
-            lease_at = func.coalesce(
-                PersistentBrowserSessionModel.last_activity_at,
-                PersistentBrowserSessionModel.started_at,
-            )
-            query = (
-                select(PersistentBrowserSessionModel)
-                .filter(_VENDOR_HELD)
-                .filter_by(deleted_at=None, completed_at=None)
-                .filter(PersistentBrowserSessionModel.status.not_in(FINAL_STATUSES))
-                .filter(lease_at < stale_before)
-                .order_by(lease_at)
-                .limit(limit)
-            )
-            rows = (await session.scalars(query)).all()
-            return [PersistentBrowserSession.model_validate(row) for row in rows]
-
     @db_operation("get_persistent_browser_session_unscoped")
     async def get_persistent_browser_session_unscoped(self, session_id: str) -> PersistentBrowserSession | None:
         """Primary-key read without organization scoping, for trusted internal session
@@ -891,12 +854,18 @@ class BrowserSessionsRepository(BaseRepository):
         organization_id: str | None = None,
         upstream_cdp_url: str | None = None,
         browser_vendor: str | None = None,
+        mark_started: bool = False,
     ) -> None:
         """Set the browser address for a persistent browser session.
 
         browser_address is the client-facing (proxied) URL; upstream_cdp_url is the endpoint the
         CDP proxy dials and must never be handed to a client. It is never a long-lived operator
         credential, though it may carry a session-scoped token.
+
+        mark_started starts the session's timeout clock, which is not implied by writing an
+        address: an address naming the session rather than the browser is publishable before
+        anything is provisioned, and starting the clock there would bill and expire a session
+        that has no browser yet.
         """
         async with self.Session() as session:
             persistent_browser_session = (
@@ -910,7 +879,7 @@ class BrowserSessionsRepository(BaseRepository):
             if persistent_browser_session:
                 if browser_address:
                     persistent_browser_session.browser_address = browser_address
-                    # once the address is set, the session is started
+                if mark_started:
                     persistent_browser_session.started_at = naive_utc_now()
                 if ip_address:
                     persistent_browser_session.ip_address = ip_address

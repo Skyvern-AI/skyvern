@@ -35,12 +35,14 @@ from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
     RUN_RECORDING_PATH_SEGMENT,
     sync_run_recording_clips,
 )
+from skyvern.forge.sdk.artifact.utils import replace_file_extension
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.utils.script_file_paths import build_script_file_storage_uri
+from skyvern.webeye.video_utils import prepare_recording_for_upload
 
 LOG = structlog.get_logger()
 
@@ -788,11 +790,60 @@ class GcsStorage(BaseStorage):
         date: str | None = None,
     ) -> str:
         """Sync a file from local browser session to GCS."""
-        # Anchor per-run clip offsets to browser close, captured before the upload below.
-        recording_finalized_at = datetime.now(timezone.utc)
         uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
         storage_class = await self._get_storage_class_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
+
+        if artifact_type == "videos":
+            # Anchor per-run clip offsets to browser close, captured before the
+            # potentially slow prepare+upload below so upload time does not shift clips.
+            recording_finalized_at = datetime.now(timezone.utc)
+            async with prepare_recording_for_upload(local_file_path) as prepared_upload:
+                upload_file_path = prepared_upload.path
+                upload_remote_path = replace_file_extension(remote_path, prepared_upload.file_extension)
+                uri = self._build_browser_session_uri(
+                    organization_id, browser_session_id, artifact_type, upload_remote_path, date
+                )
+                await self.async_client.upload_file_from_path(
+                    uri, upload_file_path, storage_class=storage_class, tags=tags
+                )
+
+                # See s3.py for recording artifact fallback rationale.
+                checksum = calculate_sha256_for_file(upload_file_path)
+                file_size = _safe_get_file_size(upload_file_path)
+                await app.ARTIFACT_MANAGER.create_browser_session_recording_artifact(
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    uri=uri,
+                    filename=os.path.basename(upload_remote_path),
+                    checksum=checksum,
+                    file_size=file_size,
+                )
+
+                async def _upload_clip(run_id: str, clip_path: str, filename: str) -> str:
+                    clip_uri = self._build_browser_session_uri(
+                        organization_id, browser_session_id, RUN_RECORDING_PATH_SEGMENT, f"{run_id}/{filename}", date
+                    )
+                    await self.async_client.upload_file_from_path(
+                        clip_uri, clip_path, storage_class=storage_class, tags=tags
+                    )
+                    return clip_uri
+
+                try:
+                    async with asyncio.timeout(RUN_RECORDING_CLIPS_SYNC_TIMEOUT_SECONDS):
+                        await sync_run_recording_clips(
+                            organization_id=organization_id,
+                            browser_session_id=browser_session_id,
+                            source_path=upload_file_path,
+                            upload_clip=_upload_clip,
+                            now=recording_finalized_at,
+                        )
+                except Exception:
+                    LOG.warning(
+                        "Run recording clip generation failed", browser_session_id=browser_session_id, exc_info=True
+                    )
+            return uri
+
         await self.async_client.upload_file_from_path(uri, local_file_path, storage_class=storage_class, tags=tags)
 
         if artifact_type == "downloads":
@@ -803,58 +854,16 @@ class GcsStorage(BaseStorage):
             # propagate so the watcher's bounded retry can recover from a
             # transient DB outage — both ops are idempotent.
             is_partial = remote_path.endswith(BROWSER_DOWNLOADING_SUFFIX)
-            checksum = None if is_partial else calculate_sha256_for_file(local_file_path)
-            file_size = None if is_partial else _safe_get_file_size(local_file_path)
+            download_checksum = None if is_partial else calculate_sha256_for_file(local_file_path)
+            download_file_size = None if is_partial else _safe_get_file_size(local_file_path)
             await app.ARTIFACT_MANAGER.create_browser_session_download_artifact(
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
                 uri=uri,
                 filename=os.path.basename(remote_path),
-                checksum=checksum,
-                file_size=file_size,
+                checksum=download_checksum,
+                file_size=download_file_size,
             )
-        elif artifact_type == "videos":
-            # Recording uploaded once at session close — see s3.py. Artifact-
-            # row creation is best-effort: the only caller swallows
-            # exceptions without retry, so the gated legacy listing fallback
-            # in ``get_shared_recordings_in_browser_session`` is the safety
-            # net for missed writes (when the session has no RECORDING rows
-            # we fall through to the GCS LIST path, so a row-less recording
-            # still surfaces via the legacy signed URL).
-            checksum = calculate_sha256_for_file(local_file_path)
-            file_size = _safe_get_file_size(local_file_path)
-            await app.ARTIFACT_MANAGER.create_browser_session_recording_artifact(
-                organization_id=organization_id,
-                browser_session_id=browser_session_id,
-                uri=uri,
-                filename=os.path.basename(remote_path),
-                checksum=checksum,
-                file_size=file_size,
-            )
-
-            async def _upload_clip(run_id: str, clip_path: str, filename: str) -> str:
-                clip_uri = self._build_browser_session_uri(
-                    organization_id, browser_session_id, RUN_RECORDING_PATH_SEGMENT, f"{run_id}/{filename}", date
-                )
-                await self.async_client.upload_file_from_path(
-                    clip_uri, clip_path, storage_class=storage_class, tags=tags
-                )
-                return clip_uri
-
-            try:
-                async with asyncio.timeout(RUN_RECORDING_CLIPS_SYNC_TIMEOUT_SECONDS):
-                    await sync_run_recording_clips(
-                        organization_id=organization_id,
-                        browser_session_id=browser_session_id,
-                        source_path=local_file_path,
-                        upload_clip=_upload_clip,
-                        now=recording_finalized_at,
-                    )
-            except Exception:
-                LOG.warning(
-                    "Run recording clip generation failed", browser_session_id=browser_session_id, exc_info=True
-                )
-
         return uri
 
     async def delete_browser_session_file(
