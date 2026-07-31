@@ -16,6 +16,12 @@ _FINAL_RUN_VERDICTS = frozenset({"demonstrated", "not_demonstrated", "not_evalua
 _REVIEW_PROPOSAL_DISPOSITIONS = frozenset({"review_untested", "review_tested"})
 _SHADOW_REASON_TRAILING_PUNCTUATION = ".,;:!?"
 
+INTERRUPTED_TERMINAL_REASON = "interrupted"
+INTERRUPTED_TERMINAL_MESSAGE = (
+    "This turn was interrupted before it could finish — the server stopped part-way through it. "
+    "Send your message again to retry."
+)
+
 
 class TerminalOutcomeEnvelope(BaseModel):
     next_state: TerminalNextState
@@ -105,6 +111,16 @@ def finalize_applied_state(
     )
     return envelope.model_copy(
         update={"workflow_applied": applied, "next_state": next_state, "response_kind": response_kind}
+    )
+
+
+def interrupted_terminal_envelope() -> TerminalOutcomeEnvelope:
+    """Envelope for a turn whose process died mid-run — stopped, but never user-cancelled."""
+    return TerminalOutcomeEnvelope(
+        next_state="stopped",
+        verified=False,
+        response_kind="stopped",
+        halt_kind=INTERRUPTED_TERMINAL_REASON,
     )
 
 

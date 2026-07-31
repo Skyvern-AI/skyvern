@@ -4841,9 +4841,9 @@ async def wrapper({default_args}):
             or failure.healability_hint is not None
         )
         if not has_structured:
-            # No healability_hint to disambiguate, so only the page-class code heals blind;
+            # No healability_hint to disambiguate, so only the page-class codes heal blind;
             # user_code_error is ambiguous (could be a bare `raise`) and stays fail-closed.
-            if failure.error_code == "unsupported_page_operation":
+            if failure.error_code in {"unsupported_page_operation", "browser_operation_failed"}:
                 return HealClassification(healable=True, skip_reason=None)
             return HealClassification(
                 healable=False,
