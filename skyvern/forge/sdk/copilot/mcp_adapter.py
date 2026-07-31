@@ -25,6 +25,7 @@ from mcp.types import (
 )
 from playwright.async_api import Browser, BrowserContext
 
+from skyvern.cli.core.session_manager import request_session_scope
 from skyvern.forge import app
 from skyvern.forge.agent_functions import CopilotCandidateNetworkHop
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -308,7 +309,8 @@ class SkyvernOverlayMCPServer(MCPServer):
         stack = AsyncExitStack()
         await stack.__aenter__()
         client = Client(self._transport)
-        await stack.enter_async_context(client)
+        with request_session_scope(self._context_provider().organization_id):
+            await stack.enter_async_context(client)
         self._client = client
         self._exit_stack = stack
 

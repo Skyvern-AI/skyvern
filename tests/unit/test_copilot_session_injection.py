@@ -191,13 +191,14 @@ class TestMcpBrowserContextBridge:
             # that resolve_browser(session_id=...) relies on.
             args = register_mock.call_args.args
             assert args[0] == ctx.browser_session_id
+            assert register_mock.call_args.kwargs == {"organization_id": ctx.organization_id}
             registered_state = args[1]
             assert isinstance(registered_state, SessionState)
             assert registered_state.context.session_id == ctx.browser_session_id
 
         assert register_mock.call_count == 1
         assert unregister_mock.call_count == 1
-        unregister_mock.assert_called_with(ctx.browser_session_id)
+        unregister_mock.assert_called_with(ctx.browser_session_id, organization_id=ctx.organization_id)
         # Override installed then reset.
         assert [c[0] for c in override_calls] == ["set", "reset"]
 
