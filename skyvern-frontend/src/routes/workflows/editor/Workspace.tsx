@@ -1603,6 +1603,7 @@ function Workspace({
       scriptCacheKey: workflowData.cache_key ?? null,
       aiFallback: workflowData.ai_fallback ?? true,
       enableSelfHealing: workflowData.enable_self_healing ?? false,
+      maskSecrets: workflowData.mask_secrets ?? false,
       runSequentially: workflowData.run_sequentially ?? false,
       sequentialKey: workflowData.sequential_key ?? null,
       finallyBlockLabel:
@@ -1915,6 +1916,7 @@ function Workspace({
       scriptCacheKey: selectedVersion.cache_key,
       aiFallback: selectedVersion.ai_fallback ?? true,
       enableSelfHealing: selectedVersion.enable_self_healing ?? false,
+      maskSecrets: selectedVersion.mask_secrets ?? false,
       runSequentially: selectedVersion.run_sequentially ?? false,
       sequentialKey: selectedVersion.sequential_key ?? null,
       finallyBlockLabel:
@@ -2941,6 +2943,7 @@ function Workspace({
               ai_fallback: saveData.settings.aiFallback,
               enable_self_healing: saveData.settings.enableSelfHealing ?? false,
               adaptive_caching: false,
+              mask_secrets: saveData.settings.maskSecrets,
               code_version:
                 saveData.settings.runWith === "code"
                   ? (saveData.settings.codeVersion ?? 2)

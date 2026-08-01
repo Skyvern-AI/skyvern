@@ -54,6 +54,9 @@ import {
 const PREVENT_OVERLAPPING_RUNS_TOOLTIP =
   "Queues new runs of this agent until any in-progress run finishes. Does not affect block ordering inside a single run; blocks always execute in declared order. Use this when concurrent runs would collide on shared state, such as the same credentials, browser session, or downstream account.";
 
+const MASK_SECRETS_TOOLTIP =
+  "Visually mask secrets while they are typed, so they do not appear in screenshots, recordings, or the live browser view. Turning this on can make login debugging harder because typed values are hidden.";
+
 const SEQUENTIAL_KEY_TOOLTIP =
   "Scope the run queue. Runs with the same key are queued together; runs with different keys can still execute in parallel. Templated against agent inputs, for example {{ account_id }} to serialize per account.";
 
@@ -284,6 +287,17 @@ function WorkflowSettingsEditorBody({
         </div>
       </div>
       <div className="flex flex-col gap-4">
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <Label>Mask Secrets</Label>
+            <HelpTooltip content={MASK_SECRETS_TOOLTIP} />
+            <Switch
+              className="ml-auto"
+              checked={data.maskSecrets}
+              onCheckedChange={(value) => update({ maskSecrets: value })}
+            />
+          </div>
+        </div>
         <div className="space-y-2">
           <div className="flex items-center gap-2">
             <Label>Prevent Overlapping Runs</Label>

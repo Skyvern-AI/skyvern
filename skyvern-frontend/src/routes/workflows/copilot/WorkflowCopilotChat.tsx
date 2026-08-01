@@ -2084,6 +2084,7 @@ export function WorkflowCopilotChat({
             cache_key: normalizedKey,
             ai_fallback: saveData.settings.aiFallback ?? true,
             enable_self_healing: saveData.settings.enableSelfHealing ?? false,
+            mask_secrets: saveData.settings.maskSecrets,
             code_version:
               saveData.settings.runWith === "code"
                 ? (saveData.settings.codeVersion ?? 2)
@@ -2112,6 +2113,7 @@ export function WorkflowCopilotChat({
             webhook_callback_url: saveData.settings.webhookCallbackUrl,
             persist_browser_session: saveData.settings.persistBrowserSession,
             pin_saved_session_ip: saveData.settings.pinSavedSessionIp,
+            mask_secrets: saveData.settings.maskSecrets,
             browser_profile_id: saveData.settings.browserProfileId,
             browser_profile_key: saveData.settings.browserProfileKey,
             model: saveData.settings.model,
