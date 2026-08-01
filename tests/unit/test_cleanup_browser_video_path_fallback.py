@@ -10,22 +10,30 @@ OSS-synced: synthetic ids and example.* placeholders only.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.forge import agent as agent_module
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 
 
-def _make_task(task_id: str = "tsk_1", organization_id: str = "o_1") -> MagicMock:
+def _make_task(
+    task_id: str = "tsk_1",
+    organization_id: str = "o_1",
+    workflow_run_id: str | None = None,
+) -> MagicMock:
     task = MagicMock()
     task.task_id = task_id
     task.organization_id = organization_id
+    task.workflow_run_id = workflow_run_id
     task.webhook_callback_url = None
     return task
 
@@ -295,3 +303,74 @@ async def test_cleanup_preserves_update_path_for_pre_registered_artifact(tmp_pat
     ]
     assert recording_calls == []
     assert video_artifacts[0].video_artifact_id == "a_existing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("artifact_redaction_enabled", [False, True])
+async def test_cleanup_gates_har_and_console_redaction_on_environment_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_redaction_enabled: bool,
+) -> None:
+    har_data = json.dumps(
+        {
+            "log": {
+                "entries": [
+                    {
+                        "request": {
+                            "headers": [{"name": "Authorization", "value": "Bearer token"}],
+                        }
+                    }
+                ]
+            }
+        }
+    ).encode()
+    console_log = b"console secret: console-secret"
+    task = _make_task(workflow_run_id="wr_1")
+    browser_state = _browser_state()
+    context_manager = SimpleNamespace(
+        mask_secrets_enabled_for_run=MagicMock(return_value=False),
+        get_secret_values_for_run=MagicMock(return_value={"console-secret"}),
+    )
+
+    monkeypatch.setattr(
+        agent_module.settings,
+        "ENABLE_SECRET_ARTIFACT_REDACTION",
+        artifact_redaction_enabled,
+    )
+    with patch("skyvern.forge.agent.app") as mock_app:
+        mock_app.WORKFLOW_CONTEXT_MANAGER = context_manager
+        mock_app.BROWSER_MANAGER.cleanup_for_task = AsyncMock(return_value=browser_state)
+        mock_app.BROWSER_MANAGER.get_video_artifacts = AsyncMock(return_value=[])
+        mock_app.BROWSER_MANAGER.get_har_data = AsyncMock(return_value=har_data)
+        mock_app.BROWSER_MANAGER.get_browser_console_log = AsyncMock(return_value=console_log)
+        mock_app.ARTIFACT_MANAGER.create_artifact = AsyncMock(return_value="a_har")
+
+        await ForgeAgent().cleanup_browser_and_create_artifacts(
+            close_browser_on_completion=True,
+            last_step=_make_step(),
+            task=task,
+        )
+
+    har_calls = [
+        call
+        for call in mock_app.ARTIFACT_MANAGER.create_artifact.await_args_list
+        if call.kwargs.get("artifact_type") == ArtifactType.HAR
+    ]
+    console_calls = [
+        call
+        for call in mock_app.ARTIFACT_MANAGER.create_artifact.await_args_list
+        if call.kwargs.get("artifact_type") == ArtifactType.BROWSER_CONSOLE_LOG
+    ]
+    stored_har = har_calls[0].kwargs["data"]
+    stored_console_log = console_calls[0].kwargs["data"]
+    context_manager.mask_secrets_enabled_for_run.assert_not_called()
+    if artifact_redaction_enabled:
+        assert REDACTED_SECRET_PLACEHOLDER.encode() in stored_har
+        assert b"Bearer token" not in stored_har
+        assert REDACTED_SECRET_PLACEHOLDER.encode() in stored_console_log
+        assert b"console-secret" not in stored_console_log
+        context_manager.get_secret_values_for_run.assert_called_once_with("wr_1")
+    else:
+        assert stored_har == har_data
+        assert stored_console_log == console_log
+        context_manager.get_secret_values_for_run.assert_not_called()

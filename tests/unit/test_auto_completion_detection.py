@@ -5,10 +5,12 @@ Covers direct attribute detection in is_auto_completion_input().
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.webeye.actions import handler as handler_module
 from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import apply_secret_visual_mask_to_active_element
 
@@ -111,3 +113,103 @@ async def test_active_element_secret_visual_mask_script_skips_password_inputs() 
     assert 'toLowerCase() === "password"' in expression
     assert "getRootNode" in expression
     assert "data-skyvern-secret-mask" in expression
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("workflow_run_id", "enabled"), [(None, False), ("wr_disabled", False)])
+async def test_secret_visual_mask_helper_skips_inactive_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_run_id: str | None,
+    enabled: bool,
+) -> None:
+    element = SimpleNamespace(apply_secret_visual_mask=AsyncMock())
+    manager = SimpleNamespace(mask_secrets_enabled_for_run=MagicMock(return_value=enabled))
+    monkeypatch.setattr(handler_module.app, "WORKFLOW_CONTEXT_MANAGER", manager)
+    monkeypatch.setattr(handler_module.settings, "ENABLE_SECRET_VISUAL_MASKING", True)
+
+    await handler_module._apply_secret_visual_mask_if_needed(
+        element,
+        workflow_run_id=workflow_run_id,
+        is_secret_value=True,
+        is_totp_value=False,
+    )
+
+    element.apply_secret_visual_mask.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_secret_visual_mask_helper_applies_for_opted_in_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    element = SimpleNamespace(apply_secret_visual_mask=AsyncMock())
+    manager = SimpleNamespace(mask_secrets_enabled_for_run=MagicMock(return_value=True))
+    monkeypatch.setattr(handler_module.app, "WORKFLOW_CONTEXT_MANAGER", manager)
+    monkeypatch.setattr(handler_module.settings, "ENABLE_SECRET_VISUAL_MASKING", True)
+
+    await handler_module._apply_secret_visual_mask_if_needed(
+        element,
+        workflow_run_id="wr_enabled",
+        is_secret_value=True,
+        is_totp_value=False,
+    )
+
+    element.apply_secret_visual_mask.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_secret_visual_mask_helper_skips_when_global_flag_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    element = SimpleNamespace(apply_secret_visual_mask=AsyncMock())
+    manager = SimpleNamespace(mask_secrets_enabled_for_run=MagicMock(return_value=True))
+    monkeypatch.setattr(handler_module.app, "WORKFLOW_CONTEXT_MANAGER", manager)
+    monkeypatch.setattr(handler_module.settings, "ENABLE_SECRET_VISUAL_MASKING", False)
+
+    await handler_module._apply_secret_visual_mask_if_needed(
+        element,
+        workflow_run_id="wr_enabled",
+        is_secret_value=True,
+        is_totp_value=False,
+    )
+
+    element.apply_secret_visual_mask.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_active_element_secret_visual_mask_helper_skips_inactive_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SimpleNamespace(
+        mask_secrets_enabled_for_run=MagicMock(return_value=False),
+        get_secret_values_for_run=MagicMock(return_value={"secret-value"}),
+    )
+    apply_mask = AsyncMock()
+    monkeypatch.setattr(handler_module.app, "WORKFLOW_CONTEXT_MANAGER", manager)
+    monkeypatch.setattr(handler_module.settings, "ENABLE_SECRET_VISUAL_MASKING", True)
+    monkeypatch.setattr(handler_module, "apply_secret_visual_mask_to_active_element", apply_mask)
+
+    await handler_module._apply_active_element_secret_visual_mask_if_needed(MagicMock(), "secret-value", "wr_disabled")
+
+    manager.get_secret_values_for_run.assert_not_called()
+    apply_mask.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_active_element_secret_visual_mask_helper_uses_raw_values_for_opted_in_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SimpleNamespace(
+        mask_secrets_enabled_for_run=MagicMock(return_value=True),
+        get_secret_values_for_run=MagicMock(return_value={"secret-value"}),
+    )
+    apply_mask = AsyncMock()
+    monkeypatch.setattr(handler_module.app, "WORKFLOW_CONTEXT_MANAGER", manager)
+    monkeypatch.setattr(handler_module.settings, "ENABLE_SECRET_VISUAL_MASKING", True)
+    monkeypatch.setattr(handler_module, "apply_secret_visual_mask_to_active_element", apply_mask)
+
+    page = MagicMock()
+    await handler_module._apply_active_element_secret_visual_mask_if_needed(page, "secret-value", "wr_enabled")
+
+    manager.get_secret_values_for_run.assert_called_once_with(
+        "wr_enabled",
+        respect_artifact_redaction_flag=False,
+    )
+    apply_mask.assert_awaited_once_with(page)

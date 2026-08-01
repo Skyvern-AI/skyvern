@@ -1,26 +1,51 @@
+from collections.abc import Callable
+
 from skyvern.forge.sdk.api.llm import api_handler_factory
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 
 
-class _FakeWorkflowContextManager:
-    def get_secret_values_for_run(self, workflow_run_id: str | None, exclude_runtime_otp: bool = False) -> set[str]:
-        return {"real-password"} if workflow_run_id == "wr_redact" else set()
-
-
 def test_redact_prompt_text_removes_real_secret_and_keeps_placeholder(monkeypatch) -> None:
-    monkeypatch.setattr(api_handler_factory.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
-    monkeypatch.setattr(
-        api_handler_factory.app,
-        "WORKFLOW_CONTEXT_MANAGER",
-        _FakeWorkflowContextManager(),
-    )
-
     redacted = api_handler_factory._redact_prompt_text(
         "password real-password id placeholder_ab12_password",
         {"real-password"},
     )
 
     assert redacted == f"password {REDACTED_SECRET_PLACEHOLDER} id placeholder_ab12_password"
+
+
+def test_current_secret_values_for_redaction_ignores_workflow_opt_out(
+    monkeypatch,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+) -> None:
+    monkeypatch.setattr(api_handler_factory.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
+    manager = workflow_context_manager_factory(
+        workflow_run_id="wr_redact",
+        mask_secrets=False,
+        secrets={"password": "real-password"},
+    )
+    monkeypatch.setattr(api_handler_factory.app, "WORKFLOW_CONTEXT_MANAGER", manager)
+
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id="wr_redact")):
+        assert api_handler_factory._current_secret_values_for_redaction() == {"real-password"}
+
+
+def test_current_secret_values_for_redaction_respects_global_flag(
+    monkeypatch,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+) -> None:
+    monkeypatch.setattr(api_handler_factory.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", False)
+    manager = workflow_context_manager_factory(
+        workflow_run_id="wr_redact",
+        mask_secrets=False,
+        secrets={"password": "real-password"},
+    )
+    monkeypatch.setattr(api_handler_factory.app, "WORKFLOW_CONTEXT_MANAGER", manager)
+
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id="wr_redact")):
+        assert api_handler_factory._current_secret_values_for_redaction() == set()
 
 
 def test_redact_message_text_content_redacts_tool_call_arguments() -> None:

@@ -410,6 +410,7 @@ class FakeWorkflowRunContext:
     workflow_run_id = "wr_test"
     browser_session_id = None
     workflow = None
+    mask_secrets = True
 
     def __init__(self, secrets: dict[str, str] | None = None) -> None:
         self.secrets = secrets or {}

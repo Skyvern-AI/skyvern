@@ -68,6 +68,7 @@ def _patch_workflow_context(monkeypatch: pytest.MonkeyPatch, workflow_context: _
         SimpleNamespace(
             WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
                 get_workflow_run_context=lambda _workflow_run_id: workflow_context,
+                mask_secrets_enabled_for_run=lambda _workflow_run_id: False,
             ),
             BROWSER_MANAGER=SimpleNamespace(get_for_task=lambda *_args, **_kwargs: None),
         ),

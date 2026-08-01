@@ -346,13 +346,18 @@ async def test_search_bar_does_not_use_combobox_branch() -> None:
 async def test_secret_valued_action_does_not_trigger_select() -> None:
     """A secret-valued parameter must never enter the selection path: its value would otherwise be
     logged (target_value=...) and sent into the custom-select LLM prompt via target_value=text."""
-    results, el, select_mock = await _run_combobox_input(
-        attrs=_INVALID_BOTH,
-        options=_listbox_with_option(_TARGET),
-        select_success=True,
-        stop_flag=True,
-        is_secret=True,
-    )
+    with patch.object(
+        handler.app.WORKFLOW_CONTEXT_MANAGER,
+        "mask_secrets_enabled_for_run",
+        MagicMock(return_value=True),
+    ):
+        results, el, select_mock = await _run_combobox_input(
+            attrs=_INVALID_BOTH,
+            options=_listbox_with_option(_TARGET),
+            select_success=True,
+            stop_flag=True,
+            is_secret=True,
+        )
     select_mock.assert_not_awaited()
     el.apply_secret_visual_mask.assert_awaited_once_with()
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)

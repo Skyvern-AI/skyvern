@@ -999,6 +999,7 @@ def _build_wrc_with_totp_seed(seed: str = _RFC_TOTP_SEED):
         workflow_permanent_id="wpid",
         workflow_run_id=_WORKFLOW_RUN_ID,
         aws_client=MagicMock(),
+        mask_secrets=True,
     )
     totp_secret_id = wrc.generate_random_secret_id() + "_totp"
     wrc.secrets[totp_secret_id] = BitwardenConstants.TOTP
@@ -1019,6 +1020,7 @@ def _build_wrc_with_identifier(identifier: str = "otp@example.com"):
         workflow_permanent_id="wpid",
         workflow_run_id=_WORKFLOW_RUN_ID,
         aws_client=MagicMock(),
+        mask_secrets=True,
     )
     wrc.values[_CREDENTIAL_KEY] = {"context": "placeholder note"}
     wrc.credential_totp_identifiers[_CREDENTIAL_KEY] = identifier

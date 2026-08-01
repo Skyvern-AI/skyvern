@@ -1,6 +1,6 @@
 import base64
 import json
-from types import SimpleNamespace
+from collections.abc import Callable
 
 import pytest
 
@@ -267,10 +267,44 @@ def test_get_secret_values_for_run_returns_empty_for_unknown_run(monkeypatch: py
     assert manager.get_secret_values_for_run("missing") == set()
 
 
-def test_get_secret_values_for_run_respects_artifact_redaction_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mask_secrets_enabled_for_run_truth_table(
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+) -> None:
+    manager = workflow_context_manager_factory(workflow_run_id="wr_enabled", mask_secrets=True)
+    manager.workflow_run_contexts["wr_disabled"] = workflow_context_manager_factory(
+        workflow_run_id="wr_disabled", mask_secrets=False
+    ).workflow_run_contexts["wr_disabled"]
+
+    assert manager.mask_secrets_enabled_for_run("wr_enabled") is True
+    assert manager.mask_secrets_enabled_for_run("wr_disabled") is False
+    assert manager.mask_secrets_enabled_for_run("missing") is False
+    assert manager.mask_secrets_enabled_for_run(None) is False
+
+
+def test_get_secret_values_for_run_ignores_workflow_opt_out_when_flag_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+) -> None:
+    monkeypatch.setattr(settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
+    manager = workflow_context_manager_factory(
+        workflow_run_id="wr_1",
+        mask_secrets=False,
+        secrets={"password": "super-secret"},
+    )
+
+    assert manager.get_secret_values_for_run("wr_1") == {"super-secret"}
+    assert manager.get_secret_values_for_run("wr_1", respect_artifact_redaction_flag=False) == {"super-secret"}
+
+
+def test_get_secret_values_for_run_returns_empty_when_global_flag_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+) -> None:
     monkeypatch.setattr(settings, "ENABLE_SECRET_ARTIFACT_REDACTION", False)
-    manager = WorkflowContextManager()
-    manager.workflow_run_contexts["wr_1"] = SimpleNamespace(secrets={"password": "super-secret"})
+    manager = workflow_context_manager_factory(
+        workflow_run_id="wr_1",
+        secrets={"password": "super-secret"},
+    )
 
     assert manager.get_secret_values_for_run("wr_1") == set()
     assert manager.get_secret_values_for_run("wr_1", respect_artifact_redaction_flag=False) == {"super-secret"}
@@ -278,16 +312,17 @@ def test_get_secret_values_for_run_respects_artifact_redaction_flag(monkeypatch:
 
 def test_get_secret_values_for_run_returns_filtered_context_and_current_totp_values(
     monkeypatch: pytest.MonkeyPatch,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
-    manager = WorkflowContextManager()
-    manager.workflow_run_contexts["wr_1"] = SimpleNamespace(
+    manager = workflow_context_manager_factory(
+        workflow_run_id="wr_1",
         secrets={
             "password": "super-secret",
             "short_numeric": "587",
             "placeholder_x1y2_password": "placeholder_x1y2_password",
             "sentinel": "OP_TOTP",
-        }
+        },
     )
 
     with skyvern_context.scoped(SkyvernContext(totp_codes={"task_1": "654321", "task_2": None})):
@@ -296,10 +331,13 @@ def test_get_secret_values_for_run_returns_filtered_context_and_current_totp_val
     assert values == {"super-secret", "654321"}
 
 
-def test_get_secret_values_for_run_can_exclude_runtime_otp_values(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_secret_values_for_run_can_exclude_runtime_otp_values(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+) -> None:
     monkeypatch.setattr(settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
-    manager = WorkflowContextManager()
-    manager.workflow_run_contexts["wr_1"] = SimpleNamespace(
+    manager = workflow_context_manager_factory(
+        workflow_run_id="wr_1",
         secrets={
             "placeholder_ab_pw": "hunter2secret",
             "placeholder_cd_otp": "483920",
@@ -311,10 +349,13 @@ def test_get_secret_values_for_run_can_exclude_runtime_otp_values(monkeypatch: p
     assert manager.get_secret_values_for_run("wr_1", exclude_runtime_otp=True) == {"hunter2secret"}
 
 
-def test_get_secret_values_for_run_collects_short_runtime_otp_values(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_secret_values_for_run_collects_short_runtime_otp_values(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+) -> None:
     monkeypatch.setattr(settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
-    manager = WorkflowContextManager()
-    manager.workflow_run_contexts["wr_1"] = SimpleNamespace(
+    manager = workflow_context_manager_factory(
+        workflow_run_id="wr_1",
         secrets={
             "placeholder_ab_pw": "hunter2secret",
             "placeholder_cd_smtp_port": "587",
@@ -326,10 +367,12 @@ def test_get_secret_values_for_run_collects_short_runtime_otp_values(monkeypatch
     assert manager.get_secret_values_for_run("wr_1", exclude_runtime_otp=True) == {"hunter2secret"}
 
 
-def test_get_secret_values_for_run_skips_totp_cache_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_secret_values_for_run_skips_totp_cache_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+) -> None:
     monkeypatch.setattr(settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
-    manager = WorkflowContextManager()
-    manager.workflow_run_contexts["wr_1"] = SimpleNamespace(secrets={}, runtime_otp_values=set())
+    manager = workflow_context_manager_factory(workflow_run_id="wr_1")
 
     with skyvern_context.scoped(
         SkyvernContext(

@@ -45,7 +45,9 @@ def _fake_app(har_data: bytes = b"", browser_log: bytes = b"") -> SimpleNamespac
             create_artifact=AsyncMock(return_value="artifact_1"),
             create_task_archive=AsyncMock(return_value="archive_1"),
         ),
-        WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(get_secret_values_for_run=Mock(return_value={SECRET})),
+        WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
+            get_secret_values_for_run=Mock(return_value={SECRET}),
+        ),
     )
 
 
@@ -79,6 +81,29 @@ async def test_persist_har_data_redacts_secret_and_sensitive_header(monkeypatch:
     assert request["headers"][0]["value"] == REDACTED_SECRET_PLACEHOLDER
     assert REDACTED_SECRET_PLACEHOLDER.encode() in stored_data
     assert SECRET.encode() not in stored_data
+
+
+@pytest.mark.asyncio
+async def test_persist_har_data_skips_all_redaction_when_flag_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_har = _har_bytes()
+    fake_app = _fake_app(har_data=original_har)
+    monkeypatch.setattr(workflow_service_module, "app", fake_app)
+    monkeypatch.setattr(workflow_service_module.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", False)
+
+    browser_state, last_step, workflow, workflow_run = _workflow_objects()
+    service = WorkflowService()
+
+    await service.persist_har_data(browser_state, last_step, workflow, workflow_run)
+
+    fake_app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run.assert_not_called()
+    artifact_kwargs = fake_app.ARTIFACT_MANAGER.create_artifact.await_args.kwargs
+    stored_data = artifact_kwargs["data"]
+    request = json.loads(stored_data)["log"]["entries"][0]["request"]
+
+    assert stored_data == original_har
+    assert request["headers"][0]["value"] == f"Bearer {SECRET}"
 
 
 @pytest.mark.asyncio
