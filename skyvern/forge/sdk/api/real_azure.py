@@ -5,7 +5,7 @@ from mimetypes import add_type, guess_type
 from typing import IO, Self
 
 import structlog
-from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
+from azure.core.exceptions import ResourceNotFoundError
 from azure.identity.aio import ClientSecretCredential, DefaultAzureCredential
 from azure.keyvault.secrets.aio import SecretClient
 from azure.storage.blob import BlobSasPermissions, ContentSettings, StandardBlobTier, generate_blob_sas
@@ -47,9 +47,11 @@ class RealAsyncAzureVaultClient(AsyncAzureVaultClient):
         try:
             secret = await secret_client.get_secret(secret_name)
             return secret.value
-        except Exception as e:
-            LOG.exception("Failed to get secret from Azure Key Vault.", secret_name=secret_name, error=e)
+        except ResourceNotFoundError:
             return None
+        except Exception:
+            LOG.exception("Failed to get secret from Azure Key Vault.", secret_name=secret_name)
+            raise
         finally:
             await secret_client.close()
 
@@ -70,34 +72,12 @@ class RealAsyncAzureVaultClient(AsyncAzureVaultClient):
                 # enabled and readable; fail the write so it retries instead of silently orphaning them.
                 if enumerated_any:
                     raise
-            except HttpResponseError as e:
-                # An identity permitted to set but not list secret versions raises a 401/403 here, and
-                # disabling priors is best-effort, so proceed rather than failing every write. Re-raise any
-                # other status, or a failure after enumerating any versions (a first page of only
-                # current/already-disabled versions leaves `previous_versions` empty yet still means the
-                # error is partial), so the write fails and retries instead of silently leaving the
-                # un-enumerated prior versions enabled and readable.
-                if enumerated_any or e.status_code not in (401, 403):
-                    raise
-                LOG.warning(
-                    "Could not enumerate prior Azure secret versions to disable; proceeding with the write",
-                    secret_name=secret_name,
-                    exc_info=True,
-                )
 
             secret = await secret_client.set_secret(secret_name, secret_value)
             # Azure Key Vault leaves every prior version enabled and readable by explicit version id; disable
             # the ones that predate this write so a rotated/detached secret value can't be read back.
             for version in previous_versions:
-                try:
-                    await secret_client.update_secret_properties(secret_name, version, enabled=False)
-                except Exception:
-                    LOG.warning(
-                        "Failed to disable prior Azure secret version",
-                        secret_name=secret_name,
-                        version=version,
-                        exc_info=True,
-                    )
+                await secret_client.update_secret_properties(secret_name, version, enabled=False)
             return secret.name
         except Exception as e:
             LOG.exception("Failed to create secret from Azure Key Vault.", secret_name=secret_name, error=e)
