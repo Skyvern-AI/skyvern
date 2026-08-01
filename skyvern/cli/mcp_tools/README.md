@@ -87,7 +87,7 @@ Manual config for any MCP client:
 `skyvern_extract` (structured JSON output), `skyvern_screenshot`, `skyvern_find`, `skyvern_validate`, `skyvern_evaluate` (run JavaScript), `skyvern_get_html`, `skyvern_get_value`, `skyvern_get_styles`
 
 ### Authentication & Credentials
-`skyvern_login`, `skyvern_credential_list`, `skyvern_credential_get`, `skyvern_credential_delete`
+`skyvern_login`, `skyvern_credential_list`, `skyvern_credential_get`, `skyvern_credential_delete`, `skyvern_onepassword_items`, `skyvern_onepassword_config_get`, `skyvern_onepassword_config_set`, `skyvern_onepassword_config_clear`, `skyvern_bitwarden_items`, `skyvern_bitwarden_config_get`, `skyvern_bitwarden_config_set`, `skyvern_bitwarden_config_clear`
 
 Supports Skyvern vault, Bitwarden, 1Password, and Azure Key Vault with automatic 2FA/TOTP.
 
