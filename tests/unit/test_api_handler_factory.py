@@ -186,6 +186,64 @@ async def test_custom_openrouter_client_is_scoped_to_request(
 
 
 @pytest.mark.asyncio
+async def test_openrouter_extra_body_reaches_async_openai(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider_routing = {
+        "order": ["cloudflare", "parasail"],
+        "allow_fallbacks": False,
+        "quantizations": ["fp8"],
+    }
+    llm_config = LLMConfig(
+        "openrouter/deepseek/deepseek-v4-flash-0731",
+        [],
+        supports_vision=False,
+        add_assistant_prefix=False,
+        max_completion_tokens=4096,
+        temperature=0.2,
+        reasoning_effort="medium",
+        litellm_params={
+            "extra_body": {
+                "provider": provider_routing,
+                "reasoning_effort": "high",
+                "temperature": 0.1,
+            }
+        },
+    )
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+
+    completion = MagicMock()
+    completion.model_dump.return_value = {"provider": "Cloudflare", "service_tier": "standard"}
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(return_value=completion)
+    monkeypatch.setattr(api_handler_factory, "AsyncOpenAI", MagicMock(return_value=client))
+    monkeypatch.setattr(api_handler_factory.litellm, "ModelResponse", MagicMock())
+
+    caller = LLMCaller("OPENROUTER_DEEPSEEK_V4_FLASH_0731")
+    active_parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
+    active_parameters.update(llm_config.litellm_params or {})
+    await caller._dispatch_llm_call(messages=[{"role": "user", "content": "test"}], **active_parameters)
+
+    request_kwargs = client.chat.completions.create.await_args.kwargs
+    assert request_kwargs["extra_body"] == {"provider": provider_routing}
+    assert request_kwargs["temperature"] == 0.2
+    assert request_kwargs["reasoning_effort"] == "medium"
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (SimpleNamespace(provider="Cloudflare", service_tier="flex"), ("Cloudflare", "flex")),
+        (SimpleNamespace(_hidden_params={"custom_llm_provider": "openrouter"}), ("openrouter", None)),
+        (SimpleNamespace(_hidden_params={}), (None, None)),
+        (SimpleNamespace(provider=None, service_tier=None), (None, None)),
+        (SimpleNamespace(provider=123, service_tier={"tier": "flex"}), (None, None)),
+        (SimpleNamespace(), (None, None)),
+    ],
+)
+def test_response_routing_metadata_is_string_or_none(response: object, expected: tuple[str | None, str | None]) -> None:
+    assert api_handler_factory._response_routing_metadata(response) == expected
+
+
+@pytest.mark.asyncio
 async def test_cached_content_not_added_for_non_gemini(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that cached_content is NOT added to non-Gemini models like GPT-4."""
     # Setup context with caching enabled
