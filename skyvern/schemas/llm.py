@@ -49,6 +49,11 @@ class LiteLLMParams(TypedDict, total=False):
     service_tier: str | None
     extra_headers: dict[str, str] | None
     timeout: float | None
+    # Raw request-body keys, passed through without LiteLLM's per-provider
+    # translation. Use only when a provider accepts a param that LiteLLM would
+    # strip under drop_params=True (unrecognized model + provider pairing);
+    # prefer a real field above whenever LiteLLM knows how to translate it.
+    extra_body: dict[str, Any] | None
 
 
 def _settings() -> Any:
