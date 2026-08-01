@@ -2271,6 +2271,31 @@ if settings.ENABLE_OPENROUTER:
     )
 
     LLMConfigRegistry.register_config(
+        "OPENROUTER_DEEPSEEK_V4_FLASH_0731",
+        LLMConfig(
+            "openrouter/deepseek/deepseek-v4-flash-0731",
+            ["OPENROUTER_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                api_key=settings.OPENROUTER_API_KEY,
+                api_base=settings.OPENROUTER_API_BASE,
+                api_version=None,
+                model_info={"model_name": "openrouter/deepseek/deepseek-v4-flash-0731"},
+                extra_body={
+                    "reasoning_effort": "high",
+                    "provider": {
+                        "order": ["cloudflare", "parasail"],
+                        "allow_fallbacks": False,
+                        "quantizations": ["fp8"],
+                    },
+                },
+            ),
+        ),
+    )
+
+    LLMConfigRegistry.register_config(
         "OPENROUTER_XIAOMI_MIMO_V2_5",
         LLMConfig(
             "openrouter/xiaomi/mimo-v2.5",

@@ -571,6 +571,18 @@ def _slim_log_fields(context: SkyvernContext | None, prompt_name: str | None) ->
     }
 
 
+def _response_routing_metadata(response: object) -> tuple[str | None, str | None]:
+    provider = getattr(response, "provider", None)
+    if provider is None:
+        hidden_params = getattr(response, "_hidden_params", None)
+        provider = hidden_params.get("custom_llm_provider") if isinstance(hidden_params, dict) else None
+    service_tier = getattr(response, "service_tier", None)
+    return (
+        provider if isinstance(provider, str) else None,
+        service_tier if isinstance(service_tier, str) else None,
+    )
+
+
 @runtime_checkable
 class RouterWithModelList(Protocol):
     model_list: list[dict[str, Any]]
@@ -2026,6 +2038,7 @@ class LLMAPIHandlerFactory:
                 image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
                     screenshots, model_used or main_model_group, response
                 )
+                resolved_provider, service_tier = _response_routing_metadata(response)
                 LOG.info(
                     "LLM API handler duration metrics",
                     llm_key=llm_key,
@@ -2047,7 +2060,8 @@ class LLMAPIHandlerFactory:
                     image_tokens=image_tokens if image_tokens > 0 else None,
                     image_cost=image_cost if image_cost > 0 else None,
                     image_tokens_source=image_source,
-                    service_tier=getattr(response, "service_tier", None),
+                    resolved_provider=resolved_provider,
+                    service_tier=service_tier,
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_slim_log_fields(context, prompt_name),
                     **_enrich_tree_log_fields(context, step),
@@ -2594,6 +2608,7 @@ class LLMAPIHandlerFactory:
                 image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
                     screenshots, actual_model or llm_config.model_name, response
                 )
+                resolved_provider, service_tier = _response_routing_metadata(response)
                 LOG.info(
                     "LLM API handler duration metrics",
                     llm_key=llm_key,
@@ -2615,7 +2630,8 @@ class LLMAPIHandlerFactory:
                     image_tokens=image_tokens if image_tokens > 0 else None,
                     image_cost=image_cost if image_cost > 0 else None,
                     image_tokens_source=image_source,
-                    service_tier=getattr(response, "service_tier", None),
+                    resolved_provider=resolved_provider,
+                    service_tier=service_tier,
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_slim_log_fields(context, prompt_name),
                     **_enrich_tree_log_fields(context, step),
@@ -3115,6 +3131,7 @@ class LLMCaller:
             image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
                 screenshots, actual_model or self.llm_config.model_name, response
             )
+            resolved_provider, service_tier = _response_routing_metadata(response)
             LOG.info(
                 "LLM API handler duration metrics",
                 llm_key=self.llm_key,
@@ -3138,6 +3155,8 @@ class LLMCaller:
                 image_tokens=image_tokens if image_tokens > 0 else None,
                 image_cost=image_cost if image_cost > 0 else None,
                 image_tokens_source=image_source,
+                resolved_provider=resolved_provider,
+                service_tier=service_tier,
                 llm_screenshots_enabled=llm_screenshots_enabled,
                 **_slim_log_fields(context, prompt_name),
                 **_enrich_tree_log_fields(context, step),
@@ -3297,6 +3316,13 @@ class LLMCaller:
                 openai_params["service_tier"] = active_parameters["service_tier"]
             if active_parameters.get("reasoning_effort"):
                 openai_params["reasoning_effort"] = active_parameters["reasoning_effort"]
+            extra_body = active_parameters.get("extra_body")
+            if isinstance(extra_body, dict):
+                request_extra_body = dict(extra_body)
+                for parameter_name in openai_params:
+                    request_extra_body.pop(parameter_name, None)
+                if request_extra_body:
+                    openai_params["extra_body"] = request_extra_body
 
             try:
                 completion = await openai_client.chat.completions.create(
