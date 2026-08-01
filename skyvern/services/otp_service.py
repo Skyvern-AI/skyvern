@@ -602,7 +602,7 @@ async def _get_otp_value_from_url(
             organization_id=organization_id,
         )
     except Exception as e:
-        LOG.error(
+        LOG.warning(
             "Failed to get otp value from url",
             exception_type=type(e).__name__,
         )
