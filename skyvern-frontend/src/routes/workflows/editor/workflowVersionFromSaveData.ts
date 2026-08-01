@@ -65,6 +65,7 @@ export function workflowVersionFromSaveData(
     ai_fallback: settings.aiFallback,
     enable_self_healing: settings.enableSelfHealing ?? false,
     adaptive_caching: workflow.adaptive_caching ?? false,
+    mask_secrets: settings.maskSecrets,
     code_version:
       settings.runWith === "code" ? (settings.codeVersion ?? 2) : null,
     run_sequentially: settings.runSequentially,
