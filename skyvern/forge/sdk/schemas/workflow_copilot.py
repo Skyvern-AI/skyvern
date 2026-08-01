@@ -99,7 +99,8 @@ class WorkflowCopilotTurnMode(StrEnum):
     BUILD = "build"
     EDIT = "edit"
     DIAGNOSE = "diagnose"
-    DOCS_ANSWER = "docs_answer"
+    # Wire-compatible mirror of the generic answer-only TurnIntent mode.
+    ANSWER = "docs_answer"
     DRAFT_ONLY = "draft_only"
     CLARIFY = "clarify"
     REFUSE = "refuse"

@@ -42,7 +42,9 @@ class TurnIntentMode(StrEnum):
     BUILD = "build"
     EDIT = "edit"
     DIAGNOSE = "diagnose"
-    DOCS_ANSWER = "docs_answer"
+    # Keep the established wire value for persisted turns and API consumers;
+    # the mode is defined by its answer-only effect, not by one content family.
+    ANSWER = "docs_answer"
     DRAFT_ONLY = "draft_only"
     CLARIFY = "clarify"
     REFUSE = "refuse"
@@ -58,10 +60,11 @@ _EDIT_SPECIFIC_TARGET_ENTITY_TYPES = frozenset(
 
 NO_MUTATION_TURN_INTENT_MODES = frozenset(
     {
-        TurnIntentMode.DOCS_ANSWER,
+        TurnIntentMode.ANSWER,
         TurnIntentMode.DIAGNOSE,
         TurnIntentMode.CLARIFY,
         TurnIntentMode.REFUSE,
+        TurnIntentMode.UNKNOWN,
     }
 )
 
@@ -69,9 +72,10 @@ NO_MUTATION_TURN_INTENT_MODES = frozenset(
 # the intra-turn read-context override away from explicitly answer-only turns.
 READ_CONTEXT_DENIED_MODES = frozenset(
     {
-        TurnIntentMode.DOCS_ANSWER,
+        TurnIntentMode.ANSWER,
         TurnIntentMode.REFUSE,
         TurnIntentMode.CLARIFY,
+        TurnIntentMode.UNKNOWN,
     }
 )
 
@@ -144,7 +148,7 @@ _DEFAULT_EXPECTED_OUTPUT_BY_MODE: dict[TurnIntentMode, TurnIntentExpectedOutput]
     TurnIntentMode.BUILD: TurnIntentExpectedOutput.WORKFLOW_DRAFT,
     TurnIntentMode.EDIT: TurnIntentExpectedOutput.WORKFLOW_UPDATE,
     TurnIntentMode.DIAGNOSE: TurnIntentExpectedOutput.RUN_RESULT,
-    TurnIntentMode.DOCS_ANSWER: TurnIntentExpectedOutput.EXPLANATION,
+    TurnIntentMode.ANSWER: TurnIntentExpectedOutput.EXPLANATION,
     TurnIntentMode.DRAFT_ONLY: TurnIntentExpectedOutput.WORKFLOW_DRAFT,
     TurnIntentMode.CLARIFY: TurnIntentExpectedOutput.CLARIFICATION,
     TurnIntentMode.REFUSE: TurnIntentExpectedOutput.REFUSAL,
@@ -202,6 +206,19 @@ class TurnIntent(BaseModel):
         if mapped_expected_output := _DEFAULT_EXPECTED_OUTPUT_BY_MODE.get(self.mode):
             self.expected_output = mapped_expected_output
         return self
+
+    @property
+    def is_inline_only(self) -> bool:
+        """Whether the resolved effect is a prose answer with no external authority."""
+        authority = self.authority
+        return (
+            self.expected_output == TurnIntentExpectedOutput.EXPLANATION
+            and authority.may_answer_without_mutation
+            and not authority.may_update_workflow
+            and not authority.may_run_blocks
+            and not authority.may_read_run_context
+            and not authority.requires_user_input
+        )
 
     def to_trace_data(self) -> dict[str, object]:
         data: dict[str, object] = {
@@ -597,7 +614,7 @@ async def classify_turn_intent(
             required_context_values=", ".join(key.value for key in RequiredContextKey),
             reason_code_values=", ".join(reason.value for reason in _CLASSIFIER_REASON_CODES),
             user_message=escape_code_fences(safe_user_message),
-            request_policy_summary=escape_code_fences(request_policy.prompt_summary()),
+            request_policy_summary=escape_code_fences(request_policy.trust_floor_summary()),
             workflow_yaml=escape_code_fences(
                 redact_raw_secrets_for_prompt(workflow_yaml)[:_WORKFLOW_YAML_PROMPT_MAX_CHARS]
             ),
@@ -812,8 +829,8 @@ def build_turn_intent(
     if classification is not None and TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE in classification.reason_codes:
         infeasibility_question = (classification.missing_context_question or "").strip()
         if not infeasibility_question:
-            # Questionless infeasibility fails open: drop the verdict and proceed at request-policy
-            # authority rather than stranding the turn in an answerless CLARIFY.
+            # Drop the unusable verdict rather than stranding the turn in an answerless
+            # CLARIFY. The resulting UNKNOWN still cannot earn side-effect authority.
             LOG.warning("turn-intent dropped questionless structural-infeasibility verdict, proceeding")
             classification = classification.model_copy(
                 update={
@@ -926,10 +943,15 @@ def build_turn_intent(
         expected_output = TurnIntentExpectedOutput.RUN_RESULT
         reason_codes.append(TurnIntentReasonCode.RECOVERY_FROM_RUN_CONTEXT)
 
-    if mode == TurnIntentMode.DOCS_ANSWER:
+    if mode == TurnIntentMode.ANSWER:
         authority.may_update_workflow = False
         authority.may_run_blocks = False
         required_context.append(RequiredContextKey.DOCS_CONTEXT)
+    elif mode == TurnIntentMode.UNKNOWN:
+        # Insufficient signal cannot inherit RequestPolicy's permissive defaults.
+        # A later, classified turn can earn side-effect authority; this turn has not.
+        authority.may_update_workflow = False
+        authority.may_run_blocks = False
     elif mode == TurnIntentMode.DRAFT_ONLY:
         authority.may_run_blocks = False
     elif mode == TurnIntentMode.CLARIFY:

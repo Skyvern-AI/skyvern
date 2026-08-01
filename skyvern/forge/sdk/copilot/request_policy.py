@@ -599,6 +599,7 @@ class RequestPolicy:
     classifier_non_runtime_requested_output_evidence_sources: list[str] = field(default_factory=list)
     completion_contract_status: str = "absent"
     request_slot_failure_kind: str | None = None
+    _authoring_pending: bool = field(default=False, repr=False, compare=False)
 
     def graded_completion_criteria(self) -> list[CompletionCriterion]:
         return [criterion for criterion in self.completion_criteria if not criterion.method_mandated]
@@ -761,6 +762,20 @@ class RequestPolicy:
         if self.invalid_credential_ids:
             lines.append("invalid_credential_ids: " + ", ".join(f"`{cid}`" for cid in self.invalid_credential_ids))
         return "\n".join(lines)
+
+    def trust_floor_summary(self) -> str:
+        return "\n".join(
+            [
+                f"testing_intent: {self.testing_intent}",
+                f"credential_input_kind: {self.credential_input_kind}",
+                f"clarification_reason: {self.clarification_reason}",
+                f"allow_update_workflow: {self.allow_update_workflow}",
+                f"allow_run_blocks: {self.allow_run_blocks}",
+                f"allow_missing_credentials_in_draft: {self.allow_missing_credentials_in_draft}",
+                f"raw_secret_handling: {self.raw_secret_handling}",
+                f"classifier_status: {self.classifier_status}",
+            ]
+        )
 
 
 def request_policy_has_present_completion_contract(request_policy: RequestPolicy | None) -> bool:
@@ -3981,6 +3996,7 @@ async def _classify_request(
     prompt = prompt_engine.load_prompt(
         template=PROMPT_NAME,
         terminal_action_reconciliation=False,
+        trust_floor_only=False,
         user_message=escape_code_fences(safe_user_message),
         raw_secret_present=str(raw_secret_present).lower(),
         workflow_yaml=escape_code_fences(redact_raw_secrets_for_prompt(workflow_yaml)[:2048]),
@@ -5186,6 +5202,134 @@ def _workflow_credential_inputs_unbound(workflow_yaml: str) -> list[dict[str, st
     return findings
 
 
+async def _classify_request_trust_floor(
+    user_message: str,
+    workflow_yaml: str,
+    chat_history: list[WorkflowCopilotChatHistoryMessage],
+    global_llm_context: str,
+    handler: LLMAPIHandler | None,
+    *,
+    config: CopilotConfig | None = None,
+) -> RequestPolicy:
+    requested_output_path_aliases = config.requested_output_path_aliases if config is not None else {}
+    ids = _credential_ids(user_message)
+    raw_secret_present = _raw_secret_detected(user_message)
+    structural_reason = _structural_clarification_reason(user_message)
+    if raw_secret_present and handler is None:
+        policy = _classifier_fallback_policy(
+            ids,
+            raw_secret_present=True,
+            failure_kind="raw_secret_no_handler",
+            user_message=user_message,
+            requested_output_path_aliases=requested_output_path_aliases,
+        )
+        policy.authoring_intent = "pending"
+        policy.completion_contract = None
+        policy.completion_criteria = []
+        policy.completion_contract_status = "absent"
+        policy._authoring_pending = True
+        return policy
+    if structural_reason != "none" and not raw_secret_present:
+        return RequestPolicy(
+            authoring_intent="pending",
+            credential_input_kind="credential_id" if ids else "none",
+            credential_refs=ids,
+            requires_user_clarification=True,
+            clarification_reason=structural_reason,
+            _authoring_pending=True,
+        )
+    if handler is None:
+        policy = _classifier_fallback_policy(
+            ids,
+            raw_secret_present=False,
+            failure_kind="missing_handler",
+            user_message=user_message,
+            requested_output_path_aliases=requested_output_path_aliases,
+        )
+        policy.authoring_intent = "pending"
+        policy.completion_contract = None
+        policy.completion_criteria = []
+        policy.completion_contract_status = "absent"
+        policy._authoring_pending = True
+        return policy
+
+    safe_user_message = redact_raw_secrets_for_prompt(user_message) if raw_secret_present else user_message
+    safe_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
+    transcript = build_transcript_context(chat_history, safe_user_message)
+    prompt = prompt_engine.load_prompt(
+        template=PROMPT_NAME,
+        terminal_action_reconciliation=False,
+        trust_floor_only=True,
+        user_message=escape_code_fences(safe_user_message),
+        raw_secret_present=str(raw_secret_present).lower(),
+        workflow_yaml=escape_code_fences(redact_raw_secrets_for_prompt(workflow_yaml)[:2048]),
+        earliest_user_turn=transcript.earliest_user_turn,
+        latest_prior_user_turn=transcript.latest_prior_user_turn,
+        latest_assistant_turn=transcript.latest_assistant_turn,
+        retained_history=transcript.retained_history,
+        global_llm_context=escape_code_fences(redact_raw_secrets_for_prompt(safe_global_llm_context)[:2048]),
+    )
+    classifier_deadline = time.monotonic() + settings.COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS
+    raw, failure_kind, retry_count = await _run_request_policy_classifier(
+        handler,
+        prompt,
+        deadline=classifier_deadline,
+    )
+    raw_payload = _coerce_classifier_payload(raw)
+    if raw_payload is None:
+        policy = _classifier_fallback_policy(
+            ids,
+            raw_secret_present=raw_secret_present,
+            failure_kind=failure_kind if failure_kind != "none" else "provider_error",
+            retry_count=retry_count,
+            user_message=user_message,
+            requested_output_path_aliases=requested_output_path_aliases,
+        )
+        policy.authoring_intent = "pending"
+        policy.completion_contract = None
+        policy.completion_criteria = []
+        policy.completion_contract_status = "absent"
+        policy._authoring_pending = True
+        return policy
+
+    policy = _classification_from_raw(raw_payload)
+    policy.classifier_retry_count = retry_count
+    policy.authoring_intent = "pending"
+    policy.completion_contract = None
+    policy.completion_criteria = []
+    policy._authoring_pending = True
+    policy.raw_secret_detected = raw_secret_present or policy.credential_input_kind == "raw_secret"
+    classifier_credential_refs = [_canonicalize_credential_ref(ref) for ref in policy.credential_refs]
+    policy.credential_refs = _clean_list(classifier_credential_refs + ids)
+    if raw_secret_present:
+        if policy.raw_secret_handling == "redacted_draft":
+            if policy.credential_input_kind == "raw_secret":
+                policy.credential_input_kind = "placeholder"
+            policy.raw_secret_evidence = None
+        else:
+            policy.credential_input_kind = "raw_secret"
+            policy.raw_secret_handling = "block"
+            policy.clarification_reason = structural_reason if structural_reason != "none" else "raw_secret"
+    if ids and policy.credential_input_kind != "raw_secret":
+        classifier_named_a_credential = any(not _credential_ids(ref) for ref in classifier_credential_refs)
+        classifier_target_wins = (
+            policy.credential_input_kind == "credential_name" and classifier_named_a_credential
+        ) or (policy.credential_input_kind == "website_stored_credential" and bool(policy.login_page_urls))
+        if not classifier_target_wins:
+            policy.credential_input_kind = "credential_id"
+    if (
+        policy.credential_input_kind == "raw_secret"
+        and not raw_secret_present
+        and not _verify_raw_secret_evidence(policy.raw_secret_evidence, user_message)
+    ):
+        policy.credential_input_kind = "credential_id" if ids else "none"
+        policy.clarification_reason = "none"
+        policy.requires_user_clarification = False
+        policy.raw_secret_evidence = None
+    policy.completion_contract_status = "absent"
+    return policy
+
+
 async def build_request_policy(
     *,
     user_message: str,
@@ -5196,16 +5340,19 @@ async def build_request_policy(
     handler: LLMAPIHandler | None,
     active_criteria: list[CompletionCriterion] | None = None,
     config: CopilotConfig | None = None,
+    _preclassified_policy: RequestPolicy | None = None,
 ) -> RequestPolicy:
-    policy = await _classify_request(
-        user_message,
-        workflow_yaml,
-        chat_history,
-        global_llm_context,
-        handler,
-        active_criteria=active_criteria,
-        config=config,
-    )
+    policy = _preclassified_policy
+    if policy is None:
+        policy = await _classify_request(
+            user_message,
+            workflow_yaml,
+            chat_history,
+            global_llm_context,
+            handler,
+            active_criteria=active_criteria,
+            config=config,
+        )
     policy.raw_secret_detected = policy.raw_secret_detected or policy.credential_input_kind == "raw_secret"
     policy.existing_workflow_credential_ids = sorted(workflow_credential_ids(workflow_yaml))
     policy.existing_workflow_credential_origins = {
@@ -5369,7 +5516,7 @@ async def build_request_policy(
         else:
             policy.clarification_reason = "login_credentials_unresolved"
 
-    if policy.authoring_intent == "defer_authoring":
+    if policy.authoring_intent == "defer_authoring" and not policy._authoring_pending:
         policy.allow_update_workflow = False
         policy.allow_run_blocks = False
         if not any(is_defer_authoring_durable_fill_criterion(criterion) for criterion in policy.completion_criteria):
@@ -5380,4 +5527,78 @@ async def build_request_policy(
         LOG.warning("request-policy fallback policy used", **trace_data)
     with copilot_span("request_policy", data=trace_data):
         LOG.info("request-policy decision", **trace_data)
+    return policy
+
+
+async def build_request_policy_trust_floor(
+    *,
+    user_message: str,
+    workflow_yaml: str,
+    chat_history: list[WorkflowCopilotChatHistoryMessage],
+    global_llm_context: str,
+    organization_id: str,
+    handler: LLMAPIHandler | None,
+    config: CopilotConfig | None = None,
+) -> RequestPolicy:
+    policy = await _classify_request_trust_floor(
+        user_message,
+        workflow_yaml,
+        chat_history,
+        global_llm_context,
+        handler,
+        config=config,
+    )
+    return await build_request_policy(
+        user_message=user_message,
+        workflow_yaml=workflow_yaml,
+        chat_history=chat_history,
+        global_llm_context=global_llm_context,
+        organization_id=organization_id,
+        handler=handler,
+        config=config,
+        _preclassified_policy=policy,
+    )
+
+
+async def materialize_request_policy_authoring(
+    policy: RequestPolicy,
+    *,
+    user_message: str,
+    workflow_yaml: str,
+    chat_history: list[WorkflowCopilotChatHistoryMessage],
+    global_llm_context: str,
+    handler: LLMAPIHandler | None,
+    active_criteria: list[CompletionCriterion] | None = None,
+    config: CopilotConfig | None = None,
+) -> RequestPolicy:
+    if not policy._authoring_pending:
+        return policy
+    enriched = await _classify_request(
+        user_message,
+        workflow_yaml,
+        chat_history,
+        global_llm_context,
+        handler,
+        active_criteria=active_criteria,
+        config=config,
+    )
+    policy.authoring_intent = enriched.authoring_intent
+    policy.completion_contract = enriched.completion_contract
+    policy.completion_criteria = list(enriched.completion_criteria)
+    policy.classifier_non_runtime_requested_output_evidence_sources = list(
+        enriched.classifier_non_runtime_requested_output_evidence_sources
+    )
+    policy.completion_contract_status = enriched.completion_contract_status
+    policy.request_slot_failure_kind = enriched.request_slot_failure_kind
+    policy._authoring_pending = False
+    if policy.authoring_intent == "defer_authoring":
+        policy.allow_update_workflow = False
+        policy.allow_run_blocks = False
+        if not any(is_defer_authoring_durable_fill_criterion(criterion) for criterion in policy.completion_criteria):
+            policy.completion_criteria = list(policy.completion_criteria) + [_defer_authoring_durable_fill_criterion()]
+    LOG.info(
+        "request-policy authoring enrichment materialized",
+        completion_criteria_count=len(policy.completion_criteria),
+        completion_contract_status=policy.completion_contract_status,
+    )
     return policy

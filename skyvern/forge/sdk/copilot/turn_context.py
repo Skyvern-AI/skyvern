@@ -373,7 +373,7 @@ class TurnContextAssembler:
         return packet
 
     def _should_include_workflow(self, intent: TurnIntent, required: set[RequiredContextKey]) -> bool:
-        if intent.mode == TurnIntentMode.DOCS_ANSWER:
+        if intent.mode == TurnIntentMode.ANSWER:
             return False
         # Edit-capable turns still need workflow context even when the shadow classifier
         # did not include a specific workflow key yet.
@@ -399,7 +399,7 @@ class TurnContextAssembler:
         return RunnableDraftContext(rendered_summary=summary, block_labels=labels)
 
     def _should_include_run_context(self, intent: TurnIntent, required: set[RequiredContextKey]) -> bool:
-        if intent.mode == TurnIntentMode.DOCS_ANSWER:
+        if intent.mode == TurnIntentMode.ANSWER:
             return False
         return RequiredContextKey.LATEST_RUN_RESULT in required or intent.mode in _RUN_MODES
 

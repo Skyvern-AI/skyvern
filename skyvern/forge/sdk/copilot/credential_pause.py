@@ -592,15 +592,11 @@ async def preflight_credential_pause(
     if resolution is None or policy is None:
         return resolution
     policy.user_response_policy = "proceed"
-    if policy.authoring_intent == "defer_authoring":
-        # Lifting the credential clarification must not also lift the user's
-        # explicit defer_authoring hold. Re-apply it, overriding the run grant
-        # a connect resolution stamped via _apply_connected_credential_to_policy.
-        policy.allow_update_workflow = False
-        policy.allow_run_blocks = False
-    else:
-        policy.allow_update_workflow = True
-        policy.allow_run_blocks = True
+    # Trust-floor policy has not classified authoring intent yet. Grant the
+    # provisional policy baseline; the resumed TurnIntent pipeline decides
+    # whether the requested effect earns authoring authority.
+    policy.allow_update_workflow = True
+    policy.allow_run_blocks = True
     if resolution.action == "skip":
         policy.allow_missing_credentials_in_draft = True
         policy.requires_user_clarification = False
