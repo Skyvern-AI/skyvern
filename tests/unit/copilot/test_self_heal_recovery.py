@@ -134,6 +134,7 @@ async def test_recovery_uses_browser_only_surface_and_no_native_tools(monkeypatc
         "console_messages",
         "select_option",
         "press_key",
+        "wait_for_either_state",
     }
     assert "get_block_schema" not in alias_map
 
