@@ -9,7 +9,6 @@ a challenge started by someone else simply resolves to a row that does not exist
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import secrets
 
@@ -32,4 +31,4 @@ def consent_nonce(state: str, initiator_id: str | None) -> str:
     such callback fails the lookup instead of falling through to the token exchange.
     """
     material = f"{initiator_id or _UNIDENTIFIED_INITIATOR}\x00{state}".encode()
-    return hmac.new(settings.SECRET_KEY.encode(), material, hashlib.sha256).hexdigest()
+    return hmac.digest(settings.SECRET_KEY.encode(), material, "sha256").hex()
