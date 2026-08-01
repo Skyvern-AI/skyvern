@@ -1,5 +1,4 @@
 import asyncio
-import inspect
 import io
 import os
 import time
@@ -90,6 +89,7 @@ _REDACTABLE_TEXT_ARTIFACT_TYPES: frozenset[ArtifactType] = frozenset(
         ArtifactType.BROWSER_CONSOLE_LOG,
         ArtifactType.SKYVERN_LOG,
         ArtifactType.SKYVERN_LOG_RAW,
+        ArtifactType.HASHED_HREF_MAP,
     }
 )
 
@@ -106,14 +106,6 @@ def _maybe_redact_artifact_data(artifact_type: ArtifactType, data: bytes, workfl
         secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(resolved_workflow_run_id)
     except Exception:
         return data
-    if inspect.isawaitable(secret_values):
-        close = getattr(secret_values, "close", None)
-        if callable(close):
-            close()
-        return data
-    if not isinstance(secret_values, set):
-        return data
-
     if artifact_type == ArtifactType.HAR:
         return redact_har_bytes(data, secret_values)
     if not secret_values:

@@ -1,7 +1,6 @@
 import asyncio
 import copy
 import dataclasses
-import inspect
 import json
 import re
 import time
@@ -274,13 +273,6 @@ def _current_secret_values_for_redaction() -> set[str]:
             exclude_runtime_otp=True,
         )
     except Exception:
-        return set()
-    if inspect.isawaitable(secret_values):
-        close = getattr(secret_values, "close", None)
-        if callable(close):
-            close()
-        return set()
-    if not isinstance(secret_values, set):
         return set()
     return secret_values
 
@@ -2141,6 +2133,9 @@ class LLMAPIHandlerFactory:
         llm_key: str,
         base_parameters: dict[str, Any] | None = None,
     ) -> LLMAPIHandler:
+        if settings.ENV == "local" and LLMConfigRegistry.get_config_issue(llm_key):
+            return dummy_llm_api_handler
+
         try:
             llm_config = LLMConfigRegistry.get_config(llm_key)
         except InvalidLLMConfigError:

@@ -1548,6 +1548,7 @@ async def _set_up_workflow_context(workflow: Workflow, workflow_run_id: str, org
         [],
         None,
         workflow,
+        mask_secrets=getattr(workflow, "mask_secrets", False),
     )
 
 

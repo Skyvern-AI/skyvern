@@ -276,18 +276,27 @@ def _is_totp_sentinel(value: Any) -> bool:
 async def _apply_secret_visual_mask_if_needed(
     skyvern_element: SkyvernElement,
     *,
+    workflow_run_id: str | None,
     is_secret_value: bool,
     is_totp_value: bool,
     is_totp_sequence: bool = False,
 ) -> None:
-    if settings.ENABLE_SECRET_VISUAL_MASKING and (is_secret_value or is_totp_value or is_totp_sequence):
+    if not settings.ENABLE_SECRET_VISUAL_MASKING or not app.WORKFLOW_CONTEXT_MANAGER.mask_secrets_enabled_for_run(
+        workflow_run_id
+    ):
+        return
+    if is_secret_value or is_totp_value or is_totp_sequence:
         await skyvern_element.apply_secret_visual_mask()
 
 
 async def _apply_active_element_secret_visual_mask_if_needed(
     page: Page, text: str | None, workflow_run_id: str | None
 ) -> None:
-    if not settings.ENABLE_SECRET_VISUAL_MASKING or not text or workflow_run_id is None:
+    if (
+        not settings.ENABLE_SECRET_VISUAL_MASKING
+        or not text
+        or not app.WORKFLOW_CONTEXT_MANAGER.mask_secrets_enabled_for_run(workflow_run_id)
+    ):
         return
     try:
         secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(
@@ -4777,6 +4786,7 @@ async def handle_input_text_action(
 
     await _apply_secret_visual_mask_if_needed(
         skyvern_element,
+        workflow_run_id=task.workflow_run_id,
         is_secret_value=is_secret_value,
         is_totp_value=is_totp_value,
         is_totp_sequence=is_multi_field_totp,
@@ -4834,12 +4844,6 @@ async def handle_input_text_action(
             if await blocking_element.is_editable():
                 skyvern_element = blocking_element
                 tag_name = blocking_element.get_tag_name()
-                await _apply_secret_visual_mask_if_needed(
-                    skyvern_element,
-                    is_secret_value=is_secret_value,
-                    is_totp_value=is_totp_value,
-                    is_totp_sequence=is_multi_field_totp,
-                )
                 if used_bare_nanp:
                     # The tel plan read constraints from the original element; re-derive them from
                     # the element actually being filled.
@@ -4848,6 +4852,13 @@ async def handle_input_text_action(
                     tel_e164_fallback = _nanp_e164_fallback(
                         tel_source_text or "", pattern=tel_pattern, maxlength=tel_maxlength
                     )
+                await _apply_secret_visual_mask_if_needed(
+                    skyvern_element,
+                    workflow_run_id=task.workflow_run_id,
+                    is_secret_value=is_secret_value,
+                    is_totp_value=is_totp_value,
+                    is_totp_sequence=is_multi_field_totp,
+                )
     except Exception:
         LOG.info(
             "Failed to find the blocking element, continue with the original element",
@@ -9164,6 +9175,7 @@ async def select_from_emerging_elements(
         await input_element.scroll_into_view()
         await _apply_secret_visual_mask_if_needed(
             input_element,
+            workflow_run_id=task.workflow_run_id,
             is_secret_value=is_dropdown_secret_value,
             is_totp_value=is_dropdown_totp_value,
         )
@@ -9373,6 +9385,7 @@ async def select_from_dropdown(
             await input_element.scroll_into_view()
             await _apply_secret_visual_mask_if_needed(
                 input_element,
+                workflow_run_id=task.workflow_run_id,
                 is_secret_value=is_dropdown_secret_value,
                 is_totp_value=is_dropdown_totp_value,
             )

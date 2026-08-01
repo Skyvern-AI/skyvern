@@ -140,6 +140,7 @@ class WorkflowRunContext:
         block_outputs: dict[str, Any] | None = None,
         workflow: "Workflow | None" = None,
         inherited_workflow_system_prompt: str | None = None,
+        mask_secrets: bool = False,
     ) -> Self:
         # key is label name
         workflow_run_context = cls(
@@ -150,6 +151,7 @@ class WorkflowRunContext:
             aws_client=aws_client,
             workflow=workflow,
             inherited_workflow_system_prompt=inherited_workflow_system_prompt,
+            mask_secrets=mask_secrets,
         )
 
         workflow_run_context.organization_id = organization.organization_id
@@ -229,12 +231,14 @@ class WorkflowRunContext:
         aws_client: AsyncAWSClient,
         workflow: "Workflow | None" = None,
         inherited_workflow_system_prompt: str | None = None,
+        mask_secrets: bool = False,
     ) -> None:
         self.workflow_title = workflow_title
         self.workflow_id = workflow_id
         self.workflow_permanent_id = workflow_permanent_id
         self.workflow_run_id = workflow_run_id
         self.workflow = workflow
+        self.mask_secrets: bool = mask_secrets
         # Joined raw workflow_system_prompt(s) from ancestor workflows (outermost
         # first) collected by walking workflow_run.parent_workflow_run_id at
         # execute_workflow time. Jinja-rendered on demand and concatenated with
@@ -1734,6 +1738,7 @@ class WorkflowContextManager:
         block_outputs: dict[str, Any] | None = None,
         workflow: "Workflow | None" = None,
         inherited_workflow_system_prompt: str | None = None,
+        mask_secrets: bool = False,
     ) -> WorkflowRunContext:
         workflow_run_context = await WorkflowRunContext.init(
             self.aws_client,
@@ -1749,6 +1754,7 @@ class WorkflowContextManager:
             block_outputs,
             workflow,
             inherited_workflow_system_prompt=inherited_workflow_system_prompt,
+            mask_secrets=mask_secrets,
         )
         self.workflow_run_contexts[workflow_run_id] = workflow_run_context
         return workflow_run_context
@@ -1759,6 +1765,12 @@ class WorkflowContextManager:
 
     def remove_workflow_run_context(self, workflow_run_id: str) -> None:
         self.workflow_run_contexts.pop(workflow_run_id, None)
+
+    def mask_secrets_enabled_for_run(self, workflow_run_id: str | None) -> bool:
+        if workflow_run_id is None:
+            return False
+        context = self.workflow_run_contexts.get(workflow_run_id)
+        return context is not None and context.mask_secrets
 
     def get_secret_values_for_run(
         self,
