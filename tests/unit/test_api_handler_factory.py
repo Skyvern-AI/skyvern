@@ -1750,3 +1750,56 @@ async def test_truncation_retry_skipped_when_fallback_served(monkeypatch: pytest
         await handler(prompt='{"actions": []}', prompt_name="extract-actions")
 
     assert router_cls.last_instance.calls == ["primary-group"]
+
+
+@pytest.mark.asyncio
+async def test_extra_body_from_litellm_params_reaches_completion(monkeypatch: pytest.MonkeyPatch) -> None:
+    """litellm_params["extra_body"] must survive to the acompletion call.
+
+    A top-level reasoning_effort is stripped by drop_params=True whenever LiteLLM
+    does not recognize the model as a reasoning model, which silently disables
+    thinking on custom OpenAI-compatible deployments. extra_body is the escape
+    hatch: LiteLLM forwards it verbatim, so it must not be swallowed en route.
+    """
+    context = MagicMock()
+    context.vertex_cache_name = None
+    context.use_prompt_caching = False
+    context.cached_static_prompt = None
+    context.hashed_href_map = {}
+
+    llm_config = LLMConfig(
+        model_name="openai/some-custom-deployment",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+        litellm_params={
+            "api_key": "test-key",
+            "api_base": "https://llm.example.test/openai/v1",
+            "extra_body": {"reasoning_effort": "high"},
+        },
+    )
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.api.llm.api_handler_factory.LLMConfigRegistry.get_config", lambda _: llm_config
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.api.llm.api_handler_factory.LLMConfigRegistry.is_router_config", lambda _: False
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.api.llm.api_handler_factory.skyvern_context.current", lambda: context)
+    monkeypatch.setattr(
+        api_handler_factory, "llm_messages_builder", AsyncMock(return_value=[{"role": "user", "content": "test"}])
+    )
+    monkeypatch.setattr(api_handler_factory.litellm, "completion_cost", lambda _: 0.0)
+
+    completion_params: dict[str, Any] = {}
+
+    async def mock_acompletion(*args: Any, **kwargs: Any) -> FakeLLMResponse:
+        completion_params.update(kwargs)
+        return FakeLLMResponse("some-custom-deployment")
+
+    monkeypatch.setattr(api_handler_factory.litellm, "acompletion", AsyncMock(side_effect=mock_acompletion))
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler("TEST_EXTRA_BODY_PASSTHROUGH")
+    await handler(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+
+    assert completion_params["extra_body"] == {"reasoning_effort": "high"}
