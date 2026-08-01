@@ -115,9 +115,32 @@ def test_sanitize_run_blocks_debug_does_not_mutate_extracted_data() -> None:
     assert original_block["extracted_data"] is original_extracted
 
 
-def test_sanitize_other_tools_do_not_touch_block_screenshot_b64() -> None:
-    # `run_blocks_and_collect_debug` does not attach nested `screenshot_b64`;
-    # if one somehow shows up there, leave it alone so behavior is scoped.
+def test_sanitize_run_blocks_debug_strips_block_screenshot_b64() -> None:
+    # `run_blocks_and_collect_debug` now attaches at-failure `screenshot_b64` to failed blocks
+    # (SKY-13250). The image reaches the model through `data.screenshot_base64`, so the raw bytes
+    # are stripped here as they are for `get_run_results` — leaving them crowds out the sibling
+    # fields, `final_url` among them.
+    result = {
+        "ok": False,
+        "data": {
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "a",
+                    "status": "failed",
+                    "screenshot_b64": "raw_base64_bytes",
+                    "final_url": "https://portal.example.com/mfa",
+                }
+            ],
+        },
+    }
+    sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
+    assert sanitized["data"]["blocks"][0]["screenshot_b64"].startswith("[base64 image omitted")
+    assert sanitized["data"]["blocks"][0]["final_url"] == "https://portal.example.com/mfa"
+
+
+def test_sanitize_unrelated_tools_do_not_touch_block_screenshot_b64() -> None:
+    # The strip is scoped to the two tools that carry failed-block payloads.
     result = {
         "ok": True,
         "data": {
@@ -131,7 +154,7 @@ def test_sanitize_other_tools_do_not_touch_block_screenshot_b64() -> None:
             ],
         },
     }
-    sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
+    sanitized = sanitize_tool_result_for_llm("update_workflow", result)
     assert sanitized["data"]["blocks"][0]["screenshot_b64"] == "stays_here"
 
 
