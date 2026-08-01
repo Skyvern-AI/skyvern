@@ -162,6 +162,7 @@ export interface ActivityEntry {
 // Closed vocabulary of the backend TurnOutcome.response_kind enum. Unknown
 // wire values parse to null so a newer backend cannot crash the renderer.
 export type TurnResponseKind =
+  | "answer"
   | "build"
   | "clarify"
   | "diagnose"
@@ -293,7 +294,8 @@ export function parseUtcIsoMs(iso: string | null | undefined): number | null {
 }
 
 export function parseResponseKind(value: unknown): TurnResponseKind | null {
-  return value === "build" ||
+  return value === "answer" ||
+    value === "build" ||
     value === "clarify" ||
     value === "diagnose" ||
     value === "refuse" ||
@@ -1421,7 +1423,7 @@ function adjudicatedSummaryParts(
     if (turn.responseKind === "refuse") {
       return { headline: "Declined", accent: "qa", glyph: "✦" };
     }
-    if (turn.responseKind === "diagnose") {
+    if (turn.responseKind === "answer" || turn.responseKind === "diagnose") {
       return { headline: "Answered", accent: "qa", glyph: "✦" };
     }
     if (
