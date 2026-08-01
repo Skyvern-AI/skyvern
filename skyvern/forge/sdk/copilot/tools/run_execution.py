@@ -483,27 +483,94 @@ async def _fetch_last_screenshot_b64(task_id: str, organization_id: str) -> str 
         return None
 
 
+async def _fetch_run_block_screenshot_b64(workflow_run_block_id: str, organization_id: str) -> str | None:
+    try:
+        artifact = await app.DATABASE.artifacts.get_artifact_by_entity_id(
+            artifact_type=ArtifactType.SCREENSHOT_LLM,
+            organization_id=organization_id,
+            workflow_run_block_id=workflow_run_block_id,
+        )
+        if not artifact:
+            return None
+        artifact_bytes = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
+        if not artifact_bytes:
+            return None
+        return base64.b64encode(artifact_bytes).decode("utf-8")
+    except Exception:
+        LOG.debug(
+            "Failed to fetch run-block screenshot for failed block",
+            workflow_run_block_id=workflow_run_block_id,
+            exc_info=True,
+        )
+        return None
+
+
+async def _fetch_failed_block_screenshot_b64(block: Any, organization_id: str) -> str | None:
+    """Resolve a failed block's at-failure screenshot.
+
+    Code blocks persist theirs on the workflow_run_block, so read that first. The task_v2
+    lookup filters on observer_cruise_id — it can never match a code block — and is kept only
+    so runs whose screenshots resolved through it before keep resolving.
+    """
+    if block.workflow_run_block_id:
+        b64 = await _fetch_run_block_screenshot_b64(block.workflow_run_block_id, organization_id)
+        if b64 is not None:
+            return b64
+    if block.task_id:
+        return await _fetch_last_screenshot_b64(block.task_id, organization_id)
+    return None
+
+
 async def _attach_failed_block_screenshots(
     blocks: list,
     results: list[dict[str, Any]],
     organization_id: str,
 ) -> None:
-    """For failed blocks with a task_id, fetch the last SCREENSHOT_LLM artifact."""
-    task_id_to_block: dict[str, dict] = {
-        block.task_id: block_result
+    """Attach the at-failure screenshot and final URL to every failed block that has them."""
+    failed = [
+        (block, block_result)
         for block, block_result in zip(blocks, results)
-        if block.task_id and block_result.get("status") in _FAILED_BLOCK_STATUSES
-    }
-    if not task_id_to_block:
+        if block_result.get("status") in _FAILED_BLOCK_STATUSES
+    ]
+    if not failed:
         return
 
-    task_ids = list(task_id_to_block.keys())
     screenshots = await asyncio.gather(
-        *(_fetch_last_screenshot_b64(task_id, organization_id) for task_id in task_ids),
+        *(_fetch_failed_block_screenshot_b64(block, organization_id) for block, _ in failed),
     )
-    for task_id, b64 in zip(task_ids, screenshots):
+    for (block, block_result), b64 in zip(failed, screenshots):
         if b64 is not None:
-            task_id_to_block[task_id]["screenshot_b64"] = b64
+            block_result["screenshot_b64"] = b64
+        if block.final_url:
+            block_result["final_url"] = block.final_url
+        if b64 is not None or block.final_url:
+            LOG.info(
+                "Attached at-failure evidence to failed block",
+                workflow_run_block_id=block.workflow_run_block_id,
+                block_type=block_result.get("block_type"),
+                has_screenshot=b64 is not None,
+                final_url=block.final_url,
+            )
+
+
+def _resolve_run_screenshot_b64(
+    *,
+    live_capture: str | None,
+    results: list[dict[str, Any]],
+    run_ok: bool,
+) -> str | None:
+    """Pick the screenshot the model sees for this run.
+
+    Only data.screenshot_base64 becomes a model-visible image, and the live capture that fills
+    it is skipped on dispatched runs — so a failed run falls back to its first failed block's
+    at-failure screenshot. A successful run never promotes one: a healed or continue_on_failure
+    block must not put a failure image in front of the model.
+    """
+    if live_capture is not None:
+        return live_capture
+    if run_ok:
+        return None
+    return next((r["screenshot_b64"] for r in results if r.get("screenshot_b64")), None)
 
 
 # Block types that establish browser state (loaded page / authenticated
@@ -2066,6 +2133,7 @@ async def _run_blocks_and_collect_debug(
     ctx.last_run_blocks_block_labels = list(dict.fromkeys(block.label for block in run_block_rows if block.label))
 
     await _attach_action_traces(blocks, results, ctx.organization_id)
+    await _attach_failed_block_screenshots(blocks, results, ctx.organization_id)
 
     # final_status is guaranteed set here: every non-success exit returns
     # above, and the success path always populates final_status.
@@ -2187,6 +2255,7 @@ async def _run_blocks_and_collect_debug(
         result_data["runtime_frontier_anchor_url"] = runtime_frontier_anchor_url
     if runtime_frontier_starter_url_seeded:
         result_data["runtime_frontier_starter_url_seeded"] = True
+    screenshot_b64 = _resolve_run_screenshot_b64(live_capture=screenshot_b64, results=results, run_ok=run_ok)
     if screenshot_b64 is not None:
         result_data["screenshot_base64"] = screenshot_b64
     if not run_ok and run and getattr(run, "failure_reason", None):
