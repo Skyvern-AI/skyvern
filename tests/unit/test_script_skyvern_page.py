@@ -7,6 +7,7 @@ terminate() (raises ScriptTerminationException for Code 2.0 cached execution),
 and wait() (accepts both seconds= and timeout_ms= parameter styles).
 """
 
+import asyncio
 import inspect
 import re
 import time
@@ -1551,6 +1552,115 @@ class TestActionSubclassPersistence:
         assert isinstance(action, MoveAction)
         assert action.x == 100
         assert action.y == 200
+
+    @pytest.mark.asyncio
+    async def test_cached_script_action_persists_execution_window(self, mock_scraped_page, mock_ai):
+        from skyvern.webeye.actions.action_types import ActionType
+
+        script_page = self._build_script_page(mock_scraped_page, mock_ai)
+        script_page._wait_for_page_ready_before_action = AsyncMock()
+        script_page._create_screenshot_after_execution = AsyncMock()
+        script_page._create_html_action_after_execution = AsyncMock()
+        captured: list = []
+        context = self._build_context()
+
+        async def execute(_page, **_kwargs):
+            await asyncio.sleep(0.01)
+
+        async def fake_create_action(action):
+            captured.append(action)
+            action.action_id = "act_test"
+            return action
+
+        with (
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
+                return_value=context,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.workflow_params.create_action",
+                new=AsyncMock(side_effect=fake_create_action),
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.workflow_params.update_action_reasoning",
+                new=AsyncMock(),
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.script_run_context_manager.get_run_context",
+                return_value=None,
+            ),
+            patch("skyvern.core.script_generations.script_skyvern_page.settings.CACHED_ACTION_DELAY_SECONDS", 0),
+        ):
+            await script_page._decorate_call(execute, ActionType.CLICK, selector="#go")
+
+        assert len(captured) == 1
+        action = captured[0]
+        assert action.started_at is not None
+        assert action.finished_at is not None
+        assert action.started_at <= action.finished_at
+
+    @pytest.mark.asyncio
+    async def test_cached_script_window_excludes_download_detection_baseline(self, mock_scraped_page, mock_ai):
+        import time as time_module
+        from pathlib import Path
+
+        from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
+        from skyvern.webeye.actions.action_types import ActionType
+
+        script_page = self._build_script_page(mock_scraped_page, mock_ai)
+        script_page._wait_for_page_ready_before_action = AsyncMock()
+        script_page._create_screenshot_after_execution = AsyncMock()
+        script_page._create_html_action_after_execution = AsyncMock()
+        captured: list = []
+        context = self._build_context()
+        context.browser_session_id = None
+        during_baseline: list = []
+
+        def fake_download_dir(workflow_run_id):
+            time_module.sleep(0.002)
+            during_baseline.append(naive_utc_now())
+            return Path("/nonexistent-download-dir")
+
+        async def execute(_page, **_kwargs):
+            await asyncio.sleep(0.01)
+
+        async def fake_create_action(action):
+            captured.append(action)
+            action.action_id = "act_test"
+            return action
+
+        with (
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
+                return_value=context,
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.workflow_params.create_action",
+                new=AsyncMock(side_effect=fake_create_action),
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.workflow_params.update_action_reasoning",
+                new=AsyncMock(),
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.script_run_context_manager.get_run_context",
+                return_value=None,
+            ),
+            patch("skyvern.core.script_generations.script_skyvern_page.settings.CACHED_ACTION_DELAY_SECONDS", 0),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.get_path_for_workflow_download_directory",
+                side_effect=fake_download_dir,
+            ),
+        ):
+            await script_page._decorate_call(execute, ActionType.CLICK, selector="#go")
+
+        assert during_baseline, "download-detection baseline never ran"
+        assert len(captured) == 1
+        action = captured[0]
+        # The window starts at the action itself: started_at is stamped after the
+        # download-detection baseline I/O, never before it.
+        assert action.started_at is not None
+        assert action.started_at >= during_baseline[0]
 
     @pytest.mark.asyncio
     async def test_scroll_persists_scroll_x_and_scroll_y(self, mock_scraped_page, mock_ai):

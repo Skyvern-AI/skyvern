@@ -738,6 +738,69 @@ class TestGemini3ReasoningEffortExperiment:
         assert params["thinking_level"] == "minimal"
 
 
+class TestThinkingBudgetOptimization:
+    @pytest.mark.parametrize("reasoning_effort", ["medium", "high"])
+    def test_xai_reasoning_model_preserves_configured_reasoning_effort(
+        self, reasoning_effort: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(api_handler_factory.litellm, "supports_reasoning", lambda model: True)
+
+        llm_config = LLMConfig(
+            model_name="xai/grok-4.5",
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            reasoning_effort=reasoning_effort,
+        )
+        params = LLMAPIHandlerFactory.get_api_parameters(llm_config)
+
+        LLMAPIHandlerFactory._apply_thinking_budget_optimization(
+            params, new_budget=1024, llm_config=llm_config, prompt_name="extract-actions"
+        )
+
+        assert params["reasoning_effort"] == reasoning_effort
+
+    @pytest.mark.parametrize("reasoning_effort", ["medium", "high"])
+    def test_non_xai_reasoning_model_clamps_configured_reasoning_effort(
+        self, reasoning_effort: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(api_handler_factory.litellm, "supports_reasoning", lambda model: True)
+
+        llm_config = LLMConfig(
+            model_name="gpt-5",
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            reasoning_effort=reasoning_effort,
+        )
+        params = LLMAPIHandlerFactory.get_api_parameters(llm_config)
+
+        LLMAPIHandlerFactory._apply_thinking_budget_optimization(
+            params, new_budget=1024, llm_config=llm_config, prompt_name="extract-actions"
+        )
+
+        assert params["reasoning_effort"] == "low"
+
+    def test_other_reasoning_model_defaults_to_low_without_configured_reasoning_effort(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(api_handler_factory.litellm, "supports_reasoning", lambda model: True)
+
+        llm_config = LLMConfig(
+            model_name="deepseek/deepseek-reasoner",
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+        )
+        params = LLMAPIHandlerFactory.get_api_parameters(llm_config)
+
+        LLMAPIHandlerFactory._apply_thinking_budget_optimization(
+            params, new_budget=1024, llm_config=llm_config, prompt_name="extract-actions"
+        )
+
+        assert params["reasoning_effort"] == "low"
+
+
 # SKY-10200 — runtime tests for the router timeout-precedence fix and per-hop
 # fallback chain expansion. These complement the config-shape tests in
 # tests/cloud/test_llm_router_fallback.py by pinning the api_handler_factory

@@ -12,6 +12,7 @@ from skyvern.forge.sdk.api.real_gcp import RealAsyncGcsStorageClient
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import SENSITIVE_SHARE_URL_EXPIRY_HOURS
 from skyvern.forge.sdk.artifact.storage.gcs import GcsStorage
+from skyvern.forge.sdk.artifact.storage.recording_test_helpers import fake_prepared_recording
 
 TEST_BUCKET = "test-gcs-bucket"
 TEST_ORGANIZATION_ID = "test-org-123"
@@ -92,19 +93,28 @@ class TestGcsStorageBrowserSessionFiles:
     async def test_sync_browser_session_file_with_date(self, gcs_storage: GcsStorageForTests, tmp_path: Path) -> None:
         test_file = tmp_path / "recording.webm"
         test_file.write_bytes(b"fake video data")
+        prepared_file = tmp_path / "recording.mp4"
+        prepared_file.write_bytes(b"fake mp4 data")
 
-        uri = await gcs_storage.sync_browser_session_file(
-            organization_id=TEST_ORGANIZATION_ID,
-            browser_session_id=TEST_BROWSER_SESSION_ID,
-            artifact_type="videos",
-            local_file_path=str(test_file),
-            remote_path="recording.webm",
-            date="2025-01-15",
-        )
+        with patch(
+            "skyvern.forge.sdk.artifact.storage.gcs.prepare_recording_for_upload",
+            lambda path: fake_prepared_recording(path, str(prepared_file)),
+        ):
+            with patch("skyvern.forge.sdk.artifact.storage.gcs.sync_run_recording_clips", new=AsyncMock()):
+                uri = await gcs_storage.sync_browser_session_file(
+                    organization_id=TEST_ORGANIZATION_ID,
+                    browser_session_id=TEST_BROWSER_SESSION_ID,
+                    artifact_type="videos",
+                    local_file_path=str(test_file),
+                    remote_path="recording.webm",
+                    date="2025-01-15",
+                )
 
-        expected_uri = f"gs://{TEST_BUCKET}/v1/{settings.ENV}/{TEST_ORGANIZATION_ID}/browser_sessions/{TEST_BROWSER_SESSION_ID}/videos/2025-01-15/recording.webm"
+        expected_uri = f"gs://{TEST_BUCKET}/v1/{settings.ENV}/{TEST_ORGANIZATION_ID}/browser_sessions/{TEST_BROWSER_SESSION_ID}/videos/2025-01-15/recording.mp4"
         assert uri == expected_uri
-        gcs_storage.async_client.upload_file_from_path.assert_called_once()
+        gcs_storage.async_client.upload_file_from_path.assert_called_once_with(
+            expected_uri, str(prepared_file), storage_class=STORAGE_CLASS_STANDARD, tags={}
+        )
 
     async def test_sync_browser_session_file_without_date(
         self, gcs_storage: GcsStorageForTests, tmp_path: Path
