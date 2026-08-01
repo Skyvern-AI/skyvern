@@ -221,7 +221,7 @@ def _derive_response_kind(
         return "answer"
     # Refusals and repeat-reply recover escalations are complete answer-only
     # replies, not halted work — their text must survive envelope rendering.
-    if workflow_mutated is False and turn_outcome_response_kind in ("diagnose", "refuse", "recover"):
+    if workflow_mutated is False and turn_outcome_response_kind in ("answer", "diagnose", "refuse", "recover"):
         return "answer"
     return "stopped"
 

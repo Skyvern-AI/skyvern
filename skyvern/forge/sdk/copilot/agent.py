@@ -174,9 +174,10 @@ from skyvern.forge.sdk.copilot.request_policy import (
     RAW_SECRET_REFUSAL_SENTINEL,
     CompletionCriterion,
     RequestPolicy,
-    build_request_policy,
+    build_request_policy_trust_floor,
     credential_prompt_reason,
     is_defer_authoring_durable_fill_criterion,
+    materialize_request_policy_authoring,
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, run_outcome_display_reason
@@ -540,6 +541,7 @@ def _store_request_policy_on_context(
     policy: RequestPolicy,
     policy_inputs: RequestPolicyGuardrailInputs,
     turn_intent_classifier_result: TurnIntentClassifierResult | None = None,
+    reconcile_completion_criteria: bool = True,
 ) -> None:
     agent_user_message, policy_chat_history_text = _request_policy_agent_inputs(
         policy,
@@ -549,7 +551,8 @@ def _store_request_policy_on_context(
     )
     ctx.turn_intent_classifier_result = turn_intent_classifier_result
     _derive_turn_intent_on_context(ctx, policy, policy_inputs)
-    _reconcile_completion_criteria_on_context(ctx, policy, policy_inputs)
+    if reconcile_completion_criteria:
+        _reconcile_completion_criteria_on_context(ctx, policy, policy_inputs)
     ctx.request_policy = policy
     ctx.allow_untested_workflow_draft = policy.testing_intent == "skip_test"
     ctx.user_message = agent_user_message
@@ -584,6 +587,50 @@ def _derive_turn_intent_on_context(
         classifier_result=ctx.turn_intent_classifier_result,
         fix_origin=policy_inputs.fix_origin,
     )
+
+
+async def _materialize_authoring_for_resolved_intent(
+    ctx: CopilotContext,
+    policy: RequestPolicy,
+    policy_inputs: RequestPolicyGuardrailInputs,
+) -> None:
+    """Fill authoring policy only after the resolved effect earns it."""
+    turn_intent = ctx.turn_intent
+    if not isinstance(turn_intent, TurnIntent) or not (
+        turn_intent.authority.may_update_workflow or turn_intent.authority.may_run_blocks
+    ):
+        return
+    await materialize_request_policy_authoring(
+        policy,
+        user_message=policy_inputs.user_message,
+        workflow_yaml=policy_inputs.workflow_yaml,
+        chat_history=policy_inputs.chat_history_messages,
+        global_llm_context=policy_inputs.global_llm_context,
+        handler=policy_inputs.request_policy_handler,
+        active_criteria=_stored_active_completion_criteria(policy_inputs),
+        config=ctx.copilot_config,
+    )
+    _reconcile_completion_criteria_on_context(ctx, policy, policy_inputs)
+    _derive_turn_intent_on_context(ctx, policy, policy_inputs)
+
+
+async def _resume_turn_intent_after_preflight_credential(
+    ctx: CopilotContext,
+    policy: RequestPolicy,
+    policy_inputs: RequestPolicyGuardrailInputs,
+) -> None:
+    """Resume the staged intent pipeline after a credential pause lifts its policy block."""
+    if ctx.turn_intent_classifier_result is None:
+        ctx.turn_intent_classifier_result = await classify_turn_intent(
+            user_message=policy_inputs.user_message,
+            workflow_yaml=policy_inputs.workflow_yaml,
+            chat_history=policy_inputs.chat_history_messages,
+            global_llm_context=policy_inputs.global_llm_context,
+            request_policy=policy,
+            handler=policy_inputs.turn_intent_handler,
+        )
+    _derive_turn_intent_on_context(ctx, policy, policy_inputs)
+    await _materialize_authoring_for_resolved_intent(ctx, policy, policy_inputs)
 
 
 def _turn_intent_log_fields(intent: TurnIntent | None) -> dict[str, Any]:
@@ -656,6 +703,7 @@ def _build_system_prompt(
     tool_usage_guide: str,
     config: CopilotConfig | None = None,
     security_rules: str | None = None,
+    answer_only: bool = False,
 ) -> str:
     copilot_config = config or CopilotConfig(security_rules=security_rules or "")
     template = copilot_config.prompt_template.removesuffix(".j2")
@@ -668,6 +716,7 @@ def _build_system_prompt(
         current_datetime=datetime_boundary,
         tool_usage_guide=tool_usage_guide,
         security_rules=copilot_config.security_rules,
+        answer_only=answer_only,
     )
     stable_prefix, boundary, dynamic_suffix = prompt_with_boundary.partition(datetime_boundary)
     if boundary:
@@ -677,7 +726,7 @@ def _build_system_prompt(
         # suffix, so its complete rendered prompt is safe to mark stable.
         stable_prefix = prompt_with_boundary
         dynamic_suffix = ""
-    if copilot_config.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+    if not answer_only and copilot_config.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         dynamic_suffix = f"{dynamic_suffix}\n\n{_render_code_only_browser_authoring_prompt()}"
     return CacheableSystemInstructions(stable_prefix, dynamic_suffix)
 
@@ -1230,6 +1279,7 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
 
 def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -> Callable[[object, object], str]:
     base_system_prompt = _build_system_prompt(tool_usage_guide=tool_usage_guide, config=config)
+    answer_only_system_prompt = _build_system_prompt(tool_usage_guide="", config=config, answer_only=True)
 
     def instructions(context: object, _agent: object) -> str:
         if not isinstance(context, _AgentInstructionsContext):
@@ -1240,53 +1290,46 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
         policy = ctx.request_policy
         if not isinstance(policy, RequestPolicy):
             return base_system_prompt
-        policy_summary = escape_code_fences(redact_raw_secrets_for_prompt(policy.prompt_summary()))
-        dynamic_context = (
-            "\n\nREQUEST POLICY:\n```yaml\n"
-            + policy_summary
-            + "\n```\nFollow this policy. If `allow_run_blocks` is false, do not call block-running tools. "
-            + "Exception: when `clarification_reason` is `workflow_credential_inputs_unbound` or "
-            + "`credential_name_unresolved` and "
-            + "`allow_missing_credentials_in_draft` is true, call `update_and_run_blocks`; it will save the draft "
-            + "workflow and skip the browser run with a credential setup message. "
-            + "If `raw_secret_handling` is `redacted_draft`, build only from the redacted request, do not run blocks, "
-            + "and tell the user to store the redacted secret as a saved credential before testing. "
-            + "If `resolved_credentials` are present, use those `credential_id` values. "
-            + "If `resolved_signin_email` is present, that address signs in: bind it to the workflow as a "
-            + "workflow input parameter with that value as the default, so the saved workflow can be re-run "
-            + "under a different address, and do not ask for a saved password credential for that login."
-        )
-        dynamic_context = (
-            dynamic_context
-            + _runtime_verification_evidence_prompt(ctx)
-            + _recorded_build_test_outcome_prompt(ctx)
-            + _code_authoring_repair_context_prompt(ctx)
-            + _synthesized_block_offer_prompt(ctx)
-            + todo_list_prompt(ctx)
-            + _docs_answer_turn_directive(ctx.turn_intent)
-        )
-        if isinstance(base_system_prompt, CacheableSystemInstructions):
+        answer_only = isinstance(ctx.turn_intent, TurnIntent) and ctx.turn_intent.is_inline_only
+        selected_system_prompt = answer_only_system_prompt if answer_only else base_system_prompt
+        summary = policy.trust_floor_summary() if answer_only else policy.prompt_summary()
+        policy_summary = escape_code_fences(redact_raw_secrets_for_prompt(summary))
+        if answer_only:
+            dynamic_context = (
+                "\n\nREQUEST POLICY TRUST FLOOR:\n```yaml\n"
+                + policy_summary
+                + "\n```\nFollow the trust floor while answering inline."
+            )
+        else:
+            dynamic_context = (
+                "\n\nREQUEST POLICY:\n```yaml\n"
+                + policy_summary
+                + "\n```\nFollow this policy. If `allow_run_blocks` is false, do not call block-running tools. "
+                + "Exception: when `clarification_reason` is `workflow_credential_inputs_unbound` or "
+                + "`credential_name_unresolved` and "
+                + "`allow_missing_credentials_in_draft` is true, call `update_and_run_blocks`; it will save the "
+                + "draft workflow and skip the browser run with a credential setup message. "
+                + "If `raw_secret_handling` is `redacted_draft`, build only from the redacted request, do not run "
+                + "blocks, and tell the user to store the redacted secret as a saved credential before testing. "
+                + "If `resolved_credentials` are present, use those `credential_id` values. "
+                + "If `resolved_signin_email` is present, that address signs in: bind it to the workflow as a "
+                + "workflow input parameter with that value as the default, so the saved workflow can be re-run "
+                + "under a different address, and do not ask for a saved password credential for that login."
+                + _runtime_verification_evidence_prompt(ctx)
+                + _recorded_build_test_outcome_prompt(ctx)
+                + _code_authoring_repair_context_prompt(ctx)
+                + _synthesized_block_offer_prompt(ctx)
+                + todo_list_prompt(ctx)
+            )
+        if isinstance(selected_system_prompt, CacheableSystemInstructions):
             return CacheableSystemInstructions(
-                base_system_prompt.stable_prefix,
-                base_system_prompt.dynamic_suffix + dynamic_context,
+                selected_system_prompt.stable_prefix,
+                selected_system_prompt.dynamic_suffix + dynamic_context,
                 cache_namespace=ctx.workflow_copilot_chat_id,
             )
-        return base_system_prompt + dynamic_context
+        return selected_system_prompt + dynamic_context
 
     return instructions
-
-
-def _docs_answer_turn_directive(turn_intent: TurnIntent | None) -> str:
-    """Prompt-side complement to the no-mutation tool gate — keeps a docs-answer
-    turn from substituting a routing question or build offer for the inline answer."""
-    if not isinstance(turn_intent, TurnIntent) or turn_intent.mode != TurnIntentMode.DOCS_ANSWER:
-        return ""
-    return (
-        "\n\nTURN INTENT: docs_answer\n"
-        "This turn is a documentation or explanation question. Answer it inline in the user's language. "
-        "Do not ask whether the user wants a workflow change instead, do not re-ask a confirmation the "
-        "prior turn already covered, and do not offer to build an example workflow in place of answering."
-    )
 
 
 def _build_user_context(
@@ -1576,10 +1619,10 @@ def _native_tools_for_turn(
     turn_intent: TurnIntent | None,
     request_policy: RequestPolicy | None = None,
 ) -> list[Any]:
-    # Keep native tools registered even when the current turn is not allowed to
-    # use them. The tool implementations enforce TurnIntent/RequestPolicy
-    # authority and return structured blockers; removing a tool lets the model
-    # hit an SDK-level ModelBehaviorError if static prompt text still names it.
+    if isinstance(turn_intent, TurnIntent) and turn_intent.is_inline_only:
+        return []
+    # Draft-only turns keep permitted authoring tools registered; tool
+    # implementations remain the defense-in-depth authority boundary.
     if _request_policy_disables_browser_scout_tools(request_policy):
         return [tool for tool in native_tools if getattr(tool, "name", None) not in _DRAFT_ONLY_NATIVE_TOOL_DENYLIST]
     return list(native_tools)
@@ -4301,14 +4344,13 @@ def _build_copilot_input_guardrails(
         ctx = getattr(context, "context", None)
         policy = getattr(ctx, "request_policy", None)
         if not isinstance(policy, RequestPolicy) and policy_inputs is not None:
-            policy = await build_request_policy(
+            policy = await build_request_policy_trust_floor(
                 user_message=policy_inputs.user_message,
                 workflow_yaml=policy_inputs.workflow_yaml,
                 chat_history=policy_inputs.chat_history_messages,
                 global_llm_context=policy_inputs.global_llm_context,
                 organization_id=policy_inputs.organization_id,
                 handler=policy_inputs.request_policy_handler,
-                active_criteria=_stored_active_completion_criteria(policy_inputs),
                 config=getattr(ctx, "copilot_config", None) if isinstance(ctx, CopilotContext) else None,
             )
             if isinstance(ctx, CopilotContext):
@@ -4327,7 +4369,9 @@ def _build_copilot_input_guardrails(
                     policy,
                     policy_inputs,
                     turn_intent_classifier_result=turn_intent_classifier_result,
+                    reconcile_completion_criteria=False,
                 )
+                await _materialize_authoring_for_resolved_intent(ctx, policy, policy_inputs)
         blocked = isinstance(policy, RequestPolicy) and policy.user_response_policy == "ask_clarification"
         if isinstance(policy, RequestPolicy):
             turn_intent = ctx.turn_intent if isinstance(ctx, CopilotContext) else None
@@ -4948,7 +4992,7 @@ async def _run_copilot_turn_impl(
         if request_policy.clarification_reason == "login_credentials_unresolved":
             preflight_resolution = await preflight_credential_pause(ctx, stream, copilot_config)
             if preflight_resolution is not None:
-                _derive_turn_intent_on_context(ctx, request_policy, policy_inputs)
+                await _resume_turn_intent_after_preflight_credential(ctx, request_policy, policy_inputs)
         if preflight_resolution is None:
             return _build_request_policy_clarification_result(
                 request_policy,

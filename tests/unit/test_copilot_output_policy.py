@@ -1521,7 +1521,7 @@ def test_actuation_obligation_unrelated_prior_steer_stays_recoverable() -> None:
     assert evaluation.reason_code == ACTUATION_OBLIGATION_STEER_REASON_CODE
 
 
-@pytest.mark.parametrize("mode", [TurnIntentMode.DOCS_ANSWER, TurnIntentMode.DIAGNOSE])
+@pytest.mark.parametrize("mode", [TurnIntentMode.ANSWER, TurnIntentMode.DIAGNOSE])
 def test_actuation_obligation_allows_non_actuation_intents(mode: TurnIntentMode) -> None:
     evaluation = evaluate_actuation_obligation(
         turn_intent=TurnIntent(mode=mode, authority=TurnIntentAuthority(may_update_workflow=False)),

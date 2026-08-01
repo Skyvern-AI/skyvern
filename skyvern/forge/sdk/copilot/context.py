@@ -95,7 +95,7 @@ class TurnNarrativePayload(TypedDict):
     responseType: NotRequired[ResponseType]
     cancelled: NotRequired[bool]
     proposalDisposition: NotRequired[ProposalDisposition]
-    # TurnOutcome.response_kind value: "build" | "clarify" | "diagnose" | "refuse" | "recover".
+    # TurnOutcome.response_kind value: "answer" | "build" | "clarify" | "diagnose" | "refuse" | "recover".
     responseKind: NotRequired[str]
     terminalEnvelope: NotRequired[dict[str, Any]]
     # The ADR-0005 terminal adjudication (enforcement.verified_goal_claim_authorized):

@@ -1,4 +1,4 @@
-"""Builders + closed `TurnIntentMode -> ResponseKind` mapping for `TurnOutcome`.
+"""Builders + deterministic `TurnIntent -> ResponseKind` mapping for `TurnOutcome`.
 
 Schema types live in ``schemas/copilot_turn_outcome.py`` so chat-history
 schemas can embed ``TurnOutcome`` without importing copilot business logic.
@@ -74,7 +74,7 @@ _RESPONSE_KIND_BY_MODE: dict[TurnIntentMode, ResponseKind] = {
     TurnIntentMode.CLARIFY: ResponseKind.CLARIFY,
     TurnIntentMode.UNKNOWN: ResponseKind.CLARIFY,
     TurnIntentMode.DIAGNOSE: ResponseKind.DIAGNOSE,
-    TurnIntentMode.DOCS_ANSWER: ResponseKind.DIAGNOSE,
+    TurnIntentMode.ANSWER: ResponseKind.ANSWER,
     TurnIntentMode.REFUSE: ResponseKind.REFUSE,
 }
 
@@ -87,8 +87,13 @@ if _missing_modes:
 
 
 def derive_response_kind(turn_intent: TurnIntent | None) -> ResponseKind:
-    """Closed mapping. ``RECOVER`` is set only by the enforcement guard."""
+    """Closed mapping with an effect-based fallback for safe unknown explanations.
+
+    ``RECOVER`` is set only by the enforcement guard.
+    """
     mode = getattr(turn_intent, "mode", None)
+    if isinstance(turn_intent, TurnIntent) and mode is TurnIntentMode.UNKNOWN and turn_intent.is_inline_only:
+        return ResponseKind.ANSWER
     if isinstance(mode, TurnIntentMode):
         return _RESPONSE_KIND_BY_MODE[mode]
     return ResponseKind.CLARIFY

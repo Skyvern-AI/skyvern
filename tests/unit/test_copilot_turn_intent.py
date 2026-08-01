@@ -9,9 +9,9 @@ import pytest
 from pydantic import ValidationError
 
 from skyvern.config import settings
+from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.agent import (
     RequestPolicyGuardrailInputs,
-    _docs_answer_turn_directive,
     _store_request_policy_on_context,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext, StructuredContext
@@ -78,6 +78,33 @@ def _classification(
     return TurnIntentClassifierResult.success(classification)
 
 
+def test_answer_mode_keeps_the_legacy_wire_value() -> None:
+    assert TurnIntentMode.ANSWER.value == "docs_answer"
+
+
+def test_turn_intent_prompt_defines_answer_mode_by_effect_not_examples() -> None:
+    prompt = prompt_engine.load_prompt(
+        template=PROMPT_NAME,
+        mode_values=", ".join(mode.value for mode in TurnIntentMode),
+        expected_output_values=", ".join(output.value for output in TurnIntentExpectedOutput),
+        required_context_values=", ".join(key.value for key in RequiredContextKey),
+        reason_code_values=", ".join(reason.value for reason in TurnIntentReasonCode),
+        user_message="hello",
+        request_policy_summary="",
+        workflow_yaml="",
+        earliest_user_turn="",
+        latest_prior_user_turn="",
+        latest_assistant_turn="",
+        retained_history="",
+        global_llm_context="",
+    )
+
+    assert "docs_answer=respond inline when no workflow, browser, or run action is requested" in prompt
+    assert "Classify by the requested effect, not by vocabulary or subject matter" in prompt
+    assert "product/docs/concept answer or conversational greeting" not in prompt
+    assert "A greeting with no workflow-change request" not in prompt
+
+
 def _classifier_failure(failure_kind: TurnIntentClassifierFailureKind) -> TurnIntentClassifierResult:
     return TurnIntentClassifierResult.failure(failure_kind)
 
@@ -139,7 +166,39 @@ def test_build_turn_intent_does_not_keyword_classify_without_llm_result() -> Non
     )
 
     assert intent.mode == TurnIntentMode.UNKNOWN
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
     assert TurnIntentReasonCode.LLM_CLASSIFIER not in intent.reason_codes
+
+
+def test_genuine_unknown_classification_cannot_inherit_side_effect_authority() -> None:
+    intent = build_turn_intent(
+        user_message="Insufficient signal for a requested effect",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        classifier_result=_classification(TurnIntentMode.UNKNOWN, confidence=0.95),
+    )
+
+    assert intent.mode is TurnIntentMode.UNKNOWN
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+    assert intent.is_inline_only is True
+
+
+@pytest.mark.parametrize(
+    "authority",
+    [
+        TurnIntentAuthority(may_update_workflow=True),
+        TurnIntentAuthority(may_run_blocks=True),
+        TurnIntentAuthority(may_read_run_context=True),
+        TurnIntentAuthority(requires_user_input=True),
+        TurnIntentAuthority(may_answer_without_mutation=False),
+    ],
+)
+def test_inline_only_effect_requires_no_external_authority(authority: TurnIntentAuthority) -> None:
+    assert TurnIntent(mode=TurnIntentMode.UNKNOWN, authority=authority).is_inline_only is False
 
 
 def test_build_turn_intent_applies_llm_build_classification() -> None:
@@ -173,10 +232,10 @@ def test_build_turn_intent_applies_docs_classification_without_mutation() -> Non
         chat_history=[],
         global_llm_context="",
         request_policy=RequestPolicy(),
-        classifier_result=_classification(TurnIntentMode.DOCS_ANSWER),
+        classifier_result=_classification(TurnIntentMode.ANSWER),
     )
 
-    assert intent.mode == TurnIntentMode.DOCS_ANSWER
+    assert intent.mode == TurnIntentMode.ANSWER
     assert intent.authority.may_update_workflow is False
     assert intent.authority.may_run_blocks is False
     assert RequiredContextKey.CURRENT_WORKFLOW in intent.required_context
@@ -907,17 +966,6 @@ def test_user_non_progress_does_not_fire_on_first_turn_even_when_marker_matches(
     assert TurnIntentReasonCode.USER_NON_PROGRESS not in intent.reason_codes
 
 
-def test_docs_answer_turn_directive_renders_only_for_docs_answer_mode() -> None:
-    docs_directive = _docs_answer_turn_directive(TurnIntent(mode=TurnIntentMode.DOCS_ANSWER))
-    assert "TURN INTENT: docs_answer" in docs_directive
-    assert "Answer it inline in the user's language" in docs_directive
-    assert "do not offer to build an example workflow" in docs_directive
-
-    assert _docs_answer_turn_directive(TurnIntent(mode=TurnIntentMode.BUILD)) == ""
-    assert _docs_answer_turn_directive(TurnIntent(mode=TurnIntentMode.EDIT)) == ""
-    assert _docs_answer_turn_directive(None) == ""
-
-
 def test_store_request_policy_attaches_classified_turn_intent_to_context() -> None:
     ctx = CopilotContext(
         organization_id="org-1",
@@ -1281,7 +1329,7 @@ def test_structurally_infeasible_with_question_but_non_clarify_mode_forces_clari
     assert intent.target_entities == {"workflow": ["current_workflow"]}
 
 
-def test_structurally_infeasible_without_question_fails_open_to_request_policy_baseline() -> None:
+def test_structurally_infeasible_without_question_falls_back_to_safe_unknown_baseline() -> None:
     baseline = build_turn_intent(
         user_message="build a workflow",
         workflow_yaml="",
@@ -1306,8 +1354,8 @@ def test_structurally_infeasible_without_question_fails_open_to_request_policy_b
     assert TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE not in intent.reason_codes
     assert intent.missing_context_question is None
     assert intent.authority.model_dump() == baseline.authority.model_dump()
-    assert intent.authority.may_update_workflow is True
-    assert intent.authority.may_run_blocks is True
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
 
 
 def test_request_policy_clarification_precedes_structural_infeasibility() -> None:
@@ -1345,8 +1393,8 @@ def test_classifier_failure_does_not_emit_infeasibility_clarify() -> None:
 
     assert intent.mode != TurnIntentMode.CLARIFY
     assert TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE not in intent.reason_codes
-    assert intent.authority.may_update_workflow is True
-    assert intent.authority.may_run_blocks is True
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
 
 
 def test_skip_test_bare_value_continuation_classifies_identically_after_fold() -> None:

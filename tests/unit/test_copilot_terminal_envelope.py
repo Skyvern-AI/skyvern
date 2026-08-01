@@ -137,6 +137,7 @@ def test_next_state_derivation(
         ({"response_type": "ASK_QUESTION"}, "question"),
         ({"verified": True, "workflow_applied": True}, "update"),
         ({"proposal_disposition": "review_untested"}, "update"),
+        ({"turn_outcome_response_kind": "answer", "workflow_mutated": False}, "answer"),
         ({"turn_outcome_response_kind": "diagnose", "workflow_mutated": False}, "answer"),
         ({"turn_outcome_response_kind": "diagnose", "workflow_mutated": True}, "stopped"),
         ({"turn_outcome_response_kind": "refuse", "workflow_mutated": False}, "answer"),
@@ -219,7 +220,7 @@ def test_finalize_applied_state_keeps_question_for_user_action_required() -> Non
 
 
 def test_finalize_applied_state_preserves_answer_when_not_promoted_to_update() -> None:
-    envelope = _assemble(turn_outcome_response_kind="diagnose", workflow_mutated=False)
+    envelope = _assemble(turn_outcome_response_kind="answer", workflow_mutated=False)
     assert envelope.response_kind == "answer"
 
     finalized = finalize_applied_state(envelope, applied=False)

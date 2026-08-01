@@ -188,7 +188,7 @@ def test_docs_answer_turn_does_not_pull_workflow_or_run_context() -> None:
     packet = TurnContextAssembler().assemble(
         TurnContextInputs(
             turn_intent=TurnIntent(
-                mode=TurnIntentMode.DOCS_ANSWER,
+                mode=TurnIntentMode.ANSWER,
                 required_context=[RequiredContextKey.DOCS_CONTEXT],
             ),
             request_policy=RequestPolicy(),

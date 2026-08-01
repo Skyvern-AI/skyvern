@@ -34,6 +34,7 @@ from fastapi import HTTPException, status
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import NoopLock
+from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import credential_pause as credential_pause_module
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import RequestPolicyGuardrailInputs, _derive_turn_intent_on_context
@@ -72,7 +73,13 @@ from skyvern.forge.sdk.copilot.request_policy import (
     credential_prompt_reason,
 )
 from skyvern.forge.sdk.copilot.tools._shared import TOTAL_TIMEOUT_SECONDS, _copilot_seconds_remaining
-from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
+from skyvern.forge.sdk.copilot.turn_intent import (
+    TurnIntent,
+    TurnIntentAuthority,
+    TurnIntentClassification,
+    TurnIntentClassifierResult,
+    TurnIntentMode,
+)
 from skyvern.forge.sdk.routes.workflow_copilot import (
     WorkflowCopilotCredentialResponseRequest,
     workflow_copilot_credential_response,
@@ -1882,36 +1889,6 @@ async def test_preflight_connect_binds_the_credential_and_clears_the_clarificati
     assert sent_types == [WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED]
 
 
-@pytest.mark.asyncio
-async def test_preflight_connect_preserves_an_explicit_defer_authoring_hold(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = _preflight_ctx()
-    ctx.request_policy.authoring_intent = "defer_authoring"
-    cache = _FakeCache()
-    cache.store[credential_response_cache_key("org-1", "chat-1", "turn-1")] = encode_credential_response(
-        "connected", "cred_1"
-    )
-    monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
-    credential = _make_credential()
-    monkeypatch.setattr(
-        credential_pause_module.app,
-        "DATABASE",
-        SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[credential]))),
-    )
-    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
-    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
-
-    resolution = await preflight_credential_pause(ctx, _make_stream(), config)
-
-    assert resolution is not None and resolution.action == "connected"
-    policy = ctx.request_policy
-    assert policy.user_response_policy == "proceed"
-    assert policy.resolved_credentials == [credential]
-    assert policy.allow_update_workflow is False
-    assert policy.allow_run_blocks is False
-
-
 def _preflight_policy_inputs() -> RequestPolicyGuardrailInputs:
     return RequestPolicyGuardrailInputs(
         user_message="Log in to https://portal.example.com/login and download the invoices.",
@@ -1948,16 +1925,56 @@ async def test_preflight_connect_re_derives_run_authority_onto_the_turn_intent(
         ),
     )
     monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
+    classify = AsyncMock(
+        return_value=TurnIntentClassifierResult.success(
+            TurnIntentClassification(mode=TurnIntentMode.BUILD, confidence=0.95)
+        )
+    )
+    materialize = AsyncMock()
+    monkeypatch.setattr(agent_module, "classify_turn_intent", classify)
+    monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize)
     config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
 
     resolution = await preflight_credential_pause(ctx, _make_stream(), config)
     assert resolution is not None and resolution.action == "connected"
-    _derive_turn_intent_on_context(ctx, ctx.request_policy, policy_inputs)
+    await agent_module._resume_turn_intent_after_preflight_credential(ctx, ctx.request_policy, policy_inputs)
 
     assert ctx.request_policy.clarification_reason == "none"
-    assert ctx.turn_intent.mode is not TurnIntentMode.CLARIFY
+    assert ctx.turn_intent.mode is TurnIntentMode.BUILD
     assert ctx.turn_intent.authority.may_update_workflow is True
     assert ctx.turn_intent.authority.may_run_blocks is True
+    classify.assert_awaited_once()
+    materialize.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_preflight_resume_unknown_does_not_inherit_connected_policy_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _preflight_ctx()
+    policy = ctx.request_policy
+    policy.user_response_policy = "proceed"
+    policy.clarification_reason = "none"
+    policy.allow_update_workflow = True
+    policy.allow_run_blocks = True
+    monkeypatch.setattr(
+        agent_module,
+        "classify_turn_intent",
+        AsyncMock(
+            return_value=TurnIntentClassifierResult.success(
+                TurnIntentClassification(mode=TurnIntentMode.UNKNOWN, confidence=0.95)
+            )
+        ),
+    )
+    materialize = AsyncMock()
+    monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize)
+
+    await agent_module._resume_turn_intent_after_preflight_credential(ctx, policy, _preflight_policy_inputs())
+
+    assert ctx.turn_intent.mode is TurnIntentMode.UNKNOWN
+    assert ctx.turn_intent.authority.may_update_workflow is False
+    assert ctx.turn_intent.authority.may_run_blocks is False
+    materialize.assert_not_awaited()
 
 
 @pytest.mark.asyncio
