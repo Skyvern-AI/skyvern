@@ -1,6 +1,7 @@
 import structlog
 from fastapi import HTTPException
 
+from skyvern.exceptions import HttpException
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
@@ -110,7 +111,47 @@ class BitwardenCredentialVaultService(CredentialVaultService):
             raise HTTPException(status_code=404, detail="Credential account not found. It might have been deleted.")
 
         await app.DATABASE.credentials.delete_credential(credential.credential_id, credential.organization_id)
-        await BitwardenService.delete_credential_item(credential.item_id)
+        await self._run_task_to_completion(
+            self._delete_credential_item_or_enqueue_cleanup(credential),
+            cancellation_failure_message="Bitwarden vault-item cleanup failed while the delete was being cancelled",
+            log_context={
+                "credential_id": credential.credential_id,
+                "item_id": credential.item_id,
+                "organization_id": credential.organization_id,
+            },
+        )
+
+    async def _delete_credential_item_or_enqueue_cleanup(self, credential: Credential) -> None:
+        try:
+            await BitwardenService.delete_credential_item(credential.item_id)
+        except BaseException as exc:
+            if isinstance(exc, HttpException) and exc.status_code == 404:
+                return
+            try:
+                cleanup_enqueued = await self._enqueue_orphaned_vault_item_cleanup(
+                    organization_id=credential.organization_id,
+                    item_id=credential.item_id,
+                    vault_type=CredentialVaultType.BITWARDEN,
+                )
+            except Exception:
+                if isinstance(exc, Exception):
+                    raise
+                # Preserve provider cancellation even when its fallback enqueue also fails.
+            else:
+                log = LOG.warning if cleanup_enqueued else LOG.error
+                message = (
+                    "Bitwarden vault-item delete failed after DB row deletion; enqueued durable cleanup"
+                    if cleanup_enqueued
+                    else "Bitwarden vault-item delete failed after DB row deletion; durable cleanup unavailable"
+                )
+                log(
+                    message,
+                    organization_id=credential.organization_id,
+                    item_id=credential.item_id,
+                    error_type=type(exc).__name__,
+                )
+            if not isinstance(exc, Exception):
+                raise
 
     async def post_delete_credential_item(self, item_id: str, organization_id: str | None = None) -> bool:
         try:

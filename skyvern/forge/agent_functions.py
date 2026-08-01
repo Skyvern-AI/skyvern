@@ -1320,8 +1320,8 @@ class AgentFunction:
         organization_id: str,
         item_id: str,
         vault_type: CredentialVaultType,
-    ) -> None:
-        return
+    ) -> bool:
+        return False
 
     async def process_registered_credential_item(
         self,
