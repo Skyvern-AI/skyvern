@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.db.models import Base
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
 from tests.unit.force_stub_app import start_forge_stub_app
 
@@ -39,6 +40,26 @@ def fingerprint_secret_key(monkeypatch: pytest.MonkeyPatch) -> str:
 
     monkeypatch.setattr(settings, "SECRET_KEY", FINGERPRINT_TEST_SECRET_KEY)
     return FINGERPRINT_TEST_SECRET_KEY
+
+
+@pytest.fixture
+def workflow_context_manager_factory() -> Callable[..., WorkflowContextManager]:
+    def _make(
+        *,
+        workflow_run_id: str = "wr_mask_secrets",
+        mask_secrets: bool = True,
+        secrets: dict[str, str] | None = None,
+        runtime_otp_values: set[str] | None = None,
+    ) -> WorkflowContextManager:
+        manager = WorkflowContextManager()
+        manager.workflow_run_contexts[workflow_run_id] = SimpleNamespace(
+            mask_secrets=mask_secrets,
+            secrets=dict(secrets or {}),
+            runtime_otp_values=set(runtime_otp_values or set()),
+        )
+        return manager
+
+    return _make
 
 
 # Wire structlog through stdlib so caplog can capture log records in tests.

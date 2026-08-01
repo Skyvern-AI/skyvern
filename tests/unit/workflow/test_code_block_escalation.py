@@ -72,6 +72,7 @@ def _make_context(
         workflow_permanent_id="wpid_test",
         workflow_run_id="wr_test",
         aws_client=MagicMock(),
+        mask_secrets=with_secret,
     )
     if with_secret:
         context.secrets["k_secret"] = SECRET_VALUE
