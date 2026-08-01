@@ -9,7 +9,7 @@ a challenge started by someone else simply resolves to a row that does not exist
 
 from __future__ import annotations
 
-import hmac
+import hashlib
 import secrets
 
 from skyvern.config import settings
@@ -17,6 +17,7 @@ from skyvern.config import settings
 # Callers with no resolvable user (raw API key, no UI session) share this binding; they
 # already hold org-wide credentials, so there is no narrower identity to bind them to.
 _UNIDENTIFIED_INITIATOR = "\x00unidentified"
+_CONSENT_NONCE_KDF_ITERATIONS = 120_000
 
 
 def generate_consent_state() -> str:
@@ -31,4 +32,9 @@ def consent_nonce(state: str, initiator_id: str | None) -> str:
     such callback fails the lookup instead of falling through to the token exchange.
     """
     material = f"{initiator_id or _UNIDENTIFIED_INITIATOR}\x00{state}".encode()
-    return hmac.digest(settings.SECRET_KEY.encode(), material, "sha256").hex()
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        settings.SECRET_KEY.encode(),
+        material,
+        _CONSENT_NONCE_KDF_ITERATIONS,
+    ).hex()
