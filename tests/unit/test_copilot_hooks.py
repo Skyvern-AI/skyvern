@@ -1943,6 +1943,7 @@ def test_browser_overlays_are_gated_by_phase_and_session_classification() -> Non
     """A requires_browser overlay provisions a session, so leaving one out of these sets lets it run
     before composition and stops a dead-session failure from being classified unrecoverable."""
     from skyvern.forge.sdk.copilot.build_phase import _BROWSER_PRIMITIVE_TOOLS
+    from skyvern.forge.sdk.copilot.streaming_adapter import _OBSERVATION_TOOLS
     from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
     from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _BROWSER_SESSION_TOOL_NAMES
 
@@ -1950,3 +1951,9 @@ def test_browser_overlays_are_gated_by_phase_and_session_classification() -> Non
 
     assert browser_overlays <= _BROWSER_PRIMITIVE_TOOLS, browser_overlays - _BROWSER_PRIMITIVE_TOOLS
     assert browser_overlays <= _BROWSER_SESSION_TOOL_NAMES, browser_overlays - _BROWSER_SESSION_TOOL_NAMES
+
+    # navigate_browser is the call that creates the need for an observation, so it cannot satisfy it.
+    # Every other browser tool touches the page it arrived on, which is what the post-navigate nudge
+    # is asking the model to do — leaving one out re-asks for work it already did.
+    observers = browser_overlays - {"navigate_browser"}
+    assert observers <= _OBSERVATION_TOOLS, observers - _OBSERVATION_TOOLS
