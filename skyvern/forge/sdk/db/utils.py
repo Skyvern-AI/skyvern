@@ -108,6 +108,8 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
+_MODEL_TIMESTAMP_FIELDS = frozenset({"started_at", "finished_at", "created_at", "modified_at"})
+
 
 def summarize_copilot_chat_title(content: str, max_length: int = 120) -> str:
     # Collapse the opening message to one line so multi-line prompts read cleanly in the history dropdown.
@@ -961,14 +963,16 @@ def hydrate_action(action_model: ActionModel, empty_element_id: bool = False) ->
         "skyvern_element_hash": action_model.skyvern_element_hash,
         "skyvern_element_data": action_model.skyvern_element_data,
         "screenshot_artifact_id": action_model.screenshot_artifact_id,
+        "started_at": action_model.started_at,
+        "finished_at": action_model.finished_at,
         "created_at": action_model.created_at,
         "modified_at": action_model.modified_at,
     }
 
-    # Merge with action_json data, skipping None values
+    model_timestamp_fields = _MODEL_TIMESTAMP_FIELDS
     if action_model.action_json:
         for key, value in action_model.action_json.items():
-            if value is not None:
+            if value is not None and key not in model_timestamp_fields:
                 action_data[key] = value
 
     # Get the appropriate action class and instantiate it. Fall back to base Action on
@@ -1013,6 +1017,8 @@ def _hydrate_as_base_action(action_data: dict[str, typing.Any], action_model: Ac
             "workflow_run_id": action_model.workflow_run_id,
             "task_id": action_model.task_id,
             "step_id": action_model.step_id,
+            "started_at": action_model.started_at,
+            "finished_at": action_model.finished_at,
             "created_at": action_model.created_at,
             "modified_at": action_model.modified_at,
         }

@@ -923,23 +923,48 @@ class Block(BaseModel, abc.ABC):
                 },
                 exclude_none=True,
             )
+            # The description is a pure function of the rendered prompt, and a
+            # workflow's blocks are identical run over run — cache on a hash of the
+            # prompt itself so repeat runs skip the LLM call entirely and a template
+            # change naturally invalidates the cache. output_parameter is reduced to
+            # its key first: its row ids/timestamps vary per workflow revision
+            # without changing what the description says. Cache failures fall
+            # through to generation; only non-empty summaries are cached.
+            prompt_block_data = dict(block_data)
+            output_parameter_data = prompt_block_data.get("output_parameter")
+            if isinstance(output_parameter_data, dict):
+                prompt_block_data["output_parameter"] = output_parameter_data.get("key")
             description_generation_prompt = prompt_engine.load_prompt(
                 "generate_workflow_run_block_description",
-                block=block_data,
+                block=prompt_block_data,
             )
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
-                prompt=description_generation_prompt,
-                prompt_name="generate-workflow-run-block-description",
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-            )
-            description = json_response.get("summary")
-            LOG.info(
-                "Generated description for the workflow run block",
-                sampling=True,
-                description=description,
-                workflow_run_block_id=workflow_run_block_id,
-            )
+            cache_key = "wrb-description:" + hashlib.sha256(description_generation_prompt.encode()).hexdigest()
+            try:
+                cached_description = await app.CACHE.get(cache_key)
+            except Exception:
+                LOG.debug("Failed to read cached workflow run block description", exc_info=True)
+                cached_description = None
+            if isinstance(cached_description, str) and cached_description:
+                description = cached_description
+            else:
+                json_response = await app.SECONDARY_LLM_API_HANDLER(
+                    prompt=description_generation_prompt,
+                    prompt_name="generate-workflow-run-block-description",
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+                description = json_response.get("summary")
+                LOG.info(
+                    "Generated description for the workflow run block",
+                    sampling=True,
+                    description=description,
+                    workflow_run_block_id=workflow_run_block_id,
+                )
+                if isinstance(description, str) and description:
+                    try:
+                        await app.CACHE.set(cache_key, description)
+                    except Exception:
+                        LOG.debug("Failed to cache workflow run block description", exc_info=True)
         except Exception as e:
             LOG.exception("Failed to generate description for the workflow run block", error=e)
 

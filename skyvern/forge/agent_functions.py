@@ -1211,6 +1211,9 @@ class AgentFunction:
         api_key = settings.SKYVERN_API_KEY
         return api_key if api_key and api_key != "PLACEHOLDER" else None
 
+    async def browser_context_route_handlers_allowed(self, **_: Any) -> bool:
+        return True
+
     async def setup_browser_context_extensions(self, browser_context: Any, **kwargs: Any) -> None:
         """Attach cloud-only listeners/route handlers to a fresh BrowserContext. OSS no-op."""
 
@@ -2239,10 +2242,12 @@ class AgentFunction:
         return None
 
     def try_import_static_script(self, script_path: str) -> Any | None:
-        """Try to import a static script module as a fallback when spec_from_file_location fails.
+        """Import the live platform module for a static (marker) pin.
 
-        Override in subclass for platform-specific import logic.
-        Returns the loaded module or None.
+        The loader calls this BEFORE exec-ing the stored script body, so marker
+        pins always run the deployed module. Override in subclass for
+        platform-specific import logic. Returns the loaded module, or None for
+        a markerless (generated) script or a failed import.
         """
         return None
 

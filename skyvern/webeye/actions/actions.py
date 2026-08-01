@@ -181,6 +181,8 @@ class Action(BaseModel):
     # bound to what was actually seen rather than to a counter's value.
     observation_digest: str | None = Field(default=None, exclude=True)
 
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
     created_at: datetime | None = None
     modified_at: datetime | None = None
     created_by: str | None = None

@@ -601,6 +601,52 @@ def _resolve_first_block_url(
     return None
 
 
+# Written by ensure_static_script as the first line of a static pin's main.py;
+# must stay in sync with try_import_static_script's marker parsing.
+_STATIC_MODULE_MARKER = "# __static_module__: "
+
+
+def _script_has_static_module_marker(script_path: str) -> bool:
+    try:
+        with open(script_path) as script_file:
+            return script_file.readline().startswith(_STATIC_MODULE_MARKER)
+    except OSError:
+        return False
+
+
+def _load_user_script_module(script_path: str, spec: "importlib.machinery.ModuleSpec") -> Any | None:
+    """Load a cached script's main.py for execution.
+
+    Static (marker) pins must import the live platform module FIRST: the stored
+    main.py is a point-in-time copy of the platform script, and exec-ing it
+    silently shadows every fix shipped since the pin was created
+    (``_pinned_script_is_current_static`` keeps such pins on the promise that
+    the loader imports the deployed module). A marker pin whose live import
+    fails loads as None — blocks drop to the agent — because exec-ing its
+    stored body would resurrect the same staleness, and the marker-only pin
+    check would never supersede it. Only a markerless pin (a generated script)
+    executes its stored body.
+    """
+    loaded_script_module = app.AGENT_FUNCTION.try_import_static_script(script_path)
+    if loaded_script_module is not None:
+        return loaded_script_module
+    if _script_has_static_module_marker(script_path):
+        LOG.warning(
+            "Static pin's live module import failed; refusing to exec the stale stored body",
+            script_path=script_path,
+        )
+        return None
+    if not spec.loader:
+        return None
+    loaded_script_module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(loaded_script_module)
+    except Exception:
+        LOG.warning("exec_module failed for stored script body", script_path=script_path, exc_info=True)
+        return None
+    return loaded_script_module
+
+
 _RUN_SIGNATURE_CACHE_KEY_RE = re.compile(r"""cache_key\s*=\s*(['"])(?P<key>.+?)\1""")
 
 
@@ -3923,15 +3969,7 @@ class WorkflowService:
 
                         spec = importlib.util.spec_from_file_location("user_script", script_path)
                         if spec and spec.loader:
-                            loaded_script_module = importlib.util.module_from_spec(spec)
-                            try:
-                                spec.loader.exec_module(loaded_script_module)
-                            except Exception:
-                                # Static scripts may fail with spec_from_file_location
-                                # due to circular imports. Delegate to AgentFunction for
-                                # platform-specific fallback loading.
-                                LOG.warning("exec_module failed, trying import_module fallback", exc_info=True)
-                                loaded_script_module = app.AGENT_FUNCTION.try_import_static_script(script_path)
+                            loaded_script_module = _load_user_script_module(script_path, spec)
                             param_cls = (
                                 getattr(loaded_script_module, "GeneratedWorkflowParameters", None)
                                 if loaded_script_module
@@ -9328,17 +9366,34 @@ class WorkflowService:
         last_step_resolved = False
         for video_artifact in video_artifacts:
             if video_artifact.video_artifact_id:
-                upload_key = await app.ARTIFACT_MANAGER.update_artifact_data(
-                    artifact_id=video_artifact.video_artifact_id,
-                    organization_id=workflow_run.organization_id,
-                    data=video_artifact.video_data,
-                )
+                try:
+                    if video_artifact.video_file_extension:
+                        upload_key = await app.ARTIFACT_MANAGER.update_artifact_data(
+                            artifact_id=video_artifact.video_artifact_id,
+                            organization_id=workflow_run.organization_id,
+                            data=video_artifact.video_data,
+                            file_extension=video_artifact.video_file_extension,
+                        )
+                    else:
+                        upload_key = await app.ARTIFACT_MANAGER.update_artifact_data(
+                            artifact_id=video_artifact.video_artifact_id,
+                            organization_id=workflow_run.organization_id,
+                            data=video_artifact.video_data,
+                        )
+                except Exception:
+                    LOG.warning(
+                        "Failed to persist workflow video artifact",
+                        workflow_id=workflow.workflow_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        organization_id=workflow_run.organization_id,
+                        video_artifact_id=video_artifact.video_artifact_id,
+                        exc_info=True,
+                    )
+                    continue
                 if upload_key:
                     upload_keys.add(upload_key)
                 continue
 
-            # A teardown-attached recording has no pre-registered artifact row.
-            # Prefer collected video bytes; use the on-disk path only when no bytes were returned.
             video_path = video_artifact.video_path
             if not video_artifact.video_data and (not video_path or not os.path.exists(video_path)):
                 continue
@@ -9357,17 +9412,33 @@ class WorkflowService:
                 )
                 continue
             if video_artifact.video_data:
-                artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                    step=last_step,
-                    artifact_type=ArtifactType.RECORDING,
-                    data=video_artifact.video_data,
-                )
+                if video_artifact.video_file_extension:
+                    artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step,
+                        artifact_type=ArtifactType.RECORDING,
+                        data=video_artifact.video_data,
+                        file_extension=video_artifact.video_file_extension,
+                    )
+                else:
+                    artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step,
+                        artifact_type=ArtifactType.RECORDING,
+                        data=video_artifact.video_data,
+                    )
             else:
-                artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                    step=last_step,
-                    artifact_type=ArtifactType.RECORDING,
-                    path=video_path,
-                )
+                if video_artifact.video_file_extension:
+                    artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step,
+                        artifact_type=ArtifactType.RECORDING,
+                        path=video_path,
+                        file_extension=video_artifact.video_file_extension,
+                    )
+                else:
+                    artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step,
+                        artifact_type=ArtifactType.RECORDING,
+                        path=video_path,
+                    )
             video_artifact.video_artifact_id = artifact_id
             upload_keys.add(last_step.task_id)
         if upload_keys:

@@ -25,6 +25,7 @@ from skyvern.forge.sdk.db.repositories.microsoft_oauth import (  # noqa: F401
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
+from skyvern.forge.sdk.services import oauth_consent
 from skyvern.utils.email_validation import SAFE_EMAIL_ADDRESS_PATTERN
 
 LOG = structlog.get_logger()
@@ -256,6 +257,7 @@ async def start_authorization(
     scopes_requested: str | list[str] | tuple[str, ...] | None = None,
     scope_profile: str | None = None,
     app_origin: str | None = None,
+    initiator_id: str | None = None,
 ) -> MicrosoftAuthorizationStart:
     _require_encryption()
     _validate_redirect_uri(redirect_uri)
@@ -263,7 +265,8 @@ async def start_authorization(
         _validate_app_origin(app_origin)
 
     credential_id = generate_microsoft_oauth_credential_id()
-    nonce = secrets.token_urlsafe(32)
+    state = oauth_consent.generate_consent_state()
+    nonce = oauth_consent.consent_nonce(state, initiator_id)
     code_verifier = secrets.token_urlsafe(64)
     now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
     requested_scopes = (
@@ -284,17 +287,18 @@ async def start_authorization(
 
     authorize_url, _ = build_authorize_url(
         redirect_uri=redirect_uri,
-        state=nonce,
+        state=state,
         scopes=requested_scopes,
         code_verifier=code_verifier,
     )
 
-    return MicrosoftAuthorizationStart(authorize_url=authorize_url, state=nonce)
+    return MicrosoftAuthorizationStart(authorize_url=authorize_url, state=state)
 
 
 async def promote_pending_credential(
     organization_id: str,
-    nonce: str,
+    state: str,
+    initiator_id: str | None,
     refresh_token: str,
     scopes_granted: str | list[str] | tuple[str, ...] | None,
 ) -> MicrosoftOAuthCredentialBase:
@@ -303,7 +307,7 @@ async def promote_pending_credential(
     now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
     return await app.DATABASE.microsoft_oauth.promote_pending_to_active(
         organization_id=organization_id,
-        nonce=nonce,
+        nonce=oauth_consent.consent_nonce(state, initiator_id),
         encrypted_refresh_token=encrypted_token,
         encrypted_method=EncryptMethod.AES,
         scopes_granted=_coerce_scopes(scopes_granted),
@@ -311,10 +315,14 @@ async def promote_pending_credential(
     )
 
 
-async def load_pending_consent_context(organization_id: str, nonce: str) -> PendingConsentContext | None:
+async def load_pending_consent_context(
+    organization_id: str,
+    state: str,
+    initiator_id: str | None,
+) -> PendingConsentContext | None:
     return await app.DATABASE.microsoft_oauth.load_pending_by_nonce(
         organization_id=organization_id,
-        nonce=nonce,
+        nonce=oauth_consent.consent_nonce(state, initiator_id),
     )
 
 

@@ -38,6 +38,7 @@ from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
     RUN_RECORDING_PATH_SEGMENT,
     sync_run_recording_clips,
 )
+from skyvern.forge.sdk.artifact.utils import replace_file_extension
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -58,12 +59,6 @@ def _safe_get_file_size(path: str) -> int | None:
     except OSError:
         LOG.warning("Failed to get file size", path=path, exc_info=True)
         return None
-
-
-def _replace_file_extension(path: str, extension: str) -> str:
-    normalized_extension = extension.lstrip(".")
-    stem, _ = os.path.splitext(path)
-    return f"{stem}.{normalized_extension}" if normalized_extension else path
 
 
 class S3Storage(BaseStorage):
@@ -977,7 +972,7 @@ class S3Storage(BaseStorage):
             # object and artifact metadata reflect the prepared upload file.
             async with prepare_recording_for_upload(local_file_path) as prepared_upload:
                 upload_file_path = prepared_upload.path
-                upload_remote_path = _replace_file_extension(remote_path, prepared_upload.file_extension)
+                upload_remote_path = replace_file_extension(remote_path, prepared_upload.file_extension)
                 uri = self._build_browser_session_uri(
                     organization_id, browser_session_id, artifact_type, upload_remote_path, date
                 )
