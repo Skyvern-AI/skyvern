@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import io
 import os
 import time
@@ -30,6 +31,7 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.utils.secret_redaction import redact_har_bytes, redact_secrets_from_bytes
 
 if TYPE_CHECKING:
     from skyvern.schemas.action_log import ActionLogEvent
@@ -71,6 +73,52 @@ _SCREENSHOT_PREFIX_MAP: dict[ArtifactType, str] = {
     ArtifactType.SCREENSHOT_ACTION: "screenshot_action",
     ArtifactType.SCREENSHOT_FINAL: "screenshot_final",
 }
+
+_REDACTABLE_TEXT_ARTIFACT_TYPES: frozenset[ArtifactType] = frozenset(
+    {
+        ArtifactType.HTML,
+        ArtifactType.HTML_SCRAPE,
+        ArtifactType.HTML_ACTION,
+        ArtifactType.VISIBLE_ELEMENTS_TREE,
+        ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
+        ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
+        ArtifactType.LLM_PROMPT,
+        ArtifactType.LLM_REQUEST,
+        ArtifactType.LLM_RESPONSE,
+        ArtifactType.LLM_RESPONSE_PARSED,
+        ArtifactType.LLM_RESPONSE_RENDERED,
+        ArtifactType.BROWSER_CONSOLE_LOG,
+        ArtifactType.SKYVERN_LOG,
+        ArtifactType.SKYVERN_LOG_RAW,
+    }
+)
+
+
+def _maybe_redact_artifact_data(artifact_type: ArtifactType, data: bytes, workflow_run_id: str | None = None) -> bytes:
+    if artifact_type not in _REDACTABLE_TEXT_ARTIFACT_TYPES and artifact_type != ArtifactType.HAR:
+        return data
+    if not settings.ENABLE_SECRET_ARTIFACT_REDACTION:
+        return data
+
+    try:
+        context = skyvern_context.current()
+        resolved_workflow_run_id = workflow_run_id or (context.workflow_run_id if context else None)
+        secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(resolved_workflow_run_id)
+    except Exception:
+        return data
+    if inspect.isawaitable(secret_values):
+        close = getattr(secret_values, "close", None)
+        if callable(close):
+            close()
+        return data
+    if not isinstance(secret_values, set):
+        return data
+
+    if artifact_type == ArtifactType.HAR:
+        return redact_har_bytes(data, secret_values)
+    if not secret_values:
+        return data
+    return redact_secrets_from_bytes(data, secret_values)
 
 
 def _safe_file_size_from_path(path: str | None) -> int | None:
@@ -291,6 +339,10 @@ class ArtifactManager:
             run_id = context.run_id
         if not workflow_run_block_id and context:
             workflow_run_block_id = context.parent_workflow_run_block_id
+
+        if data is not None:
+            data = _maybe_redact_artifact_data(artifact_type, data, workflow_run_id=workflow_run_id)
+            file_size = len(data)
 
         if file_size is None:
             file_size = _safe_file_size_from_path(path)
@@ -895,6 +947,16 @@ class ArtifactManager:
         if not request.artifacts:
             return []
 
+        for artifact_data in request.artifacts:
+            if artifact_data.data is not None:
+                artifact_type = ArtifactType(artifact_data.artifact_model.artifact_type)
+                artifact_data.data = _maybe_redact_artifact_data(
+                    artifact_type,
+                    artifact_data.data,
+                    workflow_run_id=artifact_data.artifact_model.workflow_run_id,
+                )
+                artifact_data.artifact_model.file_size = len(artifact_data.data)
+
         # Extract models for bulk insert
         artifact_models = [artifact_data.artifact_model for artifact_data in request.artifacts]
 
@@ -1205,6 +1267,11 @@ class ArtifactManager:
         artifact = await app.DATABASE.artifacts.get_artifact_by_id(artifact_id, organization_id)
         if not artifact:
             return None
+        data = _maybe_redact_artifact_data(
+            ArtifactType(artifact.artifact_type),
+            data,
+            workflow_run_id=artifact.workflow_run_id,
+        )
         if file_extension and artifact.artifact_type == ArtifactType.RECORDING:
             next_uri = replace_file_extension(artifact.uri, file_extension)
             file_size = len(data)
@@ -1488,7 +1555,7 @@ class ArtifactManager:
         Returns the artifact_id (pre-generated or provided) so callers can link it
         in DB foreign keys (e.g. action.screenshot_artifact_id) before flush.
         """
-        acc.entries[filename] = data
+        acc.entries[filename] = _maybe_redact_artifact_data(artifact_type, data, workflow_run_id=acc.workflow_run_id)
         # Deduplicate by filename — update in place if it already exists
         for i, (_, fn, existing_id) in enumerate(acc.member_types):
             if fn == filename:
@@ -1827,7 +1894,10 @@ class ArtifactManager:
             modified_at=now,
         )
 
-        zip_entries = {filename: data for filename, (_, data) in entries.items()}
+        zip_entries = {
+            filename: _maybe_redact_artifact_data(artifact_type, data, workflow_run_id=archive_artifact.workflow_run_id)
+            for filename, (artifact_type, data) in entries.items()
+        }
         zip_bytes = self._build_zip(zip_entries)
         await app.STORAGE.store_artifact(archive_artifact, zip_bytes)
 

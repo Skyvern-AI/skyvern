@@ -30,6 +30,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AsyncAzureVaultClient
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -60,6 +61,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.utils.secret_redaction import collect_redactable_secret_values
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
 
@@ -265,6 +267,7 @@ class WorkflowRunContext:
         self.include_secrets_in_templates: bool = False
         self.credential_totp_identifiers: dict[str, str] = {}
         self.resolved_credential_parameter_ids: dict[str, str] = {}
+        self.runtime_otp_values: set[str] = set()
 
     def set_workflow(self, workflow: "Workflow") -> None:
         """
@@ -630,6 +633,14 @@ class WorkflowRunContext:
                 break
         self.secrets[secret_id] = secret_value
         return secret_id
+
+    def register_runtime_otp_value(self, value: str) -> None:
+        if not value:
+            return
+        self.runtime_otp_values.add(value)
+        if value in self.secrets.values():
+            return
+        self.secrets[self.generate_random_secret_id()] = value
 
     async def _get_credential_vault_and_item_ids(self, credential_id: str) -> tuple[str, str]:
         """
@@ -1748,6 +1759,36 @@ class WorkflowContextManager:
 
     def remove_workflow_run_context(self, workflow_run_id: str) -> None:
         self.workflow_run_contexts.pop(workflow_run_id, None)
+
+    def get_secret_values_for_run(
+        self,
+        workflow_run_id: str | None,
+        exclude_runtime_otp: bool = False,
+        *,
+        respect_artifact_redaction_flag: bool = True,
+    ) -> set[str]:
+        if respect_artifact_redaction_flag and not settings.ENABLE_SECRET_ARTIFACT_REDACTION:
+            return set()
+        if workflow_run_id is None or workflow_run_id not in self.workflow_run_contexts:
+            return set()
+
+        context = self.workflow_run_contexts[workflow_run_id]
+        current_context = skyvern_context.current()
+        totp_values: list[str] = []
+        if current_context is not None:
+            totp_values = [
+                value
+                for key, value in current_context.totp_codes.items()
+                if isinstance(key, str) and not key.endswith(("_valid_from", "_valid_until")) and value is not None
+            ]
+        runtime_otp_values: set[str] = getattr(context, "runtime_otp_values", set())
+        secret_values = collect_redactable_secret_values(
+            context.secrets, otp_values=[*totp_values, *runtime_otp_values]
+        )
+        if exclude_runtime_otp:
+            secret_values -= runtime_otp_values
+            secret_values -= set(totp_values)
+        return secret_values
 
     async def register_block_parameters_for_workflow_run(
         self,

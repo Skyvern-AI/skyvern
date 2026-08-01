@@ -676,6 +676,8 @@ class Settings(BaseSettings):
     ENABLE_CSS_SVG_PARSING: bool = True
 
     ENABLE_LOG_ARTIFACTS: bool = False
+    ENABLE_SECRET_ARTIFACT_REDACTION: bool = True
+    ENABLE_SECRET_VISUAL_MASKING: bool = True
     # Deployment-level fail-closed override; takes precedence over all CodeBlock entitlements.
     DISABLE_CODE_BLOCK_EXECUTION: bool = False
     ENABLE_CODE_BLOCK: bool = True

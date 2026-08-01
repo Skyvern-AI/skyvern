@@ -998,6 +998,15 @@ class ScriptSkyvernPage(SkyvernPage):
                                     totp_code = generate_totp_code(totp_secret)
                                     # Cache the code for subsequent digit requests in this sequence
                                     self._totp_sequence_cache[cache_key] = totp_code
+                                    try:
+                                        workflow_run_context.register_runtime_otp_value(totp_code)
+                                    except Exception:
+                                        LOG.debug(
+                                            "Failed to register runtime TOTP for redaction",
+                                            workflow_run_id=workflow_run_id,
+                                            credential_key=key,
+                                            exc_info=True,
+                                        )
                                     LOG.info(
                                         "Generated fresh TOTP and cached for sequence",
                                         field_name=field_name,

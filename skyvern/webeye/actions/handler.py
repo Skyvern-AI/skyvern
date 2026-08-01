@@ -181,7 +181,12 @@ from skyvern.webeye.utils.dom import (
     is_incompatible_text_input_error,
     is_post_dispatch_click_timeout,
 )
-from skyvern.webeye.utils.page import SkyvernFrame, _all_page_frames, take_element_screenshot
+from skyvern.webeye.utils.page import (
+    SkyvernFrame,
+    _all_page_frames,
+    apply_secret_visual_mask_to_active_element,
+    take_element_screenshot,
+)
 
 LOG = structlog.get_logger()
 
@@ -262,6 +267,38 @@ SELECT_SHADOW_MATCH_WORD_RE = re.compile(r"\w+")
 
 def _select_shadow_match_enabled() -> bool:
     return settings.SKYVERN_SELECT_SHADOW_MATCH
+
+
+def _is_totp_sentinel(value: Any) -> bool:
+    return value in {BitwardenConstants.TOTP, OnePasswordConstants.TOTP, AzureVaultConstants.TOTP}
+
+
+async def _apply_secret_visual_mask_if_needed(
+    skyvern_element: SkyvernElement,
+    *,
+    is_secret_value: bool,
+    is_totp_value: bool,
+    is_totp_sequence: bool = False,
+) -> None:
+    if settings.ENABLE_SECRET_VISUAL_MASKING and (is_secret_value or is_totp_value or is_totp_sequence):
+        await skyvern_element.apply_secret_visual_mask()
+
+
+async def _apply_active_element_secret_visual_mask_if_needed(
+    page: Page, text: str | None, workflow_run_id: str | None
+) -> None:
+    if not settings.ENABLE_SECRET_VISUAL_MASKING or not text or workflow_run_id is None:
+        return
+    try:
+        secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(
+            workflow_run_id,
+            respect_artifact_redaction_flag=False,
+        )
+    except Exception:
+        LOG.warning("Failed to resolve secret values for active element masking", exc_info=True)
+        return
+    if isinstance(secret_values, set) and text in secret_values:
+        await apply_secret_visual_mask_to_active_element(page)
 
 
 def _normalize_select_shadow_text(text: Any | None) -> str:
@@ -4365,8 +4402,10 @@ async def handle_input_text_action(
                 cua_text = generate_totp_value_from_secret(cua_totp_secret)
             except NoTOTPSecretFound as exc:
                 return [ActionFailure(exc)]
+            _register_runtime_otp_value_best_effort(task.workflow_run_id, cua_text)
         elif is_unresolved_totp_value(cua_text):
             return [ActionFailure(NoTOTPSecretFound())]
+        await _apply_active_element_secret_visual_mask_if_needed(page, cua_text, task.workflow_run_id)
         await EventStrategyFactory.type_text(page, None, cua_text)
         return [ActionSuccess()]
 
@@ -4451,6 +4490,7 @@ async def handle_input_text_action(
                 select_text = generate_totp_value_from_secret(totp_secret)
             except NoTOTPSecretFound as exc:
                 return [ActionFailure(exc)]
+            _register_runtime_otp_value_best_effort(task.workflow_run_id, select_text)
         select_action = SelectOptionAction(
             reasoning=action.reasoning,
             element_id=skyvern_element.get_id(),
@@ -4735,6 +4775,13 @@ async def handle_input_text_action(
                 exc_info=True,
             )
 
+    await _apply_secret_visual_mask_if_needed(
+        skyvern_element,
+        is_secret_value=is_secret_value,
+        is_totp_value=is_totp_value,
+        is_totp_sequence=is_multi_field_totp,
+    )
+
     # TODO: some elements are supported to use `locator.press_sequentially()` to fill in the data
     # we need find a better way to detect the attribute in the future
     class_name: str | None = await skyvern_element.get_attr("class")
@@ -4744,6 +4791,7 @@ async def handle_input_text_action(
                 text = generate_totp_value_from_secret(totp_secret)
             except NoTOTPSecretFound as exc:
                 return [ActionFailure(exc)]
+            _register_runtime_otp_value_best_effort(task.workflow_run_id, text)
         await skyvern_element.press_fill(text=text)
         return [ActionSuccess()]
 
@@ -4786,6 +4834,12 @@ async def handle_input_text_action(
             if await blocking_element.is_editable():
                 skyvern_element = blocking_element
                 tag_name = blocking_element.get_tag_name()
+                await _apply_secret_visual_mask_if_needed(
+                    skyvern_element,
+                    is_secret_value=is_secret_value,
+                    is_totp_value=is_totp_value,
+                    is_totp_sequence=is_multi_field_totp,
+                )
                 if used_bare_nanp:
                     # The tel plan read constraints from the original element; re-derive them from
                     # the element actually being filled.
@@ -4806,6 +4860,7 @@ async def handle_input_text_action(
             text = generate_totp_value_from_secret(totp_secret)
         except NoTOTPSecretFound as exc:
             return [ActionFailure(exc)]
+        _register_runtime_otp_value_best_effort(task.workflow_run_id, text)
         await skyvern_element.input(text)
         return [ActionSuccess()]
 
@@ -6640,8 +6695,23 @@ def generate_totp_value_from_secret(totp_secret: str | None) -> str:
         raise NoTOTPSecretFound() from exc
 
 
+def _register_runtime_otp_value_best_effort(workflow_run_id: str | None, code: str) -> None:
+    if not workflow_run_id or not code:
+        return
+    try:
+        app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id).register_runtime_otp_value(code)
+    except Exception:
+        LOG.debug(
+            "Failed to register runtime TOTP for redaction",
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+
+
 def generate_totp_value(workflow_run_id: str, parameter: str) -> str:
-    return generate_totp_value_from_secret(get_totp_secret(workflow_run_id, parameter))
+    code = generate_totp_value_from_secret(get_totp_secret(workflow_run_id, parameter))
+    _register_runtime_otp_value_best_effort(workflow_run_id, code)
+    return code
 
 
 def generate_totp_value_with_task(task: Task, parameter: str) -> str:
@@ -9084,12 +9154,19 @@ async def select_from_emerging_elements(
 
     if value is not None and action_type == ActionType.INPUT_TEXT:
         actual_value = get_actual_value_of_parameter_if_secret_with_task(task, value)
+        is_dropdown_secret_value = actual_value != value
+        is_dropdown_totp_value = _is_totp_sentinel(actual_value)
         LOG.info(
             "No clickable option found, but found input element to search",
             element_id=element_id,
         )
         input_element = await dom_after_open.get_skyvern_element_by_id(element_id)
         await input_element.scroll_into_view()
+        await _apply_secret_visual_mask_if_needed(
+            input_element,
+            is_secret_value=is_dropdown_secret_value,
+            is_totp_value=is_dropdown_totp_value,
+        )
         current_text = await get_input_value(
             input_element.get_tag_name(),
             input_element.get_locator(),
@@ -9290,8 +9367,15 @@ async def select_from_dropdown(
         )
         try:
             actual_value = get_actual_value_of_parameter_if_secret_with_task(task, value)
+            is_dropdown_secret_value = actual_value != value
+            is_dropdown_totp_value = _is_totp_sentinel(actual_value)
             input_element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
             await input_element.scroll_into_view()
+            await _apply_secret_visual_mask_if_needed(
+                input_element,
+                is_secret_value=is_dropdown_secret_value,
+                is_totp_value=is_dropdown_totp_value,
+            )
             current_text = await get_input_value(
                 input_element.get_tag_name(),
                 input_element.get_locator(),
