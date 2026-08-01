@@ -9328,17 +9328,34 @@ class WorkflowService:
         last_step_resolved = False
         for video_artifact in video_artifacts:
             if video_artifact.video_artifact_id:
-                upload_key = await app.ARTIFACT_MANAGER.update_artifact_data(
-                    artifact_id=video_artifact.video_artifact_id,
-                    organization_id=workflow_run.organization_id,
-                    data=video_artifact.video_data,
-                )
+                try:
+                    if video_artifact.video_file_extension:
+                        upload_key = await app.ARTIFACT_MANAGER.update_artifact_data(
+                            artifact_id=video_artifact.video_artifact_id,
+                            organization_id=workflow_run.organization_id,
+                            data=video_artifact.video_data,
+                            file_extension=video_artifact.video_file_extension,
+                        )
+                    else:
+                        upload_key = await app.ARTIFACT_MANAGER.update_artifact_data(
+                            artifact_id=video_artifact.video_artifact_id,
+                            organization_id=workflow_run.organization_id,
+                            data=video_artifact.video_data,
+                        )
+                except Exception:
+                    LOG.warning(
+                        "Failed to persist workflow video artifact",
+                        workflow_id=workflow.workflow_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        organization_id=workflow_run.organization_id,
+                        video_artifact_id=video_artifact.video_artifact_id,
+                        exc_info=True,
+                    )
+                    continue
                 if upload_key:
                     upload_keys.add(upload_key)
                 continue
 
-            # A teardown-attached recording has no pre-registered artifact row.
-            # Prefer collected video bytes; use the on-disk path only when no bytes were returned.
             video_path = video_artifact.video_path
             if not video_artifact.video_data and (not video_path or not os.path.exists(video_path)):
                 continue
@@ -9357,17 +9374,33 @@ class WorkflowService:
                 )
                 continue
             if video_artifact.video_data:
-                artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                    step=last_step,
-                    artifact_type=ArtifactType.RECORDING,
-                    data=video_artifact.video_data,
-                )
+                if video_artifact.video_file_extension:
+                    artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step,
+                        artifact_type=ArtifactType.RECORDING,
+                        data=video_artifact.video_data,
+                        file_extension=video_artifact.video_file_extension,
+                    )
+                else:
+                    artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step,
+                        artifact_type=ArtifactType.RECORDING,
+                        data=video_artifact.video_data,
+                    )
             else:
-                artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                    step=last_step,
-                    artifact_type=ArtifactType.RECORDING,
-                    path=video_path,
-                )
+                if video_artifact.video_file_extension:
+                    artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step,
+                        artifact_type=ArtifactType.RECORDING,
+                        path=video_path,
+                        file_extension=video_artifact.video_file_extension,
+                    )
+                else:
+                    artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                        step=last_step,
+                        artifact_type=ArtifactType.RECORDING,
+                        path=video_path,
+                    )
             video_artifact.video_artifact_id = artifact_id
             upload_keys.add(last_step.task_id)
         if upload_keys:

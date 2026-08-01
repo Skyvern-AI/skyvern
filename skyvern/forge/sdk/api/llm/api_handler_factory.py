@@ -834,13 +834,14 @@ class LLMAPIHandlerFactory:
                     parameters, new_budget, llm_config, prompt_name
                 )
             else:
-                # Other reasoning-capable models (Deepseek, etc.) - use "low" for all budget values
-                parameters["reasoning_effort"] = "low"
+                is_xai_model = (check_model or "").lower().startswith("xai/")
+                reasoning_effort = (parameters.get("reasoning_effort") or "low") if is_xai_model else "low"
+                parameters["reasoning_effort"] = reasoning_effort
                 LOG.debug(
                     "Applied thinking budget optimization (reasoning_effort)",
                     prompt_name=prompt_name,
                     budget=new_budget,
-                    reasoning_effort="low",
+                    reasoning_effort=reasoning_effort,
                     model=model_label,
                 )
         except (AttributeError, KeyError, TypeError) as e:

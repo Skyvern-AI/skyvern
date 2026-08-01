@@ -8609,7 +8609,10 @@ class TestWholeTrajectoryImposition:
         assert len(code_blocks) > 1
         block = _code_blocks(parsed)[label]
         browser_code = "\n".join(str(stage.get("code") or "") for stage in code_blocks[:-1])
-        assert all(stage.get("parameter_keys") == ["postal_code"] for stage in code_blocks[:-1])
+        for stage in code_blocks[:-1]:
+            expected_keys = ["postal_code"] if "postal_code" in str(stage.get("code") or "") else None
+            assert stage.get("parameter_keys") == expected_keys
+        assert any(stage.get("parameter_keys") == ["postal_code"] for stage in code_blocks[:-1])
         assert "postal_code" in browser_code
         assert "zip_code" not in browser_code
         code = str(block["code"])
@@ -13786,3 +13789,268 @@ class TestScoutedSpineRepeatedOmissionSeam:
         naming = workflow_update_module._pre_persist_scouted_spine_result(draft, ctx)
         assert naming is not None
         assert "#search-submit" in naming.violations[0]
+
+
+def _no_goal_value_metadata(label: str, declared_goal: str) -> dict:
+    metadata = _terminal_metadata(label, declared_goal)
+    for outcome in metadata["claimed_outcomes"]:
+        outcome["goal_value_paths"] = []
+    for expectation in metadata["terminal_verifier_expectations"]:
+        expectation["goal_value_paths"] = []
+    return metadata
+
+
+class TestScoutCredentialSegments:
+    _LOGIN_URL = "https://example.com/login"
+
+    def _credential_trajectory(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#user",
+                "source_url": self._LOGIN_URL,
+                "credential_id": "cred_1",
+                "credential_field": "username",
+            },
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#pass",
+                "source_url": self._LOGIN_URL,
+                "credential_id": "cred_1",
+                "credential_field": "password",
+            },
+            {
+                "tool_name": "click",
+                "selector": "#sign-in",
+                "role": "button",
+                "accessible_name": "Sign in",
+                "source_url": self._LOGIN_URL,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#reports-nav",
+                "role": "link",
+                "accessible_name": "Reports",
+                "source_url": "https://example.com/dashboard",
+            },
+            {
+                "tool_name": "read_value",
+                "read_expression": "document.querySelector('#total').textContent",
+                "read_output_path": "output.total",
+                "source_url": "https://example.com/dashboard/reports",
+            },
+        ]
+
+    def test_segments_are_valid_self_contained_python(self) -> None:
+        synthesized = workflow_update_module.synthesize_code_block(self._credential_trajectory(), strict_selectors=True)
+        assert synthesized is not None
+        assert len(synthesized.segments) == 3
+
+        for segment in synthesized.segments:
+            ast.parse(textwrap.dedent(segment.code).strip())
+
+    def test_credential_reaches_only_the_login_segment(self) -> None:
+        synthesized = workflow_update_module.synthesize_code_block(self._credential_trajectory(), strict_selectors=True)
+        assert synthesized is not None
+
+        keys_per_segment = [[str(param.get("key")) for param in segment.parameters] for segment in synthesized.segments]
+
+        assert any(keys for keys in keys_per_segment[:1])
+        assert all(not keys for keys in keys_per_segment[1:])
+        assert ".password" not in "".join(segment.code for segment in synthesized.segments[1:])
+
+    def test_each_scouted_action_appears_in_exactly_one_segment(self) -> None:
+        synthesized = workflow_update_module.synthesize_code_block(self._credential_trajectory(), strict_selectors=True)
+        assert synthesized is not None
+
+        for selector in ("#pass", "#sign-in", "#reports-nav"):
+            hits = sum(1 for segment in synthesized.segments if f'.locator("{selector}").' in segment.code)
+            assert hits == 1, f"{selector} appeared in {hits} segments"
+
+    def test_value_read_lands_in_the_last_segment(self) -> None:
+        synthesized = workflow_update_module.synthesize_code_block(self._credential_trajectory(), strict_selectors=True)
+        assert synthesized is not None
+
+        assert "page.evaluate" in synthesized.segments[-1].code
+        assert not any("page.evaluate" in segment.code for segment in synthesized.segments[:-1])
+
+    def test_trajectory_without_credential_fill_is_not_segmented(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": "#a", "source_url": self._LOGIN_URL},
+            {"tool_name": "click", "selector": "#b", "source_url": self._LOGIN_URL},
+        ]
+
+        synthesized = workflow_update_module.synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert synthesized is not None
+        assert synthesized.segments == []
+
+    def test_no_identifiable_login_submit_is_not_segmented(self) -> None:
+        trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#user",
+                "source_url": self._LOGIN_URL,
+                "credential_id": "cred_1",
+                "credential_field": "username",
+            },
+            {
+                "tool_name": "read_value",
+                "read_expression": "document.querySelector('#total').textContent",
+                "read_output_path": "output.total",
+                "source_url": "https://other.example.com/dashboard",
+            },
+        ]
+
+        synthesized = workflow_update_module.synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert synthesized is not None
+        assert synthesized.segments == []
+
+    def test_login_only_trajectory_is_not_segmented(self) -> None:
+        synthesized = workflow_update_module.synthesize_code_block(
+            self._credential_trajectory()[:3], strict_selectors=True
+        )
+
+        assert synthesized is not None
+        assert synthesized.segments == []
+
+    def test_superseded_reads_do_not_shift_the_boundary(self) -> None:
+        trajectory: list[dict[str, Any]] = [
+            {
+                "tool_name": "read_value",
+                "read_expression": "early",
+                "read_output_path": "output.total",
+                "source_url": self._LOGIN_URL,
+            },
+            *self._credential_trajectory(),
+        ]
+
+        synthesized = workflow_update_module.synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert synthesized is not None
+        assert len(synthesized.segments) == 3
+        assert "credential" in "".join(str(p.get("key")) for p in synthesized.segments[0].parameters)
+        assert "page.evaluate" in synthesized.segments[-1].code
+
+    def test_resolver_prefers_segments_over_the_per_interaction_derivation(self) -> None:
+        synthesized = workflow_update_module.synthesize_code_block(self._credential_trajectory(), strict_selectors=True)
+        assert synthesized is not None
+
+        resolved = workflow_update_module._resolve_durable_stages(synthesized, source_code=synthesized.code)
+
+        assert resolved.segmented is True
+        assert len(resolved.codes) == 3
+        for code in resolved.codes:
+            ast.parse(code)
+
+    def test_split_places_segments_and_scopes_keys(self) -> None:
+        code_block: dict[str, Any] = {"block_type": "code", "label": "get_total", "code": "placeholder"}
+        parsed: dict[str, Any] = {"workflow_definition": {"blocks": [code_block]}}
+        stage_codes = [
+            'await page.locator("#user").fill(str(cred.username))',
+            'await page.locator("#reports-nav").click()',
+        ]
+
+        with capture_logs() as logs:
+            violations = workflow_update_module._split_selected_output_owner_into_browser_stages(
+                parsed=parsed,
+                code_block=code_block,
+                stage_codes=stage_codes,
+                extraction_code='value = await page.locator("#t").inner_text()\nreturn {"output": {"total": value}}',
+                parameter_keys=["cred"],
+                segmented=True,
+            )
+
+        assert violations == []
+        blocks = parsed["workflow_definition"]["blocks"]
+        assert [block.get("label") for block in blocks] == [
+            "get_total_browser_stage_1",
+            "get_total_browser_stage_2",
+            "get_total",
+        ]
+        assert blocks[0].get("parameter_keys") == ["cred"]
+        assert "parameter_keys" not in blocks[1]
+        emitted = [entry for entry in logs if entry.get("event") == "copilot_output_owner_split_into_browser_stages"]
+        assert len(emitted) == 1
+        assert emitted[0]["credential_grouped"] is True
+
+    def test_split_declines_when_another_block_routes_to_the_output_owner(self) -> None:
+        code_block: dict[str, Any] = {"block_type": "code", "label": "get_total", "code": "placeholder"}
+        upstream = {"block_type": "code", "label": "prep", "code": "pass", "next_block_label": "get_total"}
+        parsed: dict[str, Any] = {"workflow_definition": {"blocks": [upstream, code_block]}}
+
+        violations = workflow_update_module._split_selected_output_owner_into_browser_stages(
+            parsed=parsed,
+            code_block=code_block,
+            stage_codes=["await page.locator('#a').click()", "await page.locator('#b').click()"],
+            extraction_code='return {"output": {"total": 1}}',
+            parameter_keys=[],
+            segmented=True,
+        )
+
+        assert violations
+        assert [block.get("label") for block in parsed["workflow_definition"]["blocks"]] == ["prep", "get_total"]
+
+    def test_synthesized_step_action_types_use_the_shared_action_vocabulary(self) -> None:
+        from skyvern.forge.sdk.workflow.models.block import CodeBlockStep
+
+        synthesized = workflow_update_module.synthesize_code_block(self._credential_trajectory(), strict_selectors=True)
+        assert synthesized is not None
+        assert any(str(step.get("description", "")).startswith("Fill ") for step in synthesized.steps)
+
+        for step in synthesized.steps:
+            CodeBlockStep(**step)
+
+    @pytest.mark.asyncio
+    async def test_fused_credential_draft_persists_as_separated_blocks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+
+        async def _no_credential_validation_error(_value: object, _ctx: object) -> None:
+            return None
+
+        monkeypatch.setattr(
+            workflow_update_module, "_credential_reference_validation_error", _no_credential_validation_error
+        )
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = self._credential_trajectory()[:4]
+        ctx.scouted_credential_field_inventory_by_credential_id = {"cred_1": frozenset({"username", "password"})}
+        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
+        assert synthesized is not None
+        submitted_code = (
+            synthesized.code.rstrip()
+            + '\nvalue = await page.locator("#total").inner_text()\nreturn {"output": {"total": value}}\n'
+        )
+        submitted = yaml.safe_dump(
+            {
+                "title": "Dashboard total",
+                "workflow_definition": {
+                    "parameters": [],
+                    "blocks": [{"block_type": "code", "label": "get_total", "code": submitted_code}],
+                },
+            },
+            sort_keys=False,
+        )
+        metadata = [_no_goal_value_metadata("get_total", "read the dashboard total")]
+
+        result = await _update_workflow({"workflow_yaml": submitted, "code_artifact_metadata": metadata}, ctx)
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        code_blocks = [block for block in workflow_blocks(parsed) if block.get("block_type") == "code"]
+        assert [str(block.get("label") or "") for block in code_blocks][-1] == "get_total"
+        assert len(code_blocks) >= 3
+        stage_codes = [str(block.get("code") or "") for block in code_blocks[:-1]]
+        owner_code = str(code_blocks[-1].get("code") or "")
+        login_positions = [index for index, code in enumerate(stage_codes) if ".password" in code]
+        nav_positions = [
+            index for index, code in enumerate(stage_codes) if 'page.locator("#reports-nav").click()' in code
+        ]
+        assert login_positions and nav_positions
+        assert max(login_positions) < min(nav_positions)
+        assert ".password" not in owner_code
+        assert "inner_text" in owner_code
+        for code in (*stage_codes, owner_code):
+            ast.parse(textwrap.dedent(code).strip())

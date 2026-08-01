@@ -70,6 +70,8 @@ def _action_row(**overrides: Any) -> SimpleNamespace:
         "skyvern_element_hash": None,
         "skyvern_element_data": None,
         "screenshot_artifact_id": None,
+        "started_at": None,
+        "finished_at": None,
         "created_at": datetime(2026, 5, 6, 0, 0, 0),
         "modified_at": datetime(2026, 5, 6, 0, 0, 0),
         "action_json": None,

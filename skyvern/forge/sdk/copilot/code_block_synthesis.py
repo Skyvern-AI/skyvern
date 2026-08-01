@@ -252,6 +252,85 @@ def first_matched_post_fill_submit_index(
     return None
 
 
+_LOGIN_SUBMIT_NAME_PATTERN = re.compile(
+    r"^(?:log in|login|sign in|authenticate)(?: now| securely| to continue)?$",
+    re.I,
+)
+_LOGIN_SUBMIT_SELECTOR_PATTERN = re.compile(
+    r"^(?:(?:log in|login|sign in|authenticate)(?: submit| button| btn)?|"
+    r"(?:submit|button|btn) (?:log in|login|sign in|authenticate))$",
+    re.I,
+)
+
+
+def last_scout_credential_fill_index(trajectory: Sequence[Any]) -> int | None:
+    # Boundary past the ENTIRE credential flow, including a runtime-only OTP/MFA fill. Keying only on
+    # username/password let an MFA step (fill totp -> verify-click) form a durable entry->commit past
+    # the boundary and falsely release the terminal-action gate on a login-only trajectory.
+    last_index: int | None = None
+    for index, item in enumerate(trajectory):
+        if isinstance(item, Mapping) and str(item.get("tool_name") or "").strip() == CREDENTIAL_FILL_TOOL_NAME:
+            last_index = index
+    return last_index
+
+
+def first_stable_login_submit_index(interactions: Sequence[Mapping[str, Any]], credential_index: int) -> int | None:
+    for index, interaction in enumerate(interactions[credential_index + 1 :], start=credential_index + 1):
+        tool_name = str(interaction.get("tool_name") or "").strip()
+        if tool_name == "press_key" and str(interaction.get("key") or "").strip() == "Enter":
+            return index
+        if tool_name != "click":
+            continue
+        accessible_name = re.sub(r"[^a-z0-9]+", " ", str(interaction.get("accessible_name") or "").lower()).strip()
+        selector = re.sub(r"[^a-z0-9]+", " ", str(interaction.get("selector") or "").lower()).strip()
+        if _LOGIN_SUBMIT_NAME_PATTERN.fullmatch(accessible_name) or _LOGIN_SUBMIT_SELECTOR_PATTERN.fullmatch(selector):
+            return index
+    return None
+
+
+def credential_submit_boundary_index(interactions: Sequence[Mapping[str, Any]], credential_index: int) -> int | None:
+    """The submit that commits the scout's login: a stable login-submit identity, else the first submit
+    after the latest credential fill on that fill's own page. None when neither identifies one."""
+    submit_index = first_stable_login_submit_index(interactions, credential_index)
+    if submit_index is not None:
+        return submit_index
+    latest_fill_source_url = str(interactions[credential_index].get("source_url") or "").strip()
+    if not latest_fill_source_url:
+        return None
+    return first_matched_post_fill_submit_index(interactions, credential_index, {latest_fill_source_url})
+
+
+def credential_segment_bounds(trajectory: Sequence[Mapping[str, Any]]) -> list[tuple[int, int]] | None:
+    """Inclusive trajectory bounds for each durable segment of a credentialed scout: the login flow up
+    to its submit, the business steps that follow, and the value read. None when the trajectory carries
+    no credential fill or no identifiable submit, which leaves the single-block shape in effect."""
+    fill_index = last_scout_credential_fill_index(trajectory)
+    if fill_index is None:
+        return None
+    submit_index = credential_submit_boundary_index(trajectory, fill_index)
+    if submit_index is None:
+        return None
+    last_index = len(trajectory) - 1
+    if submit_index >= last_index:
+        return None
+    first_read = next(
+        (
+            index
+            for index in range(submit_index + 1, len(trajectory))
+            if str(trajectory[index].get("tool_name") or "") == "read_value"
+        ),
+        None,
+    )
+    bounds = [(0, submit_index)]
+    if first_read is None:
+        bounds.append((submit_index + 1, last_index))
+    else:
+        if first_read > submit_index + 1:
+            bounds.append((submit_index + 1, first_read - 1))
+        bounds.append((first_read, last_index))
+    return bounds
+
+
 def _captcha_boundary_indices(trajectory: Sequence[Mapping[str, Any]]) -> set[int]:
     """Return typed challenge points plus credential-associated submit boundaries."""
     boundaries = {
@@ -453,6 +532,10 @@ class SynthesizedCodeBlock:
     notes: list[str] = field(default_factory=list)
     diagnostics: SynthesisDiagnostics = field(default_factory=SynthesisDiagnostics)
     steps: list[dict[str, Any]] = field(default_factory=list)
+    # Durable segments of a credentialed trajectory (login / business / read), each synthesized from
+    # its own slice so it is self-contained and independently runnable. Empty when the trajectory has
+    # no credential boundary, which leaves the single-block shape in effect.
+    segments: list[SynthesizedCodeBlock] = field(default_factory=list)
     interaction_code: str = ""
     extraction_code: str = ""
     extraction_fingerprint: str = ""
@@ -2104,6 +2187,7 @@ def synthesize_code_block(
     parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None,
     file_match_transform: SameMonthFileMatchTransform | None = None,
     emit_read_return: bool = True,
+    _segment_pass: bool = False,
 ) -> SynthesizedCodeBlock | None:
     """Deterministically synthesize a code block from a scout trajectory, or None if empty."""
     if not trajectory:
@@ -2616,7 +2700,7 @@ def synthesize_code_block(
             lines.append(f"{action_indent}{_INDENT}{variable} = await page.evaluate({expression!r})")
             read_bindings.append((output_path, variable))
             record_emission(trajectory_index, tool_name, "evaluate", "page", line_start=line_start, lane="page_read")
-            append_step(f"Read {output_path.removeprefix('output.')}", "read", line_start)
+            append_step(f"Read {output_path.removeprefix('output.')}", "extract", line_start)
             emitted += 1
             continue
 
@@ -2766,6 +2850,9 @@ def synthesize_code_block(
                 parameters.append({"key": credential_param_key, "credential_id": credential_id})
             lines.append(f"{action_indent}{credential_fill_source(locator, credential_param_key, credential_field)}")
             record_emission(trajectory_index, tool_name, "fill", locator, line_start=line_start)
+            # action_type values are ActionType members held as string literals, the same vocabulary
+            # code_block_steps.py uses; there is no credential-fill member, and a fill is text entry.
+            append_step(f"Fill {credential_field}", "input_text", line_start)
         elif tool_name == "select_option":
             emit_snapshot_recovery(trajectory_index, action_indent)
             value = str(interaction.get("value") or "").strip()
@@ -2944,7 +3031,32 @@ def synthesize_code_block(
 
     diagnostics.emitted_interaction_count = emitted
     code = "\n".join(lines) + "\n"
-    return SynthesizedCodeBlock(code=code, parameters=parameters, notes=notes, diagnostics=diagnostics, steps=steps)
+    segments: list[SynthesizedCodeBlock] = []
+    if not _segment_pass:
+        # Each segment is synthesized from its own slice rather than sliced out of the code above, so it
+        # carries its own prelude and guards and is valid, correctly scoped, and independently runnable.
+        for start, end in credential_segment_bounds(trajectory) or []:
+            segment = synthesize_code_block(
+                trajectory[start : end + 1],
+                strict_selectors=strict_selectors,
+                reached_download_target=reached_download_target,
+                parameter_binding_snapshot=parameter_binding_snapshot,
+                file_match_transform=file_match_transform,
+                emit_read_return=emit_read_return,
+                _segment_pass=True,
+            )
+            if segment is None or not segment.diagnostics.emitted_interaction_count:
+                segments = []
+                break
+            segments.append(segment)
+    return SynthesizedCodeBlock(
+        code=code,
+        parameters=parameters,
+        notes=notes,
+        diagnostics=diagnostics,
+        steps=steps,
+        segments=segments if len(segments) >= 2 else [],
+    )
 
 
 SCOUTED_SPINE_UNDER_BUILD_REASON_CODE = "scouted_spine_under_build"

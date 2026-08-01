@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -39,6 +40,7 @@ from skyvern.forge.sdk.api.files import (
 )
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.utils import ACTION_TYPE_TO_CLASS
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import generate_totp_code
@@ -274,6 +276,10 @@ class ScriptSkyvernPage(SkyvernPage):
             except Exception:
                 pass  # Don't block action execution if file listing fails
 
+        # Stamped after the download-detection baseline (a listdir plus an awaited storage
+        # lookup): the window starts at the action itself, matching finished_at's cut before
+        # the post-action scan.
+        started_at = naive_utc_now()
         try:
             # Wait for page to be ready before executing action
             # This helps prevent issues where cached actions execute before the page is fully loaded
@@ -321,6 +327,7 @@ class ScriptSkyvernPage(SkyvernPage):
 
             raise
         finally:
+            finished_at = naive_utc_now()
             # Add a small buffer between cached actions to give slow pages time to settle
             if settings.CACHED_ACTION_DELAY_SECONDS > 0:
                 await asyncio.sleep(settings.CACHED_ACTION_DELAY_SECONDS)
@@ -384,6 +391,8 @@ class ScriptSkyvernPage(SkyvernPage):
                 call_error=call.error,
                 download_triggered=download_triggered,
                 downloaded_files=downloaded_files,
+                started_at=started_at,
+                finished_at=finished_at,
             )
 
             # Auto-create screenshot artifact after execution
@@ -452,6 +461,8 @@ class ScriptSkyvernPage(SkyvernPage):
         call_error: Exception | None = None,
         download_triggered: bool | None = None,
         downloaded_files: list[str] | None = None,
+        started_at: datetime | None = None,
+        finished_at: datetime | None = None,
     ) -> tuple[Action | None, list[ActionResult]]:
         """Create an action record and result in the database after execution if task_id and step_id are available.
 
@@ -514,6 +525,8 @@ class ScriptSkyvernPage(SkyvernPage):
                 download=download_triggered,
                 download_triggered=download_triggered,
                 downloaded_files=downloaded_files,
+                started_at=started_at,
+                finished_at=finished_at,
                 created_by="script",
             )
             data_extraction_goal: str | None = None

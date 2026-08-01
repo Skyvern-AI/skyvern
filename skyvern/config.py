@@ -424,10 +424,15 @@ class Settings(BaseSettings):
     ENABLE_VERTEX_AI: bool = False
     ENABLE_AZURE_CUA: bool = False
     ENABLE_OPENAI_COMPATIBLE: bool = False
+    ENABLE_XAI: bool = False
     # OPENAI
     OPENAI_API_KEY: str | None = None
     GPT5_REASONING_EFFORT: str | None = "medium"
     OPENAI_CUA_MODEL: str = "computer-use-preview"
+    # xAI
+    XAI_API_KEY: str | None = None
+    XAI_API_BASE: str = "https://api.x.ai/v1"
+    XAI_REASONING_EFFORT: str | None = "medium"
     # ANTHROPIC
     ANTHROPIC_API_KEY: str | None = None
     ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE4.6_SONNET"
@@ -637,7 +642,7 @@ class Settings(BaseSettings):
     OP_SERVICE_ACCOUNT_TOKEN: str | None = None
 
     # Where credentials are stored: skyvern, bitwarden, azure_vault, gcp, or custom
-    CREDENTIAL_VAULT_TYPE: str = "bitwarden"
+    CREDENTIAL_VAULT_TYPE: str = "skyvern"
     ENABLE_LOCAL_CREDENTIAL_VAULT: bool | None = None
     LOCAL_CREDENTIAL_VAULT_PATH: str = str(Path.home() / ".skyvern" / "credential_vault")
     LOCAL_CREDENTIAL_VAULT_KEY: str | None = None
@@ -873,6 +878,9 @@ class Settings(BaseSettings):
         }
 
         mapping["mercury-2"] = {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"}
+
+        if self.ENABLE_XAI:
+            mapping["grok-4.5"] = {"llm_key": "XAI_GROK_4_5", "label": "Grok 4.5"}
 
         # Their configs are registered only under ENABLE_OPENROUTER, so without it the dropdown
         # would offer models that resolve to unregistered configs and fail at runtime.
