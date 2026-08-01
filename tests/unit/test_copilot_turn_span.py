@@ -53,19 +53,15 @@ async def _stub_build_request_policy_with_child_span(*_args: Any, **_kwargs: Any
     )
 
 
-async def _stub_build_request_policy_proceed(*_args: Any, **_kwargs: Any) -> RequestPolicy:
-    return RequestPolicy(user_response_policy="ask_clarification", clarification_question="?")
-
-
 async def _raise_unhandled_turn_error(*_args: Any, **_kwargs: Any) -> None:
     raise RuntimeError("boom")
 
 
 @pytest.fixture
-def patched_build_request_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+def patched_request_policy_trust_floor(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         copilot_agent,
-        "build_request_policy",
+        "build_request_policy_trust_floor",
         _stub_build_request_policy_with_child_span,
     )
 
@@ -80,7 +76,7 @@ def _find_span(spans: list[Any], name: str) -> Any:
 @pytest.mark.asyncio
 async def test_copilot_turn_span_parents_inner_spans(
     span_exporter: Any,
-    patched_build_request_policy: None,
+    patched_request_policy_trust_floor: None,
 ) -> None:
     chat_request = _make_chat_request(message="Hello, build me a workflow")
     chat_history = [_user_message("prior question")]
@@ -116,7 +112,7 @@ async def test_copilot_turn_span_parents_inner_spans(
 @pytest.mark.asyncio
 async def test_copilot_turn_span_uses_explicit_turn_index(
     span_exporter: Any,
-    patched_build_request_policy: None,
+    patched_request_policy_trust_floor: None,
 ) -> None:
     chat_request = _make_chat_request()
     chat_history = [_user_message("a"), _user_message("b"), _user_message("c")]
@@ -139,7 +135,7 @@ async def test_copilot_turn_span_uses_explicit_turn_index(
 @pytest.mark.asyncio
 async def test_copilot_turn_span_omits_session_id_when_missing(
     span_exporter: Any,
-    patched_build_request_policy: None,
+    patched_request_policy_trust_floor: None,
 ) -> None:
     chat_request = _make_chat_request(workflow_copilot_chat_id=None)
 
@@ -161,7 +157,7 @@ async def test_copilot_turn_span_omits_session_id_when_missing(
 @pytest.mark.asyncio
 async def test_copilot_turn_span_preview_is_single_line_and_truncated(
     span_exporter: Any,
-    patched_build_request_policy: None,
+    patched_request_policy_trust_floor: None,
 ) -> None:
     long_msg = "Line one\nLine two with extra content " + ("x" * 200)
     chat_request = _make_chat_request(message=long_msg)

@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot.terminal_envelope import (
     INTERRUPTED_TERMINAL_REASON,
     assemble_terminal_envelope,
 )
+from skyvern.forge.sdk.copilot.turn_outcome import build_minimal_turn_outcome
 from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 from skyvern.forge.sdk.routes.workflow_copilot import (
     COPILOT_V2_FLAG_KEY,
@@ -89,7 +90,13 @@ def _make_chat_request(
     )
 
 
-def _terminal_payload(*, verified: bool, workflow_applied: bool) -> dict[str, Any]:
+def _terminal_payload(
+    *,
+    verified: bool,
+    workflow_applied: bool,
+    workflow_mutated: bool = True,
+    turn_outcome_response_kind: str = "build",
+) -> dict[str, Any]:
     envelope = assemble_terminal_envelope(
         response_type="REPLY",
         verified=verified,
@@ -99,8 +106,8 @@ def _terminal_payload(*, verified: bool, workflow_applied: bool) -> dict[str, An
         blocker_reason=None,
         halt_kind=None,
         attempted="Attempted full run.",
-        workflow_mutated=True,
-        turn_outcome_response_kind="build",
+        workflow_mutated=workflow_mutated,
+        turn_outcome_response_kind=turn_outcome_response_kind,
     )
     assert envelope is not None
     return envelope.model_dump(mode="json")
@@ -521,6 +528,60 @@ async def test_finalise_normal_turn_flag_on_stopped_envelope_renders_terminal_te
     assert persisted_payload["terminalMessage"] == expected
     assert persisted_payload["narrativeSummary"] == expected
     assert persisted_payload["terminalEnvelope"]["rendered_from_envelope"] is True
+
+
+@pytest.mark.asyncio
+async def test_finalise_normal_turn_preserves_and_persists_answer_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "should_render_copilot_terminal_from_envelope",
+        AsyncMock(return_value=True),
+    )
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    answer = "Google Sheets steps can read rows through a connected integration."
+    outcome = build_minimal_turn_outcome(answer, response_kind=ResponseKind.ANSWER)
+    agent_result = AgentResult(
+        user_response=answer,
+        updated_workflow=None,
+        global_llm_context=None,
+        response_type="REPLY",
+        narrative_payload=_narrative_payload(),
+        turn_outcome=outcome,
+        terminal_envelope=_terminal_payload(
+            verified=False,
+            workflow_applied=False,
+            workflow_mutated=False,
+            turn_outcome_response_kind="answer",
+        ),
+    )
+    setup_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, setup_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=None,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    response_frame = stream.send.await_args.args[0]
+    assert response_frame.message == answer
+    assert response_frame.terminal_envelope is not None
+    assert response_frame.terminal_envelope["response_kind"] == "answer"
+    assert response_frame.terminal_envelope["user_action_required"] is False
+    persisted = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs
+    assert persisted["content"] == answer
+    assert persisted["turn_outcome"].response_kind is ResponseKind.ANSWER
 
 
 @pytest.mark.asyncio

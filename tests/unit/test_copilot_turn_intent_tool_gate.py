@@ -82,9 +82,9 @@ def _assert_signal(
 @pytest.mark.parametrize(
     ("mode", "tool_name", "expected_reason"),
     [
-        (TurnIntentMode.DOCS_ANSWER, "update_workflow", "turn_intent_no_mutation_update_blocked"),
-        (TurnIntentMode.DOCS_ANSWER, "inspect_page_for_composition", "turn_intent_page_inspection_blocked"),
-        (TurnIntentMode.DOCS_ANSWER, "list_credentials", "turn_intent_credential_metadata_blocked"),
+        (TurnIntentMode.ANSWER, "update_workflow", "turn_intent_no_mutation_update_blocked"),
+        (TurnIntentMode.ANSWER, "inspect_page_for_composition", "turn_intent_page_inspection_blocked"),
+        (TurnIntentMode.ANSWER, "list_credentials", "turn_intent_credential_metadata_blocked"),
         (TurnIntentMode.CLARIFY, "inspect_page_for_composition", "turn_intent_page_inspection_blocked"),
         (TurnIntentMode.CLARIFY, "update_and_run_blocks", "turn_intent_no_mutation_run_blocked"),
         (TurnIntentMode.REFUSE, "update_and_run_blocks", "turn_intent_no_mutation_run_blocked"),
@@ -405,7 +405,7 @@ def test_turn_intent_gate_preserves_request_policy_update_skip_path() -> None:
 @pytest.mark.asyncio
 async def test_update_workflow_stops_before_persisting_for_answer_only_intent() -> None:
     intent = TurnIntent(
-        mode=TurnIntentMode.DOCS_ANSWER,
+        mode=TurnIntentMode.ANSWER,
         authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
     )
     ctx = _ctx(intent)
@@ -595,6 +595,26 @@ def test_recovery_diagnose_keeps_all_native_tools_registered() -> None:
     names = {getattr(tool, "name", None) for tool in filtered}
 
     assert names == {tool.name for tool in NATIVE_TOOLS}
+
+
+@pytest.mark.parametrize("mode", [TurnIntentMode.ANSWER, TurnIntentMode.UNKNOWN])
+def test_inline_only_turn_registers_no_model_visible_tools(mode: TurnIntentMode) -> None:
+    intent = TurnIntent(
+        mode=mode,
+        authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
+    )
+
+    alias_map, overlays = _mcp_tool_surface_for_turn(
+        get_skyvern_mcp_alias_map(),
+        _build_skyvern_mcp_overlays(),
+        intent,
+        RequestPolicy(),
+    )
+    native_tools = _native_tools_for_turn(list(NATIVE_TOOLS), intent, RequestPolicy())
+
+    assert alias_map == {}
+    assert overlays == {}
+    assert native_tools == []
 
 
 @pytest.mark.asyncio

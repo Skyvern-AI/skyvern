@@ -84,9 +84,12 @@ from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     _classifier_fallback_policy,
     _classify_request,
+    _classify_request_trust_floor,
     build_classifier_fallback_floor,
     build_transcript_context,
+    is_defer_authoring_durable_fill_criterion,
     is_fallback_floor_criterion,
+    materialize_request_policy_authoring,
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOTS_PROMPT_NAME
@@ -110,6 +113,8 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     RequiredContextKey,
     TurnIntent,
     TurnIntentAuthority,
+    TurnIntentClassification,
+    TurnIntentClassifierResult,
     TurnIntentMode,
     TurnIntentReasonCode,
 )
@@ -1658,6 +1663,394 @@ class TestSupersededAgentIntentGates:
 
 class TestRequestPolicyInputGuardrail:
     @pytest.mark.asyncio
+    async def test_answer_only_turn_skips_authoring_enrichment_and_stored_criteria(self, monkeypatch) -> None:
+        policy = RequestPolicy(_authoring_pending=True)
+        stored = StoredCriteriaSet(
+            set_id="wccs_1",
+            goal_epoch=1,
+            criteria=(CompletionCriterion(id="c0", outcome="A prior authoring criterion"),),
+        )
+        monkeypatch.setattr(
+            agent_module,
+            "build_request_policy_trust_floor",
+            AsyncMock(return_value=policy),
+        )
+        monkeypatch.setattr(
+            agent_module,
+            "classify_turn_intent",
+            AsyncMock(
+                return_value=TurnIntentClassifierResult.success(
+                    TurnIntentClassification(mode=TurnIntentMode.ANSWER, confidence=0.95)
+                )
+            ),
+        )
+        materialize = AsyncMock()
+        monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize)
+        ctx = _ctx()
+        policy_inputs = agent_module.RequestPolicyGuardrailInputs(
+            user_message="How do I make a workflow with a google sheet step?",
+            workflow_yaml="",
+            chat_history_text="",
+            chat_history_messages=[],
+            global_llm_context="",
+            organization_id="org-1",
+            request_policy_handler=object(),
+            turn_intent_handler=object(),
+            stored_completion_criteria=StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        )
+
+        guardrail = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=policy_inputs,
+        )[0]
+        await guardrail.run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        materialize.assert_not_awaited()
+        assert ctx.turn_intent is not None
+        assert ctx.turn_intent.mode is TurnIntentMode.ANSWER
+        assert policy.completion_criteria == []
+        assert ctx.completion_criteria_turn_state is None
+
+    @pytest.mark.asyncio
+    async def test_read_only_diagnose_skips_authoring_enrichment(self, monkeypatch) -> None:
+        policy = RequestPolicy(testing_intent="unspecified", _authoring_pending=True)
+        monkeypatch.setattr(
+            agent_module,
+            "build_request_policy_trust_floor",
+            AsyncMock(return_value=policy),
+        )
+        monkeypatch.setattr(
+            agent_module,
+            "classify_turn_intent",
+            AsyncMock(
+                return_value=TurnIntentClassifierResult.success(
+                    TurnIntentClassification(mode=TurnIntentMode.DIAGNOSE, confidence=0.95)
+                )
+            ),
+        )
+        materialize = AsyncMock()
+        monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize)
+        ctx = _ctx()
+        policy_inputs = agent_module.RequestPolicyGuardrailInputs(
+            user_message="Why did the last run fail?",
+            workflow_yaml="workflow: yaml",
+            chat_history_text="",
+            chat_history_messages=[],
+            global_llm_context="",
+            organization_id="org-1",
+            request_policy_handler=object(),
+            turn_intent_handler=object(),
+            workflow_run_id="wr_1",
+        )
+
+        guardrail = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=policy_inputs,
+        )[0]
+        await guardrail.run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        materialize.assert_not_awaited()
+        assert ctx.turn_intent is not None
+        assert ctx.turn_intent.mode is TurnIntentMode.DIAGNOSE
+        assert ctx.turn_intent.authority.may_run_blocks is False
+
+    @pytest.mark.asyncio
+    async def test_diagnose_retest_authority_materializes_completion_criteria(
+        self,
+        monkeypatch,
+    ) -> None:
+        stored = StoredCriteriaSet(
+            set_id="wccs_1",
+            goal_epoch=1,
+            criteria=(CompletionCriterion(id="c0", outcome="The requested value is returned"),),
+        )
+        policy = RequestPolicy(
+            testing_intent="require_test",
+            allow_run_blocks=True,
+            _authoring_pending=True,
+        )
+        monkeypatch.setattr(
+            agent_module,
+            "build_request_policy_trust_floor",
+            AsyncMock(return_value=policy),
+        )
+        monkeypatch.setattr(
+            agent_module,
+            "classify_turn_intent",
+            AsyncMock(
+                return_value=TurnIntentClassifierResult.success(
+                    TurnIntentClassification(mode=TurnIntentMode.DIAGNOSE, confidence=0.95)
+                )
+            ),
+        )
+
+        async def materialize(target: RequestPolicy, **_kwargs) -> RequestPolicy:
+            target.completion_criteria = list(stored.criteria)
+            target._authoring_pending = False
+            return target
+
+        materialize_mock = AsyncMock(side_effect=materialize)
+        monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize_mock)
+        ctx = _ctx()
+        policy_inputs = agent_module.RequestPolicyGuardrailInputs(
+            user_message="Run it again and verify the requested value",
+            workflow_yaml="workflow: yaml",
+            chat_history_text="",
+            chat_history_messages=[],
+            global_llm_context="",
+            organization_id="org-1",
+            request_policy_handler=object(),
+            turn_intent_handler=object(),
+            stored_completion_criteria=StoredCriteriaSnapshot(active=stored, next_epoch=2),
+            workflow_run_id="wr_1",
+        )
+
+        guardrail = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=policy_inputs,
+        )[0]
+        await guardrail.run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        materialize_mock.assert_awaited_once()
+        assert materialize_mock.await_args.kwargs["active_criteria"] == list(stored.criteria)
+        assert ctx.turn_intent is not None
+        assert ctx.turn_intent.mode is TurnIntentMode.DIAGNOSE
+        assert ctx.turn_intent.authority.may_update_workflow is False
+        assert ctx.turn_intent.authority.may_run_blocks is True
+        assert policy.completion_criteria == list(stored.criteria)
+        assert ctx.completion_criteria_turn_state is not None
+
+    @pytest.mark.asyncio
+    async def test_unknown_turn_skips_authoring_enrichment(self, monkeypatch) -> None:
+        policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True, _authoring_pending=True)
+        monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", AsyncMock(return_value=policy))
+        monkeypatch.setattr(
+            agent_module,
+            "classify_turn_intent",
+            AsyncMock(
+                return_value=TurnIntentClassifierResult.success(
+                    TurnIntentClassification(mode=TurnIntentMode.UNKNOWN, confidence=0.95)
+                )
+            ),
+        )
+        materialize = AsyncMock()
+        monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize)
+        ctx = _ctx()
+        policy_inputs = agent_module.RequestPolicyGuardrailInputs(
+            user_message="Insufficient signal for a requested effect",
+            workflow_yaml="",
+            chat_history_text="",
+            chat_history_messages=[],
+            global_llm_context="",
+            organization_id="org-1",
+            request_policy_handler=object(),
+            turn_intent_handler=object(),
+        )
+
+        guardrail = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=policy_inputs,
+        )[0]
+        await guardrail.run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        materialize.assert_not_awaited()
+        assert ctx.turn_intent is not None
+        assert ctx.turn_intent.mode is TurnIntentMode.UNKNOWN
+        assert ctx.turn_intent.authority.may_update_workflow is False
+        assert ctx.turn_intent.authority.may_run_blocks is False
+
+    @pytest.mark.asyncio
+    async def test_authoring_enriches_once_and_rebuilds_authority_from_same_classifier_result(
+        self, monkeypatch
+    ) -> None:
+        policy = RequestPolicy(_authoring_pending=True)
+        classifier_result = TurnIntentClassifierResult.success(
+            TurnIntentClassification(mode=TurnIntentMode.BUILD, confidence=0.95)
+        )
+        monkeypatch.setattr(
+            agent_module,
+            "build_request_policy_trust_floor",
+            AsyncMock(return_value=policy),
+        )
+        classify = AsyncMock(return_value=classifier_result)
+        monkeypatch.setattr(agent_module, "classify_turn_intent", classify)
+
+        async def materialize(target: RequestPolicy, **_kwargs) -> RequestPolicy:
+            target.allow_update_workflow = False
+            target.allow_run_blocks = False
+            target.completion_criteria = [CompletionCriterion(id="c0", outcome="Draft exists")]
+            target._authoring_pending = False
+            return target
+
+        materialize_mock = AsyncMock(side_effect=materialize)
+        monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize_mock)
+        ctx = _ctx()
+        policy_inputs = agent_module.RequestPolicyGuardrailInputs(
+            user_message="Add a Google Sheets write step to this workflow",
+            workflow_yaml="",
+            chat_history_text="",
+            chat_history_messages=[],
+            global_llm_context="",
+            organization_id="org-1",
+            request_policy_handler=object(),
+            turn_intent_handler=object(),
+        )
+
+        guardrail = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=policy_inputs,
+        )[0]
+        await guardrail.run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        classify.assert_awaited_once()
+        materialize_mock.assert_awaited_once()
+        assert ctx.turn_intent is not None
+        assert ctx.turn_intent.mode is TurnIntentMode.BUILD
+        assert ctx.turn_intent.authority.may_update_workflow is False
+        assert ctx.turn_intent.authority.may_run_blocks is False
+
+    @pytest.mark.asyncio
+    async def test_request_policy_trust_floor_defers_completion_producers(self, monkeypatch) -> None:
+        prompts: list[str] = []
+
+        async def handler(*, prompt: str, **_kwargs: object) -> dict[str, object]:
+            prompts.append(prompt)
+            return {
+                "testing_intent": "require_test",
+                "credential_input_kind": "none",
+                "credential_refs": [],
+                "login_page_urls": [],
+                "login_intent": False,
+                "email_signin_intent": False,
+                "signin_email_candidates": [],
+                "requires_user_clarification": False,
+                "raw_secret_handling": "none",
+                "clarification_reason": "none",
+            }
+
+        produce_request_slots = AsyncMock()
+        monkeypatch.setattr(request_policy_module, "produce_request_slots", produce_request_slots)
+
+        policy = await _classify_request_trust_floor(
+            "Build and test a workflow",
+            "",
+            [],
+            "",
+            handler,
+        )
+
+        produce_request_slots.assert_not_awaited()
+        assert policy.authoring_intent == "pending"
+        assert policy.completion_contract is None
+        assert policy.completion_criteria == []
+        assert policy._authoring_pending is True
+        assert len(prompts) == 1
+        assert "completion_contract" not in prompts[0]
+        assert "completion_criteria" not in prompts[0]
+        assert "REQUEST SLOT SOURCES" not in prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_request_policy_trust_floor_defers_fallback_criteria_until_authoring(self) -> None:
+        policy = await _classify_request_trust_floor(
+            "Build a workflow that extracts the page title",
+            "",
+            [],
+            "",
+            None,
+        )
+
+        assert policy.completion_criteria == []
+        assert policy._authoring_pending is True
+
+        await materialize_request_policy_authoring(
+            policy,
+            user_message="Build a workflow that extracts the page title",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=None,
+        )
+
+        assert policy.completion_criteria
+        assert policy.authoring_intent == "author_now"
+        assert policy._authoring_pending is False
+
+    @pytest.mark.asyncio
+    async def test_authoring_materialization_preserves_trust_floor_fields(self, monkeypatch) -> None:
+        policy = RequestPolicy(
+            testing_intent="require_test",
+            credential_input_kind="credential_name",
+            credential_refs=["saved-login"],
+            allow_update_workflow=False,
+            allow_run_blocks=False,
+            _authoring_pending=True,
+        )
+        enriched = RequestPolicy(
+            testing_intent="skip_test",
+            authoring_intent="author_now",
+            credential_input_kind="none",
+            allow_update_workflow=True,
+            allow_run_blocks=True,
+            completion_contract="The draft exists",
+            completion_criteria=[CompletionCriterion(id="c0", outcome="The draft exists")],
+            completion_contract_status="present",
+        )
+        classify = AsyncMock(return_value=enriched)
+        monkeypatch.setattr(request_policy_module, "_classify_request", classify)
+
+        await materialize_request_policy_authoring(
+            policy,
+            user_message="Build and test the workflow with saved-login",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=object(),
+        )
+
+        classify.assert_awaited_once()
+        assert policy.testing_intent == "require_test"
+        assert policy.credential_input_kind == "credential_name"
+        assert policy.credential_refs == ["saved-login"]
+        assert policy.allow_update_workflow is False
+        assert policy.allow_run_blocks is False
+        assert policy.completion_criteria == enriched.completion_criteria
+        assert policy._authoring_pending is False
+
+    @pytest.mark.asyncio
+    async def test_authoring_materialization_preserves_explicit_defer_authoring_authority(self, monkeypatch) -> None:
+        policy = RequestPolicy(
+            allow_update_workflow=True,
+            allow_run_blocks=True,
+            _authoring_pending=True,
+        )
+        enriched = RequestPolicy(
+            authoring_intent="defer_authoring",
+            allow_update_workflow=True,
+            allow_run_blocks=True,
+        )
+        monkeypatch.setattr(request_policy_module, "_classify_request", AsyncMock(return_value=enriched))
+
+        await materialize_request_policy_authoring(
+            policy,
+            user_message="Fill the live form, but do not create a workflow yet",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=object(),
+        )
+
+        assert policy.authoring_intent == "defer_authoring"
+        assert policy.allow_update_workflow is False
+        assert policy.allow_run_blocks is False
+        assert any(is_defer_authoring_durable_fill_criterion(item) for item in policy.completion_criteria)
+        assert policy._authoring_pending is False
+
+    @pytest.mark.asyncio
     async def test_sdk_input_guardrail_computes_and_stores_request_policy(self, monkeypatch) -> None:
         policy = RequestPolicy(
             testing_intent="skip_test",
@@ -1666,7 +2059,7 @@ class TestRequestPolicyInputGuardrail:
             allow_run_blocks=False,
         )
         build_request_policy = AsyncMock(return_value=policy)
-        monkeypatch.setattr(agent_module, "build_request_policy", build_request_policy)
+        monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", build_request_policy)
         ctx = _ctx()
         policy_inputs = agent_module.RequestPolicyGuardrailInputs(
             user_message="just draft without testing",
@@ -1702,7 +2095,6 @@ class TestRequestPolicyInputGuardrail:
             global_llm_context="",
             organization_id="org-1",
             handler=policy_inputs.request_policy_handler,
-            active_criteria=None,
             config=None,
         )
 
@@ -1715,7 +2107,7 @@ class TestRequestPolicyInputGuardrail:
         policy = RequestPolicy()
         build_request_policy = AsyncMock(return_value=policy)
         classify_turn_intent = AsyncMock(return_value=None)
-        monkeypatch.setattr(agent_module, "build_request_policy", build_request_policy)
+        monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", build_request_policy)
         monkeypatch.setattr(agent_module, "classify_turn_intent", classify_turn_intent)
         policy_inputs = agent_module.RequestPolicyGuardrailInputs(
             user_message="build and test it",
@@ -1741,14 +2133,25 @@ class TestRequestPolicyInputGuardrail:
         assert classify_turn_intent.await_args.kwargs["handler"] is turn_intent_handler
 
     @pytest.mark.asyncio
-    async def test_sdk_input_guardrail_forwards_stored_active_criteria(self, monkeypatch) -> None:
+    async def test_sdk_input_guardrail_defers_stored_active_criteria_until_authoring(self, monkeypatch) -> None:
         stored = StoredCriteriaSet(
             set_id="wccs_1",
             goal_epoch=1,
             criteria=(CompletionCriterion(id="c0", outcome="The main heading is extracted into the run output"),),
         )
-        build_request_policy = AsyncMock(return_value=RequestPolicy())
-        monkeypatch.setattr(agent_module, "build_request_policy", build_request_policy)
+        build_request_policy = AsyncMock(return_value=RequestPolicy(_authoring_pending=True))
+        materialize = AsyncMock()
+        monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", build_request_policy)
+        monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize)
+        monkeypatch.setattr(
+            agent_module,
+            "classify_turn_intent",
+            AsyncMock(
+                return_value=TurnIntentClassifierResult.success(
+                    TurnIntentClassification(mode=TurnIntentMode.BUILD, confidence=0.95)
+                )
+            ),
+        )
         policy_inputs = agent_module.RequestPolicyGuardrailInputs(
             user_message="run it again",
             workflow_yaml="",
@@ -1768,7 +2171,9 @@ class TestRequestPolicyInputGuardrail:
         await guardrails[0].run(SimpleNamespace(), "input", RunContextWrapper(context=_ctx()))
 
         assert build_request_policy.await_args is not None
-        assert build_request_policy.await_args.kwargs["active_criteria"] == list(stored.criteria)
+        assert "active_criteria" not in build_request_policy.await_args.kwargs
+        assert materialize.await_args is not None
+        assert materialize.await_args.kwargs["active_criteria"] == list(stored.criteria)
 
     @pytest.mark.asyncio
     async def test_sdk_input_guardrail_trips_after_computing_blocked_policy(self, monkeypatch) -> None:
@@ -1781,7 +2186,7 @@ class TestRequestPolicyInputGuardrail:
             clarification_reason="raw_secret",
             clarification_question="Do not paste raw credentials.",
         )
-        monkeypatch.setattr(agent_module, "build_request_policy", AsyncMock(return_value=policy))
+        monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", AsyncMock(return_value=policy))
         ctx = _ctx()
         guardrails = agent_module._build_copilot_input_guardrails(
             InputGuardrail,
@@ -1813,7 +2218,7 @@ class TestRequestPolicyInputGuardrail:
             testing_intent="unspecified",
             user_response_policy="proceed",
         )
-        monkeypatch.setattr(agent_module, "build_request_policy", AsyncMock(return_value=policy))
+        monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", AsyncMock(return_value=policy))
         ctx = _ctx()
         guardrails = agent_module._build_copilot_input_guardrails(
             InputGuardrail,
@@ -1852,7 +2257,7 @@ class TestRequestPolicyInputGuardrail:
             testing_intent="unspecified",
             user_response_policy="proceed",
         )
-        monkeypatch.setattr(agent_module, "build_request_policy", AsyncMock(return_value=policy))
+        monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", AsyncMock(return_value=policy))
         ctx = _ctx()
         guardrails = agent_module._build_copilot_input_guardrails(
             InputGuardrail,
@@ -1893,7 +2298,7 @@ class TestRequestPolicyInputGuardrail:
             allow_run_blocks=False,
             allow_missing_credentials_in_draft=True,
         )
-        monkeypatch.setattr(agent_module, "build_request_policy", AsyncMock(return_value=policy))
+        monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", AsyncMock(return_value=policy))
         ctx = _ctx()
         guardrails = agent_module._build_copilot_input_guardrails(
             InputGuardrail,
@@ -3359,6 +3764,77 @@ class TestCredentialRefusalReachesAgent:
         assert "Use validate_block only for allowed non-browser helper blocks" in prompt
         assert "Do not call `validate_block`" not in prompt
         assert "native_allowed" not in prompt
+
+    def test_answer_only_prompt_is_content_neutral_and_has_no_tool_guidance(self) -> None:
+        prompt = agent_module._build_system_prompt(
+            tool_usage_guide="",
+            security_rules="",
+            answer_only=True,
+        )
+
+        assert "Respond to the user's current request inline" in prompt
+        assert "No tools are available in this answer-only turn" in prompt
+        assert "Explain the answer in prose" in prompt
+        assert "Do not return serialized workflow YAML/JSON or literal credential values" in prompt
+        assert "product or workflow-concept question" not in prompt
+        assert "documentation question" not in prompt
+        assert "greeting" not in prompt
+        for unavailable_name in (
+            "update_workflow",
+            "update_and_run_blocks",
+            "navigate_browser",
+            "list_credentials",
+        ):
+            assert unavailable_name not in prompt
+
+    def test_code_only_docs_answer_prompt_has_no_authoring_appendix(self) -> None:
+        prompt = agent_module._build_system_prompt(
+            tool_usage_guide="",
+            config=CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER),
+            answer_only=True,
+        )
+
+        assert "ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE" not in prompt
+        assert "SYNTHESIZED CODE BLOCK" not in prompt
+        assert "update_workflow" not in prompt
+
+    def test_docs_answer_prompt_keeps_custom_security_rules(self) -> None:
+        prompt = agent_module._build_system_prompt(
+            tool_usage_guide="",
+            config=CopilotConfig(security_rules="CUSTOM SECURITY RULE"),
+            answer_only=True,
+        )
+
+        assert "CUSTOM SECURITY RULE" in prompt
+
+    @pytest.mark.parametrize("mode", [TurnIntentMode.ANSWER, TurnIntentMode.UNKNOWN])
+    def test_inline_only_dynamic_prompt_keeps_projected_guide_empty(self, mode: TurnIntentMode) -> None:
+        config = CopilotConfig()
+        ctx = _ctx(
+            copilot_config=config,
+            request_policy=RequestPolicy(),
+            turn_intent=TurnIntent(mode=mode),
+        )
+        instructions = agent_module._build_dynamic_system_prompt(
+            tool_usage_guide="- **update_workflow** — Mutate a workflow.",
+            config=config,
+        )
+
+        prompt = instructions(SimpleNamespace(context=ctx), object())
+
+        assert "Respond to the user's current request inline" in prompt
+        assert "TURN INTENT: docs_answer" not in prompt
+        assert "Mutate a workflow" not in prompt
+        assert "authoring_intent" not in prompt
+        assert "completion_contract" not in prompt
+        for unavailable_name in (
+            "update_workflow",
+            "update_and_run_blocks",
+            "navigate_browser",
+            "list_credentials",
+        ):
+            assert f"`{unavailable_name}`" not in prompt
+            assert f"**{unavailable_name}**" not in prompt
 
     @pytest.mark.asyncio
     async def test_run_copilot_agent_logs_resolved_block_authoring_policy(
