@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 from tests.unit.forge.sdk.artifact.storage.test_helpers import (
     TEST_ORGANIZATION_ID,
@@ -16,16 +18,6 @@ from tests.unit.forge.sdk.artifact.storage.test_helpers import (
 )
 
 TEST_STEP_ID = "step_secret_redaction"
-
-
-class _FakeWorkflowContextManager:
-    def get_secret_values_for_run(self, workflow_run_id: str | None) -> set[str]:
-        return {"secret-value"} if workflow_run_id == "wr_redact" else set()
-
-
-class _EmptyWorkflowContextManager:
-    def get_secret_values_for_run(self, workflow_run_id: str | None) -> set[str]:
-        return set()
 
 
 class _FakeStorage:
@@ -67,7 +59,10 @@ class _FakeArtifactDatabase:
 
 
 @pytest.fixture
-def artifact_redaction_setup(monkeypatch: pytest.MonkeyPatch) -> _FakeStorage:
+def artifact_redaction_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+) -> _FakeStorage:
     storage = _FakeStorage()
     monkeypatch.setattr(artifact_manager_module.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
     monkeypatch.setattr(artifact_manager_module.app, "STORAGE", storage)
@@ -79,7 +74,11 @@ def artifact_redaction_setup(monkeypatch: pytest.MonkeyPatch) -> _FakeStorage:
     monkeypatch.setattr(
         artifact_manager_module.app,
         "WORKFLOW_CONTEXT_MANAGER",
-        _FakeWorkflowContextManager(),
+        workflow_context_manager_factory(
+            workflow_run_id="wr_redact",
+            mask_secrets=False,
+            secrets={"password": "secret-value"},
+        ),
     )
     skyvern_context.reset()
     skyvern_context.set(SkyvernContext(organization_id=TEST_ORGANIZATION_ID, workflow_run_id="wr_redact"))
@@ -103,8 +102,26 @@ async def test_create_artifact_redacts_textual_artifact_data(artifact_redaction_
 
 
 @pytest.mark.asyncio
+async def test_create_artifact_redacts_hashed_href_map(artifact_redaction_setup: _FakeStorage) -> None:
+    manager = ArtifactManager()
+    step = create_fake_step(TEST_STEP_ID)
+
+    await manager.create_artifact(
+        step=step,
+        artifact_type=ArtifactType.HASHED_HREF_MAP,
+        data=b'{"h1": "https://example.test/callback?token=secret-value"}',
+    )
+    await manager.wait_for_upload_aiotasks([step.task_id])
+
+    stored = artifact_redaction_setup.stored[0][1]
+    assert b"secret-value" not in stored
+    assert REDACTED_SECRET_PLACEHOLDER.encode() in stored
+
+
+@pytest.mark.asyncio
 async def test_create_artifact_redacts_using_artifact_workflow_run_id_without_context(
     monkeypatch: pytest.MonkeyPatch,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
 ) -> None:
     storage = _FakeStorage()
     monkeypatch.setattr(artifact_manager_module.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
@@ -117,7 +134,11 @@ async def test_create_artifact_redacts_using_artifact_workflow_run_id_without_co
     monkeypatch.setattr(
         artifact_manager_module.app,
         "WORKFLOW_CONTEXT_MANAGER",
-        _FakeWorkflowContextManager(),
+        workflow_context_manager_factory(
+            workflow_run_id="wr_redact",
+            mask_secrets=False,
+            secrets={"password": "secret-value"},
+        ),
     )
     skyvern_context.reset()
     assert skyvern_context.current() is None
@@ -176,11 +197,12 @@ async def test_create_artifact_leaves_textual_artifact_data_unchanged_when_flag_
 async def test_create_artifact_redacts_har_structured_fields_with_empty_secret_set(
     artifact_redaction_setup: _FakeStorage,
     monkeypatch: pytest.MonkeyPatch,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
 ) -> None:
     monkeypatch.setattr(
         artifact_manager_module.app,
         "WORKFLOW_CONTEXT_MANAGER",
-        _EmptyWorkflowContextManager(),
+        workflow_context_manager_factory(workflow_run_id="wr_redact"),
     )
     manager = ArtifactManager()
     step = create_fake_step(TEST_STEP_ID)
@@ -194,3 +216,26 @@ async def test_create_artifact_redacts_har_structured_fields_with_empty_secret_s
 
     assert REDACTED_SECRET_PLACEHOLDER.encode() in artifact_redaction_setup.stored[0][1]
     assert b"Bearer token" not in artifact_redaction_setup.stored[0][1]
+
+
+@pytest.mark.asyncio
+async def test_create_artifact_redacts_har_when_workflow_opted_out(
+    artifact_redaction_setup: _FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+) -> None:
+    monkeypatch.setattr(
+        artifact_manager_module.app,
+        "WORKFLOW_CONTEXT_MANAGER",
+        workflow_context_manager_factory(workflow_run_id="wr_redact", mask_secrets=False),
+    )
+    manager = ArtifactManager()
+    step = create_fake_step(TEST_STEP_ID)
+    har_data = b'{"log":{"entries":[{"request":{"headers":[{"name":"Authorization","value":"Bearer token"}]}}]}}'
+
+    await manager.create_artifact(step=step, artifact_type=ArtifactType.HAR, data=har_data)
+    await manager.wait_for_upload_aiotasks([step.task_id])
+
+    stored = artifact_redaction_setup.stored[0][1]
+    assert REDACTED_SECRET_PLACEHOLDER.encode() in stored
+    assert b"Bearer token" not in stored

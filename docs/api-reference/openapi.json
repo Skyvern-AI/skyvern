@@ -26757,6 +26757,11 @@
             "title": "Persist Browser Session",
             "default": false
           },
+          "mask_secrets": {
+            "type": "boolean",
+            "title": "Mask Secrets",
+            "default": false
+          },
           "pin_saved_session_ip": {
             "type": "boolean",
             "title": "Pin Saved Session Ip",
@@ -27084,6 +27089,18 @@
             "type": "boolean",
             "title": "Persist Browser Session",
             "default": false
+          },
+          "mask_secrets": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mask Secrets",
+            "description": "Visually mask secrets as they are typed in the browser, hiding them from screenshots, recordings, and the live view."
           },
           "pin_saved_session_ip": {
             "type": "boolean",

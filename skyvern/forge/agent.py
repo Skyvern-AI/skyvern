@@ -5391,10 +5391,15 @@ class ForgeAgent:
 
             _ctx = skyvern_context.current()
             _use_bundling = _ctx.use_artifact_bundling if _ctx else False
-            secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
+            redaction_enabled = settings.ENABLE_SECRET_ARTIFACT_REDACTION
+            secret_values = (
+                app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
+                if redaction_enabled
+                else set()
+            )
 
             har_data = await app.BROWSER_MANAGER.get_har_data(task_id=task.task_id, browser_state=browser_state)
-            if settings.ENABLE_SECRET_ARTIFACT_REDACTION:
+            if redaction_enabled:
                 har_data = await asyncio.to_thread(redact_har_bytes, har_data, secret_values)
             if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
                 submission_shadow.schedule_submission_signal_shadow(
@@ -5409,7 +5414,7 @@ class ForgeAgent:
             browser_log = await app.BROWSER_MANAGER.get_browser_console_log(
                 task_id=task.task_id, browser_state=browser_state
             )
-            if settings.ENABLE_SECRET_ARTIFACT_REDACTION:
+            if redaction_enabled:
                 browser_log = await asyncio.to_thread(redact_console_log_bytes, browser_log, secret_values)
             LOG.debug("Uploading browser log", browser_log_size=len(browser_log))
 

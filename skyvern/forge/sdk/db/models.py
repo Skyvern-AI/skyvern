@@ -594,6 +594,7 @@ class WorkflowModel(SoftDeleteMixin, Base):
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
     persist_browser_session = Column(Boolean, default=False, nullable=False)
+    mask_secrets = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     pin_saved_session_ip = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     browser_profile_id = Column(String, nullable=True)
     browser_profile_key = Column(String, nullable=True)

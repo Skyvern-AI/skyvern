@@ -1,7 +1,6 @@
 import asyncio
 import copy
 import dataclasses
-import inspect
 import json
 import re
 import time
@@ -274,13 +273,6 @@ def _current_secret_values_for_redaction() -> set[str]:
             exclude_runtime_otp=True,
         )
     except Exception:
-        return set()
-    if inspect.isawaitable(secret_values):
-        close = getattr(secret_values, "close", None)
-        if callable(close):
-            close()
-        return set()
-    if not isinstance(secret_values, set):
         return set()
     return secret_values
 
