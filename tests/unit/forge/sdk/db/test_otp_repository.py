@@ -174,3 +174,31 @@ async def test_otp_repository_readers_match_non_email_identifiers_exactly(
 
     assert [result.totp_code_id for result in upper_results] == ["otp_username_upper"]
     assert [result.totp_code_id for result in lower_results] == ["otp_username_lower"]
+
+
+@pytest.mark.asyncio
+async def test_promote_raw_otp_code_returns_promoted_row(agent_db: AgentDB) -> None:
+    async with agent_db.Session() as session:
+        session.add(
+            TOTPCodeModel(
+                totp_code_id="otp_promote",
+                organization_id="o_test",
+                totp_identifier="user@example.test",
+                content="your code is 123456",
+                code=None,
+                otp_type=None,
+                parse_status="raw",
+            )
+        )
+        await session.commit()
+
+    promoted = await agent_db.otp.promote_raw_otp_code(
+        totp_code_id="otp_promote",
+        organization_id="o_test",
+        code="123456",
+        otp_type=OTPType.TOTP,
+    )
+
+    assert promoted is not None
+    assert promoted.totp_code_id == "otp_promote"
+    assert promoted.code == "123456"
