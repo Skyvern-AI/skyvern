@@ -6121,7 +6121,7 @@ async def handle_scroll_action(
                 element_id=action.element_id,
             )
             await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
-    elif action.x and action.y:
+    elif action.x is not None and action.y is not None:
         # Coordinate-based scrolling from CUA/UI-TARS agents
         await EventStrategyFactory.move_cursor(page, action.x, action.y)
         await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
