@@ -80,6 +80,7 @@ _OBSERVATION_TOOLS = {
     "console_messages",
     "select_option",
     "press_key",
+    "wait_for_either_state",
 }
 
 _AUTHORING_TOOL_NAMES = frozenset({"update_and_run_blocks", "update_workflow"})
