@@ -1177,6 +1177,7 @@ _ALLOWED_EXECUTE_TOOLS = frozenset(
         "hover",
         "scroll",
         "wait",
+        "wait_for_either_state",
         "observe",
         "screenshot",
         "evaluate",

@@ -717,6 +717,7 @@ class TestMCPToolOverlayCompleteness:
             "console_messages",
             "select_option",
             "press_key",
+            "wait_for_either_state",
         }
         assert set(alias_map.keys()) == expected_aliases
         assert all(v.startswith("skyvern_") for v in alias_map.values())
@@ -746,9 +747,21 @@ class TestMCPToolOverlayCompleteness:
             "console_messages",
             "select_option",
             "press_key",
+            "wait_for_either_state",
         }
         for name in browser_tools:
             assert overlays[name].requires_browser, f"{name} should have requires_browser=True"
+
+    def test_wait_for_either_state_exposes_the_two_selector_branch(self) -> None:
+        """Without selector_or the copilot must guess one state and pay the timeout when it is wrong."""
+        from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
+
+        assert get_skyvern_mcp_alias_map()["wait_for_either_state"] == "skyvern_wait_for_either_state"
+        overlay = _build_skyvern_mcp_overlays()["wait_for_either_state"]
+
+        # Both states are required by the tool itself, so a single-selector call — the shape that
+        # spends the whole ceiling on a wrong guess — is not expressible here at all.
+        assert not overlay.hide_params & {"selector_a", "selector_b"}
 
     def test_intent_hidden_on_element_action_tools(self) -> None:
         """An `intent` runs a second LLM agent to pick the element, duplicating reasoning the
@@ -1924,3 +1937,16 @@ class TestClickPostHookReachedDownloadTarget:
         await _click_post_hook(result, {}, ctx)
 
         assert ctx.reached_download_target is None
+
+
+def test_browser_overlays_are_gated_by_phase_and_session_classification() -> None:
+    """A requires_browser overlay provisions a session, so leaving one out of these sets lets it run
+    before composition and stops a dead-session failure from being classified unrecoverable."""
+    from skyvern.forge.sdk.copilot.build_phase import _BROWSER_PRIMITIVE_TOOLS
+    from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
+    from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _BROWSER_SESSION_TOOL_NAMES
+
+    browser_overlays = {name for name, o in _build_skyvern_mcp_overlays().items() if o.requires_browser}
+
+    assert browser_overlays <= _BROWSER_PRIMITIVE_TOOLS, browser_overlays - _BROWSER_PRIMITIVE_TOOLS
+    assert browser_overlays <= _BROWSER_SESSION_TOOL_NAMES, browser_overlays - _BROWSER_SESSION_TOOL_NAMES

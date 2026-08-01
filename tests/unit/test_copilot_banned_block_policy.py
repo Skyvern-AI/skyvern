@@ -257,6 +257,9 @@ def test_code_only_authoring_prompt_requires_idempotent_credential_login() -> No
     # spends the whole timeout proving it is absent on an already-authenticated session.
     assert ".or_(" in prompt
     assert re.search(r"\.or_\([^)]*\)\.first\.wait_for\([^)]*timeout=90000(?!\d)", prompt)
+    # `.first` is the first match in DOM order, not the first to become visible, so an unconstrained
+    # union binds to a hidden sign-in form and holds the wait to the ceiling.
+    assert "visible=true" in prompt
     assert "is_visible()" in prompt
     assert "await solve_captcha(page)" in prompt
     assert "platform-managed verification challenge" in prompt
@@ -772,6 +775,7 @@ def test_schema_guidance_teaches_a_no_wait_branch_between_two_page_states() -> N
     guidance = " ".join(_code_only_browser_schema_guidance())
 
     assert ".or_(" in guidance
+    assert "visible=true" in guidance
     assert "is_visible()" in guidance or "count()" in guidance
 
     entry_ceiling = re.search(r"entry wait[^.]*?timeout=(\d+)(?!\d)", guidance)

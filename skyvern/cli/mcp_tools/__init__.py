@@ -44,6 +44,8 @@ except ImportError as fastmcp_import_error:
 else:
     _FASTMCP_IMPORT_ERROR = None
 
+from skyvern.cli.mcp_tools.browser import EITHER_STATE_OUTPUT_SCHEMA
+
 from .blocks import (
     skyvern_block_schema,
     skyvern_block_validate,
@@ -78,6 +80,7 @@ from .browser import (
     skyvern_type,
     skyvern_validate,
     skyvern_wait,
+    skyvern_wait_for_either_state,
 )
 from .browser_profiles import (
     skyvern_browser_profile_create,
@@ -449,6 +452,11 @@ mcp.tool(tags={"browser_primitive"}, annotations=_web_mut("Scroll Page"))(skyver
 mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Select Option"))(skyvern_select_option)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Press Key"))(skyvern_press_key)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_ro("Wait"))(skyvern_wait)
+mcp.tool(
+    tags={"browser_primitive"},
+    annotations=_web_ro("Wait For Either State"),
+    output_schema=EITHER_STATE_OUTPUT_SCHEMA,
+)(skyvern_wait_for_either_state)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_ro("Find Element"))(skyvern_find)
 
 # -- Tab management (multi-tab) --
@@ -594,6 +602,7 @@ __all__ = [
     "skyvern_select_option",
     "skyvern_press_key",
     "skyvern_wait",
+    "skyvern_wait_for_either_state",
     "skyvern_find",
     # Tab management
     "skyvern_tab_list",
