@@ -1100,6 +1100,7 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
         "console_messages": "skyvern_console_messages",
         "select_option": "skyvern_select_option",
         "press_key": "skyvern_press_key",
+        "wait_for_either_state": "skyvern_wait_for_either_state",
     }
 
 
@@ -1251,5 +1252,9 @@ def _build_skyvern_mcp_overlays(
             requires_browser=True,
             pre_hook=_press_key_pre_hook,
             post_hook=_press_key_post_hook,
+        ),
+        "wait_for_either_state": SchemaOverlay(
+            hide_params=frozenset({"session_id", "cdp_url"}),
+            requires_browser=True,
         ),
     }

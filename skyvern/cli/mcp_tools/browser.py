@@ -1867,6 +1867,42 @@ async def skyvern_press_key(
     )
 
 
+async def _wait_for_either_selector(
+    page: Any,
+    selectors: tuple[str, str],
+    *,
+    state: str | None,
+    timeout: int,
+) -> tuple[str | None, BaseException | None]:
+    """Return the first selector to reach ``state``, or ``(None, error)`` if neither did. A waiter
+    that raises does not end the wait, so a malformed selector cannot beat a slow-but-valid one, and
+    ties go to the declared-first selector since both land in one ``done`` batch when both are ready.
+    """
+    tasks = {asyncio.create_task(page.wait_for_selector(sel, state=state, timeout=timeout)): sel for sel in selectors}
+    pending = set(tasks)
+    last_error: BaseException | None = None
+    try:
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in sorted(done, key=lambda settled: selectors.index(tasks[settled])):
+                error = task.exception()
+                if error is None:
+                    return tasks[task], None
+                # A malformed selector names the caller's mistake; a timeout only says the other
+                # side never appeared. Keep the diagnosable one when both sides fail.
+                if last_error is None or (
+                    isinstance(last_error, PlaywrightTimeoutError) and not isinstance(error, PlaywrightTimeoutError)
+                ):
+                    last_error = error
+        return None, last_error
+    finally:
+        for task in tasks:
+            task.cancel()
+        # asyncio.wait does not reap its children: drain every task so none outlives the call and
+        # no exception is left unretrieved.
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def skyvern_wait(
     selector: Annotated[str | None, Field(description=f"{DIRECT_TARGET_DESCRIPTION} CSS selector to wait for.")] = None,
     state: Annotated[str | None, Field(description="Element state: visible, hidden, attached, detached")] = "visible",
@@ -1958,6 +1994,15 @@ async def skyvern_wait(
                 waited_for = "selector"
             timer.mark("sdk")
         except Exception as e:
+            # A single-selector timeout is the one failure the caller can convert into a decision:
+            # it just spent the ceiling learning the page is not in the state it guessed.
+            hint = "Condition was not met within timeout"
+            if selector and state in (None, "visible", "attached"):
+                hint += (
+                    ". The page was not in the state you named. If you were deciding between two states, "
+                    "skyvern_wait_for_either_state takes both and returns the moment either appears, "
+                    "instead of spending the ceiling on a wrong guess"
+                )
             return action_result(
                 "skyvern_wait",
                 ok=False,
@@ -1966,22 +2011,114 @@ async def skyvern_wait(
                 error=make_error(
                     ErrorCode.TIMEOUT,
                     _exception_message(e),
-                    "Condition was not met within timeout",
+                    hint,
                     details=_exception_details(e),
                 ),
             )
 
     sdk_eq = ""
+    data: dict[str, Any] = {"waited_for": waited_for}
     if waited_for == "time":
         sdk_eq = f"await page.wait_for_timeout({time_ms})"
     elif waited_for == "intent":
         sdk_eq = f"await page.validate({intent!r})"
     elif waited_for == "selector":
         sdk_eq = f"await page.wait_for_selector({selector!r})"
+    data["sdk_equivalent"] = sdk_eq
     return action_result(
         "skyvern_wait",
         browser_context=ctx,
-        data={"waited_for": waited_for, "sdk_equivalent": sdk_eq},
+        data=data,
+        timing_ms=timer.timing_ms,
+    )
+
+
+EITHER_STATE_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "ok": {"type": "boolean"},
+        "data": {
+            "type": ["object", "null"],
+            "properties": {
+                "matched_selector": {
+                    "type": "string",
+                    "description": "The selector that reached the state first. Branch on it.",
+                },
+                "matched": {
+                    "type": "string",
+                    "enum": ["selector_a", "selector_b"],
+                    "description": "Which argument matched_selector came from.",
+                },
+            },
+        },
+        "error": {"type": ["object", "null"]},
+    },
+}
+
+
+async def skyvern_wait_for_either_state(
+    selector_a: Annotated[str, Field(description="CSS selector for the first page state, e.g. the sign-in form.")],
+    selector_b: Annotated[
+        str, Field(description="CSS selector for the second page state, e.g. an element only present once signed in.")
+    ],
+    state: Annotated[str | None, Field(description="Element state to wait for: visible or attached")] = "visible",
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    timeout: Annotated[int, Field(description="Max wait time in milliseconds", ge=1000, le=120000)] = 90000,
+) -> dict[str, Any]:
+    """Find out which of two page states the page settled into — a sign-in form or an already
+    signed-in view, a challenge or the page behind it.
+
+    Returns as soon as either selector reaches `state`, with `matched_selector` naming the one that
+    did, so you can branch on the answer without inspecting the page again. Waiting on a single
+    selector instead spends the whole timeout proving that state is absent whenever it is the wrong
+    guess, which is why this takes both.
+    """
+    if state not in (None, "visible", "attached"):
+        return make_result(
+            "skyvern_wait_for_either_state",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                f"state must be visible or attached, not {state}",
+                "A selector matching nothing satisfies hidden and detached at once, so the absent side would win",
+            ),
+        )
+
+    try:
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+    except BrowserNotAvailableError:
+        return make_result("skyvern_wait_for_either_state", ok=False, error=no_browser_error())
+
+    with Timer() as timer:
+        matched_selector, wait_error = await _wait_for_either_selector(
+            page, (selector_a, selector_b), state=state, timeout=timeout
+        )
+        timer.mark("sdk")
+
+    if matched_selector is None:
+        # A cancelled waiter surfaces as BaseException; only a real failure carries a reportable message.
+        failure = wait_error if isinstance(wait_error, Exception) else None
+        return _action_result_factory(ctx=ctx, page=page, selector=selector_a)(
+            "skyvern_wait_for_either_state",
+            ok=False,
+            browser_context=ctx,
+            timing_ms=timer.timing_ms,
+            error=make_error(
+                ErrorCode.TIMEOUT,
+                _exception_message(failure) if failure else f"Neither selector reached {state!r}",
+                "The page settled into neither state; both selectors may be wrong for this page",
+                details=_exception_details(failure) if failure else None,
+            ),
+        )
+
+    return _action_result_factory(ctx=ctx, page=page, selector=matched_selector)(
+        "skyvern_wait_for_either_state",
+        browser_context=ctx,
+        data={
+            "matched_selector": matched_selector,
+            "matched": "selector_a" if matched_selector == selector_a else "selector_b",
+        },
         timing_ms=timer.timing_ms,
     )
 
@@ -3160,6 +3297,7 @@ _TOOL_NAME_MAP: dict[str, str] = {
     "hover": "skyvern_hover",
     "scroll": "skyvern_scroll",
     "wait": "skyvern_wait",
+    "wait_for_either_state": "skyvern_wait_for_either_state",
     "screenshot": "skyvern_screenshot",
     "evaluate": "skyvern_evaluate",
 }
@@ -3174,6 +3312,7 @@ _TOOL_ACCEPTED_PARAMS: dict[str, frozenset[str]] = {
     "hover": frozenset({"intent", "selector", "timeout"}),
     "scroll": frozenset({"direction", "amount", "intent", "selector"}),
     "wait": frozenset({"time_ms", "intent", "selector", "state", "timeout", "poll_interval_ms"}),
+    "wait_for_either_state": frozenset({"selector_a", "selector_b", "state", "timeout"}),
     "screenshot": frozenset({"full_page", "selector", "inline"}),
     "evaluate": frozenset({"expression"}),
 }
