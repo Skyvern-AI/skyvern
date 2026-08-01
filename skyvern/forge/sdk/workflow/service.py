@@ -76,6 +76,7 @@ from skyvern.forge.sdk.db.id import generate_output_parameter_id, generate_workf
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.transient_ui_capture import resolve_transient_ui_capture_arm
+from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
 from skyvern.forge.sdk.schemas.credentials import Credential
@@ -2017,10 +2018,21 @@ class WorkflowService:
                     trigger_type=resolved_trigger_type,
                 )
             except Exception as e:
-                LOG.exception(
-                    f"Error while setting up workflow run {workflow_run.workflow_run_id}",
-                    workflow_run_id=workflow_run.workflow_run_id,
-                )
+                # Client 4xx (e.g. missing param, invalid credential id) is expected user input and
+                # already surfaced via the failed run + failure_reason below, so it needs no operator
+                # action. Log it at warning without a traceback (keeping the error_type/exception_hash
+                # dashboard fields), and reserve error+traceback for genuine setup defects.
+                if isinstance(e, SkyvernHTTPException) and e.status_code < 500:
+                    LOG.warning(
+                        f"Error while setting up workflow run {workflow_run.workflow_run_id}",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        **exception_log_fields(e),
+                    )
+                else:
+                    LOG.exception(
+                        f"Error while setting up workflow run {workflow_run.workflow_run_id}",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                    )
 
                 # Discard any failed transaction state on the shared outer session before
                 # mark_workflow_run_as_failed reuses it.

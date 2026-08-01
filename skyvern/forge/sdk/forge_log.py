@@ -372,6 +372,22 @@ def add_error_processor(logger: logging.Logger, method_name: str, event_dict: Ev
     return event_dict
 
 
+def exception_log_fields(exc: BaseException) -> dict[str, str]:
+    """The error_type/error_category/exception_hash fields add_error_processor derives from exc_info.
+
+    For callsites that want these dashboard fields on a log line that deliberately omits the
+    traceback (e.g. a warning downgraded from an exception log).
+    """
+    exc_type = type(exc)
+    fields = {
+        "error_type": f"{exc_type.__module__}.{exc_type.__name__}",
+        "error_category": _categorize_exception(exc_type, exc_type.__name__),
+    }
+    if exc.__traceback__ is not None:
+        fields["exception_hash"] = _generate_exception_hash(exc_type, exc.__traceback__)
+    return fields
+
+
 def _generate_exception_hash(exc_type: type, tb: TracebackType) -> str:
     """
     Generate a stable hash for an exception based on:
