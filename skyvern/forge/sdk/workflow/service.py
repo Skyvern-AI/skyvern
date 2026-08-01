@@ -3301,6 +3301,7 @@ class WorkflowService:
                 block_outputs,
                 workflow,
                 inherited_workflow_system_prompt=inherited_workflow_system_prompt,
+                mask_secrets=getattr(workflow, "mask_secrets", False),
             )
         except Exception as e:
             LOG.exception(
@@ -6316,6 +6317,7 @@ class WorkflowService:
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
+        mask_secrets: bool = False,
         pin_saved_session_ip: bool = False,
         browser_profile_id: str | None = None,
         browser_profile_key: str | None = None,
@@ -6353,6 +6355,7 @@ class WorkflowService:
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
+                mask_secrets=mask_secrets,
                 pin_saved_session_ip=pin_saved_session_ip,
                 browser_profile_id=browser_profile_id,
                 browser_profile_key=browser_profile_key,
@@ -6751,6 +6754,7 @@ class WorkflowService:
         totp_verification_url: str | None | object = _UNSET,
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        mask_secrets: bool | None = None,
         pin_saved_session_ip: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
         browser_profile_key: str | None | object = _UNSET,
@@ -6790,6 +6794,7 @@ class WorkflowService:
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
+                mask_secrets=mask_secrets,
                 pin_saved_session_ip=pin_saved_session_ip,
                 browser_profile_id=browser_profile_id,
                 browser_profile_key=browser_profile_key,
@@ -6821,6 +6826,7 @@ class WorkflowService:
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
+                mask_secrets=mask_secrets,
                 pin_saved_session_ip=pin_saved_session_ip,
                 browser_profile_id=browser_profile_id,
                 browser_profile_key=browser_profile_key,
@@ -9469,8 +9475,8 @@ class WorkflowService:
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
         )
-        secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
         if settings.ENABLE_SECRET_ARTIFACT_REDACTION:
+            secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
             har_data = await asyncio.to_thread(redact_har_bytes, har_data, secret_values)
         if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
             submission_shadow.schedule_submission_signal_shadow(
@@ -9499,8 +9505,8 @@ class WorkflowService:
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
         )
-        secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
         if settings.ENABLE_SECRET_ARTIFACT_REDACTION:
+            secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
             browser_log = await asyncio.to_thread(redact_console_log_bytes, browser_log, secret_values)
         LOG.debug("Persisting browser log", browser_log_size=len(browser_log))
         if browser_log:
@@ -9555,8 +9561,13 @@ class WorkflowService:
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
         )
-        secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
-        if settings.ENABLE_SECRET_ARTIFACT_REDACTION:
+        redaction_enabled = settings.ENABLE_SECRET_ARTIFACT_REDACTION
+        secret_values = (
+            app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
+            if redaction_enabled
+            else set()
+        )
+        if redaction_enabled:
             browser_log = await asyncio.to_thread(redact_console_log_bytes, browser_log, secret_values)
         LOG.debug("Persisting browser log (bundled)", browser_log_size=len(browser_log))
         if browser_log:
@@ -9567,7 +9578,7 @@ class WorkflowService:
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
         )
-        if settings.ENABLE_SECRET_ARTIFACT_REDACTION:
+        if redaction_enabled:
             har_data = await asyncio.to_thread(redact_har_bytes, har_data, secret_values)
         if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
             submission_shadow.schedule_submission_signal_shadow(
@@ -9658,6 +9669,7 @@ class WorkflowService:
             totp_verification_url=runtime_workflow.totp_verification_url,
             totp_identifier=runtime_workflow.totp_identifier,
             persist_browser_session=runtime_workflow.persist_browser_session,
+            mask_secrets=runtime_workflow.mask_secrets,
             pin_saved_session_ip=runtime_workflow.pin_saved_session_ip,
             browser_profile_id=runtime_workflow.browser_profile_id,
             browser_profile_key=runtime_workflow.browser_profile_key,
@@ -9798,6 +9810,9 @@ class WorkflowService:
                     totp_verification_url=request.totp_verification_url,
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
+                    mask_secrets=request.mask_secrets
+                    if request.mask_secrets is not None
+                    else getattr(existing_latest_workflow, "mask_secrets", False),
                     pin_saved_session_ip=request.pin_saved_session_ip
                     if "pin_saved_session_ip" in request.model_fields_set
                     else existing_latest_workflow.pin_saved_session_ip,
@@ -9847,6 +9862,7 @@ class WorkflowService:
                     totp_verification_url=request.totp_verification_url,
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
+                    mask_secrets=request.mask_secrets if request.mask_secrets is not None else False,
                     pin_saved_session_ip=request.pin_saved_session_ip,
                     browser_profile_id=request.browser_profile_id,
                     browser_profile_key=request.browser_profile_key,

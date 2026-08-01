@@ -10625,12 +10625,14 @@ async def _update_workflow(
         # Derive plain-language steps from each code block's code so the editor timeline
         # mirrors the actual code (deterministic action_type + line ranges).
         workflow_yaml_with_steps = await apply_derived_code_block_steps(workflow_yaml)
+        prior_workflow = await _get_prior_workflow(ctx)
         workflow = await _process_workflow_yaml(
             workflow_id=ctx.workflow_id,
             workflow_permanent_id=ctx.workflow_permanent_id,
             organization_id=ctx.organization_id,
             workflow_yaml=workflow_yaml_with_steps,
             settings_fallback_yaml=prior_yaml,
+            settings_fallback_workflow=prior_workflow,
             credential_scrub_values=registered_scrub_values(ctx),
         )
         _record_workflow_proxy_location_span(workflow_yaml, workflow)
@@ -10638,7 +10640,6 @@ async def _update_workflow(
         # Param / top-level setting changes go through canonical because
         # prepare_workflow and the runtime parameter-row read consume canonical
         # values; terminal handlers roll back on non-auto-accept.
-        prior_workflow = await _get_prior_workflow(ctx)
         requires_canonical_persist = _workflow_requires_canonical_persist(
             prior_workflow, workflow
         ) or _workflow_needs_contract_readback_persist(
@@ -10660,6 +10661,7 @@ async def _update_workflow(
                 totp_verification_url=workflow.totp_verification_url,
                 totp_identifier=workflow.totp_identifier,
                 persist_browser_session=workflow.persist_browser_session,
+                mask_secrets=getattr(workflow, "mask_secrets", False),
                 pin_saved_session_ip=workflow.pin_saved_session_ip,
                 browser_profile_id=workflow.browser_profile_id,
                 browser_profile_key=workflow.browser_profile_key,
