@@ -145,7 +145,14 @@ function TaskHistory() {
         <div className="flex gap-2">
           <StatusFilterDropdown
             values={statusFilters}
-            onChange={setStatusFilters}
+            onChange={(values) => {
+              setStatusFilters(values);
+              if (page !== 1) {
+                const params = new URLSearchParams(searchParams);
+                params.set("page", "1");
+                setSearchParams(params, { replace: true });
+              }
+            }}
           />
           <Button variant="secondary" onClick={handleExport}>
             <DownloadIcon className="mr-2" />
