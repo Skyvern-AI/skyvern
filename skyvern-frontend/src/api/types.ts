@@ -180,6 +180,7 @@ export type TaskApiResponse = {
   screenshot_url: string | null;
   recording_url: string | null;
   recording_archived?: boolean;
+  browser_console_log_url?: string | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;

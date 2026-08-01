@@ -36,7 +36,7 @@ import { buildTaskRunPayload } from "@/util/taskRunPayload";
 import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, Outlet } from "react-router-dom";
-import { statusIsFinalized } from "../types";
+import { statusIsCancellable, statusIsFinalized } from "../types";
 import { MAX_STEPS_DEFAULT } from "../constants";
 import { useTaskQuery } from "./hooks/useTaskQuery";
 import { useFirstParam } from "@/hooks/useFirstParam";
@@ -170,8 +170,7 @@ function TaskDetails() {
     </div>
   ) : null;
 
-  const taskIsRunningOrQueued =
-    task?.status === Status.Running || task?.status === Status.Queued;
+  const taskIsCancellable = task ? statusIsCancellable(task) : false;
 
   const taskHasTerminalState = task && statusIsFinalized(task);
 
@@ -201,6 +200,22 @@ function TaskDetails() {
       <Label>Webhook Failure Reason</Label>
       <div className="rounded-md border border-yellow-600 p-4 text-sm">
         {task.webhook_failure_reason}
+      </div>
+    </div>
+  ) : null;
+
+  const browserConsoleLog = task?.browser_console_log_url ? (
+    <div className="space-y-1">
+      <Label>Browser Console Log</Label>
+      <div>
+        <a
+          href={task.browser_console_log_url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-sm underline underline-offset-4"
+        >
+          Download console log
+        </a>
       </div>
     </div>
   ) : null;
@@ -268,13 +283,13 @@ function TaskDetails() {
               onTestWebhook={() => setReplayOpen(true)}
             />
             <WebhookReplayDialog
-              runId={task?.workflow_run_id ?? ""}
+              runId={task?.workflow_run_id ?? task?.task_id ?? ""}
               disabled={taskIsLoading || !taskHasTerminalState}
               open={replayOpen}
               onOpenChange={setReplayOpen}
               hideTrigger
             />
-            {taskIsRunningOrQueued && (
+            {taskIsCancellable && (
               <Dialog>
                 <DialogTrigger asChild>
                   <Button variant="destructive">Cancel</Button>
@@ -345,6 +360,7 @@ function TaskDetails() {
           {extractedInformation}
           {failureReason}
           {webhookFailureReason}
+          {browserConsoleLog}
         </>
       )}
       <SwitchBarNavigation
