@@ -75,7 +75,7 @@ Skyvern is a browser automation platform that uses LLMs and computer vision to i
 - Browser dependencies installed via Playwright
 
 ### LLM Configuration
-Configure via environment variables or `skyvern init llm`:
+Configure via environment variables or the interactive `skyvern init` wizard:
 - Supports OpenAI, Anthropic, Azure OpenAI, AWS Bedrock, Gemini, Ollama
 - Uses `LLM_KEY` to specify which model to use
 - `SECONDARY_LLM_KEY` for lightweight agent operations
