@@ -228,12 +228,13 @@ async def _run_combobox_input(
         action.prefilter_typeahead = prefilter_typeahead
 
     select_mock = AsyncMock(return_value=select_result)
+    input_value_mock = AsyncMock(side_effect=["", _TARGET]) if is_secret else AsyncMock(return_value="")
 
     with (
         patch("skyvern.webeye.actions.handler.DomUtil", return_value=dom_instance),
         patch("skyvern.webeye.actions.handler.SkyvernFrame.create_instance", new=AsyncMock(return_value=skyvern_frame)),
         patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=inc),
-        patch("skyvern.webeye.actions.handler.get_input_value", new=AsyncMock(return_value="")),
+        patch("skyvern.webeye.actions.handler.get_input_value", new=input_value_mock),
         patch(
             "skyvern.webeye.actions.handler.get_actual_value_of_parameter_if_secret_with_task",
             return_value=_TARGET,
@@ -278,7 +279,7 @@ async def test_invalid_combobox_commit_stops_batch_when_flagged() -> None:
 @pytest.mark.asyncio
 async def test_non_combobox_does_not_trigger_select() -> None:
     """A plain textbox (not a combobox) must never enter the deterministic selection path."""
-    results, el, select_mock = await _run_combobox_input(
+    results, _el, select_mock = await _run_combobox_input(
         attrs={"role": "textbox", "aria-autocomplete": None, "aria-invalid": "true"},
         options=_listbox_with_option(_TARGET),
         select_success=True,
@@ -345,7 +346,7 @@ async def test_search_bar_does_not_use_combobox_branch() -> None:
 async def test_secret_valued_action_does_not_trigger_select() -> None:
     """A secret-valued parameter must never enter the selection path: its value would otherwise be
     logged (target_value=...) and sent into the custom-select LLM prompt via target_value=text."""
-    results, _el, select_mock = await _run_combobox_input(
+    results, el, select_mock = await _run_combobox_input(
         attrs=_INVALID_BOTH,
         options=_listbox_with_option(_TARGET),
         select_success=True,
@@ -353,6 +354,7 @@ async def test_secret_valued_action_does_not_trigger_select() -> None:
         is_secret=True,
     )
     select_mock.assert_not_awaited()
+    el.apply_secret_visual_mask.assert_awaited_once_with()
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
 
 

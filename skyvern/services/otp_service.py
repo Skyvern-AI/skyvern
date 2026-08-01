@@ -324,12 +324,6 @@ def try_generate_totp_for_credential(
         return None
     try:
         code = generate_totp_code(totp_secret)
-        LOG.info(
-            "Generated TOTP from credential secret",
-            workflow_run_id=workflow_run_id,
-            credential_key=credential_key,
-        )
-        return OTPValue(value=code, type=OTPType.TOTP)
     except Exception:
         LOG.warning(
             "Failed to generate TOTP from credential secret",
@@ -338,6 +332,21 @@ def try_generate_totp_for_credential(
             exc_info=True,
         )
         return None
+    LOG.info(
+        "Generated TOTP from credential secret",
+        workflow_run_id=workflow_run_id,
+        credential_key=credential_key,
+    )
+    try:
+        workflow_run_context.register_runtime_otp_value(code)
+    except Exception:
+        LOG.debug(
+            "Failed to register runtime TOTP for redaction",
+            workflow_run_id=workflow_run_id,
+            credential_key=credential_key,
+            exc_info=True,
+        )
+    return OTPValue(value=code, type=OTPType.TOTP)
 
 
 def has_credential_totp_candidate(workflow_run_id: str | None) -> bool:

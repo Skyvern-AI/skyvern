@@ -34,6 +34,72 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
+SECRET_VISUAL_MASK_STYLE_ID = "skyvern-secret-mask-style"
+SECRET_VISUAL_MASK_ATTRIBUTE = "data-skyvern-secret-mask"
+SECRET_VISUAL_MASK_CSS_RULE = '[data-skyvern-secret-mask="true"] { -webkit-text-security: disc !important; }'
+SECRET_VISUAL_MASK_BLUR_FILTER = "blur(6px)"
+
+_SECRET_VISUAL_MASK_BODY = f"""
+    const ownerDocument = element.ownerDocument;
+    if (!ownerDocument) {{
+        return;
+    }}
+
+    const root = element.getRootNode();
+    const isShadowRoot = root instanceof ShadowRoot;
+    let style = root.querySelector({json.dumps(f"#{SECRET_VISUAL_MASK_STYLE_ID}")});
+    if (!style) {{
+        style = ownerDocument.createElement("style");
+        style.id = {json.dumps(SECRET_VISUAL_MASK_STYLE_ID)};
+        if (isShadowRoot) {{
+            root.appendChild(style);
+        }} else {{
+            (ownerDocument.head || ownerDocument.documentElement).appendChild(style);
+        }}
+    }}
+    style.textContent = {json.dumps(SECRET_VISUAL_MASK_CSS_RULE)};
+
+    element.setAttribute({json.dumps(SECRET_VISUAL_MASK_ATTRIBUTE)}, "true");
+
+    const elementTagName = element.tagName ? element.tagName.toLowerCase() : "";
+    if (elementTagName !== "input" && elementTagName !== "textarea") {{
+        element.style.filter = {json.dumps(SECRET_VISUAL_MASK_BLUR_FILTER)};
+    }}
+"""
+
+SECRET_VISUAL_MASK_SCRIPT = f"""
+    (element) => {{
+        {_SECRET_VISUAL_MASK_BODY}
+    }}
+"""
+
+_SECRET_VISUAL_MASK_ACTIVE_ELEMENT_SCRIPT = f"""
+    () => {{
+        const element = document.activeElement;
+        if (!element) {{
+            return;
+        }}
+
+        const activeElementTagName = element.tagName ? element.tagName.toLowerCase() : "";
+        if (
+            activeElementTagName === "input"
+            && String(element.getAttribute("type") || "").toLowerCase() === "password"
+        ) {{
+            return;
+        }}
+
+        {_SECRET_VISUAL_MASK_BODY}
+    }}
+"""
+
+
+async def apply_secret_visual_mask_to_active_element(page: Page) -> None:
+    try:
+        await SkyvernFrame.evaluate(page, expression=_SECRET_VISUAL_MASK_ACTIVE_ELEMENT_SCRIPT)
+    except Exception:
+        LOG.warning("Failed to apply secret visual mask to active element", exc_info=True)
+
+
 _SCREENSHOT_TARGET_CLOSED_MESSAGE = "Target page, context or browser has been closed"
 _SELECTED_SCREENSHOT_TARGET_CLOSED_MESSAGES = (
     "target page, context or browser has been closed",

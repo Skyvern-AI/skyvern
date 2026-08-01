@@ -41,6 +41,7 @@ class _FakeWorkflowRunContext:
             self.placeholder: OnePasswordConstants.TOTP,
             self.totp_secret_value_key(self.placeholder): totp_secret,
         }
+        self.runtime_otp_values: set[str] = set()
 
     def get_original_secret_value_or_none(self, key: str) -> str | None:
         return self.secrets.get(key)
@@ -53,6 +54,9 @@ class _FakeWorkflowRunContext:
 
     def find_embedded_placeholder_tokens(self, text: str) -> list[str]:
         return [text]
+
+    def register_runtime_otp_value(self, value: str) -> None:
+        self.runtime_otp_values.add(value)
 
 
 def _patch_workflow_context(monkeypatch: pytest.MonkeyPatch, workflow_context: _FakeWorkflowRunContext) -> None:
@@ -133,6 +137,7 @@ async def test_cua_input_types_generated_totp_instead_of_placeholder(monkeypatch
     assert len(results) == 1
     assert isinstance(results[0], ActionSuccess)
     type_text.assert_awaited_once_with(page, None, "654321")
+    assert workflow_context.runtime_otp_values == {"654321"}
 
 
 @pytest.mark.asyncio
@@ -215,6 +220,7 @@ async def test_dom_input_generates_totp_immediately_before_write(monkeypatch: py
     element.find_blocking_element = AsyncMock(
         side_effect=lambda **_kwargs: events.append("blocking-check") or (None, False)
     )
+    element.apply_secret_visual_mask = AsyncMock()
     element.input = AsyncMock(side_effect=lambda _text: events.append("input"))
 
     dom = MagicMock()
@@ -240,6 +246,52 @@ async def test_dom_input_generates_totp_immediately_before_write(monkeypatch: py
     assert isinstance(results[0], ActionSuccess)
     assert events == ["animation-wait", "blocking-check", "generate", "input"]
     element.input.assert_awaited_once_with("654321")
+    assert workflow_context.runtime_otp_values == {"654321"}
+
+
+@pytest.mark.asyncio
+async def test_blinking_cursor_input_registers_generated_totp_before_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.webeye.actions import handler
+
+    workflow_context = _FakeWorkflowRunContext(totp_secret="JBSWY3DPEHPK3PXP")
+    _patch_workflow_context(monkeypatch, workflow_context)
+    monkeypatch.setattr(handler, "generate_totp_code", MagicMock(return_value="654321"))
+
+    locator = MagicMock()
+    locator.focus = AsyncMock()
+    element = MagicMock()
+    element.get_id.return_value = "otp"
+    element.get_frame.return_value = MagicMock()
+    element.get_tag_name.return_value = "div"
+    element.get_locator.return_value = locator
+    element.get_selectable = AsyncMock(return_value=False)
+    element.is_disabled = AsyncMock(return_value=False)
+    element.supports_text_input = AsyncMock(return_value=True)
+    element.has_hidden_attr = AsyncMock(return_value=False)
+    element.is_readonly = AsyncMock(return_value=False)
+    element.get_attr = AsyncMock(side_effect=lambda name, **_kwargs: "blinking-cursor" if name == "class" else None)
+    element.apply_secret_visual_mask = AsyncMock()
+    element.press_fill = AsyncMock()
+
+    dom = MagicMock(get_skyvern_element_by_id=AsyncMock(return_value=element))
+    monkeypatch.setattr(handler, "DomUtil", MagicMock(return_value=dom))
+    monkeypatch.setattr(handler.SkyvernFrame, "create_instance", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(handler, "IncrementalScrapePage", MagicMock())
+    monkeypatch.setattr(handler, "get_input_value", AsyncMock(return_value=""))
+    monkeypatch.setattr(handler, "_get_input_or_select_context", AsyncMock(return_value=None))
+
+    results = await handle_input_text_action(
+        InputTextAction(element_id="otp", text=workflow_context.placeholder),
+        MagicMock(),
+        SimpleNamespace(id_to_element_dict={"otp": {"tagName": "div"}}),
+        SimpleNamespace(workflow_run_id="wr_test", task_id="task_test"),
+        SimpleNamespace(step_id="step_test"),
+    )
+
+    assert len(results) == 1
+    assert isinstance(results[0], ActionSuccess)
+    element.press_fill.assert_awaited_once_with(text="654321")
+    assert workflow_context.runtime_otp_values == {"654321"}
 
 
 @pytest.mark.asyncio
@@ -324,6 +376,7 @@ async def test_selectable_input_receives_generated_totp_instead_of_marker(monkey
     select_action = select_mock.await_args.args[0]
     assert select_action.option.label == "654321"
     assert select_action.option.label != workflow_context.placeholder
+    assert workflow_context.runtime_otp_values == {"654321"}
 
 
 class TestAnnotateMultiFieldTotpSequence:

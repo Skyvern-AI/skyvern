@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import dataclasses
+import inspect
 import json
 import re
 import time
@@ -63,6 +64,7 @@ from skyvern.schemas.llm import (
 )
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
 from skyvern.utils.image_token_estimator import estimate_image_cost, estimate_image_tokens, provider_image_tokens
+from skyvern.utils.secret_redaction import redact_secrets_from_text
 from skyvern.utils.url_validators import validate_fetch_url
 
 # Keep this server-only side effect out of the package __init__ so the legacy
@@ -259,6 +261,138 @@ def _set_llm_context_attrs(
     span.set_attribute("screenshots_included", bool(screenshots))
     span.set_attribute("screenshot_count", len(screenshots) if screenshots else 0)
     span.set_attribute("speculative", bool(is_speculative_step))
+
+
+def _current_secret_values_for_redaction() -> set[str]:
+    if not settings.ENABLE_SECRET_ARTIFACT_REDACTION:
+        return set()
+
+    try:
+        context = skyvern_context.current()
+        secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(
+            context.workflow_run_id if context else None,
+            exclude_runtime_otp=True,
+        )
+    except Exception:
+        return set()
+    if inspect.isawaitable(secret_values):
+        close = getattr(secret_values, "close", None)
+        if callable(close):
+            close()
+        return set()
+    if not isinstance(secret_values, set):
+        return set()
+    return secret_values
+
+
+def _redact_prompt_text(text: str | None, secret_values: set[str]) -> str | None:
+    if text is None:
+        return None
+
+    if not secret_values:
+        return text
+
+    return redact_secrets_from_text(text, secret_values)
+
+
+def _redact_content_blocks(blocks: list[Any], secret_values: set[str]) -> tuple[list[Any], bool]:
+    redacted_blocks: list[Any] = []
+    changed = False
+    for block in blocks:
+        redacted_block, block_changed = _redact_content_block(block, secret_values)
+        redacted_blocks.append(redacted_block)
+        changed = changed or block_changed
+    return (redacted_blocks, True) if changed else (blocks, False)
+
+
+def _redact_content_value(content: Any, secret_values: set[str]) -> tuple[Any, bool]:
+    if isinstance(content, str):
+        redacted_content = redact_secrets_from_text(content, secret_values)
+        return redacted_content, redacted_content != content
+    if isinstance(content, list):
+        return _redact_content_blocks(content, secret_values)
+    return content, False
+
+
+def _redact_content_block(block: Any, secret_values: set[str]) -> tuple[Any, bool]:
+    if not isinstance(block, dict):
+        return block, False
+
+    block_type = block.get("type")
+    if block_type == "text":
+        text = block.get("text")
+        if not isinstance(text, str):
+            return block, False
+        redacted_text = redact_secrets_from_text(text, secret_values)
+        if redacted_text == text:
+            return block, False
+        return {**block, "text": redacted_text}, True
+
+    if block_type == "tool_result":
+        content = block.get("content")
+        redacted_content, content_changed = _redact_content_value(content, secret_values)
+        if not content_changed:
+            return block, False
+        return {**block, "content": redacted_content}, True
+
+    return block, False
+
+
+def _redact_tool_calls(tool_calls: list[Any], secret_values: set[str]) -> tuple[list[Any], bool]:
+    redacted_tool_calls: list[Any] = []
+    changed = False
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            redacted_tool_calls.append(tool_call)
+            continue
+        function = tool_call.get("function")
+        if not isinstance(function, dict):
+            redacted_tool_calls.append(tool_call)
+            continue
+        arguments = function.get("arguments")
+        if not isinstance(arguments, str):
+            redacted_tool_calls.append(tool_call)
+            continue
+        redacted_arguments = redact_secrets_from_text(arguments, secret_values)
+        if redacted_arguments == arguments:
+            redacted_tool_calls.append(tool_call)
+            continue
+        redacted_function = {**function, "arguments": redacted_arguments}
+        redacted_tool_calls.append({**tool_call, "function": redacted_function})
+        changed = True
+    return (redacted_tool_calls, True) if changed else (tool_calls, False)
+
+
+def _redact_message_text_content(
+    messages: list[dict[str, Any]] | None,
+    secret_values: set[str],
+) -> list[dict[str, Any]] | None:
+    if messages is None or not secret_values:
+        return messages
+
+    redacted_messages: list[dict[str, Any]] = []
+    changed = False
+    for message in messages:
+        redacted_message = message
+        content = message.get("content")
+        if isinstance(content, str):
+            redacted_content = redact_secrets_from_text(content, secret_values)
+            if redacted_content != content:
+                redacted_message = {**redacted_message, "content": redacted_content}
+                changed = True
+        elif isinstance(content, list):
+            redacted_content_blocks, content_changed = _redact_content_blocks(content, secret_values)
+            if content_changed:
+                redacted_message = {**redacted_message, "content": redacted_content_blocks}
+                changed = True
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            redacted_tool_calls, tool_calls_changed = _redact_tool_calls(tool_calls, secret_values)
+            if tool_calls_changed:
+                redacted_message = {**redacted_message, "tool_calls": redacted_tool_calls}
+                changed = True
+        redacted_messages.append(redacted_message)
+    return redacted_messages if changed else messages
 
 
 def _enrich_llm_span(
@@ -1274,6 +1408,12 @@ class LLMAPIHandlerFactory:
                 )
 
             context = skyvern_context.current()
+            secret_values = _current_secret_values_for_redaction()
+            prompt = _redact_prompt_text(prompt, secret_values) or ""
+            system_prompt = _redact_prompt_text(system_prompt, secret_values)
+            redacted_cached_static_prompt = (
+                _redact_prompt_text(context.cached_static_prompt, secret_values) if context else None
+            )
             is_speculative_step = step.is_speculative if step else False
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
                 step, is_speculative_step, task_v2, thought, ai_suggestion
@@ -1370,7 +1510,7 @@ class LLMAPIHandlerFactory:
                 try:
                     if (
                         context
-                        and context.cached_static_prompt
+                        and redacted_cached_static_prompt
                         and prompt_name == EXTRACT_ACTION_PROMPT_NAME  # Only inject for extract-actions
                         and isinstance(llm_config, LLMConfig)
                         and isinstance(llm_config.model_name, str)
@@ -1388,7 +1528,7 @@ class LLMAPIHandlerFactory:
                                 "content": [
                                     {
                                         "type": "text",
-                                        "text": context.cached_static_prompt,
+                                        "text": redacted_cached_static_prompt,
                                     }
                                 ],
                             }
@@ -1440,9 +1580,9 @@ class LLMAPIHandlerFactory:
 
                     # Strip static prompt from the request messages because it's already in the cache
                     # Sending it again causes double-billing (once cached, once uncached)
-                    if context and context.cached_static_prompt:
+                    if redacted_cached_static_prompt:
                         prompt_stripped = LLMAPIHandlerFactory._strip_static_prompt_from_messages(
-                            active_messages, context.cached_static_prompt
+                            active_messages, redacted_cached_static_prompt
                         )
 
                         if prompt_stripped:
@@ -2069,6 +2209,12 @@ class LLMAPIHandlerFactory:
                 )
 
             context = skyvern_context.current()
+            secret_values = _current_secret_values_for_redaction()
+            prompt = _redact_prompt_text(prompt, secret_values) or ""
+            system_prompt = _redact_prompt_text(system_prompt, secret_values)
+            redacted_cached_static_prompt = (
+                _redact_prompt_text(context.cached_static_prompt, secret_values) if context else None
+            )
             is_speculative_step = step.is_speculative if step else False
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
                 step, is_speculative_step, task_v2, thought, ai_suggestion
@@ -2150,7 +2296,7 @@ class LLMAPIHandlerFactory:
                 try:
                     if (
                         context
-                        and context.cached_static_prompt
+                        and redacted_cached_static_prompt
                         and prompt_name == EXTRACT_ACTION_PROMPT_NAME  # Only inject for extract-actions
                         and isinstance(llm_config, LLMConfig)
                         and isinstance(llm_config.model_name, str)
@@ -2168,7 +2314,7 @@ class LLMAPIHandlerFactory:
                                 "content": [
                                     {
                                         "type": "text",
-                                        "text": context.cached_static_prompt,
+                                        "text": redacted_cached_static_prompt,
                                     }
                                 ],
                             }
@@ -2235,10 +2381,10 @@ class LLMAPIHandlerFactory:
                 # Strip static prompt from the request messages because it's already in the cache
                 # Sending it again causes double-billing (once cached, once uncached)
                 active_messages = messages
-                if vertex_cache_attached and context and context.cached_static_prompt:
+                if vertex_cache_attached and redacted_cached_static_prompt:
                     active_messages = copy.deepcopy(messages)
                     prompt_stripped = LLMAPIHandlerFactory._strip_static_prompt_from_messages(
-                        active_messages, context.cached_static_prompt
+                        active_messages, redacted_cached_static_prompt
                     )
 
                     if prompt_stripped:
@@ -2718,6 +2864,9 @@ class LLMCaller:
             active_parameters.update(self.llm_config.litellm_params)  # type: ignore
 
         context = skyvern_context.current()
+        secret_values = _current_secret_values_for_redaction()
+        original_prompt = prompt
+        prompt = _redact_prompt_text(prompt, secret_values)
         is_speculative_step = step.is_speculative if step else False
         should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
             step, is_speculative_step, task_v2, thought, ai_suggestion
@@ -2810,9 +2959,15 @@ class LLMCaller:
                 message_pattern = "anthropic"
 
             if use_message_history:
-                # self.message_history will be updated in place
+                redacted_message_history = _redact_message_text_content(self.message_history, secret_values)
                 messages = await llm_messages_builder_with_history(
                     prompt,
+                    screenshots,
+                    redacted_message_history,
+                    message_pattern=message_pattern,
+                )
+                message_history_after_success = await llm_messages_builder_with_history(
+                    original_prompt,
                     screenshots,
                     self.message_history,
                     message_pattern=message_pattern,
@@ -2823,6 +2978,7 @@ class LLMCaller:
                     screenshots,
                     message_pattern=message_pattern,
                 )
+                message_history_after_success = None
             llm_request_payload = {
                 "model": self.llm_key if openrouter_model_name and self.openai_client else self.llm_config.model_name,
                 "messages": messages,
@@ -2853,9 +3009,9 @@ class LLMCaller:
                     **active_parameters,
                 )
                 llm_duration_seconds = time.perf_counter() - t_llm_request
-                if use_message_history:
+                if use_message_history and message_history_after_success is not None:
                     # only update message_history when the request is successful
-                    self.message_history = messages
+                    self.message_history = message_history_after_success
             # Error paths only set status=error, not token/cost attrs via
             # _enrich_llm_span — no response object exists so there's nothing to report.
             except litellm.exceptions.ContextWindowExceededError as e:

@@ -43,7 +43,7 @@ from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.scraper.scraped_page import ScrapedPage, json_to_html
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, trim_element
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import SECRET_VISUAL_MASK_SCRIPT, SkyvernFrame
 
 LOG = structlog.get_logger()
 COMMON_INPUT_TAGS = {"input", "textarea", "select"}
@@ -1093,6 +1093,20 @@ class SkyvernElement:
                 raise
             await self._classify_typing_timeout(exc)
             raise
+
+    async def apply_secret_visual_mask(self) -> None:
+        try:
+            tag_name = self.get_tag_name().lower()
+            if tag_name == InteractiveElement.INPUT and str(await self.get_attr("type")).lower() == "password":
+                return
+
+            await SkyvernFrame.evaluate(
+                frame=self.get_frame(),
+                expression=SECRET_VISUAL_MASK_SCRIPT,
+                arg=await self.get_element_handler(),
+            )
+        except Exception:
+            LOG.warning("Failed to apply secret visual mask", exc_info=True, element_id=self.get_id())
 
     async def press_key(self, key: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().press(key=key, timeout=timeout)
