@@ -5037,6 +5037,104 @@ async def wrapper({default_args}):
                 exc_info=True,
             )
 
+    async def _capture_failure_evidence(
+        self,
+        *,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        browser_state: BrowserState | None,
+        page: Page | None,
+    ) -> None:
+        """Persist the page the block died on, so the copilot repair loop can see it.
+
+        Entirely best-effort: this runs inside the failure path, so it must never raise and
+        never change the block outcome.
+        """
+        if not organization_id:
+            return
+        live_browser_state = browser_state or app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
+        if not live_browser_state:
+            return
+        try:
+            screenshot = await live_browser_state.take_fullpage_screenshot()
+        except Exception:
+            LOG.warning(
+                "Failed to capture the at-failure screenshot for a code block",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+            screenshot = None
+        final_url: str | None = None
+        try:
+            failure_page = page or await live_browser_state.get_or_create_page()
+            # A failing login/MFA step can leave a credential or a generated OTP in the query
+            # string, and this URL is persisted and logged; mask before it leaves the page.
+            final_url = workflow_run_context.mask_secrets_in_data(failure_page.url) if failure_page else None
+        except Exception:
+            LOG.warning(
+                "Failed to read the at-failure URL for a code block",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+
+        try:
+            workflow_run_block = await app.DATABASE.observer.update_workflow_run_block(
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                final_url=final_url,
+            )
+            if screenshot:
+                await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
+                    workflow_run_block=workflow_run_block,
+                    artifact_type=ArtifactType.SCREENSHOT_LLM,
+                    data=screenshot,
+                )
+        except Exception:
+            LOG.warning(
+                "Failed to persist the at-failure evidence for a code block",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+
+    async def _failed_result_with_evidence(
+        self,
+        *,
+        failure_reason: str,
+        status: BlockStatus,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        browser_state: BrowserState | None,
+        page: Page | None,
+    ) -> BlockResult:
+        """Fail a code block after recording the page it died on.
+
+        Every non-healable exit routes through here so a new one inherits the capture instead of
+        silently reopening the blindness this closes.
+        """
+        await self._capture_failure_evidence(
+            workflow_run_context=workflow_run_context,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            browser_state=browser_state,
+            page=page,
+        )
+        return await self.build_block_result(
+            success=False,
+            failure_reason=failure_reason,
+            output_parameter_value=None,
+            status=status,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
     async def _resolve_failure_with_heal(
         self,
         *,
@@ -5053,6 +5151,17 @@ async def wrapper({default_args}):
         browser_state: BrowserState | None = None,
         page: Page | None = None,
     ) -> BlockResult:
+        # Capture before the healable branch: a non-healable failure is exactly the case the
+        # repair loop has the least to go on.
+        await self._capture_failure_evidence(
+            workflow_run_context=workflow_run_context,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            browser_state=browser_state,
+            page=page,
+        )
+
         async def _finalize_heal_result(result: BlockResult | None) -> BlockResult:
             if result is not None:
                 output_obligation = self._output_obligation_for_heal_result(result)
@@ -5596,17 +5705,29 @@ async def wrapper({default_args}):
                             block_label=self.label,
                         )
                         await recorder.finalize(success=False)
-                        return await self.build_block_result(
-                            success=False,
+                        return await self._failed_result_with_evidence(
                             failure_reason="Secure code block runner returned no result",
-                            output_parameter_value=None,
                             status=BlockStatus.failed,
+                            workflow_run_context=workflow_run_context,
+                            workflow_run_id=workflow_run_id,
                             workflow_run_block_id=workflow_run_block_id,
                             organization_id=organization_id,
+                            browser_state=browser_state,
+                            page=page,
                         )
                     # failure=None does not imply success: infra arms (no browser/page, runner raise,
                     # invalid output) return a failed block_result with no healable failure metadata.
                     if not secure_code_block_result.block_result.success:
+                        # No healable metadata means the repair loop has even less to go on here
+                        # than on the healable path, so the page evidence matters more, not less.
+                        await self._capture_failure_evidence(
+                            workflow_run_context=workflow_run_context,
+                            workflow_run_id=workflow_run_id,
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                            browser_state=browser_state,
+                            page=page,
+                        )
                         await recorder.finalize(success=False)
                         return secure_code_block_result.block_result
                     await recorder.finalize(success=True)
@@ -5651,27 +5772,31 @@ async def wrapper({default_args}):
         except InsecureCodeDetected as e:
             await recorder.persist(recorder.recorded_actions())
             await recorder.finalize(success=False)
-            return await self.build_block_result(
-                success=False,
+            return await self._failed_result_with_evidence(
                 failure_reason=str(e),
-                output_parameter_value=None,
                 status=BlockStatus.failed,
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
+                browser_state=browser_state,
+                page=page,
             )
         except asyncio.TimeoutError:
             await recorder.persist(recorder.recorded_actions())
             await recorder.finalize(success=False)
-            return await self.build_block_result(
-                success=False,
+            return await self._failed_result_with_evidence(
                 failure_reason=(
                     "Failed to execute code block. Reason: TimeoutError: code block exceeded "
                     f"{settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS} seconds"
                 ),
-                output_parameter_value=None,
                 status=BlockStatus.failed,
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
+                browser_state=browser_state,
+                page=page,
             )
         except Exception as e:
             # Exact type, not isinstance: the IllegitCompleteScriptTermination subclass means the
@@ -5679,13 +5804,15 @@ async def wrapper({default_args}):
             if type(e) is ScriptTerminationException:
                 await recorder.persist(recorder.recorded_actions())
                 await recorder.finalize(success=False)
-                return await self.build_block_result(
-                    success=False,
+                return await self._failed_result_with_evidence(
                     failure_reason=workflow_run_context.mask_secrets_in_data(str(e)),
-                    output_parameter_value=None,
                     status=BlockStatus.terminated,
+                    workflow_run_context=workflow_run_context,
+                    workflow_run_id=workflow_run_id,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    browser_state=browser_state,
+                    page=page,
                 )
             exc = CustomizedCodeException(e)
             failing_line = user_code_line_from_exception(e)

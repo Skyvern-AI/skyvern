@@ -28608,6 +28608,17 @@
             ],
             "title": "Url"
           },
+          "final_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Final Url"
+          },
           "navigation_goal": {
             "anyOf": [
               {
