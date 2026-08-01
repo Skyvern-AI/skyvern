@@ -1447,6 +1447,23 @@ if settings.ENABLE_GEMINI:
             ),
         ),
     )
+    # litellm prices the gemini/ flex tier itself (50% of standard), unlike the Vertex flex
+    # configs whose discount is applied at the cost site in api_handler_factory.
+    LLMConfigRegistry.register_config(
+        "GEMINI_3.1_FLASH_LITE_FLEX",
+        LLMConfig(
+            "gemini/gemini-3.1-flash-lite",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+                service_tier="flex",
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
+            ),
+        ),
+    )
     LLMConfigRegistry.register_config(
         "GEMINI_3.5_FLASH_LITE",
         LLMConfig(
