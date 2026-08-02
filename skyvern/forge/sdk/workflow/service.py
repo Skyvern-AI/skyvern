@@ -2928,8 +2928,9 @@ class WorkflowService:
         the legacy in-process executor. When the org is enabled for the secure runner, provision
         a session here so the CodeBlock routes to the runner. A run's browser_profile_id is loaded
         into the session so profile-backed CodeBlock workflows still reach the runner. Returns None
-        (run continues on the legacy path) when no CodeBlock is present, the org is not enabled, a
-        session was already supplied, or session creation fails.
+        (run continues on the legacy path) when no CodeBlock is present, the org is not enabled, or a
+        session was already supplied. Session-creation failure propagates: an enrolled run must fail
+        closed rather than silently downgrade its code to in-process execution.
         """
         if browser_session_id:  # the caller supplied a session; respect it unchanged
             return None
@@ -2956,14 +2957,14 @@ class WorkflowService:
                 inherit_profile_proxy=True,
             )
         except Exception:
-            LOG.warning(
-                "Failed to auto-create browser session for CodeBlock run; falling back to legacy executor",
+            LOG.error(
+                "Failed to auto-create browser session for CodeBlock run; failing the run closed",
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
                 workflow_permanent_id=workflow.workflow_permanent_id,
                 exc_info=True,
             )
-            return None
+            raise
 
         LOG.info(
             "Auto-created browser session for CodeBlock run",
@@ -3345,14 +3346,35 @@ class WorkflowService:
         # profile-backed CodeBlock workflow still needs a session for the secure runner, so the
         # profile is loaded into the auto-created session instead of skipping it.
         if browser_session is None and browser_session_id is None:
-            browser_session = await self.auto_create_browser_session_for_code_block_if_needed(
-                organization.organization_id,
-                workflow,
-                workflow_run_id=workflow_run_id,
-                browser_session_id=browser_session_id,
-                browser_profile_id=browser_profile_id,
-                proxy_location=workflow_run.proxy_location,
-            )
+            # The helper raises only for a secure-runner-enrolled run whose session could not be
+            # created; letting that run continue would silently execute its code in-process instead
+            # of the sandbox, so fail closed like the sidecar-absent posture.
+            try:
+                browser_session = await self.auto_create_browser_session_for_code_block_if_needed(
+                    organization.organization_id,
+                    workflow,
+                    workflow_run_id=workflow_run_id,
+                    browser_session_id=browser_session_id,
+                    browser_profile_id=browser_profile_id,
+                    proxy_location=workflow_run.proxy_location,
+                )
+            except Exception as e:
+                failure_reason = (
+                    "Failed to create the browser session required for secure code execution: "
+                    f"{get_user_facing_exception_message(e)}"
+                )
+                workflow_run = await self.mark_workflow_run_as_failed(
+                    workflow_run_id=workflow_run_id, failure_reason=failure_reason
+                )
+                await self.clean_up_workflow(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    api_key=api_key,
+                    browser_session_id=browser_session_id,
+                    close_browser_on_completion=close_browser_on_completion,
+                    need_call_webhook=need_call_webhook,
+                )
+                return workflow_run
 
         if browser_session:
             browser_session_id = browser_session.persistent_browser_session_id
