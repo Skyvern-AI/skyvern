@@ -14,8 +14,8 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.request_logging import redact_sensitive_fields
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import (
