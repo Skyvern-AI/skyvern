@@ -17,6 +17,10 @@ from skyvern.exceptions import NoTOTPSecretFound, SkyvernActionFailed, WorkflowR
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import validate_download_url
+from skyvern.forge.sdk.api.llm.api_handler_factory import (
+    get_org_aware_primary_llm_api_handler,
+    get_org_aware_secondary_llm_api_handler,
+)
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.core import skyvern_context
@@ -237,7 +241,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
                 user_context=context.prompt,
             )
-            json_response = await app.SINGLE_CLICK_AGENT_LLM_API_HANDLER(
+            json_response = await get_org_aware_secondary_llm_api_handler(
+                default=app.SINGLE_CLICK_AGENT_LLM_API_HANDLER
+            )(
                 prompt=single_click_prompt,
                 prompt_name="single-click-action",
                 step=step,
@@ -398,7 +404,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         goal=prompt,
                         data=data,
                     )
-                    json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                    json_response = await get_org_aware_secondary_llm_api_handler(
+                        default=app.SINGLE_INPUT_AGENT_LLM_API_HANDLER
+                    )(
                         prompt=script_generation_input_text_prompt,
                         prompt_name="script-generation-input-text-generatiion",
                         step=step,
@@ -434,7 +442,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         elements=element_tree,
                         local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
                     )
-                    json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                    json_response = await get_org_aware_secondary_llm_api_handler(
+                        default=app.SINGLE_INPUT_AGENT_LLM_API_HANDLER
+                    )(
                         prompt=single_input_prompt,
                         prompt_name="single-input-action",
                         step=step,
@@ -513,7 +523,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         data=data,
                         goal=prompt,
                     )
-                    json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                    json_response = await get_org_aware_secondary_llm_api_handler(
+                        default=app.SINGLE_INPUT_AGENT_LLM_API_HANDLER
+                    )(
                         prompt=script_generation_file_url_prompt,
                         prompt_name="script-generation-file-url-generation",
                         step=step,
@@ -547,7 +559,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         elements=element_tree,
                         local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
                     )
-                    json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                    json_response = await get_org_aware_secondary_llm_api_handler(
+                        default=app.SINGLE_INPUT_AGENT_LLM_API_HANDLER
+                    )(
                         prompt=single_upload_prompt,
                         prompt_name="single-upload-action",
                         step=step,
@@ -618,7 +632,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         elements=element_tree,
                         local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
                     )
-                    json_response = await app.SELECT_AGENT_LLM_API_HANDLER(
+                    json_response = await get_org_aware_secondary_llm_api_handler(
+                        default=app.SELECT_AGENT_LLM_API_HANDLER
+                    )(
                         prompt=single_select_prompt,
                         prompt_name="single-select-action",
                         step=step,
@@ -749,7 +765,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             )
 
         try:
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
+            json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=classify_prompt,
                 prompt_name="page-classify",
                 step=step,
@@ -1464,7 +1480,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 organization_id=context.organization_id,
             )
 
-        result = await app.EXTRACTION_LLM_API_HANDLER(
+        result = await get_org_aware_primary_llm_api_handler(default=app.EXTRACTION_LLM_API_HANDLER)(
             prompt=extract_information_prompt,
             step=step,
             screenshots=self.scraped_page.screenshots,
@@ -1541,7 +1557,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 organization_id=context.organization_id,
             )
 
-        result = await app.EXTRACTION_LLM_API_HANDLER(
+        result = await get_org_aware_primary_llm_api_handler(default=app.EXTRACTION_LLM_API_HANDLER)(
             prompt=locate_element_prompt,
             step=step,
             screenshots=scraped_page_refreshed.screenshots,
@@ -1627,7 +1643,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             navigation_goal=prompt,
         )
 
-        json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+        json_response = await get_org_aware_secondary_llm_api_handler(default=app.SINGLE_INPUT_AGENT_LLM_API_HANDLER)(
             prompt=infer_action_type_prompt,
             prompt_name="infer-action-type",
             step=step,
@@ -1683,6 +1699,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         else:
             LOG.warning("ai_act: unknown action type", action_type=action_type, prompt=prompt)
             return
+        llm_handler = get_org_aware_secondary_llm_api_handler(default=llm_handler)
 
         local_datetime = datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat()
         single_action_prompt = prompt_engine.load_prompt(

@@ -158,6 +158,10 @@ class OrganizationsRepository(BaseRepository):
         max_retries_per_step: int | None = None,
         artifact_url_expiry_seconds: int | None = None,
         clear_artifact_url_expiry_seconds: bool = False,
+        default_llm_key: str | None = None,
+        clear_default_llm_key: bool = False,
+        default_secondary_llm_key: str | None = None,
+        clear_default_secondary_llm_key: bool = False,
     ) -> Organization:
         async with self.Session() as session:
             organization = (
@@ -185,6 +189,14 @@ class OrganizationsRepository(BaseRepository):
                 organization.artifact_url_expiry_seconds = None
             elif artifact_url_expiry_seconds is not None:
                 organization.artifact_url_expiry_seconds = artifact_url_expiry_seconds
+            if clear_default_llm_key:
+                organization.default_llm_key = None
+            elif default_llm_key is not None:
+                organization.default_llm_key = default_llm_key
+            if clear_default_secondary_llm_key:
+                organization.default_secondary_llm_key = None
+            elif default_secondary_llm_key is not None:
+                organization.default_secondary_llm_key = default_secondary_llm_key
             await session.commit()
             await session.refresh(organization)
             return Organization.model_validate(organization)

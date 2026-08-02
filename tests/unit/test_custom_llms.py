@@ -8,6 +8,7 @@ import pytest
 
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost
+from skyvern.forge.sdk.api.llm import custom_llm_registry
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
@@ -17,6 +18,7 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     get_custom_llm_model_mappings,
     register_custom_llm_config,
 )
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
@@ -28,7 +30,7 @@ from skyvern.forge.sdk.schemas.custom_llms import (
     CustomLLMCreateRequest,
     CustomLLMUpdateRequest,
 )
-from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
+from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken, OrganizationUpdate
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.services import task_v1_service, task_v2_service
@@ -40,6 +42,7 @@ class FakeOrganizationsRepository:
         self.next_id = 1
         self.created_encrypted_methods: list[EncryptMethod | None] = []
         self.updated_encrypted_methods: list[EncryptMethod | None] = []
+        self.update_organization = AsyncMock()
 
     async def get_valid_org_auth_tokens(
         self,
@@ -141,6 +144,36 @@ def fake_organizations(monkeypatch: pytest.MonkeyPatch) -> FakeOrganizationsRepo
     monkeypatch.setattr(task_v1_service.app, "DATABASE", fake_database)
     monkeypatch.setattr(task_v2_service.app, "DATABASE", fake_database)
     return organizations
+
+
+@pytest.mark.asyncio
+async def test_prepare_org_llm_runtime_creates_context_and_stamps_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization = _org("o_runtime").model_copy(
+        update={
+            "default_llm_key": "CUSTOM_LLM_oat_smart",
+            "default_secondary_llm_key": "CUSTOM_LLM_oat_fast",
+        }
+    )
+    get_organization = AsyncMock(return_value=organization)
+    load_configs = AsyncMock()
+    monkeypatch.setattr(custom_llm_registry, "load_custom_llm_configs_for_organization", load_configs)
+    database = SimpleNamespace(organizations=SimpleNamespace(get_organization=get_organization))
+    skyvern_context.reset()
+
+    try:
+        await custom_llm_registry.prepare_org_llm_runtime(database, organization.organization_id)
+        context = skyvern_context.current()
+    finally:
+        skyvern_context.reset()
+
+    assert context is not None
+    assert context.organization_id == organization.organization_id
+    assert context.org_default_llm_key == "CUSTOM_LLM_oat_smart"
+    assert context.org_default_secondary_llm_key == "CUSTOM_LLM_oat_fast"
+    get_organization.assert_awaited_once_with(organization.organization_id)
+    load_configs.assert_awaited_once_with(database, organization.organization_id)
 
 
 @pytest.mark.asyncio
@@ -367,6 +400,145 @@ async def test_models_route_lists_only_current_org_custom_llms_with_unique_label
     finally:
         for custom_llm_id in custom_llm_ids:
             deregister_custom_llm_config(custom_llm_id)
+
+
+@pytest.mark.asyncio
+async def test_update_organization_accepts_valid_custom_llm_defaults(
+    fake_organizations: FakeOrganizationsRepository,
+) -> None:
+    org = _org("o_defaults")
+    token = await fake_organizations.create_org_auth_token(
+        organization_id=org.organization_id,
+        token_type=OrganizationAuthTokenType.custom_llm,
+        token=CustomLLMConfig(
+            display_name="Default Llama",
+            provider="ollama",
+            model_name="llama3.1",
+        ).model_dump_json(),
+    )
+    fake_organizations.update_organization = AsyncMock(
+        return_value=org.model_copy(
+            update={
+                "default_llm_key": custom_llm_key(token.id),
+                "default_secondary_llm_key": custom_llm_key(token.id),
+            }
+        )
+    )
+
+    try:
+        updated = await agent_protocol.update_organization(
+            OrganizationUpdate(
+                default_llm_key=custom_llm_key(token.id),
+                default_secondary_llm_key=custom_llm_key(token.id),
+            ),
+            org,
+        )
+    finally:
+        deregister_custom_llm_config(token.id)
+
+    assert updated.default_llm_key == custom_llm_key(token.id)
+    assert updated.default_secondary_llm_key == custom_llm_key(token.id)
+    update_args = fake_organizations.update_organization.await_args
+    assert update_args is not None
+    assert update_args.kwargs["default_llm_key"] == custom_llm_key(token.id)
+    assert update_args.kwargs["default_secondary_llm_key"] == custom_llm_key(token.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("value_field", "clear_field"),
+    [
+        ("default_llm_key", "clear_default_llm_key"),
+        ("default_secondary_llm_key", "clear_default_secondary_llm_key"),
+    ],
+)
+async def test_update_organization_accepts_default_llm_clear(
+    fake_organizations: FakeOrganizationsRepository,
+    value_field: str,
+    clear_field: str,
+) -> None:
+    org = _org("o_clear_defaults")
+    fake_organizations.update_organization = AsyncMock(return_value=org)
+
+    await agent_protocol.update_organization(OrganizationUpdate(**{clear_field: True}), org)
+
+    update_args = fake_organizations.update_organization.await_args
+    assert update_args is not None
+    assert update_args.kwargs[value_field] is None
+    assert update_args.kwargs[clear_field] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("value_field", "clear_field"),
+    [
+        ("default_llm_key", "clear_default_llm_key"),
+        ("default_secondary_llm_key", "clear_default_secondary_llm_key"),
+    ],
+)
+async def test_update_organization_rejects_default_llm_value_with_clear(
+    fake_organizations: FakeOrganizationsRepository,
+    value_field: str,
+    clear_field: str,
+) -> None:
+    org = _org("o_ambiguous_defaults")
+    fake_organizations.update_organization = AsyncMock(return_value=org)
+
+    with pytest.raises(agent_protocol.HTTPException) as exc_info:
+        await agent_protocol.update_organization(
+            OrganizationUpdate(**{value_field: "CUSTOM_LLM_oat_custom", clear_field: True}),
+            org,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert clear_field in exc_info.value.detail
+    fake_organizations.update_organization.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_organization_rejects_custom_llm_from_another_org(
+    fake_organizations: FakeOrganizationsRepository,
+) -> None:
+    owner_org = _org("o_default_owner")
+    requester_org = _org("o_default_requester")
+    token = await fake_organizations.create_org_auth_token(
+        organization_id=owner_org.organization_id,
+        token_type=OrganizationAuthTokenType.custom_llm,
+        token=CustomLLMConfig(
+            display_name="Owner Llama",
+            provider="ollama",
+            model_name="llama3.1",
+        ).model_dump_json(),
+    )
+    fake_organizations.update_organization = AsyncMock(return_value=requester_org)
+
+    with pytest.raises(agent_protocol.HTTPException) as exc_info:
+        await agent_protocol.update_organization(
+            OrganizationUpdate(default_llm_key=custom_llm_key(token.id)),
+            requester_org,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "default_llm_key" in exc_info.value.detail
+    fake_organizations.update_organization.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_organization_rejects_garbage_default_llm_key(
+    fake_organizations: FakeOrganizationsRepository,
+) -> None:
+    org = _org("o_garbage_default")
+    fake_organizations.update_organization = AsyncMock(return_value=org)
+
+    with pytest.raises(agent_protocol.HTTPException) as exc_info:
+        await agent_protocol.update_organization(
+            OrganizationUpdate(default_secondary_llm_key="not-a-custom-llm"),
+            org,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "default_secondary_llm_key" in exc_info.value.detail
+    fake_organizations.update_organization.assert_not_awaited()
 
 
 @pytest.mark.asyncio

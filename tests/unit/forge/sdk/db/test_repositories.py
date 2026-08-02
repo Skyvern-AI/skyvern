@@ -6,7 +6,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
+from skyvern.forge.sdk.db.models import OrganizationModel
+from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from tests.unit.conftest import MockAsyncSessionCtx, make_mock_session
 
@@ -200,6 +203,43 @@ def test_organizations_repository_instantiation():
     assert hasattr(repo, "create_organization")
     assert hasattr(repo, "create_org_auth_token")
     assert hasattr(repo, "validate_org_auth_token")
+
+
+@pytest.mark.asyncio
+async def test_organizations_repository_persists_and_clears_default_llm_keys(sqlite_engine: AsyncEngine) -> None:
+    session_factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    async with session_factory() as session:
+        session.add(OrganizationModel(organization_id="o_defaults", organization_name="Defaults Org"))
+        await session.commit()
+
+    repo = OrganizationsRepository(session_factory=session_factory, debug_enabled=False)
+    updated = await repo.update_organization(
+        "o_defaults",
+        default_llm_key="CUSTOM_LLM_oat_primary",
+        default_secondary_llm_key="CUSTOM_LLM_oat_secondary",
+    )
+
+    assert updated.default_llm_key == "CUSTOM_LLM_oat_primary"
+    assert updated.default_secondary_llm_key == "CUSTOM_LLM_oat_secondary"
+    async with session_factory() as session:
+        stored = await session.get(OrganizationModel, "o_defaults")
+        assert stored is not None
+        assert stored.default_llm_key == "CUSTOM_LLM_oat_primary"
+        assert stored.default_secondary_llm_key == "CUSTOM_LLM_oat_secondary"
+
+    cleared = await repo.update_organization(
+        "o_defaults",
+        clear_default_llm_key=True,
+        clear_default_secondary_llm_key=True,
+    )
+
+    assert cleared.default_llm_key is None
+    assert cleared.default_secondary_llm_key is None
+    async with session_factory() as session:
+        stored = await session.get(OrganizationModel, "o_defaults")
+        assert stored is not None
+        assert stored.default_llm_key is None
+        assert stored.default_secondary_llm_key is None
 
 
 def test_schedules_repository_instantiation():

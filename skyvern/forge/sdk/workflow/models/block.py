@@ -94,7 +94,11 @@ from skyvern.forge.sdk.api.files import (
     validate_local_file_path,
 )
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.api_handler_factory import (
+    LLMAPIHandlerFactory,
+    get_org_aware_primary_llm_api_handler,
+    get_org_aware_secondary_llm_api_handler,
+)
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_model_name
 from skyvern.forge.sdk.api.llm.exceptions import (
     EmptyLLMResponseError,
@@ -472,16 +476,16 @@ class Block(BaseModel, abc.ABC):
     # value left by a prior for-loop iteration.
     _output_recorded_this_execution: bool = PrivateAttr(default=False)
 
+    def _own_llm_key(self) -> str | None:
+        return None
+
     @property
     def override_llm_key(self) -> str | None:
         return self.override_llm_key_for_organization(None)
 
     def override_llm_key_for_organization(self, organization_id: str | None) -> str | None:
-        """
-        If the `Block` has a `model` defined, then return the mapped llm_key for it.
-
-        Otherwise return `None`.
-        """
+        """Resolve an explicit model mapping or the block's own LLM key."""
+        own_llm_key = self._own_llm_key() or None
         if self.model:
             model_name = self.model.get("model_name")
             if model_name:
@@ -491,8 +495,9 @@ class Block(BaseModel, abc.ABC):
                     return llm_key
                 if is_custom_llm_model_name(model_name):
                     raise ValueError("Custom LLM model not found for organization")
+                return own_llm_key
 
-        return None
+        return own_llm_key
 
     async def record_output_parameter_value(
         self,
@@ -947,7 +952,7 @@ class Block(BaseModel, abc.ABC):
             if isinstance(cached_description, str) and cached_description:
                 description = cached_description
             else:
-                json_response = await app.SECONDARY_LLM_API_HANDLER(
+                json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                     prompt=description_generation_prompt,
                     prompt_name="generate-workflow-run-block-description",
                     workflow_run_block_id=workflow_run_block_id,
@@ -6128,6 +6133,9 @@ class TextPromptBlock(Block):
     schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
     schema_validation_max_errors: ClassVar[int] = SCHEMA_VALIDATION_MAX_ERRORS
 
+    def _own_llm_key(self) -> str | None:
+        return self.llm_key
+
     def get_all_parameters(
         self,
         workflow_run_id: str,
@@ -6287,7 +6295,7 @@ class TextPromptBlock(Block):
         if prompt_config_handler:
             return prompt_config_handler
 
-        secondary_handler = app.SECONDARY_LLM_API_HANDLER
+        secondary_handler = get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)
         if secondary_handler:
             return secondary_handler
 
@@ -6296,7 +6304,7 @@ class TextPromptBlock(Block):
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )
-        return app.LLM_API_HANDLER
+        return get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)
 
     async def execute(
         self,
@@ -7245,7 +7253,9 @@ class FileDestinationBlock(Block):
             candidate_file_names=candidate_file_names,
         )
         llm_key = self.override_llm_key_for_organization(organization_id)
-        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=app.LLM_API_HANDLER)
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+            llm_key, default=get_org_aware_primary_llm_api_handler()
+        )
 
         workflow_run_block = None
         try:
@@ -8383,7 +8393,7 @@ class FileParserBlock(Block):
             posthog_handler = await get_llm_handler_for_prompt_type(prompt_type, distinct_id, organization_id)
             if posthog_handler:
                 return posthog_handler
-        return app.LLM_API_HANDLER
+        return get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)
 
     async def _ocr_pdf_pages(
         self,
@@ -9214,7 +9224,7 @@ class PDFParserBlock(Block):
         prompt_for_attempt = llm_prompt
         for attempt in range(self.schema_validation_max_attempts):
             try:
-                llm_response = await app.LLM_API_HANDLER(
+                llm_response = await get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)(
                     prompt=prompt_for_attempt,
                     prompt_name="extract-information-from-file-text",
                     # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.

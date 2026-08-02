@@ -16,6 +16,7 @@ from skyvern.config import settings
 from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import DEFAULT_REQUEST_TIMEOUT
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
@@ -101,7 +102,7 @@ async def parse_otp_login(
         content=content,
         enforced_otp_type=enforced_otp_type.value if enforced_otp_type else None,
     )
-    resp = await app.SECONDARY_LLM_API_HANDLER(
+    resp = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
         prompt=prompt, prompt_name="parse-otp-login", organization_id=organization_id
     )
     # The LLM call succeeded, so the extraction work is billable regardless of

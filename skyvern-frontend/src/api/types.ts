@@ -222,6 +222,8 @@ export type User = {
 export type OrganizationApiResponse = {
   created_at: string;
   modified_at: string;
+  default_llm_key?: string | null;
+  default_secondary_llm_key?: string | null;
   max_retries_per_step: number | null;
   max_steps_per_run: number | null;
   // Optional because the field is added in a backend image rollout; until

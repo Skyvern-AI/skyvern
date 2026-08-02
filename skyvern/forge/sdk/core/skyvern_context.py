@@ -87,6 +87,8 @@ class SkyvernContext:
     request_id: str | None = None
     organization_id: str | None = None
     organization_name: str | None = None
+    org_default_llm_key: str | None = None
+    org_default_secondary_llm_key: str | None = None
     task_id: str | None = None
     step_id: str | None = None
     workflow_id: str | None = None

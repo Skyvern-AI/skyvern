@@ -336,11 +336,7 @@ class Task(TaskBase):
 
     @property
     def llm_key(self) -> str | None:
-        """
-        If the `Task` has a `model` defined, then return the mapped llm_key for it.
-
-        Otherwise return `None`.
-        """
+        """Resolve the task's explicit model mapping, if any."""
         if self.model:
             model_name = self.model.get("model_name")
             if model_name:

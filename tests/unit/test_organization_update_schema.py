@@ -17,12 +17,16 @@ class TestOrganizationUpdateSchema:
             max_retries_per_step=3,
             webhook_callback_url="https://example.com/hook",
             artifact_url_expiry_seconds=3600,
+            default_llm_key="CUSTOM_LLM_oat_primary",
+            default_secondary_llm_key="CUSTOM_LLM_oat_secondary",
         )
         assert update.model_dump(exclude_unset=True) == {
             "max_steps_per_run": 25,
             "max_retries_per_step": 3,
             "webhook_callback_url": "https://example.com/hook",
             "artifact_url_expiry_seconds": 3600,
+            "default_llm_key": "CUSTOM_LLM_oat_primary",
+            "default_secondary_llm_key": "CUSTOM_LLM_oat_secondary",
         }
 
     def test_partial_update_excludes_unset(self) -> None:
@@ -34,6 +38,12 @@ class TestOrganizationUpdateSchema:
 
     def test_clear_max_steps_per_workflow_run_defaults_false(self) -> None:
         assert OrganizationUpdate().clear_max_steps_per_workflow_run is False
+
+    def test_clear_default_llm_flags_default_false(self) -> None:
+        update = OrganizationUpdate()
+
+        assert update.clear_default_llm_key is False
+        assert update.clear_default_secondary_llm_key is False
 
     def test_accepts_max_steps_per_workflow_run(self) -> None:
         update = OrganizationUpdate(max_steps_per_workflow_run=42)

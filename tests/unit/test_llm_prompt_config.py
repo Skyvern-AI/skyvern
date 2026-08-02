@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.experimentation import llm_prompt_config as module
 
 # ---------------------------------------------------------------------------
@@ -221,3 +222,79 @@ async def test_no_override_key_delegates_to_prompt_type_resolution(monkeypatch: 
 
     assert result is default_handler
     resolver.assert_awaited_once_with("confirm-multi-selection-finish", "wr_123", "org_1", default_handler)
+
+
+@pytest.mark.asyncio
+async def test_org_secondary_override_skips_prompt_type_config_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = SimpleNamespace(
+        get_value_cached=AsyncMock(side_effect=AssertionError("PostHog must not be consulted")),
+        get_payload_cached=AsyncMock(side_effect=AssertionError("PostHog must not be consulted")),
+    )
+    monkeypatch.setattr(module, "app", SimpleNamespace(EXPERIMENTATION_PROVIDER=provider))
+    monkeypatch.setattr(
+        module.skyvern_context,
+        "current",
+        lambda: SkyvernContext(org_default_secondary_llm_key="CUSTOM_LLM_oat_fast"),
+    )
+
+    result = await module.get_llm_config_by_prompt_type("wr_123", "org_1")
+
+    assert result is None
+    provider.get_value_cached.assert_not_awaited()
+    provider.get_payload_cached.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_org_primary_override_skips_prompt_type_config_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = SimpleNamespace(
+        get_value_cached=AsyncMock(side_effect=AssertionError("PostHog must not be consulted")),
+        get_payload_cached=AsyncMock(side_effect=AssertionError("PostHog must not be consulted")),
+    )
+    monkeypatch.setattr(module, "app", SimpleNamespace(EXPERIMENTATION_PROVIDER=provider))
+    monkeypatch.setattr(
+        module.skyvern_context,
+        "current",
+        lambda: SkyvernContext(org_default_llm_key="CUSTOM_LLM_oat_smart"),
+    )
+
+    result = await module.get_llm_config_by_prompt_type("wr_123", "org_1")
+
+    assert result is None
+    provider.get_value_cached.assert_not_awaited()
+    provider.get_payload_cached.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_org_secondary_override_skips_check_user_goal_config_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = SimpleNamespace(
+        get_value_cached=AsyncMock(side_effect=AssertionError("PostHog must not be consulted")),
+    )
+    monkeypatch.setattr(module, "app", SimpleNamespace(EXPERIMENTATION_PROVIDER=provider))
+    monkeypatch.setattr(
+        module.skyvern_context,
+        "current",
+        lambda: SkyvernContext(org_default_secondary_llm_key="CUSTOM_LLM_oat_fast"),
+    )
+
+    result = await module.get_check_user_goal_llm_override("wr_123", "org_1")
+
+    assert result is None
+    provider.get_value_cached.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_org_primary_override_skips_check_user_goal_config_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = SimpleNamespace(
+        get_value_cached=AsyncMock(side_effect=AssertionError("PostHog must not be consulted")),
+    )
+    monkeypatch.setattr(module, "app", SimpleNamespace(EXPERIMENTATION_PROVIDER=provider))
+    monkeypatch.setattr(
+        module.skyvern_context,
+        "current",
+        lambda: SkyvernContext(org_default_llm_key="CUSTOM_LLM_oat_smart"),
+    )
+
+    result = await module.get_check_user_goal_llm_override("wr_123", "org_1")
+
+    assert result is None
+    provider.get_value_cached.assert_not_awaited()

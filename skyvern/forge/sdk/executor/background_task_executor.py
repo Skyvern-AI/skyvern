@@ -8,7 +8,7 @@ from fastapi import BackgroundTasks, Request
 
 from skyvern.exceptions import BackgroundSequentialCredentialUnsupported, OrganizationNotFound
 from skyvern.forge import app
-from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_for_organization
+from skyvern.forge.sdk.api.llm.custom_llm_registry import prepare_org_llm_runtime
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
@@ -112,7 +112,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         context.max_steps_override = max_steps_override
         context.max_screenshot_scrolls = task.max_screenshot_scrolls
 
-        await load_custom_llm_configs_for_organization(app.DATABASE, organization_id)
+        await prepare_org_llm_runtime(app.DATABASE, organization_id, organization)
         await initialize_skyvern_state_file(task_id=task_id, organization_id=organization_id)
         self._schedule(
             background_tasks,
@@ -185,7 +185,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         await initialize_skyvern_state_file(
             workflow_run_id=workflow_run_id, organization_id=organization.organization_id
         )
-        await load_custom_llm_configs_for_organization(app.DATABASE, organization.organization_id)
+        await prepare_org_llm_runtime(app.DATABASE, organization.organization_id, organization)
 
         self._schedule(
             background_tasks,
@@ -234,6 +234,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         )
 
         await initialize_skyvern_state_file(workflow_run_id=task_v2.workflow_run_id, organization_id=organization_id)
+        await prepare_org_llm_runtime(app.DATABASE, organization_id, organization)
         self._schedule(
             background_tasks,
             task_v2_service.run_task_v2,

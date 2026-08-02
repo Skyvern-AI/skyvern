@@ -42,7 +42,12 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_for_organization
+from skyvern.forge.sdk.api.llm.custom_llm_registry import (
+    CUSTOM_LLM_KEY_PREFIX,
+    ensure_custom_llm_registered_for_org,
+    is_custom_llm_key,
+    load_custom_llm_configs_for_organization,
+)
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactSignedUrl, ArtifactType
 from skyvern.forge.sdk.artifact.signing import (
@@ -5274,6 +5279,32 @@ async def update_organization(
                 "max_steps_per_workflow_run — pick one"
             ),
         )
+    for field_name, llm_key, clear_llm_key in [
+        ("default_llm_key", org_update.default_llm_key, org_update.clear_default_llm_key),
+        (
+            "default_secondary_llm_key",
+            org_update.default_secondary_llm_key,
+            org_update.clear_default_secondary_llm_key,
+        ),
+    ]:
+        if clear_llm_key and llm_key is not None:
+            raise HTTPException(
+                status_code=http_status.HTTP_400_BAD_REQUEST,
+                detail=f"clear_{field_name} cannot be combined with a non-null {field_name} — pick one",
+            )
+        if llm_key is not None and (
+            not is_custom_llm_key(llm_key)
+            or not await ensure_custom_llm_registered_for_org(
+                llm_key.removeprefix(CUSTOM_LLM_KEY_PREFIX),
+                current_org.organization_id,
+                app.DATABASE,
+            )
+        ):
+            raise HTTPException(
+                status_code=http_status.HTTP_400_BAD_REQUEST,
+                detail=f"{field_name} must reference a valid custom LLM for this organization",
+            )
+
     updated = await app.DATABASE.organizations.update_organization(
         current_org.organization_id,
         max_steps_per_run=org_update.max_steps_per_run,
@@ -5283,6 +5314,10 @@ async def update_organization(
         webhook_callback_url=org_update.webhook_callback_url,
         artifact_url_expiry_seconds=org_update.artifact_url_expiry_seconds,
         clear_artifact_url_expiry_seconds=org_update.clear_artifact_url_expiry_seconds,
+        default_llm_key=org_update.default_llm_key,
+        clear_default_llm_key=org_update.clear_default_llm_key,
+        default_secondary_llm_key=org_update.default_secondary_llm_key,
+        clear_default_secondary_llm_key=org_update.clear_default_secondary_llm_key,
     )
 
     org_auth_service.invalidate_cached_org(current_org.organization_id)

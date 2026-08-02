@@ -23,7 +23,10 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.api_handler_factory import (
+    LLMAPIHandlerFactory,
+    get_org_aware_primary_llm_api_handler,
+)
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     CustomLLMNotFoundError,
     ensure_custom_llm_model_registered_for_org,
@@ -131,7 +134,9 @@ async def _validate_task_v2_model_for_org(organization: Organization, model: dic
 
 
 def _get_task_v2_llm_api_handler(task_v2: TaskV2) -> Any:
-    return LLMAPIHandlerFactory.get_override_llm_api_handler(task_v2.llm_key, default=app.LLM_API_HANDLER)
+    return LLMAPIHandlerFactory.get_override_llm_api_handler(
+        task_v2.llm_key, default=get_org_aware_primary_llm_api_handler()
+    )
 
 
 def _generate_data_extraction_schema_for_loop(loop_values_key: str) -> dict:
@@ -566,6 +571,8 @@ async def run_task_v2(
     context = SkyvernContext(
         organization_id=organization_id,
         organization_name=organization.organization_name,
+        org_default_llm_key=organization.default_llm_key,
+        org_default_secondary_llm_key=organization.default_secondary_llm_key,
         root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
         task_v2_id=task_v2_id,
         run_id=current_run_id,
@@ -1979,7 +1986,7 @@ async def _generate_compute_task(
             prior_attempt=prior_attempt,
             safety_error=safety_error,
         )
-        compute_response = await app.LLM_API_HANDLER(
+        compute_response = await _get_task_v2_llm_api_handler(task_v2)(
             compute_prompt,
             task_v2=task_v2,
             prompt_name="task_v2_generate_compute_code",

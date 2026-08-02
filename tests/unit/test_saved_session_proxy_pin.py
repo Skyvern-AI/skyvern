@@ -264,7 +264,12 @@ async def _setup_profile_with_reconcile_failure(
             request_id="req_test",
             workflow_request=workflow_request,
             workflow_permanent_id="wpid_test",
-            organization=SimpleNamespace(organization_id="org_test", organization_name="Test Org"),
+            organization=SimpleNamespace(
+                organization_id="org_test",
+                organization_name="Test Org",
+                default_llm_key=None,
+                default_secondary_llm_key=None,
+            ),
         )
     except Exception as exc:
         caught = exc
