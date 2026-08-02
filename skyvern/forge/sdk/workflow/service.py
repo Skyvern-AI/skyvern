@@ -3506,6 +3506,11 @@ class WorkflowService:
                 return workflow_run
             else:
                 timeout_context = asyncio.timeout(max_elapsed_timeout_seconds)
+                # Publish the same deadline the timeout enforces, so work that can block for
+                # a long time can give up in time to still do something useful instead of
+                # being cancelled with nothing done.
+                if body_context := skyvern_context.current():
+                    body_context.max_elapsed_deadline = asyncio.get_running_loop().time() + max_elapsed_timeout_seconds
                 try:
                     async with timeout_context:
                         await execute_workflow_blocks()
