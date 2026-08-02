@@ -293,7 +293,11 @@ export type ClearOrganizationAuthTokenResponse = {
   success: boolean;
 };
 
-export type CustomLLMProvider = "openai_compatible" | "ollama" | "openrouter";
+export type CustomLLMProvider =
+  | "openai_compatible"
+  | "ollama"
+  | "openrouter"
+  | "gemini";
 
 export type CustomLLMConfig = {
   display_name: string;
@@ -307,6 +311,7 @@ export type CustomLLMConfig = {
   max_completion_tokens?: number | null;
   temperature?: number | null;
   reasoning_effort?: string | null;
+  extra_parameters?: Record<string, unknown> | null;
 };
 
 export type CustomLLM = {
