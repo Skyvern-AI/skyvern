@@ -47,6 +47,7 @@ from .completion import (
 )
 from .discovery import _resolve_discovery_entry_url
 from .guardrails import _authority_tool_error
+from .mcp_hooks import _bind_login_credential_for_observed_url
 from .scouting import (
     _clear_pending_browser_interaction_observation,
     _consume_pending_browser_interaction_observation,
@@ -727,6 +728,7 @@ async def _inspect_page_for_composition_impl(
         "reached_via": reached_via,
         "data": evidence,
     }
+    await _bind_login_credential_for_observed_url(copilot_ctx, str(current_url), result)
     if observation_step is not None:
         result["observation_step"] = observation_step
     record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)

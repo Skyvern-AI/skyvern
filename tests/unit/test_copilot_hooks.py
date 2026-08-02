@@ -1008,6 +1008,9 @@ class TestBrowserInteractionObservationHooks:
             scouted_interactions=[],
             scout_trajectory=[],
             pending_scout_source_url=None,
+            request_policy=None,
+            org_credentials_for_turn=None,
+            organization_id="o_1",
         )
         result = await _click_post_hook(
             {"ok": True, "data": {"selector": "#add-to-cart"}},
@@ -1111,6 +1114,9 @@ class TestScoutedInteractionCapture:
             pending_scout_source_url=source_url,
             prior_fill_carry=[],
             fill_carry_rebound_done=False,
+            request_policy=None,
+            org_credentials_for_turn=None,
+            organization_id="o_1",
         )
         if policy is not None:
             ns.block_authoring_policy = policy

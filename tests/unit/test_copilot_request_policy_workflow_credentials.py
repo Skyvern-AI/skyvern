@@ -26,6 +26,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     CREDENTIAL_DEFERRED_DRAFT_REASONS,
     CREDENTIAL_PROMPT_CLARIFICATION_REASONS,
     LiveCredentialAdmission,
+    LivePageResolutionRecord,
     RequestPolicy,
     _can_defer_unresolved_credential_name_for_draft,
     _classification_from_raw,
@@ -38,6 +39,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     admit_credential_for_live_page,
     build_request_policy,
     credential_prompt_reason,
+    resolve_credential_for_live_page,
 )
 from skyvern.forge.sdk.copilot.tools.credentials import _credential_run_approval_error
 from skyvern.forge.sdk.schemas.credentials import CredentialType
@@ -2907,6 +2909,175 @@ class TestLivePageCredentialAdmission:
 
         assert admission.admitted is False
         load_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_admission_fingerprint_names_the_fill_seam(self) -> None:
+        with capture_logs() as logs:
+            await _admit(
+                RequestPolicy(),
+                credential_id="cred_analytics",
+                page_url=_LIVE_LOGIN_URL,
+                org_credentials=[_cred("analytics", "cred_analytics", _SAVED_LOGIN_URL)],
+            )
+
+        emitted = [entry for entry in logs if entry["event"] == "copilot credential live-page admission"]
+        assert [(entry["seam"], entry["outcome"]) for entry in emitted] == [("fill", "admitted")]
+
+
+async def _resolve_live_page(
+    policy: RequestPolicy,
+    *,
+    page_url: str,
+    org_credentials: list[SimpleNamespace],
+) -> tuple[LivePageResolutionRecord, AsyncMock]:
+    load_mock = AsyncMock(return_value=org_credentials)
+    with patch("skyvern.forge.app.DATABASE.credentials.get_credentials", new=load_mock):
+        record = await resolve_credential_for_live_page(
+            policy,
+            organization_id="o_test",
+            page_url=page_url,
+        )
+    return record, load_mock
+
+
+class TestLivePageCredentialObservation:
+    """The observation seam asks the same question with no credential requested: whose page is this?"""
+
+    @pytest.mark.asyncio
+    async def test_a_sole_page_match_binds_and_writes_the_fill_seam_records(self) -> None:
+        policy = RequestPolicy()
+        record, _ = await _resolve_live_page(
+            policy,
+            page_url=_LIVE_LOGIN_URL,
+            org_credentials=[
+                _cred("analytics", "cred_analytics", _SAVED_LOGIN_URL),
+                _cred("billing", "cred_billing", "https://billing.example.com/login"),
+                _cred("urlless", "cred_urlless"),
+            ],
+        )
+
+        assert record.verdict == "resolved"
+        assert record.tier == "url_path"
+        assert [c.credential_id for c in record.candidates] == ["cred_analytics"]
+        assert [c.credential_id for c in policy.resolved_credentials] == ["cred_analytics"]
+        assert policy.live_page_admitted_urls == {"cred_analytics": _LIVE_LOGIN_URL}
+
+    @pytest.mark.asyncio
+    async def test_two_page_matches_bind_nothing_and_record_both_candidates(self) -> None:
+        policy = RequestPolicy()
+        record, _ = await _resolve_live_page(
+            policy,
+            page_url=_LIVE_LOGIN_URL,
+            org_credentials=[
+                _cred("analytics one", "cred_one", _SAVED_LOGIN_URL),
+                _cred("analytics two", "cred_two", _SAVED_LOGIN_URL),
+            ],
+        )
+
+        assert record.verdict == "ambiguous"
+        assert [c.credential_id for c in record.candidates] == ["cred_one", "cred_two"]
+        assert policy.resolved_credentials == []
+        assert policy.live_page_admitted_urls == {}
+        assert policy.live_page_resolution is record
+
+    @pytest.mark.asyncio
+    async def test_decoys_only_bind_nothing(self) -> None:
+        policy = RequestPolicy()
+        record, _ = await _resolve_live_page(
+            policy,
+            page_url=_LIVE_LOGIN_URL,
+            org_credentials=[
+                _cred("billing", "cred_billing", "https://billing.example.com/login"),
+                _cred("urlless", "cred_urlless"),
+            ],
+        )
+
+        assert record.verdict == "no_match"
+        assert policy.resolved_credentials == []
+        assert policy.live_page_admitted_urls == {}
+
+    @pytest.mark.asyncio
+    async def test_a_card_credential_never_binds_as_a_login(self) -> None:
+        policy = RequestPolicy()
+        record, _ = await _resolve_live_page(
+            policy,
+            page_url=_LIVE_LOGIN_URL,
+            org_credentials=[_cred("card", "cred_card", _SAVED_LOGIN_URL, CredentialType.CREDIT_CARD)],
+        )
+
+        assert record.verdict == "no_match"
+        assert policy.resolved_credentials == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            RequestPolicy(raw_secret_detected=True),
+            RequestPolicy(allow_run_blocks=False),
+            RequestPolicy(email_signin_intent=True, login_intent=True),
+        ],
+    )
+    async def test_a_turn_without_run_authority_never_reads_credentials(self, policy: RequestPolicy) -> None:
+        record, load_mock = await _resolve_live_page(
+            policy,
+            page_url=_LIVE_LOGIN_URL,
+            org_credentials=[_cred("analytics", "cred_analytics", _SAVED_LOGIN_URL)],
+        )
+
+        assert record.verdict == "declined"
+        assert policy.resolved_credentials == []
+        assert policy.live_page_admitted_urls == {}
+        load_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_admission_fingerprint_fires_once_per_page(self) -> None:
+        policy = RequestPolicy()
+        org_credentials = [_cred("analytics", "cred_analytics", _SAVED_LOGIN_URL)]
+        with capture_logs() as logs:
+            await _resolve_live_page(policy, page_url=_LIVE_LOGIN_URL, org_credentials=org_credentials)
+            await _resolve_live_page(policy, page_url=_LIVE_LOGIN_URL, org_credentials=org_credentials)
+            await _resolve_live_page(
+                policy, page_url="https://other.example.com/login", org_credentials=org_credentials
+            )
+
+        emitted = [entry for entry in logs if entry["event"] == "copilot credential live-page admission"]
+        assert [entry["seam"] for entry in emitted] == ["page_observation", "page_observation"]
+        assert emitted[0]["outcome"] == "admitted"
+        assert emitted[0]["tier"] == "url_path"
+
+    @pytest.mark.asyncio
+    async def test_a_passwordless_email_turn_declines_under_the_observation_seam(self) -> None:
+        policy = RequestPolicy(email_signin_intent=True, login_intent=True)
+        with capture_logs() as logs:
+            record, _ = await _resolve_live_page(
+                policy,
+                page_url=_LIVE_LOGIN_URL,
+                org_credentials=[_cred("analytics", "cred_analytics", _SAVED_LOGIN_URL)],
+            )
+
+        emitted = [entry for entry in logs if entry["event"] == "copilot credential live-page admission"]
+        assert record.verdict == "declined"
+        # Both lines emit: the guard keys on outcome, so a decline cannot consume the token a later
+        # grant on the same URL needs.
+        assert [(entry["seam"], entry["outcome"]) for entry in emitted] == [
+            ("page_observation", "passwordless_declined"),
+            ("page_observation", "declined"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_later_unmatched_page_does_not_erase_the_login_pages_answer(self) -> None:
+        policy = RequestPolicy()
+        ambiguous_credentials = [
+            _cred("analytics one", "cred_one", _SAVED_LOGIN_URL),
+            _cred("analytics two", "cred_two", _SAVED_LOGIN_URL),
+        ]
+        await _resolve_live_page(policy, page_url=_LIVE_LOGIN_URL, org_credentials=ambiguous_credentials)
+        await _resolve_live_page(
+            policy, page_url="https://help.example.com/docs", org_credentials=ambiguous_credentials
+        )
+
+        assert policy.live_page_resolution is not None
+        assert policy.live_page_resolution.verdict == "ambiguous"
 
 
 @pytest.mark.asyncio

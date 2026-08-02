@@ -34,6 +34,9 @@ _CDP_CONNECTION_ERROR_SUBSTR_FALLBACK = (
 # selected: they are raised beneath every driver, so no engine's native error families own them. Kept
 # as the shared floor under both the selection-aware and stock paths so migrating classification to a
 # selected engine never drops the cross-engine transport signal.
+# These three subclasses, never `OSError` itself: this predicate also gates cloud quarantine, and
+# `OSError` covers permanent local failures (missing or unexecutable browser binary, EACCES, EMFILE)
+# where retrying cannot succeed and pulling the address from the pool is wrong.
 _CDP_CONNECTION_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
     ConnectionRefusedError,
     ConnectionResetError,
