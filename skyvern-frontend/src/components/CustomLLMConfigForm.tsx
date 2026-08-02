@@ -32,11 +32,17 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import {
+  ExtraParamRow,
+  buildExtraParameters,
+  extraParamsToRows,
+} from "@/components/customLLMExtraParams";
 
 const providerLabels: Record<CustomLLMProvider, string> = {
   openai_compatible: "OpenAI compatible",
   ollama: "Ollama",
   openrouter: "OpenRouter",
+  gemini: "Gemini",
 };
 
 const optionalString = z.preprocess(
@@ -55,7 +61,7 @@ const optionalNumber = (schema: z.ZodNumber) =>
 const configSchema = z
   .object({
     display_name: z.string().trim().min(1, "Name is required"),
-    provider: z.enum(["openai_compatible", "ollama", "openrouter"]),
+    provider: z.enum(["openai_compatible", "ollama", "openrouter", "gemini"]),
     model_name: z.string().trim().min(1, "Model ID is required"),
     api_base: optionalString,
     api_key: optionalString,
@@ -87,7 +93,8 @@ const configSchema = z
     }
     if (
       (value.provider === "openai_compatible" ||
-        value.provider === "openrouter") &&
+        value.provider === "openrouter" ||
+        value.provider === "gemini") &&
       !value.api_key
     ) {
       ctx.addIssue({
@@ -119,6 +126,13 @@ const providerDefaults: Record<CustomLLMProvider, Partial<CustomLLMConfig>> = {
   },
   openrouter: {
     api_base: "https://openrouter.ai/api/v1",
+    api_key: "",
+    api_version: "",
+    supports_vision: true,
+    add_assistant_prefix: false,
+  },
+  gemini: {
+    api_base: "",
     api_key: "",
     api_version: "",
     supports_vision: true,
@@ -159,7 +173,10 @@ function valuesForCustomLLM(customLLM: CustomLLM): FormData {
   };
 }
 
-function requestFromValues(values: FormData): { config: CustomLLMConfig } {
+function requestFromValues(
+  values: FormData,
+  extraParameters: Record<string, unknown>,
+): { config: CustomLLMConfig } {
   return {
     config: {
       ...values.config,
@@ -172,6 +189,7 @@ function requestFromValues(values: FormData): { config: CustomLLMConfig } {
           ? null
           : values.config.temperature,
       reasoning_effort: values.config.reasoning_effort || null,
+      extra_parameters: extraParameters,
     },
   };
 }
@@ -179,6 +197,8 @@ function requestFromValues(values: FormData): { config: CustomLLMConfig } {
 export function CustomLLMConfigForm() {
   const [editing, setEditing] = useState<CustomLLM | null>(null);
   const [showApiKey, setShowApiKey] = useState(false);
+  const [extraParams, setExtraParams] = useState<ExtraParamRow[]>([]);
+  const [extraParamsError, setExtraParamsError] = useState<string | null>(null);
   const {
     customLLMs,
     isLoading,
@@ -202,16 +222,41 @@ export function CustomLLMConfigForm() {
       return;
     }
     form.reset(valuesForCustomLLM(editing));
+    setExtraParams(extraParamsToRows(editing.config.extra_parameters));
+    setExtraParamsError(null);
   }, [editing, form]);
 
   const resetForm = () => {
     setEditing(null);
     setShowApiKey(false);
+    setExtraParams([]);
+    setExtraParamsError(null);
     form.reset(emptyFormValues());
   };
 
+  const addExtraParam = () =>
+    setExtraParams((rows) => [...rows, { key: "", value: "" }]);
+
+  const updateExtraParam = (
+    index: number,
+    field: keyof ExtraParamRow,
+    value: string,
+  ) =>
+    setExtraParams((rows) =>
+      rows.map((row, i) => (i === index ? { ...row, [field]: value } : row)),
+    );
+
+  const removeExtraParam = (index: number) =>
+    setExtraParams((rows) => rows.filter((_, i) => i !== index));
+
   const onSubmit = (values: FormData) => {
-    const request = requestFromValues(values);
+    const { params, error } = buildExtraParameters(extraParams);
+    if (error) {
+      setExtraParamsError(error);
+      return;
+    }
+    setExtraParamsError(null);
+    const request = requestFromValues(values, params);
     if (editing) {
       updateCustomLLM({ id: editing.id, request }, { onSuccess: resetForm });
       return;
@@ -359,7 +404,9 @@ export function CustomLLMConfigForm() {
                         ? "anthropic/claude-3.5-sonnet"
                         : provider === "ollama"
                           ? "llama3.1"
-                          : "mistral"
+                          : provider === "gemini"
+                            ? "gemini-2.5-flash"
+                            : "mistral"
                     }
                     disabled={isLoading || isMutating}
                   />
@@ -560,6 +607,70 @@ export function CustomLLMConfigForm() {
                 </FormItem>
               )}
             />
+          </div>
+
+          <div className="space-y-3 rounded-md border p-3">
+            <div className="space-y-1">
+              <div className="text-sm font-medium">Advanced parameters</div>
+              <p className="text-xs text-muted-foreground">
+                Provider-specific parameters passed through to the model (e.g.{" "}
+                <code>service_tier</code>, <code>thinking</code>,{" "}
+                <code>extra_headers</code>). Values are parsed as JSON when
+                possible, otherwise sent as text.
+              </p>
+            </div>
+            {extraParams.length > 0 && (
+              <div className="space-y-2">
+                {extraParams.map((row, index) => (
+                  <div
+                    key={index}
+                    className="flex flex-col gap-2 md:flex-row md:items-start"
+                  >
+                    <Input
+                      value={row.key}
+                      placeholder="Parameter name"
+                      className="md:w-1/3"
+                      disabled={isLoading || isMutating}
+                      onChange={(event) =>
+                        updateExtraParam(index, "key", event.target.value)
+                      }
+                    />
+                    <Input
+                      value={row.value}
+                      placeholder='Value (e.g. flex or {"type":"enabled"})'
+                      className="md:flex-1"
+                      disabled={isLoading || isMutating}
+                      onChange={(event) =>
+                        updateExtraParam(index, "value", event.target.value)
+                      }
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      aria-label="Remove parameter"
+                      disabled={isLoading || isMutating}
+                      onClick={() => removeExtraParam(index)}
+                    >
+                      <TrashIcon className="h-4 w-4" />
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            )}
+            {extraParamsError && (
+              <p className="text-sm text-destructive">{extraParamsError}</p>
+            )}
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={isLoading || isMutating}
+              onClick={addExtraParam}
+            >
+              <PlusIcon className="mr-2 h-4 w-4" />
+              Add parameter
+            </Button>
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
