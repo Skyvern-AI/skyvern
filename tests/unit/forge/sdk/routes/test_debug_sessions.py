@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot.active_run_session import ActiveRunSessionAssociation
 from skyvern.forge.sdk.routes import debug_sessions as debug_sessions_mod
 from skyvern.schemas.runs import ProxyLocation
 
@@ -185,6 +186,125 @@ async def test_new_debug_session_response_carries_pbs_browser_profile_id() -> No
 
     assert result is created_debug_session
     assert created_debug_session.pbs_browser_profile_id == "bp_seeded"
+
+
+# ─── read-only viewer-state endpoint ───────────────────────────────────────
+
+
+def _active_association() -> ActiveRunSessionAssociation:
+    from datetime import datetime, timedelta, timezone
+
+    return ActiveRunSessionAssociation(
+        organization_id="org_x",
+        workflow_permanent_id="wpid_x",
+        debug_browser_session_id="pbs_debug",
+        run_browser_session_id="pbs_run",
+        workflow_run_id="wr_x",
+        turn_id="turn_x",
+        generation="generation_x",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+
+
+def _viewer_state_app(*, run_status: str = "running") -> MagicMock:
+    app_mock = MagicMock()
+    app_mock.DATABASE.debug.get_debug_session = AsyncMock(
+        return_value=SimpleNamespace(browser_session_id="pbs_debug"),
+    )
+    app_mock.DATABASE.workflow_runs.get_workflow_run = AsyncMock(
+        return_value=SimpleNamespace(
+            workflow_permanent_id="wpid_x",
+            browser_session_id="pbs_run",
+            status=run_status,
+        ),
+    )
+    app_mock.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session = AsyncMock()
+    return app_mock
+
+
+@pytest.mark.asyncio
+async def test_viewer_state_returns_matching_nonterminal_run_without_renewal() -> None:
+    app_mock = _viewer_state_app()
+    with (
+        patch.object(debug_sessions_mod, "app", app_mock),
+        patch.object(
+            debug_sessions_mod,
+            "get_active_run_session",
+            AsyncMock(return_value=_active_association()),
+        ),
+    ):
+        result = await debug_sessions_mod.get_debug_session_viewer_state(
+            "wpid_x",
+            current_org=SimpleNamespace(organization_id="org_x"),
+            current_user_id="user_x",
+        )
+
+    assert result.active_run_session_id == "pbs_run"
+    app_mock.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("association_update", "run_update"),
+    [
+        ({"organization_id": "org_other"}, {}),
+        ({"workflow_permanent_id": "wpid_other"}, {}),
+        ({"debug_browser_session_id": "pbs_other"}, {}),
+        ({"run_browser_session_id": "pbs_other"}, {}),
+        ({}, {"workflow_permanent_id": "wpid_other"}),
+        ({}, {"browser_session_id": "pbs_other"}),
+        ({}, {"status": "completed"}),
+        ({}, {"status": "malformed"}),
+    ],
+)
+async def test_viewer_state_rejects_mismatched_or_terminal_state(
+    association_update: dict[str, str],
+    run_update: dict[str, str],
+) -> None:
+    app_mock = _viewer_state_app()
+    workflow_run = app_mock.DATABASE.workflow_runs.get_workflow_run.return_value
+    for field, value in run_update.items():
+        setattr(workflow_run, field, value)
+    association = _active_association().model_copy(update=association_update)
+
+    with (
+        patch.object(debug_sessions_mod, "app", app_mock),
+        patch.object(
+            debug_sessions_mod,
+            "get_active_run_session",
+            AsyncMock(return_value=association),
+        ),
+    ):
+        result = await debug_sessions_mod.get_debug_session_viewer_state(
+            "wpid_x",
+            current_org=SimpleNamespace(organization_id="org_x"),
+            current_user_id="user_x",
+        )
+
+    assert result.active_run_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_viewer_state_returns_null_for_missing_or_unreadable_association() -> None:
+    for association_result in (None, RuntimeError("cache unavailable")):
+        app_mock = _viewer_state_app()
+        lookup = (
+            AsyncMock(side_effect=association_result)
+            if isinstance(association_result, Exception)
+            else AsyncMock(return_value=association_result)
+        )
+        with (
+            patch.object(debug_sessions_mod, "app", app_mock),
+            patch.object(debug_sessions_mod, "get_active_run_session", lookup),
+        ):
+            result = await debug_sessions_mod.get_debug_session_viewer_state(
+                "wpid_x",
+                current_org=SimpleNamespace(organization_id="org_x"),
+                current_user_id="user_x",
+            )
+
+        assert result.active_run_session_id is None
+        app_mock.DATABASE.workflow_runs.get_workflow_run.assert_not_awaited()
 
 
 # ─── login-block-compatibility endpoint ────────────────────────────────────

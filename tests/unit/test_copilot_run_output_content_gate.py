@@ -973,6 +973,64 @@ async def test_inline_registered_output_identity_uses_runtime_override_when_pers
     assert [item["output_parameter_id"] for item in data["registered_output_parameter_values"]] == ["op_runtime"]
 
 
+@pytest.mark.asyncio
+async def test_inline_prior_draft_registered_output_identity_uses_snapshot_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_get_workflow_run_output_parameters(*, workflow_run_id: str) -> list[SimpleNamespace]:
+        assert workflow_run_id == "wr_inline_snapshot"
+        return [
+            SimpleNamespace(
+                workflow_run_id="wr_inline_snapshot",
+                output_parameter_id="op_snapshot",
+                value={"record_number": "1234567890"},
+            )
+        ]
+
+    monkeypatch.setattr(
+        run_execution.app.DATABASE,
+        "workflow_runs",
+        SimpleNamespace(get_workflow_run_output_parameters=fake_get_workflow_run_output_parameters),
+    )
+
+    def workflow(output_parameter_id: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            organization_id="o",
+            workflow_definition=SimpleNamespace(
+                blocks=[
+                    SimpleNamespace(
+                        label="extract_record",
+                        block_type="CODE",
+                        output_parameter=SimpleNamespace(
+                            output_parameter_id=output_parameter_id,
+                            key="extract_record_output",
+                        ),
+                    )
+                ]
+            ),
+        )
+
+    runtime_workflow = workflow("op_runtime")
+    snapshot_workflow = workflow("op_snapshot")
+    output_identity_workflow = run_execution._registered_output_identity_workflow(
+        dispatch_to_worker=False,
+        dispatch_workflow=snapshot_workflow,  # type: ignore[arg-type]
+        runtime_workflow=runtime_workflow,  # type: ignore[arg-type]
+    )
+    data: dict[str, Any] = {"workflow_run_id": "wr_inline_snapshot", "blocks": []}
+
+    by_label = await _attach_registered_output_parameter_values(
+        workflow_run_id="wr_inline_snapshot",
+        workflow=runtime_workflow,  # type: ignore[arg-type]
+        output_identity_workflow=output_identity_workflow,
+        data=data,
+    )
+
+    assert output_identity_workflow is snapshot_workflow
+    assert by_label == {"extract_record": {"extract_record_output": {"record_number": "1234567890"}}}
+    assert [item["output_parameter_id"] for item in data["registered_output_parameter_values"]] == ["op_snapshot"]
+
+
 def test_satisfied_completion_prevents_empty_output_suspicious_success() -> None:
     result = _empty_extraction_run_result()
     ctx = _ctx(result["data"]["blocks"])
