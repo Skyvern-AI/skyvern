@@ -22,12 +22,14 @@ from skyvern.forge.sdk.copilot.config import (
     download_scout_act_required_for_policy,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.credential_resolution import load_credentials
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, resolve_credential_for_live_page
 from skyvern.forge.sdk.copilot.request_slots import is_canonical_request_slot_path
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction
 from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values
 from skyvern.forge.sdk.copilot.typed_value_policy import safe_typed_default_value, should_reject_type_text_value
+from skyvern.forge.sdk.schemas.credentials import Credential
 
 from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS, _composition_get_structured_evidence
 from .banned_blocks import (
@@ -435,6 +437,52 @@ async def _press_key_pre_hook(
     return _strip_intent_for_code_only_selector_action(params, ctx, tool_name="press_key")
 
 
+async def _bind_login_credential_for_observed_url(ctx: AgentContext, url: str, result: dict[str, Any]) -> None:
+    """Surface the saved credential the observed page vouches for, if the server can bind one.
+
+    A resolver or loader failure leaves the page observation exactly as it was, but the context
+    reads stay outside that guard: swallowing them would turn a mis-wired context into a silent
+    no-op that no test can catch.
+    """
+    if not url:
+        return
+
+    policy = ctx.request_policy
+    if not isinstance(policy, RequestPolicy):
+        return
+    organization_id = ctx.organization_id
+
+    async def load_once() -> list[Credential]:
+        if ctx.org_credentials_for_turn is None:
+            ctx.org_credentials_for_turn = await load_credentials(organization_id)
+        return ctx.org_credentials_for_turn
+
+    try:
+        record = await resolve_credential_for_live_page(
+            policy,
+            organization_id=organization_id,
+            page_url=url,
+            load_org_credentials=load_once,
+        )
+    except Exception:
+        LOG.warning(
+            "copilot credential live-page admission",
+            outcome="resolver_error",
+            seam="page_observation",
+            exc_info=True,
+        )
+        return
+
+    if record.verdict == "resolved" and record.candidates:
+        credential = record.candidates[0]
+        result["resolved_login_credential_id"] = credential.credential_id
+        result["resolved_login_credential_name"] = credential.name
+    elif record.verdict == "ambiguous":
+        result["candidate_login_credentials"] = [
+            {"credential_id": candidate.credential_id, "name": candidate.name} for candidate in record.candidates
+        ]
+
+
 async def _navigate_post_hook(
     result: dict[str, Any],
     raw: dict[str, Any],
@@ -444,6 +492,7 @@ async def _navigate_post_hook(
     if result.get("ok"):
         data = result.pop("data", {})
         result["url"] = data.get("url", "")
+        await _bind_login_credential_for_observed_url(ctx, result["url"], result)
         result["next_step"] = (
             "Page loaded, and a screenshot of it is attached. Use evaluate or "
             "inspect_page_for_composition when you need the page's structure or selectors "
@@ -508,6 +557,7 @@ async def _click_post_hook(
             "url": url,
             "title": title,
         }
+        await _bind_login_credential_for_observed_url(ctx, url, result)
         navigated = bool(source_url) and bool(url) and source_url != url
         role, accessible_name = await _resolve_scout_role_name(ctx, selector, allow_browser_read=not navigated)
         if navigated and not (role and accessible_name):
@@ -1077,6 +1127,7 @@ async def _press_key_post_hook(
             "selector": selector,
             "url": url,
         }
+        await _bind_login_credential_for_observed_url(ctx, url, result)
         _record_scouted_interaction(
             ctx,
             tool_name="press_key",

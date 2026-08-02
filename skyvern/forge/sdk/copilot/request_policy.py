@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast, get_args
 
@@ -22,6 +22,10 @@ from skyvern.forge.sdk.copilot.context import (
     StructuredContext,
     prior_signin_email_from_context,
     sanitize_global_llm_context_for_prompt,
+)
+from skyvern.forge.sdk.copilot.credential_resolution import (
+    CredentialResolution,
+    CredentialResolutionTier,
 )
 from skyvern.forge.sdk.copilot.credential_resolution import deduplicate_credentials as _deduplicate_credentials
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials as _load_credentials
@@ -552,6 +556,20 @@ class RequestSlotAnchorCorrectionDecisionV1:
     accepted_payload: dict[str, Any] | None = None
 
 
+LiveCredentialSeam = Literal["fill", "page_observation"]
+LivePageResolutionVerdict = Literal["resolved", "ambiguous", "no_match", "declined"]
+
+
+@dataclass(frozen=True)
+class LivePageResolutionRecord:
+    verdict: LivePageResolutionVerdict
+    tier: CredentialResolutionTier | None = None
+    candidates: tuple[Credential, ...] = ()
+    # The page the verdict is about. Without it a later observation's record is rendered as an answer
+    # about whichever page the reply happens to mention.
+    page_url: str = ""
+
+
 @dataclass
 class RequestPolicy:
     testing_intent: str = "unspecified"
@@ -581,6 +599,8 @@ class RequestPolicy:
     # credential_id -> the login page URL that granted it, so each later fill can confirm the
     # browser has not left that site and a redirect cannot inherit the grant.
     live_page_admitted_urls: dict[str, str] = field(default_factory=dict)
+    live_page_resolution: LivePageResolutionRecord | None = None
+    live_page_logged_urls: set[str] = field(default_factory=set)
     # Approves persisting a bound credential, not running it: run authority stays
     # scoped to resolved_credentials (ADR 0002).
     discovered_credentials: list[Credential] = field(default_factory=list)
@@ -5023,6 +5043,131 @@ class LiveCredentialAdmission:
     page_url: str | None = None
 
 
+def _live_page_log_allowed(policy: RequestPolicy, page_url: str, seam: LiveCredentialSeam, outcome: str = "") -> bool:
+    """Whether this seam may emit the admission fingerprint for this page.
+
+    The observation seam runs on every page the scout reaches, so without a per-URL guard a
+    single turn's no-match spam would drown the admission signal it shares a name with. The key
+    carries the outcome so a declining observation cannot eat the token before the grant that
+    follows it on the same URL — the grant is the signal the guard exists to protect.
+    """
+    if seam != "page_observation":
+        return True
+    key = f"{page_url}::{outcome}"
+    if key in policy.live_page_logged_urls:
+        return False
+    policy.live_page_logged_urls.add(key)
+    return True
+
+
+async def _resolve_live_page_credentials(
+    policy: RequestPolicy,
+    *,
+    organization_id: str,
+    page_url: str,
+    load_org_credentials: Callable[[], Awaitable[list[Credential]]] | None,
+    seam: LiveCredentialSeam,
+    credential_id: str | None = None,
+) -> CredentialResolution | None:
+    """Ask the live page which saved credentials it vouches for, or None when a precondition declines."""
+    if policy.raw_secret_detected or not policy.allow_run_blocks or not page_url:
+        return None
+    if _is_passwordless_email_signin(policy):
+        # Turn-start resolution excludes this shape from every URL tier because a site that signs in
+        # by emailed link has no password question to put to the user, so admitting one here would
+        # fill a password the user said the account does not have.
+        if _live_page_log_allowed(policy, page_url, seam, "passwordless_declined"):
+            LOG.info(
+                "copilot credential live-page admission",
+                outcome="passwordless_declined",
+                seam=seam,
+                organization_id=organization_id,
+                credential_id=credential_id,
+                page_url=loggable_origin(page_url),
+            )
+        return None
+
+    return resolve_by_url(
+        await (load_org_credentials() if load_org_credentials else _load_credentials(organization_id)),
+        [page_url],
+        # The scout reached this page, so its own path is the evidence; a bare host match would let
+        # any other page on that host — a profile, an upload, a user-content route — claim the login.
+        tiers=("url_exact", "url_path"),
+        password_only=True,
+    )
+
+
+def _record_live_page_admission(policy: RequestPolicy, candidates: Sequence[Credential], page_url: str) -> None:
+    # Only a credential this page is what granted gets the page-scoped stamp. One the turn already
+    # resolved (the user named it) keeps its unstamped standing: record_approved_credentials_in_global_llm_context
+    # skips stamped ids, so stamping it here would strip its durable cross-turn approval.
+    already_resolved = {credential.credential_id for credential in policy.resolved_credentials}
+    policy.resolved_credentials = _deduplicate_credentials(list(policy.resolved_credentials) + list(candidates))
+    for candidate in candidates:
+        if candidate.credential_id not in already_resolved:
+            policy.live_page_admitted_urls[candidate.credential_id] = page_url
+
+
+async def resolve_credential_for_live_page(
+    policy: RequestPolicy,
+    *,
+    organization_id: str,
+    page_url: str,
+    load_org_credentials: Callable[[], Awaitable[list[Credential]]] | None = None,
+) -> LivePageResolutionRecord:
+    """Grant run authority for the sole saved credential the observed page vouches for.
+
+    Same discriminator and same records as the fill seam; the difference is only that no
+    credential was requested, so a sole match is the answer rather than something to check against.
+    """
+    resolution = await _resolve_live_page_credentials(
+        policy,
+        organization_id=organization_id,
+        page_url=page_url,
+        load_org_credentials=load_org_credentials,
+        seam="page_observation",
+    )
+    if resolution is None:
+        record = LivePageResolutionRecord(verdict="declined", page_url=page_url)
+    else:
+        record = LivePageResolutionRecord(
+            verdict="no_match" if resolution.verdict == "unresolved" else resolution.verdict,
+            tier=resolution.tier,
+            candidates=tuple(resolution.candidates),
+            page_url=page_url,
+        )
+    if record.verdict == "resolved":
+        _record_live_page_admission(policy, record.candidates, page_url)
+    if record.verdict == "ambiguous":
+        policy.discovered_credentials = _deduplicate_credentials(
+            list(policy.discovered_credentials) + list(record.candidates)
+        )
+    # A later page that matches nothing must not erase the login page's answer, which the
+    # blocked-output renderer still needs at the end of the turn. An ambiguous verdict also outranks a
+    # later resolved one from a different page: the ambiguity is the thing the user has to settle, and
+    # a same-page verdict is a genuine update rather than an unrelated overwrite.
+    stored = policy.live_page_resolution
+    if record.verdict in {"resolved", "ambiguous"} and (
+        stored is None
+        or stored.verdict != "ambiguous"
+        or stored.page_url == record.page_url
+        or record.verdict == "ambiguous"
+    ):
+        policy.live_page_resolution = record
+    observation_outcome = "admitted" if record.verdict == "resolved" else record.verdict
+    if _live_page_log_allowed(policy, page_url, "page_observation", observation_outcome):
+        LOG.info(
+            "copilot credential live-page admission",
+            outcome=observation_outcome,
+            seam="page_observation",
+            organization_id=organization_id,
+            page_url=loggable_origin(page_url),
+            tier=record.tier,
+            candidate_credential_ids=[candidate.credential_id for candidate in record.candidates],
+        )
+    return record
+
+
 async def admit_credential_for_live_page(
     policy: RequestPolicy,
     *,
@@ -5037,29 +5182,18 @@ async def admit_credential_for_live_page(
     does not vouch for is refused, and so is one saved without a login URL, which is evidence about
     no page at all.
     """
-    if policy.raw_secret_detected or not policy.allow_run_blocks or not credential_id or not page_url:
+    if not credential_id:
         return LiveCredentialAdmission(False)
-    if _is_passwordless_email_signin(policy):
-        # Turn-start resolution excludes this shape from every URL tier because a site that signs in
-        # by emailed link has no password question to put to the user, so admitting one here would
-        # fill a password the user said the account does not have.
-        LOG.info(
-            "copilot credential live-page admission",
-            outcome="passwordless_declined",
-            organization_id=organization_id,
-            credential_id=credential_id,
-            page_url=loggable_origin(page_url),
-        )
-        return LiveCredentialAdmission(False)
-
-    resolution = resolve_by_url(
-        await (load_org_credentials() if load_org_credentials else _load_credentials(organization_id)),
-        [page_url],
-        # The scout reached this page, so its own path is the evidence; a bare host match would let
-        # any other page on that host — a profile, an upload, a user-content route — claim the login.
-        tiers=("url_exact", "url_path"),
-        password_only=True,
+    resolution = await _resolve_live_page_credentials(
+        policy,
+        organization_id=organization_id,
+        page_url=page_url,
+        load_org_credentials=load_org_credentials,
+        seam="fill",
+        credential_id=credential_id,
     )
+    if resolution is None:
+        return LiveCredentialAdmission(False)
     # Being *one of* several page matches is not authority; only a sole match the page
     # vouches for is, so an ambiguous set still asks even when it contains the requested id.
     admitted = resolution.verdict == "resolved" and resolution.contains(credential_id)
@@ -5068,6 +5202,7 @@ async def admit_credential_for_live_page(
         outcome="admitted"
         if admitted
         else ("wrong_credential" if resolution.verdict == "resolved" else resolution.verdict),
+        seam="fill",
         organization_id=organization_id,
         credential_id=credential_id,
         page_url=loggable_origin(page_url),
@@ -5075,11 +5210,7 @@ async def admit_credential_for_live_page(
         candidate_credential_ids=[candidate.credential_id for candidate in resolution.candidates],
     )
     if admitted:
-        policy.resolved_credentials = _deduplicate_credentials(
-            list(policy.resolved_credentials) + list(resolution.candidates)
-        )
-        for candidate in resolution.candidates:
-            policy.live_page_admitted_urls[candidate.credential_id] = page_url
+        _record_live_page_admission(policy, resolution.candidates, page_url)
         return LiveCredentialAdmission(True, page_url=page_url)
 
     if resolution.verdict == "ambiguous":

@@ -4505,6 +4505,25 @@ def _output_policy_diagnostics_from_guardrail_exception(exc: BaseException) -> d
     return {key: data[key] for key in keys if key in data}
 
 
+def _unapproved_credential_reference_reply(request_policy: RequestPolicy | None) -> str:
+    resolution = request_policy.live_page_resolution if request_policy is not None else None
+    if resolution is not None and resolution.verdict == "ambiguous" and resolution.candidates:
+        listed = "; ".join(f"{candidate.name} (`{candidate.credential_id}`)" for candidate in resolution.candidates)
+        # The Credentials UI marker has to survive on this branch too: credential_prompt_reason keys
+        # the FE credential card off it, so dropping it silently removes the card for ambiguous asks.
+        return (
+            f"More than one saved credential is set up for the sign-in page I reached: {listed}. "
+            "Reply with the credential ID you want me to use, manage them in the Credentials UI, "
+            "or adjust the workflow to avoid using credentials."
+        )
+    # Only the observation seam records a verdict, so the absence of one says nothing about whether a
+    # credential matched — claiming "no match" here would deny a real match found at the fill seam.
+    return (
+        "I need an approved credential to continue. Reply with the credential ID to use, "
+        "add one in the Credentials UI, or adjust the workflow to avoid using credentials."
+    )
+
+
 def _build_output_policy_blocked_result(
     ctx: CopilotContext,
     verdict: OutputPolicyVerdict,
@@ -4545,11 +4564,7 @@ def _build_output_policy_blocked_result(
         user_response = _RAW_SECRET_LEAK_REFUSAL
         add_saved_draft_copy = True
     elif OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE in verdict.reason_codes:
-        user_response = (
-            "I need you to confirm which saved credential should be used before I can continue. "
-            "Please reply with the credential name from the Credentials UI, or adjust the workflow to avoid "
-            "using credentials."
-        )
+        user_response = _unapproved_credential_reference_reply(request_policy)
         add_saved_draft_copy = True
     elif OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes:
         user_response = (
