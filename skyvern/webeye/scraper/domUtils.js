@@ -1947,20 +1947,35 @@ var __destinationFactBudget = 0;
 // an opaque fact is cheap, not free, and the budget bounds the PAYLOAD, not one field of it.
 const DESTINATION_FACT_OVERHEAD = 56;
 
-// Charge one fact against the per-build budget, or return null to attach nothing. Exhaustion
-// zeroes the budget, which is what stops all further capture WORK in buildElementObject —
-// resolution runs before the per-URL cap, so bounding only the output leaves the cost unbounded.
+// Deduct a cost from the per-build budget, or refuse and zero it. Zeroing on exhaustion is what
+// makes buildElementObject's guard skip every later element in the build outright.
+//
+// The injection wrapper exports every top-level declaration onto globalThis, so a hostile page
+// can call this directly while a build is awaiting. The cost is therefore validated, not trusted:
+// a negative cost ADDS budget (spend(-Infinity) sets it to Infinity and erases both the
+// resolution and the payload bound), and NaN poisons every later comparison into passing, since
+// `x < NaN` is false. Only a finite, non-negative charge may proceed; anything else zeroes the
+// budget, which is the fail-closed direction — a build captures fewer facts, never more.
+function spendDestinationBudget(cost) {
+  if (!(Number.isFinite(cost) && cost >= 0)) {
+    __destinationFactBudget = 0;
+    return false;
+  }
+  if (__destinationFactBudget < cost) {
+    __destinationFactBudget = 0;
+    return false;
+  }
+  __destinationFactBudget -= cost;
+  return true;
+}
+
+// Charge one fact against the per-build budget, or return null to attach nothing.
 function chargeDestinationBudget(facts) {
   if (!facts) return null;
   const cost =
     DESTINATION_FACT_OVERHEAD +
     (typeof facts.url === "string" ? facts.url.length : 0);
-  if (__destinationFactBudget < cost) {
-    __destinationFactBudget = 0;
-    return null;
-  }
-  __destinationFactBudget -= cost;
-  return facts;
+  return spendDestinationBudget(cost) ? facts : null;
 }
 
 function normalizeFormMethod(raw) {
@@ -1976,12 +1991,6 @@ function normalizeFormMethod(raw) {
 // dicts at the SkyvernFrame boundary. Malformed, clobbered, or throwing input fails closed:
 // null means "no destination structure"; url:null means unresolved; both are INCOMPLETE.
 function buildDestinationFacts(element, tagNameLower) {
-  // Capture remains deliberately disabled for SKY-12875. Re-enable only after: (1) F3 bounds
-  // resolution/serialization work before allocation instead of truncating the post-resolution
-  // result (that truncation is the defect, not the fix); (2) the MAIN-WORLD tamperability and
-  // cannot-authorize telemetry note has landed; (3) the (beforeunload, dismiss) capability-table
-  // gap is closed; and (4) the F5 consequence is load-bearing in with_resolved_target's docstring.
-  return null;
   try {
     const doc = element.ownerDocument;
     // Length caps bound the RESOLVED value, not just the raw attribute: 4096 compact raw chars
@@ -1997,6 +2006,19 @@ function buildDestinationFacts(element, tagNameLower) {
       doc && typeof doc.baseURI === "string" ? bounded(doc.baseURI) : null;
     const resolve = (raw) => {
       if (bounded(raw) === null) return null;
+      // Charge the resolution's INPUT before allocating its output. Charging only the surviving
+      // fact leaves the REJECTED resolutions free, and those are the expensive ones: 4096 compact
+      // raw chars build a 36,889-char href, get rejected by the per-URL cap, then charge 56 as an
+      // opaque fact — buying 329MiB of resolution for 512KiB of budget. Input length is known
+      // before allocation, so charging it makes a build's total resolution work O(budget) rather
+      // than O(elements). Refusing yields url:null, and the attach site then drops the fact.
+      if (
+        !spendDestinationBudget(
+          raw.length + (baseURI === null ? 0 : baseURI.length),
+        )
+      ) {
+        return null;
+      }
       try {
         return bounded(
           baseURI ? new URL(raw, baseURI).href : new URL(raw).href,
