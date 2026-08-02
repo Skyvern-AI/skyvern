@@ -355,6 +355,7 @@ async def new_debug_session(
         timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
         proxy_location=proxy_location,
         wait_for_startup=settings.ENV != "local",
+        needs_live_view=True,
     )
 
     debug_session = await app.DATABASE.debug.create_debug_session(
@@ -364,6 +365,10 @@ async def new_debug_session(
         workflow_permanent_id=workflow_permanent_id,
         vnc_streaming_supported=(
             settings.ENV == "local" or bool(new_browser_session.ip_address or new_browser_session.browser_address)
+        )
+        and await app.AGENT_FUNCTION.supports_live_view(
+            new_browser_session.persistent_browser_session_id,
+            ip_address=new_browser_session.ip_address,
         ),
     )
 
