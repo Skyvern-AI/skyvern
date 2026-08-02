@@ -787,6 +787,10 @@ export type DebugSessionApiResponse = {
   pbs_browser_profile_id: string | null;
 };
 
+export type DebugSessionViewerStateApiResponse = {
+  active_run_session_id: string | null;
+};
+
 export type DebugLoginBlockCompatibilityResponse = {
   compatible: boolean;
   reason: "pbs_no_profile" | "pbs_different_profile" | null;

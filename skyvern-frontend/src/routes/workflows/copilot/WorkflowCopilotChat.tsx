@@ -98,6 +98,7 @@ import {
   parseUtcIsoMs,
 } from "./narrativeState";
 import { computeFollowSignature, useStickToBottom } from "./useStickToBottom";
+import { useTurnActivityChange } from "./useTurnActivityChange";
 import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
 import { SpeechInputButton } from "@/components/SpeechInputButton";
 import { useFeatureFlag, useFeatureFlagValue } from "@/hooks/useFeatureFlag";
@@ -575,6 +576,7 @@ interface WorkflowCopilotChatProps {
   isOpen?: boolean;
   onClose?: () => void;
   onMessageCountChange?: (count: number) => void;
+  onTurnActivityChange?: (active: boolean) => void;
   buttonRef?: React.RefObject<HTMLButtonElement>;
   liveBrowserSessionId?: string | null;
   workflowRunId?: string | null;
@@ -654,6 +656,7 @@ export function WorkflowCopilotChat({
   isOpen = true,
   onClose,
   onMessageCountChange,
+  onTurnActivityChange,
   buttonRef,
   liveBrowserSessionId,
   workflowRunId: workflowRunIdProp,
@@ -766,6 +769,7 @@ export function WorkflowCopilotChat({
   const [inputValue, setInputValue] = useState("");
   const dismissPasteSkillHint = usePasteSkillHintStore((s) => s.dismiss);
   const [isLoading, setIsLoading] = useState(false);
+  useTurnActivityChange(isLoading, onTurnActivityChange);
   const [queuedPrompt, setQueuedPrompt] = useState<QueuedPrompt | null>(null);
   const [narrative, setNarrative] =
     useState<TurnNarrativeState>(EMPTY_NARRATIVE);
