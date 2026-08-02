@@ -560,7 +560,7 @@ class TestCredentialFillLivePageAdmission:
             patch("skyvern.forge.app.DATABASE.credentials.get_credentials", new=load_mock),
             patch.object(credential_fill_module, "_live_working_page_url", AsyncMock(return_value=page_url)),
         ):
-            error, _ = await credential_fill_module._credential_fill_gate_error(ctx, credential_id)
+            _, error = await credential_fill_module._credential_fill_origin_grant(ctx, credential_id)
         return error, policy, load_mock
 
     @pytest.mark.asyncio
@@ -624,10 +624,11 @@ class TestCredentialFillLivePageAdmission:
                 AsyncMock(return_value="https://analytics.example.com/login"),
             ),
         ):
-            error, intended_url = await credential_fill_module._credential_fill_gate_error(ctx, "cred_123")
+            grant, error = await credential_fill_module._credential_fill_origin_grant(ctx, "cred_123")
 
         assert error is None
-        assert intended_url == _FIXTURE_LOGIN_URL
+        assert grant is not None
+        assert grant.intended_url == _FIXTURE_LOGIN_URL
         load_mock.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -854,12 +855,13 @@ class TestObservationSeamCredentialBinding:
         )
 
         with patch.object(credential_fill_module, "_live_working_page_url", AsyncMock(return_value=_FIXTURE_LOGIN_URL)):
-            error, admitted_url = await credential_fill_module._credential_fill_gate_error(
+            grant, error = await credential_fill_module._credential_fill_origin_grant(
                 ctx, result["resolved_login_credential_id"]
             )
 
         assert error is None
-        assert admitted_url == _FIXTURE_LOGIN_URL
+        assert grant is not None
+        assert grant.intended_url == _FIXTURE_LOGIN_URL
 
     @pytest.mark.asyncio
     async def test_leaving_the_admitted_origin_after_the_seam_bind_refuses_the_fill(

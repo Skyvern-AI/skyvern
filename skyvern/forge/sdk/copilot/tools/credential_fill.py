@@ -182,6 +182,8 @@ async def _credential_fill_origin_grant(
             return None, _missing_credential_origin_error(credential_id)
         intended_url = _resolved_credential_intended_url(policy, credential_id)
         if not intended_url:
+            # API/import-created credentials remain unbound until tested against a login page.
+            # Denying that onboarding state is intentional: there is no origin safe to release to.
             return None, _missing_credential_origin_error(credential_id)
         return _CredentialFillOriginGrant(intended_url), None
 
@@ -205,12 +207,6 @@ async def _credential_fill_origin_grant(
     if admission.admitted:
         return None, _missing_credential_origin_error(credential_id)
     return None, admission.steer or authority_error
-
-
-async def _credential_fill_gate_error(copilot_ctx: AgentContext, credential_id: str) -> tuple[str | None, str | None]:
-    """Compatibility view of the origin-grant gate for tests and policy callers."""
-    grant, error = await _credential_fill_origin_grant(copilot_ctx, credential_id)
-    return error, grant.intended_url if grant else None
 
 
 async def _resolve_credential_fill_value(
