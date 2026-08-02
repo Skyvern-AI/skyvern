@@ -72,7 +72,13 @@ def prepend_scheme_and_validate_url(url: str) -> str:
     if not url:
         return url
 
-    parsed_url = urlparse(url=url)
+    try:
+        parsed_url = urlparse(url=url)
+    except ValueError as error:
+        # Malformed authorities (e.g. an unterminated IPv6 literal like ``http://[``) make
+        # stdlib urlparse raise a raw ValueError; surface it as the typed InvalidUrl so
+        # callers get one contract instead of a leaking parser error.
+        raise InvalidUrl(url=url) from error
     if parsed_url.scheme and parsed_url.scheme not in ["http", "https"]:
         raise InvalidUrl(url=url)
 
@@ -88,6 +94,24 @@ def prepend_scheme_and_validate_url(url: str) -> str:
         raise InvalidUrl(url=url)
 
     return url
+
+
+def canonical_navigation_host(url: str) -> str | None:
+    """Host a browser resolves ``url`` against, via pydantic's WHATWG URL model.
+
+    The WHATWG parser (what the browser uses) canonicalizes numeric IPv4 literals
+    (decimal/octal/hex/shortened) and backslash authority tricks to the host the
+    browser truly connects to, unlike stdlib ``urlparse`` which can diverge. Raises
+    ``InvalidUrl`` for non-http(s) schemes and malformed URLs; returns ``None`` when
+    there is no host.
+    """
+    validated_url = prepend_scheme_and_validate_url(url)
+    if not validated_url:
+        return None
+    try:
+        return HttpUrl(validated_url).host
+    except ValidationError:
+        return None
 
 
 def _normalize_host(host: str) -> str:

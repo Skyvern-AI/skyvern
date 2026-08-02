@@ -16,7 +16,7 @@ from skyvern.config import settings
 
 # Reuse the HTTP-logging redactor so SSE tool inputs and request-body logs
 # share one exact-match sensitive-key policy.
-from skyvern.forge.request_logging import redact_sensitive_fields
+from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.sdk.copilot.context import InFlightStreamToolCall
 from skyvern.forge.sdk.copilot.narration import (
     CODE_REPAIR_PROGRESS_SURFACE_KIND,

@@ -550,6 +550,16 @@ class FailedToNavigateToUrl(SkyvernException):
         super().__init__(f"Failed to navigate to url {url}. Error message: {error_message}")
 
 
+class BlockedNavigationDestination(FailedToNavigateToUrl):
+    """A navigation target (or one of its redirect hops) resolves to a private, link-local,
+    loopback, metadata, or local-resource destination. A subclass of FailedToNavigateToUrl so
+    existing navigation error handling treats it as a permanent failure and never retries it."""
+
+    def __init__(self, url: str, reason: str) -> None:
+        self.reason = reason
+        super().__init__(url=url, error_message=f"blocked navigation destination: {reason}")
+
+
 class FailedToReloadPage(SkyvernException):
     def __init__(self, url: str, error_message: str) -> None:
         self.url = url
