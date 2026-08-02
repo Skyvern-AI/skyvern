@@ -104,7 +104,12 @@ def _make_service_with_mocks(
     # setup_workflow_run tests (param batching / tagging / trigger types) don't need seed fixtures.
     service._resolve_and_stamp_run_seed = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
 
-    organization = SimpleNamespace(organization_id="org_test", organization_name="Test Org")
+    organization = SimpleNamespace(
+        organization_id="org_test",
+        organization_name="Test Org",
+        default_llm_key="CUSTOM_LLM_oat_smart",
+        default_secondary_llm_key="CUSTOM_LLM_oat_fast",
+    )
     return service, organization, workflow_run
 
 
@@ -814,6 +819,8 @@ async def test_setup_workflow_run_preserves_parent_loop_state_when_replacing_con
     parent_context = SkyvernContext(
         organization_id="org_test",
         organization_name="Test Org",
+        org_default_llm_key="CUSTOM_LLM_oat_parent_smart",
+        org_default_secondary_llm_key="CUSTOM_LLM_oat_parent_fast",
         workflow_run_id="wr_parent",
         root_workflow_run_id="wr_root",
         run_id="wr_parent",
@@ -839,6 +846,8 @@ async def test_setup_workflow_run_preserves_parent_loop_state_when_replacing_con
     assert current_context.workflow_run_id == "wr_test"
     assert current_context.run_id == "wr_parent"
     assert current_context.root_workflow_run_id == "wr_root"
+    assert current_context.org_default_llm_key == "CUSTOM_LLM_oat_smart"
+    assert current_context.org_default_secondary_llm_key == "CUSTOM_LLM_oat_fast"
     assert current_context.trigger_type == WorkflowRunTriggerType.api
     assert current_context.loop_internal_state == loop_state
     assert current_context.loop_internal_state is not loop_state

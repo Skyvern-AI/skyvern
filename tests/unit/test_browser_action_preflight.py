@@ -766,7 +766,15 @@ class TestStampingHappensAtTheParsePoint:
     whole batch later handed such an action provenance for an observation it predates."""
 
     @staticmethod
-    async def _generate(injected: list | None, parsed, *, extraction: bool = True, otp=None) -> list:
+    async def _generate(
+        injected: list | None,
+        parsed,
+        *,
+        extraction: bool = True,
+        otp=None,
+        primary_default: object | None = None,
+        captured_defaults: list[object] | None = None,
+    ) -> list:
         async def fake_extract(*_a, **_k):
             return parsed
 
@@ -789,9 +797,23 @@ class TestStampingHappensAtTheParsePoint:
         task.workflow_run_id = "wr"
         task.task_id = "tsk"
         llm = AsyncMock(return_value={"actions": []})
+        resolved_primary_default = primary_default or object()
+
+        def resolve_override(_llm_key: str | None, *, default: object) -> AsyncMock:
+            if captured_defaults is not None:
+                captured_defaults.append(default)
+            return llm
+
         with (
             patch.object(ForgeAgent, "create_extract_action", fake_extract),
-            patch("skyvern.forge.agent.LLMAPIHandlerFactory.get_override_llm_api_handler", return_value=llm),
+            patch(
+                "skyvern.forge.agent.get_org_aware_primary_llm_api_handler",
+                return_value=resolved_primary_default,
+            ),
+            patch(
+                "skyvern.forge.agent.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                side_effect=resolve_override,
+            ),
         ):
             actions, _, _ = await ForgeAgent._generate_step_actions(
                 agent,
@@ -816,6 +838,21 @@ class TestStampingHappensAtTheParsePoint:
                 context=None,
             )
         return actions
+
+    @pytest.mark.asyncio
+    async def test_planner_uses_org_aware_primary_handler_as_default(self) -> None:
+        primary_default = object()
+        captured_defaults: list[object] = []
+
+        await self._generate(
+            None,
+            None,
+            extraction=False,
+            primary_default=primary_default,
+            captured_defaults=captured_defaults,
+        )
+
+        assert captured_defaults == [primary_default]
 
     @pytest.mark.asyncio
     async def test_an_action_injected_before_the_scrape_is_never_stamped(self, observing: SkyvernContext) -> None:

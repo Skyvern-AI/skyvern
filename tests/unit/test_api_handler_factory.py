@@ -16,9 +16,11 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     GEMINI_SAFETY_SETTINGS,
     LLMAPIHandlerFactory,
     LLMCaller,
+    get_org_aware_secondary_llm_api_handler,
 )
 from skyvern.forge.sdk.api.llm.models import LLMConfig
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
 from tests.unit.helpers import DummyLogger, FakeLLMResponse
@@ -635,6 +637,208 @@ def test_get_override_llm_api_handler_treats_empty_as_no_override(
 
     resolved = LLMAPIHandlerFactory.get_override_llm_api_handler(override, default=default_handler)
     assert resolved is default_handler
+
+
+def test_get_org_aware_secondary_llm_api_handler_returns_org_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    org_handler = MagicMock(name="org_handler")
+    registry_lookup = MagicMock(return_value=True)
+    handler_lookup = MagicMock(return_value=org_handler)
+    monkeypatch.setattr(
+        api_handler_factory.skyvern_context,
+        "current",
+        lambda: SkyvernContext(
+            organization_id="o_test",
+            org_default_secondary_llm_key="CUSTOM_LLM_oat_fast",
+        ),
+    )
+    monkeypatch.setattr(api_handler_factory, "is_custom_llm_owned_by_organization", lambda _id, _org: True)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_registered", registry_lookup)
+    monkeypatch.setattr(api_handler_factory.LLMAPIHandlerFactory, "get_llm_api_handler", handler_lookup)
+
+    result = get_org_aware_secondary_llm_api_handler(default=MagicMock(name="default_handler"))
+
+    assert result is org_handler
+    registry_lookup.assert_called_once_with("CUSTOM_LLM_oat_fast")
+    handler_lookup.assert_called_once_with("CUSTOM_LLM_oat_fast")
+
+
+def test_get_org_aware_secondary_llm_api_handler_warns_once_and_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_handler = MagicMock(name="default_handler")
+    log = MagicMock()
+    monkeypatch.setattr(
+        api_handler_factory.skyvern_context,
+        "current",
+        lambda: SkyvernContext(org_default_secondary_llm_key="CUSTOM_LLM_oat_deleted"),
+    )
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_registered", MagicMock(return_value=False))
+    monkeypatch.setattr(api_handler_factory, "LOG", log)
+
+    result = get_org_aware_secondary_llm_api_handler(default=default_handler)
+
+    assert result is default_handler
+    log.warning.assert_called_once()
+    assert log.warning.call_args.kwargs["llm_key"] == "CUSTOM_LLM_oat_deleted"
+
+
+def test_get_org_aware_secondary_llm_api_handler_is_safe_without_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    platform_handler = MagicMock(name="platform_handler")
+    registry_lookup = MagicMock(side_effect=AssertionError("registry must not be read without context"))
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_registered", registry_lookup)
+    monkeypatch.setattr(api_handler_factory.app, "SECONDARY_LLM_API_HANDLER", platform_handler)
+
+    result = get_org_aware_secondary_llm_api_handler()
+
+    assert result is platform_handler
+    registry_lookup.assert_not_called()
+
+
+def test_get_override_llm_api_handler_falls_back_for_stale_org_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_handler = MagicMock(name="default_handler")
+    log = MagicMock()
+    monkeypatch.setattr(
+        api_handler_factory.skyvern_context,
+        "current",
+        lambda: SkyvernContext(org_default_llm_key="CUSTOM_LLM_oat_deleted"),
+    )
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_registered", MagicMock(return_value=False))
+    monkeypatch.setattr(api_handler_factory, "LOG", log)
+
+    result = LLMAPIHandlerFactory.get_override_llm_api_handler(
+        "CUSTOM_LLM_oat_deleted",
+        default=default_handler,
+    )
+
+    assert result is default_handler
+    log.warning.assert_called_once()
+
+
+def test_get_override_llm_api_handler_rejects_foreign_org_custom_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_handler = MagicMock(name="default_handler")
+    handler_lookup = MagicMock(side_effect=AssertionError("foreign custom key must not resolve"))
+    log = MagicMock()
+    monkeypatch.setattr(
+        api_handler_factory.skyvern_context,
+        "current",
+        lambda: SkyvernContext(organization_id="o_attacker"),
+    )
+    monkeypatch.setattr(api_handler_factory, "is_custom_llm_owned_by_organization", lambda _id, _org: False)
+    monkeypatch.setattr(api_handler_factory.LLMAPIHandlerFactory, "get_llm_api_handler", handler_lookup)
+    monkeypatch.setattr(api_handler_factory, "LOG", log)
+
+    result = LLMAPIHandlerFactory.get_override_llm_api_handler(
+        "CUSTOM_LLM_oat_victim",
+        default=default_handler,
+    )
+
+    assert result is default_handler
+    handler_lookup.assert_not_called()
+    log.warning.assert_called_once()
+    assert log.warning.call_args.kwargs["organization_id"] == "o_attacker"
+
+
+def test_get_override_llm_api_handler_rejects_custom_key_without_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_handler = MagicMock(name="default_handler")
+    handler_lookup = MagicMock(side_effect=AssertionError("custom key must not resolve without an org"))
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(api_handler_factory.LLMAPIHandlerFactory, "get_llm_api_handler", handler_lookup)
+
+    result = LLMAPIHandlerFactory.get_override_llm_api_handler(
+        "CUSTOM_LLM_oat_orphan",
+        default=default_handler,
+    )
+
+    assert result is default_handler
+    handler_lookup.assert_not_called()
+
+
+def test_get_org_aware_secondary_llm_api_handler_rejects_unowned_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_handler = MagicMock(name="default_handler")
+    handler_lookup = MagicMock(side_effect=AssertionError("unowned org default must not resolve"))
+    monkeypatch.setattr(
+        api_handler_factory.skyvern_context,
+        "current",
+        lambda: SkyvernContext(
+            organization_id="o_test",
+            org_default_secondary_llm_key="CUSTOM_LLM_oat_foreign",
+        ),
+    )
+    monkeypatch.setattr(api_handler_factory, "is_custom_llm_owned_by_organization", lambda _id, _org: False)
+    monkeypatch.setattr(api_handler_factory.LLMAPIHandlerFactory, "get_llm_api_handler", handler_lookup)
+
+    result = get_org_aware_secondary_llm_api_handler(default=default_handler)
+
+    assert result is default_handler
+    handler_lookup.assert_not_called()
+
+
+@pytest.mark.parametrize("base_parameters", [None, {}])
+def test_get_llm_api_handler_caches_plain_registered_config_without_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+    base_parameters: dict[str, Any] | None,
+) -> None:
+    llm_key = "TEST_PLAIN_HANDLER_CACHE"
+    llm_config = _custom_llm_config("openai/cache-model")
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_router_config", lambda _: False)
+    LLMAPIHandlerFactory._handler_cache.pop(llm_key, None)
+
+    try:
+        first = LLMAPIHandlerFactory.get_llm_api_handler(llm_key, base_parameters)
+        second = LLMAPIHandlerFactory.get_llm_api_handler(llm_key, base_parameters)
+    finally:
+        LLMAPIHandlerFactory._handler_cache.pop(llm_key, None)
+
+    assert second is first
+
+
+def test_get_llm_api_handler_cache_self_invalidates_after_reregistration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm_key = "TEST_PLAIN_HANDLER_CACHE_REREGISTER"
+    current_config = _custom_llm_config("openai/first-cache-model")
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: current_config)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_router_config", lambda _: False)
+    LLMAPIHandlerFactory._handler_cache.pop(llm_key, None)
+
+    try:
+        first = LLMAPIHandlerFactory.get_llm_api_handler(llm_key)
+        current_config = _custom_llm_config("openai/second-cache-model")
+        second = LLMAPIHandlerFactory.get_llm_api_handler(llm_key)
+    finally:
+        LLMAPIHandlerFactory._handler_cache.pop(llm_key, None)
+
+    assert second is not first
+
+
+def test_get_llm_api_handler_does_not_cache_nonempty_base_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm_key = "TEST_PARAMETERIZED_HANDLER_CACHE"
+    llm_config = _custom_llm_config("openai/parameterized-cache-model")
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_router_config", lambda _: False)
+    LLMAPIHandlerFactory._handler_cache.pop(llm_key, None)
+
+    first = LLMAPIHandlerFactory.get_llm_api_handler(llm_key, {"temperature": 0})
+    second = LLMAPIHandlerFactory.get_llm_api_handler(llm_key, {"temperature": 0})
+
+    assert second is not first
+    assert llm_key not in LLMAPIHandlerFactory._handler_cache
 
 
 # ---------------------------------------------------------------------------

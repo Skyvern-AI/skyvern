@@ -138,3 +138,16 @@ def test_split_pdf_yaml_to_block_conversion() -> None:
     assert block.file_url == "{{ source_pdf }}"
     assert block.prompt == "Split by document."
     assert block.llm_key == "{{ llm_key }}"
+    assert block.override_llm_key == "{{ llm_key }}"
+
+
+def test_split_pdf_yaml_rejects_raw_custom_llm_key() -> None:
+    yaml_block = SplitPdfBlockYAML(
+        label="split_pdf",
+        file_url="source.pdf",
+        prompt="Split by document.",
+        llm_key="CUSTOM_LLM_oat_unverified",
+    )
+
+    assert yaml_block.llm_key is None
+    assert yaml_block.model is None
