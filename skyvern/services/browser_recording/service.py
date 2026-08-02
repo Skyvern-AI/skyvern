@@ -71,7 +71,39 @@ LOG = structlog.get_logger(__name__)
 
 # avoid decompression bombs
 MAX_BASE64_SIZE = 14 * 1024 * 1024  # ~10MB compressed + base64 overhead
+# Cap decompressed output per chunk. The compressed input is already bounded to ~10MB, so this
+# allows a generous ~10x expansion for legitimate recordings while rejecting bombs that would
+# otherwise inflate to gigabytes and exhaust process memory on a shared host.
+MAX_DECOMPRESSED_SIZE = 100 * 1024 * 1024  # 100MB
 DEFAULT_DRAFT_ACTION_TITLE = "Browser Action"
+
+
+def _gunzip_bounded(compressed_data: bytes, max_output_size: int) -> bytes | None:
+    """Gzip-decompress `compressed_data`, returning None once the output would exceed
+    `max_output_size`.
+
+    The bound is enforced incrementally via zlib's ``max_length`` so a decompression bomb
+    aborts mid-stream and never materializes its full output in memory. Raises ``zlib.error``
+    on malformed input, matching a raw ``zlib.decompress`` call.
+    """
+    decompressor = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS)
+    output = bytearray()
+    pending = compressed_data
+
+    while pending:
+        # +1 so an output that exactly fills the budget stays distinguishable from an overflow.
+        output.extend(decompressor.decompress(pending, max_output_size - len(output) + 1))
+        if len(output) > max_output_size:
+            return None
+        pending = decompressor.unconsumed_tail
+
+    # unconsumed_tail is empty, so all input was consumed within the budget; flush only drains
+    # zlib's small internal buffer and cannot reintroduce an unbounded amount of output.
+    output.extend(decompressor.flush())
+    if len(output) > max_output_size:
+        return None
+
+    return bytes(output)
 
 
 @functools.lru_cache(maxsize=None)
@@ -224,17 +256,22 @@ class Processor:
             return None
 
         try:
-            # gzip decompression -> bytes
+            # gzip decompression -> bytes, bounded to MAX_DECOMPRESSED_SIZE.
             #
-            # NOTE(llm): We use zlib.decompress with wbits=16 + zlib.MAX_WBITS (31).
-            # This tells zlib to automatically detect and handle Gzip headers,
-            # which is essential since the browser used CompressionStream('gzip').
-            # Using zlib is often faster than the higher-level gzip module for this
-            # purpose.
-            decompressed_bytes: bytes = zlib.decompress(compressed_data, wbits=16 + zlib.MAX_WBITS)
+            # NOTE(llm): wbits=16 + zlib.MAX_WBITS (31) tells zlib to detect and handle Gzip
+            # headers, which is essential since the browser used CompressionStream('gzip').
+            decompressed_bytes = _gunzip_bounded(compressed_data, MAX_DECOMPRESSED_SIZE)
         except zlib.error as e:
             LOG.warning(f"{self.class_name} decompression error: {e}", **self.identity)
             # Log the error, maybe log the first few characters of the payload for debugging
+            return None
+
+        if decompressed_bytes is None:
+            LOG.warning(
+                f"{self.class_name}: decompressed payload exceeded {MAX_DECOMPRESSED_SIZE} bytes; "
+                "rejecting suspected decompression bomb",
+                **self.identity,
+            )
             return None
 
         return decompressed_bytes
