@@ -41,6 +41,11 @@ from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wa
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.browser_engine import BrowserEngineSelection
+from skyvern.webeye.dom_inspection import (
+    read_locator_tag_name,
+    read_resolved_anchor_href,
+    read_whether_link_or_button,
+)
 from skyvern.webeye.scraper.scraped_page import ScrapedPage, json_to_html
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, trim_element
 from skyvern.webeye.utils.page import SECRET_VISUAL_MASK_SCRIPT, SkyvernFrame
@@ -482,7 +487,7 @@ class SkyvernElement:
 
     async def is_child_of_pdf_object(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> bool:
         parent_locator = self.get_locator().locator("..")
-        tag_name: str | None = await parent_locator.evaluate("el => el.tagName", timeout=timeout)
+        tag_name = await read_locator_tag_name(parent_locator, timeout=timeout)
         type_attr = await parent_locator.get_attribute("type", timeout=timeout)
         return tag_name is not None and tag_name.lower() == "object" and type_attr == "application/pdf"
 
@@ -652,11 +657,7 @@ class SkyvernElement:
 
         resolved: str | None = None
         try:
-            normalized = await SkyvernFrame.evaluate(
-                frame=self.get_frame(),
-                expression="(element) => element instanceof HTMLAnchorElement ? element.href : null",
-                arg=await self.get_element_handler(),
-            )
+            normalized = await read_resolved_anchor_href(self.get_frame(), await self.get_element_handler())
         except Exception:
             normalized = None
         if isinstance(normalized, str) and normalized.strip():
@@ -895,11 +896,7 @@ class SkyvernElement:
         # probe failure or anomalous result fails closed (treated as unsafe).
         locator = self.get_locator()
         try:
-            is_interactive = await SkyvernFrame.evaluate(
-                frame=self.get_frame(),
-                expression="(element) => element.matches('a[href], button')",
-                arg=await self.get_element_handler(),
-            )
+            is_interactive = await read_whether_link_or_button(self.get_frame(), await self.get_element_handler())
         except Exception:
             return False
         if not isinstance(is_interactive, bool) or is_interactive:
@@ -941,7 +938,7 @@ class SkyvernElement:
 
         timeout_sec = timeout / 1000
         async with asyncio.timeout(timeout_sec):
-            tag_name: str | None = await parent_locator.evaluate("el => el.tagName")
+            tag_name = await read_locator_tag_name(parent_locator)
             if not tag_name:
                 return None
 
