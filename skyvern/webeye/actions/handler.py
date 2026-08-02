@@ -85,7 +85,12 @@ from skyvern.forge.sdk.api.files import (
     make_temp_directory,
     resolve_run_download_id,
 )
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCallerManager
+from skyvern.forge.sdk.api.llm.api_handler_factory import (
+    LLMAPIHandlerFactory,
+    LLMCallerManager,
+    get_org_aware_primary_llm_api_handler,
+    get_org_aware_secondary_llm_api_handler,
+)
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
 from skyvern.forge.sdk.browser_action_preflight import preflight_action, preflight_derived_action
@@ -1559,7 +1564,7 @@ async def check_phone_number_format(
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
 
-    json_response = await app.SECONDARY_LLM_API_HANDLER(
+    json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
         prompt=prompt, step=step, prompt_name="check-phone-number-format"
     )
 
@@ -2483,7 +2488,9 @@ async def check_date_format(
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
 
-    json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="check-date-format")
+    json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
+        prompt=prompt, step=step, prompt_name="check-date-format"
+    )
 
     check_date_format_response = CheckDateFormatResponse.model_validate(json_response)
     if check_date_format_response.is_current_format_correct or not check_date_format_response.recommended_date:
@@ -4045,7 +4052,9 @@ async def handle_sequential_click_for_dropdown(
     prompt = await _build_after_click_verify_prompt(task, scraped_page_after_open, new_element_ids, action_history_str)
     distinct_id_for_override = task.workflow_run_id if task.workflow_run_id else task.task_id
     check_user_goal_handler = await resolve_check_user_goal_handler(
-        distinct_id_for_override, task.organization_id, app.CHECK_USER_GOAL_LLM_API_HANDLER
+        distinct_id_for_override,
+        task.organization_id,
+        get_org_aware_secondary_llm_api_handler(default=app.CHECK_USER_GOAL_LLM_API_HANDLER),
     )
     response = await check_user_goal_handler(
         prompt=prompt,
@@ -7500,7 +7509,7 @@ async def choose_auto_completion_dropdown(
             slim_output=slim_output,
         )
         LOG.info("Confirm if it's an auto completion dropdown", sampling=True)
-        json_response = await app.AUTO_COMPLETION_LLM_API_HANDLER(
+        json_response = await get_org_aware_secondary_llm_api_handler(default=app.AUTO_COMPLETION_LLM_API_HANDLER)(
             prompt=auto_completion_confirm_prompt, step=step, prompt_name="auto-completion-choose-option"
         )
         element_id = json_response.get("id", "")
@@ -7683,7 +7692,7 @@ async def input_or_auto_complete_input(
         )
         if collapse_autocomplete_fanout_enabled and action is not None:
             action.set_has_mini_agent()
-        json_respone = await app.SECONDARY_LLM_API_HANDLER(
+        json_respone = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
             prompt=prompt, step=step, prompt_name="auto-completion-potential-answers"
         )
         values: list[dict] = json_respone.get("potential_values", [])
@@ -7739,7 +7748,7 @@ async def input_or_auto_complete_input(
                 popped_up_elements="".join([json_to_html(element) for element in cleaned_new_elements]),
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
-            json_respone = await app.SECONDARY_LLM_API_HANDLER(
+            json_respone = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt, step=step, prompt_name="auto-completion-tweak-value"
             )
             context_reasoning = json_respone.get("reasoning")
@@ -7910,7 +7919,7 @@ async def discover_and_select_from_full_dropdown(
             element_id=skyvern_element.get_id(),
             original_text=original_text,
         )
-        json_response = await app.AUTO_COMPLETION_LLM_API_HANDLER(
+        json_response = await get_org_aware_secondary_llm_api_handler(default=app.AUTO_COMPLETION_LLM_API_HANDLER)(
             prompt=prompt, step=step, prompt_name="auto-completion-choose-option"
         )
 
@@ -8118,7 +8127,10 @@ async def sequentially_select_from_dropdown(
             task.llm_key,
             task.workflow_run_id if task.workflow_run_id else task.task_id,
             task.organization_id,
-            LLMAPIHandlerFactory.get_override_llm_api_handler(task.llm_key, default=app.SECONDARY_LLM_API_HANDLER),
+            LLMAPIHandlerFactory.get_override_llm_api_handler(
+                task.llm_key,
+                default=get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER),
+            ),
         )
         json_response = await llm_api_handler(
             prompt=prompt, screenshots=[screenshot], step=step, prompt_name="confirm-multi-selection-finish"
@@ -9121,7 +9133,9 @@ async def select_from_emerging_elements(
     )
     LOG.info("Calling LLM to find the match element", sampling=True)
 
-    json_response = await app.CUSTOM_SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
+    json_response = await get_org_aware_secondary_llm_api_handler(default=app.CUSTOM_SELECT_AGENT_LLM_API_HANDLER)(
+        prompt=prompt, step=step, prompt_name="custom-select"
+    )
     value: str | None = json_response.get("value", None)
     LOG.info(
         "LLM response for the matched element",
@@ -9325,7 +9339,9 @@ async def select_from_dropdown(
     )
 
     LOG.info("Calling LLM to find the match element", sampling=True)
-    json_response = await app.CUSTOM_SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
+    json_response = await get_org_aware_secondary_llm_api_handler(default=app.CUSTOM_SELECT_AGENT_LLM_API_HANDLER)(
+        prompt=prompt, step=step, prompt_name="custom-select"
+    )
     value: str | None = json_response.get("value", None)
     single_select_result.value = value
     select_reason: str | None = json_response.get("reasoning", None)
@@ -9694,7 +9710,7 @@ async def locate_dropdown_menu(
             "Confirm if it's an opened dropdown menu",
             element=element_dict,
         )
-        json_response = await app.SECONDARY_LLM_API_HANDLER(
+        json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
             prompt=dropdown_confirm_prompt, screenshots=[screenshot], step=step, prompt_name="opened-dropdown-confirm"
         )
         is_opened_dropdown_menu = json_response.get("is_opened_dropdown_menu")
@@ -9897,7 +9913,9 @@ async def normal_select(
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
 
-    json_response = await app.NORMAL_SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="normal-select")
+    json_response = await get_org_aware_secondary_llm_api_handler(default=app.NORMAL_SELECT_AGENT_LLM_API_HANDLER)(
+        prompt=prompt, step=step, prompt_name="normal-select"
+    )
     index: int | None = json_response.get("index")
     value: str | None = json_response.get("value")
     _log_select_shadow_match(
@@ -10039,7 +10057,8 @@ def _schedule_extraction_shadow_check_for_hit(
     extract_information_prompt: str,
 ) -> None:
     shadow_llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-        llm_key_override, default=app.EXTRACTION_LLM_API_HANDLER
+        llm_key_override,
+        default=get_org_aware_primary_llm_api_handler(default=app.EXTRACTION_LLM_API_HANDLER),
     )
     shadow_schema = task.extracted_information_schema
     # Snapshot screenshots at schedule time — scraped_page is mutable
@@ -10424,7 +10443,7 @@ async def extract_information_for_navigation_goal(
 
     # Use the appropriate LLM handler based on the feature flag
     llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-        llm_key_override, default=app.EXTRACTION_LLM_API_HANDLER
+        llm_key_override, default=get_org_aware_primary_llm_api_handler(default=app.EXTRACTION_LLM_API_HANDLER)
     )
     json_response = await llm_api_handler(
         prompt=extract_information_prompt,
@@ -10627,7 +10646,7 @@ async def _get_input_or_select_context(
         slim_output=slim_output,
     )
     # Use centralized parse-select handler (set at init or via scripts)
-    json_response = await app.PARSE_SELECT_LLM_API_HANDLER(
+    json_response = await get_org_aware_secondary_llm_api_handler(default=app.PARSE_SELECT_LLM_API_HANDLER)(
         prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
     )
 
@@ -10703,7 +10722,7 @@ async def extract_user_defined_errors(
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
         reasoning=reasoning,
     )
-    json_response = await app.EXTRACTION_LLM_API_HANDLER(
+    json_response = await get_org_aware_primary_llm_api_handler(default=app.EXTRACTION_LLM_API_HANDLER)(
         prompt=prompt,
         screenshots=scraped_page_refreshed.screenshots,
         step=step,

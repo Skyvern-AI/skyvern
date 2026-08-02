@@ -2,13 +2,14 @@ import abc
 import functools
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Protocol, TypeVar
 
 import structlog
 from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 
 from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_profile_key import validate_browser_profile_key
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
@@ -73,6 +74,57 @@ def _get_text_prompt_model_name_by_llm_key() -> dict[str, str]:
         if llm_key and llm_key not in reverse_mapping:
             reverse_mapping[llm_key] = model_name
     return reverse_mapping
+
+
+class _LLMSelectionBlock(Protocol):
+    label: str
+    model: dict[str, Any] | None
+    llm_key: str | None
+
+
+_LLMSelectionBlockT = TypeVar("_LLMSelectionBlockT", bound=_LLMSelectionBlock)
+
+
+def _normalize_llm_selection(
+    block: _LLMSelectionBlockT,
+    *,
+    unrecognized_message: str,
+) -> _LLMSelectionBlockT:
+    raw_llm_key = block.llm_key.strip() if block.llm_key else None
+
+    if block.model:
+        block.llm_key = None
+        return block
+
+    if not raw_llm_key:
+        block.llm_key = None
+        return block
+
+    if _has_jinja_syntax(raw_llm_key):
+        block.llm_key = raw_llm_key
+        return block
+
+    model_name = _get_text_prompt_model_name_by_llm_key().get(raw_llm_key)
+    if model_name:
+        block.model = {"model_name": model_name}
+        block.llm_key = None
+        return block
+
+    if is_custom_llm_key(raw_llm_key):
+        LOG.warning(
+            "Rejecting raw custom LLM key on block llm_key; use the model selector instead",
+            label=block.label,
+        )
+        block.llm_key = None
+        return block
+
+    if raw_llm_key in LLMConfigRegistry.get_model_names():
+        block.llm_key = raw_llm_key
+        return block
+
+    LOG.warning(unrecognized_message, label=block.label, llm_key=raw_llm_key)
+    block.llm_key = None
+    return block
 
 
 def _replace_references_in_value(value: Any, old_key: str, new_key: str) -> Any:
@@ -878,39 +930,12 @@ class TextPromptBlockYAML(BlockYAML):
 
     @model_validator(mode="after")
     def normalize_llm_selection(self) -> "TextPromptBlockYAML":
-        raw_llm_key = self.llm_key.strip() if self.llm_key else None
-
-        if self.model:
-            # `model` is the stable public contract; ignore any raw llm_key override
-            # once a model has been selected.
-            self.llm_key = None
-            return self
-
-        if not raw_llm_key:
-            self.llm_key = None
-            return self
-
-        if _has_jinja_syntax(raw_llm_key):
-            self.llm_key = raw_llm_key
-            return self
-
-        model_name = _get_text_prompt_model_name_by_llm_key().get(raw_llm_key)
-        if model_name:
-            self.model = {"model_name": model_name}
-            self.llm_key = None
-            return self
-
-        if raw_llm_key in LLMConfigRegistry.get_model_names():
-            self.llm_key = raw_llm_key
-            return self
-
-        LOG.warning(
-            "Unrecognized text prompt llm_key; defaulting to Skyvern Optimized/default model path",
-            label=self.label,
-            llm_key=raw_llm_key,
+        return _normalize_llm_selection(
+            self,
+            unrecognized_message=(
+                "Unrecognized text prompt llm_key; defaulting to Skyvern Optimized/default model path"
+            ),
         )
-        self.llm_key = None
-        return self
 
 
 class DownloadToS3BlockYAML(BlockYAML):
@@ -1212,37 +1237,10 @@ class PdfFillBlockYAML(BlockYAML):
 
     @model_validator(mode="after")
     def normalize_llm_selection(self) -> "PdfFillBlockYAML":
-        raw_llm_key = self.llm_key.strip() if self.llm_key else None
-
-        if self.model:
-            self.llm_key = None
-            return self
-
-        if not raw_llm_key:
-            self.llm_key = None
-            return self
-
-        if _has_jinja_syntax(raw_llm_key):
-            self.llm_key = raw_llm_key
-            return self
-
-        model_name = _get_text_prompt_model_name_by_llm_key().get(raw_llm_key)
-        if model_name:
-            self.model = {"model_name": model_name}
-            self.llm_key = None
-            return self
-
-        if raw_llm_key in LLMConfigRegistry.get_model_names():
-            self.llm_key = raw_llm_key
-            return self
-
-        LOG.warning(
-            "Unrecognized pdf fill llm_key; defaulting to Skyvern Optimized/default model path",
-            label=self.label,
-            llm_key=raw_llm_key,
+        return _normalize_llm_selection(
+            self,
+            unrecognized_message=("Unrecognized pdf fill llm_key; defaulting to Skyvern Optimized/default model path"),
         )
-        self.llm_key = None
-        return self
 
 
 class SplitPdfBlockYAML(BlockYAML):
@@ -1254,37 +1252,10 @@ class SplitPdfBlockYAML(BlockYAML):
 
     @model_validator(mode="after")
     def normalize_llm_selection(self) -> "SplitPdfBlockYAML":
-        raw_llm_key = self.llm_key.strip() if self.llm_key else None
-
-        if self.model:
-            self.llm_key = None
-            return self
-
-        if not raw_llm_key:
-            self.llm_key = None
-            return self
-
-        if _has_jinja_syntax(raw_llm_key):
-            self.llm_key = raw_llm_key
-            return self
-
-        model_name = _get_text_prompt_model_name_by_llm_key().get(raw_llm_key)
-        if model_name:
-            self.model = {"model_name": model_name}
-            self.llm_key = None
-            return self
-
-        if raw_llm_key in LLMConfigRegistry.get_model_names():
-            self.llm_key = raw_llm_key
-            return self
-
-        LOG.warning(
-            "Unrecognized split pdf llm_key; defaulting to Skyvern Optimized/default model path",
-            label=self.label,
-            llm_key=raw_llm_key,
+        return _normalize_llm_selection(
+            self,
+            unrecognized_message=("Unrecognized split pdf llm_key; defaulting to Skyvern Optimized/default model path"),
         )
-        self.llm_key = None
-        return self
 
 
 class WorkflowTriggerBlockYAML(BlockYAML):

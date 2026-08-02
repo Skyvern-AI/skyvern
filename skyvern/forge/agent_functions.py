@@ -33,6 +33,8 @@ from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AzureClientFactory
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
+from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.cache.base import CACHE_EXPIRE_TIME
 from skyvern.forge.sdk.copilot.config import CopilotConfig, block_authoring_policy_from_code_only_mode
@@ -114,6 +116,25 @@ def running_in_packaged_deployment() -> bool:
 USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
 SVG_SHAPE_CONVERTION_ATTEMPTS = 3
 CSS_SHAPE_CONVERTION_ATTEMPTS = 1
+
+
+def _get_org_aware_svg_css_converter_llm_api_handler() -> LLMAPIHandler | None:
+    default_handler = app.SVG_CSS_CONVERTER_LLM_API_HANDLER
+    if default_handler is not None:
+        return get_org_aware_secondary_llm_api_handler(default=default_handler)
+    context = skyvern_context.current()
+    if context is not None and context.org_default_secondary_llm_key:
+        return get_org_aware_secondary_llm_api_handler()
+    return None
+
+
+def _svg_css_converter_llm_api_handler_available() -> bool:
+    if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is not None:
+        return True
+    context = skyvern_context.current()
+    return context is not None and bool(context.org_default_secondary_llm_key)
+
+
 INVALID_SHAPE = "N/A"
 DISABLE_SVG_CONVERT_CACHE_RESILIENCE_FLAG = "DISABLE_SVG_CONVERT_CACHE_RESILIENCE"
 SVG_LOCAL_CACHE_MAX_ITEMS = 4096
@@ -551,6 +572,7 @@ async def _convert_svg_to_string(
     *,
     svg_html: str | None = None,
     svg_key: str | None = None,
+    llm_api_handler: LLMAPIHandler | None = None,
 ) -> None:
     """Convert an SVG element to a string description. Assumes element has already passed eligibility checks."""
     element_id = element.get("id", "")
@@ -586,13 +608,15 @@ async def _convert_svg_to_string(
 
             LOG.debug("call LLM to convert SVG to string shape", element_id=element_id)
             svg_convert_prompt = prompt_engine.load_prompt("svg-convert", svg_element=svg_html)
+            if llm_api_handler is None:
+                llm_api_handler = _get_org_aware_svg_css_converter_llm_api_handler()
 
             for retry in range(SVG_SHAPE_CONVERTION_ATTEMPTS):
                 try:
                     async with asyncio.timeout(_LLM_CALL_TIMEOUT_SECONDS):
-                        if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None:
+                        if llm_api_handler is None:
                             raise Exception("To enable svg shape conversion, please set the Secondary LLM key")
-                        json_response = await app.SVG_CSS_CONVERTER_LLM_API_HANDLER(
+                        json_response = await llm_api_handler(
                             prompt=svg_convert_prompt, step=step, prompt_name="svg-convert"
                         )
                     svg_shape = json_response.get("shape", "")
@@ -671,6 +695,8 @@ async def _convert_css_shape_to_string(
     element: dict,
     task: Task | None = None,
     step: Step | None = None,
+    *,
+    llm_api_handler: LLMAPIHandler | None = None,
 ) -> None:
     element_id: str = element.get("id", "")
 
@@ -744,14 +770,16 @@ async def _convert_css_shape_to_string(
                 engine_selection=skyvern_frame.engine_selection,
             )
             prompt = prompt_engine.load_prompt("css-shape-convert")
+            if llm_api_handler is None:
+                llm_api_handler = _get_org_aware_svg_css_converter_llm_api_handler()
 
             # TODO: we don't retry the css shape conversion today
             for retry in range(CSS_SHAPE_CONVERTION_ATTEMPTS):
                 try:
                     async with asyncio.timeout(_LLM_CALL_TIMEOUT_SECONDS):
-                        if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None:
+                        if llm_api_handler is None:
                             raise Exception("To enable css shape conversion, please set the Secondary LLM key")
-                        json_response = await app.SVG_CSS_CONVERTER_LLM_API_HANDLER(
+                        json_response = await llm_api_handler(
                             prompt=prompt, screenshots=[screenshot], step=step, prompt_name="css-shape-convert"
                         )
                     css_shape = json_response.get("shape", "")
@@ -1928,6 +1956,9 @@ class AgentFunction:
             :return: List of elements without xpaths.
             """
             context = skyvern_context.ensure_context()
+            svg_css_converter_llm_api_handler = None
+            if settings.ENABLE_CSS_SVG_PARSING and _svg_css_converter_llm_api_handler_available():
+                svg_css_converter_llm_api_handler = _get_org_aware_svg_css_converter_llm_api_handler()
             # page won't be in the context.frame_index_map, so the index is going to be 0
             skyvern_frame = await SkyvernFrame.create_instance(frame=frame, engine_selection=engine_selection)
             current_frame_index = context.frame_index_map.get(frame, 0)
@@ -1947,7 +1978,7 @@ class AgentFunction:
                 if element_cnt == MAX_ELEMENT_CNT:
                     LOG.debug(f"Element reached max count {MAX_ELEMENT_CNT}, will stop converting svg and css element.")
                 disable_conversion = element_cnt > MAX_ELEMENT_CNT
-                if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None or not settings.ENABLE_CSS_SVG_PARSING:
+                if svg_css_converter_llm_api_handler is None:
                     disable_conversion = True
 
                 if queue_ele.get("frame_index") != current_frame_index:
@@ -1978,7 +2009,13 @@ class AgentFunction:
             if eligible_css_shapes and task and step:
                 await asyncio.gather(
                     *[
-                        _convert_css_shape_to_string(skyvern_frame=sf, element=elem, task=task, step=step)
+                        _convert_css_shape_to_string(
+                            skyvern_frame=sf,
+                            element=elem,
+                            task=task,
+                            step=step,
+                            llm_api_handler=svg_css_converter_llm_api_handler,
+                        )
                         for elem, sf in eligible_css_shapes
                     ]
                 )
@@ -1993,7 +2030,14 @@ class AgentFunction:
 
                 async def convert_svg(element: dict) -> None:
                     svg_html, svg_key = svg_cache_inputs.get(id(element), (None, None))
-                    await _convert_svg_to_string(element, task, step, svg_html=svg_html, svg_key=svg_key)
+                    await _convert_svg_to_string(
+                        element,
+                        task,
+                        step,
+                        svg_html=svg_html,
+                        svg_key=svg_key,
+                        llm_api_handler=svg_css_converter_llm_api_handler,
+                    )
 
                 svg_representatives, svg_duplicates = _partition_svgs_by_cache_key(
                     [element for element, _frame in eligible_svgs],

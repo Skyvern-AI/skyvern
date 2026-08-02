@@ -201,6 +201,8 @@ class OrganizationModel(Base):
         Boolean, default=False, nullable=False, server_default=sqlalchemy.false()
     )
     selfheal_artifact_retention_days = Column(Integer, nullable=True)
+    default_llm_key = Column(String, nullable=True)
+    default_secondary_llm_key = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,

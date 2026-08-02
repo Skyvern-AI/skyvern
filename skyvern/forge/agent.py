@@ -84,7 +84,13 @@ from skyvern.forge.sdk.api.files import (
     resolve_run_download_id,
     wait_for_download_finished,
 )
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCaller, LLMCallerManager
+from skyvern.forge.sdk.api.llm.api_handler_factory import (
+    LLMAPIHandlerFactory,
+    LLMCaller,
+    LLMCallerManager,
+    get_org_aware_primary_llm_api_handler,
+    get_org_aware_secondary_llm_api_handler,
+)
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import (
     LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE,
@@ -380,7 +386,7 @@ def _schedule_summary_shadow_check_for_hit(
         return await app.AGENT_FUNCTION.should_shadow_extraction_cache_hit(task)
 
     async def _shadow_llm_call() -> Any:
-        return await app.EXTRACTION_LLM_API_HANDLER(
+        return await get_org_aware_primary_llm_api_handler(default=app.EXTRACTION_LLM_API_HANDLER)(
             prompt=summary_prompt,
             step=None,
             prompt_name="data-extraction-summary",
@@ -494,7 +500,7 @@ async def resolve_validation_evidence_route(
         local_datetime=local_datetime,
         mode=mode,
         min_confidence=min_confidence,
-        llm_handler=app.SECONDARY_LLM_API_HANDLER,
+        llm_handler=get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER),
         step=step,
     )
 
@@ -2327,7 +2333,7 @@ class ForgeAgent:
                     llm_key_override = None
 
                 llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                    llm_key_override, default=app.LLM_API_HANDLER
+                    llm_key_override, default=get_org_aware_primary_llm_api_handler()
                 )
                 # Add caching flag to context for monitoring
                 if use_caching:
@@ -2581,7 +2587,7 @@ class ForgeAgent:
                     assistant_reasoning=reasoning,
                     assistant_message=assistant_message,
                 )
-                skyvern_response = await app.LLM_API_HANDLER(
+                skyvern_response = await get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)(
                     prompt=skyvern_repsonse_prompt,
                     prompt_name="cua-answer-question",
                     step=step,
@@ -2936,7 +2942,7 @@ class ForgeAgent:
 
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 task.llm_key,
-                default=app.LLM_API_HANDLER,
+                default=get_org_aware_primary_llm_api_handler(),
             )
 
             self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)
@@ -3315,9 +3321,9 @@ class ForgeAgent:
             )
 
         if use_check_user_goal_handler:
-            default_handler = app.CHECK_USER_GOAL_LLM_API_HANDLER
+            default_handler = get_org_aware_secondary_llm_api_handler(default=app.CHECK_USER_GOAL_LLM_API_HANDLER)
         else:
-            default_handler = app.LLM_API_HANDLER
+            default_handler = get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)
 
         distinct_id_for_override = task.workflow_run_id if task.workflow_run_id else task.task_id
         default_handler = await resolve_check_user_goal_handler(
@@ -4221,7 +4227,7 @@ class ForgeAgent:
                 "infer-action-type", navigation_goal=navigation_goal, prompt_name="infer-action-type"
             )
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                task.llm_key, default=app.LLM_API_HANDLER
+                task.llm_key, default=get_org_aware_primary_llm_api_handler()
             )
             json_response = await llm_api_handler(
                 prompt=prompt, step=step, prompt_name="infer-action-type", system_prompt=task.workflow_system_prompt
@@ -4306,7 +4312,7 @@ class ForgeAgent:
         effective_llm_key = task.llm_key
         if not effective_llm_key:
             handler_for_key = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                task.llm_key, default=app.LLM_API_HANDLER
+                task.llm_key, default=get_org_aware_primary_llm_api_handler()
             )
             effective_llm_key = getattr(handler_for_key, "llm_key", None)
         cache_enabled = prompt_caching_settings.get(EXTRACT_ACTION_PROMPT_NAME) or prompt_caching_settings.get(
@@ -6107,7 +6113,7 @@ class ForgeAgent:
                 error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
-            json_response = await app.LLM_API_HANDLER(
+            json_response = await get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)(
                 prompt=prompt,
                 screenshots=screenshots,
                 step=step,
@@ -6261,7 +6267,7 @@ class ForgeAgent:
                 error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
+            json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt,
                 screenshots=screenshots,
                 step=step,
@@ -6744,7 +6750,7 @@ class ForgeAgent:
         if await service_utils.is_cua_task(task=task):
             llm_key_override = None
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            llm_key_override, default=app.LLM_API_HANDLER
+            llm_key_override, default=get_org_aware_primary_llm_api_handler()
         )
         # Add caching flag to context for monitoring
         if use_caching:
@@ -6924,7 +6930,9 @@ class ForgeAgent:
                         fallback_reason="cross_run_miss",
                         cache_path="agent",
                     )
-                data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
+                data_extraction_summary_resp = await get_org_aware_primary_llm_api_handler(
+                    default=app.EXTRACTION_LLM_API_HANDLER
+                )(
                     prompt=prompt,
                     step=step,
                     prompt_name="data-extraction-summary",

@@ -44,6 +44,10 @@ from skyvern.forge.sdk.api.files import (
     rename_file,
     resolve_run_download_id,
 )
+from skyvern.forge.sdk.api.llm.api_handler_factory import (
+    get_org_aware_primary_llm_api_handler,
+    get_org_aware_secondary_llm_api_handler,
+)
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
@@ -1053,7 +1057,7 @@ async def _prepare_cached_block_inputs(cache_key: str, prompt: str | None, step_
             step = None
             if step_id:
                 step = await app.DATABASE.tasks.get_step(step_id=step_id, organization_id=context.organization_id)
-            llm_response = await app.SCRIPT_GENERATION_LLM_API_HANDLER(
+            llm_response = await get_org_aware_secondary_llm_api_handler(default=app.SCRIPT_GENERATION_LLM_API_HANDLER)(
                 prompt=merged_prompt,
                 prompt_name="merged-block-inputs",
                 step=step,
@@ -1128,7 +1132,7 @@ async def _detect_user_defined_errors(
         )
 
         # Call LLM to detect errors
-        json_response = await app.EXTRACTION_LLM_API_HANDLER(
+        json_response = await get_org_aware_primary_llm_api_handler(default=app.EXTRACTION_LLM_API_HANDLER)(
             prompt=error_detection_prompt,
             screenshots=screenshots,
             step=step,

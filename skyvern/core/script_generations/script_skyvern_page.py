@@ -38,6 +38,7 @@ from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
     list_files_in_directory,
 )
+from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
@@ -434,7 +435,7 @@ class ScriptSkyvernPage(SkyvernPage):
             )
 
             # Call secondary LLM to generate reasoning
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
+            json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=reasoning_prompt,
                 prompt_name="generate-action-reasoning",
                 organization_id=context.organization_id,

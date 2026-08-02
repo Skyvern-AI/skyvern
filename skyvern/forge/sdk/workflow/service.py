@@ -1832,6 +1832,8 @@ class WorkflowService:
                 SkyvernContext(
                     organization_id=organization.organization_id,
                     organization_name=organization.organization_name,
+                    org_default_llm_key=organization.default_llm_key,
+                    org_default_secondary_llm_key=organization.default_secondary_llm_key,
                     request_id=request_id,
                     workflow_id=workflow_id,
                     workflow_run_id=workflow_run.workflow_run_id,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -7,12 +8,15 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.custom_llms import CustomLLMConfig, CustomLLMProvider
 from skyvern.schemas.llm import LiteLLMParams, LLMConfig
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.agent_db import AgentDB
+    from skyvern.forge.sdk.schemas.organizations import Organization
 
 LOG = structlog.get_logger()
 
@@ -188,6 +192,27 @@ async def load_custom_llm_configs_for_organization(database: AgentDB, organizati
             )
             continue
         register_custom_llm_config(token.id, token.organization_id, config)
+
+
+async def prepare_org_llm_runtime(
+    database: AgentDB,
+    organization_id: str,
+    organization: Organization | None = None,
+) -> None:
+    if organization is None:
+        organization, _ = await asyncio.gather(
+            database.organizations.get_organization(organization_id),
+            load_custom_llm_configs_for_organization(database, organization_id),
+        )
+    else:
+        await load_custom_llm_configs_for_organization(database, organization_id)
+
+    context = skyvern_context.current()
+    if context is None:
+        context = SkyvernContext(organization_id=organization_id)
+        skyvern_context.set(context)
+    context.org_default_llm_key = organization.default_llm_key if organization is not None else None
+    context.org_default_secondary_llm_key = organization.default_secondary_llm_key if organization is not None else None
 
 
 async def ensure_custom_llm_registered_for_org(

@@ -458,6 +458,8 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
         bw_organization_id=org_model.bw_organization_id,
         bw_collection_ids=org_model.bw_collection_ids,
         artifact_url_expiry_seconds=org_model.artifact_url_expiry_seconds,
+        default_llm_key=org_model.default_llm_key,
+        default_secondary_llm_key=org_model.default_secondary_llm_key,
         created_at=org_model.created_at,
         modified_at=org_model.modified_at,
     )

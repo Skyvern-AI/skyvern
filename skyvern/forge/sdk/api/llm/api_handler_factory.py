@@ -26,7 +26,12 @@ from skyvern.forge import app
 from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler, dummy_llm_api_handler
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
-from skyvern.forge.sdk.api.llm.custom_llm_registry import custom_llm_passthrough_parameters, is_custom_llm_key
+from skyvern.forge.sdk.api.llm.custom_llm_registry import (
+    CUSTOM_LLM_KEY_PREFIX,
+    custom_llm_passthrough_parameters,
+    is_custom_llm_key,
+    is_custom_llm_owned_by_organization,
+)
 from skyvern.forge.sdk.api.llm.exceptions import (
     DuplicateCustomLLMProviderError,
     InvalidLLMConfigError,
@@ -753,6 +758,7 @@ VALID_GEMINI_3_REASONING_EFFORTS: tuple[str, ...] = ("minimal", "low", "medium",
 
 class LLMAPIHandlerFactory:
     _custom_handlers: dict[str, LLMAPIHandler] = {}
+    _handler_cache: dict[str, tuple[LLMConfig, LLMAPIHandler]] = {}
     _router_handler_cache: dict[str, LLMAPIHandler] = {}
     _thinking_budget_settings: dict[str, int] | None = None
     _prompt_caching_settings: dict[str, bool] | None = None
@@ -1289,6 +1295,23 @@ class LLMAPIHandlerFactory:
             flex_handler = LLMAPIHandlerFactory._maybe_get_flex_handler(default)
             if flex_handler is not None:
                 return flex_handler
+            return default
+        context = skyvern_context.current()
+        if context is not None and override_llm_key == context.org_default_llm_key:
+            return _resolve_org_default_llm_handler(
+                override_llm_key,
+                context.organization_id if context else None,
+                default,
+            )
+        organization_id = context.organization_id if context is not None else None
+        if is_custom_llm_key(override_llm_key) and not _custom_key_belongs_to_run_org(
+            override_llm_key, organization_id
+        ):
+            LOG.warning(
+                "Rejecting custom LLM override key not owned by the run's organization, using default",
+                llm_key=override_llm_key,
+                organization_id=organization_id,
+            )
             return default
         try:
             # Explicit overrides should honor the exact model choice and skip experimentation reroutes.
@@ -2153,19 +2176,30 @@ class LLMAPIHandlerFactory:
         if LLMConfigRegistry.is_router_config(llm_key):
             return LLMAPIHandlerFactory.get_llm_api_handler_with_router(llm_key)
 
+        assert isinstance(llm_config, LLMConfig)
+        should_cache_handler = not base_parameters
+        if should_cache_handler:
+            cached = LLMAPIHandlerFactory._handler_cache.get(llm_key)
+            if cached is not None and cached[0] is llm_config:
+                return cached[1]
+
         # For OpenRouter models, use LLMCaller which has native OpenRouter support.
         # Registry keys (e.g. OPENROUTER_DEEPSEEK_V4_FLASH) also route here when their
         # model_name is openrouter/* so usage.cost is tracked in get_call_stats.
         if LLMAPIHandlerFactory._openrouter_model_name(llm_key, llm_config):
             llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
-            return llm_caller.call
+            handler = llm_caller.call
+            if should_cache_handler:
+                LLMAPIHandlerFactory._handler_cache[llm_key] = (llm_config, handler)
+            return handler
 
         # For GitHub Copilot via OPENAI_COMPATIBLE, use LLMCaller for a custom header
         if llm_key == "OPENAI_COMPATIBLE" and LLMAPIHandlerFactory.is_github_copilot_endpoint():
             llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
-            return llm_caller.call
-
-        assert isinstance(llm_config, LLMConfig)
+            handler = llm_caller.call
+            if should_cache_handler:
+                LLMAPIHandlerFactory._handler_cache[llm_key] = (llm_config, handler)
+            return handler
 
         @traced(name=LLM_REQUEST_SPAN_NAME, tags=[llm_key])
         async def llm_api_handler(
@@ -2722,6 +2756,8 @@ class LLMAPIHandlerFactory:
                         )
 
         llm_api_handler.llm_key = llm_key  # type: ignore[attr-defined]
+        if should_cache_handler:
+            LLMAPIHandlerFactory._handler_cache[llm_key] = (llm_config, llm_api_handler)
         return llm_api_handler
 
     @staticmethod
@@ -2791,6 +2827,70 @@ class LLMAPIHandlerFactory:
             return
         cls._gemini_3_reasoning_effort_override = normalized
         LOG.info("Gemini 3 reasoning_effort override applied", value=normalized)
+
+
+def _custom_key_belongs_to_run_org(llm_key: str, organization_id: str | None) -> bool:
+    if organization_id is None:
+        return False
+    custom_llm_id = llm_key.removeprefix(CUSTOM_LLM_KEY_PREFIX)
+    return is_custom_llm_owned_by_organization(custom_llm_id, organization_id)
+
+
+def _resolve_org_default_llm_handler(
+    llm_key: str,
+    organization_id: str | None,
+    fallback: LLMAPIHandler,
+) -> LLMAPIHandler:
+    try:
+        if is_custom_llm_key(llm_key) and not _custom_key_belongs_to_run_org(llm_key, organization_id):
+            LOG.warning(
+                "Organization default LLM key is not owned by the run's organization, using default",
+                llm_key=llm_key,
+                organization_id=organization_id,
+            )
+            return fallback
+        if not LLMConfigRegistry.is_registered(llm_key):
+            raise InvalidLLMConfigError(llm_key)
+        return LLMAPIHandlerFactory.get_llm_api_handler(llm_key)
+    except Exception:
+        LOG.warning(
+            "Failed to resolve organization default LLM API handler, using default",
+            llm_key=llm_key,
+            exc_info=True,
+        )
+        return fallback
+
+
+def _get_org_aware_llm_api_handler(
+    llm_key: str | None,
+    organization_id: str | None,
+    default: LLMAPIHandler | None,
+    platform_fallback: LLMAPIHandler,
+) -> LLMAPIHandler:
+    fallback = default or platform_fallback
+    if not llm_key:
+        return fallback
+    return _resolve_org_default_llm_handler(llm_key, organization_id, fallback)
+
+
+def get_org_aware_secondary_llm_api_handler(default: LLMAPIHandler | None = None) -> LLMAPIHandler:
+    context = skyvern_context.current()
+    return _get_org_aware_llm_api_handler(
+        context.org_default_secondary_llm_key if context is not None else None,
+        context.organization_id if context is not None else None,
+        default,
+        app.SECONDARY_LLM_API_HANDLER,
+    )
+
+
+def get_org_aware_primary_llm_api_handler(default: LLMAPIHandler | None = None) -> LLMAPIHandler:
+    context = skyvern_context.current()
+    return _get_org_aware_llm_api_handler(
+        context.org_default_llm_key if context is not None else None,
+        context.organization_id if context is not None else None,
+        default,
+        app.LLM_API_HANDLER,
+    )
 
 
 class LLMCaller:

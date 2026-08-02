@@ -23,6 +23,7 @@ from skyvern.exceptions import NoTOTPSecretFound, ScriptTerminationException, Sk
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import download_file as download_file_from_url
+from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.services.credentials import is_unresolved_totp_value
@@ -1708,7 +1709,7 @@ class SkyvernPage(Page):
             if skyvern_ctx:
                 skyvern_ctx.script_llm_call_count += 1
 
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
+            json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt_text,
                 prompt_name="form-field-mapper",
                 organization_id=org_id,
@@ -2121,7 +2122,7 @@ class SkyvernPage(Page):
             if skyvern_ctx:
                 skyvern_ctx.script_llm_call_count += 1
 
-            result = await app.SECONDARY_LLM_API_HANDLER(
+            result = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt_text,
                 prompt_name="form-validate-mapping",
                 organization_id=org_id,
@@ -2755,7 +2756,7 @@ class SkyvernPage(Page):
             org_id = skyvern_ctx.organization_id if skyvern_ctx else None
             if skyvern_ctx:
                 skyvern_ctx.script_llm_call_count += 1
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
+            json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt,
                 prompt_name="select-from-group",
                 organization_id=org_id,
@@ -3007,7 +3008,7 @@ class SkyvernPage(Page):
             org_id = skyvern_ctx.organization_id if skyvern_ctx else None
             if skyvern_ctx:
                 skyvern_ctx.script_llm_call_count += 1
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
+            json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt,
                 prompt_name="batch-form-fill-plan",
                 organization_id=org_id,
@@ -3418,7 +3419,7 @@ class SkyvernPage(Page):
             skyvern_ctx = skyvern_context.current()
             org_id = skyvern_ctx.organization_id if skyvern_ctx else None
 
-            result = await app.SECONDARY_LLM_API_HANDLER(
+            result = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt_text,
                 prompt_name="quality-audit",
                 organization_id=org_id,
