@@ -9,6 +9,7 @@ import {
   CustomLLMUpdateRequest,
 } from "@/api/types";
 import { useToast } from "@/components/ui/use-toast";
+import { llmDiagnosticsQueryKey } from "@/hooks/useLLMDiagnostics";
 import { useCredentialGetter } from "./useCredentialGetter";
 
 const customLLMsQueryKey = ["customLLMs"] as const;
@@ -39,6 +40,7 @@ export function useCustomLLMs() {
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: customLLMsQueryKey });
     queryClient.invalidateQueries({ queryKey: modelsQueryKey });
+    queryClient.invalidateQueries({ queryKey: llmDiagnosticsQueryKey });
   };
 
   const createMutation = useMutation({

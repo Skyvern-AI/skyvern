@@ -6,6 +6,7 @@ import { Header } from "./Header";
 import { Sidebar } from "./Sidebar";
 import { useDebugStore } from "@/store/useDebugStore";
 import { GlobalNotificationListener } from "@/components/GlobalNotificationListener";
+import { LLMSetupBanner } from "@/components/LLMSetupBanner";
 import { SelfHealApiKeyBanner } from "@/components/SelfHealApiKeyBanner";
 import { enable2faNotifications } from "@/util/env.ts";
 
@@ -26,6 +27,7 @@ function RootLayout() {
       <div className="h-full w-full">
         <div className={horizontalPadding}>
           <SelfHealApiKeyBanner />
+          <LLMSetupBanner />
           {enable2faNotifications && <GlobalNotificationListener />}
         </div>
         <Header />
