@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from skyvern.cli.core import client as client_mod
@@ -209,6 +210,37 @@ def test_build_cloud_client_passes_mcp_user_agent_header(monkeypatch: pytest.Mon
 
     assert len(captured_kwargs) == 1
     assert captured_kwargs[0]["headers"] == {"x-user-agent": SKYVERN_MCP_USER_AGENT}
+
+
+@pytest.mark.asyncio
+async def test_build_cloud_client_user_agent_header_reaches_the_wire(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Generated SDK methods send x-user-agent: None per call, which must not clobber the MCP header (SKY-13333)."""
+    monkeypatch.setattr(client_mod.settings, "SKYVERN_BASE_URL", "http://skyvern.test")
+    session_manager.set_stateless_http_mode(False)
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "run_id": "wr_123",
+                "status": "queued",
+                "created_at": "2026-01-01T00:00:00Z",
+                "modified_at": "2026-01-01T00:00:00Z",
+            },
+        )
+
+    instance = client_mod._build_cloud_client("sk_test")
+    try:
+        instance._client_wrapper.httpx_client.httpx_client._transport = httpx.MockTransport(handler)
+        await instance.run_workflow(workflow_id="wpid_123")
+    finally:
+        await instance.aclose()
+
+    assert requests
+    assert requests[0].headers.get("x-user-agent") == SKYVERN_MCP_USER_AGENT
 
 
 def test_build_cloud_client_uses_settings_url_in_normal_mode(monkeypatch: pytest.MonkeyPatch) -> None:
