@@ -8,6 +8,110 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.webeye.schemas import BrowserSessionResponse
 
+# Every field a client is allowed to read off a browser session. Adding a field to
+# BrowserSessionResponse fails the pin below until it is listed here, which is the point:
+# the row carries upstream routing and provider identity, and the response is the allowlist.
+PINNED_CLIENT_FIELDS = frozenset(
+    {
+        "browser_session_id",
+        "organization_id",
+        "status",
+        "runnable_type",
+        "runnable_id",
+        "timeout",
+        "browser_address",
+        "app_url",
+        "extensions",
+        "browser_type",
+        "browser_profile_id",
+        "generate_browser_profile",
+        "vnc_streaming_supported",
+        "download_path",
+        "downloaded_files",
+        "recordings",
+        "started_at",
+        "completed_at",
+        "created_at",
+        "modified_at",
+        "deleted_at",
+    }
+)
+
+# Row fields the response legitimately reflects, under the response's own names.
+CLIENT_VISIBLE_ROW_FIELDS = frozenset(
+    {
+        "persistent_browser_session_id",  # -> browser_session_id
+        "timeout_minutes",  # -> timeout
+        "organization_id",
+        "runnable_type",
+        "runnable_id",
+        "browser_address",
+        "status",
+        "extensions",
+        "browser_type",
+        "browser_profile_id",
+        "generate_browser_profile",
+        "started_at",
+        "completed_at",
+        "created_at",
+        "modified_at",
+        "deleted_at",
+    }
+)
+
+# Server-side row fields that take a free-form string, so a sentinel round-trips unvalidated.
+SERVER_SIDE_STRING_ROW_FIELDS = (
+    "ip_address",
+    "upstream_cdp_url",
+    "browser_vendor",
+    "browser_id",
+    "instance_type",
+)
+
+
+def server_side_row_fields() -> set[str]:
+    """Row fields no client may read. Derived, so a newly added row field is server-side
+    by default and has to be named in CLIENT_VISIBLE_ROW_FIELDS to become readable."""
+    return set(PersistentBrowserSession.model_fields) - CLIENT_VISIBLE_ROW_FIELDS
+
+
+def test_browser_session_response_exposes_exactly_the_pinned_client_field_set() -> None:
+    assert set(BrowserSessionResponse.model_fields) == PINNED_CLIENT_FIELDS
+
+
+def test_no_server_side_row_field_becomes_a_response_field() -> None:
+    leaked = server_side_row_fields() & set(BrowserSessionResponse.model_fields)
+    assert leaked == set()
+
+
+@pytest.mark.asyncio
+async def test_no_server_side_row_value_reaches_the_serialized_response() -> None:
+    """from_browser_session must stay a constructed allowlist. Dumping the row instead
+    would carry every sentinel below into the payload."""
+    now = datetime.now(timezone.utc)
+    sentinels = {field: f"server-side-{field}-sentinel" for field in SERVER_SIDE_STRING_ROW_FIELDS}
+    session = PersistentBrowserSession(
+        persistent_browser_session_id="pbs_123",
+        organization_id="org_123",
+        status="running",
+        browser_address="wss://proxy.example/pbs_123?token=t",
+        created_at=now,
+        modified_at=now,
+        **sentinels,
+    )
+
+    with patch.object(
+        app.AGENT_FUNCTION,
+        "resolve_browser_session_connect_url",
+        AsyncMock(return_value=session.browser_address),
+    ):
+        response = await BrowserSessionResponse.from_browser_session(session)
+
+    serialized = response.model_dump_json()
+    for field, sentinel in sentinels.items():
+        assert sentinel not in serialized, f"{field} leaked into the response"
+        assert field not in serialized
+
 
 @pytest.mark.asyncio
 async def test_browser_session_response_supports_vnc_when_browser_address_is_set() -> None:
