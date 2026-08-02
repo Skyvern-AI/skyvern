@@ -17,14 +17,19 @@ The unit-level tests below cover:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import urlparse
 
 import pytest
+from fastapi import HTTPException
 
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
+from skyvern.forge.sdk.routes.browser_sessions import base_router
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.webeye.schemas import BrowserSessionResponse
 
 _DUMMY_KEYRING_JSON = '{"current_kid": "k1", "keys": {"k1": {"secret": "0000000000000000000000000000000000000000000000000000000000000000"}}}'
 
@@ -591,3 +596,69 @@ async def test_delete_browser_session_file_swallows_db_failure_and_still_deletes
 # Watcher-level tests for browser_controller live under tests/cloud/ — the
 # browser_controller module imports cloud-only dependencies (redis client) and
 # can't load in the OSS-synced unit suite.
+
+
+@pytest.mark.asyncio
+async def test_browser_session_response_returns_retryable_503_when_download_lookup_times_out():
+    now = datetime.now(timezone.utc)
+    browser_session = PersistentBrowserSession(
+        persistent_browser_session_id="pbs_1",
+        organization_id="o_1",
+        status="running",
+        created_at=now,
+        modified_at=now,
+    )
+    storage = MagicMock()
+    storage.get_shared_downloaded_files_in_browser_session = AsyncMock(side_effect=TimeoutError)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await BrowserSessionResponse.from_browser_session(browser_session, storage, fail_download_lookup=True)
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == {"code": "downloaded_files_unavailable", "retryable": True}
+
+
+@pytest.mark.asyncio
+async def test_browser_session_response_preserves_empty_downloads_on_timeout_by_default():
+    now = datetime.now(timezone.utc)
+    browser_session = PersistentBrowserSession(
+        persistent_browser_session_id="pbs_1",
+        organization_id="o_1",
+        status="running",
+        created_at=now,
+        modified_at=now,
+    )
+    storage = MagicMock()
+    storage.get_shared_downloaded_files_in_browser_session = AsyncMock(side_effect=TimeoutError)
+    storage.get_shared_recordings_in_browser_session = AsyncMock(return_value=[])
+
+    with patch("skyvern.webeye.schemas.app") as app_mock:
+        app_mock.AGENT_FUNCTION.resolve_browser_session_connect_url = AsyncMock(return_value=None)
+        response = await BrowserSessionResponse.from_browser_session(browser_session, storage)
+
+    assert response.downloaded_files == []
+
+
+def test_get_browser_session_openapi_documents_download_unavailable_response():
+    route = next(
+        route
+        for route in base_router.routes
+        if getattr(route, "path", None) == "/browser_sessions/{browser_session_id}"
+        and "GET" in getattr(route, "methods", set())
+    )
+    response_schema = route.responses[503]["content"]["application/json"]["schema"]
+
+    assert response_schema == {
+        "type": "object",
+        "required": ["detail"],
+        "properties": {
+            "detail": {
+                "type": "object",
+                "required": ["code", "retryable"],
+                "properties": {
+                    "code": {"type": "string", "enum": ["downloaded_files_unavailable"]},
+                    "retryable": {"type": "boolean"},
+                },
+            }
+        },
+    }
