@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime
 
 import structlog
+from fastapi import HTTPException, status
 from pydantic import BaseModel, Field
 
 from skyvern.config import settings
@@ -88,13 +89,20 @@ class BrowserSessionResponse(BaseModel):
 
     @classmethod
     async def from_browser_session(
-        cls, browser_session: PersistentBrowserSession, storage: BaseStorage | None = None
+        cls,
+        browser_session: PersistentBrowserSession,
+        storage: BaseStorage | None = None,
+        *,
+        # False deliberately preserves the existing permissive timeout behavior for PATCH,
+        # active-list, and history responses; the single-session GET opts into strict lookup.
+        fail_download_lookup: bool = False,
     ) -> BrowserSessionResponse:
         """
         Creates a BrowserSessionResponse from a PersistentBrowserSession object.
 
         Args:
             browser_session: The persistent browser session to convert
+            fail_download_lookup: Raise a structured 503 when downloads cannot be listed.
 
         Returns:
             BrowserSessionResponse: The converted response object
@@ -118,6 +126,11 @@ class BrowserSessionResponse(BaseModel):
                 LOG.warning(
                     "Timeout getting downloaded files", browser_session_id=browser_session.persistent_browser_session_id
                 )
+                if fail_download_lookup:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail={"code": "downloaded_files_unavailable", "retryable": True},
+                    ) from None
 
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
