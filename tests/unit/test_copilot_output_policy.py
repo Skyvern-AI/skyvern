@@ -1785,7 +1785,7 @@ def test_sdk_output_guardrail_allows_unknown_click_with_authority_denied_blocker
 @pytest.mark.parametrize(
     ("reason", "expected_terms"),
     [
-        (OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE, ("credential", "confirm")),
+        (OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE, ("credential", "credential id")),
         (OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED, ("credential", "url", "re-select")),
     ],
 )
@@ -1901,7 +1901,7 @@ workflow_definition:
 
     assert result.response_type == "ASK_QUESTION"
     assert "credential" in result.user_response.lower()
-    assert "confirm" in result.user_response.lower()
+    assert "credential id" in result.user_response.lower()
     assert "I could not safely return" not in result.user_response
 
 

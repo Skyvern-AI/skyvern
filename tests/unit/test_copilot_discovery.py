@@ -33,6 +33,8 @@ class _Ctx:
         self.pending_browser_interaction_observation = None
         self.workflow_verification_evidence = WorkflowVerificationEvidence()
         self.browser_session_id = None
+        self.request_policy = None
+        self.org_credentials_for_turn = None
 
 
 class _FailingNavigateServer:

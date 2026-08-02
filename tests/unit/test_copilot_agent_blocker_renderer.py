@@ -36,7 +36,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyReason,
     OutputPolicyVerdict,
 )
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, LivePageResolutionRecord, RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools.discovery import _build_discovery_exhausted_escape_signal
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
@@ -1020,6 +1020,49 @@ def test_unapproved_credential_reference_asks_without_naming_the_credential_inve
 
     result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
 
-    assert "confirm which saved credential" in result.user_response
+    assert "I need an approved credential to continue" in result.user_response
+    # Only the observation seam records a verdict, so no-verdict must not be rendered as "no match":
+    # a fill-seam ambiguity reaches this branch with a real match behind it.
+    assert "could not match" not in result.user_response
+    assert "Credentials UI" in result.user_response
     assert "cred_unrelated" not in result.user_response
     assert "hr portal" not in result.user_response
+
+
+def test_unapproved_credential_reference_lists_both_ambiguous_candidate_ids() -> None:
+    ctx = _ctx()
+    ctx.request_policy = RequestPolicy(
+        live_page_resolution=LivePageResolutionRecord(
+            verdict="ambiguous",
+            tier="url_path",
+            candidates=(
+                SimpleNamespace(credential_id="cred_first", name="first login"),
+                SimpleNamespace(credential_id="cred_second", name="second login"),
+            ),
+        )
+    )
+
+    result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
+
+    assert "cred_first" in result.user_response
+    assert "cred_second" in result.user_response
+    assert "credential ID" in result.user_response
+
+
+def test_unapproved_credential_reference_points_at_credentials_ui_when_nothing_matched() -> None:
+    """A no-match verdict must not borrow the ambiguous reply's candidate list."""
+    ctx = _ctx()
+    ctx.request_policy = RequestPolicy(
+        live_page_resolution=LivePageResolutionRecord(
+            verdict="no_match",
+            page_url="https://analytics.example.com/login",
+            candidates=(SimpleNamespace(credential_id="cred_unmatched", name="unmatched login"),),
+        )
+    )
+
+    result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
+
+    assert "Credentials UI" in result.user_response
+    # Candidates ride on the record whatever the verdict; only an ambiguous one may name them.
+    assert "cred_unmatched" not in result.user_response
+    assert "More than one saved credential" not in result.user_response
