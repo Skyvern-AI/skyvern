@@ -1941,6 +1941,9 @@ function enrichValidationState(attrs, element, elementTagNameLower) {
 // single-element parses and tree-from-element never enable it.
 var __captureDestinationFacts = false;
 var __destinationFactBudget = 0;
+// Whether a build already owns the capture flag and the budget. Guards against a nested,
+// page-triggered buildTreeFromBody replenishing an active build's bound; see that function.
+var __destinationBuildActive = false;
 
 // Serialized overhead of one attached fact ({"kind":...,"url":null,"method":"get"} plus its
 // element-id key). Charging only url.length let 15,000 url-less facts through for 615,000 bytes:
@@ -2060,14 +2063,12 @@ function buildDestinationFacts(element, tagNameLower) {
     // <base>, which real Chromium contradicted across origins.
     const isBlankUrl = (value) =>
       value.replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, "") === "";
-    const rawAction = form.getAttribute("action");
-    // Per spec a missing or empty action attribute submits to the document's own URL.
-    let url;
-    if (rawAction === null || isBlankUrl(rawAction)) {
-      url = documentUrl();
-    } else {
-      url = resolve(rawAction);
-    }
+    // The EFFECTIVE action is settled BEFORE anything is resolved, so only the destination the
+    // browser will actually use costs a resolution. Resolving the owner's action and then
+    // discarding it for a submitter's override charged the work budget twice for every submitter:
+    // a near-cap shared action plus many short overrides exhausted the budget in ~124 controls
+    // and dropped later facts whose effective URLs were small.
+    let rawTarget = form.getAttribute("action");
     let method = normalizeFormMethod(form.getAttribute("method"));
     // Enumerated-attribute normalization: an INVALID button type defaults to "submit" (only
     // "button" and "reset" opt out, and both returned opaque above), while an invalid input type
@@ -2084,13 +2085,18 @@ function buildDestinationFacts(element, tagNameLower) {
       // invalid-button-type fail-open's sibling.
       const formAction = element.getAttribute("formaction");
       if (formAction !== null) {
-        url = isBlankUrl(formAction) ? documentUrl() : resolve(formAction);
+        rawTarget = formAction;
       }
       const formMethod = element.getAttribute("formmethod");
       if (formMethod !== null) {
         method = normalizeFormMethod(formMethod);
       }
     }
+    // Per spec a missing or blank action submits to the document's own URL.
+    const url =
+      rawTarget === null || isBlankUrl(rawTarget)
+        ? documentUrl()
+        : resolve(rawTarget);
     return { kind: "form", url: url, method: method };
   } catch (e) {
     return null;
@@ -2300,8 +2306,20 @@ async function buildTreeFromBody(
   // redefining the global between injection and the call (the export itself is no longer
   // hijackable via a setter), so the per-build budget is the load-bearing bound rather than the
   // flag: it caps total serialized fact bytes AND stops resolution once exhausted.
-  __captureDestinationFacts = captureDestinationFacts === true;
-  __destinationFactBudget = 524288;
+  //
+  // Only the OUTERMOST build may arm that bound. This function is exported onto globalThis and
+  // its reset runs synchronously, before the first await, so a page that calls it from inside a
+  // trusted resolution — by replacing window.URL, say — could re-arm the budget mid-build and
+  // resolve without limit. Probed: with the budget drained, the synchronous prefix of a nested
+  // call made a 524288 spend succeed again. A nested call still builds its tree; it just cannot
+  // replenish. The ownership flag is only ever read from this closure: the wrapper exports a
+  // value COPY of it, so writing globalThis.__destinationBuildActive does not reach this binding.
+  const ownsDestinationBudget = !__destinationBuildActive;
+  if (ownsDestinationBudget) {
+    __destinationBuildActive = true;
+    __captureDestinationFacts = captureDestinationFacts === true;
+    __destinationFactBudget = 524288;
+  }
   try {
     const maxElementNumber = 15000;
     const elementsAndResultArray = await buildElementTree(
@@ -2315,7 +2333,10 @@ async function buildTreeFromBody(
     DomUtils.elementListCache = elementsAndResultArray[0];
     return elementsAndResultArray;
   } finally {
-    __captureDestinationFacts = false;
+    if (ownsDestinationBudget) {
+      __captureDestinationFacts = false;
+      __destinationBuildActive = false;
+    }
   }
 }
 
