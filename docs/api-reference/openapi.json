@@ -12148,6 +12148,11 @@
               }
             ],
             "title": "Reasoning Effort"
+          },
+          "extra_parameters": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Extra Parameters"
           }
         },
         "type": "object",
@@ -12191,7 +12196,8 @@
         "enum": [
           "openai_compatible",
           "ollama",
-          "openrouter"
+          "openrouter",
+          "gemini"
         ],
         "title": "CustomLLMProvider"
       },
