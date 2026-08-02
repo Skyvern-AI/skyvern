@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import Any, Sequence
 
 import structlog
-from sqlalchemy import and_, delete, distinct, func, select, tuple_, update
+from sqlalchemy import and_, delete, func, select, update
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
@@ -300,18 +300,17 @@ class TasksRepository(BaseRepository):
         task_ids: list[str],
         organization_id: str,
     ) -> int:
-        """
-        Get the total count of unique (step.task_id, step.order) pairs of StepModel for the given task ids
-        Basically translate this sql query into a SQLAlchemy query: select count(distinct(s.task_id, s.order)) from steps s
-        where s.task_id in task_ids
-        """
+        """Count unique ``(task_id, order)`` pairs for the given tasks."""
         async with self.Session() as session:
-            query = (
-                select(func.count(distinct(tuple_(StepModel.task_id, StepModel.order))))
+            distinct_steps = (
+                select(StepModel.task_id, StepModel.order)
                 .where(StepModel.task_id.in_(task_ids))
                 .where(StepModel.organization_id == organization_id)
+                .distinct()
+                .subquery()
             )
-            return (await session.execute(query)).scalar()
+            query = select(func.count()).select_from(distinct_steps)
+            return (await session.execute(query)).scalar_one()
 
     @db_operation("get_task_step_models")
     async def get_task_step_models(self, task_id: str, organization_id: str | None = None) -> Sequence[StepModel]:
