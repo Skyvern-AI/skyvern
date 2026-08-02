@@ -205,6 +205,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     download_filename_from_suffix,
     settle_browser_downloads_for_context,
 )
+from skyvern.webeye.dom_inspection import read_current_url
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context
 
@@ -4207,9 +4208,7 @@ class ForgeAgent:
         complete_criterion_is_untrusted = bool(task.complete_criterion and context.complete_criterion_is_untrusted)
         starting_url = task.url
         page = await browser_state.get_working_page()
-        current_url = (
-            await SkyvernFrame.evaluate(frame=page, expression="() => document.location.href") if page else starting_url
-        )
+        current_url = await read_current_url(page) if page else starting_url
         final_navigation_payload = self._build_navigation_payload(
             task, expire_verification_code=expire_verification_code, step=step, scraped_page=scraped_page
         )
