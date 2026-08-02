@@ -151,6 +151,8 @@ def _ctx(*, server: Any = None, source_url: str | None = _SOURCE_URL) -> SimpleN
         scout_observation_contract=None,
         scouted_output_covered_paths=set(),
         scout_observed_terminal_criterion_ids=set(),
+        request_policy=None,
+        org_credentials_for_turn=None,
     )
 
 

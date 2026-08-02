@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -18,6 +20,7 @@ from skyvern.forge.sdk.copilot.tools import (
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.blockers import _tool_loop_error
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
+from skyvern.forge.sdk.schemas.credentials import CredentialType
 
 
 def _ctx() -> CopilotContext:
@@ -408,3 +411,59 @@ async def test_failed_evaluate_does_not_leak_expression_into_next_read() -> None
     await _evaluate_post_hook({"ok": True, "data": {"result": "still here"}}, raw={}, ctx=ctx)
 
     assert [i for i in ctx.scout_trajectory if i.get("tool_name") == "read_value"] == []
+
+
+@pytest.mark.asyncio
+async def test_inspecting_a_login_page_binds_the_credential_that_page_vouches_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    login_url = "https://analytics.example.test/login?next=%2Fweb"
+    ctx = _ctx()
+
+    async def fallback_page_info(_ctx: CopilotContext) -> tuple[str, str]:
+        return login_url, "Sign in"
+
+    async def capture_evidence(
+        _ctx: CopilotContext,
+        *,
+        inspected_url: str,
+        current_url: str,
+    ) -> tuple[dict[str, object], None]:
+        return (
+            {
+                "inspected_url": inspected_url,
+                "current_url": current_url,
+                "page_title": "Sign in",
+                "source_tool": "inspect_page_for_composition",
+                "forms": [],
+                "result_containers": [],
+                "navigation_targets": [],
+                "challenge_controls": [],
+            },
+            None,
+        )
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._fallback_page_info",
+        fallback_page_info,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._capture_composition_evidence",
+        capture_evidence,
+    )
+    org_credentials = [
+        SimpleNamespace(
+            credential_id="cred_analytics",
+            name="analytics",
+            tested_url="https://analytics.example.test/login",
+            credential_type=CredentialType.PASSWORD,
+        )
+    ]
+
+    with patch("skyvern.forge.app.DATABASE.credentials.get_credentials", new=AsyncMock(return_value=org_credentials)):
+        result = await _inspect_page_for_composition_impl(ctx, "current_page")
+
+    assert result["resolved_login_credential_id"] == "cred_analytics"
+    assert result["resolved_login_credential_name"] == "analytics"
+    assert ctx.request_policy.live_page_admitted_urls == {"cred_analytics": login_url}
+    assert "tested_url" not in json.dumps(result)
