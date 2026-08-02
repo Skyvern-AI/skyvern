@@ -2206,6 +2206,23 @@ async def test_fill_multipage_form_allows_unmapped_optional_file_page_to_stop(mo
 # =============================================================================
 
 
+class _RecordingElementHandle:
+    def __init__(self, frame_url: str) -> None:
+        self.calls: list[tuple[str, str | None]] = []
+        self._frame = SimpleNamespace(url=frame_url)
+
+    async def owner_frame(self) -> SimpleNamespace:
+        self.calls.append(("owner_frame", None))
+        return self._frame
+
+    async def fill(self, value: str, **kwargs: object) -> None:
+        self.calls.append(("fill", value))
+
+    async def dispatch_event(self, event_name: str, **kwargs: object) -> None:
+        assert kwargs == {}
+        self.calls.append(("dispatch_event", event_name))
+
+
 class _RecordingLocator:
     """A fake Playwright locator that records fill/dispatch_event calls in order.
 
@@ -2220,13 +2237,19 @@ class _RecordingLocator:
         click_error: Exception | None = None,
         dispatch_error: Exception | None = None,
         gate_on_change: bool = False,
+        element_handle: _RecordingElementHandle | None = None,
     ) -> None:
         self.calls: list[tuple[str, str | None]] = []
         self.first = self
         self._click_error = click_error
         self._dispatch_error = dispatch_error
         self._gate_on_change = gate_on_change
+        self._element_handle = element_handle
         self.enabled = False
+
+    async def element_handle(self, **kwargs: object) -> _RecordingElementHandle | None:
+        self.calls.append(("element_handle", None))
+        return self._element_handle
 
     async def wait_for(self, *, state: str, **kwargs: object) -> None:
         self.calls.append(("wait_for", state))
@@ -2408,6 +2431,55 @@ async def test_direct_fill_dispatch_failure_does_not_regress_fill(mock_scraped_p
     result = await script_page.fill("#password", "hunter2", mode="direct")
 
     assert result == "hunter2"
+
+
+@pytest.mark.asyncio
+async def test_guarded_direct_fill_checks_the_resolved_element_frame_before_release(mock_ai):
+    """A credential guard sees the actual recipient frame and the locator cannot retarget."""
+    element_handle = _RecordingElementHandle("https://login.example.com/embedded")
+    locator = _RecordingLocator(element_handle=element_handle)
+    skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+    guarded_urls: list[str | None] = []
+
+    result = await skyvern_page.fill(
+        "#password",
+        "hunter2",
+        mode="direct",
+        _direct_fill_release_guard=guarded_urls.append,
+    )
+
+    assert result == "hunter2"
+    assert guarded_urls == ["https://login.example.com/embedded"]
+    assert locator.calls == [("element_handle", None)]
+    assert element_handle.calls == [
+        ("owner_frame", None),
+        ("fill", "hunter2"),
+        ("dispatch_event", "change"),
+        ("dispatch_event", "blur"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_guarded_direct_fill_never_releases_to_a_cross_origin_element_frame(mock_ai):
+    """Mutation guard: removing/moving the element-frame guard must make this fail."""
+    element_handle = _RecordingElementHandle("https://attacker.example/collect")
+    locator = _RecordingLocator(element_handle=element_handle)
+    skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+    def reject_cross_origin(frame_url: str | None) -> None:
+        if frame_url != "https://login.example.com/embedded":
+            raise RuntimeError("cross-origin release blocked")
+
+    with pytest.raises(RuntimeError, match="cross-origin release blocked"):
+        await skyvern_page.fill(
+            "#password",
+            "hunter2",
+            mode="direct",
+            _direct_fill_release_guard=reject_cross_origin,
+        )
+
+    assert locator.calls == [("element_handle", None)]
+    assert element_handle.calls == [("owner_frame", None)]
 
 
 # =============================================================================

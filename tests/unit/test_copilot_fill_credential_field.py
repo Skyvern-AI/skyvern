@@ -30,8 +30,10 @@ _FAKE_TOTP_SEED = "JBSWY3DPEHPK3PXP"
 _FIXTURE_LOGIN_URL = "https://authenticationtest.com/simpleFormAuth/"
 
 
-def _resolved_credential(credential_id: str = "cred_123") -> SimpleNamespace:
-    return SimpleNamespace(credential_id=credential_id, name="authtest simple")
+def _resolved_credential(
+    credential_id: str = "cred_123", tested_url: str | None = _FIXTURE_LOGIN_URL
+) -> SimpleNamespace:
+    return SimpleNamespace(credential_id=credential_id, name="authtest simple", tested_url=tested_url)
 
 
 def _policy(**overrides: Any) -> RequestPolicy:
@@ -66,6 +68,24 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
 
 
 class TestCredentialFillPolicyGate:
+    def test_origin_comparison_uses_browser_origin_semantics(self) -> None:
+        assert credential_fill_module._still_on_admitted_site(
+            "https://example.com/account",
+            "https://example.com:443/login",
+        )
+        assert credential_fill_module._still_on_admitted_site(
+            "https://example.com/account",
+            "example.com/login",
+        )
+        assert not credential_fill_module._still_on_admitted_site(
+            "http://example.com/account",
+            "https://example.com/login",
+        )
+        assert not credential_fill_module._still_on_admitted_site(
+            "https://example.com:8443/account",
+            "https://example.com/login",
+        )
+
     def test_rejects_outside_code_only_mode(self) -> None:
         ctx = _ctx(block_authoring_policy=BlockAuthoringPolicy.STANDARD)
         error = tools_module._credential_fill_prerequisite_error(ctx, "cred_123")
@@ -308,13 +328,22 @@ class TestResolveCredentialFillValue:
 
 
 class _FakePage:
-    def __init__(self, fill_error: Exception | None = None, url: str = _FIXTURE_LOGIN_URL) -> None:
+    def __init__(
+        self,
+        fill_error: Exception | None = None,
+        url: str = _FIXTURE_LOGIN_URL,
+        release_url: str | None = None,
+    ) -> None:
         self.url = url
+        self.release_url = release_url
         self.fill_calls: list[tuple[Any, ...]] = []
         self.fill_kwargs: list[dict[str, Any]] = []
         self._fill_error = fill_error
 
     async def fill(self, *args: Any, **kwargs: Any) -> None:
+        release_guard = kwargs.get("_direct_fill_release_guard")
+        if release_guard is not None:
+            release_guard(self.release_url if self.release_url is not None else self.url)
         self.fill_calls.append(args)
         self.fill_kwargs.append(kwargs)
         if self._fill_error is not None:
@@ -583,12 +612,96 @@ class TestCredentialFillLivePageAdmission:
         load_mock.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_already_resolved_credential_short_circuits_without_a_page_read(self) -> None:
+    async def test_already_resolved_credential_uses_its_tested_url_without_a_page_read(self) -> None:
+        policy = RequestPolicy(resolved_credentials=[_resolved_credential()])
+        ctx = _ctx(request_policy=policy)
+        load_mock = AsyncMock()
+        with (
+            patch("skyvern.forge.app.DATABASE.credentials.get_credentials", new=load_mock),
+            patch.object(
+                credential_fill_module,
+                "_live_working_page_url",
+                AsyncMock(return_value="https://analytics.example.com/login"),
+            ),
+        ):
+            error, intended_url = await credential_fill_module._credential_fill_gate_error(ctx, "cred_123")
+
+        assert error is None
+        assert intended_url == _FIXTURE_LOGIN_URL
+        load_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_resolved_credential_is_blocked_on_a_different_live_origin(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Mutation guard: deleting the release-time origin comparison must make this fail."""
+        page = _FakePage(url="https://elsewhere.example.com/collect")
+        _wire_impl(monkeypatch, page)
+
+        result = await tools_module._fill_credential_field_impl(_ctx(), "#passwordInput", "cred_123", "password")
+
+        assert result["ok"] is False
+        assert page.fill_calls == []
+
+    @pytest.mark.asyncio
+    async def test_resolved_credential_redirect_immediately_before_fill_is_blocked(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Mutation guard: moving the comparison before the final awaited work must make this fail."""
+        page = _FakePage()
+        _wire_impl(monkeypatch, page)
+
+        async def redirect_after_approval(_ctx: Any) -> None:
+            page.url = "https://elsewhere.example.com/collect"
+
+        monkeypatch.setattr(credential_fill_module, "_capture_scout_source_url", redirect_after_approval)
+
+        result = await tools_module._fill_credential_field_impl(_ctx(), "#passwordInput", "cred_123", "password")
+
+        assert result["ok"] is False
+        assert page.fill_calls == []
+
+    @pytest.mark.asyncio
+    async def test_resolved_credential_navigation_during_target_resolution_is_blocked(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Mutation guard: a caller-side check before locator auto-wait must make this fail."""
+        page = _FakePage(
+            url=_FIXTURE_LOGIN_URL,
+            release_url="https://elsewhere.example.com/collect",
+        )
+        _wire_impl(monkeypatch, page)
+
+        result = await tools_module._fill_credential_field_impl(_ctx(), "#passwordInput", "cred_123", "password")
+
+        assert result["ok"] is False
+        assert page.fill_calls == []
+
+    @pytest.mark.asyncio
+    async def test_resolved_credential_without_an_intended_origin_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Mutation guard: changing missing-origin denial back to a skip must make this fail."""
+        page = _FakePage()
+        _wire_impl(monkeypatch, page)
+        ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[_resolved_credential(tested_url=None)]))
+
+        result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+
+        assert result["ok"] is False
+        assert "intended login origin" in result["error"]
+        assert page.fill_calls == []
+
+    @pytest.mark.asyncio
+    async def test_live_page_admitted_credential_short_circuits_without_an_org_lookup(self) -> None:
         error, _, load_mock = await self._gate(
             credential_id="cred_123",
             page_url="https://analytics.example.com/login",
             org_credentials=[],
-            policy=RequestPolicy(resolved_credentials=[_resolved_credential()]),
+            policy=RequestPolicy(
+                resolved_credentials=[_resolved_credential(tested_url=None)],
+                live_page_admitted_urls={"cred_123": _FIXTURE_LOGIN_URL},
+            ),
         )
 
         assert error is None
