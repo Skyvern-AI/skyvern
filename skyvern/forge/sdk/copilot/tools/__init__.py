@@ -1032,8 +1032,11 @@ async def fill_credential_field_tool(
 
     `selector` must be a CSS selector for the exact input field (no comma-union
     fallbacks — inspect the page first and target the proven field).
-    `credential_id` must be a credential from the request policy's
-    `resolved_credentials`. `field` is one of `username`, `password`, `totp`.
+    `credential_id`: when a page observation returns
+    `resolved_login_credential_id`, the server has already authorized that
+    credential for this login page — pass that id. When it returns
+    `candidate_login_credentials`, ask the user which one to use and pass the
+    `credential_id` they choose. `field` is one of `username`, `password`, `totp`.
 
     This tool only fills; it never clicks or submits. Each successful fill is
     recorded as a scouted interaction, so the SYNTHESIZED CODE BLOCK will bind

@@ -546,6 +546,7 @@ class SkyvernPage(Page):
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         _skip_element_prep: bool = False,
+        _direct_fill_release_guard: Callable[[str | None], None] | None = None,
         **kwargs: Any,
     ) -> str: ...
 
@@ -561,6 +562,7 @@ class SkyvernPage(Page):
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         _skip_element_prep: bool = False,
+        _direct_fill_release_guard: Callable[[str | None], None] | None = None,
         **kwargs: Any,
     ) -> str: ...
 
@@ -577,6 +579,7 @@ class SkyvernPage(Page):
         totp_url: str | None = None,
         recoverable_marker_id: int | None = None,
         _skip_element_prep: bool = False,
+        _direct_fill_release_guard: Callable[[str | None], None] | None = None,
         **kwargs: Any,
     ) -> str:
         """Fill an input field using a CSS selector, AI-powered prompt matching, or both.
@@ -594,6 +597,8 @@ class SkyvernPage(Page):
             mode: When ``"direct"``, perform a raw Playwright fill with no AI
                 fallback or element preparation.  The action is still recorded
                 in the DB so it appears in the timeline.
+            _direct_fill_release_guard: Internal synchronous guard invoked with the
+                resolved element frame URL immediately before a direct fill.
             totp_identifier: TOTP identifier for time-based one-time password fields.
             totp_url: URL to fetch TOTP codes from for authentication.
 
@@ -633,11 +638,25 @@ class SkyvernPage(Page):
             )
             timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
             locator = self._locator_scope.locator(selector).first
-            await locator.fill(value, timeout=timeout, **kwargs)
-            # locator.fill already emits `input`; only the change/blur a JS gate may also need are missing.
+            element = None
+            if _direct_fill_release_guard is not None:
+                element = await locator.element_handle(timeout=timeout)
+                if element is None:
+                    raise RuntimeError("Direct fill could not resolve an element before the release check.")
+                owner_frame = await element.owner_frame()
+                _direct_fill_release_guard(owner_frame.url if owner_frame is not None else None)
+                # A document-bound handle cannot re-resolve onto a page/frame that navigates after
+                # the guard. It detaches and fails instead of releasing the value on the new origin.
+                await element.fill(value, timeout=timeout, **kwargs)
+            else:
+                await locator.fill(value, timeout=timeout, **kwargs)
+            # Direct fill already emits `input`; only the change/blur a JS gate may also need are missing.
             for event_name in ("change", "blur"):
                 try:
-                    await locator.dispatch_event(event_name, timeout=timeout)
+                    if element is not None:
+                        await element.dispatch_event(event_name)
+                    else:
+                        await locator.dispatch_event(event_name, timeout=timeout)
                 except Exception:
                     LOG.debug("direct fill: dispatch_event failed", dispatched_event=event_name, exc_info=True)
             return value

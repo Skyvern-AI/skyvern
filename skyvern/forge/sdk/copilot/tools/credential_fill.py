@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable
 
 import structlog
 
 from skyvern.cli.core.session_manager import get_page
 from skyvern.forge import app
+from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, url_parts
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
@@ -42,6 +44,11 @@ LOG = structlog.get_logger()
 
 _CREDENTIAL_FILL_FIELDS = frozenset({"username", "password", "totp"})
 _CREDENTIAL_FILL_TIMEOUT_MS = 15000
+
+
+@dataclass(frozen=True)
+class _CredentialFillOriginGrant:
+    intended_url: str
 
 
 async def _normalize_totp_config_for_organization(totp_secret: str, organization_id: str) -> str:
@@ -93,7 +100,30 @@ def _still_on_admitted_site(current_url: str | None, admitted_url: str) -> bool:
     """
     admitted_parts = url_parts(admitted_url)
     current_parts = url_parts(current_url or "")
-    return bool(current_parts and admitted_parts and current_parts[2] == admitted_parts[2])
+    admitted_origin = canonicalize_origin(admitted_parts[2]) if admitted_parts else None
+    current_origin = canonicalize_origin(current_parts[2]) if current_parts else None
+    return bool(current_origin and admitted_origin and current_origin == admitted_origin)
+
+
+class _CredentialFillOriginMismatchError(Exception):
+    pass
+
+
+def _credential_fill_origin_mismatch_error() -> str:
+    return (
+        "The browser left this credential's intended login origin before it could be filled. "
+        "Re-inspect the current page and fill again if the sign-in is still in progress there."
+    )
+
+
+def _credential_fill_release_guard(intended_url: str) -> Callable[[str | None], None]:
+    """Bind the fill grant to the resolved element's document at the release seam."""
+
+    def guard(target_url: str | None) -> None:
+        if not _still_on_admitted_site(target_url, intended_url):
+            raise _CredentialFillOriginMismatchError
+
+    return guard
 
 
 def _credential_fill_authority_error(copilot_ctx: AgentContext, credential_id: str) -> str | None:
@@ -112,25 +142,51 @@ def _credential_fill_authority_error(copilot_ctx: AgentContext, credential_id: s
     return None
 
 
-async def _credential_fill_gate_error(copilot_ctx: AgentContext, credential_id: str) -> tuple[str | None, str | None]:
-    """Refuse only after asking the live page whether it vouches for this credential.
+def _resolved_credential_intended_url(policy: RequestPolicy, credential_id: str) -> str | None:
+    admitted_url = policy.live_page_admitted_urls.get(credential_id)
+    if admitted_url:
+        return admitted_url
+    return next(
+        (
+            credential.tested_url
+            for credential in policy.resolved_credentials
+            if credential.credential_id == credential_id and credential.tested_url
+        ),
+        None,
+    )
 
-    Returns the refusal (if any) and the page URL that justified an admission, so the caller can
-    confirm the browser is still on that page before the secret is typed.
+
+def _missing_credential_origin_error(credential_id: str) -> str:
+    return (
+        f"Credential `{credential_id}` has no intended login origin, so it cannot be filled into the live browser. "
+        "Test the saved credential against its login page to bind it to that site, then inspect the page and retry."
+    )
+
+
+async def _credential_fill_origin_grant(
+    copilot_ctx: AgentContext, credential_id: str
+) -> tuple[_CredentialFillOriginGrant | None, str | None]:
+    """Authorize a fill only when it has a concrete intended origin.
+
+    The returned grant is the capability consumed at the release seam. A credential that reached
+    ``resolved_credentials`` through a path without either a tested URL or a live-page admission
+    receives no grant, so a missing origin cannot silently disable the final comparison.
     """
     prerequisite_error = _credential_fill_prerequisite_error(copilot_ctx, credential_id)
     if prerequisite_error:
-        return prerequisite_error, None
+        return None, prerequisite_error
     policy = copilot_ctx.request_policy
     authority_error = _credential_fill_authority_error(copilot_ctx, credential_id)
     if not authority_error:
-        # A grant the live page made stays bound to that page: re-checking only the call that
-        # made it would let the retry after a redirect inherit authority it never earned.
-        admitted = policy.live_page_admitted_urls.get(credential_id) if isinstance(policy, RequestPolicy) else None
-        return None, admitted
+        if not isinstance(policy, RequestPolicy):
+            return None, _missing_credential_origin_error(credential_id)
+        intended_url = _resolved_credential_intended_url(policy, credential_id)
+        if not intended_url:
+            return None, _missing_credential_origin_error(credential_id)
+        return _CredentialFillOriginGrant(intended_url), None
 
     if not isinstance(policy, RequestPolicy):
-        return authority_error, None
+        return None, authority_error
 
     async def load_once() -> list[Credential]:
         if copilot_ctx.org_credentials_for_turn is None:
@@ -144,9 +200,17 @@ async def _credential_fill_gate_error(copilot_ctx: AgentContext, credential_id: 
         page_url=await _live_working_page_url(copilot_ctx) or "",
         load_org_credentials=load_once,
     )
+    if admission.admitted and admission.page_url:
+        return _CredentialFillOriginGrant(admission.page_url), None
     if admission.admitted:
-        return None, admission.page_url
-    return admission.steer or authority_error, None
+        return None, _missing_credential_origin_error(credential_id)
+    return None, admission.steer or authority_error
+
+
+async def _credential_fill_gate_error(copilot_ctx: AgentContext, credential_id: str) -> tuple[str | None, str | None]:
+    """Compatibility view of the origin-grant gate for tests and policy callers."""
+    grant, error = await _credential_fill_origin_grant(copilot_ctx, credential_id)
+    return error, grant.intended_url if grant else None
 
 
 async def _resolve_credential_fill_value(
@@ -255,15 +319,15 @@ async def _fill_credential_field_impl(
         return finish({"ok": False, "error": "fill_credential_field requires a CSS selector for the input field."})
     if field not in _CREDENTIAL_FILL_FIELDS:
         return finish({"ok": False, "error": "fill_credential_field `field` must be one of: username, password, totp."})
-    policy_error, admitted_page = await _credential_fill_gate_error(copilot_ctx, credential_id)
-    if policy_error:
+    origin_grant, policy_error = await _credential_fill_origin_grant(copilot_ctx, credential_id)
+    if policy_error or origin_grant is None:
         LOG.info(
             "copilot fill_credential_field rejected tool-side",
             credential_id=credential_id,
             field=field,
             organization_id=copilot_ctx.organization_id,
         )
-        return finish({"ok": False, "error": policy_error})
+        return finish({"ok": False, "error": policy_error or _missing_credential_origin_error(credential_id)})
 
     value, credential_name, resolve_error = await _resolve_credential_fill_value(copilot_ctx, credential_id, field)
     if resolve_error or value is None:
@@ -276,20 +340,15 @@ async def _fill_credential_field_impl(
     try:
         async with mcp_browser_context(copilot_ctx):
             page, _ = await get_page(session_id=copilot_ctx.browser_session_id)
-            # Checked on the page about to be filled, with nothing awaited in between: the vault read
-            # and the evidence capture above both give a redirect room to move the browser.
-            if admitted_page and not _still_on_admitted_site(page.url, admitted_page):
-                return finish(
-                    {
-                        "ok": False,
-                        "error": (
-                            "The browser left the site whose login page authorized this credential "
-                            "before it could be filled. Re-inspect the current page and fill again if "
-                            "the sign-in is still in progress there."
-                        ),
-                    }
-                )
-            await page.fill(selector, value, mode="direct", timeout=_CREDENTIAL_FILL_TIMEOUT_MS)
+            await page.fill(
+                selector,
+                value,
+                mode="direct",
+                timeout=_CREDENTIAL_FILL_TIMEOUT_MS,
+                _direct_fill_release_guard=_credential_fill_release_guard(origin_grant.intended_url),
+            )
+    except _CredentialFillOriginMismatchError:
+        return finish({"ok": False, "error": _credential_fill_origin_mismatch_error()})
     except Exception as exc:
         error_text = scrub_secrets_from_text(copilot_ctx, _scrub_secret_from_text(str(exc), value))
         LOG.info(
