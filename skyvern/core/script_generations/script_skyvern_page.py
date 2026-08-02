@@ -77,30 +77,6 @@ LOG = structlog.get_logger()
 action_wrap = SkyvernPage.action_wrap
 
 
-async def _skip_cached_script_complete_verification(context: skyvern_context.SkyvernContext) -> bool:
-    """A cached script that replayed every recorded action has already determined
-    completion; with the flag on, complete() skips the check-user-goal LLM call."""
-    try:
-        enabled = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-            "SKIP_CACHED_SCRIPT_COMPLETE_VERIFICATION",
-            context.workflow_run_id or context.task_id or "",
-            properties={"organization_id": context.organization_id},
-        )
-    except Exception:
-        LOG.warning(
-            "Failed to check SKIP_CACHED_SCRIPT_COMPLETE_VERIFICATION; keeping LLM verification",
-            exc_info=True,
-        )
-        return False
-    if enabled:
-        LOG.info(
-            "Skipping cached-script complete verification (SKIP_CACHED_SCRIPT_COMPLETE_VERIFICATION enabled)",
-            workflow_run_id=context.workflow_run_id,
-            task_id=context.task_id,
-        )
-    return bool(enabled)
-
-
 class ScriptSkyvernPage(SkyvernPage):
     """
     A minimal adapter around the chosen driver that:
@@ -1165,22 +1141,17 @@ class ScriptSkyvernPage(SkyvernPage):
             if not step:
                 return
 
-            # Static (pinned) scripts verify page state themselves —
-            # skip LLM verification which can reject valid completions
-            # (e.g. sign-in page with pending email verification).
-            # AI-generated cached scripts still get LLM verification unless
-            # SKIP_CACHED_SCRIPT_COMPLETE_VERIFICATION opts the run out.
-            verified = bool(context.is_static_script)
-            if not verified and context.script_mode:
-                verified = await _skip_cached_script_complete_verification(context)
-
             action = CompleteAction(
                 organization_id=context.organization_id,
                 task_id=context.task_id,
                 step_id=context.step_id,
                 step_order=step.order,
                 action_order=context.action_order,
-                verified=verified,
+                # Static (pinned) scripts verify page state themselves —
+                # skip LLM verification which can reject valid completions
+                # (e.g. sign-in page with pending email verification).
+                # AI-generated cached scripts still get LLM verification.
+                verified=bool(context.is_static_script),
             )
             # result = await ActionHandler.handle_action(self.scraped_page, task, step, self.page, action)
             result = await handle_complete_action(action, self.page, self.scraped_page, task, step)
