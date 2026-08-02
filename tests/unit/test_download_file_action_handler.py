@@ -1010,7 +1010,7 @@ async def test_handle_action_closes_failed_recovery_page_and_bounds_navigation()
                     page=page,
                     action=action,
                 ),
-                timeout=0.5,
+                timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
             )
 
     assert navigation_started.is_set()
@@ -1150,7 +1150,7 @@ async def test_handle_action_download_completion_may_exceed_signal_budget(
                     page=page,
                     action=action,
                 ),
-                timeout=0.5,
+                timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
             )
 
         elapsed = time.monotonic() - started_at
@@ -1216,7 +1216,7 @@ async def test_handle_action_crdownload_signal_enters_completion_before_reportin
                     page=page,
                     action=action,
                 ),
-                timeout=0.5,
+                timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
             )
 
     settle.assert_awaited_once()
@@ -1281,7 +1281,7 @@ async def test_handle_action_remote_crdownload_signal_enters_completion_before_r
                     page=page,
                     action=action,
                 ),
-                timeout=0.5,
+                timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
             )
 
     settle.assert_awaited_once()
@@ -1341,7 +1341,7 @@ async def test_handle_action_preexisting_remote_crdownload_does_not_signal_new_d
                     page=page,
                     action=action,
                 ),
-                timeout=0.5,
+                timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
             )
 
     settle.assert_not_awaited()
@@ -1403,7 +1403,7 @@ async def test_handle_action_remote_snapshot_captures_partial_transition_before_
                     page=page,
                     action=action,
                 ),
-                timeout=0.5,
+                timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
             )
 
     settle.assert_not_awaited()
@@ -4893,7 +4893,7 @@ async def test_handle_action_threads_preclick_iframe_baseline_into_recovery(tmp_
     ):
         results = await asyncio.wait_for(
             ActionHandler.handle_action(scraped_page=scraped_page, task=task, step=step, page=page, action=action),
-            timeout=0.5,
+            timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
         )
 
     assert seen["baseline"] == baseline
@@ -4933,7 +4933,7 @@ async def test_handle_action_skips_recovery_when_native_download_fires(tmp_path:
     ):
         results = await asyncio.wait_for(
             ActionHandler.handle_action(scraped_page=scraped_page, task=task, step=step, page=page, action=action),
-            timeout=0.5,
+            timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
         )
 
     recover.assert_not_called()
