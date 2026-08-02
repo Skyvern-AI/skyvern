@@ -26,7 +26,7 @@ from skyvern.forge import app
 from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler, dummy_llm_api_handler
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
-from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
+from skyvern.forge.sdk.api.llm.custom_llm_registry import custom_llm_passthrough_parameters, is_custom_llm_key
 from skyvern.forge.sdk.api.llm.exceptions import (
     DuplicateCustomLLMProviderError,
     InvalidLLMConfigError,
@@ -1064,6 +1064,15 @@ class LLMAPIHandlerFactory:
                 budget=clamped_budget,
                 model=model_label,
             )
+
+    @staticmethod
+    def _custom_llm_owns_thinking(llm_key: str, parameters: dict[str, Any]) -> bool:
+        """Whether a custom LLM supplied its own thinking payload via extra_parameters.
+
+        When it did, the platform's default thinking-budget optimization must be skipped so it
+        neither overwrites the customer budget nor in-place mutates the shared config dict. SKY-13345.
+        """
+        return is_custom_llm_key(llm_key) and ("thinking" in parameters or "thinking_level" in parameters)
 
     @staticmethod
     def _is_gemini_3_model(llm_config: LLMConfig | LLMRouterConfig) -> bool:
@@ -2133,6 +2142,9 @@ class LLMAPIHandlerFactory:
         llm_key: str,
         base_parameters: dict[str, Any] | None = None,
     ) -> LLMAPIHandler:
+        if settings.ENV == "local" and LLMConfigRegistry.get_config_issue(llm_key):
+            return dummy_llm_api_handler
+
         try:
             llm_config = LLMConfigRegistry.get_config(llm_key)
         except InvalidLLMConfigError:
@@ -2194,8 +2206,14 @@ class LLMAPIHandlerFactory:
             if "timeout" not in active_parameters:
                 active_parameters["timeout"] = settings.LLM_CONFIG_TIMEOUT
 
+            # A custom LLM may declare its own thinking budget via extra_parameters; the platform's
+            # default thinking-budget optimization must not overwrite it (nor in-place mutate the
+            # nested dict retained in llm_config.litellm_params via the shallow merge above). SKY-13345.
+            customer_owns_thinking = LLMAPIHandlerFactory._custom_llm_owns_thinking(llm_key, active_parameters)
             # Apply thinking budget optimization if settings are available
-            if (
+            if customer_owns_thinking:
+                pass
+            elif (
                 LLMAPIHandlerFactory._thinking_budget_settings
                 and prompt_name in LLMAPIHandlerFactory._thinking_budget_settings
             ):
@@ -3314,6 +3332,30 @@ class LLMCaller:
                 for parameter_name in openai_params:
                     request_extra_body.pop(parameter_name, None)
                 if request_extra_body:
+                    openai_params["extra_body"] = request_extra_body
+
+            # Custom OpenRouter models declare provider-specific passthrough (e.g. top_p,
+            # extra_headers) via extra_parameters. The openai client only accepts known top-level
+            # kwargs, so forward the rest through extra_body / extra_headers rather than dropping
+            # them. SKY-13345.
+            if self._custom_openrouter and isinstance(self.llm_config, LLMConfig):
+                passthrough = custom_llm_passthrough_parameters(self.llm_config.litellm_params)
+                for already_mapped in (
+                    "max_completion_tokens",
+                    "max_tokens",
+                    "temperature",
+                    "service_tier",
+                    "reasoning_effort",
+                    "extra_body",
+                ):
+                    passthrough.pop(already_mapped, None)
+                passthrough_headers = passthrough.pop("extra_headers", None)
+                if isinstance(passthrough_headers, dict):
+                    extra_headers.update({str(key): str(value) for key, value in passthrough_headers.items()})
+                if passthrough:
+                    request_extra_body = dict(openai_params.get("extra_body") or {})
+                    for key, value in passthrough.items():
+                        request_extra_body.setdefault(key, value)
                     openai_params["extra_body"] = request_extra_body
 
             try:
