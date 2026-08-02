@@ -1,3 +1,6 @@
+import { useEffect } from "react";
+import { useLocation } from "react-router-dom";
+
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -26,10 +29,22 @@ import { useVersionQuery } from "@/hooks/useVersionQuery";
 import { formatVersion, getAppVersion } from "@/util/version";
 
 function Settings() {
+  const { hash } = useLocation();
   const { environment, organization, setEnvironment, setOrganization } =
     useSettingsStore();
   const apiKey = getRuntimeApiKey();
   const { data: versionData } = useVersionQuery();
+
+  useEffect(() => {
+    if (!hash) {
+      return;
+    }
+
+    document.getElementById(hash.slice(1))?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  }, [hash]);
 
   return (
     <div className="flex flex-col gap-8">
@@ -138,7 +153,7 @@ function Settings() {
           <GoogleOAuthClientConfigForm />
         </CardContent>
       </Card>
-      <Card>
+      <Card id="custom-llms">
         <CardHeader className="border-b-2">
           <CardTitle className="text-lg">Custom LLMs</CardTitle>
           <CardDescription>
