@@ -23,6 +23,9 @@ vi.mock("@/components/CustomCredentialServiceConfigForm", () => ({
 vi.mock("@/components/CustomLLMConfigForm", () => ({
   CustomLLMConfigForm: () => null,
 }));
+vi.mock("@/components/OrgLLMDefaultsCard", () => ({
+  OrgLLMDefaultsCard: () => null,
+}));
 vi.mock("@/components/GoogleOAuthClientConfigForm", () => ({
   GoogleOAuthClientConfigForm: () => null,
 }));

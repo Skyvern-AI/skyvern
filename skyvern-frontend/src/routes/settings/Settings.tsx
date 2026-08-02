@@ -24,6 +24,7 @@ import { BitwardenCredentialForm } from "@/components/BitwardenCredentialForm";
 import { AzureClientSecretCredentialTokenForm } from "@/components/AzureClientSecretCredentialTokenForm";
 import { CustomCredentialServiceConfigForm } from "@/components/CustomCredentialServiceConfigForm";
 import { CustomLLMConfigForm } from "@/components/CustomLLMConfigForm";
+import { OrgLLMDefaultsCard } from "@/components/OrgLLMDefaultsCard";
 import { GoogleOAuthClientConfigForm } from "@/components/GoogleOAuthClientConfigForm";
 import { useVersionQuery } from "@/hooks/useVersionQuery";
 import { formatVersion, getAppVersion } from "@/util/version";
@@ -164,6 +165,7 @@ function Settings() {
           <CustomLLMConfigForm />
         </CardContent>
       </Card>
+      <OrgLLMDefaultsCard />
       {(getAppVersion() !== "development" || versionData?.version) && (
         <p className="text-center text-xs text-muted-foreground/50">
           {getAppVersion() !== "development" && (
