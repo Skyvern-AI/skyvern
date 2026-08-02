@@ -826,10 +826,42 @@ class S3Storage(BaseStorage):
             artifacts = await self._list_download_artifacts_safe(organization_id=organization_id, run_id=run_id)
             if artifacts:
                 return await _file_infos_from_download_artifacts(artifacts)
+            if await self._skip_empty_downloads_listing(organization_id=organization_id, run_id=run_id):
+                return []
 
         # Legacy fallback — runs predating SKY-8861 (no artifact rows) and
         # OSS-default deployments without HMAC signing both arrive here.
         return await self._get_downloaded_files_via_s3_listing(organization_id=organization_id, run_id=run_id)
+
+    async def _skip_empty_downloads_listing(self, *, organization_id: str, run_id: str) -> bool:
+        """True when a run with zero DOWNLOAD rows may skip the legacy S3 LIST.
+
+        Only runs created at/after DOWNLOADS_EMPTY_S3_LISTING_CUTOVER qualify: they
+        register every download as an artifact row at save time, so an empty row set
+        means an empty S3 prefix. Anything unresolvable (cutover unset or unparseable,
+        run row missing, DB error) keeps the LIST fallback.
+        """
+        cutover_raw = settings.DOWNLOADS_EMPTY_S3_LISTING_CUTOVER
+        if not cutover_raw:
+            return False
+        try:
+            cutover = datetime.fromisoformat(cutover_raw)
+            run = await app.DATABASE.tasks.get_run(run_id=run_id, organization_id=organization_id)
+        except Exception:
+            LOG.warning(
+                "Failed to resolve run for empty-downloads listing skip; using S3 LIST",
+                run_id=run_id,
+                exc_info=True,
+            )
+            return False
+        if run is None:
+            return False
+        created_at = run.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        if cutover.tzinfo is None:
+            cutover = cutover.replace(tzinfo=timezone.utc)
+        return created_at >= cutover
 
     async def _list_download_artifacts_safe(self, *, organization_id: str, run_id: str) -> list[Artifact]:
         try:

@@ -582,6 +582,10 @@ async def run_task_v2(
         trigger_type=parent_context.trigger_type if parent_context else None,
         use_flex_llm_routing=parent_context.use_flex_llm_routing if parent_context else False,
         consecutive_captcha_timeouts=parent_context.consecutive_captcha_timeouts if parent_context else 0,
+        # The parent run body's asyncio.timeout stays binding inside this scope; dropping the
+        # deadline would let long-blocking work (e.g. a throttled vendor create) wait past it
+        # and be cancelled instead of giving up in time to degrade.
+        max_elapsed_deadline=parent_context.max_elapsed_deadline if parent_context else None,
         preserve_transient_ui_capture=parent_context.preserve_transient_ui_capture if parent_context else None,
         preserve_transient_ui_capture_resolved=(
             parent_context.preserve_transient_ui_capture_resolved if parent_context else False
