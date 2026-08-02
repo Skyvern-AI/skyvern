@@ -193,6 +193,7 @@ async def test_child_run_does_not_adopt_stale_sibling_browser_without_page() -> 
     # Sibling C1 completed and left a torn-down browser under the shared parent key.
     stale_state = MagicMock()
     stale_state.get_working_page = AsyncMock(return_value=None)
+    stale_state.is_connected = MagicMock(return_value=False)
     manager.pages["wfr_parent"] = stale_state
 
     workflow_run = make_workflow_run("wfr_child_2", parent_workflow_run_id="wfr_parent")
@@ -216,6 +217,42 @@ async def test_child_run_does_not_adopt_stale_sibling_browser_without_page() -> 
     # The stale entry must be replaced by the fresh browser, not left dangling.
     assert manager.pages["wfr_child_2"] is fresh_state
     assert manager.pages["wfr_parent"] is fresh_state
+
+
+@pytest.mark.asyncio
+async def test_child_run_recovers_live_inherited_browser_without_page() -> None:
+    """A ``use_parent_browser_session`` child inherits the parent's in-memory browser via the
+    shared parent key. When that browser is still live but its last valid tab was closed,
+    ``get_working_page()`` returns ``None`` even though the context is connected. The manager
+    must recreate a page in the SAME context (preserving the parent's cookies/session) instead
+    of evicting the live browser and starting a fresh one — which would orphan the parent's
+    browser and lose its session.
+    """
+    manager = RealBrowserManager()
+    # Parent's live in-memory browser, currently tab-less (last page was closed).
+    live_state = MagicMock()
+    live_state.get_working_page = AsyncMock(side_effect=[None, MagicMock()])
+    live_state.is_connected = MagicMock(return_value=True)
+    live_state.get_or_create_page = AsyncMock()
+    manager.pages["wfr_parent"] = live_state
+
+    workflow_run = make_workflow_run("wfr_child", parent_workflow_run_id="wfr_parent")
+
+    with patch.object(manager, "_create_browser_state", new=AsyncMock()) as mock_create:
+        result = await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url="https://example.com",
+            browser_session_id=None,
+        )
+
+    # The live inherited browser is adopted, not evicted.
+    assert result is live_state
+    mock_create.assert_not_awaited()
+    # A page is recreated in the existing context so the parent's session is preserved.
+    live_state.get_or_create_page.assert_awaited_once()
+    # Both entries still point at the live browser so it stays tracked for cleanup.
+    assert manager.pages["wfr_child"] is live_state
+    assert manager.pages["wfr_parent"] is live_state
 
 
 def make_task(
