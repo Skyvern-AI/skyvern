@@ -1575,6 +1575,8 @@ async def test_do_select_option_scan_observed_bare_input_uses_typeahead(
         {"text": "", "value": "Fairview", "dataValues": [], "expanded": None, "optionSelected": False},
         {"text": "", "value": "Fairview", "dataValues": [], "expanded": None, "optionSelected": True},
     ]
+    # SKY-12634: freeze the wall clock so a loaded CI runner cannot blow the 100ms budget.
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(return_value=0)))
 
     assert await do_select_option(page, "#town", "Fairview", timeout=100) == "Fairview"
     control.fill.assert_awaited_once_with("Fairview", timeout=100)
