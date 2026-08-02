@@ -165,7 +165,11 @@ class BrowserSessionResponse(BaseModel):
             runnable_id=browser_session.runnable_id,
             timeout=browser_session.timeout_minutes,
             browser_address=browser_address,
-            vnc_streaming_supported=bool(browser_session.ip_address or browser_session.browser_address),
+            vnc_streaming_supported=bool(browser_session.ip_address or browser_session.browser_address)
+            and await app.AGENT_FUNCTION.supports_live_view(
+                browser_session.persistent_browser_session_id,
+                ip_address=browser_session.ip_address,
+            ),
             app_url=app_url,
             started_at=browser_session.started_at,
             completed_at=browser_session.completed_at,

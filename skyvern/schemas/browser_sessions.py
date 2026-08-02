@@ -88,6 +88,13 @@ class CreateBrowserSessionRequest(BaseModel):
         "persist their profile regardless of this flag.",
     )
 
+    needs_live_view: bool = Field(
+        default=False,
+        description="Whether a person will watch this session's browser live. Defaults to false, which suits "
+        "unattended automation; the Skyvern app sets it because a session opened in the UI is watched. It requests "
+        "a capability, not a particular browser, and cannot be used to select where the session runs.",
+    )
+
 
 class UpdateBrowserSessionRequest(BaseModel):
     generate_browser_profile: bool = Field(
