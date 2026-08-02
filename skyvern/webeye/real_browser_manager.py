@@ -572,9 +572,29 @@ class RealBrowserManager(BrowserManager):
                 # fan-out) can therefore find an earlier, already-completed sibling's torn-down
                 # browser here. This early-return path skips get_or_create_page, so returning a
                 # page-less state would fail the run's first browser block with a missing page.
-                # Only adopt the inherited browser when it still has a working page; otherwise
-                # drop the stale entry and fall through to create a fresh browser for this run.
-                if await browser_state.get_working_page() is not None:
+                working_page = await browser_state.get_working_page()
+                if working_page is None and browser_state.is_connected():
+                    # The inherited browser is still live but its last valid tab was closed
+                    # (e.g. a use_parent_browser_session child whose prior run closed the last
+                    # page). Recreate a page in the SAME context so the child keeps the parent's
+                    # cookies/session, instead of orphaning the live browser and starting fresh.
+                    LOG.info(
+                        "Inherited parent browser is live but has no working page; recreating a page in the same context",
+                        workflow_run_id=workflow_run_id,
+                        parent_workflow_run_id=parent_workflow_run_id,
+                    )
+                    await browser_state.get_or_create_page(
+                        proxy_location=workflow_run.proxy_location,
+                        workflow_run_id=workflow_run_id,
+                        workflow_permanent_id=workflow_run.workflow_permanent_id,
+                        organization_id=workflow_run.organization_id,
+                        extra_http_headers=workflow_run.extra_http_headers,
+                        cdp_connect_headers=workflow_run.cdp_connect_headers,
+                        browser_address=workflow_run.browser_address,
+                        browser_profile_id=browser_profile_id,
+                    )
+                    working_page = await browser_state.get_working_page()
+                if working_page is not None:
                     # always keep the browser state for the workflow run and the parent workflow run synced
                     self.pages[workflow_run_id] = browser_state
                     if parent_workflow_run_id:
@@ -588,8 +608,10 @@ class RealBrowserManager(BrowserManager):
                         organization_id=workflow_run.organization_id,
                     )
                     return await _on_browser_state_acquired(browser_state, workflow_run_id)
+                # The inherited state is genuinely torn down (disconnected and page-less).
+                # Drop the stale entry and fall through to create a fresh browser for this run.
                 LOG.warning(
-                    "Inherited parent browser state has no working page; creating a fresh browser",
+                    "Inherited parent browser state is torn down; creating a fresh browser",
                     workflow_run_id=workflow_run_id,
                     parent_workflow_run_id=parent_workflow_run_id,
                 )

@@ -245,6 +245,68 @@ async def test_update_custom_llm_preserves_masked_api_key(
 
 
 @pytest.mark.asyncio
+async def test_custom_llm_masks_and_preserves_secret_extra_headers(
+    fake_organizations: FakeOrganizationsRepository,
+) -> None:
+    org = _org()
+    secret_headers = {"Authorization": "Bearer super-secret", "X-API-Key": "sk-nested"}
+    masked_headers = {name: CUSTOM_LLM_API_KEY_MASK for name in secret_headers}
+
+    create_response = await routes.create_custom_llm(
+        CustomLLMCreateRequest(
+            config=CustomLLMConfig(
+                display_name="Gemini Flex",
+                provider="gemini",
+                model_name="gemini-2.5-flash",
+                api_key="test-key",
+                extra_parameters={"service_tier": "flex", "extra_headers": dict(secret_headers)},
+            )
+        ),
+        org,
+    )
+    custom_llm_id = create_response.custom_llm.id
+
+    try:
+        # Nested header credentials are masked on output, non-secret passthrough stays visible.
+        assert create_response.custom_llm.config.extra_parameters["extra_headers"] == masked_headers
+        assert create_response.custom_llm.config.extra_parameters["service_tier"] == "flex"
+        assert create_response.custom_llm.config.api_key == CUSTOM_LLM_API_KEY_MASK
+
+        list_response = await routes.list_custom_llms(org)
+        assert list_response.custom_llms[0].config.extra_parameters["extra_headers"] == masked_headers
+
+        # The registry keeps the real credentials so requests actually authenticate.
+        registered = LLMConfigRegistry.get_config(custom_llm_key(custom_llm_id))
+        assert registered.litellm_params
+        assert registered.litellm_params["extra_headers"] == secret_headers
+
+        # A no-op save that echoes the masked headers back restores the stored credentials.
+        update_response = await routes.update_custom_llm(
+            CustomLLMUpdateRequest(
+                config=CustomLLMConfig(
+                    display_name="Gemini Flex",
+                    provider="gemini",
+                    model_name="gemini-2.5-flash",
+                    api_key=CUSTOM_LLM_API_KEY_MASK,
+                    extra_parameters={"service_tier": "flex", "extra_headers": dict(masked_headers)},
+                )
+            ),
+            custom_llm_id,
+            org,
+        )
+        assert update_response.custom_llm.config.extra_parameters["extra_headers"] == masked_headers
+
+        stored_config = CustomLLMConfig.model_validate_json(fake_organizations.tokens[0].token)
+        assert stored_config.extra_parameters["extra_headers"] == secret_headers
+        assert stored_config.api_key == "test-key"
+        registered_after = LLMConfigRegistry.get_config(custom_llm_key(custom_llm_id))
+        assert registered_after.litellm_params
+        assert registered_after.litellm_params["extra_headers"] == secret_headers
+    finally:
+        deregister_custom_llm_config(custom_llm_id)
+
+
+@pytest.mark.asyncio
 async def test_models_route_lists_only_current_org_custom_llms_with_unique_labels(
     fake_organizations: FakeOrganizationsRepository,
 ) -> None:
@@ -690,6 +752,142 @@ def test_task_v2_selected_non_custom_model_override_is_intentional(monkeypatch: 
     )
 
     assert task_v2_service._get_task_v2_llm_api_handler(task_v2) is selected_handler
+
+
+def test_custom_llm_extra_parameters_flow_into_litellm_params() -> None:
+    custom_llm_id = "oat_custom_extra_params"
+    register_custom_llm_config(
+        custom_llm_id,
+        "o_test",
+        CustomLLMConfig(
+            display_name="Gemini Flex",
+            provider="gemini",
+            model_name="gemini-2.5-flash",
+            api_key="test-key",
+            extra_parameters={
+                "service_tier": "flex",
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
+                "extra_headers": {"X-Trace": "on"},
+            },
+        ),
+    )
+
+    try:
+        llm_config = LLMConfigRegistry.get_config(custom_llm_key(custom_llm_id))
+    finally:
+        deregister_custom_llm_config(custom_llm_id)
+
+    assert llm_config.model_name == "gemini/gemini-2.5-flash"
+    assert llm_config.litellm_params
+    assert llm_config.litellm_params["service_tier"] == "flex"
+    assert llm_config.litellm_params["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+    assert llm_config.litellm_params["extra_headers"] == {"X-Trace": "on"}
+    # Provider-managed connection params survive the passthrough merge.
+    assert llm_config.litellm_params["api_key"] == "test-key"
+
+
+def test_gemini_provider_requires_api_key() -> None:
+    with pytest.raises(ValueError, match="api_key is required for Gemini"):
+        CustomLLMConfig(
+            display_name="Gemini",
+            provider="gemini",
+            model_name="gemini-2.5-flash",
+        )
+
+
+@pytest.mark.parametrize(
+    "reserved_key",
+    ["model", "api_key", "api_base", "messages", "MODEL_INFO", " api_key ", "drop_params", "stream", "tools"],
+)
+def test_custom_llm_extra_parameters_reject_reserved_keys(reserved_key: str) -> None:
+    with pytest.raises(ValueError, match="reserved"):
+        CustomLLMConfig(
+            display_name="Reserved",
+            provider="gemini",
+            model_name="gemini-2.5-flash",
+            api_key="test-key",
+            extra_parameters={reserved_key: "value"},
+        )
+
+
+def test_custom_llm_extra_parameters_reject_too_many() -> None:
+    with pytest.raises(ValueError, match="at most 30 keys"):
+        CustomLLMConfig(
+            display_name="Too Many",
+            provider="gemini",
+            model_name="gemini-2.5-flash",
+            api_key="test-key",
+            extra_parameters={f"param_{index}": index for index in range(31)},
+        )
+
+
+def test_custom_llm_extra_parameters_reject_oversized() -> None:
+    with pytest.raises(ValueError, match="bytes"):
+        CustomLLMConfig(
+            display_name="Too Big",
+            provider="gemini",
+            model_name="gemini-2.5-flash",
+            api_key="test-key",
+            extra_parameters={"blob": "x" * 11_000},
+        )
+
+
+def test_custom_llm_passthrough_parameters_excludes_connection_keys() -> None:
+    from skyvern.forge.sdk.api.llm.custom_llm_registry import custom_llm_passthrough_parameters
+
+    params = {
+        "api_key": "k",
+        "api_base": "https://openrouter.ai/api/v1",
+        "api_version": "v",
+        "model_info": {"model_name": "m"},
+        "top_p": 0.2,
+        "extra_headers": {"X-Trace": "on"},
+    }
+    assert custom_llm_passthrough_parameters(params) == {"top_p": 0.2, "extra_headers": {"X-Trace": "on"}}
+    assert custom_llm_passthrough_parameters(None) == {}
+
+
+def test_custom_gemini_thinking_budget_is_owned_and_not_overwritten() -> None:
+    custom_llm_id = "oat_custom_gemini_thinking"
+    register_custom_llm_config(
+        custom_llm_id,
+        "o_test",
+        CustomLLMConfig(
+            display_name="Gemini Thinking",
+            provider="gemini",
+            model_name="gemini-2.5-flash",
+            api_key="test-key",
+            extra_parameters={"thinking": {"type": "enabled", "budget_tokens": 4096}},
+        ),
+    )
+
+    try:
+        llm_key = custom_llm_key(custom_llm_id)
+        llm_config = LLMConfigRegistry.get_config(llm_key)
+        # Replicate the single-handler merge: get_api_parameters + the shallow litellm_params update
+        # that shares the nested thinking dict retained on the frozen config.
+        active_parameters: dict = {}
+        active_parameters.update(LLMAPIHandlerFactory.get_api_parameters(llm_config))
+        active_parameters.update(llm_config.litellm_params)
+
+        # The guard recognizes the customer-owned budget, so the handler skips the default
+        # optimization and the customer's 4096 budget reaches the provider unchanged.
+        assert LLMAPIHandlerFactory._custom_llm_owns_thinking(llm_key, active_parameters) is True
+        assert active_parameters["thinking"]["budget_tokens"] == 4096
+
+        # Sanity: had the optimization run, it would both clobber the budget and mutate the shared
+        # dict retained on llm_config.litellm_params — which is exactly what the guard prevents.
+        LLMAPIHandlerFactory._apply_gemini_thinking_optimization(active_parameters, 128, llm_config, "extract-action")
+        assert active_parameters["thinking"]["budget_tokens"] == 128
+        assert llm_config.litellm_params["thinking"]["budget_tokens"] == 128
+    finally:
+        deregister_custom_llm_config(custom_llm_id)
+
+
+def test_non_custom_key_never_owns_thinking() -> None:
+    assert (
+        LLMAPIHandlerFactory._custom_llm_owns_thinking("GEMINI_2_5_FLASH", {"thinking": {"budget_tokens": 1}}) is False
+    )
 
 
 def test_custom_ollama_chat_models_skip_max_token_parameters() -> None:

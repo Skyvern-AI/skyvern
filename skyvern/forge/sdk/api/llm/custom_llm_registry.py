@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -69,19 +70,42 @@ def _litellm_model_name(config: CustomLLMConfig) -> str:
         return f"openai/{_strip_provider_prefix(config.model_name, ('openai/',))}"
     if config.provider is CustomLLMProvider.OPENROUTER:
         return f"openrouter/{_strip_provider_prefix(config.model_name, ('openrouter/',))}"
+    if config.provider is CustomLLMProvider.GEMINI:
+        return f"gemini/{_strip_provider_prefix(config.model_name, ('gemini/',))}"
     if config.model_name.startswith(("ollama/", "ollama_chat/")):
         return config.model_name
     return f"ollama_chat/{config.model_name}"
 
 
+# Keys _build_litellm_params derives from the config; everything else in litellm_params is
+# customer-supplied passthrough. Kept here so dispatch paths can recover the passthrough set.
+_CONNECTION_PARAM_KEYS = frozenset({"api_key", "api_base", "api_version", "model_info"})
+
+
 def _build_litellm_params(config: CustomLLMConfig, litellm_model_name: str) -> LiteLLMParams:
-    params: LiteLLMParams = {
+    params: dict[str, Any] = {
         "api_key": config.api_key,
         "api_base": config.api_base,
         "api_version": config.api_version,
         "model_info": {"model_name": litellm_model_name},
     }
-    return {key: value for key, value in params.items() if value is not None}  # type: ignore[return-value]
+    merged = {key: value for key, value in params.items() if value is not None}
+    # Provider-specific passthrough (e.g. service_tier, thinking, extra_headers). Applied last so it
+    # rides through the same litellm_params merge that reaches the completion call; reserved keys are
+    # rejected at config validation, so nothing here can clobber api_key/api_base/model.
+    merged.update(config.extra_parameters)
+    return merged  # type: ignore[return-value]
+
+
+def custom_llm_passthrough_parameters(litellm_params: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return the customer-supplied passthrough params from a registered config's litellm_params.
+
+    Dispatch paths that rebuild the request kwargs from a fixed allowlist (e.g. the custom
+    OpenRouter branch) use this to forward provider-specific params they would otherwise drop.
+    """
+    if not litellm_params:
+        return {}
+    return {key: value for key, value in litellm_params.items() if key not in _CONNECTION_PARAM_KEYS}
 
 
 def _build_llm_config(config: CustomLLMConfig) -> LLMConfig:

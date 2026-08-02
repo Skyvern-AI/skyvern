@@ -3385,7 +3385,7 @@ async def webhook(
             "Webhook signature or timestamp missing",
             x_skyvern_signature=x_skyvern_signature,
             x_skyvern_timestamp=x_skyvern_timestamp,
-            payload=payload,
+            payload_length=len(payload),
         )
         raise HTTPException(
             status_code=http_status.HTTP_400_BAD_REQUEST,
@@ -3401,7 +3401,7 @@ async def webhook(
         "Webhook received",
         x_skyvern_signature=x_skyvern_signature,
         x_skyvern_timestamp=x_skyvern_timestamp,
-        payload=payload,
+        payload_length=len(payload),
         generated_signature=generated_signature,
         valid_signature=x_skyvern_signature == generated_signature,
     )

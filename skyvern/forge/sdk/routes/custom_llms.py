@@ -13,7 +13,6 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.custom_llms import (
-    CUSTOM_LLM_API_KEY_MASK,
     CustomLLM,
     CustomLLMConfig,
     CustomLLMCreateRequest,
@@ -21,6 +20,7 @@ from skyvern.forge.sdk.schemas.custom_llms import (
     CustomLLMProvider,
     CustomLLMResponse,
     CustomLLMUpdateRequest,
+    config_with_preserved_secrets,
     custom_llm_from_org_auth_token,
     custom_llm_response_from_org_auth_token,
 )
@@ -55,18 +55,6 @@ async def _get_custom_llm(
         if token.id == custom_llm_id:
             return custom_llm_from_org_auth_token(token)
     raise NotFoundError("Custom LLM not found")
-
-
-def _config_with_preserved_api_key(config: CustomLLMConfig, existing_custom_llm: CustomLLM) -> CustomLLMConfig:
-    if config.api_key != CUSTOM_LLM_API_KEY_MASK:
-        return config
-
-    return CustomLLMConfig.model_validate(
-        {
-            **config.model_dump(),
-            "api_key": existing_custom_llm.config.api_key,
-        }
-    )
 
 
 @base_router.get(
@@ -153,7 +141,7 @@ async def update_custom_llm(
 ) -> CustomLLMResponse:
     try:
         existing_custom_llm = await _get_custom_llm(current_org.organization_id, custom_llm_id)
-        config = _config_with_preserved_api_key(request.config, existing_custom_llm)
+        config = config_with_preserved_secrets(request.config, existing_custom_llm.config)
         await _validate_custom_llm_api_base(config)
         token = await app.DATABASE.organizations.update_org_auth_token(
             organization_id=current_org.organization_id,

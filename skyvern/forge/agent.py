@@ -1294,8 +1294,8 @@ class ForgeAgent:
         except FailedToSendWebhook:
             LOG.exception(
                 "Failed to send webhook",
-                task=task,
-                step=step,
+                task_id=task.task_id,
+                step_id=step.step_id,
             )
             return step, detailed_output, next_step
         except FailedToNavigateToUrl as e:
