@@ -646,6 +646,91 @@ check(
   },
 );
 
+check("a nested build cannot replenish an active build's budget", () => {
+  // buildTreeFromBody is exported onto globalThis and arms the budget in its SYNCHRONOUS prefix,
+  // before its first await. A page that calls it from inside a trusted resolution (by replacing
+  // window.URL, say) could therefore re-arm the bound mid-build. Probed in real Chromium: with
+  // the budget drained from inside an active build, a nested call made a 524288 spend succeed
+  // again. Only the outermost build may arm; a nested one still builds, it just cannot replenish.
+  const harness = new Function(
+    `let __captureDestinationFacts = false;
+     let __destinationFactBudget = 0;
+     let __destinationBuildActive = false;
+     const window = {};
+     const document = { documentElement: {} };
+     const DomUtils = {};
+     async function buildElementTree() { return [[], []]; }
+     async ${extract("buildTreeFromBody")}
+     return {
+       start: (f) => buildTreeFromBody(f, undefined, [], true).catch(() => {}),
+       budget: () => __destinationFactBudget,
+       drain: () => { __destinationFactBudget = 0; },
+       capturing: () => __captureDestinationFacts,
+     };`,
+  )();
+  harness.start("outer");
+  assert.strictEqual(
+    harness.budget(),
+    524288,
+    "the outermost build must arm the budget",
+  );
+  assert.strictEqual(harness.capturing(), true);
+  harness.drain(); // the outer build spends its whole budget on hostile resolutions
+  harness.start("evil"); // page-triggered re-entry, still inside the outer build
+  assert.strictEqual(
+    harness.budget(),
+    0,
+    "a nested build replenished the active build's budget",
+  );
+});
+
+check("a submitter override costs ONE resolution, not two", () => {
+  // The owner's action was resolved and then discarded whenever a formaction override won, so
+  // every submitter charged the work budget twice -- directly counter to the bound this suite
+  // exists to defend. A near-cap shared action plus many short overrides exhausted the budget in
+  // ~124 controls while every effective destination was small.
+  let constructions = 0;
+  class CountingURL extends URL {
+    constructor(...args) {
+      super(...args);
+      constructions++;
+    }
+  }
+  const START = 100000;
+  const harness = new Function(
+    "URL",
+    `let __destinationFactBudget = ${START};
+     ${extract("normalizeFormMethod")}
+     ${extract("spendDestinationBudget")}
+     ${extract("buildDestinationFacts")}
+     return { build: buildDestinationFacts, remaining: () => __destinationFactBudget };`,
+  )(CountingURL);
+  const facts = harness.build(
+    stubElement({
+      tag: "input",
+      attrs: { type: "submit", formaction: "/override" },
+      form: stubForm({ action: "/a-much-longer-owner-action", method: "post" }),
+    }),
+    "input",
+  );
+  assert.deepStrictEqual(facts, {
+    kind: "form",
+    url: "https://site.example/override",
+    method: "post",
+  });
+  assert.strictEqual(
+    constructions,
+    1,
+    `resolved ${constructions} times, want 1`,
+  );
+  // Exact spend pins the charge too: only "/override" (9) against the base (25) may be billed.
+  assert.strictEqual(
+    harness.remaining(),
+    START - ("/override".length + DOC.baseURI.length),
+    "the discarded owner action was still charged",
+  );
+});
+
 check("a hostile cost cannot INFLATE the budget", () => {
   // _wrap_js_in_isolated_scope exports every top-level declaration onto globalThis, so a page can
   // call this while a build is awaiting. Probed in real Chromium: spend(-Infinity) returned true,
