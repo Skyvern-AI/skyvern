@@ -124,6 +124,11 @@ class SkyvernContext:
     browser_container_ip: str | None = None
     browser_container_task_arn: str | None = None
     feature_flag_entries: dict[str, bool | str | None] = field(default_factory=dict)
+    # Absolute event-loop time the run body's elapsed-time budget expires, set alongside the
+    # asyncio.timeout that enforces it. None when nothing is enforcing one. Read by work that
+    # may block for a long time, so it can give up and return rather than be cancelled — a
+    # cancellation propagates as BaseException and skips handlers that degrade gracefully.
+    max_elapsed_deadline: float | None = None
 
     # feature flags
     enable_page_ready_wait: bool = False
