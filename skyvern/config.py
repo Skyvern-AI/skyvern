@@ -287,6 +287,11 @@ class Settings(BaseSettings):
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
     AWS_S3_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
     AWS_S3_BUCKET_UPLOADS: str = "skyvern-uploads"
+    # ISO-8601 UTC timestamp. Runs created at/after it that have zero DOWNLOAD artifact
+    # rows skip the legacy S3 LIST fallback in get_downloaded_files — such runs register
+    # every download as a row at save time (SKY-8861), so the LIST can only return empty.
+    # None keeps the LIST fallback for every run.
+    DOWNLOADS_EMPTY_S3_LISTING_CUTOVER: str | None = None
 
     # Azure Blob Storage settings
     AZURE_STORAGE_ACCOUNT_NAME: str | None = None

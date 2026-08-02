@@ -8,6 +8,7 @@ from skyvern.constants import DEFAULT_LOGIN_PROMPT
 from skyvern.exceptions import MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.routes.code_samples import (
     DOWNLOAD_FILES_CODE_SAMPLE_PYTHON,
     DOWNLOAD_FILES_CODE_SAMPLE_TS,
@@ -156,6 +157,11 @@ async def login(
     x_api_key: Annotated[str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
+    await PermissionCheckerFactory.get_instance().check(
+        organization, browser_session_id=login_request.browser_session_id
+    )
+    await app.RATE_LIMITER.rate_limit_submit_run(organization.organization_id)
+
     url = _validate_url(login_request.url)
     totp_verification_url = _validate_url(login_request.totp_url)
     webhook_url = _validate_url(login_request.webhook_url)
@@ -320,6 +326,11 @@ async def download_files(
     x_api_key: Annotated[str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
+    await PermissionCheckerFactory.get_instance().check(
+        organization, browser_session_id=download_files_request.browser_session_id
+    )
+    await app.RATE_LIMITER.rate_limit_submit_run(organization.organization_id)
+
     url = _validate_url(download_files_request.url)
     totp_verification_url = _validate_url(download_files_request.totp_url)
     webhook_url = _validate_url(download_files_request.webhook_url)
