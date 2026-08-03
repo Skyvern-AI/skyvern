@@ -93,7 +93,8 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
-import { DeleteConfirmationDialog } from "@/components/DeleteConfirmationDialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { AffectedBlocksNotice } from "./AffectedBlocksNotice";
 import { BrowserStream } from "@/components/BrowserStream";
 import { RecordingPanel } from "@/routes/workflows/editor/recording/RecordingPanel";
 import { useApplyRecordedBlocks } from "@/routes/workflows/editor/recording/useApplyRecordedBlocks";
@@ -3076,7 +3077,7 @@ function Workspace({
           }
         }}
       />
-      <DeleteConfirmationDialog
+      <ConfirmDialog
         open={deleteBlockDialogState.open}
         onOpenChange={(open) => {
           if (!open) {
@@ -3088,9 +3089,9 @@ function Workspace({
             });
           }
         }}
-        title="Delete Block"
-        description={`Are you sure you want to delete "${deleteBlockDialogState.nodeLabel}"?`}
-        affectedBlocks={affectedBlocksForDelete}
+        title={`Delete block "${deleteBlockDialogState.nodeLabel}"?`}
+        description="This block will be deleted from the agent."
+        reversible
         onConfirm={() => {
           if (deleteConfirmCallbackRef.current) {
             deleteConfirmCallbackRef.current();
@@ -3102,7 +3103,9 @@ function Workspace({
             nodeLabel: null,
           });
         }}
-      />
+      >
+        <AffectedBlocksNotice affectedBlocks={affectedBlocksForDelete} />
+      </ConfirmDialog>
 
       {/* Studio: the cache key/value panel escapes the Editor pane via the
           shell-level portal, so the Overview pane's Code view can open it (and
