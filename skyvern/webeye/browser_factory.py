@@ -59,7 +59,6 @@ from skyvern.webeye.cdp_connection import (
 )
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, bind_download_interceptor_to_context
 from skyvern.webeye.dialog_handler import set_dialog_handler
-from skyvern.webeye.navigation_egress_guard import arm_navigation_egress_guard
 from skyvern.webeye.session_cookies import restore_banked_cookies, restore_session_cookies
 
 LOG = structlog.get_logger()
@@ -710,7 +709,6 @@ class BrowserContextFactory:
                 headers=scoped_headers,
                 route_handlers_allowed=route_handlers_allowed,
             )
-            arm_navigation_egress_guard(browser_context)
 
             proxy_location: ProxyLocationInput = kwargs.get("proxy_location")
             if isinstance(proxy_location, ProxyLocation):
