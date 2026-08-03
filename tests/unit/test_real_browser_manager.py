@@ -6,6 +6,7 @@ behind `if not browser_session_id:`, causing PBS workflow runs to skip the cache
 on every call and re-invoke navigate_to_url() on every step.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -233,6 +234,9 @@ async def test_child_run_recovers_live_inherited_browser_without_page() -> None:
     live_state = MagicMock()
     live_state.get_working_page = AsyncMock(side_effect=[None, MagicMock()])
     live_state.is_connected = MagicMock(return_value=True)
+    # A genuinely live tab-less context answers the bounded read-only liveness probe.
+    live_state.browser_context = MagicMock()
+    live_state.browser_context.cookies = AsyncMock(return_value=[])
     live_state.get_or_create_page = AsyncMock()
     manager.pages["wfr_parent"] = live_state
 
@@ -253,6 +257,189 @@ async def test_child_run_recovers_live_inherited_browser_without_page() -> None:
     # Both entries still point at the live browser so it stays tracked for cleanup.
     assert manager.pages["wfr_child"] is live_state
     assert manager.pages["wfr_parent"] is live_state
+
+
+class _FakeDriverClosedError(Exception):
+    """Production-shaped closed-transport error: a dead Playwright/Patchright driver pipe
+    surfaces this message on the first round-trip after the connection silently died."""
+
+
+class TargetClosedError(Exception):
+    """Named to match Playwright/Patchright ``TargetClosedError`` by type name only.
+
+    ``scripts/patch_browser.sh`` rewrites playwright -> patchright for the agent image but not
+    for ``cloud/persistent_browsers``, so closed-transport classification must match by type
+    name/message, never by imported class identity.
+    """
+
+
+@pytest.mark.asyncio
+async def test_child_run_does_not_adopt_inherited_browser_with_dead_transport() -> None:
+    """SKY-13389: ``is_connected()`` only reads cached client-side flags, so an inherited browser
+    whose driver/CDP transport died while idle (a long sequential-gate wait, a reaped remote
+    browser, a TCP half-close) still reports connected. Taking the #14311 same-context recovery
+    then runs ``new_page()`` on a dead transport and crashes the run with
+    "Connection closed while reading from the driver". The manager must actively probe the
+    transport before same-context recovery and, on a dead transport, evict + create a fresh
+    browser instead.
+    """
+    manager = RealBrowserManager()
+    # Inherited parent-key browser: page-less, reports connected (cached false positive),
+    # but every real round-trip over its dead driver raises the closed-transport error.
+    dead_state = MagicMock()
+    dead_state.get_working_page = AsyncMock(return_value=None)
+    dead_state.is_connected = MagicMock(return_value=True)
+    dead_state.browser_context = MagicMock()
+    dead_state.browser_context.cookies = AsyncMock(
+        side_effect=_FakeDriverClosedError("BrowserContext.cookies: Connection closed while reading from the driver")
+    )
+    # If the pre-fix #14311 path is taken, new_page() inside get_or_create_page raises the same
+    # error and crashes the run (reproducing the production crash signature).
+    dead_state.get_or_create_page = AsyncMock(
+        side_effect=_FakeDriverClosedError("BrowserContext.new_page: Connection closed while reading from the driver")
+    )
+    manager.pages["wfr_parent"] = dead_state
+
+    workflow_run = make_workflow_run("wfr_child", parent_workflow_run_id="wfr_parent")
+    fresh_state = MagicMock()
+    fresh_state.get_or_create_page = AsyncMock()
+
+    with patch.object(manager, "_create_browser_state", new=AsyncMock(return_value=fresh_state)) as mock_create:
+        result = await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url="https://example.com",
+            browser_session_id=None,
+        )
+
+    # A fresh browser is created; the dead browser is never recovered in-place.
+    mock_create.assert_awaited_once()
+    assert result is fresh_state
+    assert result is not dead_state
+    dead_state.get_or_create_page.assert_not_awaited()
+    assert manager.pages["wfr_child"] is fresh_state
+    assert manager.pages["wfr_parent"] is fresh_state
+
+
+@pytest.mark.asyncio
+async def test_child_run_evicts_inherited_browser_when_transport_probe_times_out() -> None:
+    """A dead transport can hang rather than error; the bounded probe must time out and classify
+    the inherited browser disconnected so the run gets a fresh browser instead of stalling."""
+    manager = RealBrowserManager()
+    dead_state = MagicMock()
+    dead_state.get_working_page = AsyncMock(return_value=None)
+    dead_state.is_connected = MagicMock(return_value=True)
+
+    async def _hang(*args: object, **kwargs: object) -> list:
+        await asyncio.sleep(1)
+        return []
+
+    dead_state.browser_context = MagicMock()
+    dead_state.browser_context.cookies = _hang
+    dead_state.get_or_create_page = AsyncMock()
+    manager.pages["wfr_parent"] = dead_state
+
+    workflow_run = make_workflow_run("wfr_child", parent_workflow_run_id="wfr_parent")
+    fresh_state = MagicMock()
+    fresh_state.get_or_create_page = AsyncMock()
+
+    with (
+        patch.object(real_browser_manager, "_INHERITED_BROWSER_LIVENESS_PROBE_TIMEOUT_SECONDS", 0.01),
+        patch.object(manager, "_create_browser_state", new=AsyncMock(return_value=fresh_state)) as mock_create,
+    ):
+        result = await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url="https://example.com",
+            browser_session_id=None,
+        )
+
+    mock_create.assert_awaited_once()
+    assert result is fresh_state
+    dead_state.get_or_create_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_child_run_evicts_inherited_browser_on_target_closed_by_name() -> None:
+    """Closed-transport is classified by exception type NAME, not imported identity, because
+    scripts/patch_browser.sh swaps playwright -> patchright for the agent image only. A
+    TargetClosedError from either package (message alone not matching) still evicts + goes fresh."""
+    manager = RealBrowserManager()
+    dead_state = MagicMock()
+    dead_state.get_working_page = AsyncMock(return_value=None)
+    dead_state.is_connected = MagicMock(return_value=True)
+    dead_state.browser_context = MagicMock()
+    dead_state.browser_context.cookies = AsyncMock(side_effect=TargetClosedError("boom"))
+    dead_state.get_or_create_page = AsyncMock()
+    manager.pages["wfr_parent"] = dead_state
+
+    workflow_run = make_workflow_run("wfr_child", parent_workflow_run_id="wfr_parent")
+    fresh_state = MagicMock()
+    fresh_state.get_or_create_page = AsyncMock()
+
+    with patch.object(manager, "_create_browser_state", new=AsyncMock(return_value=fresh_state)) as mock_create:
+        result = await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url="https://example.com",
+            browser_session_id=None,
+        )
+
+    mock_create.assert_awaited_once()
+    assert result is fresh_state
+    dead_state.get_or_create_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_child_run_reraises_unexpected_probe_error() -> None:
+    """An unexpected (non closed-transport) probe error must propagate, never be silently
+    converted into a fresh-browser fallback that could mask a real defect."""
+    manager = RealBrowserManager()
+    state = MagicMock()
+    state.get_working_page = AsyncMock(return_value=None)
+    state.is_connected = MagicMock(return_value=True)
+    state.browser_context = MagicMock()
+    state.browser_context.cookies = AsyncMock(side_effect=ValueError("unexpected probe failure"))
+    manager.pages["wfr_parent"] = state
+
+    workflow_run = make_workflow_run("wfr_child", parent_workflow_run_id="wfr_parent")
+
+    with patch.object(manager, "_create_browser_state", new=AsyncMock()) as mock_create:
+        with pytest.raises(ValueError, match="unexpected probe failure"):
+            await manager.get_or_create_for_workflow_run(
+                workflow_run=workflow_run,
+                url="https://example.com",
+                browser_session_id=None,
+            )
+
+    mock_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inherited_browser_transport_alive_skips_probe_when_already_disconnected() -> None:
+    state = MagicMock()
+    state.is_connected = MagicMock(return_value=False)
+    state.browser_context = MagicMock()
+    state.browser_context.cookies = AsyncMock()
+
+    assert await real_browser_manager._inherited_browser_transport_alive(state) is False
+    state.browser_context.cookies.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inherited_browser_transport_alive_false_when_no_context() -> None:
+    state = MagicMock()
+    state.is_connected = MagicMock(return_value=True)
+    state.browser_context = None
+
+    assert await real_browser_manager._inherited_browser_transport_alive(state) is False
+
+
+@pytest.mark.asyncio
+async def test_inherited_browser_transport_alive_true_when_probe_succeeds() -> None:
+    state = MagicMock()
+    state.is_connected = MagicMock(return_value=True)
+    state.browser_context = MagicMock()
+    state.browser_context.cookies = AsyncMock(return_value=[])
+
+    assert await real_browser_manager._inherited_browser_transport_alive(state) is True
 
 
 def make_task(

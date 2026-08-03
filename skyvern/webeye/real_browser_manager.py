@@ -54,6 +54,69 @@ def _is_cached_cdp_drop_error(exc: FailedToNavigateToUrl) -> bool:
     return any(needle in message for needle in _CACHED_CDP_DROP_ERROR_SUBSTRINGS)
 
 
+# A bounded, read-only probe confirms an inherited browser's transport is really alive before
+# the same-context (#14311) recovery runs new_page() on it. Kept small so the rare page-less
+# inheritance path never stalls; a live cookies() round-trip returns well under this.
+_INHERITED_BROWSER_LIVENESS_PROBE_TIMEOUT_SECONDS = 5.0
+
+# Closed-transport signatures matched by message substring and by type NAME, never by imported
+# class identity: scripts/patch_browser.sh rewrites playwright -> patchright for the agent image
+# but not for cloud/persistent_browsers, so the two packages expose distinct TargetClosedError
+# classes (see skyvern/webeye/cdp_frame_publisher.py for the same name-based matching).
+_CLOSED_TRANSPORT_ERROR_SUBSTRINGS = (
+    "Connection closed while reading from the driver",
+    "Target page, context or browser has been closed",
+    "Target closed",
+    "Browser closed",
+)
+_CLOSED_TRANSPORT_ERROR_TYPE_NAMES = ("TargetClosedError",)
+
+
+def _is_closed_transport_error(exc: BaseException) -> bool:
+    if type(exc).__name__ in _CLOSED_TRANSPORT_ERROR_TYPE_NAMES:
+        return True
+    message = str(exc)
+    return any(needle in message for needle in _CLOSED_TRANSPORT_ERROR_SUBSTRINGS)
+
+
+async def _inherited_browser_transport_alive(browser_state: BrowserState) -> bool:
+    """Truthfully classify an inherited, page-less browser as connected before same-context recovery.
+
+    ``is_connected()`` only inspects cached client-side flags, so a driver/CDP transport that died
+    with no I/O since (a long sequential-gate wait, a reaped remote browser, a NAT/LB idle timeout,
+    a TCP half-close) still reports connected. Confirm with one bounded, read-only round-trip:
+    a genuinely live tab-less context answers and is reused (preserving cookies/session), while a
+    dead transport is classified disconnected here and routed to the existing fresh-browser path,
+    instead of crashing the #14311 ``new_page()`` recovery with
+    "Connection closed while reading from the driver" (SKY-13389).
+    """
+    if not browser_state.is_connected():
+        return False
+    context = browser_state.browser_context
+    if context is None:
+        return False
+    try:
+        async with asyncio.timeout(_INHERITED_BROWSER_LIVENESS_PROBE_TIMEOUT_SECONDS):
+            await context.cookies()
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        # Process-control signals are never a browser-liveness verdict — propagate untouched.
+        raise
+    except (asyncio.TimeoutError, TimeoutError):
+        LOG.info("Inherited browser liveness probe timed out; treating browser as disconnected")
+        return False
+    except Exception as exc:
+        # Only a genuinely closed transport counts as disconnected; anything else is an unexpected
+        # programming error that must not be silently swallowed into a fresh-browser fallback.
+        if _is_closed_transport_error(exc):
+            LOG.info(
+                "Inherited browser liveness probe hit a closed transport; treating browser as disconnected",
+                error=str(exc),
+            )
+            return False
+        raise
+    return True
+
+
 async def _rebind_pbs_download_dir(
     browser_state: BrowserState,
     workflow_run: WorkflowRun,
@@ -573,11 +636,13 @@ class RealBrowserManager(BrowserManager):
                 # browser here. This early-return path skips get_or_create_page, so returning a
                 # page-less state would fail the run's first browser block with a missing page.
                 working_page = await browser_state.get_working_page()
-                if working_page is None and browser_state.is_connected():
+                if working_page is None and await _inherited_browser_transport_alive(browser_state):
                     # The inherited browser is still live but its last valid tab was closed
                     # (e.g. a use_parent_browser_session child whose prior run closed the last
                     # page). Recreate a page in the SAME context so the child keeps the parent's
                     # cookies/session, instead of orphaning the live browser and starting fresh.
+                    # Liveness is actively probed (not just is_connected()'s cached flags) so a
+                    # transport that died while idle falls through to a fresh browser (SKY-13389).
                     LOG.info(
                         "Inherited parent browser is live but has no working page; recreating a page in the same context",
                         workflow_run_id=workflow_run_id,
