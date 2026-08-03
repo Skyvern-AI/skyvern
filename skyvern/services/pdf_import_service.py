@@ -115,6 +115,12 @@ class PDFImportService:
                     blk[field] = cleaned
                     referenced.update(used)
 
+            # A non-null prompt is what makes the editor render the code-first node; "" is
+            # runtime-neutral (every backend prompt check is truthiness based) and leaves the
+            # Goal for the user, because a fabricated one would arm runtime self-heal.
+            if blk.get("block_type") == "code" and "prompt" not in blk:
+                blk["prompt"] = ""
+
             # Ensure required fields for text_prompt blocks
             if blk.get("block_type") == "text_prompt":
                 if not blk.get("prompt"):

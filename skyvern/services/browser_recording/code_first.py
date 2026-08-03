@@ -15,6 +15,7 @@ import structlog
 
 from skyvern.client.types.workflow_definition_yaml_blocks_item import WorkflowDefinitionYamlBlocksItem_Code
 from skyvern.client.types.workflow_definition_yaml_parameters_item import WorkflowDefinitionYamlParametersItem_Workflow
+from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block, synthesize_goto_code_block
 from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
@@ -297,6 +298,11 @@ def actions_to_code_first_blocks(
                 parameter_keys=block_parameter_keys or None,
                 # Editor's convertToNode reads block.parameters.map(p => p.key); mirror the action block.
                 parameters=[{"key": key} for key in block_parameter_keys],
+                # A non-null prompt is what makes the editor render the code-first node; "" is
+                # runtime-neutral (every backend prompt check is truthiness based) and leaves the
+                # Goal for the user, because a fabricated one would arm runtime self-heal.
+                prompt="",
+                steps=derive_code_block_steps(code) or None,
             )
         )
 
