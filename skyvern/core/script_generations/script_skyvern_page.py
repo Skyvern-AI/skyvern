@@ -69,7 +69,6 @@ from skyvern.webeye.actions.handler import (
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_state import BrowserState
-from skyvern.webeye.navigation_egress_guard import install_navigation_egress_guard
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -1051,11 +1050,6 @@ class ScriptSkyvernPage(SkyvernPage):
 
         timeout = kwargs.pop("timeout", settings.BROWSER_LOADING_TIMEOUT_MS)
         max_retries = kwargs.pop("max_retries", NAVIGATION_MAX_RETRY_TIME)
-
-        # This flow acquires the browser with navigate=False and drives page.goto itself, so the
-        # context page event is the only other thing that would arm the guard — and it can lose the
-        # race against a goto issued in the same tick.
-        await install_navigation_egress_guard(self.page)
 
         # Retry logic matching agent mode (real_browser_state.navigate_to_url)
         last_error: Exception | None = None

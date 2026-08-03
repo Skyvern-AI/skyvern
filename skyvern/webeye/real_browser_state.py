@@ -33,7 +33,6 @@ from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFac
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import disable_download_interceptor_for_context
 from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
-from skyvern.webeye.navigation_egress_guard import install_navigation_egress_guard
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
 from skyvern.webeye.session_cookies import persist_session_cookies
@@ -263,9 +262,6 @@ class RealBrowserState(BrowserState):
         retry_times: int = NAVIGATION_MAX_RETRY_TIME,
         wait_until: Literal["load", "domcontentloaded", "commit"] = "load",
     ) -> None:
-        # Stays attached for the page's lifetime, so later same-page navigations (link clicks,
-        # script redirects, form posts) are classified per hop too, not just this goto.
-        await install_navigation_egress_guard(page)
         await navigate_with_retry(
             navigate=lambda strategy: page.goto(url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS, wait_until=strategy),
             url=url,
