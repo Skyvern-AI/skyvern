@@ -680,29 +680,6 @@ def _build_managed_browser_profile_name(workflow_title: str | None, rendered_key
     return f"{title}{suffix}"
 
 
-def _credential_id_from_setup_parameter(parameter: Any, parameter_values: dict[str, Any]) -> str | None:
-    """Resolve the credential id a credential-typed block parameter points at from in-memory run
-    parameters. The per-run rotation selection (keyed by parameter key) wins over the static value.
-    Only credential-typed parameters are consulted, so an unrelated string input can never be mistaken
-    for a credential id."""
-    if isinstance(parameter, CredentialParameter):
-        selected = parameter_values.get(parameter.key)
-        if isinstance(selected, str) and selected:
-            return selected
-        return parameter.credential_id
-    if (
-        isinstance(parameter, WorkflowParameter)
-        and parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
-    ):
-        selected = parameter_values.get(parameter.key)
-        if isinstance(selected, str) and selected:
-            return selected
-        default_value = parameter.default_value
-        if isinstance(default_value, str) and default_value:
-            return default_value
-    return None
-
-
 class WorkflowService:
     # Prevent GC of fire-and-forget asyncio tasks (e.g. task_run sync).
     _background_tasks: set[asyncio.Task] = set()  # noqa: RUF012
@@ -2255,9 +2232,10 @@ class WorkflowService:
                 # stamp keeps today's path.
                 credential_browser_profile_id = await self._resolve_setup_credential_seed(
                     workflow=workflow,
-                    parameter_values=parameter_values,
+                    workflow_run_id=workflow_run.workflow_run_id,
                     organization_id=organization_id,
                     engine_enabled=engine_enabled,
+                    parameter_values=parameter_values,
                 )
                 if credential_browser_profile_id:
                     return credential_browser_profile_id, BrowserSeedSource.credential, own_browser_profile_id
@@ -2277,9 +2255,10 @@ class WorkflowService:
         # behavior change, so flag-off falls to fresh and the preserved mid-run stamp keeps today's path.
         credential_browser_profile_id = await self._resolve_setup_credential_seed(
             workflow=workflow,
-            parameter_values=parameter_values,
+            workflow_run_id=workflow_run.workflow_run_id,
             organization_id=organization_id,
             engine_enabled=engine_enabled,
+            parameter_values=parameter_values,
         )
         if credential_browser_profile_id:
             return credential_browser_profile_id, BrowserSeedSource.credential, None
@@ -2290,9 +2269,10 @@ class WorkflowService:
         self,
         *,
         workflow: Workflow,
-        parameter_values: dict[str, Any],
+        workflow_run_id: str,
         organization_id: str,
         engine_enabled: bool,
+        parameter_values: dict[str, Any],
     ) -> str | None:
         """Setup-time credential-profile seed, gated on the browser-memory engine. Flag-off returns None
         so the fleet keeps today's behavior (fresh until the login block's mid-run stamp); the engine era
@@ -2300,7 +2280,10 @@ class WorkflowService:
         if not engine_enabled:
             return None
         return await self._resolve_credential_browser_profile_id_for_setup(
-            workflow=workflow, parameter_values=parameter_values, organization_id=organization_id
+            workflow=workflow,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            parameter_values=parameter_values,
         )
 
     async def _resolve_picked_profile_role(
@@ -2334,23 +2317,56 @@ class WorkflowService:
             )
             return "error", None
 
+    async def _resolve_single_login_credential_ids_for_setup(
+        self, *, workflow: Workflow, workflow_run_id: str, organization_id: str, parameter_values: dict[str, Any]
+    ) -> list[str]:
+        """Credential ids for the run's single unambiguous login block, resolved via the SAME rich path
+        as the mid-run login-block stamp (workflow_run_context / rotation pool / DB fallback selection /
+        static credential id). Resolving pool- and DB-selected credentials here is what lets setup seed
+        and pin the same account the block signs into — the only loader that can win when a cached-script
+        or pre-navigating block opens the browser before the login block runs, which locks the mid-run
+        loader out. parameter_values carries the in-memory render values so a request-supplied
+        WorkflowParameter/CREDENTIAL_ID resolves at setup, before run parameters are persisted.
+
+        Returns an empty list when resolution must defer to the mid-run stamp: any conditional branching
+        (the executing branch is unknown at setup) or not exactly one non-skip login block. Best-effort:
+        a resolution failure defers rather than aborting setup."""
+        all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
+        if any(isinstance(block, ConditionalBlock) for block in all_blocks):
+            return []
+        login_blocks = [b for b in all_blocks if isinstance(b, LoginBlock) and not b.skip_saved_profile]
+        if len(login_blocks) != 1:
+            return []
+        try:
+            return await self._resolve_login_block_credential_ids(
+                login_blocks[0],
+                workflow_run_id,
+                organization_id,
+                workflow.workflow_permanent_id,
+                run_parameter_values=parameter_values,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to resolve setup login credential ids",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                exc_info=True,
+            )
+            return []
+
     async def _resolve_active_credential_pin_for_setup(
-        self, *, workflow: Workflow, parameter_values: dict[str, Any], organization_id: str
+        self, *, workflow: Workflow, workflow_run_id: str, organization_id: str, parameter_values: dict[str, Any]
     ) -> tuple[str, str] | None:
         """The run's active single-login credential's dedicated-IP pin at setup — (credential_id,
         proxy_session_id) if that credential pins its IP, else None. Same single-unambiguous-login guard
         as the credential-profile seed (branches / multiple logins defer). B4: this pin wins over the
         seed profile's own pin (the site tracks IP per account)."""
-        all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
-        if any(isinstance(block, ConditionalBlock) for block in all_blocks):
-            return None
-        login_blocks = [b for b in all_blocks if isinstance(b, LoginBlock) and not b.skip_saved_profile]
-        if len(login_blocks) != 1:
-            return None
-        for param in login_blocks[0].parameters:
-            credential_id = _credential_id_from_setup_parameter(param, parameter_values)
-            if not credential_id:
-                continue
+        credential_ids = await self._resolve_single_login_credential_ids_for_setup(
+            workflow=workflow,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            parameter_values=parameter_values,
+        )
+        for credential_id in credential_ids:
             try:
                 db_cred = await app.DATABASE.credentials.get_credential(
                     credential_id=credential_id, organization_id=organization_id
@@ -2387,7 +2403,10 @@ class WorkflowService:
             proxy_session_id: str | None = None
             pinned_credential_id: str | None = None
             active = await self._resolve_active_credential_pin_for_setup(
-                workflow=workflow, parameter_values=parameter_values, organization_id=organization_id
+                workflow=workflow,
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=organization_id,
+                parameter_values=parameter_values,
             )
             if active:
                 pinned_credential_id, proxy_session_id = active
@@ -2516,35 +2535,25 @@ class WorkflowService:
         self,
         *,
         workflow: Workflow,
-        parameter_values: dict[str, Any],
+        workflow_run_id: str,
         organization_id: str,
+        parameter_values: dict[str, Any],
     ) -> str | None:
-        """Setup-time (pre-persist) variant of the login-block credential-profile resolution: reads the
-        run's selected credential from the in-memory parameter values (rotation selections keyed by
-        parameter key) rather than the DB, so the credential's saved profile can seed the run before
-        any browser is created.
+        """Setup-time (pre-persist) variant of the login-block credential-profile resolution: resolves
+        the run's login credential via the same rich path as the mid-run stamp (see
+        _resolve_single_login_credential_ids_for_setup) so the credential's saved profile can seed the
+        run before any browser is created.
 
         Only resolves when a single login block makes the credential unambiguous. With multiple login
         blocks (e.g. one per conditional branch) the executing block is unknown at setup, so resolution
         is deferred to the mid-run login-block stamp rather than risk seeding the wrong account."""
-        # Setup can't know which branch a run takes, so only seed the credential when execution of a
-        # single login is guaranteed: no conditional branching anywhere, and exactly one top-level
-        # login block. Anything else (branches, nested/multiple logins) defers to the mid-run stamp,
-        # which resolves the login that actually runs. This keeps the common linear case working while
-        # never booting the wrong account on a branch that skips the login.
-        all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
-        if any(isinstance(block, ConditionalBlock) for block in all_blocks):
-            return None
-        # Count over ALL blocks (not just top level): a login nested in a non-conditional container
-        # (e.g. a for-loop) still executes, so it must count toward the single-login guarantee or a
-        # top-level + nested pair would seed the wrong account instead of deferring to the mid-run stamp.
-        login_blocks = [block for block in all_blocks if isinstance(block, LoginBlock) and not block.skip_saved_profile]
-        if len(login_blocks) != 1:
-            return None
-        for param in login_blocks[0].parameters:
-            credential_id = _credential_id_from_setup_parameter(param, parameter_values)
-            if not credential_id:
-                continue
+        credential_ids = await self._resolve_single_login_credential_ids_for_setup(
+            workflow=workflow,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            parameter_values=parameter_values,
+        )
+        for credential_id in credential_ids:
             try:
                 db_cred = await app.DATABASE.credentials.get_credential(
                     credential_id=credential_id,
@@ -5646,8 +5655,14 @@ class WorkflowService:
         workflow_run_id: str | None,
         organization_id: str | None = None,
         workflow_permanent_id: str | None = None,
+        run_parameter_values: dict[str, Any] | None = None,
     ) -> list[str]:
-        """Return credential ids bound to this block, preserving parameter order."""
+        """Return credential ids bound to this block, preserving parameter order.
+
+        run_parameter_values, when provided, supplies the in-memory render values (rotation selection,
+        dereferenced indirection, or request value) and wins for both credential styles. Setup resolves
+        the seed BEFORE the run context and run parameters are persisted, so the persisted reads below are
+        empty then; mid-run (block execution) passes None and the persisted state is authoritative."""
         params = block.parameters
 
         # Pre-fetch run parameters once (used by WorkflowParameter/CREDENTIAL_ID style).
@@ -5659,40 +5674,55 @@ class WorkflowService:
 
             # Style 1: CredentialParameter (has credential_id directly)
             if isinstance(param, CredentialParameter):
-                credential_id = await self._resolve_credential_parameter_id(
-                    parameter=param,
-                    workflow_run_id=workflow_run_id,
-                    organization_id=organization_id,
-                    workflow_permanent_id=workflow_permanent_id,
-                )
+                # In-memory render values win when provided (setup): they already carry the rotation
+                # selection and any dereferenced indirection, which the persisted-state resolver below
+                # can't see until the run context / selections are persisted.
+                if run_parameter_values is not None:
+                    selected = run_parameter_values.get(param.key)
+                    if isinstance(selected, str) and selected:
+                        credential_id = selected
+                if not credential_id:
+                    credential_id = await self._resolve_credential_parameter_id(
+                        parameter=param,
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                        workflow_permanent_id=workflow_permanent_id,
+                    )
 
             # Style 2: WorkflowParameter with type CREDENTIAL_ID
             elif (
                 isinstance(param, WorkflowParameter)
                 and getattr(param, "workflow_parameter_type", None) == WorkflowParameterType.CREDENTIAL_ID
             ):
-                # The credential_id is stored as the run-parameter value (or
-                # falls back to default_value on the workflow parameter).
-                if workflow_run_id is None:
-                    run_param_tuples = []
-                elif run_param_tuples is None:
-                    try:
-                        run_param_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
-                            workflow_run_id=workflow_run_id,
-                        )
-                    except Exception:
-                        LOG.warning(
-                            "Failed to fetch workflow run parameters for credential resolution",
-                            workflow_run_id=workflow_run_id,
-                            exc_info=True,
-                        )
-                        run_param_tuples = []
+                # In-memory render values win when provided: setup resolves the seed before run
+                # parameters are persisted, so the DB read below is empty at that point.
+                if run_parameter_values is not None:
+                    selected = run_parameter_values.get(param.key)
+                    if isinstance(selected, str) and selected:
+                        credential_id = selected
 
-                for wf_param, run_param in run_param_tuples:
-                    if wf_param.key == param.key:
-                        if isinstance(run_param.value, str) and run_param.value:
-                            credential_id = run_param.value
-                        break
+                # Otherwise the credential_id is the persisted run-parameter value.
+                if not credential_id:
+                    if workflow_run_id is None:
+                        run_param_tuples = []
+                    elif run_param_tuples is None:
+                        try:
+                            run_param_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
+                                workflow_run_id=workflow_run_id,
+                            )
+                        except Exception:
+                            LOG.warning(
+                                "Failed to fetch workflow run parameters for credential resolution",
+                                workflow_run_id=workflow_run_id,
+                                exc_info=True,
+                            )
+                            run_param_tuples = []
+
+                    for wf_param, run_param in run_param_tuples:
+                        if wf_param.key == param.key:
+                            if isinstance(run_param.value, str) and run_param.value:
+                                credential_id = run_param.value
+                            break
 
                 # Fallback to default_value
                 if not credential_id:
