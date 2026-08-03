@@ -233,6 +233,20 @@ RUN_BLOCKS_POLL_INTERVAL_SECONDS = 5.0
 
 COPILOT_SANDBOX_UNAVAILABLE_ERROR = "Sandboxed worker is unavailable; execution was not started."
 
+# Block types that can reach exec() in the API process, so a run containing one may
+# only proceed on the sandboxed worker. CODE compiles user code directly;
+# WORKFLOW_TRIGGER runs its child in-process with block_labels=None, which both
+# executes the child's own code blocks and re-opens the cached-script import path;
+# TaskV2 synthesizes a code block at runtime from planner output. The latter two
+# cannot be proven code-free by inspecting the draft, so they stay fail-closed.
+_SANDBOX_REQUIRED_BLOCK_TYPES = frozenset(
+    {
+        BlockType.CODE.value,
+        BlockType.WORKFLOW_TRIGGER.value,
+        BlockType.TaskV2.value,
+    }
+)
+
 # Detached cleanup tasks held here so the garbage collector does not drop them
 # while they still have work to do, and so the "task exception was never
 # retrieved" warning cannot fire — each task adds a done-callback that logs
@@ -424,7 +438,27 @@ def _maybe_clear_reconciliation_flag(copilot_ctx: Any, result: Any) -> None:
 
 
 def _copilot_sandbox_unavailable_result() -> dict[str, Any]:
-    return {"ok": False, "error": COPILOT_SANDBOX_UNAVAILABLE_ERROR}
+    # No repair can make the sandbox reachable, so the result carries
+    # UNRECOVERABLE_TOOL_ERROR to reach the contract's STOP lane. Without it the
+    # refusal classifies as a generic FAILED_RUN and the enforcement loop nudges
+    # the model to retry a run that never started.
+    return {
+        "ok": False,
+        "error": COPILOT_SANDBOX_UNAVAILABLE_ERROR,
+        "data": {
+            "workflow_run_id": None,
+            "overall_status": "failed",
+            "failure_reason": COPILOT_SANDBOX_UNAVAILABLE_ERROR,
+            "blocks": [],
+            "failure_categories": [
+                {
+                    "category": "UNRECOVERABLE_TOOL_ERROR",
+                    "confidence_float": 1.0,
+                    "reasoning": "Sandboxed execution was unavailable; no workflow run was created.",
+                }
+            ],
+        },
+    }
 
 
 def _mark_pending_reconciliation_run(copilot_ctx: Any, workflow_run_id: str) -> None:
@@ -1002,6 +1036,33 @@ def _selected_code_security_inputs(
                 )
             )
     return code_blocks
+
+
+def _selected_blocks_require_sandbox(
+    blocks: list[Any],
+    *,
+    selected_labels: set[str],
+    include_descendants: bool = False,
+) -> bool:
+    for block in blocks:
+        if isinstance(block, Mapping):
+            label = str(block.get("label") or "")
+            block_type = str(block.get("block_type") or "").lower()
+            children = _mapping_child_blocks(block)
+        else:
+            label = str(getattr(block, "label", "") or "")
+            block_type = str(getattr(block, "block_type", "") or "").lower()
+            children = _typed_child_blocks(block)
+        selected = include_descendants or label in selected_labels
+        if selected and block_type in _SANDBOX_REQUIRED_BLOCK_TYPES:
+            return True
+        if children and _selected_blocks_require_sandbox(
+            children,
+            selected_labels=selected_labels,
+            include_descendants=selected,
+        ):
+            return True
+    return False
 
 
 def _mapping_child_blocks(block: Mapping[str, Any]) -> list[Any]:
@@ -1606,15 +1667,37 @@ async def _run_blocks_and_collect_debug(
         if not workflow.get_output_parameter(label):
             return {"ok": False, "error": f"Block label not found in saved workflow: {label!r}"}
 
+    workflow_definition = workflow.workflow_definition
+    finally_block_label = (
+        workflow_definition.get("finally_block_label")
+        if isinstance(workflow_definition, Mapping)
+        else getattr(workflow_definition, "finally_block_label", None)
+    )
+    labels_that_may_execute = list(labels_to_execute)
+    if (
+        isinstance(finally_block_label, str)
+        and finally_block_label
+        and finally_block_label not in labels_that_may_execute
+    ):
+        # WorkflowService executes this top-level block after every non-canceled
+        # body, independently of the partial-run block whitelist. Admission,
+        # runtime code security, and credential replay checks must all see it.
+        labels_that_may_execute.append(finally_block_label)
+
     runtime_security_failure = _runtime_code_security_failure_for_selected_labels(
         workflow,
         block_labels=list(block_labels),
-        labels_to_execute=labels_to_execute,
+        labels_to_execute=labels_that_may_execute,
         frontier_start_label=frontier_start_label,
     )
     if runtime_security_failure is not None:
         ctx.last_executed_block_labels = []
         return runtime_security_failure
+
+    requires_sandbox = _selected_blocks_require_sandbox(
+        _workflow_definition_blocks_for_code_security(workflow_definition),
+        selected_labels=set(labels_that_may_execute),
+    )
 
     credential_ids = list(
         dict.fromkeys(
@@ -1650,7 +1733,10 @@ async def _run_blocks_and_collect_debug(
     )
     # Compared against the literal True so anything other than an explicit opt-in — including a
     # test double that auto-mocks the hook into a truthy object — still fails closed.
-    if not dispatch_to_worker and app.AGENT_FUNCTION.allow_copilot_inline_code_execution() is not True:
+    allow_inline_code_execution = (
+        app.AGENT_FUNCTION.allow_copilot_inline_code_execution() is True if not dispatch_to_worker else False
+    )
+    if requires_sandbox and not dispatch_to_worker and not allow_inline_code_execution:
         return _copilot_sandbox_unavailable_result()
 
     runtime_workflow = _workflow_with_runtime_block_goal_context(workflow, ctx)
@@ -1702,7 +1788,7 @@ async def _run_blocks_and_collect_debug(
             },
         }
 
-    use_fresh_session = _should_use_fresh_session_for_login_first_replay(ctx, labels_to_execute, workflow)
+    use_fresh_session = _should_use_fresh_session_for_login_first_replay(ctx, labels_that_may_execute, workflow)
     # True when the run was threaded into a fresh session rather than the scout's debug session;
     # gates the post-run rebind (~:1135) so the ephemeral run session is not adopted as the
     # context session.
@@ -1858,14 +1944,15 @@ async def _run_blocks_and_collect_debug(
                 block_outputs=block_outputs_to_seed or None,
             )
         else:
-            LOG.error(
-                "UNSANDBOXED: executing copilot workflow code in the API process because "
-                "COPILOT_ALLOW_INLINE_CODE_EXECUTION is enabled. This is a local-development path "
-                "with no sandbox isolation; the run below is NOT a sandboxed run.",
-                workflow_run_id=workflow_run.workflow_run_id,
-                workflow_permanent_id=ctx.workflow_permanent_id,
-                organization_id=ctx.organization_id,
-            )
+            if allow_inline_code_execution:
+                LOG.error(
+                    "UNSANDBOXED: executing copilot workflow code in the API process because "
+                    "COPILOT_ALLOW_INLINE_CODE_EXECUTION is enabled. This is a local-development path "
+                    "with no sandbox isolation; the run below is NOT a sandboxed run.",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_permanent_id=ctx.workflow_permanent_id,
+                    organization_id=ctx.organization_id,
+                )
             # prepare_workflow replaced the ambient context with this run's own, so the marker is
             # scoped to this run and is inherited by the execution task created below.
             inline_run_context = skyvern_context.current()

@@ -4091,9 +4091,12 @@ class WorkflowService:
                 loaded_script_module = None
 
         # If no cached script exists, check if a static pre-built script
-        # should be created for this platform (e.g., ATS).  This persists the
+        # should be created for this platform (e.g., ATS). This persists the
         # script to DB (pinned) on first run so it shows in the Code tab.
-        if is_script_run and not script_blocks_by_label:
+        # Partial runs must stay agent-only, matching get_workflow_script's
+        # existing contract: bootstrapping here would re-open run_signature
+        # compile/exec after that lookup deliberately returned no script.
+        if is_script_run and not block_labels and not script_blocks_by_label:
             try:
                 static_result = await app.AGENT_FUNCTION.ensure_static_script(
                     workflow=workflow,

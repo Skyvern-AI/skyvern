@@ -9,7 +9,7 @@ import urllib.parse
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
 from io import BytesIO
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import structlog
 from opentelemetry import trace as otel_trace
@@ -739,6 +739,279 @@ def _all_page_frames(page: Page) -> list[Frame]:
         seen.add(frame_id)
         frames.append(frame)
     return frames
+
+
+MAX_RETAINED_BLOB_COUNT = 8
+MAX_RETAINED_BLOB_TOTAL_BYTES = 100 * 1024 * 1024
+
+_BLOB_RETENTION_STATE_KEY = "__skyvernBlobRetention"
+# Stable ownership brand + schema version. A same-name page global is only ever mutated, restored, or
+# trusted as fresh when it carries this brand/version AND the full member schema below; anything else
+# (a page's own global, a corrupt/partial state, or one whose wrappers are no longer the active URL
+# methods) is left untouched and never read as owned.
+_BLOB_RETENTION_BRAND = "skyvern.blobRetention"
+_BLOB_RETENTION_VERSION = 1
+
+# Injected into every retention JS block. `isOwned` validates the complete schema needed for safe
+# exact-native restoration (origCreate/origRevoke), retained-map clearing/revocation (retained/deferred),
+# wrapper identity (wrapCreate/wrapRevoke), and closure neutralization (active). Restores compare each
+# URL method to its exact Skyvern wrapper independently, so a page hook is never clobbered.
+_BLOB_RETENTION_OWNERSHIP_JS = f"""
+    const KEY = '{_BLOB_RETENTION_STATE_KEY}';
+    const BRAND = '{_BLOB_RETENTION_BRAND}';
+    const VERSION = {_BLOB_RETENTION_VERSION};
+    const isOwned = (s) => !!s && s.brand === BRAND && s.version === VERSION
+        && typeof s.origCreate === 'function' && typeof s.origRevoke === 'function'
+        && (s.retained instanceof Map) && (s.deferred instanceof Set)
+        && typeof s.wrapCreate === 'function' && typeof s.wrapRevoke === 'function'
+        && typeof s.active === 'boolean';
+"""
+
+# Wrap URL.createObjectURL/revokeObjectURL in the page realm so a PDF-shaped object URL minted during
+# the action window survives a synchronous revoke long enough for the in-page read to recover its bytes.
+# Both wrappers return their native values; only PDF-typed (or untyped) blobs are retained, bounded by
+# count and total size; every other blob revokes natively so unrelated downloads are unaffected.
+_BLOB_RETENTION_INSTALL_JS = (
+    "(config) => {"
+    + _BLOB_RETENTION_OWNERSHIP_JS
+    + """
+    if (Object.prototype.hasOwnProperty.call(window, KEY)) {
+        const existing = window[KEY];
+        // Any existing own property that is not a valid owned state is foreign (a page's own global,
+        // including a null/undefined placeholder): never overwrite, delete, or modify it, and never touch
+        // the URL methods. Fail open (no retention).
+        if (!isOwned(existing)) return false;
+        // Valid owned stale state (a prior window that never tore down), possibly with the page having
+        // rewrapped one or both URL methods. Neutralize the closures first, settle the deferred revokes,
+        // restore ONLY each method that still directly equals our wrapper (preserve any page hook), clear
+        // the maps, and drop the state — regardless of any wrapper mismatch — so no prior key stays fresh.
+        existing.active = false;
+        try {
+            if (URL.createObjectURL === existing.wrapCreate) URL.createObjectURL = existing.origCreate;
+            if (URL.revokeObjectURL === existing.wrapRevoke) URL.revokeObjectURL = existing.origRevoke;
+            for (const url of existing.deferred) { try { Reflect.apply(existing.origRevoke, URL, [url]); } catch (e) {} }
+            existing.retained.clear();
+            existing.deferred.clear();
+        } catch (e) { return false; }
+        try { delete window[KEY]; } catch (e) {}
+        // If the owned state could not be dropped, do not overwrite it or patch the URL methods.
+        if (Object.prototype.hasOwnProperty.call(window, KEY)) return false;
+    }
+    // Capture whatever the current methods are now — a restored native, or a page hook we preserved. Keep
+    // the exact function objects (not .bind(URL) wrappers) so teardown restores them by identity; call
+    // them with an explicit URL receiver via Reflect.apply at the call sites instead.
+    const origCreate = URL.createObjectURL;
+    const origRevoke = URL.revokeObjectURL;
+    const state = {
+        brand: BRAND,
+        version: VERSION,
+        active: true,
+        origCreate: origCreate,
+        origRevoke: origRevoke,
+        retained: new Map(),
+        deferred: new Set(),
+        totalBytes: 0,
+        maxCount: config.maxCount,
+        maxTotalBytes: config.maxTotalBytes,
+    };
+    // The wrappers retain/defer only while state.active. Once teardown or a stale rearm flips it off,
+    // a closure orphaned inside a third-party wrapper chain degrades to a pure native pass-through.
+    const wrapCreate = function (obj) {
+        const url = Reflect.apply(origCreate, URL, arguments);
+        try {
+            if (state.active && typeof Blob !== 'undefined' && obj instanceof Blob) {
+                const type = (obj.type || '').toLowerCase();
+                const size = obj.size || 0;
+                const pdfish = type === 'application/pdf' || type === '';
+                if (pdfish && state.retained.size < state.maxCount && (state.totalBytes + size) <= state.maxTotalBytes) {
+                    state.retained.set(url, obj);
+                    state.totalBytes += size;
+                }
+            }
+        } catch (e) {}
+        return url;
+    };
+    const wrapRevoke = function (url) {
+        if (state.active && state.retained.has(url)) {
+            state.deferred.add(url);
+            return undefined;
+        }
+        return Reflect.apply(origRevoke, URL, arguments);
+    };
+    state.wrapCreate = wrapCreate;
+    state.wrapRevoke = wrapRevoke;
+    // Publish and verify ownership BEFORE patching either URL method. A non-writable same-name property
+    // makes this assignment a silent no-op; if the state did not take, change nothing else and fail open.
+    try { window[KEY] = state; } catch (e) { return false; }
+    if (window[KEY] !== state) return false;
+    URL.createObjectURL = wrapCreate;
+    URL.revokeObjectURL = wrapRevoke;
+    // Partial patch (e.g. a frozen URL method): roll back only the method that actually took, neutralize
+    // and drop the just-published state, and fail open with the methods at their pre-install identities.
+    if (URL.createObjectURL !== wrapCreate || URL.revokeObjectURL !== wrapRevoke) {
+        state.active = false;
+        if (URL.createObjectURL === wrapCreate) URL.createObjectURL = origCreate;
+        if (URL.revokeObjectURL === wrapRevoke) URL.revokeObjectURL = origRevoke;
+        try { delete window[KEY]; } catch (e) { window[KEY] = undefined; }
+        return false;
+    }
+    return true;
+}
+"""
+)
+
+_BLOB_RETENTION_TEARDOWN_JS = (
+    "() => {"
+    + _BLOB_RETENTION_OWNERSHIP_JS
+    + """
+    const state = window[KEY];
+    if (state === undefined || state === null) return false;
+    // Foreign / corrupt same-name global: never touch a property we do not own.
+    if (!isOwned(state)) return false;
+    // Neutralize first: any wrapper closure still captured in a third-party chain must stop retaining
+    // and deferring the moment we tear down, even though we cannot pull it out of that chain.
+    state.active = false;
+    try {
+        // Restore each URL method independently: if one still directly equals our wrapper, restore that
+        // saved exact method; if the other was replaced later by the page, preserve that later method so
+        // we never clobber it.
+        if (URL.createObjectURL === state.wrapCreate) URL.createObjectURL = state.origCreate;
+        if (URL.revokeObjectURL === state.wrapRevoke) URL.revokeObjectURL = state.origRevoke;
+        for (const url of state.deferred) { try { Reflect.apply(state.origRevoke, URL, [url]); } catch (e) {} }
+        state.retained.clear();
+        state.deferred.clear();
+    } finally {
+        try { delete window[KEY]; } catch (e) { window[KEY] = undefined; }
+    }
+    return true;
+}
+"""
+)
+
+
+async def _evaluate_in_all_frames(page: Page, expression: str, arg: Any, *, workflow_run_id: str | None) -> None:
+    main_frame = page.main_frame
+    for frame in _all_page_frames(page):
+        try:
+            if frame is main_frame:
+                await evaluate_in_main_world(page, expression, arg)
+            else:
+                await frame.evaluate(expression, arg)
+        except Exception:
+            # Best effort: a torn-down or navigating frame just misses this window. No URL/customer
+            # data is logged, and a failure here must never break the action.
+            LOG.debug("blob URL retention could not reach a frame", workflow_run_id=workflow_run_id)
+
+
+async def install_blob_url_retention(
+    page: Page,
+    *,
+    max_retained_count: int = MAX_RETAINED_BLOB_COUNT,
+    max_total_bytes: int = MAX_RETAINED_BLOB_TOTAL_BYTES,
+    workflow_run_id: str | None = None,
+) -> None:
+    """Retain PDF-shaped object URLs minted during the action window against a synchronous revoke.
+
+    Installed into the page's realms before the download-triggering click; paired with
+    ``teardown_blob_url_retention`` which performs the deferred revokes and restores the originals.
+    """
+    config = {"maxCount": max_retained_count, "maxTotalBytes": max_total_bytes}
+    await _evaluate_in_all_frames(page, _BLOB_RETENTION_INSTALL_JS, config, workflow_run_id=workflow_run_id)
+
+
+async def teardown_blob_url_retention(page: Page, *, workflow_run_id: str | None = None) -> None:
+    await _evaluate_in_all_frames(page, _BLOB_RETENTION_TEARDOWN_JS, None, workflow_run_id=workflow_run_id)
+
+
+# Read-only probe of the retention state installed by _BLOB_RETENTION_INSTALL_JS. Returns only
+# booleans: whether this realm exposes a Skyvern-owned retention state, and whether the passed URL is a
+# live key in its retained Map. A foreign / corrupt same-name global fails closed (never trusted). The
+# URL crosses into page JS but never comes back out and is never logged.
+_BLOB_RETENTION_PROBE_JS = (
+    "(url) => {"
+    + _BLOB_RETENTION_OWNERSHIP_JS
+    + """
+    const state = window[KEY];
+    // Require a valid owned AND active state: a stale cleanup can flip active off while retained keys
+    // linger, and those must never be trusted as action-fresh.
+    if (!isOwned(state) || state.active !== true) {
+        return { observed: false, retained: false };
+    }
+    return { observed: true, retained: state.retained.has(url) };
+}
+"""
+)
+
+
+class BlobActionFreshness(NamedTuple):
+    state_observed: bool
+    retained: bool
+
+
+def _blob_freshness_probe_frames(page: Page, blob_origin: str) -> list[Frame]:
+    """Frames to probe for a blob's retention state: those at the blob origin (the creator realm is
+    same-origin as the blob) plus indeterminate-origin frames (``about:blank``/``srcdoc``) that may
+    inherit the creator origin. Main frame first, deduped."""
+    seen: set[int] = set()
+    frames: list[Frame] = []
+    for frame in [page.main_frame, *page.frames]:
+        frame_id = id(frame)
+        if frame_id in seen:
+            continue
+        seen.add(frame_id)
+        try:
+            origin = _frame_origin(frame.url)
+        except Exception:
+            # An unreadable frame url is indeterminate; include it and let the probe best-effort.
+            frames.append(frame)
+            continue
+        if origin == blob_origin or origin is None:
+            frames.append(frame)
+    return frames
+
+
+async def probe_blob_action_freshness(
+    page: Page,
+    blob_url: str,
+    *,
+    workflow_run_id: str | None = None,
+) -> BlobActionFreshness:
+    """Whether ``blob_url`` (fragment-stripped) is a live key in a ``__skyvernBlobRetention.retained``
+    Map in any realm relevant to its origin — proof it was minted through the pre-click retention
+    wrapper during this action window.
+
+    The blob creator realm is not necessarily the frame displaying it (main/parent may mint the blob
+    and assign it to an iframe ``src``), so this probes the blob-origin frames plus indeterminate-origin
+    frames. Main frame routes through ``evaluate_in_main_world``; sub-frames through ``frame.evaluate``.
+    Only booleans cross the boundary; the URL is passed in but never logged or returned. Best-effort per
+    realm: a probe failure in one frame never raises and the verdict rests on the other realms. Returns
+    ``(state_observed, retained)`` — both False when no realm exposes retention state, so the caller
+    fails closed.
+    """
+    blob_origin = _blob_url_origin(blob_url)
+    if blob_origin is None:
+        return BlobActionFreshness(state_observed=False, retained=False)
+
+    frames = _blob_freshness_probe_frames(page, blob_origin)
+    main_frame = page.main_frame
+    state_observed = False
+    retained = False
+    for frame in frames:
+        try:
+            if frame is main_frame:
+                result = await evaluate_in_main_world(page, _BLOB_RETENTION_PROBE_JS, blob_url)
+            else:
+                result = await frame.evaluate(_BLOB_RETENTION_PROBE_JS, blob_url)
+        except Exception:
+            LOG.debug("blob action-freshness probe could not reach a frame", workflow_run_id=workflow_run_id)
+            continue
+        if not isinstance(result, dict):
+            continue
+        if result.get("observed"):
+            state_observed = True
+            if result.get("retained"):
+                retained = True
+    return BlobActionFreshness(state_observed=state_observed, retained=retained)
 
 
 def pop_destination_facts(nodes: object) -> dict[str, dict]:
