@@ -55,33 +55,46 @@ class RealAsyncAzureVaultClient(AsyncAzureVaultClient):
         finally:
             await secret_client.close()
 
+    @staticmethod
+    async def _list_enabled_secret_versions(secret_client: SecretClient, secret_name: str) -> tuple[list[str], bool]:
+        previous_versions: list[str] = []
+        enumerated_any = False
+        try:
+            async for properties in secret_client.list_properties_of_secret_versions(secret_name):
+                enumerated_any = True
+                if properties.enabled is not False and properties.version is not None:
+                    previous_versions.append(properties.version)
+        except ResourceNotFoundError:
+            # A brand-new secret has no version history, so a not-found before any version is
+            # enumerated is expected. A not-found after enumeration started means pagination was
+            # interrupted, leaving un-enumerated prior versions readable, so the write must fail.
+            if enumerated_any:
+                raise
+            return previous_versions, True
+        return previous_versions, False
+
     async def create_or_update_secret(self, secret_name: str, secret_value: str, vault_name: str) -> str:
         secret_client = await self._get_secret_client(vault_name)
         try:
-            previous_versions: list[str] = []
-            enumerated_any = False
-            try:
-                async for properties in secret_client.list_properties_of_secret_versions(secret_name):
-                    enumerated_any = True
-                    if properties.enabled is not False and properties.version is not None:
-                        previous_versions.append(properties.version)
-            except ResourceNotFoundError:
-                # A brand-new secret has no version history, so a not-found before any version is
-                # enumerated is expected — proceed with the create. But a not-found *after* some versions
-                # were already listed means pagination was interrupted, leaving the un-enumerated priors
-                # enabled and readable; fail the write so it retries instead of silently orphaning them.
-                if enumerated_any:
-                    raise
-
+            previous_versions, secret_missing = await self._list_enabled_secret_versions(secret_client, secret_name)
+            if secret_missing:
+                try:
+                    await secret_client.get_deleted_secret(secret_name)
+                except ResourceNotFoundError:
+                    pass
+                else:
+                    LOG.info("Recovering soft-deleted Azure secret before updating it", secret_name=secret_name)
+                    await secret_client.recover_deleted_secret(secret_name)
+                    previous_versions, _ = await self._list_enabled_secret_versions(secret_client, secret_name)
             secret = await secret_client.set_secret(secret_name, secret_value)
             # Azure Key Vault leaves every prior version enabled and readable by explicit version id; disable
             # the ones that predate this write so a rotated/detached secret value can't be read back.
             for version in previous_versions:
                 await secret_client.update_secret_properties(secret_name, version, enabled=False)
             return secret.name
-        except Exception as e:
-            LOG.exception("Failed to create secret from Azure Key Vault.", secret_name=secret_name, error=e)
-            raise e
+        except Exception:
+            LOG.exception("Failed to create secret from Azure Key Vault.", secret_name=secret_name)
+            raise
         finally:
             await secret_client.close()
 
