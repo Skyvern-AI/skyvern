@@ -12,6 +12,7 @@ import {
 } from "react-router-dom";
 import { useMemo } from "react";
 
+import { LogoMinimized } from "@/components/LogoMinimized";
 import { PageLayout } from "@/components/PageLayout";
 import { Status404 } from "@/components/Status404";
 import { StepArtifactsLayout } from "@/routes/tasks/detail/StepArtifactsLayout";
@@ -31,6 +32,18 @@ import { WorkflowPermanentIdContext } from "@/routes/workflows/WorkflowPermanent
 import { useWorkflowRunWithWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowRunWithWorkflowQuery";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { useTaskV2Query } from "@/routes/runs/useTaskV2Query";
+
+const loadingIndicator = (
+  <div
+    className="flex h-screen w-full items-center justify-center"
+    role="status"
+  >
+    <div className="animate-pulse">
+      <LogoMinimized />
+    </div>
+    <span className="sr-only">Loading</span>
+  </div>
+);
 
 function RunRouter() {
   const { runId } = useParams();
@@ -113,7 +126,7 @@ function RunRouter() {
 
   if (runId?.startsWith("tsk_v2")) {
     if (isLoading) {
-      return <div>Fetching task details...</div>;
+      return loadingIndicator;
     }
 
     if (!task_v2) {
@@ -145,7 +158,7 @@ function RunRouter() {
       if (studioRunFailed) {
         return <Status404 />;
       }
-      return <div>Fetching run details...</div>;
+      return loadingIndicator;
     }
     const workflowPermanentId = resolvedRun.workflow?.workflow_permanent_id;
     if (!workflowPermanentId) {
