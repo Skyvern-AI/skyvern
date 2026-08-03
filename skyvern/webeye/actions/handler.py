@@ -189,8 +189,11 @@ from skyvern.webeye.utils.dom import (
 from skyvern.webeye.utils.page import (
     SkyvernFrame,
     _all_page_frames,
+    _blob_url_origin,
     apply_secret_visual_mask_to_active_element,
+    probe_blob_action_freshness,
     take_element_screenshot,
+    teardown_blob_url_retention,
 )
 
 LOG = structlog.get_logger()
@@ -925,6 +928,27 @@ class _EagerAdoptedBlobCapture:
             )
 
 
+async def _close_eager_capture_then_teardown_retention(
+    eager_blob_capture: _EagerAdoptedBlobCapture,
+    page: Page,
+    *,
+    browser_session_id: str | None,
+    workflow_run_id: str | None,
+) -> None:
+    # aclose() can re-raise CancelledError when the enclosing action is cancelled; the retention
+    # wrapper patches page-realm URL.createObjectURL/revokeObjectURL and must be torn down anyway, or
+    # a cancelled adopted session leaks the patched globals. The original cancellation still
+    # propagates after the finally, and a teardown failure stays fail-open/debug-only.
+    try:
+        await eager_blob_capture.aclose()
+    finally:
+        if browser_session_id:
+            try:
+                await teardown_blob_url_retention(page, workflow_run_id=workflow_run_id)
+            except Exception:
+                LOG.debug("Failed to tear down blob URL retention", workflow_run_id=workflow_run_id)
+
+
 async def _save_adopted_session_download(
     download: Download,
     page: Page,
@@ -978,6 +1002,29 @@ async def _save_adopted_session_download(
     if download.url.startswith("blob:"):
         blob_bytes = await _read_adopted_session_blob_bytes(download, page, workflow_run_id=workflow_run_id)
         if blob_bytes is None:
+            # The download event's own blob is unreadable (owner torn down / remote-CDP), but the
+            # statement is often still displayed in a live same-origin blob: PDF iframe whose bytes
+            # are recoverable. Bounded by the same budget as blocked-inline-PDF recovery.
+            recovered_bytes: bytes | None = None
+            try:
+                async with asyncio.timeout(_BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS):
+                    recovered_bytes = await _recover_adopted_session_blob_pdf_iframe(page, download, workflow_run_id)
+            except asyncio.TimeoutError:
+                LOG.warning(
+                    "Adopted-session blob PDF iframe recovery exceeded its budget; treating as no recovery",
+                    workflow_run_id=workflow_run_id,
+                    recovery_budget_seconds=_BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS,
+                )
+            if recovered_bytes is not None:
+                download_target.write_bytes(recovered_bytes)
+                LOG.info(
+                    "Recovered adopted-session statement from a live blob: PDF iframe",
+                    download_dir=str(download_dir),
+                    workflow_run_id=workflow_run_id,
+                    recovered_bytes=len(recovered_bytes),
+                    download_target=str(download_target),
+                )
+                return download_target
             LOG.warning(
                 "Adopted-session blob download could not be read from any open page",
                 download_dir=str(download_dir),
@@ -1130,6 +1177,142 @@ def _looks_like_pdf(data: bytes) -> bool:
     # pages that merely mention the marker further down are rejected.
     header = data[3:] if data[:3] == b"\xef\xbb\xbf" else data
     return header[:5] == b"%PDF-"
+
+
+_BLOB_IFRAME_SRC_TITLE_JS = (
+    "() => Array.from(document.querySelectorAll('iframe')).map((f) => [f.src || '', f.title || ''])"
+)
+
+
+def _strip_url_fragment(url: str) -> str:
+    return url.split("#", 1)[0]
+
+
+async def _blob_iframe_src_titles(page: Page) -> dict[str, str]:
+    """Map each blob: <iframe> src (fragment-stripped) to its title attribute, across every frame."""
+    mapping: dict[str, str] = {}
+    main_frame = page.main_frame
+    for frame in _all_page_frames(page):
+        target: Page | Frame = page if frame is main_frame else frame
+        try:
+            pairs = await SkyvernFrame.evaluate(frame=target, expression=_BLOB_IFRAME_SRC_TITLE_JS)
+        except Exception:
+            continue
+        if not isinstance(pairs, list):
+            continue
+        for pair in pairs:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                continue
+            src, title = pair
+            if isinstance(src, str) and src.startswith("blob:"):
+                mapping.setdefault(_strip_url_fragment(src), title if isinstance(title, str) else "")
+    return mapping
+
+
+async def _read_blob_pdf_bytes(page: Page, blob_url: str, workflow_run_id: str | None) -> bytes | None:
+    """Read a blob: URL and return its bytes only when they are a non-empty PDF, else None."""
+    data = await SkyvernFrame.read_blob_url_bytes(
+        page=page,
+        blob_url=blob_url,
+        workflow_run_id=workflow_run_id,
+        max_size_bytes=MAX_FILE_SIZE_BYTES,
+        probe=True,
+    )
+    if data and _looks_like_pdf(data):
+        return data
+    return None
+
+
+async def _recover_adopted_session_blob_pdf_iframe(
+    page: Page, download: Download, workflow_run_id: str | None
+) -> bytes | None:
+    """Best-effort recovery of a statement PDF from a live same-origin blob: <iframe> when the download's own bytes are lost.
+
+    An adopted/persistent session can fire a client-side blob download whose bytes are unrecoverable
+    (empty ``save_as`` and an unfetchable download URL) while the statement is still displayed in a
+    same-origin ``blob:`` PDF iframe — a different, still-live object readable from the document that
+    minted it. Candidates come from the iframe ``src`` attribute, not ``frame.url``: Chromium's built-in
+    PDF viewer reports the framed document's URL as ``about:blank`` while the element keeps its blob src.
+
+    Matching the download's suggested filename against exactly one iframe title basename is a
+    conservative correlation, not proof that the iframe holds the requested document — a stale iframe
+    left from an earlier same-named document could still match. It is chosen because it is far safer
+    than trusting whatever single PDF happens to be on screen. No suggested filename, no match, or
+    several equally-titled matches all fail closed (return None) — an ambiguous or unmatched viewer is
+    never saved. The matched candidate is scoped to the download's blob origin, capped at
+    ``MAX_FILE_SIZE_BYTES``, and must carry PDF magic. Because this is a best-effort backstop, any
+    page/frame access error during candidate discovery or reading also fails closed.
+    """
+    download_origin = _blob_url_origin(download.url)
+    if download_origin is None:
+        return None
+
+    suggested = os.path.basename(download.suggested_filename or "").strip().lower()
+    if not suggested:
+        # Non-sensitive: reason + booleans/counts only, never filename/title/blob URL/domain.
+        LOG.info(
+            "Adopted-session blob PDF iframe recovery skipped",
+            workflow_run_id=workflow_run_id,
+            reason="missing_suggested_filename",
+        )
+        return None
+
+    try:
+        src_titles = await _blob_iframe_src_titles(page)
+        same_origin_candidates = [src for src in src_titles if _blob_url_origin(src) == download_origin]
+        named = [
+            src for src in same_origin_candidates if os.path.basename(src_titles[src]).strip().lower() == suggested
+        ]
+
+        if len(named) == 1:
+            # Freshness gate: the candidate blob must be a live key in this action window's retention
+            # Map, proving it was minted through the pre-click wrapper. A lingering iframe reusing a
+            # common filename would otherwise pass the title/PDF gates and save the wrong document.
+            freshness = await probe_blob_action_freshness(page, named[0], workflow_run_id=workflow_run_id)
+            if not freshness.retained:
+                LOG.info(
+                    "Adopted-session blob PDF iframe recovery skipped",
+                    workflow_run_id=workflow_run_id,
+                    reason="not_action_fresh" if freshness.state_observed else "retention_state_unobservable",
+                )
+                return None
+            # The single filename match must itself be a real PDF; otherwise fail closed rather than
+            # fall back to any other on-screen blob iframe.
+            return await _read_blob_pdf_bytes(page, named[0], workflow_run_id)
+
+        if len(named) > 1:
+            LOG.warning(
+                "Adopted-session blob PDF iframe recovery skipped",
+                workflow_run_id=workflow_run_id,
+                reason="duplicate_filename_match",
+                candidate_count=len(same_origin_candidates),
+                match_count=len(named),
+            )
+        elif not same_origin_candidates:
+            LOG.info(
+                "Adopted-session blob PDF iframe recovery skipped",
+                workflow_run_id=workflow_run_id,
+                reason="no_same_origin_blob_iframe",
+                candidate_count=0,
+            )
+        else:
+            LOG.info(
+                "Adopted-session blob PDF iframe recovery skipped",
+                workflow_run_id=workflow_run_id,
+                reason="no_filename_title_match",
+                candidate_count=len(same_origin_candidates),
+            )
+        return None
+    except Exception as exc:
+        # Best-effort backstop: a page/frame torn down mid-discovery (e.g. remote session closing)
+        # must fail closed, not raise. CancelledError (BaseException) still propagates.
+        LOG.warning(
+            "Adopted-session blob PDF iframe recovery skipped",
+            workflow_run_id=workflow_run_id,
+            reason="recovery_error",
+            error_type=type(exc).__name__,
+        )
+        return None
 
 
 async def _collect_inline_iframe_src_candidates(page: Page) -> list[str]:
@@ -3473,7 +3656,12 @@ class ActionHandler:
             # Fallback for exceptional exits that never reached the post-action stamp.
             if action.finished_at is None:
                 action.finished_at = naive_utc_now()
-            await eager_blob_capture.aclose()
+            await _close_eager_capture_then_teardown_retention(
+                eager_blob_capture,
+                page,
+                browser_session_id=task.browser_session_id,
+                workflow_run_id=task.workflow_run_id,
+            )
             for observed_popup, popup_callback in download_popup_callbacks:
                 try:
                     _remove_download_listener(observed_popup, popup_callback)

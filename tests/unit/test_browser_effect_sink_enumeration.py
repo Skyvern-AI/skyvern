@@ -25,7 +25,7 @@ _DISCOVERED_BROWSER_API_CALLS = {
             "clear": 4,
             "close": 5,
             "dblclick": 2,
-            "evaluate": 9,
+            "evaluate": 10,
             "fill": 2,
             "focus": 2,
             "go_back": 1,
@@ -73,6 +73,7 @@ _DISCOVERED_BROWSER_API_CALLS = {
 _EVALUATE_CALLERS = {
     "skyvern/webeye/actions/handler.py": Counter(
         {
+            "_blob_iframe_src_titles": 1,
             "_collect_inline_iframe_src_candidates": 1,
             "_evaluate_element_scoped": 1,
             "_normal_select_readback_contradicts": 1,
@@ -198,21 +199,21 @@ def test_discovered_browser_api_lower_bound_is_stable() -> None:
     }
 
     assert observed == _DISCOVERED_BROWSER_API_CALLS
-    assert sum(sum(methods.values()) for methods in observed.values()) == 141
+    assert sum(sum(methods.values()) for methods in observed.values()) == 142
     handler_candidates = _candidate_signatures("skyvern/webeye/actions/handler.py", _CANDIDATE_METHODS)
     classified_non_browser = Counter(
         {signature: count for signature, count in handler_candidates.items() if signature in _NON_BROWSER_CANDIDATES}
     )
     assert classified_non_browser == _NON_BROWSER_CANDIDATES
     assert sum(_NON_BROWSER_CANDIDATES.values()) == 5
-    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 136
+    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 137
 
 
 def test_every_raw_evaluate_call_is_classified() -> None:
     observed = {path: callers for path in _owned_source_paths() if (callers := _callers_for_method(path, "evaluate"))}
 
     assert observed == _EVALUATE_CALLERS
-    assert sum(sum(callers.values()) for callers in observed.values()) == 16
+    assert sum(sum(callers.values()) for callers in observed.values()) == 17
 
 
 def test_every_cdp_dispatch_is_classified_by_exact_command() -> None:
