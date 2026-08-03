@@ -1060,6 +1060,7 @@ export type CredentialApiResponse = {
   tested_url?: string | null;
   user_context?: string | null;
   save_browser_session_intent?: boolean | null;
+  run_sequentially?: boolean | null;
   folder_id?: string | null;
   proxy_location?: ProxyLocation | null;
   proxy_session_id?: string | null;

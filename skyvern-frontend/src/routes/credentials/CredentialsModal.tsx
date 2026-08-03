@@ -415,6 +415,7 @@ function CredentialsModal({
   // Quick-win: optional browser profile + per-credential IP pin (flag-on).
   const [browserProfileId, setBrowserProfileId] = useState<string | null>(null);
   const [pinIp, setPinIp] = useState(false);
+  const [runSequentially, setRunSequentially] = useState(false);
   // The inline profile Select has no scroll pagination, so pull a large first
   // page (unowned profiles are a small subset).
   const { data: plainProfilesPages } = useInfiniteBrowserProfilesQuery({
@@ -633,6 +634,7 @@ function CredentialsModal({
       }
       setBrowserProfileId(editingCredential.browser_profile_id ?? null);
       setPinIp(editingCredential.pin_saved_session_ip ?? false);
+      setRunSequentially(editingCredential.run_sequentially ?? false);
       if (editingCredential.user_context) {
         setUserContext(editingCredential.user_context);
       }
@@ -705,6 +707,7 @@ function CredentialsModal({
     removalConfirmedRef.current = false;
     setBrowserProfileId(null);
     setPinIp(false);
+    setRunSequentially(false);
     setTestAndSave(false);
     setTestUrl("");
     setTestStatus("idle");
@@ -1058,6 +1061,7 @@ function CredentialsModal({
               ...(capturedTestUrl && { tested_url: capturedTestUrl }),
               user_context: capturedUserContext?.trim() || null,
               save_browser_session_intent: saveBrowserSessionIntent,
+              run_sequentially: runSequentially,
               // The /update vault path drops these; persist them here so a
               // profile/IP change made alongside credential values isn't lost.
               // PASSWORD-only, matching the picker UI and the bmPatch guard.
@@ -1074,8 +1078,8 @@ function CredentialsModal({
           toast({
             title: "Partial save",
             description: includesBrowserMemoryFields
-              ? "Credential updated, but the login instructions, browser profile, and IP settings could not be saved. Please try editing again."
-              : "Credential updated, but login instructions could not be saved. Please try editing again.",
+              ? "Credential updated, but the login instructions, sequential settings, browser profile, and IP settings could not be saved. Please try editing again."
+              : "Credential updated, but login instructions and sequential settings could not be saved. Please try editing again.",
             variant: "destructive",
           });
         }
@@ -1145,6 +1149,7 @@ function CredentialsModal({
       rotate_proxy_session_id,
       browser_profile_id,
       pin_saved_session_ip,
+      run_sequentially,
     }: {
       id: string;
       name: string;
@@ -1156,6 +1161,7 @@ function CredentialsModal({
       rotate_proxy_session_id?: boolean;
       browser_profile_id?: string | null;
       pin_saved_session_ip?: boolean;
+      run_sequentially?: boolean;
     }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       const body: Record<string, string | boolean | ProxyLocation | null> = {
@@ -1184,6 +1190,9 @@ function CredentialsModal({
       }
       if (pin_saved_session_ip !== undefined) {
         body.pin_saved_session_ip = pin_saved_session_ip;
+      }
+      if (run_sequentially !== undefined) {
+        body.run_sequentially = run_sequentially;
       }
       const response = await client.patch<CredentialApiResponse>(
         `/credentials/${id}`,
@@ -1249,13 +1258,18 @@ function CredentialsModal({
       ? { browser_profile_id: browserProfileId, pin_saved_session_ip: pinIp }
       : {};
 
+    const runSequentiallyChanged =
+      isEditMode &&
+      runSequentially !== (editingCredential?.run_sequentially ?? false);
+
     // In edit mode, use editingGroups to determine what changed (type-agnostic)
     if (isEditMode && editingCredential) {
       if (
         !editingGroups.name &&
         !editingGroups.values &&
         !proxyPinChanged &&
-        !bmChanged
+        !bmChanged &&
+        !runSequentiallyChanged
       ) {
         // Nothing was edited — close silently
         reset();
@@ -1268,6 +1282,9 @@ function CredentialsModal({
           name,
           ...(proxyPinChanged ? proxyPinPayload : {}),
           ...bmPatch,
+          ...(runSequentiallyChanged
+            ? { run_sequentially: runSequentially }
+            : {}),
         });
         return;
       }
@@ -2131,6 +2148,29 @@ function CredentialsModal({
             </Alert>
           )}
           {credentialContent}
+          {isEditMode && (
+            <div className="space-y-1">
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <Checkbox
+                  checked={runSequentially}
+                  onCheckedChange={(checked) =>
+                    setRunSequentially(checked === true)
+                  }
+                  disabled={
+                    activeMutation.isPending ||
+                    renameCredentialMutation.isPending
+                  }
+                />
+                <span>Run workflows sequentially for this credential</span>
+              </label>
+              <p className="ml-6 text-xs text-muted-foreground">
+                Serializes new workflow runs that share this credential so at
+                most one runs at a time. Runs created before this is enabled are
+                not serialized, and scheduled or sync-triggered runs are not yet
+                supported and fail closed.
+              </p>
+            </div>
+          )}
           {/* The browser-memory IP checkbox only replaces this for PASSWORD
             credentials; card/secret keep the proxy-pin UI under the flag. */}
           {(!browserMemoryEnabled || type !== CredentialModalTypes.PASSWORD) &&
