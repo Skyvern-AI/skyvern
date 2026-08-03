@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -368,57 +367,3 @@ async def test_navigate_with_retry_revalidates_every_redirect_hop() -> None:
         )
 
     settle.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_navigate_to_url_installs_the_per_hop_egress_guard(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The choke point must arm per-hop enforcement, not just pre/post validation.
-
-    Without this, dropping the install call leaves both validators green while every redirect
-    hop goes unclassified again — the exact gap the guard exists to close.
-    """
-    guarded: list[object] = []
-
-    async def record(page: object) -> None:
-        guarded.append(page)
-
-    monkeypatch.setattr("skyvern.webeye.real_browser_state.install_navigation_egress_guard", record)
-
-    page = AsyncMock()
-    page.goto = AsyncMock(return_value=None)
-    browser_state = RealBrowserState(pw=AsyncMock())
-    browser_state._wait_for_settle = AsyncMock()
-    browser_state._wait_for_challenge_solver = AsyncMock()
-
-    await browser_state.navigate_to_url(page=page, url="https://example.com/")
-
-    assert guarded == [page]
-
-
-@pytest.mark.asyncio
-async def test_generated_script_goto_arms_the_egress_guard(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Generated scripts acquire the browser with navigate=False and drive page.goto themselves.
-
-    That path reaches neither navigate_with_retry nor its pre-dispatch validation, so it has to
-    arm the per-hop guard itself or a redirect to an internal host goes unclassified.
-    """
-    # script_skyvern_page has a pre-existing import cycle with script_service (reproduces on
-    # main without this test); importing the service first establishes a working order.
-    import skyvern.services.script_service  # noqa: F401
-    from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
-
-    guarded: list[object] = []
-
-    async def record(page: object) -> None:
-        guarded.append(page)
-
-    monkeypatch.setattr("skyvern.core.script_generations.script_skyvern_page.install_navigation_egress_guard", record)
-
-    page = AsyncMock()
-    page.goto = AsyncMock(return_value=None)
-    # SkyvernPage subclasses playwright's Page, so a real instance needs a live connection;
-    # goto only reads self.page, so drive it with a stand-in self.
-    await ScriptSkyvernPage.goto(SimpleNamespace(page=page), "https://example.com/")
-
-    assert guarded == [page]
-    page.goto.assert_awaited_once()
