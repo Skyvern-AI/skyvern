@@ -329,7 +329,7 @@ describe("applyNarrativeEvent — response hydration resets phase-hint fields", 
     expect(s.draftingSignaledAt).toBeNull();
   });
 
-  it("authoringCount and lastRunOutcome are NOT grafted — terminal checklist is stubs-only", () => {
+  it("authoringCount is grafted across the terminal swap (SKY-12969 parity); lastRunOutcome/activitySeq are not", () => {
     let s: TurnNarrativeState = applyNarrativeEvent(
       EMPTY_NARRATIVE,
       turnStart(),
@@ -361,7 +361,11 @@ describe("applyNarrativeEvent — response hydration resets phase-hint fields", 
         },
       }),
     );
-    expect(s.authoringCount).toBe(0);
+    // Grafted (same turnId): the uncapped counter survives even though the
+    // payload's capped designActivity has aged out the authoring entry, so
+    // Explore stays resolved at the swap rather than flipping back.
+    expect(s.authoringCount).toBe(1);
+    // Still not grafted — a cancel-mid-redraft marks Test stopped, not Draft.
     expect(s.lastRunOutcome).toBeNull();
     expect(s.activitySeq).toBe(0);
   });
