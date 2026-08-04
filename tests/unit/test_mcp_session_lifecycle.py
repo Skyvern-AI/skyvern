@@ -683,9 +683,11 @@ async def test_session_close_chains_exceptions_when_both_api_and_browser_fail(
 
 
 @pytest.mark.asyncio
-async def test_session_close_matching_context_without_browser_returns_error(
+async def test_session_close_by_id_succeeds_for_unconnected_current_cloud_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A cloud session connects its browser lazily, so closing the current session by ID before any
+    browser tool ran must report the successful remote close rather than a missing-browser error."""
     mcp_session.set_current_session(
         mcp_session.SessionState(
             browser=None,
@@ -694,6 +696,7 @@ async def test_session_close_matching_context_without_browser_returns_error(
     )
 
     fake_skyvern = MagicMock()
+    fake_skyvern.get_browser_session = AsyncMock(side_effect=Exception("no recordings"))
     monkeypatch.setattr(mcp_session, "get_skyvern", lambda: fake_skyvern)
 
     do_session_close = AsyncMock(return_value=SessionCloseResult(session_id="pbs_999", closed=True))
@@ -701,9 +704,8 @@ async def test_session_close_matching_context_without_browser_returns_error(
 
     result = await mcp_session.skyvern_browser_session_close(session_id="pbs_999")
 
-    assert result["ok"] is False
-    assert result["error"]["code"] == mcp_session.ErrorCode.SDK_ERROR
-    assert "Expected active browser for matching cloud session" in result["error"]["message"]
+    assert result["ok"] is True
+    assert result["data"] == {"session_id": "pbs_999", "closed": True}
     do_session_close.assert_awaited_once_with(fake_skyvern, "pbs_999")
     assert mcp_session.get_current_session().context is None
 
@@ -1185,11 +1187,13 @@ async def test_session_create_stateless_mode_rejects_local() -> None:
 async def test_session_create_stateful_mode_uses_sdk_app_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_browser = MagicMock()
-    fake_browser.browser_session_id = "pbs_stateful"
-    fake_browser.app_url = "https://app.example.test/sessions/pbs_stateful"
     fake_skyvern = MagicMock()
-    fake_skyvern.launch_cloud_browser = AsyncMock(return_value=fake_browser)
+    fake_skyvern.create_browser_session = AsyncMock(
+        return_value=SimpleNamespace(
+            browser_session_id="pbs_stateful",
+            app_url="https://app.example.test/sessions/pbs_stateful",
+        )
+    )
     fake_skyvern.get_browser_session = AsyncMock()
     monkeypatch.setattr(mcp_session, "get_skyvern", lambda: fake_skyvern)
 
@@ -1202,14 +1206,134 @@ async def test_session_create_stateful_mode_uses_sdk_app_url(
 
 
 @pytest.mark.asyncio
+async def test_session_create_cloud_mode_does_not_claim_initial_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_skyvern = MagicMock()
+    fake_skyvern.create_browser_session = AsyncMock(
+        return_value=SimpleNamespace(
+            browser_session_id="pbs_unclaimed",
+            app_url="https://app.example.test/sessions/pbs_unclaimed",
+        )
+    )
+    monkeypatch.setattr(mcp_session, "get_skyvern", lambda: fake_skyvern)
+
+    result = await mcp_session.skyvern_browser_session_create(timeout=50)
+
+    assert result["ok"] is True
+    assert result["data"] == {
+        "app_url": "https://app.example.test/sessions/pbs_unclaimed",
+        "session_id": "pbs_unclaimed",
+        "timeout_minutes": 50,
+    }
+    fake_skyvern.create_browser_session.assert_awaited_once_with(timeout=50, proxy_location=None)
+    assert mcp_session.get_current_session().browser is None
+    assert mcp_session.get_current_session().context == BrowserContext(
+        mode="cloud_session", session_id="pbs_unclaimed", can_access_localhost=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_created_cloud_session_connects_lazily_for_browser_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_manager.set_current_session(
+        session_manager.SessionState(
+            context=BrowserContext(mode="cloud_session", session_id="pbs_lazy"),
+            api_key_hash=session_manager.active_api_key_hash(),
+        )
+    )
+    browser = MagicMock()
+    fake_skyvern = MagicMock()
+    fake_skyvern.connect_to_cloud_browser_session = AsyncMock(return_value=browser)
+    monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
+
+    resolved_browser, context = await session_manager.resolve_browser()
+
+    assert resolved_browser is browser
+    assert context.session_id == "pbs_lazy"
+    assert session_manager.get_current_session().browser is browser
+    fake_skyvern.connect_to_cloud_browser_session.assert_awaited_once_with("pbs_lazy")
+
+
+@pytest.mark.asyncio
+async def test_session_close_closes_cloud_session_before_lazy_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_manager.set_current_session(
+        session_manager.SessionState(
+            context=BrowserContext(mode="cloud_session", session_id="pbs_unconnected"),
+        )
+    )
+    fake_skyvern = MagicMock()
+    monkeypatch.setattr(mcp_session, "get_skyvern", lambda: fake_skyvern)
+    close_session = AsyncMock(return_value=SessionCloseResult(session_id="pbs_unconnected", closed=True))
+    monkeypatch.setattr(mcp_session, "do_session_close", close_session)
+
+    result = await mcp_session.skyvern_browser_session_close()
+
+    assert result["ok"] is True
+    assert result["data"] == {"session_id": "pbs_unconnected", "closed": True}
+    close_session.assert_awaited_once_with(fake_skyvern, "pbs_unconnected")
+    assert session_manager.get_current_session().context is None
+
+
+@pytest.mark.asyncio
+async def test_session_close_clears_state_when_unconnected_cloud_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed remote close must still clear local state, matching close_current_session(), so the
+    next tool call is not wedged onto a session this process already tried to close."""
+    session_manager.set_current_session(
+        session_manager.SessionState(
+            context=BrowserContext(mode="cloud_session", session_id="pbs_wedged"),
+            api_key_hash="hash",
+        )
+    )
+    session_manager.replace_session_ref_map({"ref_1": {"selector": "#a"}}, session_id="pbs_wedged")
+    assert any("pbs_wedged" in key for key in session_manager._session_ref_maps)
+    fake_skyvern = MagicMock()
+    monkeypatch.setattr(mcp_session, "get_skyvern", lambda: fake_skyvern)
+    close_session = AsyncMock(side_effect=ConnectionError("API close failed"))
+    monkeypatch.setattr(mcp_session, "do_session_close", close_session)
+
+    result = await mcp_session.skyvern_browser_session_close()
+
+    assert result["ok"] is False
+    assert "API close failed" in result["error"]["message"]
+    assert session_manager.get_current_session().context is None
+    assert not any("pbs_wedged" in key for key in session_manager._session_ref_maps)
+
+
+@pytest.mark.asyncio
+async def test_session_close_by_id_clears_state_when_unconnected_cloud_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_manager.set_current_session(
+        session_manager.SessionState(
+            context=BrowserContext(mode="cloud_session", session_id="pbs_wedged_id"),
+        )
+    )
+    fake_skyvern = MagicMock()
+    monkeypatch.setattr(mcp_session, "get_skyvern", lambda: fake_skyvern)
+    close_session = AsyncMock(side_effect=ConnectionError("API close failed"))
+    monkeypatch.setattr(mcp_session, "do_session_close", close_session)
+
+    result = await mcp_session.skyvern_browser_session_close(session_id="pbs_wedged_id")
+
+    assert result["ok"] is False
+    assert "API close failed" in result["error"]["message"]
+    assert session_manager.get_current_session().context is None
+
+
+@pytest.mark.asyncio
 async def test_session_create_stateful_mode_omits_missing_sdk_app_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_browser = MagicMock()
-    fake_browser.browser_session_id = "pbs_stateful"
-    fake_browser.app_url = None
     fake_skyvern = MagicMock()
-    fake_skyvern.launch_cloud_browser = AsyncMock(return_value=fake_browser)
+    fake_skyvern.create_browser_session = AsyncMock(
+        return_value=SimpleNamespace(browser_session_id="pbs_stateful", app_url=None)
+    )
     fake_skyvern.get_browser_session = AsyncMock()
     monkeypatch.setattr(mcp_session, "get_skyvern", lambda: fake_skyvern)
 
@@ -1283,6 +1407,7 @@ async def test_session_create_forwards_extensions_to_stateful_session_create(
         generate_browser_profile=False,
         local=False,
         headless=False,
+        connect_browser=False,
     )
 
 
@@ -1317,6 +1442,7 @@ async def test_session_create_forwards_browser_profile_id_to_stateful_session_cr
         generate_browser_profile=False,
         local=False,
         headless=False,
+        connect_browser=False,
     )
 
 
@@ -1352,6 +1478,7 @@ async def test_session_create_forwards_generate_browser_profile_to_stateful_sess
         generate_browser_profile=True,
         local=False,
         headless=False,
+        connect_browser=False,
     )
 
 
