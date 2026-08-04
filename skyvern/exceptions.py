@@ -140,6 +140,13 @@ def _is_browser_connection_error(message: str) -> bool:
     return any(pattern in message for pattern in _BROWSER_CONNECTION_PATTERNS)
 
 
+def _is_session_closed_error(message: str) -> bool:
+    # The session router closes with (4410, "session closed") when the session was already closed;
+    # match the reason text, not the bare code — 4410 is reused elsewhere with other reasons.
+    # Message selection only: redaction routing must keep the broad _is_browser_connection_error net.
+    return "session closed" in message.lower()
+
+
 # A raw CDP connect failure (e.g. from playwright.chromium.connect_over_cdp) echoes the
 # endpoint URL, which can carry the remote-browser vendor host, a session-bearing path/query,
 # or credentials embedded as user:pass@host. The devtools socket is always ws/wss, so a ws/wss
@@ -165,6 +172,12 @@ def get_user_facing_exception_message(exception: Exception) -> str:
 
     raw = str(exception)
     if _is_browser_connection_error(raw):
+        if _is_session_closed_error(raw):
+            return (
+                "Failed to connect to the browser session because the session is already closed. "
+                "Start a new browser session to continue. "
+                "If this is unexpected, contact support@skyvern.com."
+            )
         return (
             f"Failed to connect to the browser session. "
             f"This is usually caused by high demand and is transient. {_BROWSER_CONNECTION_GUIDANCE}"
@@ -1215,6 +1228,10 @@ class BlockedHost(SkyvernHTTPException):
             f"The host in your url is blocked: {host}",
             status_code=HTTPStatus.BAD_REQUEST,
         )
+
+
+class UnresolvableHost(BlockedHost):
+    pass
 
 
 class InvalidWorkflowParameter(SkyvernHTTPException):

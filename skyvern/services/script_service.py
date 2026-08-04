@@ -107,6 +107,7 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileDownloadTarget, FileStorageType, FileType
 from skyvern.utils.css_selector import build_action_summaries_with_timing
 from skyvern.utils.script_file_paths import SCRIPT_FILE_PATH_ERROR, normalize_script_file_path
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, DecisiveAction
 from skyvern.webeye.cdp_download_interceptor import download_filename_from_suffix
@@ -3601,8 +3602,13 @@ async def goto(
             browser_session_id=block_validation_output.browser_session_id,
         )
     except Exception:
+        try:
+            candidate_url = _render_template_with_label(url, label)
+        except Exception:
+            candidate_url = url
+        candidate_url = await asyncio.to_thread(validate_fetch_url, candidate_url)
         run_context = script_run_context_manager.ensure_run_context()
-        await run_context.page.goto(url)
+        await run_context.page.goto(candidate_url)
 
 
 async def trigger_workflow(

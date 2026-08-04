@@ -36,6 +36,7 @@ from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_
 from skyvern.errors.errors import TOTPExpiredError, UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     ActionExecutionTimeout,
+    BlockedHost,
     CaptchaSolveError,
     CardNumberInputMismatch,
     EmptySelect,
@@ -73,6 +74,7 @@ from skyvern.exceptions import (
     SecretInputMismatch,
     SkyvernException,
     SkyvernPageAnalysisTimeout,
+    UnresolvableHost,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
@@ -7035,6 +7037,8 @@ async def chain_click(
     action_results: list[ActionResult] = []
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
+            if resolved_href := await skyvern_element.resolve_http_href(page):
+                await asyncio.to_thread(validate_fetch_url, resolved_href)
             if click_count == 1:
                 # Route through the active cursor strategy so alternate profiles can
                 # dispatch their own click sequence (explicit mouse.down/up).
@@ -7056,6 +7060,12 @@ async def chain_click(
                 locator=locator,
             )
             action_results = [ActionSuccess()]
+            return action_results
+
+        # The browser resolves through the run proxy and may reach hosts the worker cannot;
+        # worker resolution failure is not a policy signal.
+        if isinstance(e, BlockedHost) and not isinstance(e, UnresolvableHost):
+            action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
             return action_results
 
         action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
