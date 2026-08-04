@@ -3819,7 +3819,8 @@
                 "$ref": "#/components/schemas/CreateBrowserSessionRequest",
                 "default": {
                   "timeout": 60,
-                  "generate_browser_profile": false
+                  "generate_browser_profile": false,
+                  "needs_live_view": false
                 }
               }
             }
@@ -11259,6 +11260,12 @@
             "type": "boolean",
             "title": "Generate Browser Profile",
             "description": "When true, the session's browser profile (cookies, localStorage, etc.) is saved to storage when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid storing profiles for sessions that never need them. Sessions started with a browser_profile_id always persist their profile regardless of this flag.",
+            "default": false
+          },
+          "needs_live_view": {
+            "type": "boolean",
+            "title": "Needs Live View",
+            "description": "Whether a person will watch this session's browser live. Defaults to false, which suits unattended automation; the Skyvern app sets it because a session opened in the UI is watched. It requests a capability, not a particular browser, and cannot be used to select where the session runs.",
             "default": false
           }
         },

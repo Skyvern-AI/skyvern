@@ -1,8 +1,9 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, create_autospec
 
 import pytest
-from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
+from azure.core.exceptions import HttpResponseError, ResourceExistsError, ResourceNotFoundError
+from azure.keyvault.secrets.aio import SecretClient
 
 from skyvern.forge.sdk.api.real_azure import RealAsyncAzureVaultClient
 
@@ -82,6 +83,7 @@ class _PartialThenNotFoundVersionIterator:
 def _secret_client(versions_iterator: object, *, disable_error: Exception | None = None) -> MagicMock:
     secret_client = MagicMock()
     secret_client.list_properties_of_secret_versions = MagicMock(return_value=versions_iterator)
+    secret_client.get_deleted_secret = AsyncMock(side_effect=ResourceNotFoundError("secret was never created"))
     secret_client.set_secret = AsyncMock(return_value=SimpleNamespace(name="my-secret"))
     secret_client.update_secret_properties = AsyncMock(side_effect=disable_error)
     secret_client.close = AsyncMock()
@@ -199,6 +201,77 @@ async def test_create_or_update_secret_handles_missing_prior_versions(
     result = await client.create_or_update_secret("my-secret", "new-value", "vault")
 
     assert result == "my-secret"
+    secret_client.update_secret_properties.assert_not_awaited()
+    secret_client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_or_update_secret_recovers_name_deleted_before_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret_client = create_autospec(SecretClient, instance=True)
+    deleted = True
+    call_order: list[str] = []
+
+    def list_versions(_secret_name: str) -> object:
+        call_order.append("list")
+        if deleted:
+            return _RaisingVersionIterator()
+        return _AsyncVersionIterator([SimpleNamespace(version="v-recovered", enabled=True)])
+
+    async def set_secret(secret_name: str, _secret_value: str) -> object:
+        call_order.append("set")
+        if deleted:
+            raise ResourceExistsError("secret is deleted but recoverable")
+        return SimpleNamespace(name=secret_name)
+
+    async def recover_secret(_secret_name: str) -> object:
+        nonlocal deleted
+        call_order.append("recover")
+        deleted = False
+        return SimpleNamespace()
+
+    async def get_deleted_secret(_secret_name: str) -> object:
+        call_order.append("get_deleted")
+        return SimpleNamespace(name="my-secret")
+
+    async def disable_version(_secret_name: str, _version: str, *, enabled: bool) -> None:
+        assert enabled is False
+        call_order.append("disable")
+
+    secret_client.list_properties_of_secret_versions.side_effect = list_versions
+    secret_client.set_secret.side_effect = set_secret
+    secret_client.get_deleted_secret.side_effect = get_deleted_secret
+    secret_client.recover_deleted_secret.side_effect = recover_secret
+    secret_client.update_secret_properties.side_effect = disable_version
+    client = _vault_client(monkeypatch, secret_client)
+
+    result = await client.create_or_update_secret("my-secret", "new-value", "vault")
+
+    assert result == "my-secret"
+    assert call_order == ["list", "get_deleted", "recover", "list", "set", "disable"]
+    secret_client.get_deleted_secret.assert_awaited_once_with("my-secret")
+    secret_client.recover_deleted_secret.assert_awaited_once_with("my-secret")
+    secret_client.update_secret_properties.assert_awaited_once_with("my-secret", "v-recovered", enabled=False)
+    secret_client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_or_update_secret_does_not_recover_name_deleted_after_live_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret_client = create_autospec(SecretClient, instance=True)
+    secret_client.list_properties_of_secret_versions.return_value = _AsyncVersionIterator(
+        [SimpleNamespace(version="v-live", enabled=True)]
+    )
+    secret_client.set_secret.side_effect = ResourceExistsError("secret was deleted concurrently")
+    client = _vault_client(monkeypatch, secret_client)
+
+    with pytest.raises(ResourceExistsError, match="deleted concurrently"):
+        await client.create_or_update_secret("my-secret", "new-value", "vault")
+
+    secret_client.get_deleted_secret.assert_not_awaited()
+    secret_client.recover_deleted_secret.assert_not_awaited()
     secret_client.update_secret_properties.assert_not_awaited()
     secret_client.close.assert_awaited_once()
 

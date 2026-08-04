@@ -3,7 +3,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.webeye.utils.page import _SAME_ORIGIN_FETCH_JS, SkyvernFrame
+from skyvern.webeye.utils.page import (
+    _SAME_ORIGIN_FETCH_JS,
+    BlobActionFreshness,
+    SkyvernFrame,
+    probe_blob_action_freshness,
+)
 
 _MOD = "skyvern.webeye.utils.page"
 
@@ -312,3 +317,180 @@ async def test_read_http_url_bytes_rejects_oversized() -> None:
         result = await SkyvernFrame.read_http_url_bytes(page=page, url="https://host.example/x.pdf", max_size_bytes=10)
 
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# probe_blob_action_freshness: the retention-freshness gate. A named blob: iframe
+# candidate is action-fresh only when its fragment-stripped URL is a live key in a
+# __skyvernBlobRetention.retained Map in some realm relevant to the blob origin
+# (or an indeterminate-origin frame that may inherit the creator origin). Only
+# booleans cross the boundary; the URL is passed in but never logged or returned.
+# ---------------------------------------------------------------------------
+
+_BLOB = "blob:https://files.example.org/live-uuid"
+_BLOB_ORIGIN_URL = "https://files.example.org/app"
+_OTHER_ORIGIN_URL = "https://app.example.com/dashboard"
+
+
+@pytest.mark.asyncio
+async def test_probe_freshness_retained_in_main_realm() -> None:
+    page = MagicMock()
+    main_frame = MagicMock()
+    main_frame.url = _BLOB_ORIGIN_URL
+    page.main_frame = main_frame
+    page.frames = [main_frame]
+    eval_mock = AsyncMock(return_value={"observed": True, "retained": True})
+
+    with patch(f"{_MOD}.evaluate_in_main_world", new=eval_mock):
+        result = await probe_blob_action_freshness(page, _BLOB, workflow_run_id="wr")
+
+    assert result == BlobActionFreshness(state_observed=True, retained=True)
+    # Main frame routes through the main-world seam, never a raw main_frame.evaluate.
+    main_frame.evaluate.assert_not_called()
+    _p, _js, arg = eval_mock.await_args.args
+    assert arg == _BLOB
+
+
+@pytest.mark.asyncio
+async def test_probe_freshness_state_present_but_candidate_absent() -> None:
+    page = MagicMock()
+    main_frame = MagicMock()
+    main_frame.url = _BLOB_ORIGIN_URL
+    page.main_frame = main_frame
+    page.frames = [main_frame]
+    eval_mock = AsyncMock(return_value={"observed": True, "retained": False})
+
+    with patch(f"{_MOD}.evaluate_in_main_world", new=eval_mock):
+        result = await probe_blob_action_freshness(page, _BLOB)
+
+    assert result == BlobActionFreshness(state_observed=True, retained=False)
+
+
+@pytest.mark.asyncio
+async def test_probe_freshness_no_state_observable_anywhere() -> None:
+    page = MagicMock()
+    main_frame = MagicMock()
+    main_frame.url = _BLOB_ORIGIN_URL
+    page.main_frame = main_frame
+    page.frames = [main_frame]
+    eval_mock = AsyncMock(return_value={"observed": False, "retained": False})
+
+    with patch(f"{_MOD}.evaluate_in_main_world", new=eval_mock):
+        result = await probe_blob_action_freshness(page, _BLOB)
+
+    assert result == BlobActionFreshness(state_observed=False, retained=False)
+
+
+@pytest.mark.asyncio
+async def test_probe_freshness_creator_realm_not_display_frame() -> None:
+    """Main/parent mints the blob and assigns it to an iframe src; the display frame's realm has no
+    retention state. The gate must succeed by probing the creator (main) realm, and still best-effort
+    probe the indeterminate display frame."""
+    page = MagicMock()
+    main_frame = MagicMock()
+    main_frame.url = _BLOB_ORIGIN_URL
+    display_frame = MagicMock()
+    display_frame.url = "about:blank"
+    display_frame.evaluate = AsyncMock(return_value={"observed": False, "retained": False})
+    page.main_frame = main_frame
+    page.frames = [main_frame, display_frame]
+    main_eval = AsyncMock(return_value={"observed": True, "retained": True})
+
+    with patch(f"{_MOD}.evaluate_in_main_world", new=main_eval):
+        result = await probe_blob_action_freshness(page, _BLOB)
+
+    assert result == BlobActionFreshness(state_observed=True, retained=True)
+    display_frame.evaluate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_probe_freshness_probe_failure_in_one_frame_is_best_effort() -> None:
+    """A probe raising in one realm never escapes; the verdict rests on the other realms."""
+    page = MagicMock()
+    main_frame = MagicMock()
+    main_frame.url = _BLOB_ORIGIN_URL
+    sub_frame = MagicMock()
+    sub_frame.url = "https://files.example.org/preview"
+    sub_frame.evaluate = AsyncMock(return_value={"observed": True, "retained": True})
+    page.main_frame = main_frame
+    page.frames = [main_frame, sub_frame]
+    main_eval = AsyncMock(side_effect=RuntimeError("main realm detached"))
+
+    with patch(f"{_MOD}.evaluate_in_main_world", new=main_eval):
+        result = await probe_blob_action_freshness(page, _BLOB)
+
+    assert result == BlobActionFreshness(state_observed=True, retained=True)
+    sub_frame.evaluate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_probe_freshness_sub_frame_routes_through_frame_evaluate() -> None:
+    """A main frame at a different (determinate) origin is not probed; a same-origin sub-frame is,
+    via frame.evaluate with the candidate URL as the argument."""
+    page = MagicMock()
+    main_frame = MagicMock()
+    main_frame.url = _OTHER_ORIGIN_URL
+    sub_frame = MagicMock()
+    sub_frame.url = "https://files.example.org/preview"
+    sub_frame.evaluate = AsyncMock(return_value={"observed": True, "retained": True})
+    page.main_frame = main_frame
+    page.frames = [main_frame, sub_frame]
+    main_eval = AsyncMock(return_value={"observed": True, "retained": True})
+
+    with patch(f"{_MOD}.evaluate_in_main_world", new=main_eval):
+        result = await probe_blob_action_freshness(page, _BLOB)
+
+    assert result == BlobActionFreshness(state_observed=True, retained=True)
+    main_eval.assert_not_awaited()
+    _js, arg = sub_frame.evaluate.await_args.args
+    assert arg == _BLOB
+
+
+@pytest.mark.asyncio
+async def test_probe_freshness_non_blob_url_returns_unobservable_without_probing() -> None:
+    page = MagicMock()
+    page.main_frame = MagicMock()
+    page.frames = [page.main_frame]
+
+    with patch(f"{_MOD}.evaluate_in_main_world", new=AsyncMock()) as eval_mock:
+        result = await probe_blob_action_freshness(page, "https://files.example.org/not-a-blob")
+
+    assert result == BlobActionFreshness(state_observed=False, retained=False)
+    eval_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_probe_freshness_never_logs_candidate_url() -> None:
+    page = MagicMock()
+    main_frame = MagicMock()
+    main_frame.url = _BLOB_ORIGIN_URL
+    page.main_frame = main_frame
+    page.frames = [main_frame]
+    log_mock = MagicMock()
+    eval_mock = AsyncMock(side_effect=RuntimeError("boom"))
+
+    with (
+        patch(f"{_MOD}.evaluate_in_main_world", new=eval_mock),
+        patch(f"{_MOD}.LOG", log_mock),
+    ):
+        result = await probe_blob_action_freshness(page, _BLOB, workflow_run_id="wr")
+
+    assert result == BlobActionFreshness(state_observed=False, retained=False)
+    log_mock.debug.assert_called()
+    for call in log_mock.mock_calls:
+        assert _BLOB not in repr(call)
+
+
+def test_retention_js_blocks_share_ownership_brand_and_version() -> None:
+    # Drift guard: install/teardown/probe must validate the same Skyvern ownership brand + version so a
+    # foreign or stale same-name global is never treated as owned.
+    from skyvern.webeye.utils import page as page_mod
+
+    for js in (
+        page_mod._BLOB_RETENTION_INSTALL_JS,
+        page_mod._BLOB_RETENTION_TEARDOWN_JS,
+        page_mod._BLOB_RETENTION_PROBE_JS,
+    ):
+        assert page_mod._BLOB_RETENTION_BRAND in js
+        assert f"VERSION = {page_mod._BLOB_RETENTION_VERSION}" in js
+        assert "isOwned" in js

@@ -708,10 +708,11 @@ describe("CredentialsModal edit-mode inline test", () => {
       expect(toastMock).toHaveBeenCalledWith(
         expect.objectContaining({
           title: "Partial save",
-          // Flag-off the PATCH omits browser profile / IP, so the copy must not
-          // name them — byte-identical to the legacy partial-save message.
+          // Flag-off the PATCH omits browser profile / IP, so the copy names
+          // login instructions and sequential settings only — byte-identical
+          // to the flag-off partial-save message.
           description:
-            "Credential updated, but login instructions could not be saved. Please try editing again.",
+            "Credential updated, but login instructions and sequential settings could not be saved. Please try editing again.",
         }),
       );
     });
@@ -998,5 +999,97 @@ describe("CredentialsModal copilot-context tested_url default", () => {
       expect(onCredentialCreated).toHaveBeenCalledWith("cred-y", "credentials"),
     );
     expect(patchMock).not.toHaveBeenCalled();
+  }, 10_000);
+});
+
+describe("CredentialsModal run-sequentially toggle", () => {
+  const sequentialLabel = /Run workflows sequentially for this credential/i;
+
+  function renderEditModalFor(cred: CredentialApiResponse) {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <CredentialsModal
+            isOpen
+            onOpenChange={vi.fn()}
+            overrideType={CredentialModalTypes.PASSWORD}
+            editingCredential={cred}
+            onStartBackgroundTest={vi.fn()}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("reflects run_sequentially=false as an unchecked toggle", async () => {
+    renderEditModalFor(editingPasswordCredential);
+    const toggle = await screen.findByLabelText(sequentialLabel);
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("helper copy says scheduled/sync runs fail closed and does not over-promise", async () => {
+    renderEditModalFor(editingPasswordCredential);
+    await screen.findByLabelText(sequentialLabel);
+    expect(
+      screen.getByText(
+        /scheduled or sync-triggered runs are not yet supported and fail closed/i,
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/run without serialization/i)).toBeNull();
+  });
+
+  it("reflects run_sequentially=true as a checked toggle (readback)", async () => {
+    renderEditModalFor({
+      ...editingPasswordCredential,
+      run_sequentially: true,
+    });
+    const toggle = await screen.findByLabelText(sequentialLabel);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("persists run_sequentially via PATCH and shows success on a toggle-only edit", async () => {
+    patchMock.mockResolvedValueOnce({
+      data: { credential_id: "real-cred-id", name: "Acme Login" },
+    });
+    renderEditModalFor(editingPasswordCredential);
+    const toggle = await screen.findByLabelText(sequentialLabel);
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id",
+        expect.objectContaining({ run_sequentially: true }),
+      );
+    });
+    await waitFor(() => {
+      expect(toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Credential saved" }),
+      );
+    });
+  }, 10_000);
+
+  it("surfaces the save failure and shows no success toast when the PATCH rejects", async () => {
+    patchMock.mockRejectedValueOnce(axiosErrorWithDetail("nope"));
+    renderEditModalFor(editingPasswordCredential);
+    const toggle = await screen.findByLabelText(sequentialLabel);
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id",
+        expect.objectContaining({ run_sequentially: true }),
+      );
+    });
+    expect(toastMock).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Credential saved" }),
+    );
   }, 10_000);
 });

@@ -105,6 +105,7 @@ class PersistentSessionsManager(Protocol):
         generate_browser_profile: bool = False,
         inherit_profile_proxy: bool = False,
         wait_for_startup: bool = True,
+        needs_live_view: bool = False,
     ) -> PersistentBrowserSession:
         """Create a new browser session."""
         ...

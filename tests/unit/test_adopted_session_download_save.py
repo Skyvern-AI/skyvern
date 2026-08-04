@@ -249,11 +249,18 @@ async def test_blob_url_in_page_fetch_returns_not_ok(tmp_path) -> None:
     failing_frame = _frame(BLOB_ORIGIN_FRAME_URL, evaluate_return={"ok": False, "status": 0})
     page = _blob_capable_page(failing_frame)
 
-    saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+    # The live-blob-iframe recovery seam runs after the download-url read fails and would issue its
+    # own DOM probe; stub it out so this test isolates the download-url in-page fetch behavior.
+    with patch(
+        "skyvern.webeye.actions.handler._recover_adopted_session_blob_pdf_iframe",
+        new=AsyncMock(return_value=None),
+    ) as recover:
+        saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
 
     assert saved is None
     page.context.request.get.assert_not_awaited()
     failing_frame.evaluate.assert_awaited_once()
+    recover.assert_awaited_once_with(page, download, "wr")
     assert list(tmp_path.iterdir()) == []
 
 
@@ -264,11 +271,18 @@ async def test_blob_url_evaluate_raises_returns_none(tmp_path) -> None:
     raising_frame = _frame(BLOB_ORIGIN_FRAME_URL, evaluate_return=Exception("frame detached"))
     page = _blob_capable_page(raising_frame)
 
-    saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+    # The live-blob-iframe recovery seam runs after the download-url read fails and would issue its
+    # own DOM probe; stub it out so this test isolates the download-url in-page fetch behavior.
+    with patch(
+        "skyvern.webeye.actions.handler._recover_adopted_session_blob_pdf_iframe",
+        new=AsyncMock(return_value=None),
+    ) as recover:
+        saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
 
     assert saved is None
     page.context.request.get.assert_not_awaited()
     raising_frame.evaluate.assert_awaited_once()
+    recover.assert_awaited_once_with(page, download, "wr")
     assert list(tmp_path.iterdir()) == []
 
 
@@ -666,6 +680,63 @@ async def test_eager_capture_aclose_reraises_outer_cancellation() -> None:
             this.uncancel()
 
     assert reraised, "aclose must propagate an outer cancellation, not swallow it"
+
+
+@pytest.mark.asyncio
+async def test_retention_teardown_runs_even_when_aclose_is_cancelled() -> None:
+    """If closing the eager capture raises CancelledError, the page-realm retention wrapper must still
+    be torn down for an adopted session, and the original cancellation must propagate afterwards."""
+    from skyvern.webeye.actions.handler import _close_eager_capture_then_teardown_retention
+
+    capture = MagicMock()
+    capture.aclose = AsyncMock(side_effect=asyncio.CancelledError())
+    page = MagicMock()
+
+    with patch("skyvern.webeye.actions.handler.teardown_blob_url_retention", AsyncMock()) as teardown:
+        with pytest.raises(asyncio.CancelledError):
+            await _close_eager_capture_then_teardown_retention(
+                capture, page, browser_session_id="pbs-1", workflow_run_id="wr"
+            )
+
+    teardown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_retention_teardown_failure_does_not_replace_cancellation() -> None:
+    """A teardown failure stays fail-open/debug-only and must not swallow or replace the original
+    cancellation raised by aclose."""
+    from skyvern.webeye.actions.handler import _close_eager_capture_then_teardown_retention
+
+    capture = MagicMock()
+    capture.aclose = AsyncMock(side_effect=asyncio.CancelledError())
+    page = MagicMock()
+
+    with patch(
+        "skyvern.webeye.actions.handler.teardown_blob_url_retention",
+        AsyncMock(side_effect=RuntimeError("teardown boom")),
+    ) as teardown:
+        with pytest.raises(asyncio.CancelledError):
+            await _close_eager_capture_then_teardown_retention(
+                capture, page, browser_session_id="pbs-1", workflow_run_id="wr"
+            )
+
+    teardown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_retention_teardown_skipped_without_browser_session() -> None:
+    """Non-adopted sessions never installed the retention wrapper, so teardown must not run."""
+    from skyvern.webeye.actions.handler import _close_eager_capture_then_teardown_retention
+
+    capture = MagicMock()
+    capture.aclose = AsyncMock()
+    page = MagicMock()
+
+    with patch("skyvern.webeye.actions.handler.teardown_blob_url_retention", AsyncMock()) as teardown:
+        await _close_eager_capture_then_teardown_retention(capture, page, browser_session_id=None, workflow_run_id="wr")
+
+    capture.aclose.assert_awaited_once()
+    teardown.assert_not_awaited()
 
 
 @pytest.mark.asyncio

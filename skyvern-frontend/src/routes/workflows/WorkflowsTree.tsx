@@ -6,14 +6,7 @@ import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
 import { Button } from "@/components/ui/button";
 import { SelectionHeaderCheckboxCell } from "@/components/SelectionCheckbox";
 import { useRowSelection } from "@/hooks/useRowSelection";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   Table,
   TableBody,
@@ -1059,49 +1052,29 @@ function WorkflowsTree() {
           />
         )}
 
-        <Dialog
+        <ConfirmDialog
           open={bulkDeleteDialog.open}
           onOpenChange={(open) => {
-            if (!open && !isBulkOperating) {
+            if (!open) {
               setBulkDeleteDialog({ open: false, targets: [] });
             }
           }}
-        >
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>
-                Delete {bulkDeleteDialog.targets.length} Agent
-                {bulkDeleteDialog.targets.length === 1 ? "" : "s"}
-              </DialogTitle>
-              <DialogDescription>
-                Are you sure you want to delete{" "}
-                {bulkDeleteDialog.targets.length}{" "}
-                {bulkDeleteDialog.targets.length === 1 ? "agent" : "agents"}?
-                This action cannot be undone.
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button
-                variant="secondary"
-                disabled={isBulkOperating}
-                onClick={() =>
-                  setBulkDeleteDialog({ open: false, targets: [] })
-                }
-              >
-                Cancel
-              </Button>
-              <Button
-                variant="destructive"
-                disabled={isBulkOperating}
-                onClick={() => {
-                  void handleBulkDeleteConfirm();
-                }}
-              >
-                {isBulkOperating ? "Deleting..." : "Delete"}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+          title={`Delete ${bulkDeleteDialog.targets.length} agent${
+            bulkDeleteDialog.targets.length === 1 ? "" : "s"
+          }?`}
+          description={
+            <p>
+              {bulkDeleteDialog.targets.length}{" "}
+              {bulkDeleteDialog.targets.length === 1 ? "agent" : "agents"} will
+              be permanently deleted.
+            </p>
+          }
+          itemCount={bulkDeleteDialog.targets.length}
+          isPending={isBulkOperating}
+          onConfirm={() => {
+            void handleBulkDeleteConfirm();
+          }}
+        />
 
         {/* Folder Dialogs */}
         <CreateFolderDialog

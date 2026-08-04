@@ -35,8 +35,15 @@ function extract(name) {
   return src.substring(fnStart, fnEnd);
 }
 
+// buildDestinationFacts charges the per-build budget before it resolves, so it needs that state
+// even to answer a shape question. These single-element checks are about the fact's SHAPE, so
+// they run with an effectively unbounded budget; the per-build bound is exercised by buildLoop.
 const buildDestinationFacts = new Function(
-  `${extract("normalizeFormMethod")}\n${extract("buildDestinationFacts")}\nreturn buildDestinationFacts;`,
+  `let __destinationFactBudget = Number.MAX_SAFE_INTEGER;
+   ${extract("normalizeFormMethod")}
+   ${extract("spendDestinationBudget")}
+   ${extract("buildDestinationFacts")}
+   return buildDestinationFacts;`,
 )();
 
 const DOC = {
@@ -397,6 +404,10 @@ check("the URL parser is never handed an over-cap base (M3b)", () => {
   // "next" against a 5000-char base produces an over-cap url either way, so only what the parser
   // was CALLED with distinguishes them. A local URL binding shadows the global for the extracted
   // code, which is how the argument becomes observable.
+  // The budget is deliberately effectively unbounded here: it also refuses an over-cap base (its
+  // length is what gets charged), so a binding budget would reject the huge base for the WRONG
+  // reason and leave this green with the base cap deleted. `bounded` must be the only thing that
+  // can reject, which is why the control run below has to prove the parser is reached at all.
   const spy = new Function(
     `const bases = [];
      class URL extends globalThis.URL {
@@ -405,23 +416,27 @@ check("the URL parser is never handed an over-cap base (M3b)", () => {
          super(raw, base);
        }
      }
+     let __destinationFactBudget = Number.MAX_SAFE_INTEGER;
      ${extract("normalizeFormMethod")}
+     ${extract("spendDestinationBudget")}
      ${extract("buildDestinationFacts")}
      return { build: buildDestinationFacts, bases };`,
   )();
-  const hugeBase = "https://site.example/" + "b".repeat(1000000) + "/";
-  spy.build(
-    {
-      tagName: "a",
-      form: undefined,
-      ownerDocument: {
-        URL: "https://site.example/dir/page",
-        baseURI: hugeBase,
-      },
-      getAttribute: (name) => (name === "href" ? "next" : null),
-    },
-    "a",
+  const anchorIn = (baseURI) => ({
+    tagName: "a",
+    form: undefined,
+    ownerDocument: { URL: "https://site.example/dir/page", baseURI },
+    getAttribute: (name) => (name === "href" ? "next" : null),
+  });
+  // Non-vacuity control: an ordinary base must actually reach the parser. Without this, a builder
+  // that throws before resolving leaves `bases` empty and `every` trivially true.
+  spy.build(anchorIn("https://site.example/dir/"), "a");
+  assert.ok(
+    spy.bases.length > 0,
+    "the parser was never reached: this check proves nothing",
   );
+
+  spy.build(anchorIn("https://site.example/" + "b".repeat(1000000) + "/"), "a");
   assert.ok(
     spy.bases.every((length) => length <= 4096),
     `the parser was handed a base of ${Math.max(...spy.bases)} chars`,
@@ -574,9 +589,11 @@ function budgetHarness(startingBudget) {
   return new Function(
     `let __destinationFactBudget = ${startingBudget};
      const DESTINATION_FACT_OVERHEAD = ${OVERHEAD};
+     ${extract("spendDestinationBudget")}
      ${extract("chargeDestinationBudget")}
      return {
        charge: chargeDestinationBudget,
+       spend: spendDestinationBudget,
        remaining: () => __destinationFactBudget,
      };`,
   )();
@@ -628,6 +645,246 @@ check(
     assert.strictEqual(budget.remaining(), 10000);
   },
 );
+
+check("a nested build cannot replenish an active build's budget", () => {
+  // buildTreeFromBody is exported onto globalThis and arms the budget in its SYNCHRONOUS prefix,
+  // before its first await. A page that calls it from inside a trusted resolution (by replacing
+  // window.URL, say) could therefore re-arm the bound mid-build. Probed in real Chromium: with
+  // the budget drained from inside an active build, a nested call made a 524288 spend succeed
+  // again. Only the outermost build may arm; a nested one still builds, it just cannot replenish.
+  const harness = new Function(
+    `let __captureDestinationFacts = false;
+     let __destinationFactBudget = 0;
+     let __destinationBuildActive = false;
+     const window = {};
+     const document = { documentElement: {} };
+     const DomUtils = {};
+     async function buildElementTree() { return [[], []]; }
+     async ${extract("buildTreeFromBody")}
+     return {
+       start: (f) => buildTreeFromBody(f, undefined, [], true).catch(() => {}),
+       budget: () => __destinationFactBudget,
+       drain: () => { __destinationFactBudget = 0; },
+       capturing: () => __captureDestinationFacts,
+     };`,
+  )();
+  harness.start("outer");
+  assert.strictEqual(
+    harness.budget(),
+    524288,
+    "the outermost build must arm the budget",
+  );
+  assert.strictEqual(harness.capturing(), true);
+  harness.drain(); // the outer build spends its whole budget on hostile resolutions
+  harness.start("evil"); // page-triggered re-entry, still inside the outer build
+  assert.strictEqual(
+    harness.budget(),
+    0,
+    "a nested build replenished the active build's budget",
+  );
+});
+
+check("a submitter override costs ONE resolution, not two", () => {
+  // The owner's action was resolved and then discarded whenever a formaction override won, so
+  // every submitter charged the work budget twice -- directly counter to the bound this suite
+  // exists to defend. A near-cap shared action plus many short overrides exhausted the budget in
+  // ~124 controls while every effective destination was small.
+  let constructions = 0;
+  class CountingURL extends URL {
+    constructor(...args) {
+      super(...args);
+      constructions++;
+    }
+  }
+  const START = 100000;
+  const harness = new Function(
+    "URL",
+    `let __destinationFactBudget = ${START};
+     ${extract("normalizeFormMethod")}
+     ${extract("spendDestinationBudget")}
+     ${extract("buildDestinationFacts")}
+     return { build: buildDestinationFacts, remaining: () => __destinationFactBudget };`,
+  )(CountingURL);
+  const facts = harness.build(
+    stubElement({
+      tag: "input",
+      attrs: { type: "submit", formaction: "/override" },
+      form: stubForm({ action: "/a-much-longer-owner-action", method: "post" }),
+    }),
+    "input",
+  );
+  assert.deepStrictEqual(facts, {
+    kind: "form",
+    url: "https://site.example/override",
+    method: "post",
+  });
+  assert.strictEqual(
+    constructions,
+    1,
+    `resolved ${constructions} times, want 1`,
+  );
+  // Exact spend pins the charge too: only "/override" (9) against the base (25) may be billed.
+  assert.strictEqual(
+    harness.remaining(),
+    START - ("/override".length + DOC.baseURI.length),
+    "the discarded owner action was still charged",
+  );
+});
+
+check("a hostile cost cannot INFLATE the budget", () => {
+  // _wrap_js_in_isolated_scope exports every top-level declaration onto globalThis, so a page can
+  // call this while a build is awaiting. Probed in real Chromium: spend(-Infinity) returned true,
+  // set the budget to Infinity, and 5,000 consecutive 4,000-char facts were then all accepted —
+  // both the resolution bound and the payload bound gone. NaN is the same defect by another
+  // route, since `x < NaN` is false, so the deduction runs and poisons every later comparison.
+  // The pre-existing entry point could not reach this: a fact's cost is a string length.
+  for (const hostile of [
+    -Infinity,
+    NaN,
+    -1,
+    -0.5,
+    "5",
+    null,
+    undefined,
+    {},
+    1e309,
+  ]) {
+    const label = String(hostile);
+    const budget = budgetHarness(10000);
+    assert.strictEqual(
+      budget.spend(hostile),
+      false,
+      `accepted a cost of ${label}`,
+    );
+    assert.strictEqual(
+      budget.remaining(),
+      0,
+      `budget not zeroed after ${label}`,
+    );
+    assert.strictEqual(
+      budget.charge({ kind: "anchor", url: "z" }),
+      null,
+      `still spendable after ${label}`,
+    );
+  }
+  // Non-vacuity: an ordinary cost must still be accepted, or the guard above proves nothing.
+  const ok = budgetHarness(10000);
+  assert.strictEqual(ok.spend(100), true);
+  assert.strictEqual(ok.remaining(), 9900);
+});
+
+// The two checks below drive a whole build's worth of elements through the real builder and the
+// real charge functions, with a URL constructor that counts what resolution actually allocates.
+// Both were unreachable while the suite only exercised single elements: a per-element assertion
+// cannot see a per-build bound.
+const PER_BUILD_BUDGET = Math.max(
+  ...[...src.matchAll(/__destinationFactBudget = (\d+);/g)].map((match) =>
+    Number(match[1]),
+  ),
+);
+const MAX_ELEMENTS = Number(/const maxElementNumber = (\d+);/.exec(src)[1]);
+
+function buildLoop(href, elementCount) {
+  let urlConstructions = 0;
+  let resolvedChars = 0;
+  class CountingURL extends URL {
+    constructor(...args) {
+      super(...args);
+      urlConstructions++;
+      resolvedChars += this.href.length;
+    }
+  }
+  const harness = new Function(
+    "URL",
+    `let __destinationFactBudget = ${PER_BUILD_BUDGET};
+     const DESTINATION_FACT_OVERHEAD = ${OVERHEAD};
+     ${extract("normalizeFormMethod")}
+     ${extract("spendDestinationBudget")}
+     ${extract("chargeDestinationBudget")}
+     ${extract("buildDestinationFacts")}
+     return { build: buildDestinationFacts, charge: chargeDestinationBudget,
+              remaining: () => __destinationFactBudget };`,
+  )(CountingURL);
+  let attached = 0;
+  for (let i = 0; i < elementCount; i++) {
+    // The buildElementObject attach-site guard: exhaustion must stop the work, not just the bytes.
+    if (harness.remaining() > 0) {
+      if (
+        harness.charge(
+          harness.build(stubElement({ tag: "a", attrs: { href } }), "a"),
+        )
+      ) {
+        attached++;
+      }
+    }
+  }
+  return {
+    urlConstructions,
+    resolvedChars,
+    attached,
+    remaining: harness.remaining(),
+  };
+}
+
+check(
+  "the budget bounds RESOLUTION WORK, not just the bytes it attaches",
+  () => {
+    // A raw href OVER the per-URL cap is the worst case and the cheapest to charge: it resolves to
+    // ~9x its length, is rejected by the cap, and then bills 56 bytes as an opaque fact. Charging
+    // only the surviving fact let 15,000 elements buy 9,363 resolutions and 329MiB of allocated
+    // href for a 512KiB budget. Charging the resolution's input caps a build's total work at
+    // 9 x budget by construction. Deleting the pre-resolution charge makes this red.
+    const hostile = "€".repeat(4096); // 3-byte UTF-8: percent-encodes 1 char -> 9.
+    const run = buildLoop(hostile, MAX_ELEMENTS);
+    assert.ok(
+      run.urlConstructions < 500,
+      `resolution unbounded: ${run.urlConstructions} URLs built from ${MAX_ELEMENTS} elements`,
+    );
+    assert.ok(
+      run.resolvedChars <= PER_BUILD_BUDGET * 9,
+      `resolved ${run.resolvedChars} chars, above the 9 x budget bound`,
+    );
+    assert.strictEqual(run.remaining, 0);
+  },
+);
+
+check(
+  "the per-build budget stops a build of individually under-cap facts",
+  () => {
+    // The budget's own regression test. Every fact here is UNDER the per-URL cap, so none degrade
+    // to opaque and each bills its full serialized length — which is the only shape where the
+    // per-build budget is the binding constraint. The pre-existing hostile string resolved OVER the
+    // cap, so every fact was already opaque and deleting the budget left the suite green.
+    const underCap = "€".repeat(440); // resolves to ~3,985 chars: under the 4096 cap.
+    const run = buildLoop(underCap, MAX_ELEMENTS);
+    assert.ok(
+      run.attached > 0 && run.attached < MAX_ELEMENTS,
+      `budget did not bind: ${run.attached} of ${MAX_ELEMENTS} attached`,
+    );
+    assert.ok(
+      run.resolvedChars <= PER_BUILD_BUDGET * 9,
+      `resolved ${run.resolvedChars} chars, above the 9 x budget bound`,
+    );
+    assert.strictEqual(run.remaining, 0);
+  },
+);
+
+check("a benign page still gets facts on thousands of elements", () => {
+  // The bound must cost hostile pages, not ordinary ones: charging the input is a real reduction
+  // in benign capacity, so pin that it stays far above any realistic destination-bearing count.
+  const run = buildLoop("next/page", MAX_ELEMENTS);
+  assert.ok(
+    run.attached > 3000,
+    `benign capacity collapsed to ${run.attached}`,
+  );
+  assert.deepStrictEqual(
+    buildDestinationFacts(
+      stubElement({ tag: "a", attrs: { href: "next/page" } }),
+      "a",
+    ),
+    { kind: "anchor", url: "https://site.example/dir/next/page" },
+  );
+});
 
 if (failures.length > 0) {
   console.error(`${failures.length} failure(s): ${failures.join(", ")}`);

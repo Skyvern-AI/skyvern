@@ -125,6 +125,36 @@ def test_click_and_type_synthesize_single_code_block() -> None:
     assert "widgets" not in block.code
 
 
+def test_recorded_code_blocks_use_the_code_first_editor_shape() -> None:
+    actions: list[Action] = [
+        make_input(1000, "widgets", selector="#search", accessible_name="Search"),
+        make_click(2000, selector="#submit", role="button", accessible_name="Go"),
+    ]
+
+    result = actions_to_code_first_blocks(actions, None)
+
+    assert result is not None
+    blocks, _ = result
+    block = blocks[0]
+    # A non-null prompt is what makes the editor render the code-first node; "" leaves the
+    # Goal for the user to write rather than fabricating one.
+    assert block.prompt == ""
+    assert block.steps is not None
+    assert [step.action_type for step in block.steps] == ["goto_url", "input_text", "click"]
+    assert all(step.line_start is not None for step in block.steps)
+
+
+def test_goto_only_recording_carries_the_code_first_editor_shape() -> None:
+    actions: list[Action] = [make_url_change(1000, "https://example.com/only")]
+
+    result = actions_to_code_first_blocks(actions, None)
+
+    assert result is not None
+    blocks, _ = result
+    assert blocks[0].prompt == ""
+    assert [step.action_type for step in blocks[0].steps or []] == ["goto_url"]
+
+
 def test_password_input_becomes_parameter_without_default() -> None:
     actions: list[Action] = [
         make_input(1000, "hunter2", selector="#pw", accessible_name="Password", input_type="password"),

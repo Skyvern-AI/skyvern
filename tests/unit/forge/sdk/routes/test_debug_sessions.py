@@ -46,6 +46,7 @@ async def test_new_debug_session_uses_workflow_proxy_default_for_created_browser
     )
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=new_browser_session)
+    app_mock.AGENT_FUNCTION.supports_live_view = AsyncMock(return_value=True)
 
     with (
         patch.object(debug_sessions_mod, "app", app_mock),
@@ -65,6 +66,8 @@ async def test_new_debug_session_uses_workflow_proxy_default_for_created_browser
         timeout_minutes=debug_sessions_mod.settings.DEBUG_SESSION_TIMEOUT_MINUTES,
         proxy_location=expected_proxy_location,
         wait_for_startup=False,
+        # A debug session exists to be watched in the studio, so it always declares it.
+        needs_live_view=True,
     )
     app_mock.DATABASE.debug.create_debug_session.assert_awaited_once_with(
         browser_session_id="pbs_new",
@@ -73,6 +76,43 @@ async def test_new_debug_session_uses_workflow_proxy_default_for_created_browser
         workflow_permanent_id="wpid_test",
         vnc_streaming_supported=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_new_debug_session_records_no_vnc_when_the_infrastructure_cannot_serve_it() -> None:
+    """Asserted under the local carve-out, which is the most permissive left-hand side there is:
+    where the browser runs still decides, or the studio offers a stream that fails on click."""
+    created_debug_session = SimpleNamespace(debug_session_id="ds_new", pbs_browser_profile_id=None)
+    new_browser_session = SimpleNamespace(
+        persistent_browser_session_id="pbs_new",
+        ip_address=None,
+        browser_address="wss://session-router.example/pbs_new",
+        browser_profile_id=None,
+    )
+
+    app_mock = MagicMock()
+    app_mock.DATABASE.debug.get_debug_session = AsyncMock(return_value=None)
+    app_mock.DATABASE.debug.complete_debug_sessions = AsyncMock(return_value=[])
+    app_mock.DATABASE.debug.create_debug_session = AsyncMock(return_value=created_debug_session)
+    app_mock.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock()
+    app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(
+        return_value=SimpleNamespace(proxy_location=None)
+    )
+    app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=new_browser_session)
+    app_mock.AGENT_FUNCTION.supports_live_view = AsyncMock(return_value=False)
+
+    with (
+        patch.object(debug_sessions_mod, "app", app_mock),
+        patch.object(debug_sessions_mod.settings, "ENV", "local"),
+    ):
+        await debug_sessions_mod.new_debug_session(
+            "wpid_test",
+            current_org=SimpleNamespace(organization_id="org_123"),
+            current_user_id="user_123",
+        )
+
+    assert app_mock.DATABASE.debug.create_debug_session.await_args.kwargs["vnc_streaming_supported"] is False
 
 
 @pytest.mark.asyncio
@@ -173,6 +213,7 @@ async def test_new_debug_session_response_carries_pbs_browser_profile_id() -> No
         return_value=SimpleNamespace(proxy_location=None)
     )
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=new_browser_session)
+    app_mock.AGENT_FUNCTION.supports_live_view = AsyncMock(return_value=True)
 
     with (
         patch.object(debug_sessions_mod, "app", app_mock),

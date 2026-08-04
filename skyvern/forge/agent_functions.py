@@ -901,6 +901,13 @@ class AgentFunction:
     ) -> str | None:
         return browser_address
 
+    async def supports_live_view(self, browser_session_id: str, *, ip_address: str | None) -> bool:
+        """Whether this session's browser runs somewhere that can serve a live view stream.
+
+        Always yes here: a self-hosted deployment runs every browser itself.
+        """
+        return True
+
     def get_flex_llm_key(self, llm_key: str | None) -> str | None:
         """Return a flex-tier router key for the given LLM key, or None if no flex twin exists.
 

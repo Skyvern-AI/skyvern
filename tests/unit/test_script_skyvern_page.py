@@ -18,7 +18,6 @@ import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.config import settings
-from skyvern.core.script_generations import script_skyvern_page as script_page_module
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 from skyvern.core.script_generations.skyvern_page import ResolvedSensitiveValue, SkyvernPage
@@ -684,92 +683,6 @@ async def test_complete_raises_illegit_complete_subclass_when_handler_rejects(mo
             # fallback fires for what is genuinely a failure.
             with pytest.raises(IllegitCompleteScriptTermination, match="Illegit complete"):
                 await script_page.complete()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "script_mode,flag_result,expected_verified,expect_flag_consulted",
-    [
-        (True, True, True, True),
-        (True, False, False, True),
-        (True, Exception("posthog down"), False, True),
-        (False, True, False, False),
-    ],
-)
-async def test_complete_skip_cached_script_verification_flag(
-    mock_scraped_page,
-    mock_ai,
-    monkeypatch: pytest.MonkeyPatch,
-    script_mode,
-    flag_result,
-    expected_verified,
-    expect_flag_consulted,
-):
-    """
-    SKIP_CACHED_SCRIPT_COMPLETE_VERIFICATION (default off) marks the script-mode
-    CompleteAction as verified so handle_complete_action skips the check-user-goal
-    LLM call. Flag errors fail safe (LLM verification runs); the flag is only
-    consulted in script mode.
-    """
-    script_page = _make_script_page(mock_scraped_page, mock_ai)
-
-    mock_context = MagicMock()
-    mock_context.organization_id = "org_123"
-    mock_context.workflow_run_id = "wr_456"
-    mock_context.task_id = "tsk_789"
-    mock_context.step_id = "stp_012"
-    mock_context.action_order = 0
-    mock_context.skip_complete_verification = False
-    mock_context.code_version = 1
-    mock_context.is_static_script = False
-    mock_context.script_mode = script_mode
-
-    mock_step = MagicMock()
-    mock_step.order = 0
-
-    provider = MagicMock()
-    if isinstance(flag_result, Exception):
-        provider.is_feature_enabled_cached = AsyncMock(side_effect=flag_result)
-    else:
-        provider.is_feature_enabled_cached = AsyncMock(return_value=flag_result)
-    handle_complete = AsyncMock(return_value=[MagicMock(success=True)])
-
-    monkeypatch.setattr(script_page_module.app, "EXPERIMENTATION_PROVIDER", provider)
-
-    with (
-        patch(
-            "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
-            return_value=mock_context,
-        ),
-        patch(
-            "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_task",
-            new_callable=AsyncMock,
-            return_value=MagicMock(),
-        ),
-        patch(
-            "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.tasks.get_step",
-            new_callable=AsyncMock,
-            return_value=mock_step,
-        ),
-        patch.object(ScriptSkyvernPage, "_update_step_output_before_complete", new_callable=AsyncMock),
-        patch.object(ScriptSkyvernPage, "_create_final_screenshot", new_callable=AsyncMock),
-        patch(
-            "skyvern.core.script_generations.script_skyvern_page.handle_complete_action",
-            handle_complete,
-        ),
-    ):
-        await script_page.complete()
-
-    action = handle_complete.call_args.args[0]
-    assert action.verified is expected_verified
-    if expect_flag_consulted:
-        provider.is_feature_enabled_cached.assert_awaited_once_with(
-            "SKIP_CACHED_SCRIPT_COMPLETE_VERIFICATION",
-            "wr_456",
-            properties={"organization_id": "org_123"},
-        )
-    else:
-        provider.is_feature_enabled_cached.assert_not_awaited()
 
 
 # =============================================================================

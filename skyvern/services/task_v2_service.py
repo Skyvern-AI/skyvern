@@ -2025,7 +2025,10 @@ async def _generate_compute_task(
         raise last_error or InsecureCodeDetected("Failed to synthesize safe compute code")
 
     label = f"compute_{generate_random_string()}"
-    code_block_yaml = CodeBlockYAML(label=label, code=safe_code)
+    # A non-null prompt is what makes the editor render the code-first node; "" is runtime-neutral
+    # (every backend prompt check is truthiness based) and leaves the Goal for the user, because a
+    # fabricated one would arm runtime self-heal on a data-only block.
+    code_block_yaml = CodeBlockYAML(label=label, code=safe_code, prompt="")
     output_parameter = await app.WORKFLOW_SERVICE.create_output_parameter_for_block(
         workflow_id=workflow_id,
         block_yaml=code_block_yaml,
@@ -2035,6 +2038,7 @@ async def _generate_compute_task(
             label=label,
             code=safe_code,
             parameters=[],
+            prompt="",
             output_parameter=output_parameter,
         ),
         [code_block_yaml],
