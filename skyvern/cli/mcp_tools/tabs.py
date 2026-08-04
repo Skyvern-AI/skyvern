@@ -16,8 +16,11 @@ from pydantic import BaseModel, Field
 
 from skyvern.cli.core.browser_ops import do_screenshot
 from skyvern.cli.core.guards import GuardError, validate_wait_until
+from skyvern.exceptions import BlockedHost, SkyvernHTTPException
+from skyvern.utils.url_validators import validate_fetch_url
 
 from ._common import ErrorCode, Timer, make_error, make_result, save_artifact
+from ._localhost import is_localhost_url
 from ._session import (
     BrowserNotAvailableError,
     clear_session_ref_map,
@@ -147,6 +150,26 @@ async def skyvern_tab_new(
     browser = state.browser
     if browser is None:
         return make_result("skyvern_tab_new", ok=False, error=no_browser_error())
+
+    if url:
+        allow_localhost = ctx.can_access_localhost is True and is_localhost_url(url)
+        try:
+            url = await asyncio.to_thread(validate_fetch_url, url)
+        except BlockedHost as e:
+            if not allow_localhost:
+                return make_result(
+                    "skyvern_tab_new",
+                    ok=False,
+                    browser_context=ctx,
+                    error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use a public HTTP(S) URL"),
+                )
+        except SkyvernHTTPException as e:
+            return make_result(
+                "skyvern_tab_new",
+                ok=False,
+                browser_context=ctx,
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use a valid public HTTP(S) URL"),
+            )
 
     prev_active = state._active_page
     new_page = None
