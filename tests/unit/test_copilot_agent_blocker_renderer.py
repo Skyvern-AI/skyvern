@@ -1029,7 +1029,7 @@ def test_unapproved_credential_reference_asks_without_naming_the_credential_inve
     assert "hr portal" not in result.user_response
 
 
-def test_unapproved_credential_reference_lists_both_ambiguous_candidate_ids() -> None:
+def test_unapproved_credential_reference_ambiguous_does_not_enumerate_candidates() -> None:
     ctx = _ctx()
     ctx.request_policy = RequestPolicy(
         live_page_resolution=LivePageResolutionRecord(
@@ -1044,9 +1044,12 @@ def test_unapproved_credential_reference_lists_both_ambiguous_candidate_ids() ->
 
     result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
 
-    assert "cred_first" in result.user_response
-    assert "cred_second" in result.user_response
-    assert "credential ID" in result.user_response
+    # The ambiguous branch used to list candidate ids; the FE now renders the full org selector, so the
+    # reply is one sentence with the Credentials UI marker and no prose dump.
+    assert "I need an approved credential to continue" in result.user_response
+    assert "Credentials UI" in result.user_response
+    assert "cred_first" not in result.user_response
+    assert "cred_second" not in result.user_response
 
 
 def test_unapproved_credential_reference_points_at_credentials_ui_when_nothing_matched() -> None:
