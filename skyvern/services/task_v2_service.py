@@ -810,12 +810,29 @@ async def run_task_v2_helper(
     yaml_parameters: list[PARAMETER_YAML_TYPES] = []
     current_url: str | None = None
 
+    if browser_session_id:
+        # Task V2 bypasses WorkflowService's normal browser-session acquisition path. Establish
+        # the same immutable workflow lease here before the public BrowserManager call so the
+        # worker can prove ownership without recomputing it later from mutable task/context data.
+        lease_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+            browser_session_id=browser_session_id,
+            runnable_type="workflow_run",
+            runnable_id=root_workflow_run_id,
+            organization_id=organization_id,
+        )
+        context.browser_session_runnable_id = root_workflow_run_id
+        context.browser_session_runnable_generation_id = lease_generation_id
+
     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
         workflow_run=workflow_run,
         url=str(task_v2.url) if task_v2.url else None,
         browser_session_id=browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
         navigate=False,
+        browser_session_runnable_id=root_workflow_run_id if browser_session_id else None,
+        browser_session_runnable_generation_id=(
+            context.browser_session_runnable_generation_id if browser_session_id else None
+        ),
     )
 
     page = await browser_state.get_working_page()

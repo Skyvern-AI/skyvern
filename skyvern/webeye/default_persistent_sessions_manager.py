@@ -27,7 +27,7 @@ from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_ports import _release_cdp_port
-from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
+from skyvern.webeye.persistent_sessions_manager import PBS_TASK_RUNNABLE_TYPE, PersistentSessionsManager
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.session_cookies import persist_session_cookies
 
@@ -225,7 +225,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         runnable_type: str,
         runnable_id: str,
         organization_id: str,
-    ) -> None:
+    ) -> str | None:
         """
         Attempt to begin a session.
 
@@ -253,6 +253,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         )
 
         LOG.info("Browser session begin", browser_session_id=browser_session_id)
+        return None
 
     async def get_browser_address(self, session_id: str, organization_id: str) -> str:
         address = await wait_on_persistent_browser_address(self.database, session_id, organization_id)
@@ -299,7 +300,15 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         """Get all active sessions for an organization."""
         return await self.database.browser_sessions.get_active_persistent_browser_sessions(organization_id)
 
-    async def get_browser_state(self, session_id: str, organization_id: str | None = None) -> BrowserState | None:
+    async def get_browser_state(
+        self,
+        session_id: str,
+        organization_id: str | None = None,
+        *,
+        expected_runnable_id: str | None = None,
+        expected_runnable_generation_id: str | None = None,
+        download_run_id: str | None = None,
+    ) -> BrowserState | None:
         """Get a specific browser session's state by session ID."""
         browser_session = self._browser_sessions.get(session_id)
         return browser_session.browser_state if browser_session else None
@@ -476,6 +485,8 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         runnable_type: str,
         runnable_id: str,
         organization_id: str,
+        *,
+        runnable_generation_id: str | None = None,
     ) -> None:
         """Occupy a specific browser session."""
         await self.database.browser_sessions.occupy_persistent_browser_session(
@@ -483,6 +494,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             runnable_type=runnable_type,
             runnable_id=runnable_id,
             organization_id=organization_id,
+            runnable_generation_id=runnable_generation_id,
         )
 
     async def renew_or_close_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession:
@@ -511,9 +523,23 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     ) -> PersistentBrowserSession | None:
         return await update_status(self.database, session_id, organization_id, status)
 
-    async def release_browser_session(self, session_id: str, organization_id: str) -> None:
+    async def release_browser_session(
+        self,
+        session_id: str,
+        organization_id: str,
+        *,
+        expected_runnable_id: str | None = None,
+        expected_runnable_generation_id: str | None = None,
+        expected_browser_state: BrowserState | None = None,
+    ) -> bool:
         """Release a specific browser session."""
-        await self.database.browser_sessions.release_persistent_browser_session(session_id, organization_id)
+        released = await self.database.browser_sessions.release_persistent_browser_session(
+            session_id,
+            organization_id,
+            expected_runnable_id=expected_runnable_id,
+            expected_runnable_generation_id=expected_runnable_generation_id,
+        )
+        return released is not None
 
     async def _release_local_browser_session(
         self, organization_id: str, browser_session_id: str, *, export_profile: bool | None = None
@@ -729,24 +755,28 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         instead of skipping it forever. Owners we can't authoritatively resolve — an unrecognized
         runnable type or a lookup failure — are treated as active, so a reap never races a run we
         can't prove is gone."""
-        if runnable_type != RunType.workflow_run:
+        if runnable_type not in (RunType.workflow_run, PBS_TASK_RUNNABLE_TYPE):
             return True
         try:
-            workflow_run = await self.database.workflow_runs.get_workflow_run(
-                workflow_run_id=runnable_id,
-                organization_id=organization_id,
-            )
+            if runnable_type == PBS_TASK_RUNNABLE_TYPE:
+                owner = await self.database.tasks.get_task(runnable_id, organization_id=organization_id)
+            else:
+                owner = await self.database.workflow_runs.get_workflow_run(
+                    workflow_run_id=runnable_id,
+                    organization_id=organization_id,
+                )
         except Exception:
             LOG.warning(
                 "Could not resolve owning run for persistent browser session; leaving it protected",
                 runnable_id=runnable_id,
+                runnable_type=runnable_type,
                 organization_id=organization_id,
                 exc_info=True,
             )
             return True
-        if workflow_run is None:
+        if owner is None:
             return False
-        return not workflow_run.status.is_final()
+        return not owner.status.is_final()
 
     async def reap_expired_sessions(self) -> None:
         """Close the sessions this process holds whose timeout (plus grace) has elapsed via

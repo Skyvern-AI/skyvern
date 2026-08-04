@@ -9,7 +9,7 @@ from sqlalchemy import and_, case, desc, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, StatementError
 
 from skyvern.config import settings
-from skyvern.exceptions import BrowserProfileNotFound
+from skyvern.exceptions import BrowserProfileNotFound, BrowserSessionAlreadyOccupiedError
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -952,34 +952,84 @@ class BrowserSessionsRepository(BaseRepository):
 
     @db_operation("occupy_persistent_browser_session")
     async def occupy_persistent_browser_session(
-        self, session_id: str, runnable_type: str, runnable_id: str, organization_id: str
+        self,
+        session_id: str,
+        runnable_type: str,
+        runnable_id: str,
+        organization_id: str,
+        *,
+        runnable_generation_id: str | None = None,
     ) -> None:
         """Occupy a specific persistent browser session."""
         async with self.Session() as session:
-            persistent_browser_session = (
-                await session.scalars(
-                    select(PersistentBrowserSessionModel)
-                    .filter_by(persistent_browser_session_id=session_id)
-                    .filter_by(organization_id=organization_id)
-                    .filter_by(deleted_at=None)
+            result = await session.scalars(
+                update(PersistentBrowserSessionModel)
+                .where(
+                    PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
+                    PersistentBrowserSessionModel.organization_id == organization_id,
+                    PersistentBrowserSessionModel.deleted_at.is_(None),
+                    or_(
+                        PersistentBrowserSessionModel.runnable_id.is_(None),
+                        PersistentBrowserSessionModel.runnable_id == runnable_id,
+                    ),
                 )
-            ).first()
-            if persistent_browser_session:
-                persistent_browser_session.runnable_type = runnable_type
-                persistent_browser_session.runnable_id = runnable_id
-                await session.commit()
-                await session.refresh(persistent_browser_session)
-            else:
-                raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
+                .values(
+                    runnable_type=runnable_type,
+                    runnable_id=runnable_id,
+                    runnable_generation_id=runnable_generation_id,
+                )
+                .returning(PersistentBrowserSessionModel)
+            )
+            persistent_browser_session = result.first()
+            if persistent_browser_session is None:
+                existing = (
+                    await session.scalars(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(persistent_browser_session_id=session_id)
+                        .filter_by(organization_id=organization_id)
+                        .filter_by(deleted_at=None)
+                    )
+                ).first()
+                if existing is None:
+                    raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
+                raise BrowserSessionAlreadyOccupiedError(session_id, existing.runnable_id or "unknown")
+            await session.commit()
+            await session.refresh(persistent_browser_session)
 
     @db_operation("release_persistent_browser_session")
     async def release_persistent_browser_session(
         self,
         session_id: str,
         organization_id: str,
-    ) -> PersistentBrowserSession:
+        *,
+        expected_runnable_id: str | None = None,
+        expected_runnable_generation_id: str | None = None,
+    ) -> PersistentBrowserSession | None:
         """Release a specific persistent browser session."""
         async with self.Session() as session:
+            if expected_runnable_id is not None:
+                statement = update(PersistentBrowserSessionModel).where(
+                    PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
+                    PersistentBrowserSessionModel.organization_id == organization_id,
+                    PersistentBrowserSessionModel.deleted_at.is_(None),
+                    PersistentBrowserSessionModel.runnable_id == expected_runnable_id,
+                )
+                if expected_runnable_generation_id is not None:
+                    statement = statement.where(
+                        PersistentBrowserSessionModel.runnable_generation_id == expected_runnable_generation_id
+                    )
+                result = await session.scalars(
+                    statement.values(runnable_type=None, runnable_id=None, runnable_generation_id=None).returning(
+                        PersistentBrowserSessionModel
+                    )
+                )
+                persistent_browser_session = result.first()
+                if persistent_browser_session is None:
+                    return None
+                await session.commit()
+                await session.refresh(persistent_browser_session)
+                return PersistentBrowserSession.model_validate(persistent_browser_session)
+
             persistent_browser_session = (
                 await session.scalars(
                     select(PersistentBrowserSessionModel)
@@ -991,6 +1041,7 @@ class BrowserSessionsRepository(BaseRepository):
             if persistent_browser_session:
                 persistent_browser_session.runnable_type = None
                 persistent_browser_session.runnable_id = None
+                persistent_browser_session.runnable_generation_id = None
                 await session.commit()
                 await session.refresh(persistent_browser_session)
                 return PersistentBrowserSession.model_validate(persistent_browser_session)

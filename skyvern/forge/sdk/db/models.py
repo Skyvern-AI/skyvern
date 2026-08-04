@@ -1347,6 +1347,7 @@ class PersistentBrowserSessionModel(Base):
     organization_id = Column(String, nullable=False, index=True)
     runnable_type = Column(String, nullable=True)
     runnable_id = Column(String, nullable=True, index=True)
+    runnable_generation_id = Column(String, nullable=True)
     browser_id = Column(String, nullable=True)
     browser_address = Column(String, nullable=True, unique=True)
     status = Column(String, nullable=True, default="created")
