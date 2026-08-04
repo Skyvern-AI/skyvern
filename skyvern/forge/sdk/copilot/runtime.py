@@ -345,6 +345,7 @@ class AgentContext:
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     challenge_gated_proxy_retry_count: int = 0
     last_test_non_retriable_nav_error: str | None = None
+    last_infrastructure_tool_error: str | None = None
     non_retriable_nav_error_last_emitted_signature: str | None = None
     workflow_persisted: bool = False
     last_workflow: Any | None = None

@@ -21,6 +21,7 @@ import unicodedata
 import uuid
 import zipfile
 from collections import defaultdict, deque
+from collections.abc import Sequence
 from datetime import date, datetime, time, timezone
 from email.message import EmailMessage
 from functools import partial
@@ -438,6 +439,16 @@ def _maybe_truncate_loop_outputs(
     outputs_with_loop_values.clear()
     outputs_with_loop_values.append(summary_entry)
     outputs_with_loop_values.append(last)
+
+
+def build_block_failure_output(failure_reason: str, error_codes: Sequence[str]) -> dict[str, Any]:
+    # SKY-7939: also surface the failure in `outputs.<block_label>` so callers
+    # can tell which block failed without cross-referencing the timeline.
+    return {
+        "status": BlockStatus.failed.value,
+        "failure_reason": failure_reason,
+        "errors": [{"error_code": code, "reasoning": failure_reason, "confidence_float": 1.0} for code in error_codes],
+    }
 
 
 class Block(BaseModel, abc.ABC):
@@ -5683,17 +5694,30 @@ async def wrapper({default_args}):
                         secure_classification = self._classify_secure_runner_failure(secure_failure)
 
                         async def build_secure_failure_result() -> BlockResult:
-                            if secure_code_block_result.block_result is not None:
-                                return secure_code_block_result.block_result
+                            engine_block_result = secure_code_block_result.block_result
+                            if engine_block_result is not None:
+                                await self.record_output_parameter_value(
+                                    workflow_run_context,
+                                    workflow_run_id,
+                                    engine_block_result.output_parameter_value,
+                                )
+                                return engine_block_result
+                            secure_failure_reason = (
+                                secure_failure.failure_reason or "Code block failed in the secure runner"
+                            )
+                            secure_error_codes = [secure_failure.error_code] if secure_failure.error_code else []
+                            failure_output = build_block_failure_output(secure_failure_reason, secure_error_codes)
+                            await self.record_output_parameter_value(
+                                workflow_run_context, workflow_run_id, failure_output
+                            )
                             return await self.build_block_result(
                                 success=False,
-                                failure_reason=(
-                                    secure_failure.failure_reason or "Code block failed in the secure runner"
-                                ),
-                                output_parameter_value=None,
+                                failure_reason=secure_failure_reason,
+                                output_parameter_value=failure_output,
                                 status=BlockStatus.failed,
                                 workflow_run_block_id=workflow_run_block_id,
                                 organization_id=organization_id,
+                                error_codes=secure_error_codes or None,
                             )
 
                         return await self._resolve_failure_with_heal(
@@ -8917,16 +8941,8 @@ class FileParserBlock(Block):
         organization_id: str | None,
         failure_reason: str,
     ) -> BlockResult:
-        # SKY-7939: also surface the failure in `outputs.<block_label>` so callers
-        # can tell which block failed without cross-referencing the timeline.
         error_codes = self.get_failure_error_codes()
-        failure_output: dict[str, Any] = {
-            "status": BlockStatus.failed.value,
-            "failure_reason": failure_reason,
-            "errors": [
-                {"error_code": code, "reasoning": failure_reason, "confidence_float": 1.0} for code in error_codes
-            ],
-        }
+        failure_output = build_block_failure_output(failure_reason, error_codes)
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, failure_output)
         return await self.build_block_result(
             success=False,

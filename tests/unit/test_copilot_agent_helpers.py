@@ -23,6 +23,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _VERIFIED_WORKFLOW_SUCCESS_REPLY,
     _build_goal_satisfied_exit_result,
     _resolve_wrapped_exception_exit_result,
+    _rewrite_failed_test_response,
     _synthesized_block_offer_prompt,
     _verified_workflow_or_none,
 )
@@ -7482,3 +7483,20 @@ def test_a_turn_that_forms_no_requested_output_still_dumps_its_trajectory(tmp_pa
 
     recorded = json.loads(dumps[0].read_text())["scout_trajectory"]
     assert [step["credential_field"] for step in recorded] == ["totp"]
+
+
+def test_rewrite_names_the_sandbox_outage_when_the_runner_was_unreachable() -> None:
+    ctx = _ctx(
+        last_update_block_count=1,
+        last_test_ok=False,
+        last_test_failure_reason="Secure CodeBlock runner is unavailable. Please retry.",
+        last_failure_category_top="UNRECOVERABLE_TOOL_ERROR",
+        last_run_blocks_workflow_run_id="wr_runner",
+    )
+
+    rewritten = _rewrite_failed_test_response("All set — the workflow is ready.", ctx)
+
+    assert rewritten == (
+        "I created a draft workflow with 1 block and tested it, but the test failed. "
+        "Failure: Secure CodeBlock runner is unavailable. Please retry.."
+    )

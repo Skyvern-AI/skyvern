@@ -28,6 +28,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _is_unfinished_run_verification_candidate,
     _record_run_blocks_result,
     _run_blocks_structured_blocker_message,
+    _tool_loop_error,
     run_execution,
 )
 from skyvern.forge.sdk.copilot.tools._shared import _registered_output_parameter_payloads
@@ -1459,3 +1460,60 @@ def test_present_value_upgrade_flips_lone_judge_unknown_to_demonstrated_on_ok_ru
     assert outcome_fully_verified(ctx) is True
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_full_workflow_test_ok is True
+
+
+def _failed_code_block_run_result(error_code: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_test",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "run_code",
+                    "block_type": "CODE",
+                    "status": "failed",
+                    "failure_reason": "Secure CodeBlock runner is unavailable. Please retry.",
+                    "error_codes": [error_code],
+                }
+            ],
+        },
+    }
+
+
+@pytest.mark.parametrize("error_code", sorted(run_execution.INFRASTRUCTURE_RUNNER_ERROR_CODES))
+def test_infrastructure_runner_code_prepends_unrecoverable_tool_error(error_code: str) -> None:
+    result = _failed_code_block_run_result(error_code)
+    ctx = _ctx(result["data"]["blocks"])
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    categories = result["data"]["failure_categories"]
+    assert categories[0]["category"] == "UNRECOVERABLE_TOOL_ERROR"
+    assert ctx.last_failure_category_top == "UNRECOVERABLE_TOOL_ERROR"
+    assert ctx.last_infrastructure_tool_error == error_code
+
+
+@pytest.mark.parametrize("error_code", ["timeout", "user_code_error", "insecure_code_detected"])
+def test_repairable_runner_code_injects_no_unrecoverable_category(error_code: str) -> None:
+    result = _failed_code_block_run_result(error_code)
+    ctx = _ctx(result["data"]["blocks"])
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    categories = result["data"].get("failure_categories") or []
+    assert all(entry.get("category") != "UNRECOVERABLE_TOOL_ERROR" for entry in categories)
+    assert ctx.last_failure_category_top != "UNRECOVERABLE_TOOL_ERROR"
+    assert ctx.last_infrastructure_tool_error is None
+
+
+def test_pre_run_sandbox_refusal_leaves_the_within_turn_guard_disarmed() -> None:
+    result = run_execution._copilot_sandbox_unavailable_result()
+    ctx = _ctx()
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    assert result["data"]["workflow_run_id"] is None
+    assert ctx.last_failure_category_top == "UNRECOVERABLE_TOOL_ERROR"
+    assert ctx.last_infrastructure_tool_error is None
+    assert _tool_loop_error(ctx, "edit_block") is None
