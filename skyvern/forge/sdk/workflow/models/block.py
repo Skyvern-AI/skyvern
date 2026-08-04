@@ -3738,6 +3738,16 @@ class CodeBlockCaptchaError(Exception):
 
 CODE_BLOCK_TAB_OPEN_FAILURE_REASON = "Code block could not open a tab in the browser session; the session's browser may be held by another Playwright client"
 
+
+def _page_open_error_label(error: BaseException) -> str:
+    # Playwright maps only TimeoutError/TargetClosedError to their own Python classes; every
+    # other driver failure is the base Error whose .name carries the real class (e.g. TypeError).
+    name = getattr(error, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    return type(error).__name__
+
+
 _CODE_BLOCK_CAPTCHA_CHECKBOX_SELECTOR = ", ".join(
     (
         'input[type="checkbox"][id*="captcha" i]',
@@ -5558,7 +5568,7 @@ async def wrapper({default_args}):
                 )
                 return await self.build_block_result(
                     success=False,
-                    failure_reason=f"{CODE_BLOCK_TAB_OPEN_FAILURE_REASON} ({type(e).__name__})",
+                    failure_reason=f"{CODE_BLOCK_TAB_OPEN_FAILURE_REASON} ({_page_open_error_label(e)})",
                     output_parameter_value=None,
                     status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,

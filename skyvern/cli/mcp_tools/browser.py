@@ -21,6 +21,7 @@ from pydantic import Field
 from skyvern.cli.core.action_log import enqueue_action_event
 from skyvern.cli.core.browser_ops import (
     _ALLOWED_EXECUTE_TOOLS,
+    LOCALHOST_RECOVERY_HINT,
     MAX_EXECUTE_STEPS,
     CustomSelectClassifyError,
     CustomSelectMatchError,
@@ -61,11 +62,13 @@ from skyvern.cli.core.session_manager import is_stateless_http_mode
 from skyvern.cli.core.trajectory_store import append_trajectory_entry
 from skyvern.config import settings
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
+from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.copilot.typed_value_policy import typed_text_looks_secret
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.schemas.action_log import ActionLogOutcome, project_action_event
 from skyvern.schemas.run_blocks import CredentialType
+from skyvern.utils.url_validators import validate_fetch_url
 
 from ._common import (
     AI_FALLBACK_DESCRIPTION,
@@ -456,18 +459,28 @@ async def skyvern_navigate(
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
-    if _must_reject_localhost_url(ctx, url):
+    can_access_localhost = ctx.can_access_localhost is True
+    is_localhost_destination = is_localhost_url(url)
+    allow_localhost = can_access_localhost and is_localhost_destination
+    try:
+        validated_url = await asyncio.to_thread(validate_fetch_url, url)
+    except BlockedHost as e:
+        if allow_localhost:
+            validated_url = url
+        else:
+            hint = LOCALHOST_RECOVERY_HINT if is_localhost_destination else "Use a public HTTP(S) URL"
+            return action_result(
+                "skyvern_navigate",
+                ok=False,
+                browser_context=ctx,
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), hint),
+            )
+    except SkyvernHTTPException as e:
         return action_result(
             "skyvern_navigate",
             ok=False,
             browser_context=ctx,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                "Cloud browsers cannot reach localhost URLs",
-                "Run `pip install skyvern && skyvern browser serve --tunnel` to bridge "
-                "your local dev server to a cloud browser via ngrok. "
-                "Or use `local=true` in skyvern_browser_session_create for a local browser.",
-            ),
+            error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use a valid public HTTP(S) URL"),
         )
 
     # Any navigation attempt may destroy iframes — clear frame state upfront
@@ -478,7 +491,14 @@ async def skyvern_navigate(
 
     with Timer() as timer:
         try:
-            result = await do_navigate(page, url, timeout=timeout, wait_until=wait_until)
+            result = await do_navigate(
+                page,
+                validated_url,
+                timeout=timeout,
+                wait_until=wait_until,
+                can_access_localhost=can_access_localhost,
+                is_localhost_destination=is_localhost_destination,
+            )
             timer.mark("sdk")
         except GuardError as e:
             return action_result(
@@ -2623,9 +2643,7 @@ async def skyvern_run_task(
             error=make_error(
                 ErrorCode.INVALID_INPUT,
                 "Cloud browsers cannot reach localhost URLs",
-                "Run `pip install skyvern && skyvern browser serve --tunnel` to bridge "
-                "your local dev server to a cloud browser via ngrok. "
-                "Or use `local=true` in skyvern_browser_session_create for a local browser.",
+                LOCALHOST_RECOVERY_HINT,
             ),
         )
 
