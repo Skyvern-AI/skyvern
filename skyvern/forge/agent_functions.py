@@ -183,6 +183,14 @@ class CopilotSiteOriginAssociation:
     provider_relation_text: str
 
 
+@dataclass(frozen=True)
+class ScriptExecutionPolicyDecision:
+    allowed: bool
+    selection_reason: str
+    flag_value: bool | None = None
+    env_force_on: bool = False
+
+
 class CopilotCandidateNetworkHop(TypedDict):
     url: str
     resource_type: str
@@ -1039,6 +1047,17 @@ class AgentFunction:
         only routes runs that have a browser session for the runner to broker against.
         """
         return False
+
+    async def resolve_in_process_script_execution_policy(
+        self,
+        *,
+        organization_id: str | None,
+        workflow_run_id: str | None,
+        workflow_permanent_id: str | None = None,
+        workflow_id: str | None = None,
+        script_id: str | None = None,
+    ) -> ScriptExecutionPolicyDecision:
+        return ScriptExecutionPolicyDecision(allowed=True, selection_reason="oss_default")
 
     async def should_auto_create_browser_session_for_code_block(
         self,
