@@ -5538,6 +5538,21 @@ async def wrapper({default_args}):
             )
 
         page = await browser_state.get_working_page()
+        if page is None:
+            # A session can arrive holding a context with no tab, leaving nothing to adopt. Only a
+            # raise here means the session is genuinely unusable.
+            try:
+                page = await browser_state.get_or_create_page()
+            except Exception:
+                LOG.exception(
+                    "Failed to open a page to run the code block",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    block_label=self.label,
+                )
+                page = None
         if not page:
             return await self.build_block_result(
                 success=False,

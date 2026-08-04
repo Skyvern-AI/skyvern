@@ -1493,6 +1493,13 @@ class ScriptTerminationException(SkyvernException):
         super().__init__(reason)
 
 
+class InProcessScriptExecutionDenied(SkyvernException):
+    def __init__(self, *, seam: str, selection_reason: str) -> None:
+        self.seam = seam
+        self.selection_reason = selection_reason
+        super().__init__(f"In-process script execution denied at {seam}: {selection_reason}")
+
+
 class IllegitCompleteScriptTermination(ScriptTerminationException):
     """Raised when a cached script's page.complete() is rejected by the verifier; distinct from plain ScriptTerminationException, which is an intentional terminate()."""
 

@@ -45,6 +45,7 @@ from skyvern.exceptions import (
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
     DisabledBlockExecutionError,
+    InProcessScriptExecutionDenied,
     InvalidCredentialId,
     InvalidWorkflowParameter,
     MissingValueForParameter,
@@ -626,7 +627,17 @@ def _script_has_static_module_marker(script_path: str) -> bool:
         return False
 
 
-def _load_user_script_module(script_path: str, spec: "importlib.machinery.ModuleSpec") -> Any | None:
+async def _load_user_script_module(
+    script_path: str,
+    spec: "importlib.machinery.ModuleSpec",
+    *,
+    organization_id: str | None = None,
+    workflow_run_id: str | None = None,
+    workflow_permanent_id: str | None = None,
+    workflow_id: str | None = None,
+    script_id: str | None = None,
+    script_revision_id: str | None = None,
+) -> Any | None:
     """Load a cached script's main.py for execution.
 
     Static (marker) pins must import the live platform module FIRST: the stored
@@ -639,6 +650,16 @@ def _load_user_script_module(script_path: str, spec: "importlib.machinery.Module
     check would never supersede it. Only a markerless pin (a generated script)
     executes its stored body.
     """
+    await script_service.ensure_in_process_script_execution_allowed(
+        seam="workflow.cached_script_module_load",
+        organization_id=organization_id,
+        workflow_run_id=workflow_run_id,
+        workflow_permanent_id=workflow_permanent_id,
+        workflow_id=workflow_id,
+        script_id=script_id,
+        script_revision_id=script_revision_id,
+    )
+
     loaded_script_module = app.AGENT_FUNCTION.try_import_static_script(script_path)
     if loaded_script_module is not None:
         return loaded_script_module
@@ -4100,7 +4121,16 @@ class WorkflowService:
 
                         spec = importlib.util.spec_from_file_location("user_script", script_path)
                         if spec and spec.loader:
-                            loaded_script_module = _load_user_script_module(script_path, spec)
+                            loaded_script_module = await _load_user_script_module(
+                                script_path,
+                                spec,
+                                organization_id=organization_id,
+                                workflow_run_id=workflow_run_id,
+                                workflow_permanent_id=workflow.workflow_permanent_id,
+                                workflow_id=workflow.workflow_id,
+                                script_id=script.script_id,
+                                script_revision_id=script.script_revision_id,
+                            )
                             param_cls = (
                                 getattr(loaded_script_module, "GeneratedWorkflowParameters", None)
                                 if loaded_script_module
@@ -4158,6 +4188,8 @@ class WorkflowService:
                             script_path=script_path,
                             script_id=script.script_id,
                         )
+            except InProcessScriptExecutionDenied:
+                raise
             except Exception as e:
                 LOG.warning(
                     "Failed to load script blocks, will fallback to normal execution",
