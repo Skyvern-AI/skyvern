@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import shlex
 from datetime import datetime, timezone
@@ -900,6 +901,58 @@ class TestTasksCommands:
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["ok"] is False
         assert parsed["action"] == "tasks.list"
+
+
+@pytest.mark.parametrize("module_name", ["skyvern.cli.credentials", "skyvern.cli.tasks"])
+class TestCredentialClientBaseUrlGuard:
+    def test_rejects_credential_when_base_url_uses_untouched_default(
+        self, module_name: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern import config
+
+        monkeypatch.delenv("SKYVERN_API_KEY", raising=False)
+        monkeypatch.delenv("SKYVERN_BASE_URL", raising=False)
+        cli_module = importlib.import_module(module_name)
+        monkeypatch.setattr(cli_module, "prepare_cli_runtime", lambda **_: None)
+        monkeypatch.setattr(config, "settings", config.Settings(_env_file=None))
+
+        with pytest.raises(typer.BadParameter, match="SKYVERN_BASE_URL=https://api.skyvern.com"):
+            cli_module._get_client("test-api-key")
+
+    @pytest.mark.parametrize("base_url", ["https://api.skyvern.com", "https://staging.skyvern.com"])
+    def test_allows_credential_when_base_url_is_explicitly_configured(
+        self, module_name: str, base_url: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern import config
+
+        monkeypatch.delenv("SKYVERN_API_KEY", raising=False)
+        monkeypatch.setenv("SKYVERN_BASE_URL", base_url)
+        cli_module = importlib.import_module(module_name)
+        client_constructor = MagicMock(return_value=object())
+        monkeypatch.setattr(cli_module, "prepare_cli_runtime", lambda **_: None)
+        monkeypatch.setattr(cli_module, "Skyvern", client_constructor)
+        monkeypatch.setattr(config, "settings", config.Settings(_env_file=None))
+
+        cli_module._get_client("test-api-key")
+
+        client_constructor.assert_called_once_with(base_url=base_url, api_key="test-api-key")
+
+    def test_allows_untouched_default_without_a_credential(
+        self, module_name: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern import config
+
+        monkeypatch.delenv("SKYVERN_API_KEY", raising=False)
+        monkeypatch.delenv("SKYVERN_BASE_URL", raising=False)
+        cli_module = importlib.import_module(module_name)
+        client_constructor = MagicMock(return_value=object())
+        monkeypatch.setattr(cli_module, "prepare_cli_runtime", lambda **_: None)
+        monkeypatch.setattr(cli_module, "Skyvern", client_constructor)
+        monkeypatch.setattr(config, "settings", config.Settings(_env_file=None))
+
+        cli_module._get_client()
+
+        client_constructor.assert_called_once_with(base_url="https://api.skyvern.com", api_key="PLACEHOLDER")
 
 
 class TestCredentialsCommands:
