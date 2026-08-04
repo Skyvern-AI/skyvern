@@ -410,6 +410,11 @@ class Settings(BaseSettings):
     WORKFLOW_COPILOT_LITE_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
+    # The client-side timeout is a per-read gap applied per SDK attempt, so a provider that drips
+    # keep-alive bytes can hold a call open forever; the hard deadline bounds it in wall-clock time.
+    # Only the direct AsyncOpenAI client path (api_handler_factory.LLMCaller) applies this today.
+    ENFORCE_LLM_HARD_DEADLINE: bool = True
+    LLM_HARD_DEADLINE_GRACE_SECONDS: float = Field(default=10.0, ge=0)
     LLM_CONFIG_MAX_TOKENS: int = 4096
     LLM_CONFIG_TEMPERATURE: float = 0
     LLM_CONFIG_SUPPORT_VISION: bool = True  # Whether the model supports vision
