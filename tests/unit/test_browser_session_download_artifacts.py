@@ -632,11 +632,14 @@ async def test_browser_session_response_preserves_empty_downloads_on_timeout_by_
     storage.get_shared_downloaded_files_in_browser_session = AsyncMock(side_effect=TimeoutError)
     storage.get_shared_recordings_in_browser_session = AsyncMock(return_value=[])
 
+    selector = AsyncMock(return_value=[])
     with patch("skyvern.webeye.schemas.app") as app_mock:
+        app_mock.AGENT_FUNCTION.select_browser_session_recordings = selector
         app_mock.AGENT_FUNCTION.resolve_browser_session_connect_url = AsyncMock(return_value=None)
         response = await BrowserSessionResponse.from_browser_session(browser_session, storage)
 
     assert response.downloaded_files == []
+    selector.assert_not_awaited()
 
 
 def test_get_browser_session_openapi_documents_download_unavailable_response():

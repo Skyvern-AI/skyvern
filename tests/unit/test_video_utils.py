@@ -125,6 +125,19 @@ async def test_prepare_recording_for_upload_invokes_ffmpeg_with_h264_mp4_compres
 
 
 @pytest.mark.asyncio
+async def test_prepare_recording_for_upload_keeps_finalized_mp4_without_ffmpeg(tmp_path) -> None:
+    src = tmp_path / "vendor.mp4"
+    src.write_bytes(b"finalized-vendor-video")
+
+    with patch.object(video_utils, "_prepare_recording_upload", AsyncMock()) as prepare:
+        async with prepare_recording_for_upload(str(src)) as prepared:
+            assert prepared.path == str(src)
+            assert prepared.file_extension == "mp4"
+
+    prepare.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_prepare_recording_for_upload_can_disable_compression_and_stream_copy_remux(tmp_path) -> None:
     src = str(tmp_path / "src.webm")
     _write_unfinalized_webm(src)
@@ -341,6 +354,12 @@ def test_plan_run_segment_no_overlap_returns_none() -> None:
 
 def test_plan_run_segment_unfinished_run_extends_to_video_end() -> None:
     video_start = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    segment = plan_run_segment(datetime(2026, 1, 1, 10, 30, tzinfo=UTC), None, video_start, 3600)
+    assert segment == (1800.0, 1800.0)
+
+
+def test_plan_run_segment_unfinished_run_treats_naive_video_start_as_utc() -> None:
+    video_start = datetime(2026, 1, 1, 10, 0)
     segment = plan_run_segment(datetime(2026, 1, 1, 10, 30, tzinfo=UTC), None, video_start, 3600)
     assert segment == (1800.0, 1800.0)
 
