@@ -239,6 +239,10 @@ class RealBrowserManager(BrowserManager):
         # The runnable identity accepted by begin_session, carried unchanged into teardown. Cleanup
         # reads this lease instead of reconstructing identity from Task/Workflow fields.
         self._persistent_session_leases: dict[str, _PersistentSessionLease] = {}
+        # Runnables between begin_session and their lease. Occupancy is published first and occupy
+        # does not extend the session's timeout, so without this a reused-but-expired session is
+        # unprotected for the whole attach.
+        self._acquiring_session_runnables: set[str] = set()
         # CDP frame publishers keyed by stream key (``{wr}.png`` / ``{task}.png``).
         self._frame_publishers: dict[str, CDPFramePublisher] = {}
         # Serializes the check/create/start/store/register sequence in
@@ -285,6 +289,9 @@ class RealBrowserManager(BrowserManager):
     def _discard_session_lease(self, run_id: str, lease: _PersistentSessionLease | None) -> None:
         if lease is not None and self._persistent_session_leases.get(run_id) is lease:
             self._persistent_session_leases.pop(run_id, None)
+
+    def live_session_runnable_ids(self) -> set[str]:
+        return set(self._persistent_session_leases) | self._acquiring_session_runnables
 
     async def _start_frame_publisher(
         self,
@@ -1364,46 +1371,52 @@ class RealBrowserManager(BrowserManager):
                 raise MissingOrganizationForBrowserSession(browser_session_id)
             if not script_id:
                 raise MissingBrowserStateForBrowserSession(browser_session_id)
-            raw_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
-                browser_session_id=browser_session_id,
-                runnable_type="script",
-                runnable_id=script_id,
-                organization_id=organization_id,
-            )
-            expected_runnable_generation_id = raw_generation_id if isinstance(raw_generation_id, str) else None
-            if context is not None:
-                context.browser_session_runnable_id = script_id
-                context.browser_session_runnable_generation_id = expected_runnable_generation_id
-            download_run_id = resolve_run_download_id(skyvern_context.current(), fallback_run_id=script_id) or script_id
-            LOG.info(
-                "Getting browser state for script",
-                browser_session_id=browser_session_id,
-            )
-            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-                browser_session_id,
-                **{
-                    "organization_id": organization_id,
-                    "expected_runnable_id": script_id,
-                    "download_run_id": download_run_id,
-                    **(
-                        {"expected_runnable_generation_id": expected_runnable_generation_id}
-                        if expected_runnable_generation_id is not None
-                        else {}
-                    ),
-                },
-            )
-            if browser_state is None:
-                # Fail closed: a cold/evicted session has no reusable state. Silently creating a local
-                # browser below would produce an unregistered state that terminal cleanup misclassifies as
-                # a reusable persistent session (keyed off browser_session_id) and leaks instead of closes.
-                raise MissingBrowserStateForBrowserSession(browser_session_id)
-            self._persistent_session_leases[script_id] = _PersistentSessionLease(
-                session_id=browser_session_id,
-                organization_id=organization_id,
-                runnable_id=script_id,
-                runnable_generation_id=expected_runnable_generation_id,
-                browser_state=browser_state,
-            )
+            self._acquiring_session_runnables.add(script_id)
+            try:
+                raw_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+                    browser_session_id=browser_session_id,
+                    runnable_type="script",
+                    runnable_id=script_id,
+                    organization_id=organization_id,
+                )
+                expected_runnable_generation_id = raw_generation_id if isinstance(raw_generation_id, str) else None
+                if context is not None:
+                    context.browser_session_runnable_id = script_id
+                    context.browser_session_runnable_generation_id = expected_runnable_generation_id
+                download_run_id = (
+                    resolve_run_download_id(skyvern_context.current(), fallback_run_id=script_id) or script_id
+                )
+                LOG.info(
+                    "Getting browser state for script",
+                    browser_session_id=browser_session_id,
+                )
+                browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                    browser_session_id,
+                    **{
+                        "organization_id": organization_id,
+                        "expected_runnable_id": script_id,
+                        "download_run_id": download_run_id,
+                        **(
+                            {"expected_runnable_generation_id": expected_runnable_generation_id}
+                            if expected_runnable_generation_id is not None
+                            else {}
+                        ),
+                    },
+                )
+                if browser_state is None:
+                    # Fail closed: a cold/evicted session has no reusable state. Silently creating a local
+                    # browser below would produce an unregistered state that terminal cleanup misclassifies as
+                    # a reusable persistent session (keyed off browser_session_id) and leaks instead of closes.
+                    raise MissingBrowserStateForBrowserSession(browser_session_id)
+                self._persistent_session_leases[script_id] = _PersistentSessionLease(
+                    session_id=browser_session_id,
+                    organization_id=organization_id,
+                    runnable_id=script_id,
+                    runnable_generation_id=expected_runnable_generation_id,
+                    browser_state=browser_state,
+                )
+            finally:
+                self._acquiring_session_runnables.discard(script_id)
             page = await browser_state.get_working_page()
             if not page:
                 LOG.warning("Browser state has no page to run the script", script_id=script_id)
@@ -1478,13 +1491,11 @@ class RealBrowserManager(BrowserManager):
                 # Best-effort per the "errors are logged, not raised" contract: a release failure must not
                 # escape cleanup and mask the script's own exception (this runs in run_script's finally).
                 try:
-                    released = await self._release_persistent_session(
+                    await self._release_persistent_session(
                         browser_session_id,
                         organization_id,
                         session_lease,
                     )
-                    if released:
-                        self._discard_session_lease(script_id, session_lease)
                     LOG.info("Released browser session", browser_session_id=browser_session_id)
                 except Exception:
                     LOG.warning(
@@ -1493,6 +1504,11 @@ class RealBrowserManager(BrowserManager):
                         browser_session_id=browser_session_id,
                         exc_info=True,
                     )
+                finally:
+                    # This is the script's only cleanup call, so a retained lease is never retried —
+                    # it just reads as "still running" to the reaper's lease gate and pins the
+                    # session. Drop it either way and leave the occupied row to the reaper.
+                    self._discard_session_lease(script_id, session_lease)
             elif browser_session_id:
                 LOG.warning("Organization ID not specified, cannot release browser session", script_id=script_id)
             return browser_state_to_close
