@@ -533,9 +533,10 @@ async def poll_otp_value(
                 otp_value = await _get_otp_value_from_email(
                     organization_id=organization_id,
                     totp_identifier=totp_identifier,
-                    workflow_id=workflow_permanent_id,
+                    workflow_id=workflow_id,
                     workflow_run_id=workflow_run_id,
                     created_after=email_created_after,
+                    expected_otp_type=expected_otp_type,
                     context=email_otp_context,
                 )
             if otp_value is None and totp_identifier:
@@ -545,7 +546,7 @@ async def poll_otp_value(
                     organization_id,
                     totp_identifier,
                     task_id=task_id,
-                    workflow_id=workflow_permanent_id,
+                    workflow_id=workflow_id,
                     workflow_run_id=workflow_run_id,
                     created_after=db_created_after,
                     expected_otp_type=expected_otp_type,
@@ -694,6 +695,7 @@ async def _get_otp_value_from_email(
     workflow_id: str | None = None,
     workflow_run_id: str | None = None,
     created_after: datetime | None = None,
+    expected_otp_type: OTPType | None = None,
     context: EmailOTPVerificationContext | None = None,
 ) -> OTPValue | None:
     return await app.AGENT_FUNCTION.get_otp_value_from_email(
@@ -702,6 +704,7 @@ async def _get_otp_value_from_email(
         workflow_id=workflow_id,
         workflow_run_id=workflow_run_id,
         created_after=created_after,
+        expected_otp_type=expected_otp_type,
         context=context,
     )
 
