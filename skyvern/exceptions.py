@@ -237,6 +237,16 @@ class ConditionalBranchEvaluationError(SkyvernException):
     """A conditional block could not resolve which branch to take."""
 
 
+class BranchEvaluationContextTooLargeError(ConditionalBranchEvaluationError):
+    """Branch evaluation cannot proceed without silently dropping required context."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Workflow branch evaluation context is too large to process safely. "
+            "Reduce the workflow input or prior block output size, then retry."
+        )
+
+
 class MalformedBranchEvaluationError(ConditionalBranchEvaluationError):
     """The LLM's branch-evaluation output could not be safely aligned to the branches.
 
