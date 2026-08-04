@@ -28,7 +28,9 @@ from skyvern.core.script_generations.script_skyvern_page import script_run_conte
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     CachedDownloadError,
+    CodeBlockRunnerSelectionError,
     IllegitCompleteScriptTermination,
+    InProcessScriptExecutionDenied,
     ScriptNotFound,
     ScriptTerminationException,
     StepTerminationError,
@@ -2955,6 +2957,64 @@ async def wait(seconds: int, label: str | None = None) -> None:
         raise
 
 
+async def ensure_in_process_script_execution_allowed(
+    *,
+    seam: str,
+    organization_id: str | None,
+    workflow_run_id: str | None,
+    workflow_permanent_id: str | None = None,
+    workflow_id: str | None = None,
+    script_id: str | None = None,
+    script_revision_id: str | None = None,
+) -> None:
+    try:
+        decision = await app.AGENT_FUNCTION.resolve_in_process_script_execution_policy(
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            workflow_permanent_id=workflow_permanent_id,
+            workflow_id=workflow_id,
+            script_id=script_id,
+        )
+    except CodeBlockRunnerSelectionError as exc:
+        LOG.error(
+            "script.in_process_execution_denied",
+            seam=seam,
+            selection_reason="policy_evaluation_error",
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            workflow_permanent_id=workflow_permanent_id,
+            workflow_id=workflow_id,
+            script_id=script_id,
+            script_revision_id=script_revision_id,
+            exc_info=True,
+        )
+        raise InProcessScriptExecutionDenied(
+            seam=seam,
+            selection_reason="policy_evaluation_error",
+        ) from exc
+
+    if decision.allowed:
+        return
+
+    LOG.error(
+        "script.in_process_execution_denied",
+        seam=seam,
+        selection_reason=decision.selection_reason,
+        flag_value=decision.flag_value,
+        env_force_on=decision.env_force_on,
+        organization_id=organization_id,
+        workflow_run_id=workflow_run_id,
+        workflow_permanent_id=workflow_permanent_id,
+        workflow_id=workflow_id,
+        script_id=script_id,
+        script_revision_id=script_revision_id,
+    )
+    raise InProcessScriptExecutionDenied(
+        seam=seam,
+        selection_reason=decision.selection_reason,
+    )
+
+
 async def run_script(
     path: str,
     parameters: dict[str, Any] | None = None,
@@ -2994,8 +3054,14 @@ async def run_script(
         context.workflow_run_id = workflow_run_id
         context.organization_id = organization_id
 
-    # run the script as subprocess; pass the parameters and run_id to the script
-    # Dynamically import the script at the given path
+    await ensure_in_process_script_execution_allowed(
+        seam="script_service.run_script",
+        organization_id=organization_id,
+        workflow_run_id=workflow_run_id,
+        script_id=script_id,
+        script_revision_id=script_revision_id,
+    )
+
     spec = importlib.util.spec_from_file_location("user_script", path)
     if not spec or not spec.loader:
         raise Exception(f"Failed to import script from {path}")
