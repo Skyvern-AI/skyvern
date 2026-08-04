@@ -214,7 +214,9 @@ _INVALID_CONDITIONAL_CONTAINER_MARKERS = (
     "inside conditional",
     "within conditional",
 )
-_QUOTED_CREDENTIAL_NAME_RE = re.compile(r"(?:`([^`]{1,100})`|\"([^\"]{1,100})\"|'([^']{1,100})')")
+# The leading (?<!\w) keeps a contraction's apostrophe ("I've", "can't") from opening a quote and
+# pairing with a later one, which would swallow the run between them as a bogus credential name.
+_QUOTED_CREDENTIAL_NAME_RE = re.compile(r"(?:`([^`]{1,100})`|\"([^\"]{1,100})\"|(?<!\w)'([^']{1,100})')")
 _NAMED_CREDENTIAL_TOKEN_RE = re.compile(
     r"\b(?:saved\s+credential|credential)\s+(?:named|called)\s+([A-Za-z0-9_.@:-]{2,100})\b",
     re.I,
@@ -4560,17 +4562,9 @@ def _block(
     if reason is not None:
         policy.clarification_reason = reason
     policy.credential_ask_card_answerable = card_answerable
+    # Candidate ids ride the pause frame as BE machinery; the card renders the full-org picker, so
+    # the ask never enumerates credentials in prose.
     policy.credential_ask_candidate_ids = [candidate.credential_id for candidate in candidates or []]
-    if candidates:
-        # "Safe" is a claim about the login page vouching for each candidate, so it only holds
-        # when the ask had a page to match against and every candidate was tested against one.
-        matched_by_url = bool(policy.credential_ask_login_page_urls) and all(
-            candidate.tested_url for candidate in candidates
-        )
-        label = "Safe matches" if matched_by_url else "Saved credentials"
-        question += f"\n\n{label}:\n" + "\n".join(
-            f"- {credential_candidate_label(candidate)}" for candidate in candidates
-        )
     policy.clarification_question = question
 
 

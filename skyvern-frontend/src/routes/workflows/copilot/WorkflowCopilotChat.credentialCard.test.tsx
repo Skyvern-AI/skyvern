@@ -115,37 +115,77 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
 
 vi.mock("@/components/ui/use-toast", () => ({ toast: toastFn }));
 
-const { selectValueChange } = vi.hoisted(() => ({
-  selectValueChange: { current: null as ((value: string) => void) | null },
-}));
-
-vi.mock("@/components/ui/select", () => ({
-  Select: ({
-    children,
-    onValueChange,
-  }: {
-    children?: ReactNode;
-    onValueChange?: (value: string) => void;
-  }) => {
-    selectValueChange.current = onValueChange ?? null;
-    return <div data-testid="mock-select">{children}</div>;
-  },
-  SelectTrigger: ({ children }: { children?: ReactNode }) => (
+// Radix Popover + cmdk misbehave in jsdom; stub them so the picker's items are clickable buttons.
+// Unlike the card unit test's always-render stub, this one honors `open` and wires the trigger —
+// WorkflowCopilotHistory also renders a Popover whose (closed) content pulls react-query, so an
+// unconditional PopoverContent would force-mount it and crash with "No QueryClient".
+vi.mock("@/components/ui/popover", async () => {
+  const React = await import("react");
+  const OpenCtx = React.createContext<{
+    open: boolean;
+    setOpen: (value: boolean) => void;
+  }>({ open: false, setOpen: () => {} });
+  return {
+    Popover: ({
+      open,
+      onOpenChange,
+      children,
+    }: {
+      open?: boolean;
+      onOpenChange?: (value: boolean) => void;
+      children?: ReactNode;
+    }) => (
+      <OpenCtx.Provider
+        value={{ open: Boolean(open), setOpen: onOpenChange ?? (() => {}) }}
+      >
+        {children}
+      </OpenCtx.Provider>
+    ),
+    PopoverTrigger: ({ children }: { children?: ReactNode }) => {
+      const { open, setOpen } = React.useContext(OpenCtx);
+      return <div onClick={() => setOpen(!open)}>{children}</div>;
+    },
+    PopoverContent: ({ children }: { children?: ReactNode }) => {
+      const { open } = React.useContext(OpenCtx);
+      return open ? <div>{children}</div> : null;
+    },
+  };
+});
+vi.mock("@/components/ui/command", () => ({
+  Command: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
+  CommandInput: ({ placeholder }: { placeholder?: string }) => (
+    <input placeholder={placeholder} />
+  ),
+  CommandList: ({ children }: { children?: ReactNode }) => (
     <div>{children}</div>
   ),
-  SelectValue: ({ placeholder }: { placeholder?: string }) => (
-    <span>{placeholder}</span>
-  ),
-  SelectContent: ({ children }: { children?: ReactNode }) => (
+  CommandEmpty: ({ children }: { children?: ReactNode }) => (
     <div>{children}</div>
   ),
-  SelectItem: ({
+  CommandGroup: ({
     children,
-    value,
+    heading,
   }: {
     children?: ReactNode;
-    value: string;
-  }) => <div data-testid={`select-item-${value}`}>{children}</div>,
+    heading?: string;
+  }) => (
+    <div>
+      {heading ? <div>{heading}</div> : null}
+      {children}
+    </div>
+  ),
+  CommandItem: ({
+    children,
+    onSelect,
+  }: {
+    children?: ReactNode;
+    onSelect?: () => void;
+    value?: string;
+  }) => (
+    <button type="button" onClick={() => onSelect?.()}>
+      {children}
+    </button>
+  ),
 }));
 
 // The real modal pulls react-query; a stub is enough to prove the connect →
@@ -332,6 +372,30 @@ const errorFrame = (turnId = "turn-1") => ({
   turn_id: turnId,
 });
 
+// A continuation the user cancels: a terminal response flagged cancelled, which
+// flows through handleResponse (not the error path).
+const cancelledContinuationResponse = (turnId = "turn-10") => ({
+  type: "response",
+  workflow_copilot_chat_id: "chat-1",
+  message: "Canceled.",
+  updated_workflow: null,
+  cancelled: true,
+  response_time: "2026-07-13T00:00:05Z",
+  proposal_disposition: "no_proposal",
+  turn_id: turnId,
+  narrative_payload: {
+    turnId,
+    turnIndex: 1,
+    mode: "build",
+    responseType: "REPLY",
+    terminal: "response",
+    terminalMessage: "Canceled.",
+    narrativeSummary: "Canceled.",
+    startedAt: "2026-07-13T00:00:00Z",
+    endedAt: "2026-07-13T00:00:05Z",
+  },
+});
+
 function credentialResponsePosts() {
   return sansApiPost.mock.calls.filter(
     (call) => call[0] === "/workflow/copilot/credential-response",
@@ -433,9 +497,10 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
       streamCalls[0]!.onMessage(turnStart());
       streamCalls[0]!.onMessage(credentialFrame());
     });
-    const useButton = await screen.findByRole("button", {
-      name: /Use 'HN Login'/,
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
     });
+    const useButton = await screen.findByRole("button", { name: "HN Login" });
     await act(async () => {
       fireEvent.click(useButton);
     });
@@ -500,7 +565,7 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
     expect(postStreaming).toHaveBeenCalledTimes(1);
   });
 
-  it("offers the credential_refs candidates even when none has a tested_url", async () => {
+  it("shows the full org credential list on a pause ask (not just the frame's candidates) and answers via the typed POST", async () => {
     flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     credentialsData.current = [
       { credential_id: "cred-abc", name: "abc", tested_url: null },
@@ -516,13 +581,20 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
         credentialFrame({ credential_refs: ["cred-abc", "cred-spare"] }),
       );
     });
-    expect(await screen.findByText("Use existing…")).toBeTruthy();
-    expect(screen.getByTestId("select-item-cred-abc")).toBeTruthy();
-    expect(screen.getByTestId("select-item-cred-spare")).toBeTruthy();
-    expect(screen.queryByTestId("select-item-cred-other")).toBeNull();
     await act(async () => {
-      selectValueChange.current?.("cred-spare");
+      fireEvent.click(await screen.findByRole("combobox"));
     });
+    // The copilot suggestion (credential_refs) is pinned under "Suggested"; the full org list —
+    // including the credential NOT in credential_refs — stays below to override.
+    expect(await screen.findByText("Suggested")).toBeTruthy();
+    expect(screen.getByText("All credentials")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "abc" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "spare-portal" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "unrelated" })).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "spare-portal" }));
+    });
+    // The pick answers through the typed resume POST (which origin-binds), not a chat message.
     await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
     expect(credentialResponsePosts()[0]![1]).toMatchObject({
       action: "connected",
@@ -564,7 +636,7 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
     errSpy.mockRestore();
   });
 
-  it("retries the credentials fetch on a later pause after a transient failure (no poisoned cache)", async () => {
+  it("degrades a pause ask to the Connect-credential CTA when the credentials fetch fails", async () => {
     flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     credsFail.current = true;
@@ -578,16 +650,12 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
     await waitFor(() =>
       expect(credentialsGets().length).toBeGreaterThanOrEqual(1),
     );
-    const afterFailure = credentialsGets().length;
-    // A later pause frame must trigger a fresh fetch — caching [] on failure
-    // would have left credentialsList non-null and blocked all retries.
-    credsFail.current = false;
-    await act(async () => {
-      streamCalls[0]!.onMessage(credentialFrame({ turn_id: "turn-b" }));
-    });
-    await waitFor(() =>
-      expect(credentialsGets().length).toBeGreaterThan(afterFailure),
-    );
+    // Failed fetch → no picker (null, not a cached []); the Connect-credential CTA remains so the
+    // user can still create one, and the pause stays answerable.
+    expect(
+      await screen.findByRole("button", { name: "Connect credential" }),
+    ).toBeTruthy();
+    expect(screen.queryByText("Use existing…")).toBeNull();
     errSpy.mockRestore();
   });
 
@@ -667,16 +735,136 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
     await act(async () => {
       fireEvent.click(createBtn);
     });
-    // A fresh turn is sent (exactly one) referencing the connected credential.
+    // A fresh turn is sent (exactly one) referencing the connected credential by id (the
+    // deterministic _explicit_credential_ids path), not by name.
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
-    expect(streamCalls[1]!.body.message).toContain(
-      "I've connected the credential 'New Login'",
-    );
+    expect(streamCalls[1]!.body.message).toContain("new-cred-1");
     expect(streamCalls[1]!.body.message).toContain("continue");
     expect(credentialResponsePosts()).toHaveLength(0);
     expect(
       await screen.findByText("Continuing with 'New Login'…"),
     ).toBeTruthy();
+  });
+
+  it("fetches the org credentials on a terminal ask and offers the picker", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    credentialsData.current = [
+      { credential_id: "cred_hn", name: "HN login", tested_url: null },
+    ];
+    await renderChat();
+    await submit("who am I signing in as?");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalPromptResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    // The real card fetches /credentials and surfaces the searchable picker alongside the CTA.
+    expect(await screen.findByText("Use existing…")).toBeTruthy();
+    expect(apiGet).toHaveBeenCalledWith(
+      "/credentials",
+      expect.objectContaining({
+        params: { page: 1, page_size: 100, credential_type: "password" },
+      }),
+    );
+  });
+
+  it("restores the terminal picker when the auto-continue send fails", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    credentialsData.current = [
+      { credential_id: "cred_hn", name: "HN login", tested_url: null },
+    ];
+    await renderChat();
+    await submit("who am I signing in as?");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalPromptResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    // Pick an existing credential from the terminal picker → the auto-continue send fires.
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "HN login" }));
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("Continuing with 'HN login'…")).toBeTruthy();
+    // The continuation stream fails.
+    await act(async () => {
+      streamCalls[1]!.onMessage(turnStart("turn-10"));
+      streamCalls[1]!.onMessage(errorFrame("turn-10"));
+      streamCalls[1]!.resolve();
+    });
+    // The optimistic "connected" receipt is rolled back and the picker returns, even though the
+    // error message is now the tail — so the user can re-pick instead of hitting a dead end.
+    expect(await screen.findByRole("combobox")).toBeTruthy();
+    expect(screen.queryByText("Continuing with 'HN login'…")).toBeNull();
+    // Re-picking from the restored picker actually resumes: a fresh continuation fires even though
+    // the stranded ask is no longer the literal tail.
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "HN login" }));
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(3));
+  });
+
+  it("restores the terminal picker when the auto-continue is cancelled", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    credentialsData.current = [
+      { credential_id: "cred_hn", name: "HN login", tested_url: null },
+    ];
+    await renderChat();
+    await submit("who am I signing in as?");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalPromptResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "HN login" }));
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("Continuing with 'HN login'…")).toBeTruthy();
+    // Cancelling the continuation (a cancelled terminal, not an error) must also roll the optimistic
+    // receipt back so it doesn't strand a permanent "Continuing…" with no continuation behind it.
+    await act(async () => {
+      streamCalls[1]!.onMessage(turnStart("turn-10"));
+      streamCalls[1]!.onMessage(cancelledContinuationResponse("turn-10"));
+      streamCalls[1]!.resolve();
+    });
+    expect(await screen.findByRole("combobox")).toBeTruthy();
+    expect(screen.queryByText("Continuing with 'HN login'…")).toBeNull();
+  });
+
+  it("hides a stale terminal ask once it is no longer the last message", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    await renderChat();
+    await submit("who am I signing in as?");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalPromptResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    expect(
+      screen.getByRole("button", { name: "Connect credential" }),
+    ).toBeTruthy();
+    // A new message makes the credential ask non-tail; its actionable card must disappear — picking
+    // on a stale card would only show a misleading receipt with no backend call.
+    await submit("actually, do something else");
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "Connect credential" }),
+      ).toBeNull(),
+    );
   });
 
   it("does not auto-continue while a turn is still in flight", async () => {

@@ -469,6 +469,8 @@ async def _run_credential_pause(
 
     policy = getattr(ctx, "request_policy", None)
     login_page_urls = list(policy.login_page_urls) if isinstance(policy, RequestPolicy) else []
+    # The FE credential card fetches the full org list itself; these ride the frame as `credential_refs`
+    # and seed the picker's "Suggested" group (pinned first), so the user still sees the full list.
     credential_refs: list[str] = []
     if isinstance(policy, RequestPolicy):
         credential_refs = list(policy.credential_ask_candidate_ids or policy.credential_refs)

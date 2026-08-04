@@ -32,6 +32,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _can_defer_unresolved_credential_name_for_draft,
     _classification_from_raw,
     _clean_email_list,
+    _exact_credential_name_candidates,
     _resolve_credentials,
     _saved_credential_names_mentioned,
     _seed_prior_approved_credentials,
@@ -1030,11 +1031,12 @@ async def test_multiple_name_hits_keep_the_existing_picker_and_skip_url() -> Non
     )
 
     assert policy.requires_user_clarification is True
-    assert policy.clarification_question is not None
-    assert policy.clarification_question.startswith(
-        "I found multiple stored credentials with that exact name. Which one should I use?"
+    assert (
+        policy.clarification_question
+        == "I found multiple stored credentials with that exact name. Which one should I use?"
     )
-    assert "`cred_url`" not in policy.clarification_question
+    # No prose credential dump: neither the named matches nor the unrelated URL cred are listed.
+    assert "cred_" not in policy.clarification_question
     load_mock.assert_awaited_once()
 
 
@@ -1061,8 +1063,11 @@ async def test_name_collision_candidates_are_not_labelled_safe_matches() -> None
     )
 
     assert policy.clarification_question is not None
-    assert "Saved credentials:" in policy.clarification_question
+    # No prose enumeration at all — the card renders the full-org picker, so candidates are never
+    # labelled (neither "Safe matches" nor "Saved credentials"); they ride on the policy field.
+    assert "Saved credentials" not in policy.clarification_question
     assert "Safe matches" not in policy.clarification_question
+    assert policy.credential_ask_candidate_ids == ["cred_one", "cred_two"]
     assert policy.credential_ask_login_page_urls == []
 
 
@@ -1082,10 +1087,11 @@ async def test_url_tier_deduplicates_and_keeps_existing_picker() -> None:
         org_credentials=[first, first, second],
     )
 
-    assert policy.clarification_question is not None
-    assert policy.clarification_question.startswith(_AMBIGUOUS_URL_CREDENTIAL_QUESTION)
-    assert policy.clarification_question.count("`cred_first`") == 1
-    assert policy.clarification_question.count("`cred_second`") == 1
+    assert policy.clarification_question == _AMBIGUOUS_URL_CREDENTIAL_QUESTION
+    # The "Safe matches" prose dump is gone; the deduplicated candidate set now rides only on
+    # discovered_credentials (the FE renders the full org selector instead of a text list).
+    assert {c.credential_id for c in policy.discovered_credentials} == {"cred_first", "cred_second"}
+    assert len(policy.discovered_credentials) == 2
     load_mock.assert_awaited_once()
 
 
@@ -1435,12 +1441,10 @@ async def test_website_kind_multiple_url_less_credentials_ask_which_one() -> Non
     )
 
     assert policy.requires_user_clarification is True
-    assert policy.clarification_question is not None
-    assert policy.clarification_question.startswith(_AMBIGUOUS_URLLESS_CREDENTIAL_QUESTION)
-    assert "Safe matches" not in policy.clarification_question
-    assert "for that login page" not in policy.clarification_question
-    assert "first-login" in policy.clarification_question
-    assert "second-login" in policy.clarification_question
+    # One clean sentence, no prose credential dump; candidates ride on discovered_credentials / candidate_ids.
+    assert policy.clarification_question == _AMBIGUOUS_URLLESS_CREDENTIAL_QUESTION
+    assert "first-login" not in policy.clarification_question
+    assert "second-login" not in policy.clarification_question
     assert policy.clarification_reason == "credential_name_unresolved"
     assert sorted(c.credential_id for c in policy.discovered_credentials) == ["cred_one", "cred_two"]
     assert not policy.resolved_credentials
@@ -1466,9 +1470,8 @@ async def test_website_kind_multiple_url_matches_keep_disambiguation_reason() ->
         ],
     )
 
-    assert policy.clarification_question is not None
-    assert policy.clarification_question.startswith(_AMBIGUOUS_URL_CREDENTIAL_QUESTION)
-    assert "Safe matches:" in policy.clarification_question
+    # One clean sentence, no prose credential dump; candidates ride on discovered_credentials.
+    assert policy.clarification_question == _AMBIGUOUS_URL_CREDENTIAL_QUESTION
     assert policy.clarification_reason == "credential_name_unresolved"
     assert policy.credential_ask_card_answerable is True
     assert sorted(c.credential_id for c in policy.discovered_credentials) == ["cred_one", "cred_two"]
@@ -1787,13 +1790,9 @@ async def test_login_intent_none_kind_multiple_host_matches_asks_pick_question()
 
     assert policy.credential_input_kind == "none"
     assert policy.requires_user_clarification is True
-    assert policy.clarification_question is not None
-    assert (
-        "I found multiple stored credentials for that login page. Which one should I use?"
-        in policy.clarification_question
-    )
-    assert "`cred_a`" in policy.clarification_question
-    assert "`cred_b`" in policy.clarification_question
+    # One clean sentence, no prose credential dump; the candidate set rides on discovered_credentials.
+    assert policy.clarification_question == _AMBIGUOUS_URL_CREDENTIAL_QUESTION
+    assert {c.credential_id for c in policy.discovered_credentials} == {"cred_a", "cred_b"}
     assert policy.clarification_reason == "credential_name_unresolved"
 
 
@@ -2759,6 +2758,15 @@ def test_a_named_credential_resolves_without_the_word_credential() -> None:
     credentials = [SimpleNamespace(name="skyvern-datadog"), SimpleNamespace(name="skyvern-posthog")]
 
     assert _saved_credential_names_mentioned("use skyvern-datadog to login.", credentials) == ["skyvern-datadog"]
+
+
+def test_contraction_apostrophe_does_not_open_a_bogus_quoted_name() -> None:
+    """A contraction's apostrophe once paired with a later quote and swallowed the span between them as
+    a credential name (e.g. from "I've connected the credential 'hex'"). It must extract only 'hex'."""
+    candidates = _exact_credential_name_candidates("I've connected the credential 'hex' — continue.")
+
+    assert "hex" in candidates
+    assert not any("connected" in candidate for candidate in candidates)
 
 
 @pytest.mark.asyncio
