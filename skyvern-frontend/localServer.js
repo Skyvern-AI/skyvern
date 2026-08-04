@@ -5,6 +5,22 @@ import open from "open";
 const port = 8080;
 const url = `http://localhost:${port}`;
 
+// Opening a browser fails in headless environments (e.g. the Docker image,
+// which has no xdg-open/gio/etc.). Left unhandled, that rejection crashes
+// the whole process right after the HTTP server starts listening, so the
+// container restart-loops and requests intermittently fail with a blank
+// page. Auto-opening a browser is a convenience, not a requirement, so a
+// failure here should just be logged.
+export async function openBrowserSafely(targetUrl) {
+  try {
+    await open(targetUrl);
+  } catch (error) {
+    console.log(
+      `[${new Date().toISOString()}] Skipping browser auto-open: ${error.message}`,
+    );
+  }
+}
+
 const server = createServer((request, response) => {
   const start = Date.now();
 
@@ -39,5 +55,5 @@ server.listen(8080, async () => {
   console.log(
     `[${new Date().toISOString()}] Frontend server running at ${url}`,
   );
-  await open(url);
+  await openBrowserSafely(url);
 });
