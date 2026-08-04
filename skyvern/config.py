@@ -207,9 +207,10 @@ class Settings(BaseSettings):
     COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
     COPILOT_TURN_INTENT_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
     COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
-    # Consecutive repair runs that make no newly-verified forward progress before the
-    # copilot stops re-running and escalates honestly. Set very high to disable the ceiling.
-    COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
+    # A capture that runs out of time yields no page evidence at all, so the scout falls back to
+    # dumping the page. Measured attaches on a live dashboard reach 8.6s; the former 4s bound cut the
+    # tail off and a third of captures returned nothing.
+    COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 12.0
     # Bounded settle-then-re-perceive after a non-advancing click on a precondition-gated control:
     # re-probe the side-effect-free extractor a few times (hard-capped) until a just-issued AJAX populates.
     COPILOT_CLICK_SETTLE_MAX_PROBES: int = 3

@@ -28,7 +28,10 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
+    _BARE_MAGNITUDE_RE,
     _MAX_CLICKABLE_CONTROLS,
+    _MAX_SELECTOR_CHARS,
+    _structural_path,
     composition_page_evidence_error,
     has_actionable_steer_content,
     has_bounded_page_schema,
@@ -39,6 +42,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     parse_composition_html,
     parse_composition_structured,
 )
+from skyvern.forge.sdk.copilot.output_extraction_plan import _relation_label_child_index
 from skyvern.forge.sdk.copilot.result_evidence import (
     loaded_result_composition_evidence_from_page,
     loaded_result_composition_target_summary,
@@ -2528,6 +2532,37 @@ def test_html_reveal_shape_multi_value_leaves_carry_empty_key() -> None:
     assert all(r["key_text"] == "" for r in reveal)
 
 
+def test_html_reveal_shape_metric_tile_keys_the_magnitude_leaf_by_heading() -> None:
+    parsed = parse_composition_html(
+        '<body><section id="result"><h3>Visitors</h3>'
+        "<div>-15.0%</div><div>8.45K</div><div>vs. 9.99K prior</div></section></body>",
+        inspected_url=_REVEAL_URL,
+        current_url=_REVEAL_URL,
+    )
+    # The metric-card pass supersedes the reveal shape for this tile: one keyed relation pairing
+    # the heading with the magnitude leaf, no unkeyed delta remainders.
+    reveal = [r for r in parsed["key_value_relations"] if r["direct_child_count"] == 4]
+    assert [(r["key_text"], r["value_text"], r["value_child_index"]) for r in reveal] == [("Visitors", "8.45K", 2)]
+
+
+def test_html_reveal_shape_two_magnitude_leaves_stay_unkeyed() -> None:
+    parsed = parse_composition_html(
+        '<body><section id="result"><h3>Visitors</h3>'
+        "<div>8.45K</div><div>9.99K</div><div>vs. prior</div></section></body>",
+        inspected_url=_REVEAL_URL,
+        current_url=_REVEAL_URL,
+    )
+    reveal = [r for r in parsed["key_value_relations"] if r["direct_child_count"] == 4]
+    assert len(reveal) == 3
+    assert all(r["key_text"] == "" for r in reveal)
+
+
+def test_browser_reveal_shape_designates_the_same_leaf_as_the_html_parser() -> None:
+    assert "valueLeaves.length === 1 ? keyText : ''" not in COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+    assert "leaf.index === designatedIndex ? keyText : ''" in COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+    assert _BARE_MAGNITUDE_RE.pattern in COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+
+
 def test_html_reveal_shape_rejects_structural_and_token_negatives() -> None:
     def reveal_relations(inner: str, container: str = 'id="result"') -> list[dict[str, Any]]:
         parsed = parse_composition_html(
@@ -2575,7 +2610,7 @@ def test_html_reveal_shape_page_cap_emits_truncation_signal() -> None:
     inner = "<h3>Heading</h3>" + "".join(f"<div>v{i}</div>" for i in range(5))
     containers = "".join(f'<section id="result-{index}">{inner}</section>' for index in range(5))
     parsed = parse_composition_html(
-        f"<body><header><h1>Title</h1><p>Sub</p></header>{containers}</body>",
+        f"<body><div class=intro><h1>Title</h1><p>Sub</p></div>{containers}</body>",
         inspected_url=_REVEAL_URL,
         current_url=_REVEAL_URL,
     )
@@ -2592,7 +2627,7 @@ def test_html_reveal_shape_non_truncating_multi_reveal_emits_no_warning() -> Non
     inner = "<h3>Heading</h3><div>A</div><p>B</p>"
     containers = "".join(f'<section id="result-{index}">{inner}</section>' for index in range(3))
     parsed = parse_composition_html(
-        f"<body><header><h1>Title</h1><p>Sub</p></header>{containers}</body>",
+        f"<body><div class=intro><h1>Title</h1><p>Sub</p></div>{containers}</body>",
         inspected_url=_REVEAL_URL,
         current_url=_REVEAL_URL,
     )
@@ -3695,3 +3730,495 @@ def test_has_witnessed_value_content_false_on_blank_value_text() -> None:
     packet = _kv_value_content_packet()
     packet["key_value_relations"][0]["value_text"] = "   "
     assert has_witnessed_value_content(packet) is False
+
+
+_METRIC_DASHBOARD_HTML = """
+<body>
+  <nav id="sidebar">
+    <div><span>Visitors</span><span>3</span></div>
+    <div><span>I</span><span>x</span></div>
+  </nav>
+  <main>
+    <div id="visitors-card">
+      <div><span>Visitors</span><span>-8.5%</span></div>
+      <div>8.83K</div>
+      <div>vs 9.58K prior</div>
+    </div>
+    <div id="sessions-card">
+      <div><span>Sessions</span><span>-10.0%</span></div>
+      <div>10.7K</div>
+      <div>vs 11.8K prior</div>
+    </div>
+  </main>
+</body>
+"""
+
+
+def test_metric_card_pairs_the_heading_with_the_magnitude_not_the_delta() -> None:
+    # Live custody (SKY-13226/SKY-13332): the only capturable "Visitors" pair was the header row,
+    # which pairs the label with the -8.5% delta; the 8.83K figure was structurally invisible.
+    parsed = parse_composition_html(
+        _METRIC_DASHBOARD_HTML, inspected_url="https://example.test/web", current_url="https://example.test/web"
+    )
+    visitors = [r for r in parsed["key_value_relations"] if r["key_text"] == "Visitors"]
+    assert [(r["value_text"], r["value_child_index"]) for r in visitors] == [("8.83K", 1)]
+    assert parsed["key_value_relations_truncated"] is False
+
+
+def test_page_chrome_relations_are_excluded() -> None:
+    # The sidebar "Visitors" nav item would shadow the tile (ambiguous binding) and chrome pairs
+    # flood the relation cap into a truncation flag that voids the whole packet.
+    parsed = parse_composition_html(
+        _METRIC_DASHBOARD_HTML, inspected_url="https://example.test/web", current_url="https://example.test/web"
+    )
+    keys = [r["key_text"] for r in parsed["key_value_relations"]]
+    assert keys.count("Visitors") == 1
+    assert "I" not in keys
+
+
+def test_metric_dashboard_derives_a_grounded_plan_end_to_end() -> None:
+    # AC1's offline witness: the captured packet binds the requested label to the tile value.
+    from skyvern.forge.sdk.copilot.output_extraction_plan import derive_requested_output_extraction_plan
+
+    parsed = parse_composition_html(
+        _METRIC_DASHBOARD_HTML, inspected_url="https://example.test/web", current_url="https://example.test/web"
+    )
+    entry = {"step": 4, "reached_via": "current_page", "had_bounded_schema": True, "evidence": parsed}
+    plan = derive_requested_output_extraction_plan(
+        flow_evidence=[entry], labels_by_path={"output.visitors": ("visitors",)}
+    )
+    assert plan is not None
+    (binding,) = plan.live_reads
+    assert binding.relation_label == "Visitors"
+    assert binding.child_index == 1
+
+
+def test_browser_twin_carries_the_metric_card_and_chrome_guards() -> None:
+    assert "metricCardNodes" in COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+    assert "insidePageChrome" in COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+    assert "nonContentChildTags" in COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+    assert "nav,aside,header,footer,[role=navigation]" in COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+    assert COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION.count("const bareMagnitude") == 1
+
+
+def test_no_packet_selector_is_a_truncated_fragment() -> None:
+    # A selector cut to a length budget can end mid-token, and the block generated from it raises
+    # SyntaxError from querySelectorAll on a selector that never matched anything. A control with no
+    # id or name falls through to the class chain, which is where selectors outgrow the bound.
+    classes = " ".join(f"ui-analytics-dashboard-control-surface-element-variant-{i}" for i in range(6))
+    nesting = "".join(f'<div class="wrapper-layer-with-a-fairly-long-name-{i}">' for i in range(8))
+    parsed = parse_composition_html(
+        f'<html><body><form action="/search">{nesting}'
+        f'<input type="text" class="{classes}" /><button type="submit" class="{classes}">Go</button>'
+        f"{'</div>' * 8}</form></body></html>",
+        inspected_url="https://analytics.example.test/web",
+        current_url="https://analytics.example.test/web",
+    )
+
+    def selectors(node: Any) -> list[str]:
+        found: list[str] = []
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "selector" and isinstance(value, str):
+                    found.append(value)
+                else:
+                    found.extend(selectors(value))
+        elif isinstance(node, list):
+            for item in node:
+                found.extend(selectors(item))
+        return found
+
+    emitted = selectors(parsed)
+    assert emitted, "expected the packet to describe at least one control"
+    for selector in emitted:
+        # An absent selector is fine — a fragment is not.
+        assert len(selector) != 160, f"selector sits exactly at the bound, so it was cut: {selector!r}"
+        if not selector:
+            continue
+        assert selector.count("[") == selector.count("]"), f"unbalanced attribute selector: {selector!r}"
+        assert selector.count("(") == selector.count(")"), f"unbalanced pseudo-class: {selector!r}"
+        assert not selector.endswith((":", "-", "_", ".", "#", ",", ">")), f"truncated selector: {selector!r}"
+
+
+def test_no_normalized_browser_selector_is_a_truncated_fragment() -> None:
+    # The same invariant on the packet the live browser returns, which is the one that reaches a
+    # generated block. A tile nested deeply in id-less markup overruns the bound, and cutting it to
+    # fit produced "div:nth-of-ty" — a selector that parses nowhere and reads as a product failure.
+    long_selector = " > ".join(["div:nth-of-type(3)"] * 9)
+    payload: dict[str, Any] = {
+        "page_title": "Dashboard",
+        "forms": [],
+        "clickable_controls": [{"text": "Go", "selector": long_selector, "tag": "button"}],
+        "navigation_targets": [],
+        "result_containers": [],
+        "modal_overlays": [],
+        "page_obstructions": [],
+        "challenge_controls": [],
+        "key_value_relations": [
+            {
+                "key_text": "Visitors",
+                "value_text": "8.7K",
+                "container_selector": long_selector,
+                "container_match_count": 1,
+                "container_position": 0,
+                "value_child_index": 1,
+                "direct_child_count": 2,
+                "visible": True,
+                "value_visible": True,
+            }
+        ],
+    }
+
+    parsed = parse_composition_structured(payload, inspected_url="https://example.test/web", current_url="u")
+
+    assert parsed is not None
+    emitted = [relation.get("container_selector", "") for relation in parsed.get("key_value_relations") or []] + [
+        control.get("selector", "") for control in parsed.get("clickable_controls") or []
+    ]
+    for selector in emitted:
+        assert len(selector) != 160, f"selector sits exactly at the bound, so it was cut: {selector!r}"
+        assert not selector.endswith((":", "-", "_", ".", "#", ",", ">")), f"truncated selector: {selector!r}"
+
+
+def test_a_deep_path_that_overruns_the_bound_falls_back_to_a_shorter_unique_tail() -> None:
+    # Rejecting the overrun keeps a broken selector out of a block, but on its own it also drops the
+    # only relation carrying the requested value. The shortest tail that still resolves to this node
+    # alone is the read that survives the bound.
+    from bs4 import BeautifulSoup
+
+    tile = '<section><article><div id="tile"><span>Visitors</span><span>8.7K</span></div></article></section>'
+    body = tile
+    for _ in range(6):
+        body = f"<div><div>a</div><div>{body}</div></div>"
+    soup = BeautifulSoup(f"<body>{body}</body>", "html.parser")
+    node = soup.find(id="tile")
+    del node["id"]
+
+    path = _structural_path(node)
+
+    assert len(path) <= _MAX_SELECTOR_CHARS
+    assert path.endswith("article:nth-of-type(1) > div:nth-of-type(1)")
+    assert len(soup.select(path)) == 1
+
+
+def test_a_metric_tile_pairs_its_heading_with_the_figure_not_the_delta() -> None:
+    # A live dashboard capture recorded 'Visitors' -> '-17.0%' and filed the figure under the
+    # comparison text, so the requested number was absent from the evidence the binder was handed.
+    from bs4 import BeautifulSoup
+
+    from skyvern.forge.sdk.copilot.composition_evidence import _key_value_relations
+
+    soup = BeautifulSoup(
+        """<div id="root"><div class="tile">
+             <div class="hdr"><span>Visitors</span><span>-17.0%</span></div>
+             <div class="fig"><span>8.7K</span><span>vs. 9.48K prior</span></div>
+           </div></div>""",
+        "html.parser",
+    )
+
+    relations, _truncated, _reveal_truncated = _key_value_relations(soup)
+
+    assert [(relation["key_text"], relation["value_text"]) for relation in relations] == [("Visitors", "8.7K")]
+    relation = relations[0]
+    carrier = soup.select(relation["container_selector"])[relation["container_position"]]
+    children = [child for child in carrier.find_all(recursive=False) if child.name]
+    assert children[relation["value_child_index"]].get_text(" ", strip=True) == "8.7K"
+
+
+_DEEP_TILE_HTML = (
+    "<body><main><div id=tile>"
+    "<div><span>Visitors</span><span>-17.0%</span></div>"
+    "<div><div><span>7.89K</span></div></div>"
+    "<div>vs. 9.55K prior</div>"
+    "</div></main></body>"
+)
+
+
+def test_a_requested_label_reaches_the_figure_its_tile_nests_deeper() -> None:
+    # Live capture on a real dashboard recorded ('Visitors', '-17.0%'): the shape passes give up once
+    # a grandchild has children of its own, and the tile's header row - heading beside delta badge -
+    # was captured instead and read as the requested value.
+    parsed = parse_composition_html(
+        _DEEP_TILE_HTML,
+        inspected_url="https://example.test/web",
+        current_url="https://example.test/web",
+        requested_targets=("Visitors",),
+    )
+
+    visitors = [r for r in parsed["key_value_relations"] if r["key_text"] == "Visitors"]
+
+    assert [r["value_text"] for r in visitors] == ["7.89K"]
+
+
+def test_a_tile_reaches_its_figure_whether_or_not_the_label_was_requested() -> None:
+    # The targeted pass rescued this shape only for labels the turn named, so a tile whose label was
+    # minted as prose kept the delta badge and offered it as the page's answer. A decorated delta is
+    # decoration either way, so the figure is reached without depending on the mint (SKY-13226).
+    parsed = parse_composition_html(
+        _DEEP_TILE_HTML, inspected_url="https://example.test/web", current_url="https://example.test/web"
+    )
+
+    visitors = [r for r in parsed["key_value_relations"] if r["key_text"] == "Visitors"]
+
+    assert [r["value_text"] for r in visitors] == ["7.89K"]
+
+
+def test_a_requested_label_abstains_when_its_tile_carries_several_candidate_figures() -> None:
+    # Markup that cannot say which number the label owns is not evidence that any of them is.
+    parsed = parse_composition_html(
+        "<body><main><div id=tile>"
+        "<div><span>Visitors</span></div>"
+        "<div><div><span>7.89K</span></div></div>"
+        "<div><div><span>9.55K</span></div></div>"
+        "</div></main></body>",
+        inspected_url="https://example.test/web",
+        current_url="https://example.test/web",
+        requested_targets=("Visitors",),
+    )
+
+    assert [r["value_text"] for r in parsed["key_value_relations"] if r["key_text"] == "Visitors"] != ["7.89K"]
+
+
+def test_browser_twin_resolves_requested_targets_before_the_shape_passes() -> None:
+    from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+        composition_structured_evidence_expression,
+    )
+
+    expression = composition_structured_evidence_expression(("Visitors",))
+
+    assert '"Visitors"' in expression.split("const ANTI_BOT_PATTERNS")[0]
+    assert "valueBesideLabel" in expression
+    # The targeted pass must own its carrier before the metric-card loop can claim it.
+    assert expression.index("for (const target of REQUESTED_TARGETS)") < expression.index("const magnitudeLeaves2")
+    assert "REQUESTED_TARGETS=[]" in composition_structured_evidence_expression()
+
+
+def test_a_generated_read_proves_a_non_sibling_label_at_its_own_anchor() -> None:
+    from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_extraction_suffix
+    from skyvern.forge.sdk.copilot.output_extraction_plan import derive_requested_output_extraction_plan
+
+    parsed = parse_composition_html(
+        _DEEP_TILE_HTML,
+        inspected_url="https://example.test/web",
+        current_url="https://example.test/web",
+        requested_targets=("Visitors",),
+    )
+    plan = derive_requested_output_extraction_plan(
+        flow_evidence=[{"step": 1, "reached_via": "current_page", "had_bounded_schema": True, "evidence": parsed}],
+        labels_by_path={"output.visitors": ("Visitors",)},
+    )
+
+    assert plan is not None
+    binding = plan.live_reads[0]
+    assert binding.label_selector
+    suffix = synthesize_extraction_suffix(plan)
+    assert suffix is not None
+    # The label is proven where it lives, not as the value's first sibling.
+    assert f'page.locator("{binding.label_selector}").first.inner_text()' in suffix.code
+
+
+def test_browser_twin_carries_the_non_sibling_label_anchor() -> None:
+    from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+        composition_structured_evidence_expression,
+    )
+
+    expression = composition_structured_evidence_expression(("Visitors",))
+
+    assert "label_selector: labelSelector" in expression
+    assert "resolvesUniquely(labelSelector, labelEl)" in expression
+
+
+_VALUE_FIRST_TILE_HTML = "<body><main><div id=agg><span>1.22K</span><span>logs found</span></div></main></body>"
+
+
+def test_a_tile_that_prints_its_figure_before_its_label_records_where_the_label_is() -> None:
+    # Live capture (SKY-13226): a log query renders "1.22K logs found", so the value is the first
+    # child and a read proving the label at child zero raises on a page that plainly shows both.
+    parsed = parse_composition_html(
+        _VALUE_FIRST_TILE_HTML, inspected_url="https://example.test/logs", current_url="https://example.test/logs"
+    )
+
+    relation = next(r for r in parsed["key_value_relations"] if r["key_text"] == "logs found")
+
+    assert (relation["value_text"], relation["value_child_index"], relation["label_child_index"]) == ("1.22K", 0, 1)
+
+
+def test_a_value_first_tile_binds_by_witness_and_reads_it_without_proving_a_heading() -> None:
+    from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_extraction_suffix
+    from skyvern.forge.sdk.copilot.output_extraction_plan import derive_requested_output_extraction_plan
+
+    parsed = parse_composition_html(
+        _VALUE_FIRST_TILE_HTML, inspected_url="https://example.test/logs", current_url="https://example.test/logs"
+    )
+    plan = derive_requested_output_extraction_plan(
+        flow_evidence=[{"step": 1, "reached_via": "current_page", "had_bounded_schema": True, "evidence": parsed}],
+        labels_by_path={"output.errors": ("azure",)},
+        witnessed_by_path={"output.errors": "1.22K"},
+    )
+
+    # "azure" shares no wording with "logs found": the witnessed quantity is what joins them.
+    assert plan is not None
+    binding = plan.live_reads[0]
+    assert (binding.child_index, binding.label_child_index) == (0, 1)
+    code = synthesize_extraction_suffix(plan).code
+    # The witness chose this element by the value it showed, so re-reading the heading proves nothing
+    # about that choice — and a tile whose heading slot also carries a delta chip, or a page with no
+    # heading at all, has nothing to re-read (SKY-13226).
+    assert "logs found" not in code
+    assert "nth(0).inner_text()).strip()\n" in code or "nth(0).inner_text()).strip()" in code
+
+
+def _playwright_chromium_available() -> bool:
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: PLC0415
+
+        with sync_playwright() as runner:
+            browser = runner.chromium.launch()
+            browser.close()
+        return True
+    except Exception:
+        return False
+
+
+_ICON_SPRITE_SHEET_PAGE = (
+    "<html><body><svg style='display:none' aria-hidden='true'>"
+    + "".join(
+        f'<symbol id="icons_arrow-{name}_{index:04x}--sprite"><path d="M0 0h1v1H0z"/></symbol>'
+        for index, name in enumerate(
+            ("center-horizontal", "center-vertical", "down", "end-bottom", "end-left", "end-right", "up", "start")
+        )
+    )
+    + "</svg>"
+    + '<div class="query-results-summary"><span>1.31K</span><span>logs found</span></div>'
+    + "</body></html>"
+)
+
+
+@pytest.mark.skipif(
+    not _playwright_chromium_available(),
+    reason="Requires Playwright browsers installed (run: playwright install chromium)",
+)
+@pytest.mark.asyncio
+async def test_browser_twin_spends_the_container_budget_on_containers_a_value_can_live_in() -> None:
+    # The twins have to agree about what a result container is, and only this one runs against a real
+    # page: an icon sprite sheet sits at the top of the document, so a substring test that reads "row"
+    # out of "arrow" claims every slot of the bounded budget before any real result is reached.
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    async with async_playwright() as runner:
+        browser = await runner.chromium.launch()
+        try:
+            page = await browser.new_page()
+            await page.set_content(_ICON_SPRITE_SHEET_PAGE)
+            raw = await page.evaluate(COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION)
+        finally:
+            await browser.close()
+
+    live = json.loads(raw) if isinstance(raw, str) else raw
+    captured = live["result_containers"]
+    assert [entry["tag"] for entry in captured if entry["tag"] == "symbol"] == []
+    assert not live["result_containers_truncated"]
+    assert [entry["tag"] for entry in captured] == ["div"]
+
+    parsed = parse_composition_html(
+        _ICON_SPRITE_SHEET_PAGE,
+        inspected_url="https://example.test/logs",
+        current_url="https://example.test/logs",
+    )
+    assert [entry["tag"] for entry in parsed["result_containers"]] == [entry["tag"] for entry in captured]
+
+
+def test_a_dialog_only_observation_does_not_shadow_the_tile_captured_before_it() -> None:
+    from skyvern.forge.sdk.copilot.output_extraction_plan import derive_requested_output_extraction_plan
+    from skyvern.forge.sdk.copilot.tools._shared import _append_flow_evidence
+
+    def parsed(body: str) -> dict[str, Any]:
+        return parse_composition_html(
+            f'<html><body><nav><a href="/logs">Logs</a></nav>{body}</body></html>',
+            inspected_url="https://example.test/logs",
+            current_url="https://example.test/logs",
+        )
+
+    tile = parsed('<div class="query-results-summary"><span>1.22K</span><span>logs found</span></div>')
+    dialog = parsed(
+        '<div role="dialog" aria-label="Update your time zone">'
+        '<div class="dialog-footer"><button>No, keep it</button><button>Yes, update</button></div></div>'
+    )
+    ctx = SimpleNamespace(flow_evidence=[])
+    _append_flow_evidence(ctx, tile, reached_via="current_page")
+    _append_flow_evidence(ctx, dialog, reached_via="current_page")
+
+    # Derivation spends its one attempt on the freshest bindable packet, so a capture describing
+    # nothing but the dialog in front takes that attempt and the tile behind it is never read.
+    plan = derive_requested_output_extraction_plan(
+        flow_evidence=ctx.flow_evidence,
+        labels_by_path={"output.errors": ("azure",)},
+        witnessed_by_path={"output.errors": "1.22K"},
+    )
+
+    assert plan is not None
+    assert [binding.relation_label for binding in plan.live_reads] == ["logs found"]
+    assert [entry["obstructed"] for entry in ctx.flow_evidence] == [False, True]
+
+
+def test_a_decorated_delta_does_not_cost_the_tile_its_figure() -> None:
+    # Live shape (SKY-13226): the delta renders as an arrow plus its text, so treating any nested
+    # grandchild as structure abandoned the whole tile and the positional builder paired the heading
+    # with the delta — the figure sat at the next child the entire time.
+    html = """
+    <div><div>
+      <div><span>Visitors</span><div><svg></svg><span>-12.0%</span></div></div>
+      <div>8.43K</div>
+      <div>vs. 9.55K prior</div>
+    </div></div>
+    """
+
+    packet = parse_composition_html(html, inspected_url="https://example.test/a", current_url="https://example.test/a")
+
+    visitors = [r for r in packet["key_value_relations"] if r["key_text"] == "Visitors"]
+    assert [(r["value_text"], r["value_child_index"], r["direct_child_count"]) for r in visitors] == [("8.43K", 1, 3)]
+
+
+def test_a_genuinely_nested_subtree_is_still_not_a_tile() -> None:
+    html = """
+    <div><div>
+      <div><span>Visitors</span><div><span>a</span><span>b</span></div></div>
+      <div>8.43K</div>
+    </div></div>
+    """
+
+    packet = parse_composition_html(html, inspected_url="https://example.test/a", current_url="https://example.test/a")
+
+    assert not [r for r in packet["key_value_relations"] if r["value_text"] == "8.43K"]
+
+
+def test_the_page_side_capture_keeps_a_label_that_sits_outside_the_value_row() -> None:
+    payload = {
+        "page_title": "Logs",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "result_containers_truncated": False,
+        "key_value_relations": [
+            {
+                "key_text": "logs found",
+                "value_text": "1.42K",
+                "container_selector": ".tile > .row",
+                "container_match_count": 1,
+                "container_position": 0,
+                "value_child_index": 0,
+                "label_child_index": -1,
+                "direct_child_count": 2,
+                "visible": True,
+                "value_visible": True,
+            }
+        ],
+    }
+
+    packet = parse_composition_structured(
+        payload, inspected_url="https://example.test/logs", current_url="https://example.test/logs"
+    )
+
+    relation = packet["key_value_relations"][0]
+    assert relation["label_child_index"] == -1
+    assert _relation_label_child_index(relation) == -1

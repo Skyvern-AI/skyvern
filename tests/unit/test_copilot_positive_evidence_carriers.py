@@ -931,3 +931,48 @@ def test_value_present_abstains_when_registered_output_producer_block_failed() -
     )
     verdict = grade_requested_output_criteria(ctx, [_value_present_criterion()], snapshot)[0]
     assert verdict.state != "satisfied"
+
+
+# Byte-exact rows from the SKY-13332 live witness (wr_557702915819208430) and the SKY-13200 custody
+# dir: a dashboard renders "8.45K" while the block registers the integer 8450, and the same tile's
+# "-8.0%" delta yields a bare 8 that must not pass as the count.
+_DELTA_DIGIT_EVIDENCE = "Visitors\n-8.0%"
+_TILE_EVIDENCE = "Visitors\n-15.0%\n8.45K\nvs. 9.99K prior"
+
+
+def test_literal_containment_alone_would_miss_the_correct_extraction() -> None:
+    # Pins why the numeric-equivalence half is load-bearing: the correct value is not a substring of
+    # the tile that displays it, so a containment-only rule leaves a right answer unconfirmable.
+    assert _boundary_delimited_present("8450", _TILE_EVIDENCE) is False
+
+
+def _exact_value_criterion(value: str) -> object:
+    return make_completion_criterion(
+        "c_star",
+        "the number of stars for https://example.com/example-org/example-repo is retrieved",
+        output_path="output.star_count",
+        expected_output_value=value,
+    )
+
+
+def test_registered_scalar_does_not_witness_itself() -> None:
+    # The delta digit reached a verified terminal because the block's own registered output counted
+    # as independent confirmation of that same value.
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "extract_star_count_output": {
+                "evidence_text": _DELTA_DIGIT_EVIDENCE,
+                "output": {"star_count": 8},
+            }
+        },
+        block_output_sources={"extract_star_count_output": "registered_output_parameter"},
+    )
+    verdict = grade_requested_output_criteria(_star_ctx(), [_exact_value_criterion("8")], snapshot)[0]
+    assert verdict.state != "satisfied"
+
+
+def test_runtime_output_scalar_still_credits_normally() -> None:
+    # The narrowing targets the self-witnessing source only; ordinary runtime_output grading is
+    # untouched, so the reject does not swallow the legitimate path.
+    verdict = grade_requested_output_criteria(_star_ctx(), [_exact_value_criterion("22600")], _star_snapshot())[0]
+    assert verdict.state == "satisfied"

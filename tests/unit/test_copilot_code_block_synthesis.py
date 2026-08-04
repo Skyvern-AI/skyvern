@@ -5274,6 +5274,63 @@ class TestScoutedReadSynthesis:
         assert block.code.rstrip().endswith('return {"error_count": _read_value_0}')
         ast.parse(textwrap.dedent(block.code))
 
+    def test_emitted_read_fails_loudly_when_the_value_never_appears(self) -> None:
+        # The scout only records a read that returned something. An empty replay contradicts that
+        # proof, so the block must end rather than register a field carrying nothing.
+        block = synthesize_code_block(
+            [
+                {
+                    "tool_name": "read_value",
+                    "read_expression": 'document.querySelector("#total").innerText',
+                    "read_output_path": "output.error_count",
+                    "read_result_shape": "str",
+                    "source_url": "https://example.test/logs",
+                    "trajectory_index": 0,
+                },
+            ]
+        )
+        assert block is not None
+        code = textwrap.dedent(block.code)
+        ast.parse(code)
+
+        settle = next(line.strip() for line in code.splitlines() if line.strip().startswith("if _read_value_0 not in"))
+        decide = eval(f"lambda _read_value_0: bool({settle.removeprefix('if ').rstrip(':')})")  # noqa: S307
+        for empty in (None, "", [], {}):
+            assert not decide(empty), f"emitted read settled for {empty!r}"
+        for value in ("8.3K", 0, 0.0, ["row"], {"a": 1}):
+            assert decide(value), f"emitted read discarded {value!r}"
+
+        # and the block raises rather than returning the empty value
+        raises = [line.strip() for line in code.splitlines() if line.strip().startswith("raise Exception")]
+        assert raises, "an unresolved read must end the block"
+        assert "output.error_count" in raises[0]
+
+    def test_an_empty_replay_contradicts_the_proof_whatever_shape_it_had(self) -> None:
+        # A read is only recorded once it returns something, so there are no empty proven reads: an
+        # empty replay is absence for a collection-proven read exactly as for a scalar-proven one.
+        for shape in ("str", "list", "dict"):
+            block = synthesize_code_block(
+                [
+                    {
+                        "tool_name": "read_value",
+                        "read_expression": 'document.querySelectorAll("tr")',
+                        "read_output_path": "output.rows",
+                        "read_result_shape": shape,
+                        "source_url": "https://example.test/rows",
+                        "trajectory_index": 0,
+                    }
+                ]
+            )
+            assert block is not None
+            code = textwrap.dedent(block.code)
+            ast.parse(code)
+            guard = next(line.strip() for line in code.splitlines() if line.strip().startswith("if _read_value_0 in"))
+            decide = eval(f"lambda _read_value_0: bool({guard.removeprefix('if ').rstrip(':')})")  # noqa: S307
+            for empty in (None, "", [], {}):
+                assert decide(empty), f"{shape}-proven read must treat {empty!r} as absent"
+            for value in ("8.3K", 0, ["row"], {"a": 1}):
+                assert not decide(value), f"{shape}-proven read must accept {value!r}"
+
     def test_read_without_an_expression_is_dropped_rather_than_emitted_empty(self) -> None:
         block = synthesize_code_block(
             [
@@ -5447,3 +5504,108 @@ def test_synthesized_extraction_guards_only_name_things_the_sandbox_provides() -
     diagnostic = sandbox_unresolved_name_repair_diagnostic("\n".join(emitted), parameter_keys=[])
 
     assert diagnostic is None, diagnostic.unresolved_names if diagnostic else ()
+
+
+def test_a_value_witnessed_read_proves_no_heading_at_runtime() -> None:
+    # Live failure (SKY-13226): the value witness picks the element by the value it showed, then the
+    # generated read asserted the heading beside it and raised "Observed scalar label changed" —
+    # the tile's heading slot also carries a delta chip, and a page with no heading has none to read.
+    from skyvern.forge.sdk.copilot.code_block_synthesis import _key_value_scalar_read_statements
+    from skyvern.forge.sdk.copilot.output_extraction_plan import LiveReadBinding
+
+    fields = {
+        "output_path": "output.count",
+        "kind": "key_value_scalar",
+        "selector": "#summary",
+        "selector_count": 1,
+        "selector_index": 0,
+        "child_index": 1,
+        "child_count": 3,
+        "relation_label": "Visitors",
+    }
+
+    witnessed = "\n".join(
+        _key_value_scalar_read_statements(
+            LiveReadBinding(**fields, identified_by_label=False), "_value", guard_empty=True
+        )
+    )
+    by_label = "\n".join(_key_value_scalar_read_statements(LiveReadBinding(**fields), "_value", guard_empty=True))
+
+    assert "Observed scalar label" not in witnessed
+    # The element is still pinned by everything that chose it.
+    assert "Observed scalar selector cardinality changed" in witnessed
+    assert "Observed scalar direct-child shape changed" in witnessed
+    assert '_value = (await page.locator("#summary").nth(0).locator(":scope > *").nth(1).inner_text()).strip()' in (
+        witnessed
+    )
+    # A binding the label did choose keeps proving it.
+    assert "Observed scalar label changed" in by_label
+
+
+def test_entry_anchors_on_what_the_flow_fills_not_the_link_it_clicks_away_from() -> None:
+    # Live capture (SKY-13226): a scout opened a password-reset link before signing in, and the login
+    # block anchored on that link — so every execution began by leaving the login form.
+    trajectory = [
+        {
+            "tool_name": "click",
+            "selector": 'a[href="/account/forgot_password"]',
+            "accessible_name": "Forgot password?",
+            "source_url": "https://example.test/account/login",
+        },
+        {
+            "tool_name": "fill_credential_field",
+            "selector": "#username",
+            "credential_id": "cred_1",
+            "credential_field": "username",
+            "source_url": "https://example.test/account/login",
+        },
+        {
+            "tool_name": "fill_credential_field",
+            "selector": "#password",
+            "credential_id": "cred_1",
+            "credential_field": "password",
+            "source_url": "https://example.test/account/login",
+        },
+    ]
+
+    block = synthesize_code_block(trajectory, strict_selectors=True)
+
+    assert block is not None
+    assert '_scout_entry_target = page.locator("#username")' in block.code
+    # The click is still demonstrated, it just no longer decides where the flow starts.
+    assert 'a[href=\\"/account/forgot_password\\"]").click()' in block.code
+    assert [step["action_type"] for step in block.steps][:4] == ["goto_url", "click", "input_text", "input_text"]
+
+
+def test_a_designated_read_waits_for_a_figure_the_page_has_not_rendered_yet() -> None:
+    # Live failure (SKY-13226): the tile renders while its query is still resolving, so a read that
+    # fires once takes the empty frame — and on the log explorer it took the neighbouring control's
+    # text instead, costing a whole test run.
+    from skyvern.forge.sdk.copilot.code_block_synthesis import _key_value_scalar_read_statements
+    from skyvern.forge.sdk.copilot.output_extraction_plan import LiveReadBinding
+
+    designated = LiveReadBinding(
+        output_path="output.count",
+        kind="key_value_scalar",
+        selector="#total",
+        selector_count=1,
+        selector_index=0,
+    )
+    emitted = "\n".join(_key_value_scalar_read_statements(designated, "_value", guard_empty=True))
+
+    assert "wait_for_timeout" in emitted
+    assert emitted.count("inner_text()") == 2, "the value is re-read after each wait, not just once"
+    assert 'raise Exception("Designated value element is empty")' in emitted
+
+    # A relation-bound read proves its own shape and is left alone.
+    relation = LiveReadBinding(
+        output_path="output.count",
+        kind="key_value_scalar",
+        selector="#card",
+        selector_count=1,
+        selector_index=0,
+        child_index=1,
+        child_count=3,
+        relation_label="Visitors",
+    )
+    assert "wait_for_timeout" not in "\n".join(_key_value_scalar_read_statements(relation, "_value", guard_empty=True))

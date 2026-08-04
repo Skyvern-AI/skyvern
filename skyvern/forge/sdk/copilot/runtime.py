@@ -58,7 +58,10 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
     from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
-    from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
+    from skyvern.forge.sdk.copilot.output_extraction_plan import (
+        FrozenRequestedOutputExtractionCandidate,
+        RequestedOutputExtractionPlan,
+    )
     from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence, ScoutObservationContract
@@ -221,7 +224,14 @@ class ScoutedInteraction(TypedDict):
     # value answers. Recorded so authoring quotes a proven read instead of guessing a selector.
     read_expression: NotRequired[str]
     read_output_path: NotRequired[str]
+    # Whether the reader named this path or it was the only one left. A witness binds a value to a
+    # path, so a read that merely inherited the path by elimination is not evidence of that path.
+    read_output_path_source: NotRequired[str]
     read_result_shape: NotRequired[str]
+    # The scalar the read actually returned, so a later binding can locate the element that still
+    # carries it rather than re-deriving one from labels. Bounded and scalar-only; turn-ephemeral,
+    # like raw_typed_value, and excluded from every persistence path.
+    read_result_value: NotRequired[str]
     # Set when a live scout-time count()==1 probe found the captured selector matching >1 element on its
     # source page; synthesis re-anchors or drops it rather than emitting a selector that strict-mode-fails.
     ambiguous: NotRequired[bool]
@@ -258,6 +268,10 @@ class AgentContext:
     injected_browser_state: BrowserState | None = None
     heal_workflow_run_id: str | None = None
     turn_intent: TurnIntent | None = None
+    # The streaming adapter narrates any context it is handed, so the design-phase latches live here
+    # rather than on the copilot subclass it is annotated for.
+    design_start_emitted: bool = False
+    design_end_emitted: bool = False
     # Ephemeral carrier for SDK-action run reuse, bounded by browser sessions touched in one Copilot run.
     sdk_action_workflow_run_ids_by_browser_session: dict[SdkActionWorkflowRunCacheKey, str] = field(
         default_factory=dict
@@ -479,10 +493,16 @@ class AgentContext:
     synthesized_block_offered: bool = False
     synthesized_block_offered_trajectory_len: int = 0
     synthesized_block_offered_goal_complete: bool = False
+    # Probe-validated value elements the model designated, each pinned to the page it was resolved on.
+    requested_output_designations: list[dict[str, Any]] = field(default_factory=list)
     requested_output_extraction_candidate: FrozenRequestedOutputExtractionCandidate | None = None
     # Candidate frozen by an imposition that has not been persisted yet; promoted to the committed
     # candidate only once the update it rode in on succeeds.
     pending_requested_output_extraction_candidate: FrozenRequestedOutputExtractionCandidate | None = None
+    # The last plan that bound every requested path. Derivation reads the freshest packet, which is
+    # usually truncated or unbindable, so a plan that did bind is kept rather than re-derived away
+    # before the imposition that needs it.
+    last_bound_requested_output_extraction_plan: RequestedOutputExtractionPlan | None = None
     # Set by the imposition seam when a goal-complete spine is on its way into a draft; the successful update
     # promotes it to the landed latch only when the persisted draft covers the freshly scouted spine.
     pending_goal_complete_landing: bool = False
@@ -545,6 +565,9 @@ class AgentContext:
     # Expression of an in-flight evaluate, stashed pre-dispatch: the MCP response carries only the
     # result, so a post-hook that wants the expression must receive it from the invocation side.
     pending_scout_read_expression: str | None = None
+    # Requested output the in-flight evaluate says it fills. Without it a read can only be attributed
+    # when the turn requests exactly one output, so a multi-field request binds nothing.
+    pending_scout_read_output_path: str | None = None
     # Connected overlay used by bounded pre-click evidence probes; declared so capture code accesses it
     # directly instead of silently accepting a dynamically attached dependency.
     discovery_mcp_server: SkyvernOverlayMCPServer | None = None

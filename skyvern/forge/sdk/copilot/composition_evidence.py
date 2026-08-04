@@ -55,6 +55,8 @@ _RESULT_CONTAINER_HINTS: frozenset[str] = frozenset({"result", "results", "recor
 _MAX_FORMS = 5
 _MAX_FIELDS_PER_FORM = 20
 _MAX_RESULT_CONTAINERS = 8
+# The cap _schema_text applies to a relation's value; at it, the text is a prefix, not the value.
+_MAX_RELATION_VALUE_CHARS = 240
 _MAX_KEY_VALUE_RELATIONS = 24
 _MAX_REVEAL_KEY_VALUE_RELATIONS = 8
 _MAX_TABLE_HEADERS = 12
@@ -1352,7 +1354,17 @@ def _structural_path(node: Any) -> str:
             parts.insert(0, f"#{parent_id}")
             break
         current = parent
-    return " > ".join(parts)
+    full = " > ".join(parts)
+    if len(full) <= _MAX_SELECTOR_CHARS:
+        return full
+    # A tile nested deeply in id-less markup outgrows the budget, and a path cut to fit ends
+    # mid-token. The shortest tail that still resolves to this node alone says the same thing in
+    # fewer characters, and the caller verifies it before handing it out either way.
+    for start in range(1, len(parts)):
+        tail = " > ".join(parts[start:])
+        if len(tail) <= _MAX_SELECTOR_CHARS and _resolves_uniquely(node, tail):
+            return tail
+    return full
 
 
 def _control_label(node: Any) -> str:
@@ -1370,6 +1382,15 @@ def _control_label(node: Any) -> str:
     if image is not None:
         return _attr_value(image, "alt") or _attr_value(image, "aria-label")
     return ""
+
+
+_MAX_SELECTOR_CHARS = 160
+
+
+def _bounded_selector(selector: str) -> str:
+    """A selector short enough to survive intact, or nothing. Cutting one to a length budget can end
+    it mid-token (``div:nth-of-ty``), and the generated block then raises on querySelectorAll."""
+    return selector if len(selector) <= _MAX_SELECTOR_CHARS else ""
 
 
 def _selector_for(node: Any) -> str:
@@ -1479,7 +1500,7 @@ def _clickable_controls_html(soup: Any, *, used_selectors: set[str]) -> list[dic
         text = _schema_text(_clickable_control_text(node), 120)
         selector = _clickable_control_selector(node)
         if selector and selector not in seen_selectors and _selector_is_live_unique_in_soup(soup, selector):
-            controls.append({"text": text, "selector": selector[:160], "tag": tag_name})
+            controls.append({"text": text, "selector": _bounded_selector(selector), "tag": tag_name})
             seen_selectors.add(selector)
             if text:
                 seen_text.add(text)
@@ -1577,26 +1598,314 @@ def _selector_match_count(soup: Any, selector: str) -> int:
         return 0
 
 
-def _key_value_relations(soup: Any) -> tuple[list[dict[str, Any]], bool, bool]:
-    relations: list[dict[str, Any]] = []
+_PAGE_CHROME_TAGS = frozenset({"nav", "aside", "header", "footer"})
+_PAGE_CHROME_ROLES = frozenset({"navigation", "menu", "menubar", "banner", "complementary"})
+_NON_CONTENT_CHILD_TAGS = frozenset({"style", "script", "noscript", "svg", "template"})
+
+
+def _inside_page_chrome(node: Any) -> bool:
+    """Site navigation and chrome repeat page vocabulary (a sidebar "Visitors" item shadows the
+    metric tile) and flood the relation cap with junk pairs, so no relation binds inside them."""
+    current = node
+    while current is not None and getattr(current, "name", None):
+        if str(current.name).lower() in _PAGE_CHROME_TAGS:
+            return True
+        role = str(current.get("role") or "").lower() if hasattr(current, "get") else ""
+        if role in _PAGE_CHROME_ROLES:
+            return True
+        current = current.parent
+    return False
+
+
+def _label_like(key_text: str) -> bool:
+    return len(key_text) >= 2 and "{" not in key_text
+
+
+def _reads_as_one_leaf(node: Any) -> bool:
+    """Whether a node's text comes from a single text-bearing descendant.
+
+    A tile's figure sits beside a delta rendered as an arrow plus its text, so treating any nested
+    grandchild as structure abandoned the whole tile and left the delta to the positional builder —
+    the figure was present the entire time (SKY-13226). Counts text-bearing descendants rather than
+    naming decorative tags, so an icon of any element type stays decoration.
+    """
+    if node.find(True) is None:
+        return True
+    bearing = [
+        descendant
+        for descendant in node.find_all(True)
+        if _schema_text(_node_text(descendant), 240) and descendant.find(True) is None
+    ]
+    return len(bearing) <= 1
+
+
+def _append_metric_card_relations(
+    soup: Any,
+    relations: list[dict[str, Any]],
+    folded_key_counts: dict[str, int],
+    walked_value_counts: dict[str, int],
+    owned_by_target: set[int] | None = None,
+) -> tuple[list[Any], bool]:
+    """Emit label→value relations for metric-card tiles (a heading beside exactly one bare-magnitude
+    figure, deltas and comparisons around it), which fit neither the 2-child pair nor the reveal
+    shape and so left the requested value structurally invisible (SKY-13226).
+
+    Reports whether the cap dropped a card: a channel that lost relations without saying so reads as
+    a complete list, which is the one thing a binder is allowed to trust.
+    """
+    cards: list[Any] = []
+    # A tile the targeted pass already resolved is not re-emitted here; both passes reach the same
+    # figure, and two relations for one tile read as two observations of it.
+    card_ids: set[int] = set(owned_by_target or ())
     truncated = False
     for node in soup.find_all(True):
         tag_name = str(getattr(node, "name", "") or "").lower()
         if tag_name in {"body", "form", "html", "table", "tbody", "thead", "tr"}:
+            continue
+        if _inside_page_chrome(node) or id(node) in card_ids or any(id(parent) in card_ids for parent in node.parents):
+            continue
+        children = [child for child in node.find_all(recursive=False) if child.name]
+        if not (2 <= len(children) <= 6):
+            continue
+        if any(str(child.name).lower() in _NON_CONTENT_CHILD_TAGS for child in children):
+            continue
+        leaves: list[tuple[int, str]] = []
+        # Where each leaf sits when it is a grandchild: the child holding it, and its index within.
+        leaf_anchors: dict[tuple[int, str], tuple[Any, int, int]] = {}
+        nested_ok = True
+        for index, child in enumerate(children):
+            grandchildren = [grand for grand in child.find_all(recursive=False) if grand.name]
+            if not grandchildren:
+                text = _schema_text(_node_text(child), 240)
+                if text:
+                    leaves.append((index, text))
+                continue
+            if any(not _reads_as_one_leaf(grand) for grand in grandchildren):
+                nested_ok = False
+                break
+            for grand_index, grand in enumerate(grandchildren):
+                text = _schema_text(_node_text(grand), 240)
+                if text:
+                    leaves.append((index, text))
+                    leaf_anchors.setdefault((index, text), (child, grand_index, len(grandchildren)))
+        if not nested_ok or not leaves or len(leaves) > 8:
+            continue
+        magnitudes = [(index, text) for index, text in leaves if _BARE_MAGNITUDE_RE.fullmatch(text)]
+        if len(magnitudes) != 1:
+            continue
+        value_index, value_text = magnitudes[0]
+        # The compiled read takes a direct child's whole text, so the relation is anchored wherever
+        # the figure is that child: the tile when the figure is a direct child, and the row holding
+        # it when the figure sits beside a comparison. Anchoring only at the tile left a figure that
+        # shares its row with "vs. N prior" unreadable, and the heading fell to the positional
+        # builder beside the delta.
+        value_carrier, value_child_index, value_child_count = node, value_index, len(children)
+        if _schema_text(_node_text(children[value_index]), 240) != value_text:
+            anchor = leaf_anchors.get((value_index, value_text))
+            if anchor is None:
+                continue
+            value_carrier, value_child_index, value_child_count = anchor
+        heading_leaves = [
+            (index, text)
+            for index, text in leaves
+            if index != value_index and len(text) <= 60 and _label_like(text) and not _BARE_MAGNITUDE_RE.fullmatch(text)
+        ]
+        if not heading_leaves:
+            continue
+        heading_index, headings = heading_leaves[0][0], [text for _index, text in heading_leaves]
+        selector = _bounded_selector(_selector_for(value_carrier))
+        match_count = _selector_match_count(soup, selector)
+        if match_count <= 0:
+            continue
+        try:
+            position = soup.select(selector).index(value_carrier)
+        except ValueError:
+            continue
+        folded_heading = headings[0][:120].lower()
+        folded_key_counts[folded_heading] = folded_key_counts.get(folded_heading, 0) + 1
+        # Counted before the cap, like the heading beside it: a value the cap drops still appeared on
+        # the page, and a witness reading the count as page-wide uniqueness would bind the wrong tile.
+        if value_text:
+            walked_value_counts[value_text] = walked_value_counts.get(value_text, 0) + 1
+        if len(relations) >= _MAX_KEY_VALUE_RELATIONS:
+            truncated = True
+            continue
+        relations.append(
+            {
+                "key_text": headings[0][:120],
+                "value_text": value_text,
+                "container_selector": selector,
+                "container_match_count": match_count,
+                "container_position": position,
+                "value_child_index": value_child_index,
+                # A tile that prints its figure before its heading ("1.22K logs found") puts the label
+                # somewhere other than the first child, and a read proving the label at child zero
+                # then fails on a page that plainly shows both. Re-anchoring onto the figure's own row
+                # leaves the heading outside it entirely, and then no child index names the label.
+                "label_child_index": heading_index if value_carrier is node else -1,
+                "direct_child_count": value_child_count,
+                "visible": True,
+                "value_visible": True,
+            }
+        )
+        cards.append(node)
+        card_ids.add(id(node))
+    return cards, truncated
+
+
+def _is_leaf_element(node: Any) -> bool:
+    return bool(getattr(node, "name", None)) and node.find(True) is None
+
+
+def _within(node: Any, ancestor: Any) -> bool:
+    current = node
+    while current is not None:
+        if current is ancestor:
+            return True
+        current = getattr(current, "parent", None)
+    return False
+
+
+def _value_beside_requested_label(soup: Any, label_node: Any) -> tuple[dict[str, Any], Any] | None:
+    """The value a labelled tile carries, found by widening from the label until one candidate remains.
+
+    Anchoring on the requested label makes this an identity search rather than a guess at which
+    containers look like metric tiles, so a figure the tile nests deeper is still its value. Widening
+    stops at the first level that offers exactly one candidate and abstains where several do: markup
+    that cannot say which number the label owns is not evidence that any of them is.
+    """
+    branch = label_node
+    ancestor = getattr(label_node, "parent", None)
+    while ancestor is not None and str(getattr(ancestor, "name", "") or "") not in {"", "body", "html", "[document]"}:
+        candidates = [
+            leaf
+            for leaf in ancestor.find_all(True)
+            if _is_leaf_element(leaf)
+            and not _within(leaf, branch)
+            and _BARE_MAGNITUDE_RE.fullmatch(_schema_text(_node_text(leaf), 240))
+        ]
+        if len(candidates) > 1:
+            return None
+        if len(candidates) == 1:
+            value_leaf = candidates[0]
+            carrier = value_leaf.parent
+            children = [child for child in carrier.find_all(recursive=False) if child.name]
+            if value_leaf not in children:
+                return None
+            # A generated scalar read proves identity by re-reading the label. Where the label is not
+            # the value's sibling it is proven at its own anchor instead, and a label with neither is
+            # unreadable: emitting it anyway builds a block that raises on its own guard.
+            label_text = _schema_text(_node_text(label_node), 120)
+            label_selector = ""
+            if not children or _schema_text(_node_text(children[0]), 120) != label_text:
+                label_selector = _bounded_selector(_selector_for(label_node))
+                if not label_selector or not _resolves_uniquely(label_node, label_selector):
+                    return None
+            selector = _bounded_selector(_selector_for(carrier))
+            match_count = _selector_match_count(soup, selector) if selector else 0
+            if not selector or match_count <= 0:
+                return None
+            try:
+                position = soup.select(selector).index(carrier)
+            except ValueError:
+                return None
+            return (
+                {
+                    "key_text": label_text,
+                    "label_selector": label_selector,
+                    "value_text": _schema_text(_node_text(value_leaf), 240),
+                    "container_selector": selector,
+                    "container_match_count": match_count,
+                    "container_position": position,
+                    "value_child_index": children.index(value_leaf),
+                    "direct_child_count": len(children),
+                    "visible": True,
+                    "value_visible": True,
+                },
+                ancestor,
+            )
+        branch = ancestor
+        ancestor = getattr(ancestor, "parent", None)
+    return None
+
+
+def _append_requested_target_relations(
+    soup: Any, relations: list[dict[str, Any]], folded_key_counts: dict[str, int], requested_targets: tuple[str, ...]
+) -> set[int]:
+    owned: set[int] = set()
+    for target in requested_targets:
+        folded = target.strip().casefold()
+        if not folded:
+            continue
+        for node in soup.find_all(True):
+            if not _is_leaf_element(node) or _inside_page_chrome(node):
+                continue
+            if _node_text(node).strip().casefold() != folded:
+                continue
+            found = _value_beside_requested_label(soup, node)
+            if found is None:
+                continue
+            relation, carrier = found
+            key = str(relation.get("key_text") or "").lower()
+            if key:
+                folded_key_counts[key] = folded_key_counts.get(key, 0) + 1
+            relations.append(relation)
+            owned.add(id(carrier))
+            break
+    return owned
+
+
+def _key_value_relations(soup: Any, requested_targets: tuple[str, ...] = ()) -> tuple[list[dict[str, Any]], bool, bool]:
+    relations: list[dict[str, Any]] = []
+    # How often each folded label occurs across the whole page, counted past the cap so a bind can be
+    # decided from a truncated capture instead of refused wholesale.
+    folded_key_counts: dict[str, int] = {}
+    # Values are counted alongside labels and for the same reason: a witness binds on the value,
+    # so whether the page shows that value once is what decides the bind on a truncated channel.
+    # Counted as displayed rather than folded, because a witness compares displayed text.
+    walked_value_counts: dict[str, int] = {}
+    # The labels the turn asked for are resolved before anything else, so the cap cannot starve them
+    # and the shape passes below cannot claim their tiles first.
+    owned_by_target = _append_requested_target_relations(soup, relations, folded_key_counts, requested_targets)
+    for relation in relations:
+        early_value = str(relation.get("value_text") or "")
+        if early_value:
+            walked_value_counts[early_value] = walked_value_counts.get(early_value, 0) + 1
+    cards, truncated = _append_metric_card_relations(
+        soup, relations, folded_key_counts, walked_value_counts, owned_by_target
+    )
+    card_ids = {id(card) for card in cards} | owned_by_target
+    for node in soup.find_all(True):
+        tag_name = str(getattr(node, "name", "") or "").lower()
+        if tag_name in {"body", "form", "html", "table", "tbody", "thead", "tr"}:
+            continue
+        if _inside_page_chrome(node):
+            continue
+        if id(node) in card_ids or any(id(parent) in card_ids for parent in node.parents):
             continue
         children = [child for child in node.find_all(recursive=False) if child.name]
         if len(children) != 2:
             continue
         if children[0].find(True) is not None:
             continue
+        if any(str(child.name).lower() in _NON_CONTENT_CHILD_TAGS for child in children):
+            continue
         key_text = _schema_text(_node_text(children[0]), 120)
         value_text = _schema_text(_node_text(children[1]), 240)
-        if not key_text or not value_text or key_text == value_text:
+        if not key_text or not value_text or key_text == value_text or not _label_like(key_text):
             continue
+        # Counting continues past the cap even though recording stops: whether a captured label is
+        # unique on the page is what decides a bind, and stopping the count as well as the payload
+        # turned "there is more beyond this" into "nothing here can be trusted".
+        # Simple lowercase rather than casefold, because the page-side twin counts with
+        # String.toLowerCase and a count only means something if both producers merge alike.
+        folded = key_text.lower()
+        folded_key_counts[folded] = folded_key_counts.get(folded, 0) + 1
+        walked_value_counts[value_text] = walked_value_counts.get(value_text, 0) + 1
         if len(relations) >= _MAX_KEY_VALUE_RELATIONS:
             truncated = True
-            break
-        selector = _selector_for(node)[:160]
+            continue
+        selector = _bounded_selector(_selector_for(node))
         match_count = _selector_match_count(soup, selector)
         if match_count <= 0:
             continue
@@ -1618,8 +1927,53 @@ def _key_value_relations(soup: Any) -> tuple[list[dict[str, Any]], bool, bool]:
                 "value_visible": True,
             }
         )
-    reveal_truncated = _append_reveal_shape_relations(soup, relations)
+    reveal_truncated = _append_reveal_shape_relations(soup, relations, card_ids)
+    for relation in relations:
+        folded = str(relation.get("key_text") or "").lower()
+        if folded:
+            relation["key_text_walked_count"] = folded_key_counts.get(folded, 1)
+        value_text = str(relation.get("value_text") or "")
+        if value_text:
+            relation["value_text_walked_count"] = walked_value_counts.get(value_text, 1)
+            if len(value_text) >= _MAX_RELATION_VALUE_CHARS:
+                relation["value_truncated"] = True
     return relations, truncated, reveal_truncated
+
+
+def clearable_dismiss_texts(evidence: dict[str, Any]) -> set[str]:
+    """The texts of the dismiss controls the captured dialogs offer."""
+    texts: set[str] = set()
+    for overlay in evidence.get("modal_overlays") or []:
+        if not isinstance(overlay, dict):
+            continue
+        for control in overlay.get("dismiss_controls") or []:
+            text = str((control or {}).get("text") or "").strip() if isinstance(control, dict) else str(control).strip()
+            if text:
+                texts.add(text)
+    return texts
+
+
+def packet_describes_a_clearable_overlay(evidence: dict[str, Any]) -> bool:
+    """Whether the relations captured are the overlay's own controls rather than the page's.
+
+    Capture reads what is in front, so an overlay can leave the packet describing the dialog instead
+    of the page behind it: a log query whose count was plainly on screen came back carrying only the
+    dialog's two buttons. Composing an extraction from that packet spends the round on evidence the
+    page never offered, while the control that clears it was collected and then dropped. Judged by
+    whether the dialog's own controls account for every relation, so a dialog beside readable page
+    content still composes.
+    """
+    dismiss_texts = clearable_dismiss_texts(evidence)
+    if not dismiss_texts:
+        return False
+    relations = [relation for relation in evidence.get("key_value_relations") or [] if isinstance(relation, dict)]
+    if not relations:
+        return False
+    return all(
+        str(relation.get("key_text") or "").strip() in dismiss_texts
+        or str(relation.get("value_text") or "").strip() in dismiss_texts
+        for relation in relations
+    )
 
 
 def _matches_result_hint_token(node: Any) -> bool:
@@ -1628,12 +1982,29 @@ def _matches_result_hint_token(node: Any) -> bool:
     return any(token in _RESULT_CONTAINER_HINTS for token in re.split(r"[^a-z0-9]+", raw) if token)
 
 
-def _append_reveal_shape_relations(soup: Any, relations: list[dict[str, Any]]) -> bool:
+_BARE_MAGNITUDE_RE = re.compile(r"-?\$?\d{1,3}(?:[,\s]?\d{3})*(?:\.\d+)?[KMB]?", re.IGNORECASE)
+
+
+def _designated_metric_leaf_index(value_leaves: list[tuple[int, str]]) -> int | None:
+    """The one leaf of a multi-leaf tile whose heading survives, or None when nothing distinguishes
+    them. Bare magnitude is a heuristic: a tile's value sits at no fixed child index."""
+
+    if len(value_leaves) == 1:
+        return value_leaves[0][0]
+    magnitudes = [index for index, value_text in value_leaves if _BARE_MAGNITUDE_RE.fullmatch(value_text)]
+    return magnitudes[0] if len(magnitudes) == 1 else None
+
+
+def _append_reveal_shape_relations(soup: Any, relations: list[dict[str, Any]], card_ids: set[int]) -> bool:
     reveal_count = 0
     reveal_truncated = False
     for node in soup.find_all(True):
         tag_name = str(getattr(node, "name", "") or "").lower()
         if tag_name in {"body", "form", "html", "table", "tbody", "thead", "tr"}:
+            continue
+        if _inside_page_chrome(node):
+            continue
+        if id(node) in card_ids or any(id(parent) in card_ids for parent in node.parents):
             continue
         if not _matches_result_hint_token(node):
             continue
@@ -1648,7 +2019,7 @@ def _append_reveal_shape_relations(soup: Any, relations: list[dict[str, Any]]) -
         key_text = _schema_text(_node_text(heading), 240)
         if not key_text or len(key_text) > 120:
             continue
-        selector = _selector_for(node)[:160]
+        selector = _bounded_selector(_selector_for(node))
         match_count = _selector_match_count(soup, selector)
         if match_count <= 0:
             continue
@@ -1662,7 +2033,7 @@ def _append_reveal_shape_relations(soup: Any, relations: list[dict[str, Any]]) -
             if not value_text or key_text == value_text:
                 continue
             value_leaves.append((index, value_text))
-        reveal_key_text = key_text if len(value_leaves) == 1 else ""
+        designated_index = _designated_metric_leaf_index(value_leaves)
         capped = False
         for index, value_text in value_leaves:
             if len(relations) >= _MAX_KEY_VALUE_RELATIONS or reveal_count >= _MAX_REVEAL_KEY_VALUE_RELATIONS:
@@ -1671,7 +2042,7 @@ def _append_reveal_shape_relations(soup: Any, relations: list[dict[str, Any]]) -
                 break
             relations.append(
                 {
-                    "key_text": reveal_key_text,
+                    "key_text": key_text if index == designated_index else "",
                     "value_text": value_text,
                     "container_selector": selector,
                     "container_match_count": match_count,
@@ -1691,7 +2062,7 @@ def _append_reveal_shape_relations(soup: Any, relations: list[dict[str, Any]]) -
 def _result_container_entry(node: Any, *, soup: Any) -> dict[str, Any]:
     tag_name = str(node.name or "").lower()
     node_id = str(node.get("id") or "")
-    selector = _selector_for(node)[:160]
+    selector = _bounded_selector(_selector_for(node))
     entry: dict[str, Any] = {
         "tag": tag_name,
         "id": node_id[:120],
@@ -1759,7 +2130,7 @@ def _challenge_control_entry(node: Any) -> dict[str, Any]:
         "name": _attr_value(node, "name")[:120],
         "class": " ".join(_classes_for(node)[:5])[:160],
         "type": control_type,
-        "selector": _selector_for(node)[:160],
+        "selector": _bounded_selector(_selector_for(node)),
         "text": _schema_text(
             _node_text(node) or _attr_value(node, "value") or _attr_value(node, "aria-label"),
             200,
@@ -1819,8 +2190,10 @@ def _challenge_controls(soup: Any) -> list[dict[str, Any]]:
         # trigger the visual fallback but must not read as a rendered control.
         if _is_hidden_modal_candidate(node):
             continue
-        selector = _selector_for(node)[:160]
-        if selector in seen_selectors:
+        selector = _bounded_selector(_selector_for(node))
+        # A selector too long to survive comes back empty, and every such node would otherwise
+        # dedupe against the first one.
+        if selector and selector in seen_selectors:
             continue
         seen_selectors.add(selector)
         controls.append(_challenge_control_entry(node))
@@ -1880,8 +2253,10 @@ def _modal_dismiss_controls(node: Any) -> list[dict[str, Any]]:
     for control in node.find_all(["button", "a", "input"]):
         if len(controls) >= _MAX_MODAL_DISMISS_CONTROLS:
             break
-        selector = _selector_for(control)[:160]
-        if selector in seen_selectors:
+        selector = _bounded_selector(_selector_for(control))
+        # A selector too long to survive comes back empty, and every such node would otherwise
+        # dedupe against the first one.
+        if selector and selector in seen_selectors:
             continue
         # Every control the dialog offers is reported. A keyword list cannot name every way a dialog
         # closes ("No, keep ...", an icon-only glyph), and filtering on one leaves the agent looking
@@ -1909,7 +2284,7 @@ def _modal_overlay_entry(node: Any) -> dict[str, Any]:
         "aria_modal": _attr_value(node, "aria-modal").strip().lower() == "true",
         "id": _attr_value(node, "id")[:120],
         "class": " ".join(_classes_for(node)[:5])[:160],
-        "selector": _selector_for(node)[:160],
+        "selector": _bounded_selector(_selector_for(node)),
         "text": _schema_text(_node_text(node), 240),
         "dismiss_controls": _modal_dismiss_controls(node),
     }
@@ -1925,8 +2300,10 @@ def _modal_overlays(nodes: Iterable[Any]) -> list[dict[str, Any]]:
             continue
         if _is_hidden_modal_candidate(node):
             continue
-        selector = _selector_for(node)[:160]
-        if selector in seen_selectors:
+        selector = _bounded_selector(_selector_for(node))
+        # A selector too long to survive comes back empty, and every such node would otherwise
+        # dedupe against the first one.
+        if selector and selector in seen_selectors:
             continue
         entry = _modal_overlay_entry(node)
         dismiss_controls = entry.get("dismiss_controls")
@@ -1975,7 +2352,9 @@ def _anti_bot_indicators(html: str, page_title: str) -> list[str]:
     return [pattern for pattern in _ANTI_BOT_PATTERNS if pattern in haystack]
 
 
-def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -> dict[str, Any]:
+def parse_composition_html(
+    html: str, *, inspected_url: str, current_url: str, requested_targets: tuple[str, ...] = ()
+) -> dict[str, Any]:
     """Extract a compact page schema for build-time workflow composition."""
 
     if BeautifulSoup is None:
@@ -2026,7 +2405,7 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
                         "class": " ".join(_classes_for(node)[:5])[:160],
                         "type": field_type[:40],
                         "disabled": _control_disabled(node),
-                        "selector": _selector_for(node)[:160],
+                        "selector": _bounded_selector(_selector_for(node)),
                     }
                 )
                 continue
@@ -2049,7 +2428,7 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
                     "disabled": _control_disabled(node),
                     "checked": bool(node.has_attr("checked")),
                     "options": _select_options(node) if tag_name == "select" else [],
-                    "selector": _selector_for(node)[:160],
+                    "selector": _bounded_selector(_selector_for(node)),
                 }
             )
         forms.append(
@@ -2077,7 +2456,7 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         nav_entry: dict[str, Any] = {
             "text": _schema_text(text, 160),
             "href": resolved_href[:300],
-            "selector": _selector_for(link)[:160],
+            "selector": _bounded_selector(_selector_for(link)),
         }
         download_kind = classify_download_affordance(
             href=resolved_href,
@@ -2101,7 +2480,9 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
                 break
             result_containers.append(_result_container_entry(node, soup=soup))
 
-    key_value_relations, key_value_relations_truncated, reveal_relations_truncated = _key_value_relations(soup)
+    key_value_relations, key_value_relations_truncated, reveal_relations_truncated = _key_value_relations(
+        soup, requested_targets
+    )
     reveal_relations_truncated = reveal_relations_truncated and not key_value_relations_truncated
 
     used_selectors: set[str] = set()
@@ -2211,7 +2592,7 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
                 "disabled": node.get("disabled") is True,
                 "checked": node.get("checked") is True,
                 "options": _structured_select_options(node.get("options")),
-                "selector": _structured_str(node.get("selector"))[:160],
+                "selector": _bounded_selector(_structured_str(node.get("selector"))),
             }
         )
     submit_controls: list[dict[str, Any]] = []
@@ -2227,7 +2608,7 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
                 "class": _structured_classes(control.get("class")),
                 "type": (_structured_str(control.get("type")) or "").lower()[:40],
                 "disabled": control.get("disabled") is True,
-                "selector": _structured_str(control.get("selector"))[:160],
+                "selector": _bounded_selector(_structured_str(control.get("selector"))),
             }
         )
     return {
@@ -2257,7 +2638,7 @@ def _structured_navigation_targets(value: Any, *, base_url: str) -> list[dict[st
         entry: dict[str, Any] = {
             "text": _schema_text(_structured_str(link.get("text")), 160),
             "href": href[:300],
-            "selector": _structured_str(link.get("selector"))[:160],
+            "selector": _bounded_selector(_structured_str(link.get("selector"))),
         }
         download_kind = classify_download_affordance(
             href=href,
@@ -2279,7 +2660,7 @@ def _structured_result_containers(value: Any) -> list[dict[str, Any]]:
         if not isinstance(node, dict):
             continue
         tag_name = (_structured_str(node.get("tag")) or "").lower()
-        selector = _structured_str(node.get("selector"))[:160]
+        selector = _bounded_selector(_structured_str(node.get("selector")))
         entry: dict[str, Any] = {
             "tag": tag_name,
             "id": _structured_str(node.get("id"))[:120],
@@ -2381,7 +2762,7 @@ def _structured_key_value_relations(value: Any) -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             continue
         key_text = _schema_text(_structured_str(item.get("key_text")), 120)
-        selector = _structured_str(item.get("container_selector"))[:160]
+        selector = _bounded_selector(_structured_str(item.get("container_selector")))
         match_count = item.get("container_match_count")
         position = item.get("container_position")
         child_index = item.get("value_child_index")
@@ -2406,19 +2787,34 @@ def _structured_key_value_relations(value: Any) -> list[dict[str, Any]]:
             continue
         if match_count <= position:
             continue
-        relations.append(
-            {
-                "key_text": key_text,
-                "value_text": value_text,
-                "container_selector": selector,
-                "container_match_count": match_count,
-                "container_position": position,
-                "value_child_index": child_index,
-                "direct_child_count": child_count,
-                "visible": item.get("visible") is True,
-                "value_visible": item.get("value_visible") is True,
-            }
-        )
+        relation = {
+            "key_text": key_text,
+            "value_text": value_text,
+            "container_selector": selector,
+            "container_match_count": match_count,
+            "container_position": position,
+            "value_child_index": child_index,
+            "direct_child_count": child_count,
+            "visible": item.get("visible") is True,
+            "value_visible": item.get("value_visible") is True,
+        }
+        label_child_index = item.get("label_child_index")
+        # -1 is meaningful: the page-side capture emits it for a tile whose heading sits outside the
+        # value's row, and dropping it reads downstream as "the label is child zero".
+        if isinstance(label_child_index, int) and not isinstance(label_child_index, bool) and label_child_index >= -1:
+            relation["label_child_index"] = label_child_index
+        label_selector = _bounded_selector(_structured_str(item.get("label_selector")))
+        if label_selector:
+            relation["label_selector"] = label_selector
+        page_count = item.get("key_text_walked_count")
+        if isinstance(page_count, int) and not isinstance(page_count, bool) and page_count > 0:
+            relation["key_text_walked_count"] = page_count
+        value_count = item.get("value_text_walked_count")
+        if isinstance(value_count, int) and not isinstance(value_count, bool) and value_count > 0:
+            relation["value_text_walked_count"] = value_count
+        if len(str(relation.get("value_text") or "")) >= _MAX_RELATION_VALUE_CHARS:
+            relation["value_truncated"] = True
+        relations.append(relation)
     return relations
 
 
@@ -2430,7 +2826,7 @@ def _structured_clickable_controls(value: Any) -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             continue
         text = _schema_text(_structured_str(item.get("text")), 120)
-        selector = _structured_str(item.get("selector"))[:160]
+        selector = _bounded_selector(_structured_str(item.get("selector")))
         entry: dict[str, Any] = {}
         if text:
             entry["text"] = text
@@ -2457,7 +2853,7 @@ def _structured_challenge_controls(value: Any) -> list[dict[str, Any]]:
             "name": _structured_str(node.get("name"))[:120],
             "class": _structured_classes(node.get("class")),
             "type": _structured_str(node.get("type"))[:40],
-            "selector": _structured_str(node.get("selector"))[:160],
+            "selector": _bounded_selector(_structured_str(node.get("selector"))),
             "text": _schema_text(_structured_str(node.get("text")), 200),
         }
         if node.get("checked") is True:
@@ -2484,7 +2880,7 @@ def _structured_modal_dismiss_controls(value: Any) -> list[dict[str, Any]]:
             "text": _schema_text(_structured_str(control.get("text")), 120),
             "aria_label": _schema_text(_structured_str(control.get("aria_label")), 120),
             "title": _schema_text(_structured_str(control.get("title")), 120),
-            "selector": _structured_str(control.get("selector"))[:160],
+            "selector": _bounded_selector(_structured_str(control.get("selector"))),
             "type": _structured_str(control.get("type"))[:40],
         }
         controls.append({k: v for k, v in entry.items() if v})
@@ -2503,7 +2899,7 @@ def _structured_modal_overlays(value: Any) -> list[dict[str, Any]]:
             "aria_modal": node.get("aria_modal") is True,
             "id": _structured_str(node.get("id"))[:120],
             "class": _structured_classes(node.get("class")),
-            "selector": _structured_str(node.get("selector"))[:160],
+            "selector": _bounded_selector(_structured_str(node.get("selector"))),
             "text": _schema_text(_structured_str(node.get("text")), 240),
             "dismiss_controls": _structured_modal_dismiss_controls(node.get("dismiss_controls")),
         }

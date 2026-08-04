@@ -74,7 +74,6 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
     apply_requested_output_producer_floor,
     build_turn_state,
     reconcile_completion_criteria,
-    requested_output_paths,
 )
 from skyvern.forge.sdk.copilot.completion_verification import only_structural_requested_output_abstentions
 from skyvern.forge.sdk.copilot.config import (
@@ -114,11 +113,15 @@ from skyvern.forge.sdk.copilot.credential_pause import credential_pause_reason, 
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
     artifact_health_blocked,
+    dump_derivation_inputs,
     log_scouted_spine_unresolved_at_turn_halt,
     outcome_fully_verified,
     recycle_admits_present_completion_contract_ask,
     requested_output_extraction_plan,
     requested_output_extraction_plan_changed,
+    requested_output_extraction_plan_diagnostic,
+    requested_output_paths_for_derivation,
+    synthesized_offer_reopened_for_extraction_plan,
     synthesized_persistence_reopened,
     synthesized_persistence_reopened_after_failed_run,
     synthesized_trajectory_is_goal_complete,
@@ -135,6 +138,7 @@ from skyvern.forge.sdk.copilot.output_contracts import (
     OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
     OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
 )
+from skyvern.forge.sdk.copilot.output_extraction_plan import unbound_candidate_relations
 from skyvern.forge.sdk.copilot.output_policy import (
     ACTUATION_OBLIGATION_STEER_REASON_CODE,
     ACTUATION_OBLIGATION_UNMET_REASON_CODE,
@@ -1173,6 +1177,29 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
     return "\n\n" + "\n".join(line for line in lines if line)
 
 
+def _unbound_output_read_offer(ctx: CopilotContext, extraction_plan: object) -> str:
+    """What the page offers for a requested output its own vocabulary never names.
+
+    The extraction binds a minted label to a page label, so a page calling the requested quantity
+    something else binds nothing however plainly it shows it. Naming what the page does offer lets
+    the read that follows be the join: reading one into the requested path lets the value witness
+    bind the relation still showing that value, on the quantity rather than on the wording.
+    """
+    if extraction_plan is not None:
+        return ""
+    paths = sorted(requested_output_paths_for_derivation(ctx))
+    candidates = unbound_candidate_relations(ctx.flow_evidence)
+    if not paths or not candidates:
+        return ""
+    offered = "\n".join(f"- {label} = {value}" for label, value in candidates)
+    return (
+        "\n\nThe page does not label any value with the wording this request uses, so the extraction "
+        f"cannot bind {', '.join(paths)} yet. The page is currently showing:\n{offered}\n"
+        "If one of these is the requested quantity, read it with read_value and claim the requested "
+        "output path, and the extraction will bind to the value you observed rather than to a word."
+    )
+
+
 def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
     """Pre-authoring offer of the synthesized code block.
 
@@ -1185,7 +1212,13 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
         LOG.debug("copilot_synthesized_block_offer_skipped", reason="policy_not_code_only_browser")
         return ""
     reopened_after_failed_run = synthesized_persistence_reopened_after_failed_run(ctx)
-    reopened = synthesized_persistence_reopened(ctx)
+    # Derived before the authored-once gate rather than after it: a page that only reveals the
+    # requested value later makes the read provable after the draft exists, and asking whether the
+    # offer should reopen only once it has already returned means the proven read is never offered.
+    extraction_plan = requested_output_extraction_plan(ctx)
+    reopened = synthesized_persistence_reopened(ctx) or synthesized_offer_reopened_for_extraction_plan(
+        ctx, extraction_plan
+    )
     if ctx.update_workflow_called and not reopened:
         LOG.debug("copilot_synthesized_block_offer_skipped", reason="already_authored")
         return ""
@@ -1195,15 +1228,29 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
     trajectory_len = len(ctx.scout_trajectory)
     previous_offer_len = ctx.synthesized_block_offered_trajectory_len
     trajectory_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
-    extraction_plan = requested_output_extraction_plan(ctx)
-    request_policy = getattr(ctx, "request_policy", None)
-    if (
-        request_policy is not None
-        and requested_output_paths(request_policy.completion_criteria)
-        and extraction_plan is None
-    ):
-        LOG.debug("copilot_synthesized_block_offer_skipped", reason="extraction_plan_unavailable")
-        return ""
+    if requested_output_paths_for_derivation(ctx):
+        if extraction_plan is None:
+            # Withholding the offer leaves the turn with no block to run, so a plan that cannot bind
+            # falls back to the spine the scout demonstrated rather than replacing it with nothing.
+            LOG.info(
+                "copilot_synthesized_block_offer_degraded_to_spine",
+                reason="extraction_plan_unavailable",
+                **requested_output_extraction_plan_diagnostic(ctx),
+            )
+            dump_derivation_inputs(ctx, outcome="degraded")
+        else:
+            LOG.info(
+                "copilot_synthesized_block_offer_extraction_plan_derived",
+                requested_output_paths=list(extraction_plan.requested_output_paths),
+                bound_output_paths=[binding.output_path for binding in extraction_plan.live_reads],
+                relation_labels=[binding.relation_label for binding in extraction_plan.live_reads],
+            )
+            dump_derivation_inputs(ctx, outcome="derived")
+    else:
+        # A turn that never forms a requested output still authors and runs code, and its trajectory
+        # is what a login or navigation defect has to be replayed from. Dumping only where a plan was
+        # attempted left exactly those turns unreproducible offline.
+        dump_derivation_inputs(ctx, outcome="no_requested_output")
     plan_changed = requested_output_extraction_plan_changed(ctx, extraction_plan)
     reopened = reopened or plan_changed
     if (
@@ -1213,7 +1260,7 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
         and not reopened
         and not plan_changed
     ):
-        LOG.debug(
+        LOG.info(
             "copilot_synthesized_block_offer_skipped",
             reason="already_offered",
             previous_trajectory_len=previous_offer_len,
@@ -1274,7 +1321,8 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
         code_len=len(synthesized.code),
     )
     goal = ctx.block_goal_main_goal or ctx.user_message or ""
-    return "\n\n" + render_synthesized_offer_text(synthesized, ctx.scout_trajectory, goal=goal)
+    offer = "\n\n" + render_synthesized_offer_text(synthesized, ctx.scout_trajectory, goal=goal)
+    return offer + _unbound_output_read_offer(ctx, extraction_plan)
 
 
 def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -> Callable[[object, object], str]:
@@ -4820,7 +4868,12 @@ async def run_copilot_agent(
                     ctx_sink[0] if ctx_sink else None, error_result, preserve_result=True
                 )
             finally:
-                finalize_outcome_verification_trace(ctx_sink[0] if ctx_sink else None, turn_span)
+                turn_end_ctx = ctx_sink[0] if ctx_sink else None
+                finalize_outcome_verification_trace(turn_end_ctx, turn_span)
+                if turn_end_ctx is not None:
+                    # The other dump sites hang off prompt construction, so a turn that ended on the
+                    # clock or on an error composed no further prompt and recorded nothing at all.
+                    dump_derivation_inputs(turn_end_ctx, outcome="turn_end")
     except Exception as exc:
         LOG.error(
             "Copilot turn unhandled error",

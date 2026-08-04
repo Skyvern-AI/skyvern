@@ -447,6 +447,9 @@ class CompletionCriterion:
     # YAML; "run": an end state only a run can evidence. Invalid input coerces to "run".
     level: CriterionLevel = "run"
     output_path: str | None = None
+    # Short page-facing noun for ``output_path`` (e.g. "visitors"), carried typed so the
+    # extraction binder never has to re-tokenize it back out of ``outcome`` prose.
+    requested_output_label: str | None = None
     expected_output_value: ExpectedOutputValue | None = None
     expected_output_shape: ExpectedOutputShape | None = None
     requested_output_evidence_source: RequestedOutputEvidenceSource = "runtime_output"
@@ -3364,6 +3367,7 @@ def _apply_requested_output_completion_criteria(
                 outcome=f"The returned record includes {field_label}.",
                 level="run",
                 output_path=output_path,
+                requested_output_label=field_label,
                 expected_output_value=expected_value,
                 expected_output_shape=expected_shape,
                 requested_output_evidence_source=source_by_output_path.get(output_path, "runtime_output"),
@@ -3389,6 +3393,72 @@ def _apply_requested_output_completion_criteria(
         criteria,
         requested_output_paths,
     )
+
+
+def _detected_output_candidates(user_message: str, aliases: dict[str, str] | None = None) -> tuple[str, ...]:
+    """Requested-output fields the deterministic scan finds, for the slot producer's bind-or-refute
+    obligation. Verbatim message substrings only — the detector composes phrases across spans, and
+    an obligation the producer cannot quote could only ever be refuted."""
+    message_fold = user_message.casefold()
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for field_name in _requested_output_fields(user_message, _normalize_requested_output_aliases(aliases)):
+        cleaned = field_name.strip()
+        fold = cleaned.casefold()
+        if not cleaned or len(cleaned) > 64 or fold in seen or fold not in message_fold:
+            continue
+        seen.add(fold)
+        candidates.append(cleaned)
+        if len(candidates) == 8:
+            break
+    return tuple(candidates)
+
+
+def _apply_requested_output_labels(
+    policy: RequestPolicy, user_message: str, aliases: dict[str, str] | None = None
+) -> None:
+    """Stamp the short requested-output noun onto classifier-authored criteria by ``output_path``,
+    which the canonical mint already carries but classifier-authored criteria only name in prose."""
+
+    schema_aliases = _normalize_requested_output_aliases(
+        schema_output_path_aliases_from_criteria(policy.completion_criteria)
+    )
+    config_aliases = _normalize_requested_output_aliases(aliases)
+    label_by_output_path: dict[str, str] = {}
+    label_by_field_name: dict[str, str] = {}
+    for field_name in _requested_output_fields(user_message, {**config_aliases, **schema_aliases}):
+        output_path = _requested_output_path_for_detected_field(field_name, schema_aliases, config_aliases)
+        label = _requested_output_field_label(field_name, output_path)
+        label_by_output_path.setdefault(output_path, label)
+        label_by_field_name.setdefault(field_name, label)
+    if not label_by_output_path:
+        return
+    policy.completion_criteria = [
+        replace(criterion, requested_output_label=label_by_output_path[criterion.output_path])
+        if criterion.requested_output_label is None
+        and criterion.output_path is not None
+        and criterion.output_path in label_by_output_path
+        else criterion
+        for criterion in policy.completion_criteria
+    ]
+    # The path join misses whenever the classifier names the field differently than the detector
+    # derives it ("visitor_count" vs "visitors"); the criterion's own outcome text still names the
+    # field, so a uniquely covering criterion takes the label rather than falling back to prose.
+    for field_name, label in label_by_field_name.items():
+        covering = [
+            index
+            for index, criterion in enumerate(policy.completion_criteria)
+            if criterion.requested_output_label is None
+            and criterion.output_path is not None
+            and _criterion_text_covers_requested_output(criterion, field_name)
+        ]
+        if len(covering) != 1:
+            continue
+        index = covering[0]
+        policy.completion_criteria = [
+            replace(criterion, requested_output_label=label) if position == index else criterion
+            for position, criterion in enumerate(policy.completion_criteria)
+        ]
 
 
 def _validation_classification_target_for_legacy_criterion(
@@ -3678,6 +3748,7 @@ def _classifier_fallback_policy(
     _apply_requested_output_completion_criteria(
         policy, user_message, requested_output_path_aliases, extract_literals=True
     )
+    _apply_requested_output_labels(policy, user_message, requested_output_path_aliases)
     _apply_classifier_typed_requested_output_corroborators(policy)
     _mark_turn_unsatisfiable_fallback_criteria(policy)
     _degrade_pathless_contingent_criteria(policy)
@@ -4024,6 +4095,7 @@ async def _classify_request(
             () if transcript.retained_history == _EMPTY_SLOT_SENTINEL else (transcript.retained_history,)
         ),
         global_context=safe_global_llm_context[:32_768],
+        detected_output_candidates=_detected_output_candidates(safe_user_message, requested_output_path_aliases),
     )
     prompt = prompt_engine.load_prompt(
         template=PROMPT_NAME,
@@ -4213,6 +4285,14 @@ async def _classify_request(
         if request_slot_result.status == "success":
             request_slot_contract = request_slot_result.contract
             request_slot_contract_request = request_slot_request
+            if request_slot_contract is not None and request_slot_contract.candidate_refutations:
+                LOG.info(
+                    "request-policy producer refuted detected output candidates",
+                    refutations=[
+                        {"candidate": refutation.candidate, "reason": refutation.reason}
+                        for refutation in request_slot_contract.candidate_refutations
+                    ],
+                )
         else:
             request_slot_failure_kind = (
                 request_slot_result.failure_kind.value if request_slot_result.failure_kind is not None else "unknown"
@@ -4339,6 +4419,7 @@ async def _classify_request(
         policy.requires_user_clarification = False
         policy.raw_secret_evidence = None
     _degrade_pathless_contingent_criteria(policy)
+    _apply_requested_output_labels(policy, user_message, requested_output_path_aliases)
     await _reconcile_missing_terminal_action(
         policy,
         user_message=safe_user_message,
