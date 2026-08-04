@@ -1,5 +1,4 @@
 import { getClient } from "@/api/AxiosClient";
-import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
@@ -7,14 +6,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -26,7 +18,7 @@ import {
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { cn } from "@/util/utils";
-import { DotsHorizontalIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { DotsHorizontalIcon } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
@@ -90,59 +82,36 @@ function SavedTaskCard({ workflowId, title, url, description }: Props) {
           <span className="overflow-hidden text-ellipsis whitespace-nowrap">
             {title}
           </span>
-          <Dialog
+          <DropdownMenu modal={false}>
+            <DropdownMenuTrigger asChild>
+              <DotsHorizontalIcon className="cursor-pointer" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent className="w-56">
+              <DropdownMenuLabel>Template Actions</DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onSelect={() => {
+                  setOpen(true);
+                }}
+              >
+                Delete Template
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <ConfirmDialog
             open={open}
-            onOpenChange={() => {
-              setOpen(false);
+            onOpenChange={(next) => {
+              if (!next) {
+                setOpen(false);
+              }
             }}
-          >
-            <DropdownMenu modal={false}>
-              <DropdownMenuTrigger asChild>
-                <DotsHorizontalIcon className="cursor-pointer" />
-              </DropdownMenuTrigger>
-              <DropdownMenuContent className="w-56">
-                <DropdownMenuLabel>Template Actions</DropdownMenuLabel>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  onSelect={() => {
-                    setOpen(true);
-                  }}
-                >
-                  Delete Template
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Are you absolutely sure?</DialogTitle>
-                <DialogDescription>
-                  Are you sure you want to delete this task template?
-                </DialogDescription>
-              </DialogHeader>
-              <DialogFooter>
-                <Button
-                  variant="secondary"
-                  onClick={() => {
-                    setOpen(false);
-                  }}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  variant="destructive"
-                  onClick={() => {
-                    deleteTaskMutation.mutate(workflowId);
-                  }}
-                  disabled={deleteTaskMutation.isPending}
-                >
-                  {deleteTaskMutation.isPending && (
-                    <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-                  )}
-                  Delete
-                </Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
+            title="Delete this task template?"
+            description="This deletes the task template."
+            isPending={deleteTaskMutation.isPending}
+            onConfirm={() => {
+              deleteTaskMutation.mutate(workflowId);
+            }}
+          />
         </CardTitle>
         <CardDescription className="overflow-hidden text-ellipsis whitespace-nowrap text-slate-400">
           {url}

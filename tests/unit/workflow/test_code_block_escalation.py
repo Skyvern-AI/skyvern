@@ -463,6 +463,33 @@ async def test_matched_step_narrows_the_goal(monkeypatch: pytest.MonkeyPatch) ->
     assert DEFAULT_PROMPT in goal
 
 
+@pytest.mark.parametrize("prompt", [None, ""], ids=["absent_goal", "empty_goal"])
+def test_steps_alone_never_manufacture_a_heal_goal(prompt: str | None) -> None:
+    # The harness heal path composes its goal without the floor path's `if not self.prompt`
+    # gate, so a goal-less block carrying a code-derived step outline (what the MCP seam and
+    # the recording converter both emit) would otherwise send the recovery agent at a live
+    # page with a bare "click the export button" and no context.
+    block = _make_code_block(
+        prompt=prompt,
+        steps=[CodeBlockStep(description="click the export button", line_start=1, line_end=1)],
+    )
+    context = _make_context()
+
+    assert block._compose_heal_goal(workflow_run_context=context, failing_line=1) == ""
+
+
+def test_an_authored_goal_is_still_narrowed_by_its_matched_step() -> None:
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="click the export button", line_start=1, line_end=1)],
+    )
+    context = _make_context()
+
+    goal = block._compose_heal_goal(workflow_run_context=context, failing_line=1)
+
+    assert "click the export button" in goal
+    assert DEFAULT_PROMPT in goal
+
+
 @pytest.mark.asyncio
 async def test_failing_static_goto_sets_escalation_url(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)

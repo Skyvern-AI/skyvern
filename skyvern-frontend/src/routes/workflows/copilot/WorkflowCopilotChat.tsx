@@ -1058,6 +1058,17 @@ export function WorkflowCopilotChat({
   }, [copilotUxV1Enabled, livePauseFrame, credentialsList, credentialGetter]);
   const liveMatchingCredentials = useMemo<MatchingCredential[]>(() => {
     if (!livePauseFrame) return [];
+    const toMatch = (
+      credential: CredentialApiResponse,
+    ): MatchingCredential => ({
+      credentialId: credential.credential_id,
+      name: credential.name,
+    });
+    // credential_refs may carry names as well as ids; intersecting on id drops the rest.
+    const asked = (credentialsList ?? []).filter((credential) =>
+      livePauseFrame.credential_refs.includes(credential.credential_id),
+    );
+    if (asked.length > 0) return asked.map(toMatch);
     const hosts = livePauseFrame.login_page_urls
       .map(getHostname)
       .filter((host): host is string => host !== null);
@@ -1069,10 +1080,7 @@ export function WorkflowCopilotChat({
           : null;
         return host !== null && hosts.includes(host);
       })
-      .map((credential) => ({
-        credentialId: credential.credential_id,
-        name: credential.name,
-      }));
+      .map(toMatch);
   }, [livePauseFrame, credentialsList]);
   const respondToCredentialPause = useCallback(
     async (

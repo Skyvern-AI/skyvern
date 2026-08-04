@@ -110,7 +110,7 @@ from skyvern.forge.sdk.copilot.credential_literal_rebind import (
     rebind_scouted_credential_literals,
     scouted_credential_targets,
 )
-from skyvern.forge.sdk.copilot.credential_pause import preflight_credential_pause
+from skyvern.forge.sdk.copilot.credential_pause import credential_pause_reason, preflight_credential_pause
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
     artifact_health_blocked,
@@ -1760,6 +1760,14 @@ def _rewrite_failed_test_response(
             block_word = "block" if positive_block_count == 1 else "blocks"
             draft_phrase = f"a draft workflow with {positive_block_count} {block_word}"
 
+        # No run row means nothing executed, so claiming the draft was tested is false.
+        if ctx.last_failure_category_top == "UNRECOVERABLE_TOOL_ERROR" and ctx.last_run_blocks_workflow_run_id is None:
+            return (
+                f"I created {draft_phrase}, but I couldn't start a test run: "
+                f"{_normalize_failure_reason(ctx.last_test_failure_reason)}. "
+                f"Nothing was executed, so the draft is unverified.{keep_draft_affordance}"
+            )
+
         failure_summary = _normalize_failure_reason(ctx.last_test_failure_reason)
         follow_up = _FAILURE_FOLLOW_UP.get(ctx.last_failure_category_top or "", "")
         return (
@@ -3041,7 +3049,14 @@ def _recorded_failure_reply(
     test_failed = ctx.last_test_ok is False or run_status == "failed"
     unrecoverable_stop = next_action == "stop" or failure_type == "unrecoverable_tool_error"
 
+    # test_after_update_done is stamped for the run tools regardless of ok, so
+    # test_attempted alone cannot distinguish "ran and failed" from "never started".
+    # Only the run id proves a row existed: pre-run refusals can carry a synthetic
+    # overall_status="failed" even though execution never started.
+    run_created = bool(getattr(diagnosis_input, "workflow_run_id", None))
     if getattr(ctx, "last_workflow", None) is not None:
+        if unrecoverable_stop and not run_created:
+            return f"I built {block_phrase}, but I couldn't start a test run: {reason}.{status_sentence}"
         if test_attempted and test_failed and not unrecoverable_stop:
             return f"I built {block_phrase} and tested it, but the test failed: {reason}.{status_sentence}"
         if test_attempted:
@@ -5004,7 +5019,7 @@ async def _run_copilot_turn_impl(
         )
     if request_policy is not None and request_policy_guardrail_result.output.tripwire_triggered:
         preflight_resolution = None
-        if request_policy.clarification_reason == "login_credentials_unresolved":
+        if credential_pause_reason(ctx) is not None:
             preflight_resolution = await preflight_credential_pause(ctx, stream, copilot_config)
             if preflight_resolution is not None:
                 await _resume_turn_intent_after_preflight_credential(ctx, request_policy, policy_inputs)

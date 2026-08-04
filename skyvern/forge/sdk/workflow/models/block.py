@@ -4520,6 +4520,12 @@ async def wrapper({default_args}):
 
     def _compose_heal_goal(self, *, workflow_run_context: WorkflowRunContext, failing_line: int | None) -> str:
         safe_main = workflow_run_context.mask_secrets_in_data(self.prompt or "")
+        # Steps are a code-derived outline, not an authored goal, so they may only narrow one.
+        # The harness path reaches here without the floor path's `if not self.prompt` gate, and
+        # a goal-less block would otherwise aim the recovery agent at a live page with a bare
+        # step description and no context.
+        if not self.prompt:
+            return safe_main
         matched_step = self._match_step_for_failing_line(failing_line) if failing_line is not None else None
         if matched_step is None or not matched_step.description:
             return safe_main

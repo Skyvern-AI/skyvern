@@ -45,6 +45,8 @@ function useCreateBrowserSessionMutation() {
           browser_type: browserType,
           generate_browser_profile: generateBrowserProfile,
           browser_profile_id: browserProfileId,
+          // Every caller of this hook starts a session the user is about to watch in the app.
+          needs_live_view: true,
         },
       );
     },

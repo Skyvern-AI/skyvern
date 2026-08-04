@@ -137,6 +137,69 @@ async def test_browser_session_response_supports_vnc_when_browser_address_is_set
 
 
 @pytest.mark.asyncio
+async def test_browser_session_response_reports_no_vnc_when_the_infrastructure_cannot_serve_it() -> None:
+    """An address the client can dial does not imply a live view stream behind it. Reporting
+    supported anyway is what makes the UI offer a stream that then fails on click."""
+    now = datetime.now(timezone.utc)
+    session = PersistentBrowserSession(
+        persistent_browser_session_id="pbs_123",
+        organization_id="org_123",
+        status="running",
+        browser_address="wss://session-router.example/pbs_123",
+        ip_address=None,
+        created_at=now,
+        modified_at=now,
+    )
+
+    with (
+        patch.object(
+            app.AGENT_FUNCTION,
+            "resolve_browser_session_connect_url",
+            AsyncMock(return_value=session.browser_address),
+        ),
+        patch.object(app.AGENT_FUNCTION, "supports_live_view", AsyncMock(return_value=False)),
+    ):
+        response = await BrowserSessionResponse.from_browser_session(session)
+
+    assert response.vnc_streaming_supported is False
+
+
+@pytest.mark.asyncio
+async def test_browser_session_response_tells_the_capability_which_address_the_session_holds() -> None:
+    """The capability short-circuits on a pod address, so a caller that never forwards one turns
+    that short-circuit into dead code and puts every response behind the lookup."""
+    now = datetime.now(timezone.utc)
+    session = PersistentBrowserSession(
+        persistent_browser_session_id="pbs_123",
+        organization_id="org_123",
+        status="running",
+        browser_address="wss://session-router.example/pbs_123",
+        ip_address="10.0.0.7",
+        created_at=now,
+        modified_at=now,
+    )
+    capability = AsyncMock(return_value=True)
+
+    with (
+        patch.object(
+            app.AGENT_FUNCTION,
+            "resolve_browser_session_connect_url",
+            AsyncMock(return_value=session.browser_address),
+        ),
+        patch.object(app.AGENT_FUNCTION, "supports_live_view", capability),
+    ):
+        await BrowserSessionResponse.from_browser_session(session)
+
+    capability.assert_awaited_once_with("pbs_123", ip_address="10.0.0.7")
+
+
+@pytest.mark.asyncio
+async def test_base_agent_function_serves_live_view_for_every_session() -> None:
+    """A self-hosted deployment runs every browser itself, so the capability is unconditional."""
+    assert await AgentFunction().supports_live_view("pbs_123", ip_address=None) is True
+
+
+@pytest.mark.asyncio
 async def test_browser_session_response_never_exposes_upstream_routing_fields() -> None:
     now = datetime.now(timezone.utc)
     session = PersistentBrowserSession(

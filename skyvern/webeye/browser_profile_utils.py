@@ -3,6 +3,9 @@ import os
 import stat
 import tempfile
 
+from skyvern.webeye.profile_cookie_merge import BANKED_COOKIES_FILENAME
+from skyvern.webeye.session_cookies import SESSION_COOKIES_FILENAME
+
 DEFAULT_PROFILE_COPY_IGNORE = {
     "Snapshots",
     "GrShaderCache",
@@ -22,6 +25,12 @@ DEFAULT_PROFILE_COPY_IGNORE = {
     "SingletonSocket",
     "DevToolsActivePort",
 }
+
+# A base template is cloned into every fresh browser dir AND every new empty (API-created) profile, so it
+# must never carry Skyvern's login-cookie sidecars — a contaminated template would restore another run's
+# (cross-org) session cookies into a "fresh" browser, or bake them permanently into a stored profile.
+# Reuse paths that return a profile dir directly never go through a copy, so they keep their cookies.
+FRESH_PROFILE_COPY_IGNORE = DEFAULT_PROFILE_COPY_IGNORE | {SESSION_COOKIES_FILENAME, BANKED_COOKIES_FILENAME}
 
 
 def operator_profile_generation(path: str) -> str | None:

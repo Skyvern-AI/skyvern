@@ -26,7 +26,7 @@ from skyvern.webeye.actions import handler
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, InputOrSelectContext, InputTextAction
 from skyvern.webeye.actions.handler import handle_input_text_action
-from skyvern.webeye.actions.responses import ActionFailure, ActionSuccess
+from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from tests.unit.conftest import make_input_element_mock
 from tests.unit.helpers import make_organization, make_step, make_task
 
@@ -153,6 +153,10 @@ def _pressed_keys(el: MagicMock) -> list[str]:
     return [call.args[0] for call in el.press_key.call_args_list if call.args]
 
 
+def _typed_values(el: MagicMock) -> list[str]:
+    return [call.args[0] if call.args else call.kwargs["text"] for call in el.input_sequentially.call_args_list]
+
+
 async def _run_combobox_input(
     *,
     attrs: dict[str, object],
@@ -167,6 +171,9 @@ async def _run_combobox_input(
     prefilter_raises: bool = False,
     use_base_action: bool = False,
     first_block_incremental: list[dict] | None = None,
+    terminal_failure: bool = False,
+    nonterminal_skip: bool = False,
+    nonterminal_failure_skip: bool = False,
 ) -> tuple[list, MagicMock, MagicMock]:
     skyvern_el = make_input_element_mock(element_id="CBX", attrs=attrs)
     if prefilter_raises:
@@ -211,7 +218,18 @@ async def _run_combobox_input(
     )
 
     select_result = MagicMock()
-    select_result.action_result = ActionSuccess() if select_success else ActionFailure(Exception("not committed"))
+    if terminal_failure:
+        select_result.action_result, _ = handler._terminal_custom_select_failure(
+            target_value=_TARGET,
+            matched_label=_TARGET,
+        )
+    elif nonterminal_failure_skip:
+        select_result.action_result = ActionFailure(Exception("not committed"))
+        select_result.action_result.skip_remaining_actions = True
+    elif nonterminal_skip:
+        select_result.action_result = ActionResult(success=False, skip_remaining_actions=True)
+    else:
+        select_result.action_result = ActionSuccess() if select_success else ActionFailure(Exception("not committed"))
 
     # A secret makes the resolved text differ from action.text, so is_secret_value becomes True.
     action_text = "{{secret_param}}" if is_secret else _TARGET
@@ -380,6 +398,171 @@ def test_prefilter_typeahead_flag_excluded_from_serialization() -> None:
 
 
 _FLAG_TYPEAHEAD_ATTRS = {"role": None, "aria-autocomplete": None, "aria-invalid": "false"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attrs", "is_search_bar", "first_block_incremental", "expected_typed_values"),
+    [
+        pytest.param(
+            _FLAG_TYPEAHEAD_ATTRS,
+            False,
+            _listbox_with_option(_TARGET),
+            [],
+            id="autocomplete-detect",
+        ),
+        pytest.param(
+            {"role": "textbox", "aria-autocomplete": None, "aria-invalid": "false"},
+            True,
+            _listbox_with_option(_TARGET),
+            [_TARGET],
+            id="search-bar",
+        ),
+        pytest.param(_INVALID_BOTH, False, None, [_TARGET], id="invalid-combobox"),
+    ],
+)
+async def test_terminal_custom_select_failure_stops_each_input_text_caller(
+    attrs: dict[str, object],
+    is_search_bar: bool,
+    first_block_incremental: list[dict] | None,
+    expected_typed_values: list[str],
+) -> None:
+    results, el, select_mock = await _run_combobox_input(
+        attrs=attrs,
+        options=_listbox_with_option(_TARGET),
+        select_success=False,
+        stop_flag=True,
+        is_search_bar=is_search_bar,
+        first_block_incremental=first_block_incremental,
+        terminal_failure=True,
+    )
+
+    failure = select_mock.return_value.action_result
+    assert results[0] is failure
+    assert isinstance(failure, ActionFailure)
+    assert not isinstance(failure, ActionSuccess)
+    assert failure.skip_remaining_actions is True
+    assert _typed_values(el) == expected_typed_values
+    assert "Tab" not in _pressed_keys(el)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attrs", "is_search_bar", "first_block_incremental"),
+    [
+        pytest.param(_FLAG_TYPEAHEAD_ATTRS, False, _listbox_with_option(_TARGET), id="autocomplete-detect"),
+        pytest.param(
+            {"role": "textbox", "aria-autocomplete": None, "aria-invalid": "false"},
+            True,
+            _listbox_with_option(_TARGET),
+            id="search-bar",
+        ),
+        pytest.param(_INVALID_BOTH, False, None, id="invalid-combobox"),
+    ],
+)
+async def test_nonterminal_skip_carrier_falls_through_each_input_text_caller(
+    attrs: dict[str, object],
+    is_search_bar: bool,
+    first_block_incremental: list[dict] | None,
+) -> None:
+    results, el, select_mock = await _run_combobox_input(
+        attrs=attrs,
+        options=_listbox_with_option(_TARGET),
+        select_success=False,
+        stop_flag=False,
+        is_search_bar=is_search_bar,
+        first_block_incremental=first_block_incremental,
+        nonterminal_skip=True,
+    )
+
+    select_mock.assert_awaited_once()
+    assert len(results) == 1
+    assert isinstance(results[0], ActionSuccess)
+    assert results[0] is not select_mock.return_value.action_result
+    assert _typed_values(el) == [_TARGET]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attrs", "is_search_bar", "first_block_incremental"),
+    [
+        pytest.param(_FLAG_TYPEAHEAD_ATTRS, False, _listbox_with_option(_TARGET), id="autocomplete-detect"),
+        pytest.param(
+            {"role": "textbox", "aria-autocomplete": None, "aria-invalid": "false"},
+            True,
+            _listbox_with_option(_TARGET),
+            id="search-bar",
+        ),
+        pytest.param(_INVALID_BOTH, False, None, id="invalid-combobox"),
+    ],
+)
+async def test_date_related_failure_with_skip_falls_through_each_input_text_caller(
+    attrs: dict[str, object],
+    is_search_bar: bool,
+    first_block_incremental: list[dict] | None,
+) -> None:
+    """A datepicker ActionFailure+skip lacks the custom-select terminal marker and falls through."""
+    results, el, select_mock = await _run_combobox_input(
+        attrs=attrs,
+        options=_listbox_with_option(_TARGET),
+        select_success=False,
+        stop_flag=False,
+        is_search_bar=is_search_bar,
+        first_block_incremental=first_block_incremental,
+        nonterminal_failure_skip=True,
+        is_date_related=True,
+    )
+
+    select_mock.assert_awaited_once()
+    assert len(results) == 1
+    assert isinstance(results[0], ActionSuccess)
+    assert results[0] is not select_mock.return_value.action_result
+    assert _typed_values(el) == [_TARGET]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attrs", "is_search_bar", "first_block_incremental", "stop_flag", "expected_stop"),
+    [
+        pytest.param(
+            _FLAG_TYPEAHEAD_ATTRS,
+            False,
+            _listbox_with_option(_TARGET),
+            False,
+            False,
+            id="autocomplete-detect",
+        ),
+        pytest.param(
+            {"role": "textbox", "aria-autocomplete": None, "aria-invalid": "false"},
+            True,
+            _listbox_with_option(_TARGET),
+            True,
+            True,
+            id="search-bar",
+        ),
+        pytest.param(_INVALID_BOTH, False, None, True, True, id="invalid-combobox"),
+    ],
+)
+async def test_successful_custom_select_preserves_each_input_text_caller(
+    attrs: dict[str, object],
+    is_search_bar: bool,
+    first_block_incremental: list[dict] | None,
+    stop_flag: bool,
+    expected_stop: bool,
+) -> None:
+    results, _el, select_mock = await _run_combobox_input(
+        attrs=attrs,
+        options=_listbox_with_option(_TARGET),
+        select_success=True,
+        stop_flag=stop_flag,
+        is_search_bar=is_search_bar,
+        first_block_incremental=first_block_incremental,
+    )
+
+    success = select_mock.return_value.action_result
+    assert results[0] is success
+    assert isinstance(success, ActionSuccess)
+    assert bool(success.skip_remaining_actions) is expected_stop
 
 
 @pytest.mark.asyncio

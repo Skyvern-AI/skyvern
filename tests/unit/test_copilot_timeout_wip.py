@@ -61,9 +61,18 @@ def _ctx(
     return ctx
 
 
-def _blocker_contract(reason: str, *, run_status: str | None = "running") -> DiagnosisRepairContract:
+def _blocker_contract(
+    reason: str,
+    *,
+    run_status: str | None = "running",
+    workflow_run_id: str | None = None,
+) -> DiagnosisRepairContract:
     return DiagnosisRepairContract(
-        diagnosis_input=DiagnosisInput(source_tool="get_browser_screenshot", run_status=run_status),
+        diagnosis_input=DiagnosisInput(
+            source_tool="get_browser_screenshot",
+            workflow_run_id=workflow_run_id,
+            run_status=run_status,
+        ),
         diagnosis_result=DiagnosisResult(root_cause_summary=reason, confidence=0.9),
         repair_decision=RepairDecision(next_action="stop"),
         verification_result=VerificationResult(
@@ -438,7 +447,10 @@ class TestBuildUnexpectedErrorExitResult:
         wf = MagicMock(name="wf")
         ctx = _ctx(last_workflow=wf, last_workflow_yaml="version: '1.0'", last_test_ok=False)
         ctx.last_update_block_count = 3
-        ctx.latest_diagnosis_repair_contract = _blocker_contract("Browser session was no longer reachable.")
+        ctx.latest_diagnosis_repair_contract = _blocker_contract(
+            "Browser session was no longer reachable.",
+            workflow_run_id="wr_test",
+        )
 
         result = _build_unexpected_error_exit_result(ctx, global_llm_context=None)
 
@@ -474,6 +486,7 @@ class TestBuildUnexpectedErrorExitResult:
         ctx.latest_diagnosis_repair_contract = _blocker_contract(
             "The browser session disappeared before screenshot verification could complete.",
             run_status="aborted",
+            workflow_run_id="wr_test",
         )
 
         result = _build_unexpected_error_exit_result(ctx, global_llm_context=None)
@@ -500,11 +513,31 @@ class TestBuildUnexpectedErrorExitResult:
         assert result.updated_workflow is wf
         assert result.proposal_disposition == "review_untested"
         assert result.user_response == (
-            "I built a 2-block draft, but I couldn't verify it: "
+            "I built a 2-block draft, but I couldn't start a test run: "
             "Browser session not found while reading https://example.test. Last run status: aborted."
         )
         assert "pbs_" not in result.user_response
         assert "token=secret" not in result.user_response
+
+    def test_sandbox_refusal_does_not_claim_a_test_ran(self) -> None:
+        """No run row means nothing executed, so the reply must not say it tested the draft."""
+        from skyvern.forge.sdk.copilot.diagnosis_repair_contract import build_diagnosis_repair_contract
+        from skyvern.forge.sdk.copilot.tools.run_execution import _copilot_sandbox_unavailable_result
+
+        wf = MagicMock(name="wf")
+        ctx = _ctx(last_workflow=wf, last_workflow_yaml="version: '1.0'", last_test_ok=False)
+        ctx.test_after_update_done = True
+        ctx.last_update_block_count = 6
+        ctx.latest_diagnosis_repair_contract = build_diagnosis_repair_contract(
+            source_tool="run_blocks_and_collect_debug",
+            result=_copilot_sandbox_unavailable_result(),
+            ctx=ctx,
+        )
+
+        result = _build_unexpected_error_exit_result(ctx, global_llm_context=None)
+
+        assert "tested it" not in result.user_response
+        assert "I couldn't start a test run" in result.user_response
 
     def test_suspicious_success_drops_proposal(self) -> None:
         wf = MagicMock(name="wf")
