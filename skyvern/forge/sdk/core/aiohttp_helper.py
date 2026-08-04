@@ -11,7 +11,12 @@ import structlog
 from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.resolver import DefaultResolver
 
-from skyvern.exceptions import HttpException, InvalidUrl
+from skyvern.exceptions import BlockedHost, HttpException, InvalidUrl
+from skyvern.forge.sdk.core.ssrf import (
+    create_public_network_trace_config,
+    validate_public_http_url,
+    validate_public_ip_address,
+)
 from skyvern.utils.url_validators import (
     MAX_SAFE_REDIRECTS,
     SAFE_REDIRECT_STATUS_CODES,
@@ -46,10 +51,11 @@ def strip_cross_origin_redirect_credentials(
 
 
 class SSRFGuardedResolver(AbstractResolver):
-    def __init__(self) -> None:
+    def __init__(self, *, require_public_network: bool = False) -> None:
         self._pinned_host_ips: dict[str, tuple[str, ...]] = {}
         self._trusted_proxy_hosts: set[str] = set()
         self._default_resolver = DefaultResolver()
+        self._require_public_network = require_public_network
 
     @staticmethod
     def _host_key(host: str) -> str:
@@ -58,16 +64,23 @@ class SSRFGuardedResolver(AbstractResolver):
     def pin_host_ips(self, host: str, ips: tuple[str, ...]) -> None:
         if not ips:
             raise OSError(f"No safe addresses resolved for host: {host}")
+        if self._require_public_network:
+            for ip in ips:
+                validate_public_ip_address(ip, host)
         self._pinned_host_ips[self._host_key(host)] = ips
 
     def pin_url_ips(self, url: str, ips: tuple[str, ...]) -> None:
         host = urlparse(url).hostname
         if not host:
             raise InvalidUrl(url=url)
+        if self._require_public_network:
+            validate_public_http_url(url)
         self.pin_host_ips(host, ips)
 
     def trust_proxy_url(self, proxy: str) -> None:
         host = urlparse(proxy).hostname
+        if self._require_public_network:
+            raise BlockedHost(host=f"proxy {host or proxy} (proxies are unsupported with public-network validation)")
         if host:
             self._trusted_proxy_hosts.add(self._host_key(host))
 
@@ -82,6 +95,8 @@ class SSRFGuardedResolver(AbstractResolver):
         ips = self._pinned_host_ips.get(host_key)
         resolved_ips = await asyncio.to_thread(resolve_fetch_host_ips, host) if ips is None else ips
         for ip in resolved_ips:
+            if self._require_public_network:
+                validate_public_ip_address(ip, host)
             ip_family = (
                 socket.AF_INET6 if isinstance(ipaddress.ip_address(ip), ipaddress.IPv6Address) else socket.AF_INET
             )
@@ -133,6 +148,7 @@ async def aiohttp_request(
     timeout: int = DEFAULT_REQUEST_TIMEOUT,
     follow_redirects: bool = True,
     proxy: str | None = None,
+    validate_public_network: bool = False,
 ) -> tuple[int, dict[str, str], Any]:
     """
     Generic HTTP request function that supports all HTTP methods.
@@ -148,12 +164,13 @@ async def aiohttp_request(
         timeout: Request timeout in seconds
         follow_redirects: Whether to follow redirects
         proxy: Proxy URL
+        validate_public_network: Whether to reject non-public request and redirect targets. Proxies are unsupported.
 
     Returns:
         Tuple of (status_code, response_headers, response_body)
         where response_body can be dict (for JSON) or str (for text)
     """
-    resolver = SSRFGuardedResolver()
+    resolver = SSRFGuardedResolver(require_public_network=validate_public_network)
     if proxy:
         resolver.trust_proxy_url(proxy)
     current_url = await validate_and_pin_fetch_url(url, resolver)
@@ -162,9 +179,15 @@ async def aiohttp_request(
     request_cookies = cookies
     strip_body_headers = False
 
-    async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=timeout), connector=ssrf_guarded_tcp_connector(resolver)
-    ) as session:
+    session_kwargs: dict[str, Any] = {
+        "timeout": aiohttp.ClientTimeout(total=timeout),
+        "connector": ssrf_guarded_tcp_connector(resolver),
+    }
+    if validate_public_network:
+        # Validate the exact URL aiohttp dispatches; numeric hosts can bypass resolver callbacks.
+        session_kwargs["trace_configs"] = [create_public_network_trace_config()]
+
+    async with aiohttp.ClientSession(**session_kwargs) as session:
 
         async def build_request_kwargs() -> dict[str, Any]:
             headers_dict = dict(request_headers)
