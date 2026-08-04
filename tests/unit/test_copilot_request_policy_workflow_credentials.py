@@ -19,6 +19,7 @@ from skyvern.forge.sdk.copilot.credential_pause import credential_pause_reason
 from skyvern.forge.sdk.copilot.credential_resolution import resolve_by_url
 from skyvern.forge.sdk.copilot.request_policy import (
     _AMBIGUOUS_URL_CREDENTIAL_QUESTION,
+    _AMBIGUOUS_URLLESS_CREDENTIAL_QUESTION,
     _LOGIN_CREDENTIAL_QUESTION,
     _SAVED_CREDENTIAL_NAME_QUESTION,
     _SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX,
@@ -630,7 +631,28 @@ async def test_name_miss_does_not_advance_to_classifier_only_url() -> None:
     assert policy.resolved_credentials == []
     assert policy.clarification_reason == "credential_name_unresolved"
     assert "missing-name" in (policy.clarification_question or "")
+    assert policy.credential_ask_card_answerable is True
+    assert credential_pause_reason(SimpleNamespace(request_policy=policy)) == "login_credentials_unresolved"
     load_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["abc", "spare-portal"], ids=["three_char", "twelve_char"])
+async def test_url_less_ambiguity_is_independent_of_credential_name_length(name: str) -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Log into the portal at https://portal.example.com/login.",
+        classifier_policy=RequestPolicy(
+            credential_input_kind="website_stored_credential",
+            login_page_urls=["https://portal.example.com/login"],
+            login_intent=True,
+            classifier_status="success",
+        ),
+        org_credentials=[_cred(name, "cred_one"), _cred("other-login", "cred_two")],
+    )
+
+    assert policy.credential_ask_card_answerable is True
+    assert policy.credential_ask_candidate_ids == ["cred_one", "cred_two"]
+    assert credential_pause_reason(SimpleNamespace(request_policy=policy)) == "login_credentials_unresolved"
 
 
 @pytest.mark.asyncio
@@ -969,6 +991,8 @@ async def test_invalid_explicit_id_does_not_fall_through_to_name() -> None:
 
     assert policy.invalid_credential_ids == ["cred_missing"]
     assert policy.clarification_reason == "credential_name_unresolved"
+    assert policy.credential_ask_card_answerable is False
+    assert credential_pause_reason(SimpleNamespace(request_policy=policy)) is None
     load_mock.assert_not_awaited()
 
 
@@ -1012,6 +1036,34 @@ async def test_multiple_name_hits_keep_the_existing_picker_and_skip_url() -> Non
     )
     assert "`cred_url`" not in policy.clarification_question
     load_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_name_collision_candidates_are_not_labelled_safe_matches() -> None:
+    """A name-formed ask has no login page vouching for its candidates.
+
+    Each candidate carrying some ``tested_url`` says nothing about *this* page, so the picker
+    must not call them safe matches even when every one of them has been tested somewhere.
+    """
+    policy = RequestPolicy(
+        credential_input_kind="website_stored_credential",
+        login_page_urls=["https://portal.example.com/login"],
+        login_intent=True,
+    )
+
+    await _resolve_direct(
+        policy,
+        user_message="Use the credential named shared-login.",
+        org_credentials=[
+            _cred("shared-login", "cred_one", tested_url="https://elsewhere.example.com/login"),
+            _cred("shared-login", "cred_two", tested_url="https://other.example.com/login"),
+        ],
+    )
+
+    assert policy.clarification_question is not None
+    assert "Saved credentials:" in policy.clarification_question
+    assert "Safe matches" not in policy.clarification_question
+    assert policy.credential_ask_login_page_urls == []
 
 
 @pytest.mark.asyncio
@@ -1384,12 +1436,18 @@ async def test_website_kind_multiple_url_less_credentials_ask_which_one() -> Non
 
     assert policy.requires_user_clarification is True
     assert policy.clarification_question is not None
-    assert policy.clarification_question.startswith(_AMBIGUOUS_URL_CREDENTIAL_QUESTION)
+    assert policy.clarification_question.startswith(_AMBIGUOUS_URLLESS_CREDENTIAL_QUESTION)
+    assert "Safe matches" not in policy.clarification_question
+    assert "for that login page" not in policy.clarification_question
     assert "first-login" in policy.clarification_question
     assert "second-login" in policy.clarification_question
     assert policy.clarification_reason == "credential_name_unresolved"
     assert sorted(c.credential_id for c in policy.discovered_credentials) == ["cred_one", "cred_two"]
     assert not policy.resolved_credentials
+    assert policy.credential_ask_card_answerable is True
+    assert policy.credential_ask_candidate_ids == ["cred_one", "cred_two"]
+    assert policy.credential_ask_login_page_urls == ["https://portal.example.com/login"]
+    assert credential_pause_reason(SimpleNamespace(request_policy=policy)) == "login_credentials_unresolved"
 
 
 @pytest.mark.asyncio
@@ -1410,7 +1468,9 @@ async def test_website_kind_multiple_url_matches_keep_disambiguation_reason() ->
 
     assert policy.clarification_question is not None
     assert policy.clarification_question.startswith(_AMBIGUOUS_URL_CREDENTIAL_QUESTION)
+    assert "Safe matches:" in policy.clarification_question
     assert policy.clarification_reason == "credential_name_unresolved"
+    assert policy.credential_ask_card_answerable is True
     assert sorted(c.credential_id for c in policy.discovered_credentials) == ["cred_one", "cred_two"]
 
 
@@ -2215,6 +2275,8 @@ async def test_a_pasted_secret_under_login_intent_keeps_the_raw_secret_refusal()
     )
 
     assert policy.clarification_reason == "raw_secret"
+    assert policy.credential_ask_card_answerable is False
+    assert credential_pause_reason(SimpleNamespace(request_policy=policy)) is None
 
 
 def test_login_credentials_unresolved_surfaces_a_prompt_but_grants_no_deferred_draft_authority() -> None:
@@ -3203,7 +3265,9 @@ async def test_a_live_page_admission_does_not_carry_to_the_next_turn() -> None:
         page_url=_LIVE_LOGIN_URL,
         org_credentials=[_cred("analytics", "cred_analytics", _SAVED_LOGIN_URL)],
     )
-    carried_context = record_approved_credentials_in_global_llm_context(SimpleNamespace(request_policy=policy), None)
+    carried_context = record_approved_credentials_in_global_llm_context(
+        SimpleNamespace(request_policy=policy, credential_pause_connected_credential_id=None), None
+    )
 
     next_turn = RequestPolicy()
     with patch(

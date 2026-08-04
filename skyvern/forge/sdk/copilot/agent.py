@@ -110,7 +110,7 @@ from skyvern.forge.sdk.copilot.credential_literal_rebind import (
     rebind_scouted_credential_literals,
     scouted_credential_targets,
 )
-from skyvern.forge.sdk.copilot.credential_pause import preflight_credential_pause
+from skyvern.forge.sdk.copilot.credential_pause import credential_pause_reason, preflight_credential_pause
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
     artifact_health_blocked,
@@ -5019,7 +5019,7 @@ async def _run_copilot_turn_impl(
         )
     if request_policy is not None and request_policy_guardrail_result.output.tripwire_triggered:
         preflight_resolution = None
-        if request_policy.clarification_reason == "login_credentials_unresolved":
+        if credential_pause_reason(ctx) is not None:
             preflight_resolution = await preflight_credential_pause(ctx, stream, copilot_config)
             if preflight_resolution is not None:
                 await _resume_turn_intent_after_preflight_credential(ctx, request_policy, policy_inputs)

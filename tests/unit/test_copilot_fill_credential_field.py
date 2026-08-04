@@ -727,6 +727,48 @@ class TestCredentialFillLivePageAdmission:
         assert [c.credential_id for c in policy.resolved_credentials] == ["cred_analytics"]
 
     @pytest.mark.asyncio
+    async def test_a_card_connected_credential_with_no_tested_url_fills(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The resume stamps the ask's origin, so a credential created from the card can sign in."""
+        page = _FakePage()
+        _wire_impl(monkeypatch, page)
+        policy = RequestPolicy(
+            resolved_credentials=[_resolved_credential(tested_url=None)],
+            live_page_admitted_urls={"cred_123": _FIXTURE_LOGIN_URL},
+        )
+        ctx = _ctx(request_policy=policy)
+
+        with patch(
+            "skyvern.forge.app.DATABASE.credentials.get_credentials",
+            new=AsyncMock(side_effect=AssertionError("a stamped credential needs no org scan")),
+        ):
+            result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+
+        assert result["ok"] is True
+        assert page.fill_calls == [("#passwordInput", _FAKE_PASSWORD)]
+
+    @pytest.mark.asyncio
+    async def test_a_card_connected_credential_still_cannot_follow_a_redirect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _FakePage()
+        _wire_impl(monkeypatch, page)
+        policy = RequestPolicy(
+            resolved_credentials=[_resolved_credential(tested_url=None)],
+            live_page_admitted_urls={"cred_123": _FIXTURE_LOGIN_URL},
+        )
+        ctx = _ctx(request_policy=policy)
+
+        async def redirect_then_capture(_ctx: Any) -> None:
+            page.url = "https://elsewhere.example.com/collect"
+
+        monkeypatch.setattr(credential_fill_module, "_capture_scout_source_url", redirect_then_capture)
+
+        result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+
+        assert result["ok"] is False
+        assert page.fill_calls == []
+
+    @pytest.mark.asyncio
     async def test_a_redirect_after_admission_stops_the_secret_reaching_the_new_page(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

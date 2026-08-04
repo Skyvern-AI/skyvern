@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import {
   act,
   cleanup,
@@ -113,6 +114,39 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
 }));
 
 vi.mock("@/components/ui/use-toast", () => ({ toast: toastFn }));
+
+const { selectValueChange } = vi.hoisted(() => ({
+  selectValueChange: { current: null as ((value: string) => void) | null },
+}));
+
+vi.mock("@/components/ui/select", () => ({
+  Select: ({
+    children,
+    onValueChange,
+  }: {
+    children?: ReactNode;
+    onValueChange?: (value: string) => void;
+  }) => {
+    selectValueChange.current = onValueChange ?? null;
+    return <div data-testid="mock-select">{children}</div>;
+  },
+  SelectTrigger: ({ children }: { children?: ReactNode }) => (
+    <div>{children}</div>
+  ),
+  SelectValue: ({ placeholder }: { placeholder?: string }) => (
+    <span>{placeholder}</span>
+  ),
+  SelectContent: ({ children }: { children?: ReactNode }) => (
+    <div>{children}</div>
+  ),
+  SelectItem: ({
+    children,
+    value,
+  }: {
+    children?: ReactNode;
+    value: string;
+  }) => <div data-testid={`select-item-${value}`}>{children}</div>,
+}));
 
 // The real modal pulls react-query; a stub is enough to prove the connect →
 // modal → onCredentialCreated wiring.
@@ -463,6 +497,38 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
       action: "connected",
       credential_id: "new-cred-1",
     });
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers the credential_refs candidates even when none has a tested_url", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    credentialsData.current = [
+      { credential_id: "cred-abc", name: "abc", tested_url: null },
+      { credential_id: "cred-spare", name: "spare-portal", tested_url: null },
+      { credential_id: "cred-other", name: "unrelated", tested_url: null },
+    ];
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart());
+      streamCalls[0]!.onMessage(
+        credentialFrame({ credential_refs: ["cred-abc", "cred-spare"] }),
+      );
+    });
+    expect(await screen.findByText("Use existing…")).toBeTruthy();
+    expect(screen.getByTestId("select-item-cred-abc")).toBeTruthy();
+    expect(screen.getByTestId("select-item-cred-spare")).toBeTruthy();
+    expect(screen.queryByTestId("select-item-cred-other")).toBeNull();
+    await act(async () => {
+      selectValueChange.current?.("cred-spare");
+    });
+    await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
+    expect(credentialResponsePosts()[0]![1]).toMatchObject({
+      action: "connected",
+      credential_id: "cred-spare",
+    });
+    expect(postStreaming).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the card actionable, toasts, and never logs the raw error (resume_token leak) when the resume POST fails", async () => {

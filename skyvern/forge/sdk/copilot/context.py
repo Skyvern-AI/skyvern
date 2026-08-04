@@ -627,7 +627,13 @@ def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_c
     sc = StructuredContext.from_json_str(raw_context)
     existing_ids = {record.credential_id for record in sc.approved_credentials}
     for credential in policy.resolved_credentials:
-        if credential.credential_id in existing_ids or credential.credential_id in policy.live_page_admitted_urls:
+        # A credential the user picked from the card is durable approval even though the resume
+        # stamped an origin for it; only page-vouched ids have to be re-earned.
+        stamped_by_page = (
+            credential.credential_id in policy.live_page_admitted_urls
+            and credential.credential_id != ctx.credential_pause_connected_credential_id
+        )
+        if credential.credential_id in existing_ids or stamped_by_page:
             continue
         sc.approved_credentials.append(ApprovedCredential(credential_id=credential.credential_id))
         existing_ids.add(credential.credential_id)

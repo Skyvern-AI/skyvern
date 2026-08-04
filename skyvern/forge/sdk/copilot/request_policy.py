@@ -181,6 +181,9 @@ _STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX = (
 )
 _STORED_CREDENTIAL_URL_QUESTION = f"{_STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
 _AMBIGUOUS_URL_CREDENTIAL_QUESTION = "I found multiple stored credentials for that login page. Which one should I use?"
+_AMBIGUOUS_URLLESS_CREDENTIAL_QUESTION = (
+    "I found multiple saved credentials, and none of them is bound to that login page. Which one should I use?"
+)
 _SIGNIN_EMAIL_QUESTION = "Which email address should I sign in with?"
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 # A credential ID typed with the wrong separator (`cred 530…`, `cred-530…`). The
@@ -610,6 +613,13 @@ class RequestPolicy:
     raw_secret_evidence: str | None = None
     raw_secret_handling: RawSecretHandling = "none"
     clarification_reason: ClarificationReason = "none"
+    # `clarification_reason` cannot say this on its own: credential_name_unresolved is also raised
+    # by raw-secret, invention and invalid-id asks the credential card cannot answer.
+    credential_ask_card_answerable: bool = False
+    # The server-held login page URLs this ask was formed against; the only origin source the
+    # connected resume may bind from.
+    credential_ask_login_page_urls: list[str] = field(default_factory=list)
+    credential_ask_candidate_ids: list[str] = field(default_factory=list)
     existing_workflow_credential_ids: list[str] = field(default_factory=list)
     # Sorted at the trace/JSON boundary; YAML traversal uses sets.
     existing_workflow_credential_origins: dict[str, list[str]] = field(default_factory=dict)
@@ -4542,14 +4552,23 @@ def _block(
     candidates: list[Credential] | None = None,
     *,
     reason: ClarificationReason | None = None,
+    card_answerable: bool = False,
 ) -> None:
     policy.requires_user_clarification = True
     policy.user_response_policy = "ask_clarification"
     policy.allow_update_workflow = policy.allow_run_blocks = False
     if reason is not None:
         policy.clarification_reason = reason
+    policy.credential_ask_card_answerable = card_answerable
+    policy.credential_ask_candidate_ids = [candidate.credential_id for candidate in candidates or []]
     if candidates:
-        question += "\n\nSafe matches:\n" + "\n".join(
+        # "Safe" is a claim about the login page vouching for each candidate, so it only holds
+        # when the ask had a page to match against and every candidate was tested against one.
+        matched_by_url = bool(policy.credential_ask_login_page_urls) and all(
+            candidate.tested_url for candidate in candidates
+        )
+        label = "Safe matches" if matched_by_url else "Saved credentials"
+        question += f"\n\n{label}:\n" + "\n".join(
             f"- {credential_candidate_label(candidate)}" for candidate in candidates
         )
     policy.clarification_question = question
@@ -4933,6 +4952,7 @@ async def _resolve_credentials(
                 question,
                 named_matches,
                 reason="credential_name_unresolved",
+                card_answerable=True,
             )
             return
         if policy.testing_intent == "skip_test" or defer_unresolved_credential_name:
@@ -4953,6 +4973,7 @@ async def _resolve_credentials(
             policy,
             question,
             reason="credential_name_unresolved",
+            card_answerable=True,
         )
         return
 
@@ -4979,6 +5000,7 @@ async def _resolve_credentials(
         url_candidates = message_url_candidates
 
     if url_candidates:
+        policy.credential_ask_login_page_urls = list(url_candidates)
         if credentials is None:
             credentials = await _load_credentials(organization_id)
         resolution = resolve_by_url(
@@ -4999,9 +5021,12 @@ async def _resolve_credentials(
             policy.discovered_credentials = list(resolution.candidates)
             _block(
                 policy,
-                _AMBIGUOUS_URL_CREDENTIAL_QUESTION,
+                _AMBIGUOUS_URLLESS_CREDENTIAL_QUESTION
+                if resolution.tier == "urlless_sole"
+                else _AMBIGUOUS_URL_CREDENTIAL_QUESTION,
                 list(resolution.candidates),
                 reason="credential_name_unresolved",
+                card_answerable=True,
             )
             return
 
@@ -5018,6 +5043,7 @@ async def _resolve_credentials(
             policy,
             _SAVED_CREDENTIAL_NAME_QUESTION,
             reason="credential_name_unresolved",
+            card_answerable=True,
         )
         return
 
@@ -5033,6 +5059,7 @@ async def _resolve_credentials(
             policy,
             "I could not find a stored credential for that login page. Please select a saved credential by exact name or a credential ID beginning with cred_, or create one in the Credentials UI.",
             reason="credential_name_unresolved",
+            card_answerable=True,
         )
 
 
