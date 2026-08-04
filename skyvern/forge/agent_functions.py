@@ -51,6 +51,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     NonEmptyPasswordCredential,
     SecretCredential,
 )
+from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.services import (
@@ -907,6 +908,16 @@ class AgentFunction:
         Always yes here: a self-hosted deployment runs every browser itself.
         """
         return True
+
+    async def select_browser_session_recordings(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        recordings: list[FileInfo],
+        browser_vendor: str | None = None,
+    ) -> list[FileInfo]:
+        return recordings
 
     def get_flex_llm_key(self, llm_key: str | None) -> str | None:
         """Return a flex-tier router key for the given LLM key, or None if no flex twin exists.

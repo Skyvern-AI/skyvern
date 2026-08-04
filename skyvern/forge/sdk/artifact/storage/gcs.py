@@ -788,6 +788,7 @@ class GcsStorage(BaseStorage):
         local_file_path: str,
         remote_path: str,
         date: str | None = None,
+        recording_finalized_at: datetime | None = None,
     ) -> str:
         """Sync a file from local browser session to GCS."""
         uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
@@ -797,7 +798,7 @@ class GcsStorage(BaseStorage):
         if artifact_type == "videos":
             # Anchor per-run clip offsets to browser close, captured before the
             # potentially slow prepare+upload below so upload time does not shift clips.
-            recording_finalized_at = datetime.now(timezone.utc)
+            recording_finalized_at = recording_finalized_at or datetime.now(timezone.utc)
             async with prepare_recording_for_upload(local_file_path) as prepared_upload:
                 upload_file_path = prepared_upload.path
                 upload_remote_path = replace_file_extension(remote_path, prepared_upload.file_extension)

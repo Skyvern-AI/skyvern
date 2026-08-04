@@ -990,6 +990,7 @@ class S3Storage(BaseStorage):
         local_file_path: str,
         remote_path: str,
         date: str | None = None,
+        recording_finalized_at: datetime | None = None,
     ) -> str:
         """Sync a file from local browser session to S3."""
         uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
@@ -998,7 +999,7 @@ class S3Storage(BaseStorage):
         if artifact_type == "videos":
             # Anchor per-run clip offsets to browser close, captured before the (potentially
             # slow) compress+upload below so a long upload doesn't shift every clip window.
-            recording_finalized_at = datetime.now(timezone.utc)
+            recording_finalized_at = recording_finalized_at or datetime.now(timezone.utc)
             # Compress finalized Playwright recordings before upload. The raw
             # local file remains the source of truth if ffmpeg fails; the S3
             # object and artifact metadata reflect the prepared upload file.
@@ -1008,7 +1009,9 @@ class S3Storage(BaseStorage):
                 uri = self._build_browser_session_uri(
                     organization_id, browser_session_id, artifact_type, upload_remote_path, date
                 )
-                await self.async_client.upload_file_from_path(uri, upload_file_path, storage_class=sc)
+                await self.async_client.upload_file_from_path(
+                    uri, upload_file_path, storage_class=sc, raise_exception=True
+                )
                 # Register the uploaded recording for signed artifact serving.
                 checksum = calculate_sha256_for_file(upload_file_path)
                 file_size = _safe_get_file_size(upload_file_path)
