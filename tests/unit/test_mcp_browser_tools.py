@@ -751,6 +751,7 @@ def _sdk_equivalent_page(monkeypatch: pytest.MonkeyPatch) -> None:
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setenv("SKYVERN_DISABLE_CUSTOM_SELECT", "1")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    monkeypatch.setattr(mcp_browser, "validate_fetch_url", lambda url: url)
     monkeypatch.setattr(mcp_browser, "get_current_session", lambda: SimpleNamespace(_working_frame=None))
     monkeypatch.setattr(mcp_browser, "clear_session_ref_map", Mock())
     monkeypatch.setattr(
