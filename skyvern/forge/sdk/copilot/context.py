@@ -985,8 +985,6 @@ class CopilotContext(AgentContext):
     # construction site, overriding this default.
     turn_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     turn_index: int = 0
-    design_start_emitted: bool = False
-    design_end_emitted: bool = False
     narrative_summary: str | None = None
 
     staged_workflow_yaml: str | None = None

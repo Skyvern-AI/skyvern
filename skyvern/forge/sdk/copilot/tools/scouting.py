@@ -55,6 +55,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     has_actionable_steer_content,
     has_bounded_page_schema,
     has_witnessed_value_content,
+    packet_describes_a_clearable_overlay,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import FillCarry
@@ -323,16 +324,27 @@ async def _capture_scout_role_name(ctx: AgentContext, selector: str | None) -> N
     if not selector:
         return
     parsed = _role_name_from_selector(selector)
+    source = "selector"
     if parsed is not None:
         role, name = parsed
     else:
+        source = "page_read"
         captured = await _capture_accessible_role_name(
             ctx, selector, timeout_seconds=_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS
         )
         if captured is None:
+            # A read that never answered and one that answered namelessly leave the same empty
+            # trajectory, and only the first is a timeout worth widening.
+            LOG.info("copilot_scout_role_name_unavailable", reason="page_read_failed", source=source)
             return
         role, name = captured
     if not role or not name:
+        LOG.info(
+            "copilot_scout_role_name_unavailable",
+            reason="empty_role" if not role else "empty_name",
+            source=source,
+            role=role,
+        )
         return
     ctx.pending_scout_role_name = (selector, role, name)
 
@@ -1393,7 +1405,9 @@ _EVALUATE_ACTIONABLE_ACT_INSTRUCTION = (
 )
 _EVALUATE_RESULT_COMPOSITION_INSTRUCTION = (
     "Loaded results are already visible on the current page; inspect this page for composition or author an "
-    "extraction/validation block from the loaded results instead of re-reading it."
+    "extraction/validation block from the loaded results instead of re-reading it. For each requested output "
+    "value you can see, pass it to synthesize_demonstrated_block's requested_output_reads as the value exactly "
+    "as rendered plus the label above it, and the page will pin the read for you."
 )
 
 
@@ -1792,7 +1806,21 @@ async def _maybe_steer_evaluate_to_action(
             return False
         record_scouted_output_coverage(ctx, parsed, contract=contract)
         _record_scout_page_observation(ctx, parsed)
-        loaded_results = _mint_current_loaded_result_source(ctx, parsed, url=url)
+        # An overlay the loop can clear takes precedence over reading what it obscured; the dismiss
+        # control is already among the actionable targets, so the model chooses rather than being
+        # vetoed, and the next observation sees the page. Checked before results are minted rather
+        # than after: a packet describing only a dialog has no results to mint, so gating this on
+        # having minted some left it dead in the one case it exists for.
+        overlay_only = packet_describes_a_clearable_overlay(parsed)
+        if overlay_only:
+            LOG.info("copilot_evaluate_result_composition_deferred_to_obstruction", url=url)
+        # Recording an observation is independent of whether it steers. A page whose relations do not
+        # mint a loaded result is steered as actionable instead, and appending only on the composition
+        # branch discarded those packets outright: the log page carrying the requested count was
+        # observed, steered as actionable, and never reached the binder at all (SKY-13226).
+        if has_bounded_page_schema(parsed):
+            _append_flow_evidence(ctx, parsed, reached_via="current_page")
+        loaded_results = None if overlay_only else _mint_current_loaded_result_source(ctx, parsed, url=url)
         if loaded_results is not None:
             _reset_evaluate_tracker(ctx)
             ctx.latest_evaluate_result_composition_steer = loaded_results

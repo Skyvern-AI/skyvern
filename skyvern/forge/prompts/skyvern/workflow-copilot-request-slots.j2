@@ -8,6 +8,7 @@ Schema-valid examples:
 {"version":"1","slots":[{"source_id":"u0","source_quote":"report the blocker if online submission is unavailable","plane":"run","pinability":"shapeless_valid","antecedent_family":"blocker"}],"datum_bindings":[]}
 {"version":"1","slots":[{"source_id":"u0","source_quote":"request id","plane":"run","pinability":"shapeless_valid","antecedent_family":"unconditional"}],"datum_bindings":[{"criterion_index":0,"datum_field":"output_path","declined":false,"source_id":"u0","source_quote":"request id"}]}
 {"version":"1","slots":[],"datum_bindings":[{"criterion_index":0,"datum_field":"output_path","declined":true}]}
+{"version":"1","slots":[],"datum_bindings":[],"candidate_refutations":[{"candidate":"visitors","reason":"names a page section, not a value the user asked the workflow to return"}]}
 
 Rules:
 - Return version exactly "1". Return an empty slots list when the user requests no output member; empty membership is an explicit contract, not an error.
@@ -28,6 +29,7 @@ Rules:
 - Do not infer slots from sampled page shapes or non-user context. Do not normalize, rename, or paraphrase source quotes.
 - Return datum_bindings as an array. When DATUM TARGETS is empty, return an empty array. Otherwise answer every target exactly once and no others, identifying each target only by its criterion_index and datum_field. When user text names the datum, return exactly {"criterion_index":<target integer>,"datum_field":<target field>,"declined":false,"source_id":<source ID>,"source_quote":<smallest unique exact quote>} whose independently declared slot names that target datum. Every accepted binding must name one exact slot in your slots array, and two targets may not bind the same slot. When no source quote actually names a target datum, return exactly {"criterion_index":<target integer>,"datum_field":<target field>,"declined":true}. The server owns datum_value and criterion_outcome_sha256; never return either field. Decline instead of guessing or borrowing an adjacent datum.
 - When a target's datum_value leaf directly matches a `whether ...` output phrase (underscores are spaces; articles and forms of "be" are insignificant), declare and bind that exact full `whether ...` phrase. Never bind the target to an earlier, broader task goal or evidence-gathering instruction.
+- DETECTED OUTPUT CANDIDATES lists field names a deterministic scan found requested in the user sources. Answer every candidate exactly once: either one of your slots' source_quote contains the candidate text, or return {"candidate":<name>,"reason":<short reason>} in candidate_refutations. An envelope silent on a candidate is invalid. A refutation is a real judgment that the user did not ask for that value, not a shortcut; when the sources do request the value, declare the slot.
 
 Ordered, deduplicated user request sources:
 ```{{ request_sources }}```
@@ -39,3 +41,5 @@ Bounded global context (non-authoritative):
 ```{{ global_context }}```
 Datum targets from the immutable request-policy payload:
 ```{{ datum_targets }}```
+Detected output candidates from the deterministic request scan:
+```{{ detected_output_candidates }}```

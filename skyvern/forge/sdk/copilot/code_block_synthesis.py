@@ -54,6 +54,10 @@ LOG = structlog.get_logger()
 
 _MAX_STEPS = 60
 _INDENT = "    "
+# A dashboard renders the tile before the figure it will hold, so a designated read waits for the
+# value rather than reporting the empty frame it lands in first.
+_DESIGNATED_VALUE_SETTLE_POLLS = 60
+_DESIGNATED_VALUE_SETTLE_INTERVAL_MS = 500
 _DOMCONTENTLOADED = "domcontentloaded"
 _ENTRY_TARGET_VAR = "_scout_entry_target"
 _DOWNLOAD_TARGET_VAR = "_scout_download_target"
@@ -429,7 +433,6 @@ _STRUCTURAL_DISMISSAL_SELECTOR_PATTERN = re.compile(
 # container). A wait returns the moment its condition holds, so a fast page pays nothing; only a
 # genuinely absent state pays the full budget. Distinct from the deliberate 1s speculative probes.
 _REQUIRED_STATE_TIMEOUT_MS = 120_000
-
 _SYNTHESIZED_BLOCK_LABEL = "scout_synthesized_browser_steps"
 
 # Names the code-block executor reserves in its exec() namespace (block.py build_safe_vars
@@ -2443,6 +2446,18 @@ def synthesize_code_block(
             if compile_download_target and reached_download_target is not None
             else ""
         )
+        # Which element proves the block is where the flow starts is a separate question from which
+        # step it resumes at: a scout that opened a password-reset link before signing in anchored the
+        # whole login on the link it then clicked away from, while still needing to replay that click.
+        # The anchor prefers a durable target - something the flow fills or selects - and the replay
+        # start is left exactly where it was.
+        durable_anchor_target, _durable_anchor_index = _entry_target_locator(
+            entry_trajectory, strict_selectors=strict_selectors, prefer_durable=True
+        )
+        if fallback_entry_target and durable_anchor_target:
+            # Re-anchoring to the first-touched element after navigating would put the block back on
+            # the link it clicked away from, so the durable target is the anchor on both paths.
+            fallback_entry_target = durable_anchor_target
         entry_target = download_entry_target if download_entry_target else fallback_entry_target
         entry_replay_condition_active = bool(download_entry_target and fallback_entry_target)
         entry_replay_start_index = (
@@ -2486,7 +2501,14 @@ def synthesize_code_block(
                 for interaction in entry_trajectory
             )
         )
+        login_guard_last_index: int | None = None
         if login_only_presence_guard_active:
+            credential_index = last_scout_credential_fill_index(entry_trajectory)
+            login_guard_last_index = (
+                credential_submit_boundary_index(entry_trajectory, credential_index)
+                if credential_index is not None
+                else None
+            )
             notes.append(
                 "login rung fills only when the credential form is present, so an authenticated replay skips it"
             )
@@ -2591,7 +2613,11 @@ def synthesize_code_block(
             return _INDENT * 2
         if entry_post_auth_resume_index and trajectory_index < entry_post_auth_resume_index:
             return _INDENT * 2
-        if login_only_presence_guard_active:
+        # The guard exists so an authenticated replay skips the login. Indenting past its submit
+        # would skip the value read too, and the block then returns a name it never bound.
+        if login_only_presence_guard_active and (
+            login_guard_last_index is None or trajectory_index <= login_guard_last_index
+        ):
             return _INDENT * 2
         return _INDENT
 
@@ -2691,13 +2717,27 @@ def synthesize_code_block(
                 continue
             line_start = len(lines) + 1
             variable = f"_read_value_{len(read_bindings)}"
+            # A read is only recorded once it returns something, so an empty replay contradicts the
+            # proof whatever shape that proof had; an empty collection here is absence, not a correct
+            # answer for a request that legitimately has none.
+            absent = '(None, "", [], {})'
             lines.append(f"{action_indent}{variable} = await page.evaluate({expression!r})")
             poll_rounds = _REQUIRED_STATE_TIMEOUT_MS // 1000
             lines.append(f"{action_indent}for _ in range({poll_rounds}):")
-            lines.append(f'{action_indent}{_INDENT}if {variable} is not None and {variable} != "":')
+            lines.append(f"{action_indent}{_INDENT}if {variable} not in {absent}:")
             lines.append(f"{action_indent}{_INDENT * 2}break")
             lines.append(f"{action_indent}{_INDENT}await page.wait_for_timeout(1000)")
             lines.append(f"{action_indent}{_INDENT}{variable} = await page.evaluate({expression!r})")
+            # The scout only records a read that returned something, so an absent replay contradicts
+            # the proof this read was built from. Returning the absent value instead reports success
+            # while the requested field carries nothing.
+            lines.append(f"{action_indent}if {variable} in {absent}:")
+            # Exception is the only type the runtime code sandbox resolves; a narrower one fails the
+            # sandbox name check.
+            lines.append(
+                f"{action_indent}{_INDENT}raise Exception("
+                f"{f'{output_path} was not present on the page: '!r} + {expression!r})"
+            )
             read_bindings.append((output_path, variable))
             record_emission(trajectory_index, tool_name, "evaluate", "page", line_start=line_start, lane="page_read")
             append_step(f"Read {output_path.removeprefix('output.')}", "extract", line_start)
@@ -3450,9 +3490,56 @@ def _array_prefix(binding: LiveReadBinding) -> tuple[tuple[str, bool], ...]:
     return _array_prefix_of_segments(output_path_segments(binding.output_path))
 
 
+def _scalar_label_proof_statements(binding: LiveReadBinding, children: str) -> list[str]:
+    """Re-read the label that proves this value's identity, wherever it lives.
+
+    A tile that renders its heading and its figure in separate branches has no container holding both,
+    so proving the label only as the value's first sibling makes such a value unreadable. A tile that
+    prints its figure first ("1.22K logs found") keeps the label beside it but not at child zero.
+    """
+    anchor = (
+        f"page.locator({json.dumps(binding.label_selector)})"
+        if binding.label_selector
+        else f"{children}.nth({binding.label_child_index})"
+    )
+    target = f"{anchor}.first" if binding.label_selector else anchor
+    return [
+        f"if not await {target}.is_visible():",
+        f'{_INDENT}raise Exception("Observed scalar label is no longer visible")',
+        f"if (await {target}.inner_text()).strip() != {json.dumps(binding.relation_label)}:",
+        f'{_INDENT}raise Exception("Observed scalar label changed")',
+    ]
+
+
 def _key_value_scalar_read_statements(binding: LiveReadBinding, variable: str, *, guard_empty: bool) -> list[str]:
     container = f"page.locator({json.dumps(binding.selector)})"
     target = f"{container}.nth({binding.selector_index})"
+    if binding.child_count == 0:
+        # A designated read: the model pointed at the value element itself, so the read takes its
+        # text directly — no child-slot walk, and no label pin, since the value is what changes.
+        statements = [
+            f'await {container}.first.wait_for(state="visible", timeout={_REQUIRED_STATE_TIMEOUT_MS})',
+            f"if await {container}.count() != {binding.selector_count}:",
+            f'{_INDENT}raise Exception("Designated value selector cardinality changed")',
+            f"if not await {target}.is_visible():",
+            f'{_INDENT}raise Exception("Designated value element is no longer visible")',
+            # The container renders before the figure does on a page still resolving its query, and
+            # reading once there returns the empty frame the value lands in a moment later.
+            f"{variable} = (await {target}.inner_text()).strip()",
+            f"for _ in range({_DESIGNATED_VALUE_SETTLE_POLLS}):",
+            f"{_INDENT}if {variable}:",
+            f"{_INDENT * 2}break",
+            f"{_INDENT}await page.wait_for_timeout({_DESIGNATED_VALUE_SETTLE_INTERVAL_MS})",
+            f"{_INDENT}{variable} = (await {target}.inner_text()).strip()",
+        ]
+        if guard_empty:
+            statements.extend(
+                [
+                    f"if not {variable}:",
+                    f'{_INDENT}raise Exception("Designated value element is empty")',
+                ]
+            )
+        return statements
     children = f'{target}.locator(":scope > *")'
     statements = [
         f'await {container}.first.wait_for(state="visible", timeout={_REQUIRED_STATE_TIMEOUT_MS})',
@@ -3462,10 +3549,7 @@ def _key_value_scalar_read_statements(binding: LiveReadBinding, variable: str, *
         f'{_INDENT}raise Exception("Observed scalar relation is no longer visible")',
         f"if await {children}.count() != {binding.child_count}:",
         f'{_INDENT}raise Exception("Observed scalar direct-child shape changed")',
-        f"if not await {children}.nth(0).is_visible():",
-        f'{_INDENT}raise Exception("Observed scalar label is no longer visible")',
-        f"if (await {children}.nth(0).inner_text()).strip() != {json.dumps(binding.relation_label)}:",
-        f'{_INDENT}raise Exception("Observed scalar label changed")',
+        *(_scalar_label_proof_statements(binding, children) if binding.identified_by_label else []),
         f"if not await {children}.nth({binding.child_index}).is_visible():",
         f'{_INDENT}raise Exception("Observed scalar value is no longer visible")',
         f"{variable} = (await {children}.nth({binding.child_index}).inner_text()).strip()",
@@ -3813,14 +3897,17 @@ def produce_covered_static_return_envelope(
 
 
 def _trajectory_contains_reveal(trajectory: Sequence[Mapping[str, Any]], plan: RequestedOutputExtractionPlan) -> bool:
+    if plan.reveal is None:
+        return True
+    reveal = plan.reveal
     return any(
         str(interaction.get("tool_name") or "") == "click"
         and (
-            (bool(plan.reveal.selector) and str(interaction.get("selector") or "") == plan.reveal.selector)
+            (bool(reveal.selector) and str(interaction.get("selector") or "") == reveal.selector)
             or (
-                bool(plan.reveal.role and plan.reveal.name)
-                and str(interaction.get("role") or "") == plan.reveal.role
-                and str(interaction.get("accessible_name") or "") == plan.reveal.name
+                bool(reveal.role and reveal.name)
+                and str(interaction.get("role") or "") == reveal.role
+                and str(interaction.get("accessible_name") or "") == reveal.name
             )
         )
         for interaction in trajectory

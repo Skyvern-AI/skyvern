@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import os
 import re
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -108,8 +110,13 @@ from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     RequestedOutputExtractionPlan,
+    bindable_candidate_headings,
+    derivation_bail_reason,
     derive_requested_output_extraction_plan,
+    plan_from_designations,
     resolve_shape_expectations_by_path,
+    unbound_candidate_relations,
+    value_shown_in_selectable_evidence,
 )
 from skyvern.forge.sdk.copilot.output_policy import (
     completion_criterion_requires_browser_fill_delivery,
@@ -2091,6 +2098,32 @@ def synthesized_persistence_reopened_after_failed_run(ctx: Any) -> bool:
     return _last_scout_interaction_commits(trajectory)
 
 
+def synthesized_offer_reopened_for_extraction_plan(
+    ctx: AgentContext, plan: RequestedOutputExtractionPlan | None
+) -> bool:
+    """Whether a newly provable read is worth reopening a closed offer for.
+
+    The offer is made once per authoring, but the value a turn was asked for often only becomes
+    provable after the draft exists — the page carrying it is reached later. Without this the proven
+    read is derived and never offered, and the draft's own guess is what the first run executes.
+    Reopening stops as soon as the authored block already carries this plan, so it cannot loop.
+
+    A page whose wording never matches the request binds no plan at all, and the relations it does
+    offer are named only by the offer this gate guards; requiring a bound plan to reopen therefore
+    asked the read that makes the plan bind to already exist. Unbound candidates reopen it too, and
+    stop doing so once one has been read into a requested path.
+    """
+    if plan is None:
+        requested = _requested_output_paths_for_ctx(ctx)
+        if not requested or not unbound_candidate_relations(ctx.flow_evidence):
+            return False
+        # The offer names relations no read has claimed, so it stops once one of them has been read
+        # into a requested path. Without this the prompt re-carries the whole offer on every build.
+        return not (requested & set(_witness_values_for_derivation(ctx)))
+    carried = (ctx.requested_output_extraction_candidate, ctx.pending_requested_output_extraction_candidate)
+    return all(candidate is None or candidate.plan_identity != plan.identity for candidate in carried)
+
+
 def synthesized_persistence_reopened(ctx: AgentContext) -> bool:
     if ctx.synthesized_block_reopened_for_credential_scout:
         return True
@@ -2286,29 +2319,208 @@ def _effective_requested_output_path(criterion: CompletionCriterion) -> str | No
     return None
 
 
+def requested_output_paths_for_derivation(ctx: AgentContext) -> set[str]:
+    """The paths derivation will try to bind, including floor-rekeyed and repair-context ones.
+
+    The offer and the binder have to read one set. Gating the offer on the policy's criteria alone
+    withheld it for a path that reached derivation by rekey, so the page's own candidates were never
+    named and the read that would have witnessed the value was never invited (SKY-13226).
+    """
+    return _requested_output_paths_for_ctx(ctx)
+
+
 def _requested_output_labels_by_path(ctx: AgentContext) -> dict[str, tuple[str, ...]]:
     requested_paths = _requested_output_paths_for_ctx(ctx)
     labels_by_path: dict[str, tuple[str, ...]] = {}
     for criterion in _pre_run_gated_completion_criteria(ctx):
-        outcome = criterion.outcome.strip()
+        label = (criterion.requested_output_label or criterion.outcome).strip()
         path = _effective_requested_output_path(criterion)
-        if path in requested_paths and outcome:
+        if path in requested_paths and label:
             labels_by_path.setdefault(path, ())
-            labels_by_path[path] += (outcome,)
+            labels_by_path[path] += (label,)
     return labels_by_path
+
+
+def _witnessed_values_by_path(ctx: AgentContext) -> dict[str, str]:
+    """The scalar each requested output was read as, keyed by the path the read claimed.
+
+    Capture retains every read of a path and defers the choice to synthesis, so this is where that
+    choice lives: differing reads resolve to the one value a selectable observation still shows,
+    because the page corroborates what was read from it and cannot corroborate a probe's echo. A
+    conflict the page corroborates for none, or for more than one, still carries no witness.
+    """
+    reads: dict[str, list[str]] = {}
+    for interaction in ctx.scout_trajectory:
+        if interaction.get("tool_name") != "read_value":
+            continue
+        # A read that inherited its path by elimination says nothing about that path: an early probe
+        # of a login form was promoted that way and its JSON became the witness for a metric the page
+        # had not shown yet. Only a read that named the path witnesses it (SKY-13226).
+        if interaction.get("read_output_path_source") != "declared":
+            continue
+        path = str(interaction.get("read_output_path") or "")
+        value = str(interaction.get("read_result_value") or "")
+        if path and value:
+            reads.setdefault(path, []).append(value)
+    resolved: dict[str, str] = {}
+    for path, values in reads.items():
+        distinct = list(dict.fromkeys(values))
+        if len(distinct) == 1:
+            resolved[path] = distinct[0]
+            continue
+        shown = [
+            value
+            for value in distinct
+            if value_shown_in_selectable_evidence(getattr(ctx, "flow_evidence", None) or [], value)
+        ]
+        if len(shown) == 1:
+            resolved[path] = shown[0]
+    return resolved
+
+
+def dump_derivation_inputs(ctx: AgentContext, *, outcome: str) -> None:
+    """Write the inputs a derivation was given, when a local run asks for them.
+
+    Derivation and the synthesis it feeds are both pure, so a live outcome is reproducible offline
+    from these values alone; without them every attempt at either costs a full turn. Successes are
+    written as well as failures because the code a bound plan generates is only reachable from a
+    packet that bound. The evidence carries whatever text the page held, so writing takes both an
+    explicit path and a local environment rather than the path alone: a deployed run cannot be
+    talked into dumping page contents by its environment.
+    """
+    directory = os.environ.get("COPILOT_DUMP_DERIVATION_INPUTS")
+    if not directory or settings.ENV != "local":
+        return
+    try:
+        os.makedirs(directory, exist_ok=True)
+        payload = {
+            "outcome": outcome,
+            "labels_by_path": {path: list(labels) for path, labels in _requested_output_labels_by_path(ctx).items()},
+            "witnessed_by_path": _witnessed_values_by_path(ctx),
+            # Scope is authoritative, so a replay that rebuilds it from the labels is not the same
+            # derivation the run performed.
+            "requested_paths": sorted(_requested_output_paths_for_ctx(ctx)),
+            "designations": list(ctx.requested_output_designations),
+            "flow_evidence": ctx.flow_evidence,
+            "scout_trajectory": list(ctx.scout_trajectory),
+        }
+        target = os.path.join(directory, f"derivation-{outcome}-{len(ctx.flow_evidence)}-{uuid.uuid4().hex[:8]}.json")
+        with open(target, "w") as handle:
+            json.dump(payload, handle, default=str)
+    except Exception:
+        LOG.info("copilot_derivation_input_dump_failed", exc_info=True)
+
+
+def _current_page_designations(ctx: AgentContext) -> list[dict[str, Any]]:
+    """Designations pin coordinates on one page; once the browser moves they describe a page the
+    block will not be looking at, so they are dropped rather than compiled into a stale read."""
+    designations = ctx.requested_output_designations
+    if not designations:
+        return []
+    page_evidence = ctx.composition_page_evidence or {}
+    current_url = str(page_evidence.get("current_url") or "")
+    # An unknown current URL is the ordinary state right after designating — the probe stamps the
+    # page, but only a composition inspection records one — so it cannot stand in for staleness.
+    if not current_url:
+        return list(designations)
+    return [
+        designation
+        for designation in designations
+        if not str(designation.get("url") or "") or str(designation.get("url")) == current_url
+    ]
+
+
+def _designated_values_by_path(ctx: AgentContext) -> dict[str, str]:
+    """The value the model designated and the page confirmed, keyed by the path it fills.
+
+    A designation is a witness the page validated against the live DOM, so it arms the value binder
+    without the model having to author an expression that returns exactly one scalar (SKY-13226).
+    """
+    values: dict[str, str] = {}
+    for designation in _current_page_designations(ctx):
+        path = designation.get("output_path")
+        text = designation.get("text")
+        if isinstance(path, str) and isinstance(text, str) and text:
+            values[path] = text
+    return values
+
+
+def _witness_values_for_derivation(ctx: AgentContext) -> dict[str, str]:
+    """Read-witnessed values, overridden for any path the page confirmed a designation for."""
+    return {**_witnessed_values_by_path(ctx), **_designated_values_by_path(ctx)}
+
+
+def _labels_outranked_by_designation(
+    ctx: AgentContext, labels_by_path: dict[str, tuple[str, ...]]
+) -> dict[str, tuple[str, ...]]:
+    """Drop the lexical channel for a path the model designated on the live page.
+
+    Both channels can bind the same path to different relations, and the designation is the one an
+    element was actually resolved from.
+    """
+    designated = _designated_values_by_path(ctx)
+    return {path: labels for path, labels in labels_by_path.items() if path not in designated}
+
+
+def requested_output_extraction_plan_diagnostic(ctx: AgentContext) -> dict[str, Any]:
+    """Why a derivation returned nothing: gate mismatch, or no bindable packet.
+
+    Without both sides plus the trajectory's stamps, an unavailable-plan log cannot separate the two
+    and each guess costs a live run.
+    """
+    requested_paths = _requested_output_paths_for_ctx(ctx)
+    labels_by_path = _requested_output_labels_by_path(ctx)
+    return {
+        "requested_paths": sorted(requested_paths),
+        "label_paths": sorted(labels_by_path),
+        # The values, not just the keys: a fallen-back outcome sentence and a minted page noun have
+        # identical paths, and only the value says which one the binder was actually given.
+        "labels_by_path": {path: list(labels) for path, labels in sorted(labels_by_path.items())},
+        "paths_match": set(labels_by_path) == requested_paths,
+        "designations": len(_current_page_designations(ctx)),
+        "bail_reason": derivation_bail_reason(
+            flow_evidence=ctx.flow_evidence,
+            labels_by_path=labels_by_path,
+            witnessed_by_path=_witness_values_for_derivation(ctx),
+            requested_paths=requested_paths,
+        ),
+        "candidate_headings": bindable_candidate_headings(ctx.flow_evidence),
+        "flow_evidence_reached_via": [
+            str(entry.get("reached_via") or "") for entry in ctx.flow_evidence if isinstance(entry, dict)
+        ],
+    }
 
 
 def requested_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtractionPlan | None:
     requested_paths = _requested_output_paths_for_ctx(ctx)
     if not requested_paths:
         return None
-    labels_by_path = _requested_output_labels_by_path(ctx)
-    if set(labels_by_path) != requested_paths:
-        return None
-    return derive_requested_output_extraction_plan(
+    # Labels are one channel for meeting the request, not the definition of it: withholding the plan
+    # unless every requested path carried a label meant a page whose wording the request never uses
+    # was refused before the value witness that exists for it could be tried (SKY-13226).
+    labels_by_path = _labels_outranked_by_designation(ctx, _requested_output_labels_by_path(ctx))
+    plan = derive_requested_output_extraction_plan(
         flow_evidence=ctx.flow_evidence,
         labels_by_path=labels_by_path,
+        witnessed_by_path=_witness_values_for_derivation(ctx),
+        requested_paths=requested_paths,
     )
+    if plan is not None:
+        ctx.last_bound_requested_output_extraction_plan = plan
+        return plan
+    # The structured packet could not carry the designated element — it is truncated, or the value
+    # is not a relation the capture models. The probe already pinned it, so read it where it sits.
+    designated = plan_from_designations(_current_page_designations(ctx), requested_paths)
+    if designated is not None:
+        ctx.last_bound_requested_output_extraction_plan = designated
+        return designated
+    # Derivation reads the freshest packet, and most are truncated or unbindable, so a plan that did
+    # bind every requested path is answered with rather than re-derived away before the imposition
+    # that needs it. A changed request abandons it: it bound paths the turn no longer asks for.
+    retained = ctx.last_bound_requested_output_extraction_plan
+    if retained is not None and set(retained.requested_output_paths) == requested_paths:
+        return retained
+    return None
 
 
 def requested_scalar_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtractionPlan | None:
@@ -2325,13 +2537,15 @@ def requested_scalar_output_extraction_plan(ctx: AgentContext) -> RequestedOutpu
         if path in requested_paths and outcome:
             labels_by_path.setdefault(path, ())
             labels_by_path[path] += (outcome,)
-    # A path with no label is an underivable field; withholding the plan keeps a clarification legitimate.
-    if set(labels_by_path) != requested_paths:
-        return None
-    return derive_requested_output_extraction_plan(
+    plan = derive_requested_output_extraction_plan(
         flow_evidence=ctx.flow_evidence,
-        labels_by_path=labels_by_path,
+        labels_by_path=_labels_outranked_by_designation(ctx, labels_by_path),
+        witnessed_by_path=_witness_values_for_derivation(ctx),
+        requested_paths=requested_paths,
     )
+    if plan is not None:
+        return plan
+    return plan_from_designations(_current_page_designations(ctx), requested_paths)
 
 
 def requested_output_extraction_plan_changed(ctx: AgentContext, current: RequestedOutputExtractionPlan | None) -> bool:
@@ -2339,7 +2553,9 @@ def requested_output_extraction_plan_changed(ctx: AgentContext, current: Request
         return False
     previous = derive_requested_output_extraction_plan(
         flow_evidence=ctx.flow_evidence[:-1],
-        labels_by_path=_requested_output_labels_by_path(ctx),
+        labels_by_path=_labels_outranked_by_designation(ctx, _requested_output_labels_by_path(ctx)),
+        witnessed_by_path=_witness_values_for_derivation(ctx),
+        requested_paths=_requested_output_paths_for_ctx(ctx),
     )
     return previous is not None and previous.identity != current.identity
 

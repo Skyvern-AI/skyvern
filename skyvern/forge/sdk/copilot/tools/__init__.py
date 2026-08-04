@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 import structlog
 from agents import function_tool
 from agents.run_context import RunContextWrapper
+from typing_extensions import TypedDict
 
 from skyvern.forge import app as app
 from skyvern.forge.sdk.copilot.build_phase import (
@@ -24,12 +26,14 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 from skyvern.forge.sdk.copilot.composition_evidence import workflow_target_url as workflow_target_url
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
+from skyvern.forge.sdk.copilot.output_extraction_plan import value_designation_probe_expression
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY as _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
 )
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -39,6 +43,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import apply_block_edit, delete_blo
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 from ._shared import _COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS
+from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS as _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
 from ._shared import _FAILED_BLOCK_STATUSES as _FAILED_BLOCK_STATUSES
 from ._shared import BLOCK_RUNNING_TOOLS as BLOCK_RUNNING_TOOLS
 from ._shared import COPILOT_FINAL_REPLY_RESERVE_SECONDS as COPILOT_FINAL_REPLY_RESERVE_SECONDS
@@ -462,19 +467,122 @@ async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
     return await _persist_block_scoped_edit(copilot_ctx, "delete_block", workflow_yaml, arguments)
 
 
+_MAX_REQUESTED_OUTPUT_READS = 8
+
+# Probe outcomes that located the designated value without resolving it to a single element.
+_DESIGNATION_ERRORS_THAT_SAW_THE_VALUE = frozenset({"text-ambiguous", "path-unstable"})
+
+
+class RequestedOutputRead(TypedDict, total=False):
+    output_path: str
+    value_text: str
+    label: str
+
+
+async def _validate_requested_output_reads(
+    copilot_ctx: AgentContext, reads: list[RequestedOutputRead]
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Resolve each designated value against the live page; keep what pins, report what does not."""
+    validated: list[dict[str, Any]] = []
+    rejected: list[dict[str, str]] = []
+    server = copilot_ctx.discovery_mcp_server
+    if len(reads) > _MAX_REQUESTED_OUTPUT_READS:
+        rejected.append({"output_path": "", "error": f"only the first {_MAX_REQUESTED_OUTPUT_READS} reads were probed"})
+    for read in reads[:_MAX_REQUESTED_OUTPUT_READS]:
+        raw_path = str(read.get("output_path") or "")
+        value_text = str(read.get("value_text") or "").strip()
+        label = str(read.get("label") or "").strip()
+        # The model designates by the output's own name; "output." is our internal path prefix.
+        output_path = raw_path if raw_path.startswith("output.") else f"output.{raw_path}"
+        if not raw_path or not value_text:
+            rejected.append({"output_path": raw_path, "error": "malformed"})
+            continue
+        if server is None:
+            rejected.append({"output_path": output_path, "error": "no-browser"})
+            continue
+        expression = value_designation_probe_expression(value_text, label)
+        try:
+            raw = await asyncio.wait_for(
+                server.call_internal_tool("skyvern_evaluate", {"expression": expression}),
+                timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            rejected.append({"output_path": output_path, "error": "probe-failed"})
+            continue
+        payload = (raw.get("data") or {}).get("result") if isinstance(raw, dict) and raw.get("ok") else None
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (TypeError, ValueError):
+                payload = None
+        if not isinstance(payload, dict) or payload.get("error") or not isinstance(payload.get("text"), str):
+            error = str(payload.get("error")) if isinstance(payload, dict) and payload.get("error") else "no-result"
+            detail = {"output_path": output_path, "error": error, "value_text": value_text[:40]}
+            if isinstance(payload, dict):
+                for field_name in ("match_count", "visible_count"):
+                    if payload.get(field_name) is not None:
+                        detail[field_name] = str(payload[field_name])
+            rejected.append(detail)
+            # The probe failed to pin one element, not to find the value: several leaves showed it,
+            # or no stable path reached the one that did. The value is still what the model read off
+            # the page, and the relation capture carries its own uniqueness proof for it.
+            if error in _DESIGNATION_ERRORS_THAT_SAW_THE_VALUE and isinstance(payload, dict):
+                validated.append(
+                    {
+                        "output_path": output_path,
+                        "selector": "",
+                        "text": str(payload.get("text") or value_text),
+                        "url": str(payload.get("url") or ""),
+                    }
+                )
+            continue
+        resolved_selector = payload.get("selector")
+        validated.append(
+            {
+                "output_path": output_path,
+                "selector": resolved_selector if isinstance(resolved_selector, str) else "",
+                "match_count": payload.get("match_count"),
+                "position": payload.get("position"),
+                "text": payload["text"],
+                "url": payload.get("url") or "",
+            }
+        )
+    return validated, rejected
+
+
 @function_tool(name_override="synthesize_demonstrated_block")
-async def synthesize_demonstrated_block_tool(ctx: RunContextWrapper) -> str:
+async def synthesize_demonstrated_block_tool(
+    ctx: RunContextWrapper,
+    requested_output_reads: list[RequestedOutputRead] | None = None,
+) -> str:
     """Return code-block source built from the steps you already performed in the browser.
 
     This is compiled from your recorded interactions, so it reflects what actually happened rather
     than what you remember doing. Use it as the body of a code block instead of writing the steps
     again from memory, and edit it if the block needs to do more.
+
+    When the request asks the workflow to return values you can see on the page, pass
+    requested_output_reads: for each requested output, `value_text` is the value exactly as it is
+    rendered ("8.9K", not 8900) and `label` is the heading it sits under. The page resolves those to
+    the element and compiles a pinned deterministic read; you do not need to know its markup.
     """
     copilot_ctx = ctx.context
-    arguments: dict[str, Any] = {}
+    arguments: dict[str, Any] = {"requested_output_reads": requested_output_reads or []}
     loop_error = _tool_loop_error(copilot_ctx, "synthesize_demonstrated_block", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
+    rejected: list[dict[str, str]] = []
+    if requested_output_reads:
+        validated, rejected = await _validate_requested_output_reads(copilot_ctx, requested_output_reads)
+        copilot_ctx.requested_output_designations = validated
+        LOG.info(
+            "copilot_requested_output_designations",
+            pinned=[{"output_path": d["output_path"], "text": d["text"][:40]} for d in validated if d["selector"]],
+            value_only=[
+                {"output_path": d["output_path"], "text": d["text"][:40]} for d in validated if not d["selector"]
+            ],
+            rejected=rejected,
+        )
     source = _demonstrated_step_sources(copilot_ctx)
     if not source:
         result = {
@@ -482,7 +590,10 @@ async def synthesize_demonstrated_block_tool(ctx: RunContextWrapper) -> str:
             "error": "Nothing has been demonstrated in the browser yet, so there are no steps to compile.",
         }
     else:
-        result = {"ok": True, "data": {"code": source}}
+        data: dict[str, Any] = {"code": source}
+        if rejected:
+            data["rejected_output_reads"] = rejected
+        result = {"ok": True, "data": data}
     record_tool_step_result_for_ctx(copilot_ctx, "synthesize_demonstrated_block", arguments, result)
     return json.dumps(result)
 

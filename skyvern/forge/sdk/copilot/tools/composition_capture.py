@@ -38,6 +38,7 @@ from ._shared import (
     _discovery_extract_current_url,
     _discovery_navigate,
     _fallback_page_info,
+    _requested_capture_targets,
     _same_page_ignoring_fragment,
     _workflow_verification_evidence,
 )
@@ -270,7 +271,12 @@ async def _composition_evidence_after_navigation_failure(
     # error still parses via the stripped-body evaluate instead of yielding hollow evidence.
     html, html_error, html_truncated, _ = await _composition_get_html(ctx)
     if html_error is None:
-        evidence = parse_composition_html(html, inspected_url=inspected_url, current_url=current_url)
+        evidence = parse_composition_html(
+            html,
+            inspected_url=inspected_url,
+            current_url=current_url,
+            requested_targets=_requested_capture_targets(ctx),
+        )
         evidence = _composition_add_inspection_warning(
             evidence,
             f"navigation_error_before_html_capture: {navigation_error}",
@@ -476,7 +482,12 @@ async def _capture_composition_evidence(
         # stripped path only so a slow page is still retried without re-serializing the full DOM.
         if used_stripped:
             skip_raw = True
-        evidence = parse_composition_html(html, inspected_url=inspected_url, current_url=current_url)
+        evidence = parse_composition_html(
+            html,
+            inspected_url=inspected_url,
+            current_url=current_url,
+            requested_targets=_requested_capture_targets(copilot_ctx),
+        )
         used_structured = False
         if _composition_capture_settled(evidence):
             break
