@@ -70,6 +70,9 @@ _CURRENT_PAGE_TERMINAL_CHALLENGE_TOOLS = (
     | frozenset({"click", "navigate_browser", "press_key", "scroll", "select_option", "type_text"})
 )
 _OUTPUT_CONTRACT_LADDER_AUTHORING_TOOLS = frozenset({"update_workflow", "update_and_run_blocks"})
+_INFRASTRUCTURE_TOOL_ERROR_BLOCKED_TOOLS = BLOCK_RUNNING_TOOLS | frozenset(
+    {"update_workflow", "edit_block", "delete_block"}
+)
 
 
 async def _safe_read_workflow_run(
@@ -1411,6 +1414,7 @@ LOOP_PLANE_REFUSAL_REASON_CODES: frozenset[str] = frozenset(
         "tool_error_synthesized_block_persistence_required",
         "tool_error_challenge_gated_submit_disabled",
         "tool_error_non_retriable_nav",
+        "tool_error_infrastructure_unavailable",
         "tool_error_pending_reconciliation_no_input",
         "tool_error_pending_reconciliation_requires_input",
         "tool_error_per_tool_budget_rerun",
@@ -1440,6 +1444,37 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
         current_page_challenge_signal = _current_page_terminal_challenge_signal(ctx, arguments, tool_name)
         if current_page_challenge_signal is not None:
             return _emit_loop_plane_refusal(ctx, current_page_challenge_signal)
+
+    # The diagnosis contract's STOP only runs BETWEEN agent turns, so without this entrypoint
+    # check the model can re-author around an unreachable sandbox before the nudge ever fires.
+    infrastructure_error = getattr(ctx, "last_infrastructure_tool_error", None)
+    if (
+        tool_name in _INFRASTRUCTURE_TOOL_ERROR_BLOCKED_TOOLS
+        and isinstance(infrastructure_error, str)
+        and infrastructure_error
+    ):
+        return _emit_loop_plane_refusal(
+            ctx,
+            CopilotToolBlockerSignal(
+                blocker_kind="tool_error",
+                agent_steering_text=(
+                    f"The last run failed because the code sandbox was unreachable ({infrastructure_error[:200]}). "
+                    "The user's code is not at fault. Do NOT edit, delete, or re-run any block — reply to the "
+                    "user explaining that the code sandbox is unavailable and asking them to retry shortly."
+                ),
+                user_facing_reason=(
+                    "The code sandbox is unavailable right now, so I couldn't test your code block. "
+                    "Your code is unchanged — please try again in a few minutes."
+                ),
+                recovery_hint="ask_user_clarifying",
+                cleared_by_tools=frozenset(),
+                # The reply promises the user's code is unchanged, so the unpersisted draft
+                # has to survive the turn that says so.
+                preserves_workflow_draft=True,
+                internal_reason_code="tool_error_infrastructure_unavailable",
+                blocked_tool=tool_name,
+            ),
+        )
 
     persistence_signal = synthesized_block_persistence_signal(ctx, tool_name, arguments)
     if persistence_signal is not None:

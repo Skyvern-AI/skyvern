@@ -247,6 +247,21 @@ _SANDBOX_REQUIRED_BLOCK_TYPES = frozenset(
     }
 )
 
+# Sandbox-process faults, not authored-code faults. ``timeout`` and ``user_code_error`` stay
+# out: both are repairable despite also carrying ``runner_internal_error``. ``busy`` is in —
+# a saturated runner gate says nothing about the code, so rewriting it cannot help.
+INFRASTRUCTURE_RUNNER_ERROR_CODES: frozenset[str] = frozenset(
+    {
+        "runner_unavailable",
+        "protocol_error",
+        "internal_error",
+        "child_exited",
+        "child_no_request",
+        "child_malformed_request",
+        "busy",
+    }
+)
+
 # Detached cleanup tasks held here so the garbage collector does not drop them
 # while they still have work to do, and so the "task exception was never
 # retrieved" warning cannot fire — each task adds a done-callback that logs
@@ -2264,6 +2279,8 @@ async def _run_blocks_and_collect_debug(
             }
             if block.failure_reason:
                 block_result["failure_reason"] = block.failure_reason
+            if block.error_codes:
+                block_result["error_codes"] = list(block.error_codes)
             if hasattr(block, "output") and block.output:
                 block_result["extracted_data"] = block.output
                 if block.label is not None:
@@ -2752,6 +2769,24 @@ def _detect_non_retriable_nav_error(result: dict[str, Any]) -> str | None:
     return next((reason for reason in iter_failure_reasons(result) if is_skip_inner_retry_error(reason)), None)
 
 
+def _infrastructure_runner_error_codes(result: dict[str, Any]) -> list[str]:
+    data = result.get("data")
+    blocks = data.get("blocks") if isinstance(data, dict) else None
+    if not isinstance(blocks, list):
+        return []
+    found: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        codes = block.get("error_codes")
+        if not isinstance(codes, list):
+            continue
+        for code in codes:
+            if isinstance(code, str) and code in INFRASTRUCTURE_RUNNER_ERROR_CODES and code not in found:
+                found.append(code)
+    return found
+
+
 def _update_verification_evidence_from_run_result(copilot_ctx: AgentContext, result: Mapping[str, object]) -> None:
     evidence = _workflow_verification_evidence(copilot_ctx)
     data_value = result.get("data")
@@ -2888,6 +2923,7 @@ def _record_run_blocks_result(
     prior_budget_flag = copilot_ctx.last_failure_category_top == PER_TOOL_BUDGET_FAILURE_CATEGORY
     copilot_ctx.last_failure_category_top = None
     copilot_ctx.last_test_non_retriable_nav_error = None
+    copilot_ctx.last_infrastructure_tool_error = None
     copilot_ctx.post_run_page_observation_tool = None
     copilot_ctx.post_run_page_observation_url = None
     copilot_ctx.post_run_page_observation_workflow_run_id = None
@@ -2897,6 +2933,22 @@ def _record_run_blocks_result(
 
     structured_blocker = _run_blocks_structured_blocker_message(result, copilot_ctx)
     anti_bot_match, empty_data_blocks, failure_categories = _analyze_run_blocks(result, copilot_ctx)
+    infrastructure_runner_codes = _infrastructure_runner_error_codes(result)
+    if infrastructure_runner_codes:
+        copilot_ctx.last_infrastructure_tool_error = ", ".join(infrastructure_runner_codes)
+        # Prepended, not appended: `last_failure_category_top` reads entry zero, and the
+        # infrastructure fault outranks whatever the block's prose was classified as.
+        failure_categories = [
+            {
+                "category": "UNRECOVERABLE_TOOL_ERROR",
+                "confidence_float": 1.0,
+                "reasoning": (
+                    "The code sandbox was unreachable "
+                    f"({copilot_ctx.last_infrastructure_tool_error}); no edit to the block can reach it."
+                ),
+            },
+            *(failure_categories or []),
+        ]
     artifact_flag_key = _artifact_challenge_flag_from_result(result, copilot_ctx)
     anti_bot_source = first_carrier_backed_anti_bot_source(failure_categories) if anti_bot_match else None
     anti_bot_evidence_source = anti_bot_source.value if anti_bot_source else None

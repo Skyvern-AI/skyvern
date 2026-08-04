@@ -61,6 +61,7 @@ BuildTestOutcomeReasonCode = Literal[
     "blocker_reported",
     "failed_run",
     "run_completed_unevaluated",
+    "unrecoverable_tool_error",
     "suspicious_success",
     "missing_structural_evidence",
     "unchanged_after_recorded_outcome",
@@ -90,6 +91,7 @@ _REF_TEXT_MAX = 96
 _VALUE_EXCERPT_MAX = 700
 _HISTORY_LIMIT = 8
 _INSPECT_PAGE_SOURCE_TOOL = "inspect_page_for_composition"
+_UNRECOVERABLE_TOOL_ERROR_CATEGORY = "UNRECOVERABLE_TOOL_ERROR"
 _PLAYWRIGHT_LOCATOR_WAIT_RE = re.compile(
     r"waiting for locator\((?P<quote>['\"])(?P<selector>.*?)(?P=quote)\)"
     r"(?P<locator_chain>(?:\.[A-Za-z_][A-Za-z0-9_]*(?:\([^)]*\))?)*)\s+to be (?P<state>[a-z_]+)",
@@ -1385,6 +1387,13 @@ def recorded_outcome_from_run_blocks_result(
         if failed_block is not None or not bool(result.get("ok"))
         else "run_completed_unevaluated"
     )
+    if any(ref.split(":", 1)[0] == _UNRECOVERABLE_TOOL_ERROR_CATEGORY for ref in failure_categories):
+        # The run failed on the tool plane, not on what was authored, so it is not test
+        # signal: dropping the identity keys it out of outcome dedup and grounding too.
+        verdict = "not_authoritative"
+        reason_code = "unrecoverable_tool_error"
+        structural_identity = ""
+        page_refs = []
     has_runtime_failure_evidence = bool(failure_categories or failure_type or runtime_failure_identity or failed_block)
     if (
         verdict == "repairable_failure"

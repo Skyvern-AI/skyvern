@@ -927,6 +927,9 @@ class CopilotContext(AgentContext):
     # exception in run_with_enforcement. Cleared at the top of every call to
     # _record_run_blocks_result so stale state can't leak across runs.
     last_test_non_retriable_nav_error: str | None = None
+    # Secure-runner codes from the latest run that were faults of the sandbox itself, joined.
+    # Cleared per run in _record_run_blocks_result, so a later clean run releases the guard.
+    last_infrastructure_tool_error: str | None = None
     # Normalized signature of the non-retriable nav error last nudged on.
     # Lets the stop nudge re-fire if the user retries with a different bad URL
     # (different signature) in the same session. Cleared on meaningful success.
