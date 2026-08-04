@@ -60,6 +60,11 @@ class BrowserManager(Protocol):
         organization_id: str | None = None,
     ) -> BrowserState: ...
 
+    def live_session_runnable_ids(self) -> set[str]:
+        """Runnables holding a persistent session in this process — leased, or mid-acquisition — i.e.
+        still running here. An implementation that tracks none reports none and is never protected."""
+        return set()
+
     async def cleanup_for_script(
         self,
         script_id: str,

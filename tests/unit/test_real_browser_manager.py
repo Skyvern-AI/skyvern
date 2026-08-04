@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.exceptions import MissingBrowserStateForBrowserSession
 from skyvern.forge.sdk.artifact.storage.recording_test_helpers import fake_prepared_recording
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -1079,6 +1080,105 @@ async def test_public_workflow_cleanup_installs_closing_tombstone_before_first_a
     allow_cleanup.set()
     await cleanup
     assert attached is False
+
+
+@pytest.mark.asyncio
+async def test_script_acquisition_reports_a_live_session_before_the_lease_exists() -> None:
+    # begin_session publishes occupancy, but the lease only lands once the attach returns — and occupy
+    # does not extend started_at/timeout_minutes. A reused session already past timeout+grace would
+    # therefore sit occupied-but-unleased for the whole attach, and the reaper (which reads liveness
+    # from this manager) would reap it out from under the run.
+    manager = RealBrowserManager()
+    pbs_state = MagicMock()
+    pbs_state.get_working_page = AsyncMock(return_value=None)
+    pbs_state.get_or_create_page = AsyncMock()
+    during_attach: list[set[str]] = []
+
+    async def _begin_session(**kwargs: object) -> str:
+        during_attach.append(manager.live_session_runnable_ids())
+        return "gen_attach"
+
+    async def _get_browser_state(*args: object, **kwargs: object) -> MagicMock:
+        during_attach.append(manager.live_session_runnable_ids())
+        return pbs_state
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock(side_effect=_begin_session)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(side_effect=_get_browser_state)
+
+        await manager.get_or_create_for_script(
+            script_id="s_attach",
+            browser_session_id="pbs_attach",
+            organization_id="org_test",
+        )
+
+    assert during_attach == [{"s_attach"}, {"s_attach"}]
+    # The lease takes over with no gap once the attach completes.
+    assert manager._persistent_session_leases["s_attach"].runnable_id == "s_attach"
+    assert manager.live_session_runnable_ids() == {"s_attach"}
+
+
+@pytest.mark.asyncio
+async def test_failed_script_acquisition_leaves_no_live_session_behind() -> None:
+    # A cold/evicted session fails closed. The in-flight marker must not outlive the attempt, or a run
+    # that never started would protect the session from the reaper forever.
+    manager = RealBrowserManager()
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock(return_value="gen_cold")
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
+
+        with pytest.raises(MissingBrowserStateForBrowserSession):
+            await manager.get_or_create_for_script(
+                script_id="s_cold",
+                browser_session_id="pbs_cold",
+                organization_id="org_test",
+            )
+
+    assert manager.live_session_runnable_ids() == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "release_outcome",
+    [{"return_value": False}, {"side_effect": RuntimeError("db unreachable")}],
+    ids=["cas_miss", "raises"],
+)
+async def test_script_cleanup_drops_lease_even_when_release_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    release_outcome: dict,
+) -> None:
+    # Unlike a workflow run, a script's cleanup runs once at run_script's terminal boundary, so
+    # nothing re-invokes it to retry a failed release — retaining the lease can only strand it. The
+    # reaper reads that lease as "still running" and would skip the session forever, so drop the
+    # lease either way and leave the still-occupied row to the reaper.
+    script_id = "s_release_failed"
+    manager = RealBrowserManager()
+    browser_state = MagicMock()
+    browser_state.browser_artifacts.traces_dir = None
+    browser_state.close = AsyncMock(return_value=False)
+    manager.pages[script_id] = browser_state
+    manager._persistent_session_leases[script_id] = _PersistentSessionLease(
+        session_id="pbs_release_failed",
+        organization_id="org_test",
+        runnable_id=script_id,
+        browser_state=browser_state,
+    )
+    sessions = MagicMock()
+    sessions.release_browser_session = AsyncMock(**release_outcome)
+    monkeypatch.setattr(real_browser_manager, "app", MagicMock(PERSISTENT_SESSIONS_MANAGER=sessions))
+
+    await manager.cleanup_for_script(
+        script_id,
+        close_browser_on_completion=False,
+        browser_session_id="pbs_release_failed",
+        organization_id="org_test",
+    )
+
+    assert script_id not in manager._persistent_session_leases
+    sessions.release_browser_session.assert_awaited_once()
 
 
 @pytest.mark.asyncio

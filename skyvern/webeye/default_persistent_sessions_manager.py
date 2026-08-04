@@ -752,11 +752,18 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
 
         A run that dies before release_browser_session leaves runnable_id set forever; treating a
         terminal or missing owner as inactive lets the normal timeout+grace gate reclaim the session
-        instead of skipping it forever. Owners we can't authoritatively resolve — an unrecognized
-        runnable type or a lookup failure — are treated as active, so a reap never races a run we
-        can't prove is gone."""
+        instead of skipping it forever. A resolvable owner whose lookup fails is treated as active,
+        so a reap never races a run we could have proven live but couldn't reach.
+
+        A runnable type we have no lookup for can't be resolved either way, so the only liveness
+        signal left is process-local: a runnable holding a session here — mid-acquisition or leased —
+        is still running (nothing renews a standalone script's session, so its run can outlive the
+        timeout). Once that ends at the run's terminal boundary the session falls through to the
+        caller's own gate — timeout+grace in the reaper, a terminal row in reconcile — rather than
+        staying protected forever. A new runnable type that occupies a session must therefore either
+        be resolvable here or report itself live there, or its runs are reaped mid-flight."""
         if runnable_type not in (RunType.workflow_run, PBS_TASK_RUNNABLE_TYPE):
-            return True
+            return runnable_id in app.BROWSER_MANAGER.live_session_runnable_ids()
         try:
             if runnable_type == PBS_TASK_RUNNABLE_TYPE:
                 owner = await self.database.tasks.get_task(runnable_id, organization_id=organization_id)
@@ -862,7 +869,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             # cleanup — never yank a browser out from under a live task/workflow. But close only sets
             # completed_at/status without clearing runnable_id, and a completed row is invisible to
             # reap_expired_sessions, so resolve the owner the same way the reaper does and skip only a
-            # still-live/unknown owner; a terminal/missing owner falls through to reclaim below.
+            # still-live owner; a terminal/missing/unresolvable owner falls through to reclaim below.
             if (
                 db_session is not None
                 and db_session.runnable_id is not None
