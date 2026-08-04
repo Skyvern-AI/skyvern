@@ -1050,6 +1050,7 @@ async def test_real_browser_manager_adoption_resolves_context_run_id() -> None:
     workflow_run = MagicMock(
         workflow_run_id="wr_x", parent_workflow_run_id=None, browser_profile_id=None, organization_id="org_1"
     )
+    manager._persistent_session_leases = {}
     browser_state = MagicMock()
     browser_state.get_working_page = AsyncMock(return_value=None)
     browser_state.get_or_create_page = AsyncMock()
