@@ -15,7 +15,7 @@ import pytest
 
 from skyvern.config import settings
 from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
-from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.block import CODE_BLOCK_TAB_OPEN_FAILURE_REASON, CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
@@ -927,7 +927,8 @@ async def wrapper({default_args}):
         assert (open_attempts, created_pages) == (1, 0)
         assert result.success is False
         assert result.status == BlockStatus.failed
-        assert result.failure_reason == "No page found to run the code block"
+        assert result.failure_reason == CODE_BLOCK_TAB_OPEN_FAILURE_REASON
+        assert result.failure_reason != "No page found to run the code block"
 
     def test_poc_blocked_at_is_safe_code_gate(self) -> None:
         """The PoC payload is rejected before exec() is ever called."""
