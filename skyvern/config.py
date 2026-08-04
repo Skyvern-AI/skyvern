@@ -861,6 +861,10 @@ class Settings(BaseSettings):
             LOG.warning("Invalid WORKER_STALL_DUMP_SECONDS=%r; using default 0", value)
             return 0
 
+    @property
+    def is_skyvern_base_url_explicitly_configured(self) -> bool:
+        return "SKYVERN_BASE_URL" in self.model_fields_set
+
     def get_model_name_to_llm_key(self, organization_id: str | None = None) -> dict[str, dict[str, str]]:
         """
         Keys are model names available to blocks in the frontend. These map to key names
