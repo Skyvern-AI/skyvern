@@ -26,7 +26,9 @@ from skyvern.exceptions import (
     NoTOTPSecretFound,
     ScriptTerminationException,
     SkyvernActionFailed,
+    SkyvernHTTPException,
 )
+from skyvern.services import script_service
 
 
 class _KeyboardStub:
@@ -88,6 +90,152 @@ def mock_scraped_page():
 @pytest.fixture
 def mock_ai():
     return _AiStub()
+
+
+def _build_navigation_page(page_type, mock_scraped_page, mock_ai):
+    raw_page = MagicMock(spec=["goto"])
+    raw_page.goto = AsyncMock()
+    with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
+        if page_type is ScriptSkyvernPage:
+            return page_type(scraped_page=mock_scraped_page, page=raw_page, ai=mock_ai), raw_page
+        return page_type(page=raw_page, ai=mock_ai), raw_page
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_type", [SkyvernPage, ScriptSkyvernPage])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1/loopback",
+        "http://169.254.169.254/latest/meta-data",
+    ],
+)
+async def test_page_navigation_rejects_internal_destination(page_type, url, mock_scraped_page, mock_ai):
+    page, raw_page = _build_navigation_page(page_type, mock_scraped_page, mock_ai)
+
+    with pytest.raises(SkyvernHTTPException):
+        await page.goto(url)
+
+    raw_page.goto.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_type", [SkyvernPage, ScriptSkyvernPage])
+async def test_page_navigation_accepts_public_destination(page_type, mock_scraped_page, mock_ai):
+    page, raw_page = _build_navigation_page(page_type, mock_scraped_page, mock_ai)
+
+    await page.goto("https://93.184.216.34/path")
+
+    raw_page.goto.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_script_service_goto_fallback_rejects_blocked_destination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url = "http://127.0.0.1/loopback"
+    page = MagicMock()
+    page.goto = AsyncMock()
+    run_context = SimpleNamespace(page=page)
+    monkeypatch.setattr(
+        script_service,
+        "_validate_and_get_output_parameter",
+        AsyncMock(side_effect=RuntimeError("force fallback")),
+    )
+    monkeypatch.setattr(
+        script_service.script_run_context_manager,
+        "ensure_run_context",
+        MagicMock(return_value=run_context),
+    )
+
+    with pytest.raises(SkyvernHTTPException):
+        await script_service.goto(url)
+
+    page.goto.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_script_service_goto_fallback_accepts_permitted_destination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url = "https://93.184.216.34/path"
+    page = MagicMock()
+    page.goto = AsyncMock()
+    run_context = SimpleNamespace(page=page)
+    monkeypatch.setattr(
+        script_service,
+        "_validate_and_get_output_parameter",
+        AsyncMock(side_effect=RuntimeError("force fallback")),
+    )
+    monkeypatch.setattr(
+        script_service.script_run_context_manager,
+        "ensure_run_context",
+        MagicMock(return_value=run_context),
+    )
+
+    await script_service.goto(url)
+
+    page.goto.assert_awaited_once_with(url)
+
+
+@pytest.mark.asyncio
+async def test_script_service_goto_fallback_rejects_rendered_blocked_destination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url = "{{ target }}"
+    rendered_url = "http://127.0.0.1/loopback"
+    page = MagicMock()
+    page.goto = AsyncMock()
+    run_context = SimpleNamespace(page=page)
+    render_template = MagicMock(return_value=rendered_url)
+    validate_fetch_url = MagicMock(wraps=script_service.validate_fetch_url)
+    monkeypatch.setattr(
+        script_service,
+        "_validate_and_get_output_parameter",
+        AsyncMock(side_effect=RuntimeError("force fallback")),
+    )
+    monkeypatch.setattr(script_service, "_render_template_with_label", render_template)
+    monkeypatch.setattr(script_service, "validate_fetch_url", validate_fetch_url)
+    monkeypatch.setattr(
+        script_service.script_run_context_manager,
+        "ensure_run_context",
+        MagicMock(return_value=run_context),
+    )
+
+    with pytest.raises(SkyvernHTTPException):
+        await script_service.goto(url)
+
+    render_template.assert_called_once_with(url, None)
+    validate_fetch_url.assert_called_once_with(rendered_url)
+    page.goto.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_script_service_goto_fallback_navigates_to_rendered_permitted_destination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url = "{{ target }}"
+    rendered_url = "https://93.184.216.34/path"
+    page = MagicMock()
+    page.goto = AsyncMock()
+    run_context = SimpleNamespace(page=page)
+    render_template = MagicMock(return_value=rendered_url)
+    monkeypatch.setattr(
+        script_service,
+        "_validate_and_get_output_parameter",
+        AsyncMock(side_effect=RuntimeError("force fallback")),
+    )
+    monkeypatch.setattr(script_service, "_render_template_with_label", render_template)
+    monkeypatch.setattr(
+        script_service.script_run_context_manager,
+        "ensure_run_context",
+        MagicMock(return_value=run_context),
+    )
+
+    await script_service.goto(url)
+
+    render_template.assert_called_once_with(url, None)
+    page.goto.assert_awaited_once_with(rendered_url)
 
 
 @pytest.mark.asyncio
