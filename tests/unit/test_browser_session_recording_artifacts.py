@@ -13,6 +13,7 @@ Mirrors the SKY-8861 download artifact pipeline in
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import urlparse
 
@@ -248,6 +249,8 @@ async def test_sync_browser_session_file_registers_recording_artifact(tmp_path):
     mock_create = AsyncMock(return_value="a_new")
     mock_artifact_manager = MagicMock()
     mock_artifact_manager.create_browser_session_recording_artifact = mock_create
+    sync_clips = AsyncMock()
+    recording_finalized_at = datetime(2026, 4, 26, tzinfo=UTC)
 
     @asynccontextmanager
     async def fake_prepare_recording_for_upload(path: str):
@@ -258,6 +261,7 @@ async def test_sync_browser_session_file_registers_recording_artifact(tmp_path):
         patch("skyvern.forge.sdk.artifact.storage.s3.prepare_recording_for_upload", fake_prepare_recording_for_upload),
         patch.object(storage, "_get_storage_class_for_org", new=AsyncMock(return_value=MagicMock())),
         patch("skyvern.forge.sdk.artifact.storage.s3.calculate_sha256_for_file", return_value="sha-r"),
+        patch("skyvern.forge.sdk.artifact.storage.s3.sync_run_recording_clips", sync_clips),
         patch("skyvern.forge.sdk.artifact.storage.s3.app") as app_module,
     ):
         app_module.ARTIFACT_MANAGER = mock_artifact_manager
@@ -268,9 +272,11 @@ async def test_sync_browser_session_file_registers_recording_artifact(tmp_path):
             local_file_path=str(recording_file),
             remote_path="recording.webm",
             date="2026-04-26",
+            recording_finalized_at=recording_finalized_at,
         )
 
     storage.async_client.upload_file_from_path.assert_awaited_once()
+    assert storage.async_client.upload_file_from_path.await_args.kwargs["raise_exception"] is True
     assert storage.async_client.upload_file_from_path.call_args.args[0].endswith("/recording.mp4")
     assert storage.async_client.upload_file_from_path.call_args.args[1] == str(compressed_file)
     mock_create.assert_awaited_once()
@@ -282,6 +288,7 @@ async def test_sync_browser_session_file_registers_recording_artifact(tmp_path):
     assert kwargs["file_size"] == compressed_file.stat().st_size
     assert kwargs["uri"].startswith("s3://") and "/browser_sessions/pbs_1/videos/" in kwargs["uri"]
     assert kwargs["uri"].endswith("/recording.mp4")
+    assert sync_clips.await_args.kwargs["now"] == recording_finalized_at
 
 
 @pytest.mark.asyncio

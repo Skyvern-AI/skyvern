@@ -59,6 +59,7 @@ from skyvern.constants import (
 )
 from skyvern.exceptions import (
     AzureConfigurationError,
+    BranchEvaluationContextTooLargeError,
     CodeBlockRunnerSelectionError,
     ConditionalBranchEvaluationError,
     ContextParameterValueNotFound,
@@ -202,6 +203,7 @@ from skyvern.schemas.workflows import (
 from skyvern.services import otp_service
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.self_heal_cap import check_and_increment_self_heal_cap
+from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
 from skyvern.utils.token_counter import count_tokens
@@ -11496,6 +11498,32 @@ def _parse_single_evaluation(
 # recovers most of them while still failing loudly when the model is persistently wrong.
 MAX_PROMPT_BRANCH_EVAL_ATTEMPTS = 2
 
+# Reserve 30k downstream tokens, about 4.7x the measured 6.4k non-goal overhead; this is not a
+# large-page bound, so the generic guard remains. Fail closed because truncation could silently change branch selection.
+BRANCH_EVALUATION_DOWNSTREAM_TOKEN_RESERVE = 30_000
+BRANCH_EVALUATION_GOAL_MAX_TOKENS = PROMPT_HARD_CEILING_TOKENS - BRANCH_EVALUATION_DOWNSTREAM_TOKEN_RESERVE
+BRANCH_CONTEXT_CIRCUIT_BREAKER_EVENT = "conditional_branch_context_circuit_breaker_tripped"
+BRANCH_CONTEXT_CONTRIBUTOR_LIMIT = 5
+
+
+def _largest_branch_context_contributors(context_snapshot: dict[str, Any]) -> list[dict[str, int | str]]:
+    """Return privacy-safe sizes for the largest snapshot values, never their keys or contents."""
+    largest_values: list[tuple[int, str, str]] = []
+    for key, value in context_snapshot.items():
+        serialized_value = json.dumps(value, default=str)
+        largest_values.append((len(serialized_value.encode("utf-8")), key, serialized_value))
+        largest_values.sort(key=lambda item: item[0], reverse=True)
+        del largest_values[BRANCH_CONTEXT_CONTRIBUTOR_LIMIT:]
+
+    return [
+        {
+            "key_fingerprint": diagnostic_fingerprint(key),
+            "serialized_bytes": serialized_bytes,
+            "token_count": count_tokens(serialized_value),
+        }
+        for serialized_bytes, key, serialized_value in largest_values
+    ]
+
 
 def _build_branch_evaluation_schema(num_branches: int) -> dict[str, Any]:
     """Strict JSON schema for the batched branch-evaluation LLM call.
@@ -11847,6 +11875,7 @@ async def _evaluate_prompt_branch_conditions_batch(
 
         rendered_expressions.append(rendered_expression)
 
+    context_snapshot: dict[str, Any] = {}
     if has_any_pure_natlang:
         context_snapshot = evaluation_context.build_llm_safe_context_snapshot()
         context_json = json.dumps(context_snapshot, default=str)
@@ -11858,6 +11887,27 @@ async def _evaluate_prompt_branch_conditions_batch(
         conditions=rendered_expressions,
         context_json=context_json,
     )
+
+    goal_token_count = count_tokens(extraction_goal)
+    if goal_token_count > BRANCH_EVALUATION_GOAL_MAX_TOKENS:
+        context_token_count = count_tokens(context_json) if context_json is not None else 0
+        context_serialized_bytes = len(context_json.encode("utf-8")) if context_json is not None else 0
+        LOG.warning(
+            BRANCH_CONTEXT_CIRCUIT_BREAKER_EVENT,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            workflow_id=workflow_id,
+            organization_id=organization_id,
+            block_label=log_label,
+            goal_token_count=goal_token_count,
+            max_goal_tokens=BRANCH_EVALUATION_GOAL_MAX_TOKENS,
+            reserved_tokens=BRANCH_EVALUATION_DOWNSTREAM_TOKEN_RESERVE,
+            context_token_count=context_token_count,
+            context_serialized_bytes=context_serialized_bytes,
+            context_key_count=len(context_snapshot),
+            top_context_contributors=_largest_branch_context_contributors(context_snapshot),
+        )
+        raise BranchEvaluationContextTooLargeError
 
     data_schema = _build_branch_evaluation_schema(len(branches))
 
@@ -12108,6 +12158,8 @@ class ConditionalBlock(Block):
                     branch.id: rendered
                     for branch, rendered in zip(natural_language_branches, prompt_rendered_expressions, strict=False)
                 }
+            except BranchEvaluationContextTooLargeError as exc:
+                failure_reason = get_user_facing_exception_message(exc)
             except Exception as exc:
                 failure_reason = f"Failed to evaluate natural language branches: {str(exc)}"
                 LOG.error(
