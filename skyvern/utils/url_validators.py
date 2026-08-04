@@ -15,6 +15,7 @@ MAX_SAFE_REDIRECTS = 10
 
 _BLOCKED_INTERNAL_HOSTNAMES = frozenset({"localhost", "metadata.google.internal", "kubernetes.default.svc"})
 _BLOCKED_INTERNAL_SUFFIXES = (".local", ".localhost", ".internal", ".cluster.local")
+_LOCAL_BROWSER_HOSTNAMES = frozenset({"localhost", "host.docker.internal"})
 _BLOCKED_IP_NETWORKS = tuple(
     ipaddress.ip_network(network)
     for network in (
@@ -134,6 +135,21 @@ def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return bool(
         ip.is_private or ip.is_link_local or ip.is_loopback or ip.is_reserved or ip.is_multicast or ip.is_unspecified
     )
+
+
+def is_allowed_local_browser_host(host: str) -> bool:
+    if settings.ENV != "local":
+        return False
+    normalized = _normalize_host(host)
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return normalized in _LOCAL_BROWSER_HOSTNAMES
+
+
+def validate_browser_host(host: str, *, resolve_dns: bool = False) -> None:
+    if not is_allowed_local_browser_host(host) and is_blocked_host(host, resolve_dns=resolve_dns):
+        raise BlockedHost(host=host)
 
 
 def _is_allowed_host(host: str) -> bool:

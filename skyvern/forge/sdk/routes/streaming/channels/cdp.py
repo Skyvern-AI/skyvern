@@ -137,7 +137,12 @@ class CdpChannel:
             close_task = asyncio.create_task(self.close())
             close_task.add_done_callback(lambda _: asyncio.create_task(self.connect()))  # TODO: avoid blind reconnect
 
-        self.browser = await connect_over_cdp_with_diagnostics(pw, url, headers=headers if headers else None)
+        self.browser = await connect_over_cdp_with_diagnostics(
+            pw,
+            url,
+            headers=headers if headers else None,
+            validate_browser_address=False,
+        )
         self.browser.on("disconnected", on_close)
 
         await self.apply_download_behavior(self.browser)

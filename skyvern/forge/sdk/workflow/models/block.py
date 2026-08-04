@@ -5547,7 +5547,7 @@ async def wrapper({default_args}):
             # (SKY-13338) — no reconnect or retry from here can fix that.
             try:
                 page = await browser_state.get_or_create_page()
-            except Exception:
+            except Exception as e:
                 LOG.exception(
                     "Failed to open a page to run the code block",
                     workflow_run_id=workflow_run_id,
@@ -5558,7 +5558,7 @@ async def wrapper({default_args}):
                 )
                 return await self.build_block_result(
                     success=False,
-                    failure_reason=CODE_BLOCK_TAB_OPEN_FAILURE_REASON,
+                    failure_reason=f"{CODE_BLOCK_TAB_OPEN_FAILURE_REASON} ({type(e).__name__})",
                     output_parameter_value=None,
                     status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,

@@ -144,6 +144,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
 from skyvern.schemas.runs import (
+    BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY,
     CUA_ENGINES,
     MAX_SEARCH_FETCH_LIMIT,
     BlockRunRequest,
@@ -3617,25 +3618,28 @@ def _workflow_run_request_from_workflow_request(
     title: str | None,
     workflow_request: WorkflowRequestBody,
 ) -> WorkflowRunRequest:
-    return WorkflowRunRequest(
-        workflow_id=workflow_id,
-        title=title,
-        parameters=workflow_request.data,
-        proxy_location=workflow_request.proxy_location,
-        webhook_url=workflow_request.webhook_callback_url,
-        totp_url=workflow_request.totp_verification_url,
-        totp_identifier=workflow_request.totp_identifier,
-        browser_session_id=workflow_request.browser_session_id,
-        browser_profile_id=workflow_request.browser_profile_id,
-        start_fresh_browser=workflow_request.start_fresh_browser,
-        max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
-        max_elapsed_time_minutes=getattr(workflow_request, "max_elapsed_time_minutes", None),
-        extra_http_headers=workflow_request.extra_http_headers,
-        cdp_connect_headers=workflow_request.cdp_connect_headers,
-        browser_address=workflow_request.browser_address,
-        run_with=workflow_request.run_with,
-        ai_fallback=workflow_request.ai_fallback,
-        run_metadata=workflow_request.run_metadata,
+    return WorkflowRunRequest.model_validate(
+        {
+            "workflow_id": workflow_id,
+            "title": title,
+            "parameters": workflow_request.data,
+            "proxy_location": workflow_request.proxy_location,
+            "webhook_url": workflow_request.webhook_callback_url,
+            "totp_url": workflow_request.totp_verification_url,
+            "totp_identifier": workflow_request.totp_identifier,
+            "browser_session_id": workflow_request.browser_session_id,
+            "browser_profile_id": workflow_request.browser_profile_id,
+            "start_fresh_browser": workflow_request.start_fresh_browser,
+            "max_screenshot_scrolls": workflow_request.max_screenshot_scrolls,
+            "max_elapsed_time_minutes": getattr(workflow_request, "max_elapsed_time_minutes", None),
+            "extra_http_headers": workflow_request.extra_http_headers,
+            "cdp_connect_headers": workflow_request.cdp_connect_headers,
+            "browser_address": workflow_request.browser_address,
+            "run_with": workflow_request.run_with,
+            "ai_fallback": workflow_request.ai_fallback,
+            "run_metadata": workflow_request.run_metadata,
+        },
+        context={BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY: True},
     )
 
 

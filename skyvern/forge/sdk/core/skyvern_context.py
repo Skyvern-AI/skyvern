@@ -103,6 +103,7 @@ class SkyvernContext:
     browser_session_runnable_id: str | None = None
     browser_session_runnable_generation_id: str | None = None
     browser_runtime: str | None = None
+    browser_address_is_server_assigned: bool = False
     tz_info: ZoneInfo | None = None
     run_id: str | None = None
     copilot_session_id: str | None = None
