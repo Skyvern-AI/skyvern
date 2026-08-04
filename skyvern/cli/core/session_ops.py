@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from skyvern.client.types.extensions import Extensions
-from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
+from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, proxy_location_to_request
 
 
 @dataclass
@@ -16,6 +16,7 @@ class SessionCreateResult:
     local: bool = False
     headless: bool = False
     timeout_minutes: int | None = None
+    app_url: str | None = None
 
 
 @dataclass
@@ -67,6 +68,7 @@ async def do_session_create(
     generate_browser_profile: bool = False,
     local: bool = False,
     headless: bool = False,
+    connect_browser: bool = True,
 ) -> tuple[Any, SessionCreateResult]:
     """Create browser session. Returns (browser, result)."""
     if local:
@@ -78,6 +80,25 @@ async def do_session_create(
         return browser, SessionCreateResult(session_id=None, local=True, headless=headless)
 
     proxy = coerce_proxy_location(proxy_location)
+    if not connect_browser:
+        create_kwargs: dict[str, Any] = {
+            "timeout": timeout,
+            "proxy_location": proxy_location_to_request(proxy),
+        }
+        if extensions is not None:
+            create_kwargs["extensions"] = extensions
+        if browser_profile_id is not None:
+            create_kwargs["browser_profile_id"] = browser_profile_id
+        browser_session = await skyvern.create_browser_session(**create_kwargs)
+        session_id = browser_session.browser_session_id
+        if generate_browser_profile and session_id:
+            await do_session_arm_generate_browser_profile(skyvern, session_id)
+        return None, SessionCreateResult(
+            session_id=session_id,
+            timeout_minutes=timeout,
+            app_url=browser_session.app_url,
+        )
+
     launch_kwargs: dict[str, Any] = {"timeout": timeout, "proxy_location": proxy}
     if extensions is not None:
         launch_kwargs["extensions"] = extensions
