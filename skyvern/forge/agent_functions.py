@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     from playwright.async_api import BrowserContext
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+    from skyvern.forge.sdk.schemas.totp_codes import OTPType
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
@@ -1719,6 +1720,7 @@ class AgentFunction:
         workflow_id: str | None = None,
         workflow_run_id: str | None = None,
         created_after: datetime | None = None,
+        expected_otp_type: OTPType | None = None,
         context: EmailOTPVerificationContext | None = None,
     ) -> OTPValue | None:
         """Find an OTP in connected email inboxes (all configured sources) for a single polling window."""
@@ -1790,7 +1792,11 @@ class AgentFunction:
                         if source_context.has_seen_message(credential_id, candidate.message_id):
                             continue
                         try:
-                            otp_value = await parse_otp_login(candidate.content, organization_id)
+                            otp_value = await parse_otp_login(
+                                candidate.content,
+                                organization_id,
+                                enforced_otp_type=expected_otp_type,
+                            )
                         except InsufficientCreditsForOTPParse:
                             source_context.remember_message(credential_id, candidate.message_id)
                             return None
@@ -1804,6 +1810,12 @@ class AgentFunction:
                             )
                             continue
                         source_context.remember_message(credential_id, candidate.message_id)
+                        if (
+                            otp_value
+                            and expected_otp_type is not None
+                            and otp_value.get_otp_type() != expected_otp_type
+                        ):
+                            continue
                         if otp_value:
                             try:
                                 # Persist only the resolved OTP value to avoid retaining raw email bodies.
