@@ -138,10 +138,18 @@ class BrowserSessionResponse(BaseModel):
                         organization_id=browser_session.organization_id,
                         browser_session_id=browser_session.persistent_browser_session_id,
                     )
+                    if recordings:
+                        recordings = await app.AGENT_FUNCTION.select_browser_session_recordings(
+                            organization_id=browser_session.organization_id,
+                            browser_session_id=browser_session.persistent_browser_session_id,
+                            recordings=recordings,
+                            browser_vendor=browser_session.browser_vendor,
+                        )
             except asyncio.TimeoutError:
                 LOG.warning(
                     "Timeout getting recordings", browser_session_id=browser_session.persistent_browser_session_id
                 )
+                recordings = []
 
             # Sort downloaded files by modified_at in descending order (newest first)
             # Treat None as "oldest".
