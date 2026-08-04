@@ -11,11 +11,11 @@ import textwrap
 import time
 import uuid
 from collections import deque
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast, overload
 
 import structlog
 from jinja2 import meta as jinja2_meta
@@ -245,6 +245,13 @@ BROWSER_SESSION_WRITE_BACK_TIMEOUT = SAVE_DOWNLOADED_FILES_TIMEOUT
 
 # Limit burst concurrency for status-path fetches that are typically hit by client polling.
 WORKFLOW_STATUS_RESPONSE_MAX_IN_FLIGHT = 3
+_T1 = TypeVar("_T1")
+_T2 = TypeVar("_T2")
+_T3 = TypeVar("_T3")
+_T4 = TypeVar("_T4")
+_T5 = TypeVar("_T5")
+_T6 = TypeVar("_T6")
+_T_OP = TypeVar("_T_OP")
 
 # Failure reason stamped when execute_workflow's body is interrupted before it captures a terminal
 # intent (pre_finally_status stays None)
@@ -735,9 +742,55 @@ class WorkflowService:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
+    @overload
     async def _gather_with_max_in_flight(
         self,
-        operations: Sequence[Awaitable[Any]],
+        operations: tuple[
+            Callable[[], Awaitable[_T1]],
+            Callable[[], Awaitable[_T2]],
+            Callable[[], Awaitable[_T3]],
+            Callable[[], Awaitable[_T4]],
+            Callable[[], Awaitable[_T5]],
+            Callable[[], Awaitable[_T6]],
+        ],
+        max_in_flight: int = WORKFLOW_STATUS_RESPONSE_MAX_IN_FLIGHT,
+    ) -> tuple[_T1, _T2, _T3, _T4, _T5, _T6]: ...
+
+    @overload
+    async def _gather_with_max_in_flight(
+        self,
+        operations: tuple[
+            Callable[[], Awaitable[_T1]],
+            Callable[[], Awaitable[_T2]],
+            Callable[[], Awaitable[_T3]],
+            Callable[[], Awaitable[_T4]],
+            Callable[[], Awaitable[_T5]],
+        ],
+        max_in_flight: int = WORKFLOW_STATUS_RESPONSE_MAX_IN_FLIGHT,
+    ) -> tuple[_T1, _T2, _T3, _T4, _T5]: ...
+
+    @overload
+    async def _gather_with_max_in_flight(
+        self,
+        operations: tuple[
+            Callable[[], Awaitable[_T1]],
+            Callable[[], Awaitable[_T2]],
+            Callable[[], Awaitable[_T3]],
+            Callable[[], Awaitable[_T4]],
+        ],
+        max_in_flight: int = WORKFLOW_STATUS_RESPONSE_MAX_IN_FLIGHT,
+    ) -> tuple[_T1, _T2, _T3, _T4]: ...
+
+    @overload
+    async def _gather_with_max_in_flight(
+        self,
+        operations: Sequence[Callable[[], Awaitable[Any]]],
+        max_in_flight: int = WORKFLOW_STATUS_RESPONSE_MAX_IN_FLIGHT,
+    ) -> tuple[Any, ...]: ...
+
+    async def _gather_with_max_in_flight(
+        self,
+        operations: Sequence[Callable[[], Awaitable[Any]]],
         max_in_flight: int = WORKFLOW_STATUS_RESPONSE_MAX_IN_FLIGHT,
     ) -> tuple[Any, ...]:
         """Run async operations with bounded concurrency.
@@ -749,11 +802,11 @@ class WorkflowService:
 
         semaphore = asyncio.Semaphore(max(max_in_flight, 1))
 
-        async def _run(operation: Awaitable[Any]) -> Any:
+        async def _bounded(operation: Callable[[], Awaitable[_T_OP]]) -> _T_OP:
             async with semaphore:
-                return await operation
+                return await operation()
 
-        return tuple(await asyncio.gather(*(_run(operation) for operation in operations)))
+        return tuple(await asyncio.gather(*(_bounded(operation) for operation in operations)))
 
     @staticmethod
     async def _apply_initial_run_metadata_tags(
@@ -8592,19 +8645,19 @@ class WorkflowService:
             block_errors,
         ) = await self._gather_with_max_in_flight(
             (
-                app.DATABASE.workflows.get_workflow_for_workflow_run(
+                lambda: app.DATABASE.workflows.get_workflow_for_workflow_run(
                     workflow_run_id,
                     organization_id=organization_id,
                     filter_deleted=not allow_deleted,
                 ),
-                self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id),
-                app.DATABASE.observer.get_task_v2_by_workflow_run_id(
+                lambda: self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id),
+                lambda: app.DATABASE.observer.get_task_v2_by_workflow_run_id(
                     workflow_run_id=workflow_run_id,
                     organization_id=organization_id,
                 ),
-                app.DATABASE.tasks.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id),
-                app.DATABASE.workflow_runs.get_workflow_run_parameters(workflow_run_id=workflow_run_id),
-                app.DATABASE.workflow_runs.get_workflow_run_block_errors(
+                lambda: app.DATABASE.tasks.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id),
+                lambda: app.DATABASE.workflow_runs.get_workflow_run_parameters(workflow_run_id=workflow_run_id),
+                lambda: app.DATABASE.workflow_runs.get_workflow_run_block_errors(
                     workflow_run_id=workflow_run_id, organization_id=organization_id
                 ),
             )
@@ -8621,23 +8674,21 @@ class WorkflowService:
             (recording_urls, recording_archived),
             (downloaded_files, downloaded_file_urls),
             retried_by_workflow_run_id,
-        ) = await self._gather_with_max_in_flight(
-            (
-                self.get_recent_workflow_screenshot_urls(
-                    workflow_run_id=workflow_run_id,
-                    organization_id=organization_id,
-                    workflow_run_tasks=workflow_run_tasks,
-                ),
-                self.get_output_parameter_workflow_run_output_parameter_tuples(
-                    workflow_id=workflow_run.workflow_id, workflow_run_id=workflow_run_id
-                ),
-                self._fetch_recording_urls(workflow_run, task_v2, organization_id),
-                self._fetch_downloaded_files(workflow_run, task_v2),
-                app.DATABASE.workflow_runs.get_workflow_run_retried_by(
-                    workflow_run_id=workflow_run_id,
-                    organization_id=workflow_run.organization_id,
-                ),
-            )
+        ) = await asyncio.gather(
+            self.get_recent_workflow_screenshot_urls(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                workflow_run_tasks=workflow_run_tasks,
+            ),
+            self.get_output_parameter_workflow_run_output_parameter_tuples(
+                workflow_id=workflow_run.workflow_id, workflow_run_id=workflow_run_id
+            ),
+            self._fetch_recording_urls(workflow_run, task_v2, organization_id),
+            self._fetch_downloaded_files(workflow_run, task_v2),
+            app.DATABASE.workflow_runs.get_workflow_run_retried_by(
+                workflow_run_id=workflow_run_id,
+                organization_id=workflow_run.organization_id,
+            ),
         )
         screenshot_urls: list[str] | None = screenshot_urls_raw or None
         # Preserve legacy singular contract: last element is the newest.
