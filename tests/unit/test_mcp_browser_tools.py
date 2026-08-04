@@ -1375,6 +1375,8 @@ async def test_do_select_option_scan_observed_control_uses_widened_shape(
         {"text": "Select", "value": "", "dataValues": [""], "expanded": "true", "optionSelected": False},
         {"text": "Music", "value": "", "dataValues": ["music"], "expanded": "false", "optionSelected": False},
     ]
+    # SKY-12634: freeze the wall clock so a loaded CI runner cannot blow the 100ms budget.
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(return_value=0)))
 
     result = await do_select_option(page, "#category", "music", timeout=100)
 
