@@ -927,7 +927,7 @@ async def wrapper({default_args}):
         assert (open_attempts, created_pages) == (1, 0)
         assert result.success is False
         assert result.status == BlockStatus.failed
-        assert result.failure_reason == CODE_BLOCK_TAB_OPEN_FAILURE_REASON
+        assert result.failure_reason == f"{CODE_BLOCK_TAB_OPEN_FAILURE_REASON} (RuntimeError)"
         assert result.failure_reason != "No page found to run the code block"
 
     def test_poc_blocked_at_is_safe_code_gate(self) -> None:

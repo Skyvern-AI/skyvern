@@ -4,6 +4,7 @@ import json
 import socket
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import structlog.testing
@@ -11,6 +12,9 @@ from playwright.async_api import Playwright
 
 import skyvern.webeye.browser_factory as browser_factory
 import skyvern.webeye.cdp_connection as cdp_connection
+from skyvern.config import settings
+from skyvern.exceptions import BlockedHost
+from skyvern.schemas.runs import TaskRunRequest
 from skyvern.webeye.cdp_connection import (
     REDACTED,
     build_cdp_connect_headers,
@@ -20,6 +24,7 @@ from skyvern.webeye.cdp_connection import (
     parse_default_cdp_connect_headers,
     resolve_host_docker_internal_url,
 )
+from skyvern.webeye.cdp_retry import connect_over_cdp_with_retry
 
 
 def test_build_cdp_connect_headers_uses_host_header() -> None:
@@ -176,6 +181,7 @@ async def test_create_cdp_connection_browser_passes_headers_to_configured_cdp_ur
         extra_http_headers: dict[str, str] | None = None,
         cdp_connect_headers: dict[str, str] | None = None,
         apply_download_behaviour: bool = False,
+        validate_browser_address: bool = True,
     ) -> tuple[object, object, object]:
         calls.append((remote_browser_url, extra_http_headers, cdp_connect_headers))
         return object(), object(), object()
@@ -228,6 +234,97 @@ async def test_connect_over_cdp_accepts_direct_websocket_with_default_timeout() 
     assert fake_playwright.chromium.calls == [
         ("ws://host.docker.internal:9223/devtools/browser/abc", 30_000, None),
     ]
+
+
+@pytest.mark.asyncio
+async def test_connect_over_cdp_with_diagnostics_validates_browser_address_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ENV", "prod")
+    connect_over_cdp = AsyncMock()
+    playwright = cast(Playwright, SimpleNamespace(chromium=SimpleNamespace(connect_over_cdp=connect_over_cdp)))
+
+    with pytest.raises(BlockedHost):
+        await connect_over_cdp_with_diagnostics(playwright, "ws://10.0.0.5:9222")
+
+    connect_over_cdp.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_public_remote_browser_address_connects_with_caller_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "skyvern.utils.url_validators.socket.getaddrinfo",
+        lambda host, port, *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))],
+    )
+    browser_address = "wss://browser.example.test/devtools/browser/id"
+    request = TaskRunRequest(
+        prompt="run",
+        browser_address=browser_address,
+        cdp_connect_headers={"X-Provider-Auth": "provider-value"},
+    )
+    expected_browser = object()
+    connect_over_cdp = AsyncMock(return_value=expected_browser)
+    playwright = cast(Playwright, SimpleNamespace(chromium=SimpleNamespace(connect_over_cdp=connect_over_cdp)))
+
+    browser = await connect_over_cdp_with_diagnostics(
+        playwright,
+        request.browser_address or "",
+        headers=request.cdp_connect_headers,
+    )
+
+    assert browser is expected_browser
+    connect_over_cdp.assert_awaited_once_with(
+        browser_address,
+        timeout=30_000,
+        headers={"X-Provider-Auth": "provider-value"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_remote_browser_address_rejects_hostname_resolving_to_private_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ENV", "local")
+    monkeypatch.setattr(
+        "skyvern.utils.url_validators.socket.getaddrinfo",
+        lambda host, port, *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.42", 0))],
+    )
+    request = TaskRunRequest(
+        prompt="run",
+        browser_address="wss://localhost.attacker.test/devtools/browser/id",
+    )
+    connect_over_cdp = AsyncMock()
+    playwright = cast(Playwright, SimpleNamespace(chromium=SimpleNamespace(connect_over_cdp=connect_over_cdp)))
+
+    with pytest.raises(BlockedHost):
+        await connect_over_cdp_with_retry(
+            playwright,
+            request.browser_address or "",
+            validate_browser_address=True,
+        )
+
+    connect_over_cdp.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_local_loopback_browser_address_connects_without_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "ENV", "local")
+    getaddrinfo = MagicMock(side_effect=AssertionError("local loopback connection must not resolve DNS"))
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", getaddrinfo)
+    expected_browser = object()
+    connect_over_cdp = AsyncMock(return_value=expected_browser)
+    playwright = cast(Playwright, SimpleNamespace(chromium=SimpleNamespace(connect_over_cdp=connect_over_cdp)))
+
+    browser = await connect_over_cdp_with_retry(
+        playwright,
+        "ws://localhost:9222",
+        validate_browser_address=True,
+    )
+
+    assert browser is expected_browser
+    getaddrinfo.assert_not_called()
 
 
 @pytest.mark.asyncio
