@@ -6,7 +6,7 @@ from types import TracebackType
 from typing import Any
 
 import structlog
-from structlog.typing import EventDict
+from structlog.typing import EventDict, Processor
 
 from skyvern._version import __version__
 from skyvern.config import settings
@@ -585,6 +585,13 @@ def setup_logger() -> None:
         + additional_processors
         + [skyvern_logs_processor, sample_logs_processor, structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
     )
+    # Foreign stdlib records never run the structlog chain above, so without these two a
+    # record reaches Datadog with an empty message (its remapper reads `msg`, not `event`)
+    # and no `organization_id` to group on. Order matters: `add_kv_pairs_to_msg` reads `msg`.
+    foreign_msg_chain: list[Processor] = (
+        [structlog.processors.EventRenamer("msg"), add_kv_pairs_to_msg] if settings.JSON_LOGGING else []
+    )
+
     handler = logging.StreamHandler()
     handler.setFormatter(
         structlog.stdlib.ProcessorFormatter(
@@ -595,7 +602,8 @@ def setup_logger() -> None:
                 structlog.stdlib.ExtraAdder(),
                 add_error_processor,
                 structlog.processors.format_exc_info,
-            ],
+            ]
+            + foreign_msg_chain,
             processors=[
                 structlog.stdlib.add_log_level,
                 structlog.stdlib.add_logger_name,
