@@ -1,11 +1,14 @@
+import asyncio
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.webeye import schemas as browser_session_schemas
 from skyvern.webeye.schemas import BrowserSessionResponse
 
 # Every field a client is allowed to read off a browser session. Adding a field to
@@ -77,6 +80,71 @@ def server_side_row_fields() -> set[str]:
 
 def test_browser_session_response_exposes_exactly_the_pinned_client_field_set() -> None:
     assert set(BrowserSessionResponse.model_fields) == PINNED_CLIENT_FIELDS
+
+
+@pytest.mark.asyncio
+async def test_browser_session_response_uses_infrastructure_aware_recording_selection() -> None:
+    now = datetime.now(timezone.utc)
+    session = PersistentBrowserSession(
+        persistent_browser_session_id="pbs_123",
+        organization_id="org_123",
+        status="completed",
+        created_at=now,
+        modified_at=now,
+    )
+    pod_recording = FileInfo(url="https://recordings.example/pod", filename="playwright-video.webm")
+    vendor_recording = FileInfo(url="https://recordings.example/vendor", filename="pbs_123.mp4")
+    storage = MagicMock()
+    storage.get_shared_downloaded_files_in_browser_session = AsyncMock(return_value=[])
+    storage.get_shared_recordings_in_browser_session = AsyncMock(return_value=[pod_recording, vendor_recording])
+    selector = AsyncMock(return_value=[vendor_recording])
+
+    with (
+        patch.object(app.AGENT_FUNCTION, "select_browser_session_recordings", selector),
+        patch.object(app.AGENT_FUNCTION, "resolve_browser_session_connect_url", AsyncMock(return_value=None)),
+    ):
+        response = await asyncio.wait_for(BrowserSessionResponse.from_browser_session(session, storage), timeout=0.1)
+
+    assert response.recordings == [vendor_recording]
+    selector.assert_awaited_once_with(
+        organization_id="org_123",
+        browser_session_id="pbs_123",
+        recordings=[pod_recording, vendor_recording],
+        browser_vendor=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_browser_session_response_bounds_infrastructure_recording_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(timezone.utc)
+    session = PersistentBrowserSession(
+        persistent_browser_session_id="pbs_123",
+        organization_id="org_123",
+        status="completed",
+        created_at=now,
+        modified_at=now,
+    )
+    pod_recording = FileInfo(url="https://recordings.example/pod", filename="playwright-video.webm")
+    storage = MagicMock()
+    storage.get_shared_downloaded_files_in_browser_session = AsyncMock(return_value=[])
+    storage.get_shared_recordings_in_browser_session = AsyncMock(return_value=[pod_recording])
+
+    async def stalled_selection(**_kwargs: object) -> list[FileInfo]:
+        await asyncio.sleep(1)
+        return []
+
+    selector = AsyncMock(side_effect=stalled_selection)
+    monkeypatch.setattr(browser_session_schemas, "GET_DOWNLOADED_FILES_TIMEOUT", 0.01)
+    with (
+        patch.object(app.AGENT_FUNCTION, "select_browser_session_recordings", selector),
+        patch.object(app.AGENT_FUNCTION, "resolve_browser_session_connect_url", AsyncMock(return_value=None)),
+    ):
+        response = await asyncio.wait_for(BrowserSessionResponse.from_browser_session(session, storage), timeout=0.1)
+
+    selector.assert_awaited_once()
+    assert response.recordings == []
 
 
 def test_no_server_side_row_field_becomes_a_response_field() -> None:

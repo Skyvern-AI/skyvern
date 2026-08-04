@@ -194,8 +194,8 @@ async def prepare_recording_for_upload(src_path: str) -> AsyncIterator[PreparedR
     if not os.path.exists(src_path):
         raise FileNotFoundError(src_path)
 
-    prepared = await _prepare_recording_upload(src_path)
     source_extension = os.path.splitext(src_path)[1].lstrip(".").lower() or "webm"
+    prepared = None if source_extension == "mp4" else await _prepare_recording_upload(src_path)
     upload = prepared or PreparedRecordingUpload(path=src_path, file_extension=source_extension)
     try:
         yield upload
@@ -364,12 +364,10 @@ def plan_run_segment(
     if video_duration_seconds <= 0:
         return None
     start = _as_utc(run_started_at)
-    end = (
-        _as_utc(run_finished_at)
-        if run_finished_at is not None
-        else video_start + timedelta(seconds=video_duration_seconds)
-    )
     anchor = _as_utc(video_start)
+    end = (
+        _as_utc(run_finished_at) if run_finished_at is not None else anchor + timedelta(seconds=video_duration_seconds)
+    )
     start_offset = min(max((start - anchor).total_seconds(), 0.0), video_duration_seconds)
     end_offset = min(max((end - anchor).total_seconds(), 0.0), video_duration_seconds)
     if end_offset - start_offset < min_segment_seconds:
