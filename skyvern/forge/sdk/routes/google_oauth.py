@@ -128,7 +128,7 @@ def _require_scopes_from_token(token_data: dict) -> list[str]:
 @google_oauth_router.post("/oauth/authorize")
 async def google_oauth_authorize(
     request: CreateGoogleOAuthAuthorizeRequest,
-    current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    current_org: Annotated[Organization, Depends(org_auth_service.get_current_admin_org)],
     current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
 ) -> GoogleOAuthAuthorizeResponse:
     """Kick off the Google OAuth 2.0 authorization flow."""
@@ -163,7 +163,7 @@ async def google_oauth_authorize(
 @google_oauth_router.post("/oauth/callback")
 async def google_oauth_callback(
     request: CreateGoogleOAuthCallbackRequest,
-    current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    current_org: Annotated[Organization, Depends(org_auth_service.get_current_admin_org)],
     current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
 ) -> GoogleOAuthCredentialResponse:
     """Handle the Google OAuth 2.0 authorization callback."""
@@ -277,7 +277,7 @@ async def google_oauth_callback(
 
 @google_oauth_router.get("/oauth/config")
 async def get_google_oauth_client_config(
-    current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    current_org: Annotated[Organization, Depends(org_auth_service.get_current_admin_org)],
 ) -> GoogleOAuthClientConfigResponse:
     """Return the effective Google OAuth client configuration without the client secret."""
     _require_organization_client_config_enabled()
@@ -291,7 +291,7 @@ async def get_google_oauth_client_config(
 @google_oauth_router.put("/oauth/config")
 async def update_google_oauth_client_config(
     request: UpdateGoogleOAuthClientConfigRequest,
-    current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    current_org: Annotated[Organization, Depends(org_auth_service.get_current_admin_org)],
 ) -> GoogleOAuthClientConfigResponse:
     """Store an organization-level Google OAuth client configuration."""
     _require_organization_client_config_enabled()
@@ -328,7 +328,7 @@ async def update_google_oauth_client_config(
 
 @google_oauth_router.delete("/oauth/config")
 async def delete_google_oauth_client_config(
-    current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    current_org: Annotated[Organization, Depends(org_auth_service.get_current_admin_org)],
 ) -> dict[str, bool]:
     """Clear the organization-level Google OAuth client config and fall back to environment config."""
     _require_organization_client_config_enabled()
@@ -341,7 +341,7 @@ async def delete_google_oauth_client_config(
 
 @google_oauth_router.get("/oauth/credentials")
 async def list_google_oauth_credentials(
-    current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    current_org: Annotated[Organization, Depends(org_auth_service.get_current_admin_org)],
     include_email: bool = False,
 ) -> GoogleOAuthCredentialListResponse:
     """Fetch a list of Google OAuth credentials associated with an organization."""
@@ -366,7 +366,7 @@ async def list_google_oauth_credentials(
 async def rename_google_oauth_credential(
     credential_id: str,
     request: UpdateGoogleOAuthCredentialRequest,
-    current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    current_org: Annotated[Organization, Depends(org_auth_service.get_current_admin_org)],
 ) -> GoogleOAuthCredentialResponse:
     """Renames an existing Google OAuth credential for the specified organization"""
     updated = await google_oauth_service.rename_credential(
@@ -384,7 +384,7 @@ async def rename_google_oauth_credential(
 )
 async def delete_google_oauth_credential(
     credential_id: str,
-    current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    current_org: Annotated[Organization, Depends(org_auth_service.get_current_admin_org)],
 ) -> dict[str, bool]:
     """Deletes a specific Google OAuth credential associated with an organization"""
     revoked = await google_oauth_service.revoke_credential(

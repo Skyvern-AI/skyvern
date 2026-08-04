@@ -26,7 +26,12 @@ from skyvern.forge import app
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-from skyvern.forge.sdk.services.org_auth_service import resolve_org_from_api_key
+from skyvern.forge.sdk.services.org_auth_service import (
+    extract_clerk_org_id,
+    extract_clerk_org_role,
+    require_org_admin_role,
+    resolve_org_from_api_key,
+)
 
 from .api_key_hash import hash_api_key_for_cache
 from .client import reset_api_key_override, set_api_key_override
@@ -264,22 +269,10 @@ def _get_oauth_org_auth_methods(db: object) -> tuple[_OrgEntitiesGetter | None, 
 
 
 def _extract_explicit_oauth_org_id(payload: dict[str, object]) -> str:
-    """Return the Clerk org id from supported org-scoped JWT claim shapes.
-
-    Our Clerk template uses `org_id`; Clerk's org-scoped session JWTs can also
-    expose the active organization as compact claim `o.id`.
-    """
-    org_id_claim = payload.get("org_id")
-    if isinstance(org_id_claim, str) and org_id_claim:
-        return org_id_claim
-
-    compact_org_claim = payload.get("o")
-    if isinstance(compact_org_claim, dict):
-        compact_org_id = compact_org_claim.get("id")
-        if isinstance(compact_org_id, str) and compact_org_id:
-            return compact_org_id
-
-    raise MissingOrgContextError()
+    org_id = extract_clerk_org_id(payload)
+    if not org_id:
+        raise MissingOrgContextError()
+    return org_id
 
 
 async def _resolve_oauth_subject_to_org(
@@ -301,6 +294,7 @@ async def _resolve_oauth_subject_to_org(
         raise HTTPException(status_code=401, detail="Bearer token missing subject claim")
 
     clerk_org_id = _extract_explicit_oauth_org_id(payload)
+    require_org_admin_role(extract_clerk_org_role(payload))
 
     org_entities = await get_entities(clerk_org_id, "organization")
     if not org_entities:
