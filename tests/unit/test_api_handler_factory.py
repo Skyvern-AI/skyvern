@@ -2070,6 +2070,39 @@ def test_completion_cost_halves_vertex_flex(monkeypatch: pytest.MonkeyPatch) -> 
     assert LLMAPIHandlerFactory._completion_cost(no_meta) == pytest.approx(0.10)
 
 
+def test_completion_cost_halves_long_context_openai_direct_gpt5_6_flex(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A flex-tagged OpenAI-direct GPT-5.6 call over the 272k-token threshold bills at
+    litellm's untiered standard long-context rate (ModelInfo drops the *_flex threshold
+    keys), so the helper halves it itself. Azure, short prompts, and standard tier are not."""
+    monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.10)
+
+    long_context_flex = SimpleNamespace(
+        service_tier="flex",
+        usage=SimpleNamespace(prompt_tokens=300_000),
+        _hidden_params={"litellm_model_name": "gpt-5.6-luna"},
+    )
+    short_prompt_flex = SimpleNamespace(
+        service_tier="flex",
+        usage=SimpleNamespace(prompt_tokens=200_000),
+        _hidden_params={"litellm_model_name": "gpt-5.6-luna"},
+    )
+    azure_long_context_flex = SimpleNamespace(
+        service_tier="flex",
+        usage=SimpleNamespace(prompt_tokens=300_000),
+        _hidden_params={"litellm_model_name": "azure/my-luna-deployment"},
+    )
+    standard_tier_long_context = SimpleNamespace(
+        service_tier=None,
+        usage=SimpleNamespace(prompt_tokens=300_000),
+        _hidden_params={"litellm_model_name": "gpt-5.6-luna"},
+    )
+
+    assert LLMAPIHandlerFactory._completion_cost(long_context_flex) == pytest.approx(0.05)
+    assert LLMAPIHandlerFactory._completion_cost(short_prompt_flex) == pytest.approx(0.10)
+    assert LLMAPIHandlerFactory._completion_cost(azure_long_context_flex) == pytest.approx(0.10)
+    assert LLMAPIHandlerFactory._completion_cost(standard_tier_long_context) == pytest.approx(0.10)
+
+
 def test_completion_cost_returns_zero_when_litellm_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     def _raise(completion_response: Any) -> float:
         raise RuntimeError("provider unsupported")

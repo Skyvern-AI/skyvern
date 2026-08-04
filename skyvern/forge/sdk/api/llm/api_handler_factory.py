@@ -184,6 +184,13 @@ async def _validate_custom_llm_api_base(llm_key: str, llm_config: LLMConfig | LL
 _VERTEX_FLEX_TRAFFIC_TYPE = "ON_DEMAND_FLEX"
 _VERTEX_FLEX_COST_MULTIPLIER = 0.5
 
+# litellm's ModelInfo schema has no field combining a service tier with the above-272k
+# threshold, so get_model_info() drops our *_above_272k_tokens_flex keys and prices a
+# flex-tagged, long-context OpenAI-direct GPT-5.6 call at the untiered standard rate.
+_OPENAI_GPT5_6_MODEL_PREFIX = "gpt-5.6-"
+_OPENAI_GPT5_6_LONG_CONTEXT_THRESHOLD = 272_000
+_OPENAI_GPT5_6_FLEX_LONG_CONTEXT_MULTIPLIER = 0.5
+
 # Canonical span name for all LLM chokepoints. Milestone 1 of the agent
 # profiling project — keep consistent so SigNoz aggregations can query across
 # router / non-router / LLMCaller paths with a single filter.
@@ -957,10 +964,10 @@ class LLMAPIHandlerFactory:
 
     @staticmethod
     def _completion_cost(response: ModelResponse | CustomStreamWrapper) -> float:
-        """litellm completion cost, with the Vertex Gemini flex tier billed at 50%.
-
-        Flex is 50% of standard, but litellm reports both at the standard rate, so the
-        discount is applied here. Internal cost tracking only — never customer-facing.
+        """litellm completion cost, with two known litellm gaps corrected here: the Vertex
+        Gemini flex tier, and long-context OpenAI-direct GPT-5.6 flex calls. Both bill at
+        the standard rate in litellm and are halved post hoc. Internal cost tracking only
+        — never customer-facing.
         """
         try:
             cost = litellm.completion_cost(completion_response=response)
@@ -971,7 +978,24 @@ class LLMAPIHandlerFactory:
         provider_specific = hidden_params.get("provider_specific_fields") if isinstance(hidden_params, dict) else None
         if isinstance(provider_specific, dict) and provider_specific.get("traffic_type") == _VERTEX_FLEX_TRAFFIC_TYPE:
             return cost * _VERTEX_FLEX_COST_MULTIPLIER
+        if LLMAPIHandlerFactory._is_openai_direct_gpt5_6_long_context_flex(response, hidden_params):
+            return cost * _OPENAI_GPT5_6_FLEX_LONG_CONTEXT_MULTIPLIER
         return cost
+
+    @staticmethod
+    def _is_openai_direct_gpt5_6_long_context_flex(
+        response: ModelResponse | CustomStreamWrapper, hidden_params: object
+    ) -> bool:
+        if getattr(response, "service_tier", None) != "flex":
+            return False
+        # litellm_model_name keeps the pre-request model string (unlike response.model,
+        # which litellm strips to the bare provider label), so "azure/" still excludes Azure.
+        requested_model = hidden_params.get("litellm_model_name") if isinstance(hidden_params, dict) else None
+        if not isinstance(requested_model, str) or not requested_model.startswith(_OPENAI_GPT5_6_MODEL_PREFIX):
+            return False
+        usage = getattr(response, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+        return bool(prompt_tokens and prompt_tokens > _OPENAI_GPT5_6_LONG_CONTEXT_THRESHOLD)
 
     @staticmethod
     def _apply_thinking_budget_optimization(
