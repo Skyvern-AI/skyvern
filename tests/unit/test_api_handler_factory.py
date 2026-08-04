@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from asyncio import CancelledError
 from datetime import datetime
 from pathlib import Path
@@ -7,7 +9,9 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import litellm  # type: ignore[import-not-found]
+import openai
 import pytest  # type: ignore[import-not-found]
 
 from skyvern.forge.sdk.api.llm import api_handler_factory
@@ -18,6 +22,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     LLMCaller,
     get_org_aware_secondary_llm_api_handler,
 )
+from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.api.llm.models import LLMConfig
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -169,6 +174,7 @@ async def test_custom_openrouter_client_is_scoped_to_request(
     completion = MagicMock()
     completion.model_dump.return_value = {}
     client = MagicMock()
+    client.max_retries = 0
     client.chat.completions.create = AsyncMock(return_value=completion, side_effect=request_error)
     client.close = AsyncMock()
     openai_client = MagicMock(return_value=client)
@@ -184,6 +190,7 @@ async def test_custom_openrouter_client_is_scoped_to_request(
         await caller._dispatch_llm_call(messages=[])
 
     assert openai_client.call_args.kwargs["http_client"].follow_redirects is False
+    assert openai_client.call_args.kwargs["max_retries"] == 0
     client.close.assert_awaited_once()
 
 
@@ -215,6 +222,7 @@ async def test_openrouter_extra_body_reaches_async_openai(monkeypatch: pytest.Mo
     completion = MagicMock()
     completion.model_dump.return_value = {"provider": "Cloudflare", "service_tier": "standard"}
     client = MagicMock()
+    client.max_retries = 0
     client.chat.completions.create = AsyncMock(return_value=completion)
     monkeypatch.setattr(api_handler_factory, "AsyncOpenAI", MagicMock(return_value=client))
     monkeypatch.setattr(api_handler_factory.litellm, "ModelResponse", MagicMock())
@@ -228,6 +236,275 @@ async def test_openrouter_extra_body_reaches_async_openai(monkeypatch: pytest.Mo
     assert request_kwargs["extra_body"] == {"provider": provider_routing}
     assert request_kwargs["temperature"] == 0.2
     assert request_kwargs["reasoning_effort"] == "medium"
+
+
+def _openrouter_caller(
+    monkeypatch: pytest.MonkeyPatch,
+    create: Any,
+    *,
+    llm_key: str = "OPENROUTER_EXAMPLE",
+    max_retries: Any = 0,
+) -> tuple[LLMCaller, MagicMock]:
+    llm_config = _custom_llm_config("openrouter/example-model", "https://openrouter.ai/api/v1")
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    client = MagicMock()
+    client.max_retries = max_retries
+    client.chat.completions.create = create
+    client.close = AsyncMock()
+    monkeypatch.setattr(api_handler_factory, "AsyncOpenAI", MagicMock(return_value=client))
+    monkeypatch.setattr(api_handler_factory.litellm, "ModelResponse", MagicMock())
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(
+        api_handler_factory,
+        "llm_messages_builder_with_history",
+        AsyncMock(return_value=[{"role": "user", "content": "test"}]),
+    )
+    return LLMCaller(llm_key), client
+
+
+def _set_hard_deadline_settings(monkeypatch: pytest.MonkeyPatch, *, enforce: bool, grace: float) -> None:
+    monkeypatch.setattr(api_handler_factory.settings, "ENFORCE_LLM_HARD_DEADLINE", enforce)
+    monkeypatch.setattr(api_handler_factory.settings, "LLM_HARD_DEADLINE_GRACE_SECONDS", grace)
+    monkeypatch.setattr(api_handler_factory, "_hard_deadline_disabled_reasons", set())
+
+
+@pytest.mark.parametrize(
+    ("enforce", "timeout", "attempts", "expected"),
+    [
+        (True, 300, 1, 310.0),
+        (True, 300, 3, 910.0),
+        (True, 300.5, 1, 310.5),
+        (False, 300, 1, None),
+        (True, 300, None, None),
+        (True, None, 1, None),
+        (True, 0, 1, None),
+        (True, -1, 1, None),
+        (True, "300", 1, None),
+        (True, True, 1, None),
+    ],
+)
+def test_llm_hard_deadline_seconds_only_extends_a_usable_timeout(
+    monkeypatch: pytest.MonkeyPatch, enforce: bool, timeout: Any, attempts: int | None, expected: float | None
+) -> None:
+    _set_hard_deadline_settings(monkeypatch, enforce=enforce, grace=10.0)
+
+    assert api_handler_factory._llm_hard_deadline_seconds(timeout, attempts) == expected
+
+
+@pytest.mark.parametrize(
+    ("max_retries", "expected"),
+    [(0, 1), (2, 3), (None, None), (-1, None), (True, None), ("2", None)],
+)
+def test_openai_client_attempts_reads_the_sdk_retry_budget(
+    monkeypatch: pytest.MonkeyPatch, max_retries: Any, expected: int | None
+) -> None:
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=10.0)
+    client = SimpleNamespace(max_retries=max_retries)
+
+    assert api_handler_factory._openai_client_attempts(client) == expected
+    if expected is None:
+        assert "client_max_retries" in api_handler_factory._hard_deadline_disabled_reasons
+
+
+@pytest.mark.asyncio
+async def test_hard_deadline_surfaces_as_retryable_from_the_public_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider_call_cancelled = asyncio.Event()
+
+    async def _drip_forever(**kwargs: Any) -> Any:
+        try:
+            while True:
+                await asyncio.sleep(0.01)
+        except CancelledError:
+            provider_call_cancelled.set()
+            raise
+
+    caller, _ = _openrouter_caller(monkeypatch, _drip_forever)
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=0.05)
+
+    with pytest.raises(LLMProviderErrorRetryableTask):
+        await caller.call(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME, timeout=0.05)
+
+    assert provider_call_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_hard_deadline_on_a_custom_openrouter_client_closes_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _hang(**kwargs: Any) -> Any:
+        await asyncio.sleep(60)
+
+    caller, client = _openrouter_caller(monkeypatch, _hang, llm_key="CUSTOM_LLM_openrouter_deadline_test")
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=0.05)
+
+    with pytest.raises(LLMProviderErrorRetryableTask):
+        await caller.call(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME, timeout=0.05)
+
+    client.close.assert_awaited_once()
+    assert api_handler_factory.AsyncOpenAI.call_args.kwargs["max_retries"] == 0
+
+
+@pytest.mark.asyncio
+async def test_hard_deadline_scales_with_the_client_retry_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A client that retries twice may legitimately spend three timeouts, so 0.2s must survive a
+    0.1s timeout: the deadline covers 3 attempts, not one."""
+
+    async def _slower_than_one_attempt(**kwargs: Any) -> Any:
+        await asyncio.sleep(0.2)
+        return SimpleNamespace(model_dump=lambda: {})
+
+    caller, _ = _openrouter_caller(monkeypatch, _slower_than_one_attempt, max_retries=2)
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=0.0)
+
+    await caller._dispatch_llm_call(messages=[], timeout=0.1)
+
+
+@pytest.mark.asyncio
+async def test_a_timeout_raised_inside_the_request_is_not_relabelled(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _proxy_timeout(**kwargs: Any) -> Any:
+        raise TimeoutError("connection to proxy timed out")
+
+    caller, _ = _openrouter_caller(monkeypatch, _proxy_timeout)
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=10.0)
+
+    with pytest.raises(TimeoutError, match="connection to proxy timed out") as raised:
+        await caller._dispatch_llm_call(messages=[], timeout=300)
+
+    assert not isinstance(raised.value, api_handler_factory.LLMProviderError)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_landing_with_the_response_still_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run-stop that arrives in the same tick the response resolves must still stop the run.
+    Releasing the response and cancelling before the loop resumes the task pins that race."""
+    provider_call_started = asyncio.Event()
+    release_response = asyncio.Event()
+
+    async def _responds_when_released(**kwargs: Any) -> Any:
+        provider_call_started.set()
+        await release_response.wait()
+        return SimpleNamespace(model_dump=lambda: {})
+
+    caller, _ = _openrouter_caller(monkeypatch, _responds_when_released)
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=10.0)
+
+    dispatch = asyncio.create_task(caller._dispatch_llm_call(messages=[], timeout=300))
+    await provider_call_started.wait()
+    release_response.set()
+    dispatch.cancel()
+
+    with pytest.raises(CancelledError):
+        await dispatch
+
+
+@pytest.mark.asyncio
+async def test_hard_deadline_does_not_convert_an_external_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider_call_started = asyncio.Event()
+
+    async def _hang(**kwargs: Any) -> Any:
+        provider_call_started.set()
+        await asyncio.sleep(60)
+
+    caller, _ = _openrouter_caller(monkeypatch, _hang)
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=10.0)
+
+    dispatch = asyncio.create_task(caller._dispatch_llm_call(messages=[], timeout=60))
+    await provider_call_started.wait()
+    dispatch.cancel()
+
+    with pytest.raises(CancelledError):
+        await dispatch
+
+
+@pytest.mark.asyncio
+async def test_hard_deadline_leaves_a_fast_call_untouched(monkeypatch: pytest.MonkeyPatch) -> None:
+    completion = MagicMock()
+    completion.model_dump.return_value = {"id": "chatcmpl-test"}
+    create = AsyncMock(return_value=completion)
+    caller, _ = _openrouter_caller(monkeypatch, create)
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=10.0)
+
+    await caller._dispatch_llm_call(messages=[{"role": "user", "content": "test"}], timeout=30)
+
+    assert create.await_args.kwargs["timeout"] == 30
+    api_handler_factory.litellm.ModelResponse.assert_called_once_with(id="chatcmpl-test")
+
+
+@pytest.mark.asyncio
+async def test_hard_deadline_disabled_lets_a_slow_call_finish(monkeypatch: pytest.MonkeyPatch) -> None:
+    completion = MagicMock()
+    completion.model_dump.return_value = {}
+
+    async def _slower_than_the_declared_timeout(**kwargs: Any) -> Any:
+        await asyncio.sleep(0.05)
+        return completion
+
+    caller, _ = _openrouter_caller(monkeypatch, _slower_than_the_declared_timeout)
+    _set_hard_deadline_settings(monkeypatch, enforce=False, grace=0.0)
+
+    await caller._dispatch_llm_call(messages=[], timeout=0.001)
+
+    completion.model_dump.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_hard_deadline_disabled_skips_reading_the_client_retry_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The kill switch should fully silence the deadline machinery: it must not even read (and
+    potentially warn about) the client's retry budget when the flag is off."""
+    completion = MagicMock()
+    completion.model_dump.return_value = {}
+    create = AsyncMock(return_value=completion)
+    caller, client = _openrouter_caller(monkeypatch, create)
+    client.max_retries = -1  # malformed; would log if _openai_client_attempts ever inspected it
+    _set_hard_deadline_settings(monkeypatch, enforce=False, grace=10.0)
+
+    await caller._dispatch_llm_call(messages=[], timeout=30)
+
+    assert api_handler_factory._hard_deadline_disabled_reasons == set()
+
+
+@pytest.mark.asyncio
+async def test_unparseable_response_body_is_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _whitespace_only_200(**kwargs: Any) -> Any:
+        raise json.JSONDecodeError("Expecting value", "           ", 0)
+
+    caller, _ = _openrouter_caller(monkeypatch, _whitespace_only_200)
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=10.0)
+
+    with pytest.raises(LLMProviderErrorRetryableTask):
+        await caller.call(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+
+
+def _openai_rate_limit_error() -> Exception:
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    return openai.RateLimitError("Too Many Requests", response=httpx.Response(429, request=request), body=None)
+
+
+def _litellm_rate_limit_error() -> Exception:
+    return litellm.exceptions.RateLimitError("Too Many Requests", llm_provider="openrouter", model="example-model")
+
+
+@pytest.mark.parametrize(
+    "make_rate_limit_error", [_openai_rate_limit_error, _litellm_rate_limit_error], ids=["openai", "litellm"]
+)
+@pytest.mark.asyncio
+async def test_a_rate_limited_custom_client_call_is_retryable(
+    monkeypatch: pytest.MonkeyPatch, make_rate_limit_error: Any
+) -> None:
+    """max_retries=0 took away the SDK's silent retries on this path, so a 429 has to reach the
+    step-level retry rather than failing the step outright."""
+
+    async def _rate_limited(**kwargs: Any) -> Any:
+        raise make_rate_limit_error()
+
+    caller, _ = _openrouter_caller(monkeypatch, _rate_limited, llm_key="CUSTOM_LLM_openrouter_rate_limit_test")
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=10.0)
+
+    with pytest.raises(LLMProviderErrorRetryableTask):
+        await caller.call(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+
+
+def test_json_error_body_length_tolerates_a_doc_less_error() -> None:
+    assert api_handler_factory._json_error_body_length(json.JSONDecodeError("Expecting value", "  ", 0)) == 2
+    assert api_handler_factory._json_error_body_length(json.JSONDecodeError.__new__(json.JSONDecodeError)) is None
 
 
 @pytest.mark.parametrize(
@@ -611,6 +888,32 @@ async def test_handler_persists_response_model_not_router_group(monkeypatch: pyt
 
     # The persisted model should be the bare response.model, not the router group key
     assert captured_kwargs.get("last_llm_model") == "gemini-2.5-flash"
+
+
+@pytest.mark.asyncio
+async def test_single_handler_maps_an_unparseable_body_to_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
+    llm_config = LLMConfig(
+        model_name="vertex_ai/gemini-2.5-flash",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+    )
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_router_config", lambda _: False)
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(
+        api_handler_factory, "llm_messages_builder", AsyncMock(return_value=[{"role": "user", "content": "test"}])
+    )
+
+    async def _whitespace_only_200(*args: Any, **kwargs: Any) -> Any:
+        raise json.JSONDecodeError("Expecting value", "     ", 0)
+
+    monkeypatch.setattr(api_handler_factory.litellm, "acompletion", _whitespace_only_200)
+    LLMAPIHandlerFactory._handler_cache.pop("TEST_UNPARSEABLE_SINGLE", None)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler("TEST_UNPARSEABLE_SINGLE")
+    with pytest.raises(LLMProviderErrorRetryableTask):
+        await handler(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
 
 
 def test_aiohttp_transport_disabled_for_per_request_timeouts() -> None:
@@ -1301,6 +1604,33 @@ async def test_router_acompletion_does_not_pass_timeout_kwarg(monkeypatch: pytes
         assert "timeout" not in call["kwargs"], (
             f"router.acompletion must not receive timeout= kwarg (it overrides per-deployment timeout); got call={call}"
         )
+
+
+@pytest.mark.asyncio
+async def test_router_handler_reports_an_unparseable_body_as_such(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The router ladder already treated this as retryable through its ValueError branch, which
+    logs every such failure as a token limit. Keep the classification, name the real cause."""
+
+    class _UnparseableRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def acompletion(self, *, model: str, messages: Any, **kwargs: Any) -> Any:
+            raise json.JSONDecodeError("Expecting value", "     ", 0)
+
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _UnparseableRouter)
+
+    config = _make_three_tier_router_config(fallback_groups=[])
+    _stub_for_router_test(monkeypatch, llm_key="TEST_UNPARSEABLE_ROUTER", config=config)
+    logger = DummyLogger()
+    monkeypatch.setattr(api_handler_factory, "LOG", logger)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_UNPARSEABLE_ROUTER")
+    with pytest.raises(LLMProviderErrorRetryableTask):
+        await handler(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+
+    assert "LLM response body was not parseable JSON" in [event for event, _ in logger.warnings]
+    assert "LLM token limit exceeded" not in [event for event, _ in logger.exceptions]
 
 
 @pytest.mark.asyncio

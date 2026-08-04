@@ -6,6 +6,7 @@ import re
 import time
 import warnings
 from asyncio import CancelledError
+from json import JSONDecodeError
 from typing import Any, AsyncIterator, Protocol, runtime_checkable
 
 import litellm
@@ -115,6 +116,56 @@ def _build_custom_llm_http_client(llm_key: str, llm_config: LLMConfig) -> AsyncO
         )
 
     return _NoRedirectAsyncHTTPHandler()
+
+
+# Deduped once per process on purpose: the reasons are a fixed, low-cardinality set, and an
+# unusable timeout shape recurs on every call.
+_hard_deadline_disabled_reasons: set[str] = set()
+
+
+def _log_unusable_hard_deadline_input(reason: str, value: Any) -> None:
+    if reason in _hard_deadline_disabled_reasons:
+        return
+    _hard_deadline_disabled_reasons.add(reason)
+    LOG.warning(
+        "LLM hard deadline disabled for an unusable input",
+        reason=reason,
+        value_type=type(value).__name__,
+        value=repr(value),
+    )
+
+
+# The openai SDK retries a failed attempt itself, and `timeout` applies per attempt, so one
+# call may legitimately span (max_retries + 1) timeouts.
+def _openai_client_attempts(openai_client: Any) -> int | None:
+    max_retries = openai_client.max_retries
+    if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
+        _log_unusable_hard_deadline_input("client_max_retries", max_retries)
+        return None
+    return max_retries + 1
+
+
+# The provider timeout is an httpx read timeout — a gap between reads, which keep-alive bytes
+# reset indefinitely. Returns the wall-clock budget for one call, or None when unenforceable.
+def _llm_hard_deadline_seconds(timeout: Any, attempts: int | None) -> float | None:
+    if not settings.ENFORCE_LLM_HARD_DEADLINE or attempts is None:
+        return None
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        _log_unusable_hard_deadline_input("timeout", timeout)
+        return None
+    deadline = attempts * float(timeout) + settings.LLM_HARD_DEADLINE_GRACE_SECONDS
+    # Unreachable given the checks above and the ge=0 grace; kept so a future input can't slip a
+    # non-positive deadline into asyncio.timeout, where it would cancel the call immediately.
+    if deadline <= 0:
+        _log_unusable_hard_deadline_input("deadline", deadline)
+        return None
+    return deadline
+
+
+# Some libraries re-raise a JSONDecodeError built through __new__, which leaves `doc` unset.
+def _json_error_body_length(error: JSONDecodeError) -> int | None:
+    doc = getattr(error, "doc", None)
+    return len(doc) if isinstance(doc, str) else None
 
 
 async def _validate_custom_llm_api_base(llm_key: str, llm_config: LLMConfig | LLMRouterConfig) -> None:
@@ -1877,6 +1928,20 @@ class LLMAPIHandlerFactory:
                         duration_seconds=duration_seconds,
                     )
                     raise SkyvernContextWindowExceededError(model=main_model_group, prompt_name=prompt_name) from e
+                except JSONDecodeError as e:
+                    # A dead upstream can answer HTTP 200 with an empty or truncated body. Already
+                    # retryable through the ValueError branch below, but logged there as a token limit.
+                    duration_seconds = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "error")
+                    LOG.warning(
+                        "LLM response body was not parseable JSON",
+                        llm_key=llm_key,
+                        model=main_model_group,
+                        prompt_name=prompt_name,
+                        body_length=_json_error_body_length(e),
+                        duration_seconds=duration_seconds,
+                    )
+                    raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except ValueError as e:
                     duration_seconds = time.perf_counter() - start_time
                     _llm_span.set_attribute("status", "error")
@@ -2520,6 +2585,20 @@ class LLMAPIHandlerFactory:
                         duration_seconds=duration_seconds,
                     )
                     raise LLMProviderError(llm_key, cause=e) from e
+                except JSONDecodeError as e:
+                    # A dead upstream can answer HTTP 200 with an empty or truncated body, which fails
+                    # parsing after the status check; that is a transient fault, not a bad request.
+                    duration_seconds = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "error")
+                    LOG.warning(
+                        "LLM response body was not parseable JSON",
+                        llm_key=llm_key,
+                        model=model_name,
+                        prompt_name=prompt_name,
+                        body_length=_json_error_body_length(e),
+                        duration_seconds=duration_seconds,
+                    )
+                    raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except Exception as e:
                     duration_seconds = time.perf_counter() - start_time
                     _llm_span.set_attribute("status", "error")
@@ -3149,9 +3228,11 @@ class LLMCaller:
                 )
                 raise SkyvernContextWindowExceededError(model=self.llm_config.model_name) from e
             except litellm.exceptions.RateLimitError as e:
+                # Rate limits are transient, and this path no longer leans on SDK-level retries, so
+                # the step-level retry (bounded by max_retries_per_step) is what absorbs them.
                 _llm_span.set_attribute("status", "rate_limited")
                 LOG.warning("LLM request rate limited", llm_key=self.llm_key)
-                raise LLMProviderError(self.llm_key, cause=e) from e
+                raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except litellm.exceptions.APIError as e:
                 _llm_span.set_attribute("status", "error")
                 raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
@@ -3179,10 +3260,27 @@ class LLMCaller:
             except RateLimitError as e:
                 _llm_span.set_attribute("status", "rate_limited")
                 LOG.warning("LLM request rate limited", llm_key=self.llm_key)
-                raise LLMProviderError(self.llm_key, cause=e) from e
+                raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except APIError as e:
                 _llm_span.set_attribute("status", "error")
                 raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
+            except JSONDecodeError as e:
+                # A dead upstream can answer HTTP 200 with an empty or truncated body, which fails
+                # parsing after the status check; that is a transient fault, not a bad request.
+                _llm_span.set_attribute("status", "error")
+                LOG.warning(
+                    "LLM response body was not parseable JSON",
+                    llm_key=self.llm_key,
+                    model=self.llm_config.model_name,
+                    body_length=_json_error_body_length(e),
+                    error=str(e),
+                )
+                raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
+            except LLMProviderError:
+                # Already classified (retryable or not) by the dispatch path; re-wrapping it below
+                # would erase that and log it as an unexpected failure.
+                _llm_span.set_attribute("status", "error")
+                raise
             except Exception as e:
                 _llm_span.set_attribute("status", "error")
                 LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
@@ -3396,6 +3494,9 @@ class LLMCaller:
                 api_key=litellm_params.get("api_key") or settings.OPENROUTER_API_KEY,
                 base_url=litellm_params.get("api_base") or settings.OPENROUTER_API_BASE,
                 http_client=ForgeAsyncHttpxClientWrapper(follow_redirects=False),
+                # An SDK retry re-spends the whole timeout against a stalled provider; leave
+                # transient failures to the step-level retry instead.
+                max_retries=0,
             )
         if openai_client:
             # Extract OpenRouter-specific and GitHub Copilot-specific parameters
@@ -3458,14 +3559,36 @@ class LLMCaller:
                         request_extra_body.setdefault(key, value)
                     openai_params["extra_body"] = request_extra_body
 
+            attempts = _openai_client_attempts(openai_client) if settings.ENFORCE_LLM_HARD_DEADLINE else None
+            deadline = _llm_hard_deadline_seconds(timeout, attempts)
             try:
-                completion = await openai_client.chat.completions.create(
+                provider_call = openai_client.chat.completions.create(
                     model=self.llm_key,
                     messages=messages,
                     extra_headers=extra_headers if extra_headers else None,
                     timeout=timeout,
                     **openai_params,
                 )
+                if deadline is None:
+                    completion = await provider_call
+                else:
+                    try:
+                        async with asyncio.timeout(deadline) as deadline_scope:
+                            completion = await provider_call
+                    except TimeoutError as e:
+                        # A TimeoutError the scope did not raise came from inside the request;
+                        # relabelling it as a deadline hit would bury its real cause.
+                        if not deadline_scope.expired():
+                            raise
+                        LOG.warning(
+                            "LLM request exceeded its hard deadline",
+                            llm_key=self.llm_key,
+                            model=self.llm_config.model_name,
+                            timeout=timeout,
+                            attempts=attempts,
+                            deadline=deadline,
+                        )
+                        raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
                 # Convert OpenAI ChatCompletion to litellm ModelResponse format
                 # litellm.utils.convert_to_model_response_object expects a dict
                 return litellm.ModelResponse(**completion.model_dump())
