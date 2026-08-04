@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.request_slots import (
     RequestSlotSourceV1,
     canonicalize_request_slots,
     produce_request_slots,
+    request_slot_contract_disagreements,
     request_slot_contracts_agree,
     request_slot_source_text,
     request_slot_sources,
@@ -1417,3 +1418,34 @@ def test_request_digest_covers_every_datum_target_identity_member_and_order() ->
     pair_digest = contract_for((base_target, second_target)).request_digest
     assert pair_digest != base_digest
     assert contract_for((second_target, base_target)).request_digest != pair_digest
+
+
+def test_disagreeing_attempts_name_the_field_that_moved() -> None:
+    request = _input(latest_request="Return status.")
+    pinned = canonicalize_request_slots(
+        request=request,
+        envelope=_envelope(request, ("status", "definition", "pinned")),
+    )
+    shapeless = canonicalize_request_slots(
+        request=request,
+        envelope=_envelope(request, ("status", "run", "shapeless_valid")),
+    )
+
+    # Which judgment flipped is what separates a producer wobbling on one axis from one drifting
+    # wholesale, and a degraded turn records only that it degraded.
+    assert request_slot_contract_disagreements(pinned, shapeless) == ("slots.0.plane", "slots.0.pinability")
+    assert request_slot_contract_disagreements(pinned, pinned) == ()
+    assert not request_slot_contracts_agree(pinned, shapeless)
+    assert request_slot_contracts_agree(pinned, pinned)
+
+
+def test_attempts_differing_in_slot_count_report_the_count_not_a_zip_error() -> None:
+    request = _input(latest_request="Return alpha and beta.")
+    one = canonicalize_request_slots(request=request, envelope=_envelope(request, ("alpha", "run", "shapeless_valid")))
+    two = canonicalize_request_slots(
+        request=request,
+        envelope=_envelope(request, ("alpha", "run", "shapeless_valid"), ("beta", "run", "shapeless_valid")),
+    )
+
+    assert request_slot_contract_disagreements(one, two) == ("count", "slots.count")
+    assert not request_slot_contracts_agree(one, two)

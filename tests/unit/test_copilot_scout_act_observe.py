@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _auto_credit_interaction_observation,
     has_bounded_page_schema,
     has_witnessed_value_content,
+    parse_composition_structured,
 )
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import (
@@ -1677,6 +1678,78 @@ class TestCredentialInventoryCarry:
         assert next_turn.scout_trajectory[-1]["credential_field"] == "username"
 
 
+class TestEvaluateCompositionSteerAppendsFlowEvidence:
+    """The steer that tells the model to compose an extraction must also hand the packet it saw to
+    the grounded plan, or the block it writes is unaimed (SKY-13226)."""
+
+    @pytest.mark.asyncio
+    async def test_composition_steer_appends_the_packet_it_steered_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = _ctx()
+        ctx.flow_evidence = []
+        packet = parse_composition_structured(
+            _bounded_extractor_payload(), inspected_url=_LANDING_URL, current_url=_LANDING_URL
+        )
+        monkeypatch.setattr(
+            scouting_module,
+            "_mint_current_loaded_result_source",
+            lambda _ctx, _packet, *, url: SimpleNamespace(result_container_count=8, table_result_container_count=1),
+        )
+        result: dict[str, Any] = {"data": {"elements": [], "text": ""}}
+
+        await scouting_module._maybe_steer_evaluate_to_action(ctx, result, url=_LANDING_URL, page_evidence=packet)
+
+        assert len(ctx.flow_evidence) == 1
+        entry = ctx.flow_evidence[0]
+        assert entry["reached_via"] == "current_page"
+        assert entry["evidence"]["source_tool"] == "inspect_page_for_composition"
+
+    @pytest.mark.asyncio
+    async def test_appended_packet_is_admissible_to_plan_derivation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Appending is only worth anything if derivation accepts the entry; assert the seam, not the
+        # append alone.
+        from skyvern.forge.sdk.copilot.output_extraction_plan import (
+            _BINDABLE_EVIDENCE_TOOLS,
+            _BINDABLE_REACHED_VIA,
+        )
+
+        ctx = _ctx()
+        ctx.flow_evidence = []
+        packet = parse_composition_structured(
+            _bounded_extractor_payload(), inspected_url=_LANDING_URL, current_url=_LANDING_URL
+        )
+        monkeypatch.setattr(
+            scouting_module,
+            "_mint_current_loaded_result_source",
+            lambda _ctx, _packet, *, url: SimpleNamespace(result_container_count=8, table_result_container_count=1),
+        )
+
+        await scouting_module._maybe_steer_evaluate_to_action(
+            ctx, {"data": {"elements": [], "text": ""}}, url=_LANDING_URL, page_evidence=packet
+        )
+
+        entry = ctx.flow_evidence[0]
+        assert entry["reached_via"] in _BINDABLE_REACHED_VIA
+        assert entry["evidence"]["source_tool"] in _BINDABLE_EVIDENCE_TOOLS[entry["reached_via"]]
+
+    @pytest.mark.asyncio
+    async def test_an_observation_that_mints_no_result_is_still_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Live shape (SKY-13226): the log page carrying the requested count minted no loaded result,
+        # so it was steered as actionable and — because appending sat inside the composition branch —
+        # never reached the binder. Recording an observation does not depend on it steering.
+        ctx = _ctx()
+        ctx.flow_evidence = []
+        packet = parse_composition_structured(
+            _bounded_extractor_payload(), inspected_url=_LANDING_URL, current_url=_LANDING_URL
+        )
+        monkeypatch.setattr(scouting_module, "_mint_current_loaded_result_source", lambda _ctx, _packet, *, url: None)
+
+        await scouting_module._maybe_steer_evaluate_to_action(
+            ctx, {"data": {"elements": [], "text": ""}}, url=_LANDING_URL, page_evidence=packet
+        )
+
+        assert [entry["reached_via"] for entry in ctx.flow_evidence] == ["current_page"]
+
+
 class TestScoutPageObservationSignal:
     def test_password_control_detected_in_forms(self) -> None:
         evidence = {
@@ -1848,3 +1921,66 @@ class TestTerminalActionObservationStampSeam:
             accessible_name="Find Address",
         )
         assert ctx.scout_observed_terminal_criterion_ids == set()
+
+
+class TestOverlayOnlyPacketDefersComposition:
+    """Live capture (SKY-13226): a log query's count was on screen, but a time-zone dialog left the
+    packet carrying only that dialog's two buttons, and the round was spent composing from it."""
+
+    def _evidence(self, relations: list[dict[str, object]]) -> dict[str, object]:
+        return {
+            "modal_overlays": [
+                {
+                    "dismiss_controls": [
+                        {"text": "No, keep it"},
+                        {"text": "Yes, update"},
+                    ]
+                }
+            ],
+            "key_value_relations": relations,
+        }
+
+    def test_a_packet_carrying_only_the_dialogs_controls_defers(self) -> None:
+        evidence = self._evidence([{"key_text": "No, keep it", "value_text": "Yes, update"}])
+
+        assert scouting_module.packet_describes_a_clearable_overlay(evidence) is True
+
+    def test_a_dialog_beside_readable_page_content_still_composes(self) -> None:
+        evidence = self._evidence(
+            [
+                {"key_text": "No, keep it", "value_text": "Yes, update"},
+                {"key_text": "logs found", "value_text": "1.22K"},
+            ]
+        )
+
+        assert scouting_module.packet_describes_a_clearable_overlay(evidence) is False
+
+    def test_a_page_with_no_dialog_composes(self) -> None:
+        evidence = {"modal_overlays": [], "key_value_relations": [{"key_text": "logs found", "value_text": "1.22K"}]}
+
+        assert scouting_module.packet_describes_a_clearable_overlay(evidence) is False
+
+
+class TestOverlayDeferralIsNotGatedOnLoadedResults:
+    """A packet describing only a dialog has no results to mint, so gating the deferral on having
+    minted some left it dead in the one case it exists for (SKY-13226, live run DDC)."""
+
+    @pytest.mark.asyncio
+    async def test_an_overlay_only_packet_defers_even_when_no_results_are_minted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        minted: list[str] = []
+
+        def _never_mint(_ctx: Any, _packet: Any, *, url: str) -> None:
+            minted.append(url)
+            return None
+
+        monkeypatch.setattr(scouting_module, "_mint_current_loaded_result_source", _never_mint)
+        evidence = {
+            "modal_overlays": [{"dismiss_controls": [{"text": "No, keep it"}, {"text": "Yes, update"}]}],
+            "key_value_relations": [{"key_text": "No, keep it", "value_text": "Yes, update"}],
+        }
+
+        assert scouting_module.packet_describes_a_clearable_overlay(evidence) is True
+        # The discriminator must not depend on results existing; minting is skipped entirely.
+        assert minted == []

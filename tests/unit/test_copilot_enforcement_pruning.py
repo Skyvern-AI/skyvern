@@ -66,6 +66,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     run_with_enforcement,
     synthesized_block_persistence_signal,
     synthesized_goal_completion_landing_pending,
+    synthesized_offer_reopened_for_extraction_plan,
     synthesized_persistence_reopened,
     synthesized_persistence_reopened_after_failed_run,
     synthesized_trajectory_is_goal_complete,
@@ -148,6 +149,8 @@ class _Ctx:
         self.scout_observed_terminal_criterion_ids: set[str] = set()
         self.scout_observation_contract: object | None = None
         self.flow_evidence: list[dict[str, object]] = []
+        self.last_bound_requested_output_extraction_plan = None
+        self.requested_output_designations: list[dict[str, object]] = []
         self.composition_page_evidence = None
         self.copilot_config: CopilotConfig | None = None
         self.latest_recorded_build_test_outcome = None
@@ -4417,3 +4420,67 @@ def test_total_timeout_override_binds_on_settings_and_defaults_unset() -> None:
 def test_shared_tools_bind_the_configured_total_timeout() -> None:
     assert shared_total_timeout_seconds == TOTAL_TIMEOUT_SECONDS
     assert TOTAL_TIMEOUT_SECONDS == (settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900)
+
+
+class TestUnboundOfferReopen:
+    """The offer names relations no read has claimed, so it stops once one of them is read."""
+
+    @staticmethod
+    def _ctx_on_a_page_with_relations() -> _Ctx:
+        ctx = _Ctx()
+        ctx.scout_trajectory = []
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(id="c0", outcome="the number of visitors", output_path="output.visitors")
+            ]
+        )
+        ctx.flow_evidence = [
+            {
+                "step": 1,
+                "reached_via": "current_page",
+                "had_bounded_schema": True,
+                "evidence": {
+                    "source_tool": "inspect_page_for_composition",
+                    "inspection_warnings": [],
+                    "result_containers": [],
+                    "result_containers_truncated": False,
+                    "key_value_relations_truncated": False,
+                    "key_value_relations": [
+                        {
+                            "key_text": "Visitors",
+                            "value_text": "7.82K",
+                            "container_selector": ".card",
+                            "container_match_count": 1,
+                            "container_position": 0,
+                            "value_child_index": 1,
+                            "direct_child_count": 3,
+                            "visible": True,
+                            "value_visible": True,
+                        }
+                    ],
+                },
+            }
+        ]
+        return ctx
+
+    def test_an_unread_requested_output_reopens_the_offer(self) -> None:
+        ctx = self._ctx_on_a_page_with_relations()
+
+        assert synthesized_offer_reopened_for_extraction_plan(ctx, None) is True
+
+    def test_a_read_that_answered_the_path_stops_reopening_it(self) -> None:
+        ctx = self._ctx_on_a_page_with_relations()
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "read_value",
+                "read_expression": "document.querySelector('.card .val').innerText",
+                "read_output_path": "output.visitors",
+                "read_output_path_source": "declared",
+                "read_result_value": "7.82K",
+                "read_result_shape": "str",
+            }
+        ]
+
+        # Without the latch this stays True for the rest of the turn and the whole offer is
+        # re-emitted on every prompt build.
+        assert synthesized_offer_reopened_for_extraction_plan(ctx, None) is False

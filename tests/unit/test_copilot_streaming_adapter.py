@@ -1754,3 +1754,30 @@ async def test_goal_satisfied_flush_reuses_the_pending_calls_label() -> None:
 
     assert [p.display_label for p in sent] == ['Editing block "Log In"']
     assert narrator_state.design_activity[-1]["displayLabel"] == 'Editing block "Log In"'
+
+
+@pytest.mark.asyncio
+async def test_design_start_narrates_for_a_plain_agent_context() -> None:
+    from skyvern.forge.sdk.copilot.runtime import AgentContext
+    from skyvern.forge.sdk.copilot.streaming_adapter import maybe_emit_design_start
+
+    sent: list[Any] = []
+
+    class _Stream:
+        async def send(self, update: Any) -> None:
+            sent.append(update)
+
+    stream = _Stream()
+    ctx = AgentContext(
+        organization_id="o_1",
+        workflow_id="w_1",
+        workflow_permanent_id="wpid_1",
+        workflow_yaml="",
+        browser_session_id=None,
+        stream=stream,  # type: ignore[arg-type]
+    )
+
+    await maybe_emit_design_start(stream, ctx)  # type: ignore[arg-type]
+
+    assert len(sent) == 1
+    assert ctx.design_start_emitted is True

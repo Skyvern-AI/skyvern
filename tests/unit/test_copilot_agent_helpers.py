@@ -7353,3 +7353,132 @@ def test_an_element_state_timeout_does_not_send_the_user_to_check_the_url() -> N
 
     assert _FAILURE_FOLLOW_UP.get("ELEMENT_STATE_TIMEOUT", "") == ""
     assert "confirm the URL" in _FAILURE_FOLLOW_UP["PAGE_LOAD_TIMEOUT"]
+
+
+def test_offer_reopens_once_when_the_requested_read_becomes_provable_after_authoring() -> None:
+    # The page carrying the requested value is often reached after the draft exists (SKY-13226: the
+    # dashboard sits behind a login). Without reopening, the proven read is derived and never offered,
+    # and the draft's own guess is what the first test run executes.
+    criterion = CompletionCriterion(id="record_id", outcome="Record Identifier", output_path="output.record_id")
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.request_policy = RequestPolicy(completion_criteria=[criterion])
+    ctx.completion_criteria_turn_state = SimpleNamespace(decision=SimpleNamespace(criteria=(criterion,)))
+    ctx.copilot_config = CopilotConfig(requested_output_path_aliases={"record identifier": "output.record_id"})
+    ctx.scout_trajectory = [
+        {"tool_name": "click", "selector": "#show-details", "source_url": "https://example.com/provider"}
+    ]
+    ctx.flow_evidence = []
+    ctx.update_workflow_called = True
+
+    before_the_page_was_reached = _synthesized_block_offer_prompt(ctx)
+    ctx.flow_evidence = [
+        {
+            "step": 2,
+            "reached_via": "interaction",
+            "had_bounded_schema": True,
+            "evidence": {
+                "source_tool": "scout_interaction",
+                "interaction_tool": "click",
+                "interaction_selector": "#show-details",
+                "inspection_warnings": [],
+                "result_containers_truncated": False,
+                "key_value_relations_truncated": False,
+                "key_value_relations": [
+                    {
+                        "key_text": "Record Identifier",
+                        "container_selector": ".record-kv",
+                        "container_match_count": 1,
+                        "container_position": 0,
+                        "value_child_index": 1,
+                        "direct_child_count": 2,
+                        "visible": True,
+                        "value_visible": True,
+                    }
+                ],
+                "result_containers": [],
+            },
+        }
+    ]
+    once_provable = _synthesized_block_offer_prompt(ctx)
+    again = _synthesized_block_offer_prompt(ctx)
+
+    assert before_the_page_was_reached == ""
+    assert 'page.locator(".record-kv").nth(0)' in once_provable
+    assert again == ""
+
+
+def test_offer_reopens_for_candidates_when_the_pages_wording_binds_no_plan() -> None:
+    # Live shape (SKY-13226): a log query labelled its count "logs found" while the request said
+    # "azure", so no plan binds. The relations the page does offer are named only by the offer this
+    # gate guards, so requiring a bound plan to reopen asked the read that makes it bind to exist first.
+    criterion = CompletionCriterion(id="c0", outcome="azure", output_path="output.errors")
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.request_policy = RequestPolicy(completion_criteria=[criterion])
+    ctx.completion_criteria_turn_state = SimpleNamespace(decision=SimpleNamespace(criteria=(criterion,)))
+    ctx.scout_trajectory = [{"tool_name": "click", "selector": "#go", "source_url": "https://example.test/logs"}]
+    ctx.update_workflow_called = True
+    ctx.flow_evidence = [
+        {
+            "step": 1,
+            "reached_via": "current_page",
+            "had_bounded_schema": True,
+            "evidence": {
+                "source_tool": "inspect_page_for_composition",
+                "inspection_warnings": [],
+                "result_containers_truncated": False,
+                "key_value_relations_truncated": False,
+                "key_value_relations": [
+                    {
+                        "key_text": "logs found",
+                        "value_text": "1.22K",
+                        "container_selector": ".agg",
+                        "container_match_count": 1,
+                        "container_position": 0,
+                        "value_child_index": 0,
+                        "direct_child_count": 2,
+                        "visible": True,
+                        "value_visible": True,
+                    }
+                ],
+                "result_containers": [],
+            },
+        }
+    ]
+
+    offer = _synthesized_block_offer_prompt(ctx)
+
+    assert "logs found = 1.22K" in offer
+    assert "output.errors" in offer
+
+
+def test_a_turn_that_forms_no_requested_output_still_dumps_its_trajectory(tmp_path, monkeypatch) -> None:
+    # A login or navigation defect lives in a turn that never forms a requested output, and dumping
+    # only where a plan was attempted left exactly those turns unreproducible offline (SKY-13226).
+    from skyvern.forge.sdk.copilot import enforcement as enforcement_module
+
+    monkeypatch.setenv("COPILOT_DUMP_DERIVATION_INPUTS", str(tmp_path))
+    monkeypatch.setattr(enforcement_module.settings, "ENV", "local")
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.request_policy = RequestPolicy(completion_criteria=[])
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "fill_credential_field",
+            "selector": "#totp",
+            "credential_id": "cred_1",
+            "credential_field": "totp",
+            "source_url": "https://example.test/login/totp",
+        }
+    ]
+    ctx.flow_evidence = []
+
+    _synthesized_block_offer_prompt(ctx)
+
+    dumps = list(tmp_path.glob("derivation-no_requested_output-*.json"))
+    assert dumps, "a turn with no requested output wrote no dump"
+    import json
+
+    recorded = json.loads(dumps[0].read_text())["scout_trajectory"]
+    assert [step["credential_field"] for step in recorded] == ["totp"]
