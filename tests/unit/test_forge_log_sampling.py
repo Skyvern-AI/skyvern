@@ -79,6 +79,12 @@ def test_sampling_marker_excluded_from_rendered_message() -> None:
     assert "action_type=click" in result["msg"]
 
 
+def test_add_kv_pairs_includes_copilot_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(skyvern_context, "current", lambda: SkyvernContext(copilot_session_id="chat_1"))
+    result = add_kv_pairs_to_msg(None, "info", {"msg": "Handling action"})  # type: ignore[arg-type]
+    assert result["copilot_session_id"] == "chat_1"
+
+
 def test_no_context_keeps_marked_info(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(skyvern_context, "current", lambda: None)
     monkeypatch.setattr(settings, "LOG_SAMPLING_ORG_IDS", [SAMPLED_ORG])
