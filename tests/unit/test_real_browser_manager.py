@@ -7,16 +7,20 @@ on every call and re-invoke navigate_to_url() on every step.
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from skyvern.forge.sdk.artifact.storage.recording_test_helpers import fake_prepared_recording
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.routes.streaming import registries
 from skyvern.webeye import real_browser_manager
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.browser_factory import set_popup_video_listener
-from skyvern.webeye.real_browser_manager import RealBrowserManager
+from skyvern.webeye.real_browser_manager import RealBrowserManager, _PersistentSessionLease
 from skyvern.webeye.real_browser_state import RealBrowserState
 
 
@@ -490,6 +494,7 @@ async def test_task_browser_inherits_session_proxy_when_no_browser_state() -> No
     with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
         configure_browser_context_acquired_hook(mock_app)
         mock_app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers.side_effect = _merge_cloud_proxy_session_headers
+        mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock()
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
         mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
@@ -517,6 +522,7 @@ async def test_task_browser_inherits_session_proxy_pin_when_no_browser_state() -
     with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
         configure_browser_context_acquired_hook(mock_app)
         mock_app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers.side_effect = _merge_cloud_proxy_session_headers
+        mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock()
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
         mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
@@ -545,6 +551,7 @@ async def test_task_browser_uses_task_proxy_when_session_has_no_proxy() -> None:
 
     with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
         configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock()
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
         mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
@@ -1001,6 +1008,126 @@ async def test_cleanup_closes_when_stream_disconnects_before_deferral(
 
 
 @pytest.mark.asyncio
+async def test_public_workflow_cleanup_defers_owner_release_until_final_stream_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_run_id = "wfr_owner_stream"
+    manager = RealBrowserManager()
+    browser_state = MagicMock()
+    browser_state.browser_artifacts.traces_dir = None
+    browser_state.browser_artifacts.browser_session_dir = "/tmp/fake_profile"
+    browser_state.close = AsyncMock(return_value=False)
+    manager.pages[workflow_run_id] = browser_state
+    manager._persistent_session_leases[workflow_run_id] = _PersistentSessionLease(
+        session_id="pbs_owner_stream",
+        organization_id="org_test",
+        runnable_id=workflow_run_id,
+        browser_state=browser_state,
+    )
+    sessions = MagicMock()
+    sessions.release_browser_session = AsyncMock(return_value=True)
+    fake_app = MagicMock(BROWSER_MANAGER=manager, PERSISTENT_SESSIONS_MANAGER=sessions)
+
+    import skyvern.forge as forge_module
+
+    monkeypatch.setattr(forge_module, "app", fake_app)
+    monkeypatch.setattr(real_browser_manager, "app", fake_app)
+    monkeypatch.setattr(real_browser_manager, "persist_session_cookies", AsyncMock())
+    assert registries.try_stream_ref_inc(workflow_run_id) is True
+
+    await manager.cleanup_for_workflow_run(
+        workflow_run_id,
+        task_ids=[],
+        close_browser_on_completion=False,
+        browser_session_id="pbs_owner_stream",
+        organization_id="org_test",
+    )
+
+    sessions.release_browser_session.assert_not_awaited()
+    browser_state.close.assert_not_awaited()
+
+    await registries.stream_ref_dec(workflow_run_id)
+
+    browser_state.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=False)
+    sessions.release_browser_session.assert_awaited_once_with(
+        session_id="pbs_owner_stream",
+        organization_id="org_test",
+        expected_runnable_id=workflow_run_id,
+        expected_runnable_generation_id=None,
+        expected_browser_state=browser_state,
+    )
+
+
+@pytest.mark.asyncio
+async def test_public_workflow_cleanup_installs_closing_tombstone_before_first_await(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_run_id = "wfr_cleanup_race"
+    manager = RealBrowserManager()
+    cleanup_awaited = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+
+    async def blocked_drop(_: str) -> None:
+        cleanup_awaited.set()
+        await allow_cleanup.wait()
+
+    monkeypatch.setattr(manager, "_drop_engine_owner", blocked_drop)
+    cleanup = asyncio.create_task(manager.cleanup_for_workflow_run(workflow_run_id, task_ids=[]))
+    await cleanup_awaited.wait()
+
+    attached = registries.try_stream_ref_inc(workflow_run_id)
+    allow_cleanup.set()
+    await cleanup
+    assert attached is False
+
+
+@pytest.mark.asyncio
+async def test_public_workflow_cleanup_retains_owner_lease_until_release_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_run_id = "wfr_release_retry"
+    manager = RealBrowserManager()
+    browser_state = MagicMock()
+    browser_state.browser_artifacts.traces_dir = None
+    browser_state.close = AsyncMock(return_value=False)
+    manager.pages[workflow_run_id] = browser_state
+    lease = _PersistentSessionLease(
+        session_id="pbs_release_retry",
+        organization_id="org_test",
+        runnable_id=workflow_run_id,
+        browser_state=browser_state,
+    )
+    manager._persistent_session_leases[workflow_run_id] = lease
+    sessions = MagicMock()
+    sessions.release_browser_session = AsyncMock(side_effect=[False, True])
+    fake_app = MagicMock(PERSISTENT_SESSIONS_MANAGER=sessions)
+    monkeypatch.setattr(real_browser_manager, "app", fake_app)
+
+    await manager.cleanup_for_workflow_run(
+        workflow_run_id,
+        task_ids=[],
+        close_browser_on_completion=False,
+        browser_session_id="pbs_release_retry",
+        organization_id="org_test",
+    )
+
+    assert manager._persistent_session_leases[workflow_run_id] is lease
+    assert registries.try_stream_ref_inc(workflow_run_id) is False
+
+    await manager.cleanup_for_workflow_run(
+        workflow_run_id,
+        task_ids=[],
+        close_browser_on_completion=False,
+        browser_session_id="pbs_release_retry",
+        organization_id="org_test",
+    )
+
+    assert workflow_run_id not in manager._persistent_session_leases
+    assert sessions.release_browser_session.await_count == 2
+    browser_state.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=False)
+
+
+@pytest.mark.asyncio
 async def test_pbs_adoption_rebinds_download_dir_to_run_id() -> None:
     """Adopting a persistent session must rebind its CDP download dir to the run's id (SKY-11083)."""
     manager = RealBrowserManager()
@@ -1017,6 +1144,7 @@ async def test_pbs_adoption_rebinds_download_dir_to_run_id() -> None:
         patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind,
     ):
         configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock()
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
         mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
 
@@ -1025,8 +1153,136 @@ async def test_pbs_adoption_rebinds_download_dir_to_run_id() -> None:
             url=None,
             browser_session_id="bs_adopt",
         )
+        mock_rebind.assert_awaited_once_with(adopted_browser, run_id="wfr_adopt")
+        mock_rebind.reset_mock()
+        await real_browser_manager._rebind_pbs_download_dir(pbs_state, workflow_run.workflow_run_id, "bs_adopt")
+        mock_rebind.assert_not_awaited()
 
-    mock_rebind.assert_awaited_once_with(adopted_browser, run_id="wfr_adopt")
+
+@pytest.mark.asyncio
+async def test_pbs_adoption_rebinds_download_dir_without_an_interceptor() -> None:
+    """A Skyvern-hosted session binds no interceptor, so it is rebind_download_dir's
+    Browser.setDownloadBehavior branch that moves it off the session-scoped connect-time path.
+    SimpleNamespace, not MagicMock: the latter auto-creates the interceptor attribute."""
+    adopted_browser = MagicMock()
+    browser_context = SimpleNamespace(browser=adopted_browser)
+    pbs_state = SimpleNamespace(browser_context=browser_context)
+
+    with patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind:
+        await real_browser_manager._rebind_pbs_download_dir(pbs_state, "wfr_own_infra", "bs_own_infra")
+        mock_rebind.assert_awaited_once_with(adopted_browser, run_id="wfr_own_infra")
+
+        mock_rebind.reset_mock()
+        await real_browser_manager._rebind_pbs_download_dir(pbs_state, "wfr_own_infra", "bs_own_infra")
+        mock_rebind.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_public_workflow_adoption_keeps_lease_identity_separate_from_download_run_id() -> None:
+    manager = RealBrowserManager()
+    workflow_run = make_workflow_run("wr_owner")
+    adopted_browser = MagicMock()
+    pbs_state = MagicMock()
+    pbs_state.browser_context.browser = adopted_browser
+    pbs_state.browser_context._skyvern_cdp_download_interceptor = MagicMock()
+    pbs_state.get_working_page = AsyncMock(return_value=None)
+    pbs_state.get_or_create_page = AsyncMock()
+
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind,
+        skyvern_context.scoped(
+            SkyvernContext(
+                organization_id="org_test",
+                workflow_run_id="wr_owner",
+                run_id="task_v2_run",
+            )
+        ),
+    ):
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
+
+        await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            browser_session_id="pbs_nested",
+            navigate=False,
+        )
+
+    mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_awaited_once_with(
+        "pbs_nested",
+        organization_id="org_test",
+        expected_runnable_id="wr_owner",
+        download_run_id="task_v2_run",
+    )
+    mock_rebind.assert_awaited_once_with(adopted_browser, run_id="task_v2_run")
+    assert manager._persistent_session_leases["wr_owner"].runnable_id == "wr_owner"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_vendor_interceptor", [True, False])
+async def test_pbs_task_adoption_rebinds_regardless_of_vendor_interceptor(has_vendor_interceptor: bool) -> None:
+    """Own-infra sessions carry no interceptor and are rebound through setDownloadBehavior; skipping
+    them would leave their downloads in the session-scoped connect-time dir, which collection
+    (get_download_dir(run_id)) never reads."""
+    manager = RealBrowserManager()
+    task = make_task("tsk_adopt")
+    adopted_browser = MagicMock()
+    pbs_state = MagicMock()
+    pbs_state.browser_context.browser = adopted_browser
+    pbs_state.browser_context._skyvern_cdp_download_interceptor = MagicMock() if has_vendor_interceptor else None
+    pbs_state.get_working_page = AsyncMock(return_value=None)
+    pbs_state.get_or_create_page = AsyncMock()
+
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind,
+    ):
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock()
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
+        await manager.get_or_create_for_task(task, browser_session_id="bs_adopt")
+
+    assert mock_rebind.await_args == ((adopted_browser,), {"run_id": "tsk_adopt"})
+    mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session.assert_awaited_once_with(
+        browser_session_id="bs_adopt",
+        runnable_type="task",
+        runnable_id="tsk_adopt",
+        organization_id="org_test",
+    )
+    mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_awaited_once_with(
+        "bs_adopt",
+        organization_id="org_test",
+        expected_runnable_id="tsk_adopt",
+        download_run_id="tsk_adopt",
+    )
+
+
+@pytest.mark.asyncio
+async def test_workflow_task_inherits_workflow_session_lease_without_beginning_task_lease() -> None:
+    manager = RealBrowserManager()
+    task = make_task("tsk_child", workflow_run_id="wr_owner")
+    pbs_state = MagicMock()
+    pbs_state.browser_context._skyvern_cdp_download_interceptor = None
+    pbs_state.get_working_page = AsyncMock(return_value=None)
+    pbs_state.get_or_create_page = AsyncMock()
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock()
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
+
+        await manager.get_or_create_for_task(task, browser_session_id="bs_workflow")
+
+    mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session.assert_not_awaited()
+    mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_awaited_once_with(
+        "bs_workflow",
+        organization_id="org_test",
+        expected_runnable_id="wr_owner",
+        download_run_id="wr_owner",
+    )
+    lease = manager._persistent_session_leases["wr_owner"]
+    assert lease.runnable_id == "wr_owner"
+    assert lease.browser_state is pbs_state
 
 
 @pytest.mark.asyncio

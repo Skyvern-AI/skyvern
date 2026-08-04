@@ -3479,12 +3479,15 @@ class WorkflowService:
         renewal_task: asyncio.Task[None] | None = None
         if browser_session_id:
             try:
-                await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+                lease_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
                     browser_session_id=browser_session_id,
                     runnable_type="workflow_run",
                     runnable_id=workflow_run_id,
                     organization_id=organization.organization_id,
                 )
+                current_context = skyvern_context.ensure_context()
+                current_context.browser_session_runnable_id = workflow_run_id
+                current_context.browser_session_runnable_generation_id = lease_generation_id
             except Exception as e:
                 LOG.exception(
                     "Failed to begin browser session for workflow run",

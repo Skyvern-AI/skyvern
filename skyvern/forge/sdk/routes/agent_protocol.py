@@ -3569,7 +3569,11 @@ async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api
         )
 
     if workflow_run.browser_session_id:
-        await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(workflow_run.browser_session_id, organization_id)
+        await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
+            workflow_run.browser_session_id,
+            organization_id,
+            expected_runnable_id=workflow_run.workflow_run_id,
+        )
 
     # get all the child workflow runs and cancel them
     child_workflow_runs = await app.DATABASE.workflow_runs.get_workflow_runs_by_parent_workflow_run_id(

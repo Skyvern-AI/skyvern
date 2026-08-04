@@ -31,6 +31,8 @@ class BrowserManager(Protocol):
         browser_session_id: str | None = None,
         browser_profile_id: str | None = None,
         navigate: bool = True,
+        browser_session_runnable_id: str | None = None,
+        browser_session_runnable_generation_id: str | None = None,
     ) -> BrowserState: ...
 
     async def cleanup_for_task(
