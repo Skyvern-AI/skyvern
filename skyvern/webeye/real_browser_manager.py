@@ -513,6 +513,7 @@ class RealBrowserManager(BrowserManager):
             **engine_selection.attribution(),
         )
         pw = await engine_selection.start_driver()
+        context = skyvern_context.current()
         try:
             (
                 browser_context,
@@ -530,6 +531,7 @@ class RealBrowserManager(BrowserManager):
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
+                browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
                 browser_profile_id=browser_profile_id,
                 engine_selection=engine_selection,
             )

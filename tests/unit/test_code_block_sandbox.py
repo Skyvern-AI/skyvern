@@ -15,7 +15,7 @@ import pytest
 
 from skyvern.config import settings
 from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
-from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.block import CODE_BLOCK_TAB_OPEN_FAILURE_REASON, CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
@@ -834,6 +834,122 @@ async def wrapper({default_args}):
         assert result.success is True
         assert result.status == BlockStatus.completed
         assert result.output_parameter_value == {"value": "ok"}
+
+    async def _execute_against_tabless_session(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        open_page_raises: bool = False,
+        open_page_error: Exception | None = None,
+    ) -> tuple[object, int, int]:
+        """Run a block against a session whose context holds zero pages."""
+
+        class TablessBrowserState:
+            def __init__(self) -> None:
+                self.browser_artifacts = BrowserArtifacts()
+                self.open_attempts = 0
+                self.created_pages = 0
+
+            async def get_or_create_page(self, *args: object, **kwargs: object) -> object:
+                self.open_attempts += 1
+                if open_page_error is not None:
+                    raise open_page_error
+                if open_page_raises:
+                    raise RuntimeError("browser is gone")
+                self.created_pages += 1
+                return object()
+
+            async def get_working_page(self) -> object | None:
+                return None
+
+        class FakeWorkflowRunContext:
+            values: dict[str, object] = {}
+            secrets: dict[str, object] = {}
+            include_secrets_in_templates = False
+            organization_id = None
+            workflow_title = "Test Workflow"
+            workflow_id = "w_test"
+            workflow_permanent_id = "wpid_test"
+            workflow_run_id = "wrid_test"
+            browser_session_id = "pbs_test"
+            workflow_run_outputs: list[object] = []
+
+            def get_block_metadata(self, label: str | None) -> dict[str, object]:
+                return {}
+
+            def build_workflow_run_summary(self) -> str:
+                return ""
+
+            def mask_secrets_in_data(self, data: object, mask: str = "*****") -> object:
+                return data
+
+        state = TablessBrowserState()
+
+        async def validate_code_block(*args: object, **kwargs: object) -> None:
+            return None
+
+        async def get_browser_state(*args: object, **kwargs: object) -> TablessBrowserState:
+            return state
+
+        async def record_output(*args: object, **kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block",
+            validate_code_block,
+        )
+        monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", get_browser_state)
+        monkeypatch.setattr(CodeBlock, "get_workflow_run_context", lambda *args: FakeWorkflowRunContext())
+        monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record_output)
+
+        now = datetime.now(timezone.utc)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="tabless_output",
+            description="test output",
+            output_parameter_id="op_tabless",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        )
+        block = CodeBlock(label="tabless", code="value = 'ok'", output_parameter=output_parameter)
+        result = await block.execute(workflow_run_id="wrid_test", workflow_run_block_id="")
+        return result, state.open_attempts, state.created_pages
+
+    @pytest.mark.asyncio
+    async def test_execute_opens_a_tab_when_the_session_has_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        result, open_attempts, created_pages = await self._execute_against_tabless_session(monkeypatch)
+
+        assert (open_attempts, created_pages) == (1, 1)
+        assert result.success is True
+        assert result.output_parameter_value == {"value": "ok"}
+
+    @pytest.mark.asyncio
+    async def test_execute_fails_when_the_session_cannot_open_a_tab(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        result, open_attempts, created_pages = await self._execute_against_tabless_session(
+            monkeypatch, open_page_raises=True
+        )
+
+        assert (open_attempts, created_pages) == (1, 0)
+        assert result.success is False
+        assert result.status == BlockStatus.failed
+        assert result.failure_reason == f"{CODE_BLOCK_TAB_OPEN_FAILURE_REASON} (RuntimeError)"
+        assert result.failure_reason != "No page found to run the code block"
+
+    @pytest.mark.asyncio
+    async def test_execute_reports_the_driver_error_name_when_the_tab_cannot_open(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Playwright surfaces most driver failures as its base Error class, whose .name carries
+        the real error (parse_error sets it); the class name alone would render as just (Error)."""
+        from playwright.async_api import Error as PlaywrightError
+
+        driver_error = PlaywrightError("BrowserContext.new_page: Cannot read properties of undefined")
+        driver_error._name = "TypeError"
+
+        result, _, _ = await self._execute_against_tabless_session(monkeypatch, open_page_error=driver_error)
+
+        assert result.success is False
+        assert result.failure_reason == f"{CODE_BLOCK_TAB_OPEN_FAILURE_REASON} (TypeError)"
 
     def test_poc_blocked_at_is_safe_code_gate(self) -> None:
         """The PoC payload is rejected before exec() is ever called."""

@@ -39,6 +39,7 @@ from skyvern.exceptions import (
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time, scroll_into_view_wait
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.dom_inspection import (
@@ -690,8 +691,8 @@ class SkyvernElement:
         coordinate click would dispatch overlay JS, which can navigate to an
         unintended URL.  Following the href avoids that side effect entirely.
 
-        Returns the resolved URL on success, ``None`` when no safe URL can be
-        derived or when frame navigation raises an unrecoverable error.
+        Returns the resolved URL on success or ``None`` when no HTTP(S) URL can be derived
+        or frame navigation fails. Raises ``SkyvernHTTPException`` for a blocked URL.
         """
         # TODO: share a lower-level href-resolution + goto/download-success
         # helper with ``navigate_to_a_href``.  Keep the entry points separate:
@@ -704,6 +705,8 @@ class SkyvernElement:
         target = await self.get_attr("target", mode="static")
         if target and target.strip().lower() != "_self":
             return None
+
+        resolved = await asyncio.to_thread(validate_fetch_url, resolved)
 
         try:
             frame = self.get_frame()
@@ -1462,6 +1465,8 @@ class SkyvernElement:
         href = await self.should_use_navigation_instead_click(page)
         if not href:
             return None
+
+        href = await asyncio.to_thread(validate_fetch_url, href)
 
         LOG.info(
             "Trying to navigate to the <a> href link instead of clicking",

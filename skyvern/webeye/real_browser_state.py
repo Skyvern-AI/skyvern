@@ -25,6 +25,7 @@ from skyvern.exceptions import (
     MissingBrowserStatePage,
 )
 from skyvern.forge import app
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.trace import traced
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
@@ -201,6 +202,7 @@ class RealBrowserState(BrowserState):
     ) -> None:
         if self.browser_context is None:
             LOG.info("creating browser context")
+            context = skyvern_context.current()
             (
                 browser_context,
                 browser_artifacts,
@@ -217,6 +219,7 @@ class RealBrowserState(BrowserState):
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
+                browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
                 browser_profile_id=browser_profile_id,
                 engine_selection=self.engine_selection,
             )

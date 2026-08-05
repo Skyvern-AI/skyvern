@@ -3736,6 +3736,18 @@ class CodeBlockCaptchaError(Exception):
     """Sanitized CAPTCHA-primitive error with no site, selector, vendor, or token details."""
 
 
+CODE_BLOCK_TAB_OPEN_FAILURE_REASON = "Code block could not open a tab in the browser session; the session's browser may be held by another Playwright client"
+
+
+def _page_open_error_label(error: BaseException) -> str:
+    # Playwright maps only TimeoutError/TargetClosedError to their own Python classes; every
+    # other driver failure is the base Error whose .name carries the real class (e.g. TypeError).
+    name = getattr(error, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    return type(error).__name__
+
+
 _CODE_BLOCK_CAPTCHA_CHECKBOX_SELECTOR = ", ".join(
     (
         'input[type="checkbox"][id*="captcha" i]',
@@ -5538,15 +5550,30 @@ async def wrapper({default_args}):
             )
 
         page = await browser_state.get_working_page()
-        if not page:
-            return await self.build_block_result(
-                success=False,
-                failure_reason="No page found to run the code block",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-            )
+        if page is None:
+            # A session can arrive holding a context with no tab, leaving nothing to adopt. Opening
+            # one can raise even on a live context: when another Playwright client enabled autoAttach
+            # first, it owns target announcements and this connection stays blind to pages
+            # (SKY-13338) — no reconnect or retry from here can fix that.
+            try:
+                page = await browser_state.get_or_create_page()
+            except Exception as e:
+                LOG.exception(
+                    "Failed to open a page to run the code block",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    block_label=self.label,
+                )
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=f"{CODE_BLOCK_TAB_OPEN_FAILURE_REASON} ({_page_open_error_label(e)})",
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
 
         await self._ensure_run_recording_artifact(
             browser_state=browser_state,

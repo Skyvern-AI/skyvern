@@ -44,7 +44,9 @@ from skyvern.exceptions import (
     BrowserProfileNotFound,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
+    BrowserSessionStartupTimeout,
     DisabledBlockExecutionError,
+    InProcessScriptExecutionDenied,
     InvalidCredentialId,
     InvalidWorkflowParameter,
     MissingValueForParameter,
@@ -263,6 +265,10 @@ WORKFLOW_RUN_INTERRUPTED_FAILURE_REASON = (
 # Short lifespan for auto-provisioned CodeBlock sessions; the renewal loop extends it while the
 # run is active, so this only bounds how long a leaked session lingers if cleanup never runs.
 CODE_BLOCK_SESSION_TIMEOUT_MINUTES = 20
+# Wall clock, not an attempt count: a waiting run holds a whole worker pod
+# (max_concurrent_activities=1), so what has to stay bounded is the time pinned, whatever the
+# per-attempt startup deadline happens to be.
+CODE_BLOCK_SESSION_STARTUP_BUDGET_SECONDS = 90.0
 
 # Structured warning emitted when a debug-session run's visible PBS profile is
 # incompatible with the LoginBlock credential's saved profile. Observability
@@ -626,7 +632,17 @@ def _script_has_static_module_marker(script_path: str) -> bool:
         return False
 
 
-def _load_user_script_module(script_path: str, spec: "importlib.machinery.ModuleSpec") -> Any | None:
+async def _load_user_script_module(
+    script_path: str,
+    spec: "importlib.machinery.ModuleSpec",
+    *,
+    organization_id: str | None = None,
+    workflow_run_id: str | None = None,
+    workflow_permanent_id: str | None = None,
+    workflow_id: str | None = None,
+    script_id: str | None = None,
+    script_revision_id: str | None = None,
+) -> Any | None:
     """Load a cached script's main.py for execution.
 
     Static (marker) pins must import the live platform module FIRST: the stored
@@ -639,6 +655,16 @@ def _load_user_script_module(script_path: str, spec: "importlib.machinery.Module
     check would never supersede it. Only a markerless pin (a generated script)
     executes its stored body.
     """
+    await script_service.ensure_in_process_script_execution_allowed(
+        seam="workflow.cached_script_module_load",
+        organization_id=organization_id,
+        workflow_run_id=workflow_run_id,
+        workflow_permanent_id=workflow_permanent_id,
+        workflow_id=workflow_id,
+        script_id=script_id,
+        script_revision_id=script_revision_id,
+    )
+
     loaded_script_module = app.AGENT_FUNCTION.try_import_static_script(script_path)
     if loaded_script_module is not None:
         return loaded_script_module
@@ -3034,12 +3060,11 @@ class WorkflowService:
             return None
 
         try:
-            browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+            browser_session = await self._create_code_block_browser_session(
                 organization_id=organization_id,
-                timeout_minutes=CODE_BLOCK_SESSION_TIMEOUT_MINUTES,
                 browser_profile_id=browser_profile_id,
                 proxy_location=proxy_location,
-                inherit_profile_proxy=True,
+                workflow_run_id=workflow_run_id,
             )
         except Exception:
             LOG.error(
@@ -3059,6 +3084,59 @@ class WorkflowService:
             browser_session_id=browser_session.persistent_browser_session_id,
         )
         return browser_session
+
+    async def _create_code_block_browser_session(
+        self,
+        *,
+        organization_id: str,
+        browser_profile_id: str | None,
+        proxy_location: ProxyLocationInput,
+        workflow_run_id: str,
+    ) -> PersistentBrowserSession:
+        """Create the CodeBlock session, retrying only a startup timeout.
+
+        A startup timeout means the session fleet had no free capacity inside the deadline,
+        not that the request was invalid — the fleet scales on demand, so a fresh attempt
+        often lands on pods that came up just after the previous deadline expired. Every
+        other failure is deterministic, so retrying it only delays the run.
+
+        Retrying is bounded by wall clock rather than by attempts because the waiting run
+        occupies a whole worker pod, and it does so during exactly the capacity crunch that
+        causes the timeout — so the cost to bound is time held, not requests made.
+        """
+        deadline = time.monotonic() + CODE_BLOCK_SESSION_STARTUP_BUDGET_SECONDS
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+                    organization_id=organization_id,
+                    timeout_minutes=CODE_BLOCK_SESSION_TIMEOUT_MINUTES,
+                    browser_profile_id=browser_profile_id,
+                    proxy_location=proxy_location,
+                    inherit_profile_proxy=True,
+                )
+            except BrowserSessionStartupTimeout:
+                if time.monotonic() >= deadline:
+                    raise
+                # A cancel can land while we wait. Provisioning another billed session for a
+                # run that already finished helps nobody and deepens the shortage.
+                workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id)
+                if workflow_run.status.is_final():
+                    LOG.info(
+                        "Workflow run reached a final state while its CodeBlock session was starting; not retrying",
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                        workflow_status=workflow_run.status,
+                    )
+                    raise
+                LOG.warning(
+                    "Browser session for CodeBlock run timed out starting; retrying",
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    attempt=attempt,
+                    budget_seconds=CODE_BLOCK_SESSION_STARTUP_BUDGET_SECONDS,
+                )
 
     async def _collect_inherited_workflow_system_prompt(
         self,
@@ -3448,8 +3526,13 @@ class WorkflowService:
                     "Failed to create the browser session required for secure code execution: "
                     f"{get_user_facing_exception_message(e)}"
                 )
-                workflow_run = await self.mark_workflow_run_as_failed(
-                    workflow_run_id=workflow_run_id, failure_reason=failure_reason
+                # Conditional: a cancel can land while the session is still starting, and an
+                # unconditional write would overwrite that terminal status with ``failed``.
+                workflow_run = (
+                    await self.mark_workflow_run_as_failed_if_not_final(
+                        workflow_run_id=workflow_run_id, failure_reason=failure_reason
+                    )
+                    or workflow_run
                 )
                 await self.clean_up_workflow(
                     workflow=workflow,
@@ -4100,7 +4183,16 @@ class WorkflowService:
 
                         spec = importlib.util.spec_from_file_location("user_script", script_path)
                         if spec and spec.loader:
-                            loaded_script_module = _load_user_script_module(script_path, spec)
+                            loaded_script_module = await _load_user_script_module(
+                                script_path,
+                                spec,
+                                organization_id=organization_id,
+                                workflow_run_id=workflow_run_id,
+                                workflow_permanent_id=workflow.workflow_permanent_id,
+                                workflow_id=workflow.workflow_id,
+                                script_id=script.script_id,
+                                script_revision_id=script.script_revision_id,
+                            )
                             param_cls = (
                                 getattr(loaded_script_module, "GeneratedWorkflowParameters", None)
                                 if loaded_script_module
@@ -4158,6 +4250,8 @@ class WorkflowService:
                             script_path=script_path,
                             script_id=script.script_id,
                         )
+            except InProcessScriptExecutionDenied:
+                raise
             except Exception as e:
                 LOG.warning(
                     "Failed to load script blocks, will fallback to normal execution",

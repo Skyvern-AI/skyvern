@@ -624,6 +624,14 @@ class RequestPolicy:
     # The server-held login page URLs this ask was formed against; the only origin source the
     # connected resume may bind from.
     credential_ask_login_page_urls: list[str] = field(default_factory=list)
+    # Credentials this turn resolved from an explicit user reference — an exact saved name or a
+    # cred_ id — as distinct from approvals carried in from earlier turns. Naming a credential
+    # answers which one to use, which is what lets the login page answer where it may be typed.
+    current_turn_named_credential_ids: set[str] = field(default_factory=set)
+    # Login targets the classifier named that the user also wrote themselves. The classifier alone
+    # decides which URL is a sign-in page but is not authority for the origin a password reaches, so
+    # only the intersection may vouch for a fill.
+    grounded_login_target_urls: list[str] = field(default_factory=list)
     credential_ask_candidate_ids: list[str] = field(default_factory=list)
     existing_workflow_credential_ids: list[str] = field(default_factory=list)
     # Sorted at the trace/JSON boundary; YAML traversal uses sets.
@@ -4867,6 +4875,29 @@ def _prior_approved_credential_ids_from_context(global_llm_context: str) -> set[
     }
 
 
+def _ground_login_target_urls(policy: RequestPolicy, user_message: str) -> None:
+    """Keep the classifier's login targets this message also carries, so neither a URL the model authored
+    nor one the user pasted in an older turn for another purpose becomes an origin a password reaches.
+    """
+    typed_origins = {
+        parts[2]
+        for candidate in URL_CANDIDATE_RE.findall(user_message or "")
+        if (parts := _url_parts(candidate.rstrip(".,;:!?")))
+    }
+    policy.grounded_login_target_urls = [
+        url for url in policy.login_page_urls if (parts := _url_parts(url)) and parts[2] in typed_origins
+    ]
+
+
+def _record_current_turn_named_credentials(policy: RequestPolicy, credentials: Sequence[Credential]) -> None:
+    """Mark credentials the user picked out by name or id in the message being handled, kept apart from
+    ``resolved_credentials`` because a turn-old approval is not evidence about the page in front of us.
+    """
+    policy.current_turn_named_credential_ids.update(
+        credential.credential_id for credential in credentials if credential.credential_id
+    )
+
+
 async def _seed_prior_approved_credentials(
     policy: RequestPolicy,
     *,
@@ -4965,6 +4996,7 @@ async def _resolve_credentials(
         existing = await app.DATABASE.credentials.get_credentials_by_ids(ids, organization_id=organization_id)
         found = {credential.credential_id for credential in existing}
         policy.resolved_credentials = existing
+        _record_current_turn_named_credentials(policy, existing)
         policy.invalid_credential_ids = [credential_id for credential_id in ids if credential_id not in found]
         if policy.invalid_credential_ids and policy.testing_intent != "skip_test":
             formatted = ", ".join(f"`{credential_id}`" for credential_id in policy.invalid_credential_ids)
@@ -5002,6 +5034,7 @@ async def _resolve_credentials(
         )
         if len(named_matches) == 1:
             policy.resolved_credentials = named_matches
+            _record_current_turn_named_credentials(policy, named_matches)
             if (
                 policy.classifier_status == "fallback"
                 and policy.credential_input_kind == "none"
@@ -5686,6 +5719,7 @@ async def build_request_policy(
             # conservative clarification flag; _resolve_credentials will block
             # again if the lookup is missing or ambiguous.
             policy.requires_user_clarification = False
+            _ground_login_target_urls(policy, user_message)
             await _resolve_credentials(
                 policy,
                 organization_id,

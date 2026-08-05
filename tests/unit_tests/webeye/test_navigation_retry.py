@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import socket
 from unittest.mock import AsyncMock
 
 import pytest
@@ -7,6 +8,15 @@ import pytest
 from skyvern.exceptions import BlockedNavigationDestination, FailedToNavigateToUrl
 from skyvern.webeye.navigation import navigate_with_retry, validate_navigation_destination
 from skyvern.webeye.real_browser_state import RealBrowserState
+
+
+@pytest.fixture(autouse=True)
+def _resolve_navigation_hosts_to_public_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolves_public(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_public)
+
 
 # Internal, loopback, link-local, metadata, and local-file targets that must fail closed.
 BLOCKED_DESTINATIONS = [
@@ -225,6 +235,30 @@ def test_validate_navigation_destination_rejects_internal_and_local_targets(url:
 )
 def test_validate_navigation_destination_allows_public_targets(url: str) -> None:
     validate_navigation_destination(url)
+
+
+def test_validate_navigation_destination_allows_a_host_the_worker_cannot_resolve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fails_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        raise OSError("dns unavailable")
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", fails_dns)
+
+    validate_navigation_destination("https://public.example.test/path")
+
+
+@pytest.mark.parametrize("url", BLOCKED_DESTINATIONS)
+def test_validate_navigation_destination_still_refuses_internal_targets_when_dns_fails(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    def fails_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        raise OSError("dns unavailable")
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", fails_dns)
+
+    with pytest.raises(BlockedNavigationDestination):
+        validate_navigation_destination(url)
 
 
 @pytest.mark.parametrize("url", BLOCKED_DESTINATIONS)

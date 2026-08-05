@@ -611,7 +611,7 @@ def _patch_pw_stack(monkeypatch: pytest.MonkeyPatch, *, fire_disconnect_on_close
     def _fake_async_playwright() -> _FakePwManager:
         return _FakePwManager(_make_pw)
 
-    async def _fake_connect(pw: object, url: str, headers: dict | None = None) -> _FakePwBrowser:
+    async def _fake_connect(pw: object, url: str, headers: dict | None = None, **kwargs: object) -> _FakePwBrowser:
         browser = _FakePwBrowser(fire_disconnect_on_close=fire_disconnect_on_close)
         state.browsers.append(browser)
         return browser

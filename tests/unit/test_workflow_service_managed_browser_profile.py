@@ -108,6 +108,9 @@ def _patch_execute_workflow_deps(
         workflow_runs=SimpleNamespace(
             get_workflow_run=AsyncMock(return_value=refreshed_run),
             update_workflow_run=AsyncMock(),
+            # Conditional finalize used by mark_workflow_run_as_failed_if_not_final: returns the
+            # run when this caller won the terminal transition, None when it was already final.
+            update_workflow_run_if_not_final=AsyncMock(return_value=refreshed_run),
         ),
         artifacts=SimpleNamespace(claim_session_download_artifacts_for_run=AsyncMock(return_value=0)),
     )

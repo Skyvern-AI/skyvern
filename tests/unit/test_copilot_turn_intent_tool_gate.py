@@ -209,6 +209,27 @@ def test_diagnose_soft_block_still_denies_side_effect(tool_name: str) -> None:
             "get_run_results",
             id="diagnose_allows_get_run_results_tool",
         ),
+        pytest.param(
+            TurnIntentMode.DIAGNOSE,
+            {"may_update_workflow": True, "may_run_blocks": True, "may_read_run_context": True},
+            {},
+            "inspect_page_for_composition",
+            id="diagnose_with_write_authority_allows_page_inspection",
+        ),
+        pytest.param(
+            TurnIntentMode.DIAGNOSE,
+            {"may_update_workflow": True, "may_run_blocks": True, "may_read_run_context": True},
+            {},
+            "update_workflow",
+            id="diagnose_with_write_authority_allows_workflow_update",
+        ),
+        pytest.param(
+            TurnIntentMode.DIAGNOSE,
+            {"may_update_workflow": True, "may_run_blocks": True, "may_read_run_context": True},
+            {},
+            "update_and_run_blocks",
+            id="diagnose_with_write_authority_allows_update_and_run",
+        ),
     ],
 )
 def test_turn_intent_gate_allows_authorized_tool(

@@ -47,7 +47,7 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import generate_totp_code
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services.otp_service import poll_otp_value
-from skyvern.utils.url_validators import prepend_scheme_and_validate_url
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -1040,7 +1040,7 @@ class ScriptSkyvernPage(SkyvernPage):
 
     async def goto(self, url: str, **kwargs: Any) -> None:
         url = render_template(url)
-        url = prepend_scheme_and_validate_url(url)
+        url = await asyncio.to_thread(validate_fetch_url, url)
 
         # Print navigation in script mode
         context = skyvern_context.current()

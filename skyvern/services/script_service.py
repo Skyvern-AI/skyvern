@@ -28,7 +28,9 @@ from skyvern.core.script_generations.script_skyvern_page import script_run_conte
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     CachedDownloadError,
+    CodeBlockRunnerSelectionError,
     IllegitCompleteScriptTermination,
+    InProcessScriptExecutionDenied,
     ScriptNotFound,
     ScriptTerminationException,
     StepTerminationError,
@@ -56,6 +58,7 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata
 from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter, MissingJinjaVariables
 from skyvern.forge.sdk.workflow.loop_download_filter import (
@@ -103,6 +106,8 @@ from skyvern.schemas.scripts import (
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileDownloadTarget, FileStorageType, FileType
 from skyvern.utils.css_selector import build_action_summaries_with_timing
+from skyvern.utils.script_file_paths import SCRIPT_FILE_PATH_ERROR, normalize_script_file_path
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, DecisiveAction
 from skyvern.webeye.cdp_download_interceptor import download_filename_from_suffix
@@ -124,6 +129,10 @@ VERIFIER_SWAP_FAILURE_REASON = (
 # Max wait for any download signal after a cached click; downstream
 # .crdownload polling handles in-progress completion separately. (SKY-9431)
 CACHED_DOWNLOAD_NO_FILE_GRACE_SECONDS = 60
+_MAX_SCRIPT_FILE_BYTES = 10 * 1024 * 1024
+_BLOCKED_SCRIPT_FILE_EXTENSIONS = frozenset(
+    {".dylib", ".egg", ".pickle", ".pkl", ".pth", ".pyc", ".pyd", ".pyo", ".so", ".whl", ".zip"}
+)
 
 
 class SkyvernLoopItem:
@@ -140,6 +149,78 @@ class SkyvernLoopItem:
         return f"SkyvernLoopItem(current_value={self.current_value}, current_index={self.current_index})"
 
 
+def _decode_uploaded_script_file(file: ScriptFileCreate) -> bytes:
+    if file.encoding == FileEncoding.BASE64:
+        try:
+            return base64.b64decode(file.content, validate=True)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"File {file.path!r} is not valid base64") from exc
+    return file.content.encode("utf-8")
+
+
+def _validate_python_file(
+    file: ScriptFileCreate,
+    content_bytes: bytes,
+    *,
+    allow_invalid_python_syntax: bool = False,
+) -> None:
+    if Path(file.path).suffix.lower() != ".py":
+        return
+    try:
+        source = content_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Python file {file.path!r} is not valid UTF-8") from exc
+
+    try:
+        is_safe_script_code(source, error_factory=ValueError)
+    except SyntaxError as exc:
+        if allow_invalid_python_syntax:
+            return
+        raise HTTPException(status_code=400, detail=f"Python file {file.path!r} does not parse") from exc
+    except (MemoryError, RecursionError) as exc:
+        raise HTTPException(status_code=400, detail=f"Python file {file.path!r} does not parse") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Python file {file.path!r} is not allowed: {exc}") from exc
+
+
+def _validate_script_files(
+    files: list[ScriptFileCreate],
+    *,
+    allow_invalid_python_syntax: bool = False,
+) -> dict[str, bytes]:
+    file_bytes_by_path: dict[str, bytes] = {}
+    for file in files:
+        try:
+            normalize_script_file_path(file.path)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File path {file.path!r} is invalid: {SCRIPT_FILE_PATH_ERROR}",
+            ) from exc
+        file_path = Path(file.path)
+        file_extension = file_path.suffix.lower() or file_path.name.lower()
+        if file_extension in _BLOCKED_SCRIPT_FILE_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File {file.path!r} has prohibited extension {file_extension!r}",
+            )
+        if file.path in file_bytes_by_path:
+            raise HTTPException(status_code=400, detail=f"Duplicate script file path {file.path!r}")
+        content_bytes = _decode_uploaded_script_file(file)
+        if len(content_bytes) > _MAX_SCRIPT_FILE_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File {file.path!r} exceeds maximum size of {_MAX_SCRIPT_FILE_BYTES} bytes",
+            )
+        _validate_python_file(file, content_bytes, allow_invalid_python_syntax=allow_invalid_python_syntax)
+        file_bytes_by_path[file.path] = content_bytes
+    return file_bytes_by_path
+
+
+def validate_uploaded_script_files(files: list[ScriptFileCreate]) -> dict[str, bytes]:
+    return _validate_script_files(files)
+
+
 async def build_file_tree(
     files: list[ScriptFileCreate],
     organization_id: str,
@@ -147,13 +228,20 @@ async def build_file_tree(
     script_version: int,
     script_revision_id: str,
     pending: bool = False,
+    file_bytes_by_path: dict[str, bytes] | None = None,
+    allow_invalid_python_syntax: bool = False,
 ) -> dict[str, FileNode]:
     """Build a hierarchical file tree from a list of files and upload the files to s3 with the same tree structure."""
     file_tree: dict[str, FileNode] = {}
+    if file_bytes_by_path is None:
+        file_bytes_by_path = _validate_script_files(
+            files,
+            allow_invalid_python_syntax=allow_invalid_python_syntax,
+        )
 
     for file in files:
         # Decode content to calculate size and hash
-        content_bytes = base64.b64decode(file.content)
+        content_bytes = file_bytes_by_path[file.path]
         content_hash = hashlib.sha256(content_bytes).hexdigest()
         file_size = len(content_bytes)
 
@@ -300,6 +388,7 @@ async def create_script(
         if run_id and not await app.DATABASE.tasks.get_run(run_id=run_id, organization_id=organization_id):
             raise HTTPException(status_code=404, detail=f"Run_id {run_id} not found")
 
+        file_bytes_by_path = validate_uploaded_script_files(files or [])
         script = await app.DATABASE.scripts.create_script(
             organization_id=organization_id,
             run_id=run_id,
@@ -314,6 +403,7 @@ async def create_script(
                 script_id=script.script_id,
                 script_version=script.version,
                 script_revision_id=script.script_revision_id,
+                file_bytes_by_path=file_bytes_by_path,
             )
             file_count = len(files)
 
@@ -325,6 +415,8 @@ async def create_script(
             created_at=script.created_at,
             file_tree=file_tree,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         LOG.error("Failed to create script", error=str(e), exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to create script")
@@ -2955,6 +3047,64 @@ async def wait(seconds: int, label: str | None = None) -> None:
         raise
 
 
+async def ensure_in_process_script_execution_allowed(
+    *,
+    seam: str,
+    organization_id: str | None,
+    workflow_run_id: str | None,
+    workflow_permanent_id: str | None = None,
+    workflow_id: str | None = None,
+    script_id: str | None = None,
+    script_revision_id: str | None = None,
+) -> None:
+    try:
+        decision = await app.AGENT_FUNCTION.resolve_in_process_script_execution_policy(
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            workflow_permanent_id=workflow_permanent_id,
+            workflow_id=workflow_id,
+            script_id=script_id,
+        )
+    except CodeBlockRunnerSelectionError as exc:
+        LOG.error(
+            "script.in_process_execution_denied",
+            seam=seam,
+            selection_reason="policy_evaluation_error",
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            workflow_permanent_id=workflow_permanent_id,
+            workflow_id=workflow_id,
+            script_id=script_id,
+            script_revision_id=script_revision_id,
+            exc_info=True,
+        )
+        raise InProcessScriptExecutionDenied(
+            seam=seam,
+            selection_reason="policy_evaluation_error",
+        ) from exc
+
+    if decision.allowed:
+        return
+
+    LOG.error(
+        "script.in_process_execution_denied",
+        seam=seam,
+        selection_reason=decision.selection_reason,
+        flag_value=decision.flag_value,
+        env_force_on=decision.env_force_on,
+        organization_id=organization_id,
+        workflow_run_id=workflow_run_id,
+        workflow_permanent_id=workflow_permanent_id,
+        workflow_id=workflow_id,
+        script_id=script_id,
+        script_revision_id=script_revision_id,
+    )
+    raise InProcessScriptExecutionDenied(
+        seam=seam,
+        selection_reason=decision.selection_reason,
+    )
+
+
 async def run_script(
     path: str,
     parameters: dict[str, Any] | None = None,
@@ -2994,8 +3144,14 @@ async def run_script(
         context.workflow_run_id = workflow_run_id
         context.organization_id = organization_id
 
-    # run the script as subprocess; pass the parameters and run_id to the script
-    # Dynamically import the script at the given path
+    await ensure_in_process_script_execution_allowed(
+        seam="script_service.run_script",
+        organization_id=organization_id,
+        workflow_run_id=workflow_run_id,
+        script_id=script_id,
+        script_revision_id=script_revision_id,
+    )
+
     spec = importlib.util.spec_from_file_location("user_script", path)
     if not spec or not spec.loader:
         raise Exception(f"Failed to import script from {path}")
@@ -3446,8 +3602,13 @@ async def goto(
             browser_session_id=block_validation_output.browser_session_id,
         )
     except Exception:
+        try:
+            candidate_url = _render_template_with_label(url, label)
+        except Exception:
+            candidate_url = url
+        candidate_url = await asyncio.to_thread(validate_fetch_url, candidate_url)
         run_context = script_run_context_manager.ensure_run_context()
-        await run_context.page.goto(url)
+        await run_context.page.goto(candidate_url)
 
 
 async def trigger_workflow(

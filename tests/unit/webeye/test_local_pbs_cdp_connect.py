@@ -20,10 +20,78 @@ def test_prepare_local_pbs_cdp_connect_rewrites_port_and_adds_session_header() -
     connect_url, headers = prepare_persistent_browser_cdp_connect(
         browser_address,
         browser_session_id="pbs_123",
-        cdp_connect_headers={"x-api-key": "test-key"},
+        x_api_key="managed-key",
+        cdp_connect_headers={"X-Provider-Auth": "provider-value"},
     )
     assert connect_url == "ws://127.0.0.1:9224/devtools/browser/abc"
-    assert headers == {"x-api-key": "test-key", "X-Session-Id": "pbs_123"}
+    assert headers == {
+        "X-Provider-Auth": "provider-value",
+        "x-api-key": "managed-key",
+        "X-Session-Id": "pbs_123",
+    }
+
+
+@patch("skyvern.webeye.cdp_connection.settings.ENV", "prod")
+def test_prepare_resolved_runner_proxy_adds_managed_headers() -> None:
+    browser_address = "wss://proxy.example.test/pbs_123"
+    connect_url, headers = prepare_persistent_browser_cdp_connect(
+        browser_address,
+        browser_session_id="pbs_123",
+        x_api_key="managed-key",
+        cdp_connect_headers={"X-Provider-Auth": "provider-value"},
+        is_resolved_runner_cdp_proxy=True,
+    )
+
+    assert connect_url == browser_address
+    assert headers == {
+        "X-Provider-Auth": "provider-value",
+        "x-api-key": "managed-key",
+        "X-Session-Id": "pbs_123",
+    }
+
+
+@patch("skyvern.webeye.cdp_connection.settings.ENV", "prod")
+def test_prepare_managed_session_router_adds_managed_headers() -> None:
+    browser_address = "wss://session-router.example.test/pbs_123/routing-token/devtools/browser/browser-id"
+    connect_url, headers = prepare_persistent_browser_cdp_connect(
+        browser_address,
+        browser_session_id="pbs_123",
+        x_api_key="managed-key",
+        is_managed_session_router=True,
+    )
+
+    assert connect_url == browser_address
+    assert headers == {
+        "x-api-key": "managed-key",
+        "X-Session-Id": "pbs_123",
+    }
+
+
+@patch("skyvern.webeye.cdp_connection.settings.ENV", "prod")
+def test_prepare_session_router_lookalike_does_not_add_managed_headers() -> None:
+    browser_address = "wss://remote.example.test/pbs_123/routing-token/devtools/browser/browser-id"
+    connect_url, headers = prepare_persistent_browser_cdp_connect(
+        browser_address,
+        browser_session_id="pbs_123",
+        x_api_key="managed-key",
+    )
+
+    assert connect_url == browser_address
+    assert headers is None
+
+
+@patch("skyvern.webeye.cdp_connection.settings.ENV", "prod")
+def test_prepare_remote_cdp_connect_does_not_add_managed_headers() -> None:
+    browser_address = "wss://browser.example.test/devtools/browser/id"
+    connect_url, headers = prepare_persistent_browser_cdp_connect(
+        browser_address,
+        browser_session_id="pbs_123",
+        x_api_key="managed-key",
+        cdp_connect_headers={"X-Provider-Auth": "provider-value"},
+    )
+
+    assert connect_url == browser_address
+    assert headers == {"X-Provider-Auth": "provider-value"}
 
 
 @patch("skyvern.webeye.cdp_connection.settings.ENV", "prod")
