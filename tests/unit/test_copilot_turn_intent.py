@@ -256,10 +256,116 @@ def test_build_turn_intent_applies_diagnose_classification_and_read_authority() 
     assert intent.mode == TurnIntentMode.DIAGNOSE
     assert intent.expected_output == TurnIntentExpectedOutput.RUN_RESULT
     assert intent.authority.may_read_run_context is True
-    assert intent.authority.may_update_workflow is False
-    assert intent.authority.may_run_blocks is False
     assert RequiredContextKey.LATEST_RUN_RESULT in intent.required_context
     assert intent.target_entities["run"] == ["wr_123"]
+
+
+def test_build_turn_intent_affirmative_diagnose_keeps_request_policy_write_authority() -> None:
+    intent = build_turn_intent(
+        user_message="We extracted the wrong value; we got the % change, not the number.",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        workflow_run_id="wr_123",
+        classifier_result=_classification(TurnIntentMode.DIAGNOSE),
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_update_workflow is True
+    assert intent.authority.may_run_blocks is True
+    # The two capabilities a run repair needs are available on the same turn.
+    assert intent.authority.may_read_run_context is True
+
+
+def test_build_turn_intent_affirmative_diagnose_still_honors_restrictive_request_policy() -> None:
+    intent = build_turn_intent(
+        user_message="We extracted the wrong value; we got the % change, not the number.",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_update_workflow=False, allow_run_blocks=False),
+        workflow_run_id="wr_123",
+        classifier_result=_classification(TurnIntentMode.DIAGNOSE),
+    )
+
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+
+
+@pytest.mark.parametrize("confidence", [0.0, 0.49])
+def test_build_turn_intent_low_confidence_diagnose_does_not_earn_write_authority(confidence: float) -> None:
+    # A missing/unparseable confidence coerces to 0.0, so an unsure diagnose must stay read-only rather
+    # than inherit RequestPolicy's permissive defaults.
+    classification = TurnIntentClassification(
+        mode=TurnIntentMode.DIAGNOSE,
+        expected_output=TurnIntentExpectedOutput.RUN_RESULT,
+        required_context=[],
+        confidence=confidence,
+        target_entities={},
+        reason_codes=[],
+        missing_context_question=None,
+    )
+    intent = build_turn_intent(
+        user_message="something looks off with the number",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        workflow_run_id="wr_123",
+        classifier_result=TurnIntentClassifierResult.success(classification),
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+    assert intent.authority.may_read_run_context is True
+
+
+def test_build_turn_intent_spurious_fix_origin_reason_code_does_not_withhold_authority() -> None:
+    # The classifier may emit FIX_ORIGIN_DIAGNOSE itself; only the caller-supplied fix_origin flag
+    # means the user actually asked for diagnose-first.
+    classification = TurnIntentClassification(
+        mode=TurnIntentMode.DIAGNOSE,
+        expected_output=TurnIntentExpectedOutput.RUN_RESULT,
+        required_context=[],
+        confidence=0.91,
+        target_entities={},
+        reason_codes=[TurnIntentReasonCode.FIX_ORIGIN_DIAGNOSE],
+        missing_context_question=None,
+    )
+    intent = build_turn_intent(
+        user_message="We extracted the wrong value; we got the % change, not the number.",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        workflow_run_id="wr_123",
+        classifier_result=TurnIntentClassifierResult.success(classification),
+        fix_origin=False,
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_update_workflow is True
+    assert intent.authority.may_run_blocks is True
+
+
+def test_build_turn_intent_declared_fix_origin_diagnose_withholds_write_authority() -> None:
+    intent = build_turn_intent(
+        user_message="We extracted the wrong value; we got the % change, not the number.",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        workflow_run_id="wr_123",
+        classifier_result=_classification(TurnIntentMode.DIAGNOSE),
+        fix_origin=True,
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+    assert TurnIntentReasonCode.FIX_ORIGIN_DIAGNOSE in intent.reason_codes
 
 
 def test_build_turn_intent_applies_draft_only_classification_without_run_authority() -> None:
@@ -304,7 +410,7 @@ def test_build_turn_intent_llm_diagnose_outranks_skip_test_policy() -> None:
 
     assert intent.mode == TurnIntentMode.DIAGNOSE
     assert intent.authority.may_read_run_context is True
-    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
     assert TurnIntentReasonCode.TESTING_INTENT_SKIP_TEST not in intent.reason_codes
 
 
@@ -321,9 +427,25 @@ def test_build_turn_intent_diagnose_with_require_test_keeps_run_authority() -> N
 
     assert intent.mode == TurnIntentMode.DIAGNOSE
     assert intent.authority.may_run_blocks is True
-    assert intent.authority.may_update_workflow is False
     assert intent.authority.may_read_run_context is True
     assert RequiredContextKey.LATEST_RUN_RESULT in intent.required_context
+
+
+def test_build_turn_intent_declared_diagnose_with_require_test_keeps_run_authority() -> None:
+    intent = build_turn_intent(
+        user_message="Test it again and confirm what it extracted.",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(testing_intent="require_test", allow_update_workflow=True, allow_run_blocks=True),
+        workflow_run_id="wr_123",
+        classifier_result=_classification(TurnIntentMode.DIAGNOSE),
+        fix_origin=True,
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_run_blocks is True
+    assert intent.authority.may_update_workflow is False
     assert TurnIntentReasonCode.TESTING_INTENT_RUN_OVERRIDES_DIAGNOSE in intent.reason_codes
 
 
@@ -997,7 +1119,7 @@ def test_store_request_policy_attaches_classified_turn_intent_to_context() -> No
 
     assert ctx.turn_intent is not None
     assert ctx.turn_intent.mode == TurnIntentMode.DIAGNOSE
-    assert ctx.turn_intent.authority.may_update_workflow is False
+    assert ctx.turn_intent.authority.may_update_workflow is True
     assert ctx.turn_intent.authority.may_run_blocks is False
 
 

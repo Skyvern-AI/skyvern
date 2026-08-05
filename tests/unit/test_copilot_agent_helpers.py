@@ -1714,7 +1714,7 @@ class TestRequestPolicyInputGuardrail:
         assert ctx.completion_criteria_turn_state is None
 
     @pytest.mark.asyncio
-    async def test_read_only_diagnose_skips_authoring_enrichment(self, monkeypatch) -> None:
+    async def test_declared_read_only_diagnose_skips_authoring_enrichment(self, monkeypatch) -> None:
         policy = RequestPolicy(testing_intent="unspecified", _authoring_pending=True)
         monkeypatch.setattr(
             agent_module,
@@ -1743,6 +1743,7 @@ class TestRequestPolicyInputGuardrail:
             request_policy_handler=object(),
             turn_intent_handler=object(),
             workflow_run_id="wr_1",
+            fix_origin=True,
         )
 
         guardrail = agent_module._build_copilot_input_guardrails(
@@ -1819,7 +1820,7 @@ class TestRequestPolicyInputGuardrail:
         assert materialize_mock.await_args.kwargs["active_criteria"] == list(stored.criteria)
         assert ctx.turn_intent is not None
         assert ctx.turn_intent.mode is TurnIntentMode.DIAGNOSE
-        assert ctx.turn_intent.authority.may_update_workflow is False
+        assert ctx.turn_intent.authority.may_update_workflow is True
         assert ctx.turn_intent.authority.may_run_blocks is True
         assert policy.completion_criteria == list(stored.criteria)
         assert ctx.completion_criteria_turn_state is not None
