@@ -2016,6 +2016,14 @@ def _make_agent_result(
             reason = credential_prompt_reason(policy, kwargs.get("user_response"))
             if reason:
                 payload_updates["credentialPrompt"] = {"reason": reason}
+        if ctx is not None and "credentialAutoBound" not in narrative_payload:
+            auto_bound = ctx.request_policy.auto_bound_credentials if ctx.request_policy is not None else []
+            if auto_bound:
+                bound = auto_bound[-1]
+                payload_updates["credentialAutoBound"] = {
+                    "credentialId": bound.credential_id,
+                    "name": bound.name,
+                }
         if ctx is not None and "credentialPause" not in narrative_payload:
             pause_outcome = ctx.credential_pause_outcome
             if pause_outcome:
