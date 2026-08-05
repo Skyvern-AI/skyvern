@@ -517,6 +517,8 @@ async def test_success_empty_refs_resolves_named_credential(kind: str) -> None:
     assert policy.classifier_status == "success"
     assert policy.credential_input_kind == kind
     assert [c.credential_id for c in policy.resolved_credentials] == ["cred_login"]
+    # The user named the credential — not a silent auto-bind, so no receipt.
+    assert policy.auto_bound_credentials == []
     assert policy.clarification_reason != "credential_name_unresolved"
 
 
@@ -1770,6 +1772,8 @@ async def test_login_intent_none_kind_one_message_url_with_single_match_resolves
 
     assert policy.credential_input_kind == "none"
     assert [c.credential_id for c in policy.resolved_credentials] == ["cred_url"]
+    # A deterministic URL-tier bind fired with no ask — the auto-bind receipt is stamped.
+    assert [c.credential_id for c in policy.auto_bound_credentials] == ["cred_url"]
     assert policy.requires_user_clarification is False
     assert policy.clarification_question is None
 
@@ -3076,7 +3080,22 @@ class TestLivePageCredentialObservation:
         assert record.tier == "url_path"
         assert [c.credential_id for c in record.candidates] == ["cred_analytics"]
         assert [c.credential_id for c in policy.resolved_credentials] == ["cred_analytics"]
+        assert [c.credential_id for c in policy.auto_bound_credentials] == ["cred_analytics"]
         assert policy.live_page_admitted_urls == {"cred_analytics": _LIVE_LOGIN_URL}
+
+    @pytest.mark.asyncio
+    async def test_a_page_reconfirming_a_turn_start_bind_is_not_double_stamped(self) -> None:
+        already = _cred("analytics", "cred_analytics", _SAVED_LOGIN_URL)
+        policy = RequestPolicy(resolved_credentials=[already])
+        await _resolve_live_page(
+            policy,
+            page_url=_LIVE_LOGIN_URL,
+            org_credentials=[already],
+        )
+
+        # A credential the turn already bound is not re-stamped as a fresh auto-bind by a later page.
+        assert policy.auto_bound_credentials == []
+        assert policy.live_page_admitted_urls == {}
 
     @pytest.mark.asyncio
     async def test_two_page_matches_bind_nothing_and_record_both_candidates(self) -> None:
@@ -3093,6 +3112,7 @@ class TestLivePageCredentialObservation:
         assert record.verdict == "ambiguous"
         assert [c.credential_id for c in record.candidates] == ["cred_one", "cred_two"]
         assert policy.resolved_credentials == []
+        assert policy.auto_bound_credentials == []
         assert policy.live_page_admitted_urls == {}
         assert policy.live_page_resolution is record
 
