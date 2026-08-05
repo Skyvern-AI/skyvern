@@ -826,6 +826,7 @@ async def _create_headless_chromium(
             extra_http_headers=extra_http_headers,
             cdp_connect_headers=cdp_connect_headers,
             apply_download_behaviour=True,
+            validate_browser_address=True,
         )
 
     # Check for browser_profile_id and load from storage if available
@@ -918,6 +919,7 @@ async def _create_headful_chromium(
             extra_http_headers=extra_http_headers,
             cdp_connect_headers=cdp_connect_headers,
             apply_download_behaviour=True,
+            validate_browser_address=True,
         )
 
     # Check for browser_profile_id and load from storage if available
@@ -1038,6 +1040,7 @@ async def _create_cdp_connection_browser(
             extra_http_headers=extra_http_headers,
             cdp_connect_headers=cdp_connect_headers,
             apply_download_behaviour=True,
+            validate_browser_address=True,
         )
 
     browser_type = settings.BROWSER_TYPE
@@ -1092,6 +1095,7 @@ async def _create_cdp_connection_browser(
         settings.BROWSER_REMOTE_DEBUGGING_URL,
         extra_http_headers=extra_http_headers,
         cdp_connect_headers=cdp_connect_headers,
+        validate_browser_address=False,
     )
 
 
@@ -1101,6 +1105,7 @@ async def _connect_to_cdp_browser(
     extra_http_headers: dict[str, str] | None = None,
     cdp_connect_headers: dict[str, str] | None = None,
     apply_download_behaviour: bool = False,
+    validate_browser_address: bool = True,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     parsed_headers = parse_extra_headers(extra_http_headers)
 
@@ -1126,6 +1131,7 @@ async def _connect_to_cdp_browser(
         remote_browser_url,
         headers=cdp_headers or None,
         timeout_ms=settings.BROWSER_CDP_CONNECT_TIMEOUT_MS,
+        validate_browser_address=validate_browser_address,
     )
 
     if apply_download_behaviour:

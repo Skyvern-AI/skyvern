@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import hashlib
 from typing import TYPE_CHECKING
 
@@ -585,6 +584,7 @@ async def deploy_script(
         if not latest_script:
             raise HTTPException(status_code=404, detail="Script not found")
 
+        file_bytes_by_path = script_service.validate_uploaded_script_files(data.files)
         # Create a new version of the script
         new_version = latest_script.version + 1
         new_script = await app.DATABASE.scripts.create_script(
@@ -610,7 +610,7 @@ async def deploy_script(
         if data.files:
             file_count = len(data.files)
             for file in data.files:
-                content_bytes = base64.b64decode(file.content)
+                content_bytes = file_bytes_by_path[file.path]
                 content_hash = hashlib.sha256(content_bytes).hexdigest()
                 file_name = file.path.split("/")[-1]
                 deployed_file_paths.add(file.path)

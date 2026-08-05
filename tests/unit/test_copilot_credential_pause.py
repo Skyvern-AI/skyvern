@@ -39,7 +39,11 @@ from skyvern.forge.sdk.copilot import credential_pause as credential_pause_modul
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import RequestPolicyGuardrailInputs, _derive_turn_intent_on_context
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import (
+    CopilotContext,
+    StructuredContext,
+    record_approved_credentials_in_global_llm_context,
+)
 from skyvern.forge.sdk.copilot.credential_pause import (
     CredentialPauseRejection,
     CredentialPauseResolution,
@@ -69,6 +73,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.request_policy import (
     CREDENTIAL_PROMPT_CLARIFICATION_REASONS,
+    ClarificationReason,
     RequestPolicy,
     credential_prompt_reason,
 )
@@ -85,7 +90,10 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     workflow_copilot_credential_response,
 )
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotCredentialRequiredUpdate,
+    WorkflowCopilotStreamMessageType,
+)
 from tests.unit.conftest import make_copilot_context
 
 
@@ -1852,6 +1860,109 @@ def test_reason_does_not_fire_for_a_login_ask_that_resolved_to_a_credential() ->
     ctx.request_policy = RequestPolicy(login_intent=True, clarification_reason="none")
 
     assert credential_pause_module.credential_pause_reason(ctx) is None
+
+
+def _card_answerable_policy(
+    *,
+    clarification_reason: ClarificationReason = "credential_name_unresolved",
+    clarification_question: str = "Which one should I use?",
+    card_answerable: bool = True,
+    ask_login_page_urls: list[str] | None = None,
+) -> RequestPolicy:
+    """A disambiguation ask the credential card can answer: a different reason to the login ask."""
+    return RequestPolicy(
+        login_intent=True,
+        clarification_reason=clarification_reason,
+        clarification_question=clarification_question,
+        requires_user_clarification=True,
+        user_response_policy="ask_clarification",
+        allow_update_workflow=False,
+        allow_run_blocks=False,
+        credential_ask_card_answerable=card_answerable,
+        credential_ask_candidate_ids=["cred_1", "cred_2"] if card_answerable else [],
+        credential_ask_login_page_urls=["https://portal.example.com/login"]
+        if ask_login_page_urls is None
+        else ask_login_page_urls,
+    )
+
+
+def test_reason_fires_on_a_card_answerable_ask_under_a_different_reason() -> None:
+    ctx = make_copilot_context()
+    ctx.request_policy = _card_answerable_policy()
+
+    assert credential_pause_module.credential_pause_reason(ctx) == "login_credentials_unresolved"
+
+
+def test_reason_ignores_a_clarification_the_card_cannot_answer() -> None:
+    ctx = make_copilot_context()
+    ctx.request_policy = _card_answerable_policy(clarification_reason="raw_secret", card_answerable=False)
+
+    assert credential_pause_module.credential_pause_reason(ctx) is None
+
+
+def test_widened_reason_still_builds_a_valid_credential_required_frame() -> None:
+    ctx = make_copilot_context()
+    ctx.request_policy = _card_answerable_policy()
+    reason = credential_pause_module.credential_pause_reason(ctx)
+
+    frame = WorkflowCopilotCredentialRequiredUpdate(
+        type=WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED,
+        turn_id="turn-1",
+        workflow_copilot_chat_id="chat-1",
+        resume_token="rt",
+        reason=reason or "",
+        message="Which one should I use?",
+        login_page_urls=[],
+        credential_refs=[],
+        timeout_seconds=5,
+        expires_at=datetime.now(timezone.utc),
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    assert frame.reason == "login_credentials_unresolved"
+
+
+def test_connected_resume_stamps_the_single_ask_origin() -> None:
+    policy = _card_answerable_policy()
+    credential = _make_credential()
+
+    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, credential)
+
+    assert policy.live_page_admitted_urls == {"cred_1": "https://portal.example.com/login"}
+
+
+def test_connected_resume_stamps_nothing_when_the_ask_spans_several_origins() -> None:
+    policy = _card_answerable_policy(
+        ask_login_page_urls=["https://portal.example.com/login", "https://other.example.com/login"]
+    )
+
+    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
+
+    assert policy.live_page_admitted_urls == {}
+
+
+def test_connected_resume_never_binds_an_origin_from_prose() -> None:
+    policy = _card_answerable_policy(
+        ask_login_page_urls=[],
+        clarification_question="Sign in at https://prose.example.com/login first. Which one should I use?",
+    )
+
+    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
+
+    assert policy.live_page_admitted_urls == {}
+
+
+def test_a_card_connected_credential_keeps_its_durable_cross_turn_approval() -> None:
+    ctx = make_copilot_context()
+    policy = _card_answerable_policy()
+    ctx.request_policy = policy
+
+    credential_pause_module._apply_connected_credential_to_policy(ctx, policy, _make_credential())
+    carried = record_approved_credentials_in_global_llm_context(ctx, None)
+
+    assert [record.credential_id for record in StructuredContext.from_json_str(carried).approved_credentials] == [
+        "cred_1"
+    ]
 
 
 @pytest.mark.asyncio

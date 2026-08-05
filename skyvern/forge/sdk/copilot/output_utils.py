@@ -274,10 +274,12 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
                     else block
                     for block in blocks
                 ]
-        if tool_name == "get_run_results":
-            # _attach_failed_block_screenshots puts base64 bytes on each failed
-            # block. They would otherwise flow straight into the LLM context as
-            # raw image data — strip them while preserving the existence signal.
+        if tool_name in {"get_run_results", "run_blocks_and_collect_debug"}:
+            # _attach_failed_block_screenshots puts base64 bytes on each failed block. They would
+            # otherwise flow straight into the LLM context as raw image data — strip them while
+            # preserving the existence signal. The image itself reaches the model through
+            # data.screenshot_base64; leaving the bytes here also crowds out later fields such as
+            # final_url under downstream truncation.
             blocks = data.get("blocks")
             if isinstance(blocks, list):
                 data["blocks"] = [

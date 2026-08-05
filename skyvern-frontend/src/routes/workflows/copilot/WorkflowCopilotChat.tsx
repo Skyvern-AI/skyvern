@@ -8,15 +8,10 @@ import {
   memo,
 } from "react";
 import { getClient } from "@/api/AxiosClient";
-import {
-  ActionsApiResponse,
-  CredentialApiResponse,
-  getReadableActionType,
-} from "@/api/types";
+import { ActionsApiResponse, getReadableActionType } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 import { CredentialModalTypes } from "@/routes/credentials/useCredentialModalState";
-import { getHostname } from "@/util/getHostname";
 import { useParams } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import {
@@ -85,7 +80,6 @@ import {
   type CredentialRequiredFrame,
   type CredentialRequiredReason,
   type CredentialPauseHistorical,
-  type MatchingCredential,
 } from "./cards/CredentialCard";
 import {
   CopilotBlockActionsEvent,
@@ -98,6 +92,7 @@ import {
   parseUtcIsoMs,
 } from "./narrativeState";
 import { computeFollowSignature, useStickToBottom } from "./useStickToBottom";
+import { useTurnActivityChange } from "./useTurnActivityChange";
 import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
 import { SpeechInputButton } from "@/components/SpeechInputButton";
 import { useFeatureFlag, useFeatureFlagValue } from "@/hooks/useFeatureFlag";
@@ -575,6 +570,7 @@ interface WorkflowCopilotChatProps {
   isOpen?: boolean;
   onClose?: () => void;
   onMessageCountChange?: (count: number) => void;
+  onTurnActivityChange?: (active: boolean) => void;
   buttonRef?: React.RefObject<HTMLButtonElement>;
   liveBrowserSessionId?: string | null;
   workflowRunId?: string | null;
@@ -654,6 +650,7 @@ export function WorkflowCopilotChat({
   isOpen = true,
   onClose,
   onMessageCountChange,
+  onTurnActivityChange,
   buttonRef,
   liveBrowserSessionId,
   workflowRunId: workflowRunIdProp,
@@ -766,6 +763,7 @@ export function WorkflowCopilotChat({
   const [inputValue, setInputValue] = useState("");
   const dismissPasteSkillHint = usePasteSkillHintStore((s) => s.dismiss);
   const [isLoading, setIsLoading] = useState(false);
+  useTurnActivityChange(isLoading, onTurnActivityChange);
   const [queuedPrompt, setQueuedPrompt] = useState<QueuedPrompt | null>(null);
   const [narrative, setNarrative] =
     useState<TurnNarrativeState>(EMPTY_NARRATIVE);
@@ -797,14 +795,14 @@ export function WorkflowCopilotChat({
   const [credentialResolutions, setCredentialResolutions] = useState<
     Record<string, CredentialResolution>
   >({});
+  // Terminal asks whose auto-continue send failed: the optimistic "connected"
+  // receipt is rolled back and the ask is forced actionable again (it is no
+  // longer the tail) so the user can re-pick instead of hitting a dead end.
+  const [strandedTerminalContinuations, setStrandedTerminalContinuations] =
+    useState<ReadonlySet<string>>(() => new Set());
   const [credentialModalOpen, setCredentialModalOpen] = useState(false);
-  // Credentials list for matching a live pause against stored credentials.
-  // Fetched lazily (only once a pause frame arrives — the only path carrying
-  // login_page_urls to match against), so a chat with no pause never fetches.
-  const [credentialsList, setCredentialsList] = useState<
-    CredentialApiResponse[] | null
-  >(null);
-  const credentialsFetchInFlight = useRef(false);
+  // Bumped when a credential is created so the card's picker re-fetches and includes the new one.
+  const [credentialsReloadKey, setCredentialsReloadKey] = useState(0);
   // Routes the add-credential modal's onCredentialCreated back to the card that
   // opened it: a live frame (POST resume) or a terminal turn (local resolve).
   // isLastMessage is captured at open time so a terminal connect only
@@ -814,6 +812,10 @@ export function WorkflowCopilotChat({
     turnId: string;
     isLastMessage: boolean;
   } | null>(null);
+  // Original ask turnId whose auto-continue send is in flight, so a stream
+  // failure can roll its optimistic resolution back. Cleared in handleSend's
+  // finally; only one continuation is ever pending (sends are serialized).
+  const pendingTerminalContinuation = useRef<string | null>(null);
   // Latest handleSend for callbacks defined before it (the terminal
   // auto-continue fires from the modal's onCredentialCreated).
   const handleSendRef = useRef<((messageOverride?: string) => void) | null>(
@@ -1022,59 +1024,12 @@ export function WorkflowCopilotChat({
     actionPollRef.current.forEach((timer) => clearInterval(timer));
     actionPollRef.current.clear();
   }, []);
-  // Fetch the stored credentials once a pause is live. ponytail: page_size 100,
-  // no pagination — a >100-credential org may miss a match and fall back to the
-  // Connect CTA. Add pagination if that shows up. Setting credentialsList back
-  // to null (after a modal create) re-runs this to pick up the new credential.
-  useEffect(() => {
-    if (
-      !copilotUxV1Enabled ||
-      !livePauseFrame ||
-      credentialsList !== null ||
-      credentialsFetchInFlight.current
-    ) {
-      return;
-    }
-    credentialsFetchInFlight.current = true;
-    void (async () => {
-      try {
-        const client = await getClient(credentialGetter);
-        const res = await client.get<CredentialApiResponse[]>("/credentials", {
-          params: { page: 1, page_size: 100 },
-        });
-        setCredentialsList(Array.isArray(res.data) ? res.data : []);
-      } catch (error) {
-        // Leave credentialsList null so a later pause frame retries; caching []
-        // here would disable matching for the whole mounted session.
-        console.error("Failed to load credentials:", error);
-      } finally {
-        credentialsFetchInFlight.current = false;
-      }
-    })();
-  }, [copilotUxV1Enabled, livePauseFrame, credentialsList, credentialGetter]);
-  const liveMatchingCredentials = useMemo<MatchingCredential[]>(() => {
-    if (!livePauseFrame) return [];
-    const hosts = livePauseFrame.login_page_urls
-      .map(getHostname)
-      .filter((host): host is string => host !== null);
-    if (hosts.length === 0) return [];
-    return (credentialsList ?? [])
-      .filter((credential) => {
-        const host = credential.tested_url
-          ? getHostname(credential.tested_url)
-          : null;
-        return host !== null && hosts.includes(host);
-      })
-      .map((credential) => ({
-        credentialId: credential.credential_id,
-        name: credential.name,
-      }));
-  }, [livePauseFrame, credentialsList]);
   const respondToCredentialPause = useCallback(
     async (
       frame: WorkflowCopilotCredentialRequiredUpdate,
       action: "connected" | "skip",
       credentialId?: string,
+      name?: string,
     ) => {
       if (credentialResponseInFlight.current) return;
       credentialResponseInFlight.current = true;
@@ -1088,9 +1043,6 @@ export function WorkflowCopilotChat({
           action,
           credential_id: action === "connected" ? credentialId : undefined,
         });
-        const name = liveMatchingCredentials.find(
-          (candidate) => candidate.credentialId === credentialId,
-        )?.name;
         setCredentialResolutions((prev) =>
           withCappedResolution(
             prev,
@@ -1116,7 +1068,7 @@ export function WorkflowCopilotChat({
         credentialResponseInFlight.current = false;
       }
     },
-    [credentialGetter, liveMatchingCredentials],
+    [credentialGetter],
   );
   // Terminal-mode cards have no resume_token — connect/skip is a local UI morph,
   // no network call.
@@ -1149,10 +1101,10 @@ export function WorkflowCopilotChat({
       turnId: string,
       credentialId: string,
       name: string | undefined,
-      isLastMessage: boolean,
+      canContinue: boolean,
     ) => {
       const shouldContinue =
-        isLastMessage && !isLoading && !isLoadingHistory && Boolean(name);
+        canContinue && !isLoading && !isLoadingHistory && Boolean(name);
       resolveTerminalCredential(
         turnId,
         "connected",
@@ -1161,13 +1113,42 @@ export function WorkflowCopilotChat({
         shouldContinue,
       );
       if (shouldContinue) {
+        pendingTerminalContinuation.current = turnId;
+        // Re-attempt: drop any prior stranded flag so the receipt shows again.
+        setStrandedTerminalContinuations((prev) => {
+          if (!prev.has(turnId)) return prev;
+          const next = new Set(prev);
+          next.delete(turnId);
+          return next;
+        });
+        // Reference the credential by id: request_policy._explicit_credential_ids resolves a raw cred_
+        // id deterministically this turn, avoiding the name-extraction ambiguity a quoted-name reply hits.
         void handleSendRef.current?.(
-          `I've connected the credential '${name}' — continue.`,
+          `Use the credential ${credentialId} — continue.`,
         );
       }
     },
     [isLoading, isLoadingHistory, resolveTerminalCredential],
   );
+  // Auto-continue send failed: undo the optimistic "connected" resolution and
+  // mark the ask stranded so its card renders actionable again for a retry.
+  const rollbackPendingTerminalContinuation = useCallback(() => {
+    const turnId = pendingTerminalContinuation.current;
+    if (turnId === null) return;
+    pendingTerminalContinuation.current = null;
+    setCredentialResolutions((prev) => {
+      if (!(turnId in prev)) return prev;
+      const next = { ...prev };
+      delete next[turnId];
+      return next;
+    });
+    setStrandedTerminalContinuations((prev) => {
+      if (prev.has(turnId)) return prev;
+      const next = new Set(prev);
+      next.add(turnId);
+      return next;
+    });
+  }, []);
   const openCredentialModal = useCallback(
     (
       frame: WorkflowCopilotCredentialRequiredUpdate | null,
@@ -1184,11 +1165,16 @@ export function WorkflowCopilotChat({
       const ctx = pendingCredentialConnect.current;
       pendingCredentialConnect.current = null;
       setCredentialModalOpen(false);
-      // Re-fetch so the new credential's name resolves in the receipt.
-      setCredentialsList(null);
+      // Refresh the picker's cached list so a still-live ask can offer the just-created credential.
+      setCredentialsReloadKey((key) => key + 1);
       if (!ctx) return;
       if (ctx.frame) {
-        void respondToCredentialPause(ctx.frame, "connected", credentialId);
+        void respondToCredentialPause(
+          ctx.frame,
+          "connected",
+          credentialId,
+          name,
+        );
       } else {
         continueAfterTerminalConnect(
           ctx.turnId,
@@ -2084,6 +2070,7 @@ export function WorkflowCopilotChat({
             cache_key: normalizedKey,
             ai_fallback: saveData.settings.aiFallback ?? true,
             enable_self_healing: saveData.settings.enableSelfHealing ?? false,
+            mask_secrets: saveData.settings.maskSecrets,
             code_version:
               saveData.settings.runWith === "code"
                 ? (saveData.settings.codeVersion ?? 2)
@@ -2112,6 +2099,7 @@ export function WorkflowCopilotChat({
             webhook_callback_url: saveData.settings.webhookCallbackUrl,
             persist_browser_session: saveData.settings.persistBrowserSession,
             pin_saved_session_ip: saveData.settings.pinSavedSessionIp,
+            mask_secrets: saveData.settings.maskSecrets,
             browser_profile_id: saveData.settings.browserProfileId,
             browser_profile_key: saveData.settings.browserProfileKey,
             model: saveData.settings.model,
@@ -2192,6 +2180,12 @@ export function WorkflowCopilotChat({
           setMessages((prev) => [...prev, aiMessage]);
           const userCancelledThisTurn =
             cancelInFlightController.current === abortController;
+          // A genuinely completed continuation keeps its optimistic "connected"
+          // receipt; a cancelled one leaves the ref set for the finally to roll
+          // back, so a canceled retry doesn't strand a false "Continuing…".
+          if (!response.cancelled && !userCancelledThisTurn) {
+            pendingTerminalContinuation.current = null;
+          }
           const responseTurnId =
             response.turn_id ?? latestTurnId.current ?? null;
           const responseEntry = responseTurnId
@@ -2435,6 +2429,10 @@ export function WorkflowCopilotChat({
         }
         pendingMessageId.current = null;
         pendingCancelToken.current = null;
+        // Backstop: roll back a continuation that didn't genuinely complete —
+        // an error/thrown path already did, but a cancel or abort reaches only
+        // here. A no-op once a genuine success cleared the ref above.
+        rollbackPendingTerminalContinuation();
         setIsLoading(false);
         // Backstop: a turn that ends without a terminal run_outcome (thrown
         // stream) would otherwise leave a live poll running past the run.
@@ -2464,6 +2462,7 @@ export function WorkflowCopilotChat({
       stopAllRecordedActionsPolls,
       requiresLiveBrowser,
       resyncProposalFromChatRow,
+      rollbackPendingTerminalContinuation,
       stopSpeech,
       takeSpeechAudioBlob,
       updateQueuedPrompt,
@@ -3237,42 +3236,43 @@ export function WorkflowCopilotChat({
                         message.narrative,
                       );
                       if (!credFrame) return null;
-                      // Terminal frames carry no login_page_urls, so there's
-                      // nothing to match against — the only name we can show is
-                      // one captured locally when this turn's pause connected.
                       const localResolution = credentialResolutions[turnId];
-                      const receiptName =
-                        localResolution?.name && localResolution.credentialId
-                          ? [
-                              {
-                                credentialId: localResolution.credentialId,
-                                name: localResolution.name,
-                              },
-                            ]
-                          : undefined;
+                      const resolvedOutcome =
+                        localResolution ??
+                        historicalCredentialOutcome(message.narrative);
+                      // The actionable ask is only live on the tail message; a resolved receipt still
+                      // renders on any message so a scrolled-back turn keeps its outcome. Without this,
+                      // picking on a stale card would show a receipt with no backend call or continue.
+                      // A stranded ask (its auto-continue failed) stays actionable off-tail for a retry.
+                      if (
+                        !resolvedOutcome &&
+                        !isLastMessage &&
+                        !strandedTerminalContinuations.has(turnId)
+                      )
+                        return null;
                       return (
                         <CredentialCard
                           frame={credFrame}
                           mode="terminal"
-                          matchingCredentials={receiptName}
-                          resolvedOutcome={
-                            localResolution ??
-                            historicalCredentialOutcome(message.narrative)
-                          }
+                          reloadKey={credentialsReloadKey}
+                          resolvedOutcome={resolvedOutcome}
                           continued={Boolean(localResolution?.continued)}
-                          // Terminal cards surface no pre-connect matches today,
-                          // so only the modal branch fires; the id branch shares
-                          // the same helper for when terminal mode gains matches.
-                          onConnect={(credentialId) =>
-                            credentialId
+                          // A picked credential (id + name from the fetched list) auto-continues by
+                          // id; the Add-credential CTA (no id) opens the modal instead. A stranded ask
+                          // (its prior continue failed) may continue too, though it is no longer the tail.
+                          onConnect={(credentialId, name) => {
+                            const canContinue =
+                              isLastMessage ||
+                              strandedTerminalContinuations.has(turnId);
+                            return credentialId
                               ? continueAfterTerminalConnect(
                                   turnId,
                                   credentialId,
-                                  localResolution?.name,
-                                  isLastMessage,
+                                  name ?? localResolution?.name,
+                                  canContinue,
                                 )
-                              : openCredentialModal(null, turnId, isLastMessage)
-                          }
+                              : openCredentialModal(null, turnId, canContinue);
+                          }}
                           onSkip={() =>
                             resolveTerminalCredential(turnId, "skip")
                           }
@@ -3398,16 +3398,19 @@ export function WorkflowCopilotChat({
                   <CredentialCard
                     frame={liveFrameToCardFrame(livePauseFrame)}
                     mode="inline-pause"
-                    matchingCredentials={liveMatchingCredentials}
+                    reloadKey={credentialsReloadKey}
                     resolvedOutcome={
                       credentialResolutions[livePauseFrame.turn_id]
                     }
-                    onConnect={(credentialId) =>
+                    // A picked credential (id + name from the fetched list) answers through the typed
+                    // resume POST, which origin-binds; the Add-credential CTA (no id) opens the modal.
+                    onConnect={(credentialId, name) =>
                       credentialId
                         ? void respondToCredentialPause(
                             livePauseFrame,
                             "connected",
                             credentialId,
+                            name,
                           )
                         : openCredentialModal(
                             livePauseFrame,

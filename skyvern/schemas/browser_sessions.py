@@ -8,9 +8,22 @@ from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.proxy_pinning import validate_proxy_session_id
 from skyvern.schemas.runs import GeoTarget, ProxyLocationInput
 from skyvern.services.browser_recording.types import RecordingDraftStep
+from skyvern.utils.url_validators import validate_url
 
 
 class CreateBrowserSessionRequest(BaseModel):
+    url: str | None = Field(
+        default=None,
+        description="Optional URL to open when the standalone browser session starts.",
+    )
+
+    @field_validator("url")
+    @classmethod
+    def validate_start_url(cls, value: str | None) -> str | None:
+        if not value:
+            return value
+        return validate_url(value)
+
     timeout: int | None = Field(
         default=DEFAULT_TIMEOUT,
         description=f"Timeout in minutes for the session. Timeout is applied after the session is started. Must be at least {MIN_TIMEOUT}; values above {MAX_TIMEOUT} are capped at {MAX_TIMEOUT}. Defaults to {DEFAULT_TIMEOUT}.",
@@ -73,6 +86,13 @@ class CreateBrowserSessionRequest(BaseModel):
         "when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid "
         "storing profiles for sessions that never need them. Sessions started with a browser_profile_id always "
         "persist their profile regardless of this flag.",
+    )
+
+    needs_live_view: bool = Field(
+        default=False,
+        description="Whether a person will watch this session's browser live. Defaults to false, which suits "
+        "unattended automation; the Skyvern app sets it because a session opened in the UI is watched. It requests "
+        "a capability, not a particular browser, and cannot be used to select where the session runs.",
     )
 
 

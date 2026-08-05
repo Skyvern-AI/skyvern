@@ -39,6 +39,38 @@ async def test_connect_to_cdp_browser_stamps_marker(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "creator_name",
+    ["_create_headless_chromium", "_create_headful_chromium", "_create_cdp_connection_browser"],
+)
+async def test_oss_creators_validate_caller_browser_address(
+    monkeypatch: pytest.MonkeyPatch,
+    creator_name: str,
+) -> None:
+    connect = AsyncMock(return_value=(MagicMock(), MagicMock(), None))
+    monkeypatch.setattr(factory_module, "_connect_to_cdp_browser", connect)
+
+    await getattr(factory_module, creator_name)(
+        playwright=MagicMock(),
+        browser_address="wss://browser.example.test/devtools/browser/id",
+    )
+
+    assert connect.await_args.kwargs["validate_browser_address"] is True
+
+
+@pytest.mark.asyncio
+async def test_cdp_connect_creator_trusts_configured_browser_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    connect = AsyncMock(return_value=(MagicMock(), MagicMock(), None))
+    monkeypatch.setattr(factory_module, "_connect_to_cdp_browser", connect)
+    monkeypatch.setattr(factory_module.settings, "BROWSER_TYPE", "cdp-connect")
+    monkeypatch.setattr(factory_module.settings, "CHROME_EXECUTABLE_PATH", None)
+
+    await factory_module._create_cdp_connection_browser(playwright=MagicMock())
+
+    assert connect.await_args.kwargs["validate_browser_address"] is False
+
+
+@pytest.mark.asyncio
 async def test_ordinary_local_creator_leaves_marker_false(monkeypatch: pytest.MonkeyPatch) -> None:
     """The factory does not auto-stamp; a local creator's marker stays False."""
     from skyvern.webeye.browser_artifacts import BrowserArtifacts

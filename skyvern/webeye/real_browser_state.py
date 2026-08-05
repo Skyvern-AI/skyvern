@@ -25,6 +25,7 @@ from skyvern.exceptions import (
     MissingBrowserStatePage,
 )
 from skyvern.forge import app
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.trace import traced
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
@@ -97,6 +98,8 @@ class RealBrowserState(BrowserState):
         # weakly, so a still-pending detached drain would be eligible for GC ("Task was destroyed
         # but it is pending!"); we own it strongly here until its done-callback discards it.
         self._detached_teardown_tasks: set[asyncio.Task[None]] = set()
+        # A release retry after a transient DB failure must not repeat local CDP teardown.
+        self._remote_driver_detached = False
 
     def add_on_close(self, callback: Callable[[], Awaitable[None]]) -> None:
         self._on_close_callbacks.append(callback)
@@ -199,6 +202,7 @@ class RealBrowserState(BrowserState):
     ) -> None:
         if self.browser_context is None:
             LOG.info("creating browser context")
+            context = skyvern_context.current()
             (
                 browser_context,
                 browser_artifacts,
@@ -215,6 +219,7 @@ class RealBrowserState(BrowserState):
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
+                browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
                 browser_profile_id=browser_profile_id,
                 engine_selection=self.engine_selection,
             )
@@ -658,13 +663,14 @@ class RealBrowserState(BrowserState):
         # Worst-case wall time is the sum of the per-phase budgets:
         # BROWSER_INTERCEPTOR_DISABLE_TIMEOUT + 3 * BROWSER_CLOSE_TIMEOUT.
         recording_finalized = False
-        if close_browser_on_completion:
+        if close_browser_on_completion or release_driver:
             if self.browser_context is not None:
                 await self._run_bounded_detachable(
                     disable_download_interceptor_for_context(self.browser_context),
                     BROWSER_INTERCEPTOR_DISABLE_TIMEOUT,
                     "download interceptor disable",
                 )
+        if close_browser_on_completion:
             recording_finalized = await self._run_bounded_detachable(
                 self._teardown_context(),
                 BROWSER_CLOSE_TIMEOUT,
@@ -674,6 +680,27 @@ class RealBrowserState(BrowserState):
 
         await self._stop_driver_bounded(release_driver)
         return recording_finalized
+
+    async def detach_remote_driver(self) -> None:
+        """Release this process's adopted-remote resources without closing the remote browser.
+
+        Unlike ``close(..., release_driver=True)``, failures propagate so the persistent-session
+        owner can leave database occupancy intact. The operation is idempotent: a successful
+        interceptor disable removes its context binding, while a successful Playwright stop is
+        recorded locally for a release retry that only needs to finish the database CAS.
+        """
+        if self._remote_driver_detached:
+            return
+        if self.browser_context is not None:
+            interceptor = getattr(self.browser_context, "_skyvern_cdp_download_interceptor", None)
+            if interceptor is not None:
+                await interceptor.disable()
+                if getattr(self.browser_context, "_skyvern_cdp_download_interceptor", None) is interceptor:
+                    self.browser_context._skyvern_cdp_download_interceptor = None  # type: ignore[attr-defined]
+        if self.pw is not None:
+            async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+                await self.pw.stop()
+        self._remote_driver_detached = True
 
     async def _run_bounded_detachable(self, coro: Awaitable[None], timeout: float, description: str) -> bool:
         # Bound a teardown phase WITHOUT relying on cancellation: a stuck download drain or a real

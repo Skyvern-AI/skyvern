@@ -3,8 +3,11 @@ Just an example unit test for now. Will expand later.
 """
 
 import asyncio
+import base64
+import gzip
 import time
 import typing as t
+import zlib
 
 import pytest
 
@@ -20,6 +23,7 @@ from skyvern.services.browser_recording.interpretation import RecordingInterpret
 from skyvern.services.browser_recording.service import (
     DUPLICATE_ACTION_WINDOW_MS,
     Processor,
+    _gunzip_bounded,
     _is_duplicate_action,
     _recording_enrichment_llm_handler,
     _resolve_enrichment_handler,
@@ -827,3 +831,56 @@ def test_summarize_exfiltrated_recording_events_mixed() -> None:
     assert summary["recording_exfil_cdp_event_name_counts"] == {"nav:frame_navigated": 2}
     assert summary["recording_exfil_console_dom_type_counts"] == {"click": 1, "keypress": 1}
     assert summary["recording_exfil_console_exfil_event_name_counts"] == {"user_interaction": 2}
+
+
+def test_gunzip_bounded_returns_full_payload_under_limit() -> None:
+    payload = b"hello world" * 500
+    compressed = gzip.compress(payload)
+
+    assert _gunzip_bounded(compressed, len(payload)) == payload
+
+
+def test_gunzip_bounded_allows_output_exactly_at_limit() -> None:
+    payload = b"A" * 4096
+    compressed = gzip.compress(payload)
+
+    assert _gunzip_bounded(compressed, len(payload)) == payload
+
+
+def test_gunzip_bounded_rejects_output_over_limit() -> None:
+    payload = b"A" * 4096
+    compressed = gzip.compress(payload)
+
+    assert _gunzip_bounded(compressed, len(payload) - 1) is None
+
+
+def test_gunzip_bounded_rejects_decompression_bomb() -> None:
+    # ~32 MiB of zeros compresses to a few KiB; the bound must reject it long before
+    # the full output would be materialized in memory.
+    bomb = gzip.compress(b"\x00" * (32 * 1024 * 1024))
+    assert len(bomb) < 1 * 1024 * 1024
+
+    assert _gunzip_bounded(bomb, 1024) is None
+
+
+def test_gunzip_bounded_raises_on_corrupt_input() -> None:
+    with pytest.raises(zlib.error):
+        _gunzip_bounded(b"not a valid gzip stream", 1024)
+
+
+def test_decompress_rejects_bomb(monkeypatch: pytest.MonkeyPatch) -> None:
+    import skyvern.services.browser_recording.service as svc
+
+    monkeypatch.setattr(svc, "MAX_DECOMPRESSED_SIZE", 1024)
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    bomb = base64.b64encode(gzip.compress(b"\x00" * (10 * 1024 * 1024))).decode("ascii")
+
+    assert processor.decompress(bomb) is None
+
+
+def test_decompress_returns_bytes_for_valid_payload() -> None:
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    raw = b'[{"source": "cdp", "event_name": "nav:frame_navigated"}]'
+    payload = base64.b64encode(gzip.compress(raw)).decode("ascii")
+
+    assert processor.decompress(payload) == raw

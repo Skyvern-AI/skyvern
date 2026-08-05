@@ -16,6 +16,7 @@ from skyvern.config import settings
 from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import DEFAULT_REQUEST_TIMEOUT
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
@@ -101,7 +102,7 @@ async def parse_otp_login(
         content=content,
         enforced_otp_type=enforced_otp_type.value if enforced_otp_type else None,
     )
-    resp = await app.SECONDARY_LLM_API_HANDLER(
+    resp = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
         prompt=prompt, prompt_name="parse-otp-login", organization_id=organization_id
     )
     # The LLM call succeeded, so the extraction work is billable regardless of
@@ -324,12 +325,6 @@ def try_generate_totp_for_credential(
         return None
     try:
         code = generate_totp_code(totp_secret)
-        LOG.info(
-            "Generated TOTP from credential secret",
-            workflow_run_id=workflow_run_id,
-            credential_key=credential_key,
-        )
-        return OTPValue(value=code, type=OTPType.TOTP)
     except Exception:
         LOG.warning(
             "Failed to generate TOTP from credential secret",
@@ -338,6 +333,21 @@ def try_generate_totp_for_credential(
             exc_info=True,
         )
         return None
+    LOG.info(
+        "Generated TOTP from credential secret",
+        workflow_run_id=workflow_run_id,
+        credential_key=credential_key,
+    )
+    try:
+        workflow_run_context.register_runtime_otp_value(code)
+    except Exception:
+        LOG.debug(
+            "Failed to register runtime TOTP for redaction",
+            workflow_run_id=workflow_run_id,
+            credential_key=credential_key,
+            exc_info=True,
+        )
+    return OTPValue(value=code, type=OTPType.TOTP)
 
 
 def has_credential_totp_candidate(workflow_run_id: str | None) -> bool:
@@ -523,9 +533,10 @@ async def poll_otp_value(
                 otp_value = await _get_otp_value_from_email(
                     organization_id=organization_id,
                     totp_identifier=totp_identifier,
-                    workflow_id=workflow_permanent_id,
+                    workflow_id=workflow_id,
                     workflow_run_id=workflow_run_id,
                     created_after=email_created_after,
+                    expected_otp_type=expected_otp_type,
                     context=email_otp_context,
                 )
             if otp_value is None and totp_identifier:
@@ -535,7 +546,7 @@ async def poll_otp_value(
                     organization_id,
                     totp_identifier,
                     task_id=task_id,
-                    workflow_id=workflow_permanent_id,
+                    workflow_id=workflow_id,
                     workflow_run_id=workflow_run_id,
                     created_after=db_created_after,
                     expected_otp_type=expected_otp_type,
@@ -593,7 +604,7 @@ async def _get_otp_value_from_url(
             organization_id=organization_id,
         )
     except Exception as e:
-        LOG.error(
+        LOG.warning(
             "Failed to get otp value from url",
             exception_type=type(e).__name__,
         )
@@ -684,6 +695,7 @@ async def _get_otp_value_from_email(
     workflow_id: str | None = None,
     workflow_run_id: str | None = None,
     created_after: datetime | None = None,
+    expected_otp_type: OTPType | None = None,
     context: EmailOTPVerificationContext | None = None,
 ) -> OTPValue | None:
     return await app.AGENT_FUNCTION.get_otp_value_from_email(
@@ -692,6 +704,7 @@ async def _get_otp_value_from_email(
         workflow_id=workflow_id,
         workflow_run_id=workflow_run_id,
         created_after=created_after,
+        expected_otp_type=expected_otp_type,
         context=context,
     )
 

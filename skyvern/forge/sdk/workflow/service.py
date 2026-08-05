@@ -11,11 +11,11 @@ import textwrap
 import time
 import uuid
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast, overload
 
 import structlog
 from jinja2 import meta as jinja2_meta
@@ -44,7 +44,9 @@ from skyvern.exceptions import (
     BrowserProfileNotFound,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
+    BrowserSessionStartupTimeout,
     DisabledBlockExecutionError,
+    InProcessScriptExecutionDenied,
     InvalidCredentialId,
     InvalidWorkflowParameter,
     MissingValueForParameter,
@@ -76,6 +78,7 @@ from skyvern.forge.sdk.db.id import generate_output_parameter_id, generate_workf
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.transient_ui_capture import resolve_transient_ui_capture_arm
+from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
 from skyvern.forge.sdk.schemas.credentials import Credential
@@ -214,6 +217,7 @@ from skyvern.services.webhook_delivery import (
 )
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.secret_headers import merge_masked_headers
+from skyvern.utils.secret_redaction import redact_console_log_bytes, redact_har_bytes
 from skyvern.utils.strings import is_uuid
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
 from skyvern.webeye.actions.action_types import ActionType
@@ -241,6 +245,16 @@ POST_RUN_TIMEOUT_EXHAUSTED_THRESHOLD_SECONDS = 0.001
 # Bound pre-finalization write-back so a stuck profile upload cannot leave the run in a non-terminal state.
 BROWSER_SESSION_WRITE_BACK_TIMEOUT = SAVE_DOWNLOADED_FILES_TIMEOUT
 
+# Limit burst concurrency for status-path fetches that are typically hit by client polling.
+WORKFLOW_STATUS_RESPONSE_MAX_IN_FLIGHT = 3
+_T1 = TypeVar("_T1")
+_T2 = TypeVar("_T2")
+_T3 = TypeVar("_T3")
+_T4 = TypeVar("_T4")
+_T5 = TypeVar("_T5")
+_T6 = TypeVar("_T6")
+_T_OP = TypeVar("_T_OP")
+
 # Failure reason stamped when execute_workflow's body is interrupted before it captures a terminal
 # intent (pre_finally_status stays None)
 WORKFLOW_RUN_INTERRUPTED_FAILURE_REASON = (
@@ -251,6 +265,10 @@ WORKFLOW_RUN_INTERRUPTED_FAILURE_REASON = (
 # Short lifespan for auto-provisioned CodeBlock sessions; the renewal loop extends it while the
 # run is active, so this only bounds how long a leaked session lingers if cleanup never runs.
 CODE_BLOCK_SESSION_TIMEOUT_MINUTES = 20
+# Wall clock, not an attempt count: a waiting run holds a whole worker pod
+# (max_concurrent_activities=1), so what has to stay bounded is the time pinned, whatever the
+# per-attempt startup deadline happens to be.
+CODE_BLOCK_SESSION_STARTUP_BUDGET_SECONDS = 90.0
 
 # Structured warning emitted when a debug-session run's visible PBS profile is
 # incompatible with the LoginBlock credential's saved profile. Observability
@@ -614,7 +632,17 @@ def _script_has_static_module_marker(script_path: str) -> bool:
         return False
 
 
-def _load_user_script_module(script_path: str, spec: "importlib.machinery.ModuleSpec") -> Any | None:
+async def _load_user_script_module(
+    script_path: str,
+    spec: "importlib.machinery.ModuleSpec",
+    *,
+    organization_id: str | None = None,
+    workflow_run_id: str | None = None,
+    workflow_permanent_id: str | None = None,
+    workflow_id: str | None = None,
+    script_id: str | None = None,
+    script_revision_id: str | None = None,
+) -> Any | None:
     """Load a cached script's main.py for execution.
 
     Static (marker) pins must import the live platform module FIRST: the stored
@@ -627,6 +655,16 @@ def _load_user_script_module(script_path: str, spec: "importlib.machinery.Module
     check would never supersede it. Only a markerless pin (a generated script)
     executes its stored body.
     """
+    await script_service.ensure_in_process_script_execution_allowed(
+        seam="workflow.cached_script_module_load",
+        organization_id=organization_id,
+        workflow_run_id=workflow_run_id,
+        workflow_permanent_id=workflow_permanent_id,
+        workflow_id=workflow_id,
+        script_id=script_id,
+        script_revision_id=script_revision_id,
+    )
+
     loaded_script_module = app.AGENT_FUNCTION.try_import_static_script(script_path)
     if loaded_script_module is not None:
         return loaded_script_module
@@ -676,29 +714,6 @@ def _build_managed_browser_profile_name(workflow_title: str | None, rendered_key
     suffix = f" (auto-saved: {key})"
     title = _truncate_managed_browser_profile_part(title, MANAGED_BROWSER_PROFILE_NAME_MAX_LENGTH - len(suffix))
     return f"{title}{suffix}"
-
-
-def _credential_id_from_setup_parameter(parameter: Any, parameter_values: dict[str, Any]) -> str | None:
-    """Resolve the credential id a credential-typed block parameter points at from in-memory run
-    parameters. The per-run rotation selection (keyed by parameter key) wins over the static value.
-    Only credential-typed parameters are consulted, so an unrelated string input can never be mistaken
-    for a credential id."""
-    if isinstance(parameter, CredentialParameter):
-        selected = parameter_values.get(parameter.key)
-        if isinstance(selected, str) and selected:
-            return selected
-        return parameter.credential_id
-    if (
-        isinstance(parameter, WorkflowParameter)
-        and parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
-    ):
-        selected = parameter_values.get(parameter.key)
-        if isinstance(selected, str) and selected:
-            return selected
-        default_value = parameter.default_value
-        if isinstance(default_value, str) and default_value:
-            return default_value
-    return None
 
 
 class WorkflowService:
@@ -752,6 +767,72 @@ class WorkflowService:
         )
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+    @overload
+    async def _gather_with_max_in_flight(
+        self,
+        operations: tuple[
+            Callable[[], Awaitable[_T1]],
+            Callable[[], Awaitable[_T2]],
+            Callable[[], Awaitable[_T3]],
+            Callable[[], Awaitable[_T4]],
+            Callable[[], Awaitable[_T5]],
+            Callable[[], Awaitable[_T6]],
+        ],
+        max_in_flight: int = WORKFLOW_STATUS_RESPONSE_MAX_IN_FLIGHT,
+    ) -> tuple[_T1, _T2, _T3, _T4, _T5, _T6]: ...
+
+    @overload
+    async def _gather_with_max_in_flight(
+        self,
+        operations: tuple[
+            Callable[[], Awaitable[_T1]],
+            Callable[[], Awaitable[_T2]],
+            Callable[[], Awaitable[_T3]],
+            Callable[[], Awaitable[_T4]],
+            Callable[[], Awaitable[_T5]],
+        ],
+        max_in_flight: int = WORKFLOW_STATUS_RESPONSE_MAX_IN_FLIGHT,
+    ) -> tuple[_T1, _T2, _T3, _T4, _T5]: ...
+
+    @overload
+    async def _gather_with_max_in_flight(
+        self,
+        operations: tuple[
+            Callable[[], Awaitable[_T1]],
+            Callable[[], Awaitable[_T2]],
+            Callable[[], Awaitable[_T3]],
+            Callable[[], Awaitable[_T4]],
+        ],
+        max_in_flight: int = WORKFLOW_STATUS_RESPONSE_MAX_IN_FLIGHT,
+    ) -> tuple[_T1, _T2, _T3, _T4]: ...
+
+    @overload
+    async def _gather_with_max_in_flight(
+        self,
+        operations: Sequence[Callable[[], Awaitable[Any]]],
+        max_in_flight: int = WORKFLOW_STATUS_RESPONSE_MAX_IN_FLIGHT,
+    ) -> tuple[Any, ...]: ...
+
+    async def _gather_with_max_in_flight(
+        self,
+        operations: Sequence[Callable[[], Awaitable[Any]]],
+        max_in_flight: int = WORKFLOW_STATUS_RESPONSE_MAX_IN_FLIGHT,
+    ) -> tuple[Any, ...]:
+        """Run async operations with bounded concurrency.
+
+        Status endpoints are often called by polling clients; this prevents a
+        single request from exhausting database sessions through large immediate
+        parallel bursts while preserving gather ordering and error propagation.
+        """
+
+        semaphore = asyncio.Semaphore(max(max_in_flight, 1))
+
+        async def _bounded(operation: Callable[[], Awaitable[_T_OP]]) -> _T_OP:
+            async with semaphore:
+                return await operation()
+
+        return tuple(await asyncio.gather(*(_bounded(operation) for operation in operations)))
 
     @staticmethod
     async def _apply_initial_run_metadata_tags(
@@ -1830,6 +1911,8 @@ class WorkflowService:
                 SkyvernContext(
                     organization_id=organization.organization_id,
                     organization_name=organization.organization_name,
+                    org_default_llm_key=organization.default_llm_key,
+                    org_default_secondary_llm_key=organization.default_secondary_llm_key,
                     request_id=request_id,
                     workflow_id=workflow_id,
                     workflow_run_id=workflow_run.workflow_run_id,
@@ -2016,10 +2099,21 @@ class WorkflowService:
                     trigger_type=resolved_trigger_type,
                 )
             except Exception as e:
-                LOG.exception(
-                    f"Error while setting up workflow run {workflow_run.workflow_run_id}",
-                    workflow_run_id=workflow_run.workflow_run_id,
-                )
+                # Client 4xx (e.g. missing param, invalid credential id) is expected user input and
+                # already surfaced via the failed run + failure_reason below, so it needs no operator
+                # action. Log it at warning without a traceback (keeping the error_type/exception_hash
+                # dashboard fields), and reserve error+traceback for genuine setup defects.
+                if isinstance(e, SkyvernHTTPException) and e.status_code < 500:
+                    LOG.warning(
+                        f"Error while setting up workflow run {workflow_run.workflow_run_id}",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        **exception_log_fields(e),
+                    )
+                else:
+                    LOG.exception(
+                        f"Error while setting up workflow run {workflow_run.workflow_run_id}",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                    )
 
                 # Discard any failed transaction state on the shared outer session before
                 # mark_workflow_run_as_failed reuses it.
@@ -2240,9 +2334,10 @@ class WorkflowService:
                 # stamp keeps today's path.
                 credential_browser_profile_id = await self._resolve_setup_credential_seed(
                     workflow=workflow,
-                    parameter_values=parameter_values,
+                    workflow_run_id=workflow_run.workflow_run_id,
                     organization_id=organization_id,
                     engine_enabled=engine_enabled,
+                    parameter_values=parameter_values,
                 )
                 if credential_browser_profile_id:
                     return credential_browser_profile_id, BrowserSeedSource.credential, own_browser_profile_id
@@ -2262,9 +2357,10 @@ class WorkflowService:
         # behavior change, so flag-off falls to fresh and the preserved mid-run stamp keeps today's path.
         credential_browser_profile_id = await self._resolve_setup_credential_seed(
             workflow=workflow,
-            parameter_values=parameter_values,
+            workflow_run_id=workflow_run.workflow_run_id,
             organization_id=organization_id,
             engine_enabled=engine_enabled,
+            parameter_values=parameter_values,
         )
         if credential_browser_profile_id:
             return credential_browser_profile_id, BrowserSeedSource.credential, None
@@ -2275,9 +2371,10 @@ class WorkflowService:
         self,
         *,
         workflow: Workflow,
-        parameter_values: dict[str, Any],
+        workflow_run_id: str,
         organization_id: str,
         engine_enabled: bool,
+        parameter_values: dict[str, Any],
     ) -> str | None:
         """Setup-time credential-profile seed, gated on the browser-memory engine. Flag-off returns None
         so the fleet keeps today's behavior (fresh until the login block's mid-run stamp); the engine era
@@ -2285,7 +2382,10 @@ class WorkflowService:
         if not engine_enabled:
             return None
         return await self._resolve_credential_browser_profile_id_for_setup(
-            workflow=workflow, parameter_values=parameter_values, organization_id=organization_id
+            workflow=workflow,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            parameter_values=parameter_values,
         )
 
     async def _resolve_picked_profile_role(
@@ -2319,23 +2419,56 @@ class WorkflowService:
             )
             return "error", None
 
+    async def _resolve_single_login_credential_ids_for_setup(
+        self, *, workflow: Workflow, workflow_run_id: str, organization_id: str, parameter_values: dict[str, Any]
+    ) -> list[str]:
+        """Credential ids for the run's single unambiguous login block, resolved via the SAME rich path
+        as the mid-run login-block stamp (workflow_run_context / rotation pool / DB fallback selection /
+        static credential id). Resolving pool- and DB-selected credentials here is what lets setup seed
+        and pin the same account the block signs into — the only loader that can win when a cached-script
+        or pre-navigating block opens the browser before the login block runs, which locks the mid-run
+        loader out. parameter_values carries the in-memory render values so a request-supplied
+        WorkflowParameter/CREDENTIAL_ID resolves at setup, before run parameters are persisted.
+
+        Returns an empty list when resolution must defer to the mid-run stamp: any conditional branching
+        (the executing branch is unknown at setup) or not exactly one non-skip login block. Best-effort:
+        a resolution failure defers rather than aborting setup."""
+        all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
+        if any(isinstance(block, ConditionalBlock) for block in all_blocks):
+            return []
+        login_blocks = [b for b in all_blocks if isinstance(b, LoginBlock) and not b.skip_saved_profile]
+        if len(login_blocks) != 1:
+            return []
+        try:
+            return await self._resolve_login_block_credential_ids(
+                login_blocks[0],
+                workflow_run_id,
+                organization_id,
+                workflow.workflow_permanent_id,
+                run_parameter_values=parameter_values,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to resolve setup login credential ids",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                exc_info=True,
+            )
+            return []
+
     async def _resolve_active_credential_pin_for_setup(
-        self, *, workflow: Workflow, parameter_values: dict[str, Any], organization_id: str
+        self, *, workflow: Workflow, workflow_run_id: str, organization_id: str, parameter_values: dict[str, Any]
     ) -> tuple[str, str] | None:
         """The run's active single-login credential's dedicated-IP pin at setup — (credential_id,
         proxy_session_id) if that credential pins its IP, else None. Same single-unambiguous-login guard
         as the credential-profile seed (branches / multiple logins defer). B4: this pin wins over the
         seed profile's own pin (the site tracks IP per account)."""
-        all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
-        if any(isinstance(block, ConditionalBlock) for block in all_blocks):
-            return None
-        login_blocks = [b for b in all_blocks if isinstance(b, LoginBlock) and not b.skip_saved_profile]
-        if len(login_blocks) != 1:
-            return None
-        for param in login_blocks[0].parameters:
-            credential_id = _credential_id_from_setup_parameter(param, parameter_values)
-            if not credential_id:
-                continue
+        credential_ids = await self._resolve_single_login_credential_ids_for_setup(
+            workflow=workflow,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            parameter_values=parameter_values,
+        )
+        for credential_id in credential_ids:
             try:
                 db_cred = await app.DATABASE.credentials.get_credential(
                     credential_id=credential_id, organization_id=organization_id
@@ -2372,7 +2505,10 @@ class WorkflowService:
             proxy_session_id: str | None = None
             pinned_credential_id: str | None = None
             active = await self._resolve_active_credential_pin_for_setup(
-                workflow=workflow, parameter_values=parameter_values, organization_id=organization_id
+                workflow=workflow,
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=organization_id,
+                parameter_values=parameter_values,
             )
             if active:
                 pinned_credential_id, proxy_session_id = active
@@ -2501,35 +2637,25 @@ class WorkflowService:
         self,
         *,
         workflow: Workflow,
-        parameter_values: dict[str, Any],
+        workflow_run_id: str,
         organization_id: str,
+        parameter_values: dict[str, Any],
     ) -> str | None:
-        """Setup-time (pre-persist) variant of the login-block credential-profile resolution: reads the
-        run's selected credential from the in-memory parameter values (rotation selections keyed by
-        parameter key) rather than the DB, so the credential's saved profile can seed the run before
-        any browser is created.
+        """Setup-time (pre-persist) variant of the login-block credential-profile resolution: resolves
+        the run's login credential via the same rich path as the mid-run stamp (see
+        _resolve_single_login_credential_ids_for_setup) so the credential's saved profile can seed the
+        run before any browser is created.
 
         Only resolves when a single login block makes the credential unambiguous. With multiple login
         blocks (e.g. one per conditional branch) the executing block is unknown at setup, so resolution
         is deferred to the mid-run login-block stamp rather than risk seeding the wrong account."""
-        # Setup can't know which branch a run takes, so only seed the credential when execution of a
-        # single login is guaranteed: no conditional branching anywhere, and exactly one top-level
-        # login block. Anything else (branches, nested/multiple logins) defers to the mid-run stamp,
-        # which resolves the login that actually runs. This keeps the common linear case working while
-        # never booting the wrong account on a branch that skips the login.
-        all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
-        if any(isinstance(block, ConditionalBlock) for block in all_blocks):
-            return None
-        # Count over ALL blocks (not just top level): a login nested in a non-conditional container
-        # (e.g. a for-loop) still executes, so it must count toward the single-login guarantee or a
-        # top-level + nested pair would seed the wrong account instead of deferring to the mid-run stamp.
-        login_blocks = [block for block in all_blocks if isinstance(block, LoginBlock) and not block.skip_saved_profile]
-        if len(login_blocks) != 1:
-            return None
-        for param in login_blocks[0].parameters:
-            credential_id = _credential_id_from_setup_parameter(param, parameter_values)
-            if not credential_id:
-                continue
+        credential_ids = await self._resolve_single_login_credential_ids_for_setup(
+            workflow=workflow,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            parameter_values=parameter_values,
+        )
+        for credential_id in credential_ids:
             try:
                 db_cred = await app.DATABASE.credentials.get_credential(
                     credential_id=credential_id,
@@ -2913,8 +3039,9 @@ class WorkflowService:
         the legacy in-process executor. When the org is enabled for the secure runner, provision
         a session here so the CodeBlock routes to the runner. A run's browser_profile_id is loaded
         into the session so profile-backed CodeBlock workflows still reach the runner. Returns None
-        (run continues on the legacy path) when no CodeBlock is present, the org is not enabled, a
-        session was already supplied, or session creation fails.
+        (run continues on the legacy path) when no CodeBlock is present, the org is not enabled, or a
+        session was already supplied. Session-creation failure propagates: an enrolled run must fail
+        closed rather than silently downgrade its code to in-process execution.
         """
         if browser_session_id:  # the caller supplied a session; respect it unchanged
             return None
@@ -2933,22 +3060,21 @@ class WorkflowService:
             return None
 
         try:
-            browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+            browser_session = await self._create_code_block_browser_session(
                 organization_id=organization_id,
-                timeout_minutes=CODE_BLOCK_SESSION_TIMEOUT_MINUTES,
                 browser_profile_id=browser_profile_id,
                 proxy_location=proxy_location,
-                inherit_profile_proxy=True,
+                workflow_run_id=workflow_run_id,
             )
         except Exception:
-            LOG.warning(
-                "Failed to auto-create browser session for CodeBlock run; falling back to legacy executor",
+            LOG.error(
+                "Failed to auto-create browser session for CodeBlock run; failing the run closed",
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
                 workflow_permanent_id=workflow.workflow_permanent_id,
                 exc_info=True,
             )
-            return None
+            raise
 
         LOG.info(
             "Auto-created browser session for CodeBlock run",
@@ -2958,6 +3084,59 @@ class WorkflowService:
             browser_session_id=browser_session.persistent_browser_session_id,
         )
         return browser_session
+
+    async def _create_code_block_browser_session(
+        self,
+        *,
+        organization_id: str,
+        browser_profile_id: str | None,
+        proxy_location: ProxyLocationInput,
+        workflow_run_id: str,
+    ) -> PersistentBrowserSession:
+        """Create the CodeBlock session, retrying only a startup timeout.
+
+        A startup timeout means the session fleet had no free capacity inside the deadline,
+        not that the request was invalid — the fleet scales on demand, so a fresh attempt
+        often lands on pods that came up just after the previous deadline expired. Every
+        other failure is deterministic, so retrying it only delays the run.
+
+        Retrying is bounded by wall clock rather than by attempts because the waiting run
+        occupies a whole worker pod, and it does so during exactly the capacity crunch that
+        causes the timeout — so the cost to bound is time held, not requests made.
+        """
+        deadline = time.monotonic() + CODE_BLOCK_SESSION_STARTUP_BUDGET_SECONDS
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+                    organization_id=organization_id,
+                    timeout_minutes=CODE_BLOCK_SESSION_TIMEOUT_MINUTES,
+                    browser_profile_id=browser_profile_id,
+                    proxy_location=proxy_location,
+                    inherit_profile_proxy=True,
+                )
+            except BrowserSessionStartupTimeout:
+                if time.monotonic() >= deadline:
+                    raise
+                # A cancel can land while we wait. Provisioning another billed session for a
+                # run that already finished helps nobody and deepens the shortage.
+                workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id)
+                if workflow_run.status.is_final():
+                    LOG.info(
+                        "Workflow run reached a final state while its CodeBlock session was starting; not retrying",
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                        workflow_status=workflow_run.status,
+                    )
+                    raise
+                LOG.warning(
+                    "Browser session for CodeBlock run timed out starting; retrying",
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    attempt=attempt,
+                    budget_seconds=CODE_BLOCK_SESSION_STARTUP_BUDGET_SECONDS,
+                )
 
     async def _collect_inherited_workflow_system_prompt(
         self,
@@ -3288,6 +3467,7 @@ class WorkflowService:
                 block_outputs,
                 workflow,
                 inherited_workflow_system_prompt=inherited_workflow_system_prompt,
+                mask_secrets=getattr(workflow, "mask_secrets", False),
             )
         except Exception as e:
             LOG.exception(
@@ -3329,14 +3509,40 @@ class WorkflowService:
         # profile-backed CodeBlock workflow still needs a session for the secure runner, so the
         # profile is loaded into the auto-created session instead of skipping it.
         if browser_session is None and browser_session_id is None:
-            browser_session = await self.auto_create_browser_session_for_code_block_if_needed(
-                organization.organization_id,
-                workflow,
-                workflow_run_id=workflow_run_id,
-                browser_session_id=browser_session_id,
-                browser_profile_id=browser_profile_id,
-                proxy_location=workflow_run.proxy_location,
-            )
+            # The helper raises only for a secure-runner-enrolled run whose session could not be
+            # created; letting that run continue would silently execute its code in-process instead
+            # of the sandbox, so fail closed like the sidecar-absent posture.
+            try:
+                browser_session = await self.auto_create_browser_session_for_code_block_if_needed(
+                    organization.organization_id,
+                    workflow,
+                    workflow_run_id=workflow_run_id,
+                    browser_session_id=browser_session_id,
+                    browser_profile_id=browser_profile_id,
+                    proxy_location=workflow_run.proxy_location,
+                )
+            except Exception as e:
+                failure_reason = (
+                    "Failed to create the browser session required for secure code execution: "
+                    f"{get_user_facing_exception_message(e)}"
+                )
+                # Conditional: a cancel can land while the session is still starting, and an
+                # unconditional write would overwrite that terminal status with ``failed``.
+                workflow_run = (
+                    await self.mark_workflow_run_as_failed_if_not_final(
+                        workflow_run_id=workflow_run_id, failure_reason=failure_reason
+                    )
+                    or workflow_run
+                )
+                await self.clean_up_workflow(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    api_key=api_key,
+                    browser_session_id=browser_session_id,
+                    close_browser_on_completion=close_browser_on_completion,
+                    need_call_webhook=need_call_webhook,
+                )
+                return workflow_run
 
         if browser_session:
             browser_session_id = browser_session.persistent_browser_session_id
@@ -3356,12 +3562,15 @@ class WorkflowService:
         renewal_task: asyncio.Task[None] | None = None
         if browser_session_id:
             try:
-                await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+                lease_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
                     browser_session_id=browser_session_id,
                     runnable_type="workflow_run",
                     runnable_id=workflow_run_id,
                     organization_id=organization.organization_id,
                 )
+                current_context = skyvern_context.ensure_context()
+                current_context.browser_session_runnable_id = workflow_run_id
+                current_context.browser_session_runnable_generation_id = lease_generation_id
             except Exception as e:
                 LOG.exception(
                     "Failed to begin browser session for workflow run",
@@ -3468,6 +3677,11 @@ class WorkflowService:
                 return workflow_run
             else:
                 timeout_context = asyncio.timeout(max_elapsed_timeout_seconds)
+                # Publish the same deadline the timeout enforces, so work that can block for
+                # a long time can give up in time to still do something useful instead of
+                # being cancelled with nothing done.
+                if body_context := skyvern_context.current():
+                    body_context.max_elapsed_deadline = asyncio.get_running_loop().time() + max_elapsed_timeout_seconds
                 try:
                     async with timeout_context:
                         await execute_workflow_blocks()
@@ -3969,7 +4183,16 @@ class WorkflowService:
 
                         spec = importlib.util.spec_from_file_location("user_script", script_path)
                         if spec and spec.loader:
-                            loaded_script_module = _load_user_script_module(script_path, spec)
+                            loaded_script_module = await _load_user_script_module(
+                                script_path,
+                                spec,
+                                organization_id=organization_id,
+                                workflow_run_id=workflow_run_id,
+                                workflow_permanent_id=workflow.workflow_permanent_id,
+                                workflow_id=workflow.workflow_id,
+                                script_id=script.script_id,
+                                script_revision_id=script.script_revision_id,
+                            )
                             param_cls = (
                                 getattr(loaded_script_module, "GeneratedWorkflowParameters", None)
                                 if loaded_script_module
@@ -4027,6 +4250,8 @@ class WorkflowService:
                             script_path=script_path,
                             script_id=script.script_id,
                         )
+            except InProcessScriptExecutionDenied:
+                raise
             except Exception as e:
                 LOG.warning(
                     "Failed to load script blocks, will fallback to normal execution",
@@ -4039,9 +4264,12 @@ class WorkflowService:
                 loaded_script_module = None
 
         # If no cached script exists, check if a static pre-built script
-        # should be created for this platform (e.g., ATS).  This persists the
+        # should be created for this platform (e.g., ATS). This persists the
         # script to DB (pinned) on first run so it shows in the Code tab.
-        if is_script_run and not script_blocks_by_label:
+        # Partial runs must stay agent-only, matching get_workflow_script's
+        # existing contract: bootstrapping here would re-open run_signature
+        # compile/exec after that lookup deliberately returned no script.
+        if is_script_run and not block_labels and not script_blocks_by_label:
             try:
                 static_result = await app.AGENT_FUNCTION.ensure_static_script(
                     workflow=workflow,
@@ -5603,8 +5831,14 @@ class WorkflowService:
         workflow_run_id: str | None,
         organization_id: str | None = None,
         workflow_permanent_id: str | None = None,
+        run_parameter_values: dict[str, Any] | None = None,
     ) -> list[str]:
-        """Return credential ids bound to this block, preserving parameter order."""
+        """Return credential ids bound to this block, preserving parameter order.
+
+        run_parameter_values, when provided, supplies the in-memory render values (rotation selection,
+        dereferenced indirection, or request value) and wins for both credential styles. Setup resolves
+        the seed BEFORE the run context and run parameters are persisted, so the persisted reads below are
+        empty then; mid-run (block execution) passes None and the persisted state is authoritative."""
         params = block.parameters
 
         # Pre-fetch run parameters once (used by WorkflowParameter/CREDENTIAL_ID style).
@@ -5616,40 +5850,55 @@ class WorkflowService:
 
             # Style 1: CredentialParameter (has credential_id directly)
             if isinstance(param, CredentialParameter):
-                credential_id = await self._resolve_credential_parameter_id(
-                    parameter=param,
-                    workflow_run_id=workflow_run_id,
-                    organization_id=organization_id,
-                    workflow_permanent_id=workflow_permanent_id,
-                )
+                # In-memory render values win when provided (setup): they already carry the rotation
+                # selection and any dereferenced indirection, which the persisted-state resolver below
+                # can't see until the run context / selections are persisted.
+                if run_parameter_values is not None:
+                    selected = run_parameter_values.get(param.key)
+                    if isinstance(selected, str) and selected:
+                        credential_id = selected
+                if not credential_id:
+                    credential_id = await self._resolve_credential_parameter_id(
+                        parameter=param,
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                        workflow_permanent_id=workflow_permanent_id,
+                    )
 
             # Style 2: WorkflowParameter with type CREDENTIAL_ID
             elif (
                 isinstance(param, WorkflowParameter)
                 and getattr(param, "workflow_parameter_type", None) == WorkflowParameterType.CREDENTIAL_ID
             ):
-                # The credential_id is stored as the run-parameter value (or
-                # falls back to default_value on the workflow parameter).
-                if workflow_run_id is None:
-                    run_param_tuples = []
-                elif run_param_tuples is None:
-                    try:
-                        run_param_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
-                            workflow_run_id=workflow_run_id,
-                        )
-                    except Exception:
-                        LOG.warning(
-                            "Failed to fetch workflow run parameters for credential resolution",
-                            workflow_run_id=workflow_run_id,
-                            exc_info=True,
-                        )
-                        run_param_tuples = []
+                # In-memory render values win when provided: setup resolves the seed before run
+                # parameters are persisted, so the DB read below is empty at that point.
+                if run_parameter_values is not None:
+                    selected = run_parameter_values.get(param.key)
+                    if isinstance(selected, str) and selected:
+                        credential_id = selected
 
-                for wf_param, run_param in run_param_tuples:
-                    if wf_param.key == param.key:
-                        if isinstance(run_param.value, str) and run_param.value:
-                            credential_id = run_param.value
-                        break
+                # Otherwise the credential_id is the persisted run-parameter value.
+                if not credential_id:
+                    if workflow_run_id is None:
+                        run_param_tuples = []
+                    elif run_param_tuples is None:
+                        try:
+                            run_param_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
+                                workflow_run_id=workflow_run_id,
+                            )
+                        except Exception:
+                            LOG.warning(
+                                "Failed to fetch workflow run parameters for credential resolution",
+                                workflow_run_id=workflow_run_id,
+                                exc_info=True,
+                            )
+                            run_param_tuples = []
+
+                    for wf_param, run_param in run_param_tuples:
+                        if wf_param.key == param.key:
+                            if isinstance(run_param.value, str) and run_param.value:
+                                credential_id = run_param.value
+                            break
 
                 # Fallback to default_value
                 if not credential_id:
@@ -6303,6 +6552,7 @@ class WorkflowService:
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
+        mask_secrets: bool = False,
         pin_saved_session_ip: bool = False,
         browser_profile_id: str | None = None,
         browser_profile_key: str | None = None,
@@ -6340,6 +6590,7 @@ class WorkflowService:
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
+                mask_secrets=mask_secrets,
                 pin_saved_session_ip=pin_saved_session_ip,
                 browser_profile_id=browser_profile_id,
                 browser_profile_key=browser_profile_key,
@@ -6738,6 +6989,7 @@ class WorkflowService:
         totp_verification_url: str | None | object = _UNSET,
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        mask_secrets: bool | None = None,
         pin_saved_session_ip: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
         browser_profile_key: str | None | object = _UNSET,
@@ -6777,6 +7029,7 @@ class WorkflowService:
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
+                mask_secrets=mask_secrets,
                 pin_saved_session_ip=pin_saved_session_ip,
                 browser_profile_id=browser_profile_id,
                 browser_profile_key=browser_profile_key,
@@ -6808,6 +7061,7 @@ class WorkflowService:
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
+                mask_secrets=mask_secrets,
                 pin_saved_session_ip=pin_saved_session_ip,
                 browser_profile_id=browser_profile_id,
                 browser_profile_key=browser_profile_key,
@@ -8486,22 +8740,24 @@ class WorkflowService:
             workflow_run_tasks,
             workflow_parameter_tuples,
             block_errors,
-        ) = await asyncio.gather(
-            app.DATABASE.workflows.get_workflow_for_workflow_run(
-                workflow_run_id,
-                organization_id=organization_id,
-                filter_deleted=not allow_deleted,
-            ),
-            self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id),
-            app.DATABASE.observer.get_task_v2_by_workflow_run_id(
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-            ),
-            app.DATABASE.tasks.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id),
-            app.DATABASE.workflow_runs.get_workflow_run_parameters(workflow_run_id=workflow_run_id),
-            app.DATABASE.workflow_runs.get_workflow_run_block_errors(
-                workflow_run_id=workflow_run_id, organization_id=organization_id
-            ),
+        ) = await self._gather_with_max_in_flight(
+            (
+                lambda: app.DATABASE.workflows.get_workflow_for_workflow_run(
+                    workflow_run_id,
+                    organization_id=organization_id,
+                    filter_deleted=not allow_deleted,
+                ),
+                lambda: self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id),
+                lambda: app.DATABASE.observer.get_task_v2_by_workflow_run_id(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                ),
+                lambda: app.DATABASE.tasks.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id),
+                lambda: app.DATABASE.workflow_runs.get_workflow_run_parameters(workflow_run_id=workflow_run_id),
+                lambda: app.DATABASE.workflow_runs.get_workflow_run_block_errors(
+                    workflow_run_id=workflow_run_id, organization_id=organization_id
+                ),
+            )
         )
 
         if workflow is None:
@@ -9456,6 +9712,9 @@ class WorkflowService:
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
         )
+        if settings.ENABLE_SECRET_ARTIFACT_REDACTION:
+            secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
+            har_data = await asyncio.to_thread(redact_har_bytes, har_data, secret_values)
         if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
             submission_shadow.schedule_submission_signal_shadow(
                 har_data=har_data,
@@ -9483,6 +9742,9 @@ class WorkflowService:
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
         )
+        if settings.ENABLE_SECRET_ARTIFACT_REDACTION:
+            secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
+            browser_log = await asyncio.to_thread(redact_console_log_bytes, browser_log, secret_values)
         LOG.debug("Persisting browser log", browser_log_size=len(browser_log))
         if browser_log:
             await app.ARTIFACT_MANAGER.create_artifact(
@@ -9536,6 +9798,14 @@ class WorkflowService:
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
         )
+        redaction_enabled = settings.ENABLE_SECRET_ARTIFACT_REDACTION
+        secret_values = (
+            app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
+            if redaction_enabled
+            else set()
+        )
+        if redaction_enabled:
+            browser_log = await asyncio.to_thread(redact_console_log_bytes, browser_log, secret_values)
         LOG.debug("Persisting browser log (bundled)", browser_log_size=len(browser_log))
         if browser_log:
             task_archive_entries["browser_console.log"] = (ArtifactType.BROWSER_CONSOLE_LOG, browser_log)
@@ -9545,6 +9815,8 @@ class WorkflowService:
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
         )
+        if redaction_enabled:
+            har_data = await asyncio.to_thread(redact_har_bytes, har_data, secret_values)
         if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
             submission_shadow.schedule_submission_signal_shadow(
                 har_data=har_data,
@@ -9634,6 +9906,7 @@ class WorkflowService:
             totp_verification_url=runtime_workflow.totp_verification_url,
             totp_identifier=runtime_workflow.totp_identifier,
             persist_browser_session=runtime_workflow.persist_browser_session,
+            mask_secrets=runtime_workflow.mask_secrets,
             pin_saved_session_ip=runtime_workflow.pin_saved_session_ip,
             browser_profile_id=runtime_workflow.browser_profile_id,
             browser_profile_key=runtime_workflow.browser_profile_key,
@@ -9774,6 +10047,9 @@ class WorkflowService:
                     totp_verification_url=request.totp_verification_url,
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
+                    mask_secrets=request.mask_secrets
+                    if request.mask_secrets is not None
+                    else getattr(existing_latest_workflow, "mask_secrets", False),
                     pin_saved_session_ip=request.pin_saved_session_ip
                     if "pin_saved_session_ip" in request.model_fields_set
                     else existing_latest_workflow.pin_saved_session_ip,
@@ -9823,6 +10099,7 @@ class WorkflowService:
                     totp_verification_url=request.totp_verification_url,
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
+                    mask_secrets=request.mask_secrets if request.mask_secrets is not None else False,
                     pin_saved_session_ip=request.pin_saved_session_ip,
                     browser_profile_id=request.browser_profile_id,
                     browser_profile_key=request.browser_profile_key,

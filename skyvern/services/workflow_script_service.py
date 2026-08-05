@@ -48,6 +48,17 @@ _CACHED_DECORATOR_RE = re.compile(
 )
 
 
+def _validate_main_py(source: str) -> bytes:
+    content = base64.b64encode(source.encode("utf-8")).decode("utf-8")
+    file = ScriptFileCreate(
+        path="main.py",
+        content=content,
+        encoding=FileEncoding.BASE64,
+        mime_type="text/x-python",
+    )
+    return script_service.validate_uploaded_script_files([file])[file.path]
+
+
 def _cached_label_from_decorator(decorator: ast.expr) -> str | None:
     if not isinstance(decorator, ast.Call):
         return None
@@ -998,6 +1009,7 @@ async def generate_workflow_script(
         script_version=script.version,
         script_revision_id=script.script_revision_id,
         pending=pending,
+        allow_invalid_python_syntax=True,
     )
 
     # check if an existing draft workflow script exists for this workflow run
@@ -1978,7 +1990,7 @@ async def create_script_version_from_review(
                         )
                         return new_script
 
-            patched_bytes = patched_main.encode("utf-8")
+            patched_bytes = _validate_main_py(patched_main)
             patched_hash = hashlib.sha256(patched_bytes).hexdigest()
 
             main_artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
@@ -2163,6 +2175,8 @@ async def create_script_version_from_full_code(
             )
             return None
 
+        main_bytes = _validate_main_py(full_main_py)
+
         # Compile the full main.py BEFORE creating the new version. A broken
         # rewrite should not persist any artifacts or DB rows.
         try:
@@ -2208,7 +2222,6 @@ async def create_script_version_from_full_code(
             )
 
         # Write the full main.py verbatim.
-        main_bytes = full_main_py.encode("utf-8")
         main_hash = hashlib.sha256(main_bytes).hexdigest()
 
         main_artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(

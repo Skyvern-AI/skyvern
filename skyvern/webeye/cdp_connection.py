@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -13,6 +14,7 @@ from playwright.async_api import Browser, Playwright
 
 from skyvern.config import settings
 from skyvern.exceptions import CdpConnectionConfigurationError
+from skyvern.utils.url_validators import validate_browser_host
 from skyvern.webeye.cdp_credentials import LIVE_VIEW_PATH_SEGMENT, marked_credential_segment
 
 LOG = structlog.get_logger()
@@ -199,21 +201,42 @@ def is_local_pbs_cdp_url(url: str) -> bool:
     return local_pbs_cdp_host_port(url) is not None
 
 
+def is_managed_session_router_cdp_url(url: str, browser_session_id: str | None) -> bool:
+    if not browser_session_id:
+        return False
+    parsed = urlparse(url)
+    if parsed.scheme != "wss":
+        return False
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    return (
+        len(segments) == 5
+        and segments[0] == browser_session_id
+        and bool(segments[1])
+        and segments[2:4] == ["devtools", "browser"]
+        and bool(segments[4])
+    )
+
+
 def prepare_persistent_browser_cdp_connect(
     browser_address: str,
     *,
     browser_session_id: str | None = None,
     x_api_key: str | None = None,
     cdp_connect_headers: dict[str, str] | None = None,
+    is_resolved_runner_cdp_proxy: bool = False,
+    is_managed_session_router: bool = False,
 ) -> tuple[str, dict[str, str] | None]:
-    """Normalize CDP URL and headers for host API connections to local PBS."""
+    """Normalize CDP URL and headers for connections to managed destinations."""
     connect_url = resolve_local_pbs_cdp_url(browser_address)
     headers: dict[str, str] = {}
     if cdp_connect_headers:
         headers.update(cdp_connect_headers)
-    if x_api_key:
+    is_managed_destination = (
+        is_local_pbs_cdp_url(connect_url) or is_resolved_runner_cdp_proxy or is_managed_session_router
+    )
+    if x_api_key and is_managed_destination:
         headers["x-api-key"] = x_api_key
-    if browser_session_id and is_local_pbs_cdp_url(connect_url):
+    if browser_session_id and is_managed_destination:
         headers["X-Session-Id"] = browser_session_id
     return connect_url, headers or None
 
@@ -308,8 +331,13 @@ async def connect_over_cdp_with_diagnostics(
     remote_browser_url: str,
     headers: dict[str, str] | None = None,
     timeout_ms: int = DEFAULT_CDP_CONNECT_TIMEOUT_MS,
+    validate_browser_address: bool = True,
 ) -> Browser:
     remote_browser_url = strip_browser_address_discriminator(remote_browser_url)
+    if validate_browser_address:
+        host = urlparse(remote_browser_url).hostname
+        if host:
+            await asyncio.to_thread(validate_browser_host, host, resolve_dns=True)
     try:
         return await playwright.chromium.connect_over_cdp(
             remote_browser_url,

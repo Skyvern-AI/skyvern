@@ -70,6 +70,7 @@ class PersistentBrowserSession(BaseModel):
     organization_id: str
     runnable_type: str | None = None
     runnable_id: str | None = None
+    runnable_generation_id: str | None = None
     browser_address: str | None = None
     ip_address: str | None = None
     # Server-side only: the upstream CDP endpoint and the adapter that dials it. browser_address

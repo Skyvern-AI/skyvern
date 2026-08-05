@@ -11,6 +11,7 @@ from playwright.async_api import BrowserContext, Dialog, Page
 from skyvern.constants import DIALOG_LLM_TIMEOUT
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.browser_action_preflight import preflight_dialog_response
 from skyvern.forge.sdk.core import skyvern_context
 
@@ -114,7 +115,7 @@ async def _handle_dialog(dialog: Dialog, page: Page | None = None) -> None:
         # JS dialogs block the page's JS thread while open. We need a hard timeout
         # to ensure the page doesn't stay frozen indefinitely if the LLM call is slow.
         response = await asyncio.wait_for(
-            app.SECONDARY_LLM_API_HANDLER(
+            get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt,
                 prompt_name="handle-dialog",
                 organization_id=organization_id,

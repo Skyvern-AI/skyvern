@@ -20,7 +20,10 @@ from skyvern.forge.sdk.api.files import (
     validate_local_file_path,
 )
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.api_handler_factory import (
+    LLMAPIHandlerFactory,
+    get_org_aware_secondary_llm_api_handler,
+)
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -51,6 +54,9 @@ class SplitPdfBlock(Block):
     prompt: str
     llm_key: str | None = None
     parameters: list[PARAMETER_TYPE] = []
+
+    def _own_llm_key(self) -> str | None:
+        return self.llm_key
 
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
         parameters = list(self.parameters)
@@ -94,7 +100,7 @@ class SplitPdfBlock(Block):
         if prompt_config_handler:
             return prompt_config_handler
 
-        secondary_handler = app.SECONDARY_LLM_API_HANDLER
+        secondary_handler = get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)
         if secondary_handler:
             return secondary_handler
 

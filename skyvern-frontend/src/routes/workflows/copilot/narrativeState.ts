@@ -365,6 +365,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   select_option: "Selecting option",
   press_key: "Interacting with page",
   navigate_browser: "Opening page",
+  wait_for_either_state: "Waiting for the page",
   get_block_schema: "Checking workflow block options",
   inspect_current_workflow: "Inspecting workflow",
   discover_workflow_entrypoint: "Finding the entry page",
@@ -989,12 +990,17 @@ export function applyNarrativeEvent(
           ...hydrated,
           blocks,
           // Graft across the terminal replacement so a cancel mid-silence
-          // doesn't visually un-check the Draft phase (hydrated payloads
-          // never carry this client-only field). authoringCount/lastRunOutcome
-          // are intentionally NOT grafted — a stubs-only terminal checklist is
-          // correct there.
+          // doesn't visually un-check the Draft phase (hydrated payloads never
+          // carry these client-only fields). authoringCount is grafted too so a
+          // turn whose only authoring entry aged out of the capped activity
+          // list still completes Explore at the swap; lastRunOutcome is not —
+          // a cancel-mid-redraft marks Test stopped rather than Draft.
           draftingSignaledAt:
             hydrated.turnId === prev.turnId ? prev.draftingSignaledAt : null,
+          authoringCount:
+            hydrated.turnId === prev.turnId
+              ? prev.authoringCount
+              : hydrated.authoringCount,
           responseType: event.response_type ?? hydrated.responseType,
           cancelled: event.cancelled ?? hydrated.cancelled,
           proposalDisposition:

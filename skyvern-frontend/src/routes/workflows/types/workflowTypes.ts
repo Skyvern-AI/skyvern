@@ -744,6 +744,7 @@ export type WorkflowApiResponse = {
   enable_self_healing: boolean | null;
   adaptive_caching: boolean | null;
   code_version: number | null;
+  mask_secrets: boolean;
   run_sequentially: boolean | null;
   sequential_key: string | null;
   folder_id: string | null;
@@ -770,6 +771,7 @@ export type WorkflowSettings = {
   scriptCacheKey: string | null;
   aiFallback: boolean | null;
   enableSelfHealing: boolean | null;
+  maskSecrets: boolean;
   runSequentially: boolean;
   sequentialKey: string | null;
   finallyBlockLabel: string | null;

@@ -60,6 +60,31 @@ def test_foreign_stdlib_exception_renders_single_structured_line(json_stream: io
     assert record["exception_hash"]
 
 
+def test_exception_log_fields_matches_processor_output_for_raised_exception() -> None:
+    """exception_log_fields lets a warning carry the same dashboard fields add_error_processor
+    derives from exc_info, so downgraded lines stay groupable without rendering a traceback."""
+    from skyvern.forge.sdk.forge_log import exception_log_fields
+
+    try:
+        _raise_through_wrapper()
+    except ValueError as exc:
+        fields = exception_log_fields(exc)
+
+    assert fields["error_type"] == "builtins.ValueError"
+    assert fields["error_category"] == "ERROR"
+    assert fields["exception_hash"]
+
+
+def test_exception_log_fields_omits_hash_when_never_raised() -> None:
+    from skyvern.forge.sdk.forge_log import exception_log_fields
+
+    fields = exception_log_fields(ValueError("never raised"))
+
+    assert fields["error_type"] == "builtins.ValueError"
+    assert fields["error_category"] == "ERROR"
+    assert "exception_hash" not in fields
+
+
 @pytest.fixture
 def registered_credential() -> Iterator[str]:
     secret_scrub._SESSION_SCRUB_VALUES.clear()

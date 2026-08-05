@@ -1747,3 +1747,53 @@ def test_an_all_literal_block_still_retires_when_the_call_is_gone() -> None:
     record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
 
     assert unresolved_runtime_block_failure(ctx) is None
+
+
+def _secure_runner_failure_result(error_code: str, category: str | None) -> dict[str, object]:
+    data: dict[str, object] = {
+        "workflow_run_id": "wr_runner",
+        "overall_status": "failed",
+        "blocks": [
+            {
+                "label": "run_code",
+                "block_type": "CODE",
+                "status": "failed",
+                "failure_reason": "Secure CodeBlock runner is unavailable. Please retry.",
+                "error_codes": [error_code],
+            }
+        ],
+    }
+    if category is not None:
+        data["failure_categories"] = [{"category": category, "confidence_float": 1.0, "reasoning": "sandbox"}]
+    return {"ok": False, "data": data}
+
+
+def test_unrecoverable_tool_error_run_is_not_repairable_and_not_authoritative() -> None:
+    outcome = recorded_outcome_from_run_blocks_result(
+        _secure_runner_failure_result("runner_unavailable", "UNRECOVERABLE_TOOL_ERROR")
+    )
+
+    assert outcome is not None
+    assert outcome.verdict != "repairable_failure"
+    assert outcome.verdict == "not_authoritative"
+    assert outcome.reason_code == "unrecoverable_tool_error"
+    assert outcome.is_authoritative is False
+    assert outcome.structural_failure_identity == ""
+
+
+def test_user_code_error_run_stays_repairable() -> None:
+    outcome = recorded_outcome_from_run_blocks_result(
+        _secure_runner_failure_result("user_code_error", "CODE_BLOCK_FAILURE")
+    )
+
+    assert outcome is not None
+    assert outcome.verdict == "repairable_failure"
+    assert outcome.reason_code == "runtime_block_failure"
+
+
+def test_runner_timeout_run_stays_repairable() -> None:
+    outcome = recorded_outcome_from_run_blocks_result(_secure_runner_failure_result("timeout", "CODE_BLOCK_FAILURE"))
+
+    assert outcome is not None
+    assert outcome.verdict == "repairable_failure"
+    assert outcome.reason_code == "runtime_block_failure"

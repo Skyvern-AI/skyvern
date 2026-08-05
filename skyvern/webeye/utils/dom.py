@@ -39,11 +39,17 @@ from skyvern.exceptions import (
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time, scroll_into_view_wait
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.browser_engine import BrowserEngineSelection
+from skyvern.webeye.dom_inspection import (
+    read_locator_tag_name,
+    read_resolved_anchor_href,
+    read_whether_link_or_button,
+)
 from skyvern.webeye.scraper.scraped_page import ScrapedPage, json_to_html
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, trim_element
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import SECRET_VISUAL_MASK_SCRIPT, SkyvernFrame
 
 LOG = structlog.get_logger()
 COMMON_INPUT_TAGS = {"input", "textarea", "select"}
@@ -482,7 +488,7 @@ class SkyvernElement:
 
     async def is_child_of_pdf_object(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> bool:
         parent_locator = self.get_locator().locator("..")
-        tag_name: str | None = await parent_locator.evaluate("el => el.tagName", timeout=timeout)
+        tag_name = await read_locator_tag_name(parent_locator, timeout=timeout)
         type_attr = await parent_locator.get_attribute("type", timeout=timeout)
         return tag_name is not None and tag_name.lower() == "object" and type_attr == "application/pdf"
 
@@ -652,11 +658,7 @@ class SkyvernElement:
 
         resolved: str | None = None
         try:
-            normalized = await SkyvernFrame.evaluate(
-                frame=self.get_frame(),
-                expression="(element) => element instanceof HTMLAnchorElement ? element.href : null",
-                arg=await self.get_element_handler(),
-            )
+            normalized = await read_resolved_anchor_href(self.get_frame(), await self.get_element_handler())
         except Exception:
             normalized = None
         if isinstance(normalized, str) and normalized.strip():
@@ -689,8 +691,8 @@ class SkyvernElement:
         coordinate click would dispatch overlay JS, which can navigate to an
         unintended URL.  Following the href avoids that side effect entirely.
 
-        Returns the resolved URL on success, ``None`` when no safe URL can be
-        derived or when frame navigation raises an unrecoverable error.
+        Returns the resolved URL on success or ``None`` when no HTTP(S) URL can be derived
+        or frame navigation fails. Raises ``SkyvernHTTPException`` for a blocked URL.
         """
         # TODO: share a lower-level href-resolution + goto/download-success
         # helper with ``navigate_to_a_href``.  Keep the entry points separate:
@@ -703,6 +705,8 @@ class SkyvernElement:
         target = await self.get_attr("target", mode="static")
         if target and target.strip().lower() != "_self":
             return None
+
+        resolved = await asyncio.to_thread(validate_fetch_url, resolved)
 
         try:
             frame = self.get_frame()
@@ -895,11 +899,7 @@ class SkyvernElement:
         # probe failure or anomalous result fails closed (treated as unsafe).
         locator = self.get_locator()
         try:
-            is_interactive = await SkyvernFrame.evaluate(
-                frame=self.get_frame(),
-                expression="(element) => element.matches('a[href], button')",
-                arg=await self.get_element_handler(),
-            )
+            is_interactive = await read_whether_link_or_button(self.get_frame(), await self.get_element_handler())
         except Exception:
             return False
         if not isinstance(is_interactive, bool) or is_interactive:
@@ -941,7 +941,7 @@ class SkyvernElement:
 
         timeout_sec = timeout / 1000
         async with asyncio.timeout(timeout_sec):
-            tag_name: str | None = await parent_locator.evaluate("el => el.tagName")
+            tag_name = await read_locator_tag_name(parent_locator)
             if not tag_name:
                 return None
 
@@ -1093,6 +1093,20 @@ class SkyvernElement:
                 raise
             await self._classify_typing_timeout(exc)
             raise
+
+    async def apply_secret_visual_mask(self) -> None:
+        try:
+            tag_name = self.get_tag_name().lower()
+            if tag_name == InteractiveElement.INPUT and str(await self.get_attr("type")).lower() == "password":
+                return
+
+            await SkyvernFrame.evaluate(
+                frame=self.get_frame(),
+                expression=SECRET_VISUAL_MASK_SCRIPT,
+                arg=await self.get_element_handler(),
+            )
+        except Exception:
+            LOG.warning("Failed to apply secret visual mask", exc_info=True, element_id=self.get_id())
 
     async def press_key(self, key: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().press(key=key, timeout=timeout)
@@ -1451,6 +1465,8 @@ class SkyvernElement:
         href = await self.should_use_navigation_instead_click(page)
         if not href:
             return None
+
+        href = await asyncio.to_thread(validate_fetch_url, href)
 
         LOG.info(
             "Trying to navigate to the <a> href link instead of clicking",

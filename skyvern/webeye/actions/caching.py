@@ -3,6 +3,7 @@ import structlog
 from skyvern.exceptions import CachedActionPlanError
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.webeye.actions.action_types import ActionType
@@ -191,7 +192,7 @@ async def get_user_detail_answers(
             queries_and_answers=queries_and_answers,
         )
 
-        llm_response = await app.SECONDARY_LLM_API_HANDLER(
+        llm_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
             prompt=question_answering_prompt, step=step, screenshots=None, prompt_name="answer-user-detail-questions"
         )
         return llm_response

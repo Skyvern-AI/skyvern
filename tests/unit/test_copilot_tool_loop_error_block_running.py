@@ -13,6 +13,8 @@ import time
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.failure_tracking import compute_action_sequence_fingerprint
 from skyvern.forge.sdk.copilot.loop_detection import record_consecutive_tool_result_boundary_for_ctx
@@ -21,7 +23,9 @@ from skyvern.forge.sdk.copilot.tools import (
     PER_TOOL_CALL_BUDGET_SECONDS,
     _active_block_run_budget_seconds,
     _tool_loop_error,
+    blockers,
 )
+from skyvern.forge.sdk.copilot.tools.run_execution import INFRASTRUCTURE_RUNNER_ERROR_CODES
 
 
 def _ctx(**overrides: Any) -> Any:
@@ -174,3 +178,48 @@ def test_bypass_applies_to_both_block_running_tool_names() -> None:
     ctx = _ctx()
     for _ in range(5):
         assert _tool_loop_error(ctx, "run_blocks_and_collect_debug") is None
+
+
+def test_infrastructure_runner_failure_blocks_authoring_and_running_tools() -> None:
+    ctx = _ctx(last_infrastructure_tool_error="runner_unavailable")
+
+    for tool in ("edit_block", "delete_block", "update_workflow", "update_and_run_blocks"):
+        msg = _tool_loop_error(ctx, tool)
+        assert msg is not None, f"{tool} should be refused"
+        assert "runner_unavailable" in msg
+        assert "code sandbox" in msg
+
+
+def test_infrastructure_runner_failure_leaves_reporting_tools_callable() -> None:
+    ctx = _ctx(last_infrastructure_tool_error="runner_unavailable")
+
+    for tool in ("get_run_results", "list_credentials"):
+        assert _tool_loop_error(ctx, tool) is None, f"{tool} should stay callable"
+
+
+def test_edit_block_is_not_refused_without_an_infrastructure_runner_failure() -> None:
+    ctx = _ctx(last_infrastructure_tool_error=None)
+
+    assert _tool_loop_error(ctx, "edit_block") is None
+
+
+def test_infrastructure_runner_failure_preserves_the_unpersisted_draft(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[Any] = []
+    monkeypatch.setattr(
+        blockers,
+        "_emit_loop_plane_refusal",
+        lambda ctx, signal: captured.append(signal) or "refused",
+    )
+    ctx = _ctx(last_infrastructure_tool_error="runner_unavailable", turn_halt=None)
+
+    _tool_loop_error(ctx, "edit_block")
+
+    (signal,) = captured
+    assert "unchanged" in signal.user_facing_reason
+    assert signal.preserves_workflow_draft is True
+
+
+def test_busy_runner_is_an_infrastructure_failure_not_an_authored_code_failure() -> None:
+    assert "busy" in INFRASTRUCTURE_RUNNER_ERROR_CODES
+    assert "timeout" not in INFRASTRUCTURE_RUNNER_ERROR_CODES
+    assert "user_code_error" not in INFRASTRUCTURE_RUNNER_ERROR_CODES

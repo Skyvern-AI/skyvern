@@ -71,6 +71,23 @@ async def test_close_keeps_driver_by_default_when_browser_kept() -> None:
 
 
 @pytest.mark.asyncio
+async def test_detach_remote_driver_disables_local_interceptor_without_closing_remote_browser() -> None:
+    pw = _pw_stub()
+    context = _context_stub()
+    interceptor = MagicMock(disable=AsyncMock())
+    context._skyvern_cdp_download_interceptor = interceptor
+    state = RealBrowserState(pw=pw, browser_context=context)
+
+    await state.detach_remote_driver()
+    await state.detach_remote_driver()
+
+    interceptor.disable.assert_awaited_once_with()
+    pw.stop.assert_awaited_once_with()
+    context.close.assert_not_awaited()
+    assert context._skyvern_cdp_download_interceptor is None
+
+
+@pytest.mark.asyncio
 async def test_close_reused_context_preserves_download_interceptor() -> None:
     pw = _pw_stub()
     context = _context_stub()
@@ -100,8 +117,9 @@ async def test_close_context_disables_download_interceptor_once() -> None:
 
 
 @pytest.mark.asyncio
-async def test_close_true_timeout_bounds_interceptor_drain_and_cleans_suspended_task(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("close_browser_on_completion", [True, False])
+async def test_close_timeout_bounds_interceptor_drain_and_cleans_suspended_task(
+    monkeypatch: pytest.MonkeyPatch, close_browser_on_completion: bool
 ) -> None:
     pw = _pw_stub()
     context = _context_stub()
@@ -131,10 +149,10 @@ async def test_close_true_timeout_bounds_interceptor_drain_and_cleans_suspended_
 
     start = time.monotonic()
     state = RealBrowserState(pw=pw, browser_context=context)
-    result = await asyncio.wait_for(state.close(True), timeout=0.5)
+    result = await asyncio.wait_for(state.close(close_browser_on_completion, release_driver=True), timeout=0.5)
     elapsed = time.monotonic() - start
 
-    assert result is True
+    assert result is close_browser_on_completion
     assert elapsed < 0.5
     await asyncio.wait_for(cancelled.wait(), timeout=0.5)
     assert not cleaned.is_set()
@@ -142,7 +160,10 @@ async def test_close_true_timeout_bounds_interceptor_drain_and_cleans_suspended_
     assert context._skyvern_cdp_download_interceptor is None
     # The bounded interceptor drain is detached independently, so later teardown steps
     # (context close, driver stop) still run instead of being starved by the stuck drain.
-    context.close.assert_awaited_once()
+    if close_browser_on_completion:
+        context.close.assert_awaited_once()
+    else:
+        context.close.assert_not_awaited()
     pw.stop.assert_awaited_once()
 
     release.set()
@@ -1292,7 +1313,13 @@ async def test_cleanup_for_script_releases_persistent_session_without_closing_dr
     )
 
     state.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=False)
-    sessions.release_browser_session.assert_awaited_once_with("session_1", organization_id="org_1")
+    sessions.release_browser_session.assert_awaited_once_with(
+        session_id="session_1",
+        organization_id="org_1",
+        expected_runnable_id=None,
+        expected_runnable_generation_id=None,
+        expected_browser_state=None,
+    )
     assert "scr_1" not in manager.pages
 
 
@@ -1336,7 +1363,13 @@ async def test_cleanup_for_script_tracing_failure_does_not_skip_close_or_release
 
     # Persistent session: close is forced reusable (False) even though the default is True.
     state.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=False)
-    sessions.release_browser_session.assert_awaited_once_with("session_1", organization_id="org_1")
+    sessions.release_browser_session.assert_awaited_once_with(
+        session_id="session_1",
+        organization_id="org_1",
+        expected_runnable_id=None,
+        expected_runnable_generation_id=None,
+        expected_browser_state=None,
+    )
 
 
 @pytest.mark.asyncio
@@ -1387,10 +1420,22 @@ async def test_get_or_create_for_script_uses_real_org_for_persistent_lookup(monk
     state.get_working_page = AsyncMock(return_value=MagicMock())
     state.get_or_create_page = AsyncMock()
     sessions = MagicMock()
+    sessions.begin_session = AsyncMock()
     sessions.get_browser_state = AsyncMock(return_value=state)
     monkeypatch.setattr("skyvern.forge.app.PERSISTENT_SESSIONS_MANAGER", sessions)
     result = await manager.get_or_create_for_script("scr_1", "session_1", "org_1")
-    sessions.get_browser_state.assert_awaited_once_with("session_1", organization_id="org_1")
+    sessions.begin_session.assert_awaited_once_with(
+        browser_session_id="session_1",
+        runnable_type="script",
+        runnable_id="scr_1",
+        organization_id="org_1",
+    )
+    sessions.get_browser_state.assert_awaited_once_with(
+        "session_1",
+        organization_id="org_1",
+        expected_runnable_id="scr_1",
+        download_run_id="scr_1",
+    )
     assert result is state and manager.pages["scr_1"] is state
 
 
@@ -1418,6 +1463,7 @@ async def test_get_or_create_for_script_fails_closed_on_cold_session(monkeypatch
     # fallback as a reusable persistent session (browser_session_id truthy) and leak its context/driver.
     manager = RealBrowserManager()
     sessions = MagicMock()
+    sessions.begin_session = AsyncMock()
     sessions.get_browser_state = AsyncMock(return_value=None)
     monkeypatch.setattr("skyvern.forge.app.PERSISTENT_SESSIONS_MANAGER", sessions)
     fallback = _fake_browser_state()
@@ -1430,7 +1476,12 @@ async def test_get_or_create_for_script_fails_closed_on_cold_session(monkeypatch
             script_id="scr_1", browser_session_id="session_1", organization_id="org_1"
         )
 
-    sessions.get_browser_state.assert_awaited_once_with("session_1", organization_id="org_1")
+    sessions.get_browser_state.assert_awaited_once_with(
+        "session_1",
+        organization_id="org_1",
+        expected_runnable_id="scr_1",
+        download_run_id="scr_1",
+    )
     created.assert_not_awaited()  # no orphan local browser created
     assert "scr_1" not in manager.pages
 
@@ -1531,7 +1582,13 @@ async def test_cleanup_for_script_completes_release_when_cancelled_during_close(
         await cleanup  # cancellation stays native
 
     assert closed.is_set()  # close ran to completion despite the cancel
-    sessions.release_browser_session.assert_awaited_once_with("session_1", organization_id="org_1")  # release too
+    sessions.release_browser_session.assert_awaited_once_with(
+        session_id="session_1",
+        organization_id="org_1",
+        expected_runnable_id=None,
+        expected_runnable_generation_id=None,
+        expected_browser_state=None,
+    )  # release too
     assert "scr_1" not in manager.pages
 
 
@@ -1606,7 +1663,13 @@ async def test_cleanup_for_script_survives_repeated_cancellation(monkeypatch: py
 
     assert exc_info.value.args == ("first cancellation",)
     assert closed.is_set()  # close ran to completion despite two cancels
-    sessions.release_browser_session.assert_awaited_once_with("session_1", organization_id="org_1")
+    sessions.release_browser_session.assert_awaited_once_with(
+        session_id="session_1",
+        organization_id="org_1",
+        expected_runnable_id=None,
+        expected_runnable_generation_id=None,
+        expected_browser_state=None,
+    )
     assert "scr_1" not in manager.pages
 
 

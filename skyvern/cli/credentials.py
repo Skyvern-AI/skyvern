@@ -52,6 +52,11 @@ def _get_client(api_key: str | None = None) -> Skyvern:
     from skyvern.config import settings  # noqa: PLC0415
 
     key = api_key or os.getenv("SKYVERN_API_KEY") or settings.SKYVERN_API_KEY
+    if key != "PLACEHOLDER" and not settings.is_skyvern_base_url_explicitly_configured:
+        raise typer.BadParameter(
+            "Refusing to send an API key to the default production URL. "
+            "Set SKYVERN_BASE_URL=https://api.skyvern.com to explicitly opt in."
+        )
     return Skyvern(base_url=settings.SKYVERN_BASE_URL, api_key=key)
 
 

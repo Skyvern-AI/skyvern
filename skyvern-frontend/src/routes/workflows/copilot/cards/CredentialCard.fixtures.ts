@@ -1,7 +1,6 @@
 import type {
   CredentialPauseHistorical,
   CredentialRequiredFrame,
-  MatchingCredential,
 } from "./CredentialCard";
 
 export function buildCredentialRequiredFrame(
@@ -67,24 +66,14 @@ export const CREDENTIAL_REQUIRED_FRAME_MINIMAL: CredentialRequiredFrame = {
   reason: "workflow_credential_inputs_unbound",
 };
 
-export const NO_MATCHING_CREDENTIALS: MatchingCredential[] = [];
-
-export const ONE_MATCHING_CREDENTIAL: MatchingCredential[] = [
-  { credentialId: "cred_hn", name: "HN login" },
-];
-
-export const TWO_MATCHING_CREDENTIALS: MatchingCredential[] = [
-  { credentialId: "cred_hn", name: "HN login" },
-  { credentialId: "cred_acme", name: "Acme portal" },
-];
-
-export const MANY_MATCHING_CREDENTIALS: MatchingCredential[] = [
-  { credentialId: "cred_hn", name: "HN login" },
-  { credentialId: "cred_acme", name: "Acme portal" },
-  { credentialId: "cred_qa", name: "QA test account" },
-];
-
 export const RESOLVED_OUTCOME_CONNECTED: CredentialPauseHistorical = {
+  outcome: "connected",
+  credentialId: "cred_hn",
+  name: "HN login",
+};
+
+// A connected outcome whose name never resolved (e.g. a pick the fetch couldn't name).
+export const RESOLVED_OUTCOME_CONNECTED_UNNAMED: CredentialPauseHistorical = {
   outcome: "connected",
   credentialId: "cred_hn",
 };

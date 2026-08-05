@@ -5,6 +5,7 @@ import pytest
 
 from skyvern.webeye import default_persistent_sessions_manager as manager_mod
 from skyvern.webeye.default_persistent_sessions_manager import BrowserSession, DefaultPersistentSessionsManager
+from skyvern.webeye.persistent_sessions_manager import PBS_TASK_RUNNABLE_TYPE
 
 
 @pytest.fixture
@@ -101,3 +102,29 @@ async def test_close_session_exports_and_closes_for_matching_org(
         "pbs_owned",
         "org_owner",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_is_final,still_active", [(False, True), (True, False)])
+async def test_owning_run_is_active_resolves_standalone_task_owners(
+    manager: DefaultPersistentSessionsManager,
+    owner_is_final: bool,
+    still_active: bool,
+) -> None:
+    """A standalone task lease writes a runnable_type that is not a RunType member, so without an
+    explicit branch the reaper reads it as unresolvable and protects the row forever."""
+    task = MagicMock()
+    task.status.is_final.return_value = owner_is_final
+    manager.database.tasks.get_task = AsyncMock(return_value=task)
+
+    assert await manager._owning_run_is_active("tsk_owner", PBS_TASK_RUNNABLE_TYPE, "org_1") is still_active
+    manager.database.tasks.get_task.assert_awaited_once_with("tsk_owner", organization_id="org_1")
+
+
+@pytest.mark.asyncio
+async def test_owning_run_is_active_releases_a_task_that_no_longer_exists(
+    manager: DefaultPersistentSessionsManager,
+) -> None:
+    manager.database.tasks.get_task = AsyncMock(return_value=None)
+
+    assert await manager._owning_run_is_active("tsk_gone", PBS_TASK_RUNNABLE_TYPE, "org_1") is False

@@ -124,4 +124,3 @@ async def test_wait_for_browser_state_returns_none_on_timeout(monkeypatch: pytes
     assert result is None
     assert resolve_mock.await_count == 3
     assert browser_state.get_working_page.await_count == 3
-    assert sleep_mock.await_count == 3

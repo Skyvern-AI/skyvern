@@ -91,6 +91,19 @@ class RequestSlotProducerInputV1(BaseModel):
     retained_history: tuple[str, ...] = Field(max_length=8)
     global_context: str = Field(max_length=32_768)
     datum_targets: tuple[RequestSlotDatumTargetV1, ...] = Field(default=(), max_length=64)
+    # Requested-output fields the deterministic detector found in the message. Each obliges the
+    # producer to anchor a slot on it or refute it by name; silence stops being a valid answer
+    # for a field the message demonstrably requests (SKY-13329).
+    detected_output_candidates: tuple[str, ...] = Field(default=(), max_length=8)
+
+    @field_validator("detected_output_candidates")
+    @classmethod
+    def _validate_detected_output_candidates(cls, candidates: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not candidate.strip() or len(candidate) > 64 for candidate in candidates):
+            raise ValueError("detected output candidates must be non-empty and at most 64 characters")
+        if len({candidate.casefold() for candidate in candidates}) != len(candidates):
+            raise ValueError("detected output candidates must be unique")
+        return candidates
 
     @field_validator("retained_history")
     @classmethod
@@ -166,6 +179,13 @@ class RequestSlotDatumDeclineDeclarationV1(BaseModel):
     declined: Literal[True]
 
 
+class RequestSlotCandidateRefutationV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    candidate: str = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=1, max_length=256)
+
+
 class RequestSlotEnvelopeV1(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -174,12 +194,14 @@ class RequestSlotEnvelopeV1(BaseModel):
     datum_bindings: tuple[RequestSlotDatumBindingDeclarationV1 | RequestSlotDatumDeclineDeclarationV1, ...] = Field(
         default=(), max_length=64
     )
+    candidate_refutations: tuple[RequestSlotCandidateRefutationV1, ...] = Field(default=(), max_length=8)
 
 
 def _request_digest(
     version: str,
     sources: tuple[RequestSlotSourceV1, ...],
     datum_targets: tuple[RequestSlotDatumTargetV1, ...],
+    detected_output_candidates: tuple[str, ...] = (),
 ) -> str:
     digest_payload: list[object] = [
         version,
@@ -189,6 +211,8 @@ def _request_digest(
     # targeted producer contracts identity-complete for replay and caching.
     if datum_targets:
         digest_payload.append([target.model_dump(mode="json") for target in datum_targets])
+    if detected_output_candidates:
+        digest_payload.append(list(detected_output_candidates))
     encoded = json.dumps(
         digest_payload,
         ensure_ascii=True,
@@ -198,7 +222,9 @@ def _request_digest(
 
 
 def request_slot_request_digest(request: RequestSlotProducerInputV1) -> str:
-    return _request_digest(request.version, request_slot_sources(request), request.datum_targets)
+    return _request_digest(
+        request.version, request_slot_sources(request), request.datum_targets, request.detected_output_candidates
+    )
 
 
 _CANONICAL_SLOT_LEAF_PREFIX = "request_slot_"
@@ -289,6 +315,7 @@ class RequestSlotContractV1(BaseModel):
     count: int = Field(ge=0, le=64)
     datum_bindings: tuple[CanonicalRequestSlotDatumBindingV1, ...] = Field(default=(), max_length=64)
     datum_declines: tuple[CanonicalRequestSlotDatumDeclineV1, ...] = Field(default=(), max_length=64)
+    candidate_refutations: tuple[RequestSlotCandidateRefutationV1, ...] = Field(default=(), max_length=8)
 
     @model_validator(mode="after")
     def _validate_derived_membership(self) -> RequestSlotContractV1:
@@ -484,6 +511,33 @@ def canonicalize_request_slots(
             raise ValueError(f"source anchors overlap in {item[1].source_id}")
         previous = item
 
+    # Mirror of the datum-target coverage rule above: every detector candidate is answered — a slot
+    # anchored on it, or a refutation naming it. An envelope silent on a candidate is invalid output.
+    candidates_by_fold = {candidate.casefold(): candidate for candidate in request.detected_output_candidates}
+    refuted_folds: set[str] = set()
+    for refutation in envelope.candidate_refutations:
+        fold = refutation.candidate.casefold()
+        if fold not in candidates_by_fold:
+            raise ValueError(f"refutation names an undetected candidate: {refutation.candidate}")
+        if fold in refuted_folds:
+            raise ValueError(f"candidate refuted more than once: {refutation.candidate}")
+        refuted_folds.add(fold)
+    answer_quotes = [declaration.source_quote.casefold() for declaration, _, _, _ in resolved] + [
+        binding.source_quote.casefold()
+        for binding in envelope.datum_bindings
+        if isinstance(binding, RequestSlotDatumBindingDeclarationV1)
+    ]
+    # Either containment direction answers: the detector composes phrases wider than the tile of
+    # text a producer legitimately quotes ("adjacent account number" vs "account number").
+    quoted_folds = {
+        fold for fold in candidates_by_fold if any(fold in quote or quote in fold for quote in answer_quotes)
+    }
+    unanswered = sorted(set(candidates_by_fold) - refuted_folds - quoted_folds)
+    if unanswered:
+        # Reported, not refused: refusing costs the whole slot contract and every criterion in it,
+        # where the only thing proven is that the producer stayed silent on a detected field.
+        LOG.info("copilot_request_slot_candidates_unanswered", unanswered=unanswered)
+
     digest = request_slot_request_digest(request)
     canonical_slots: list[CanonicalRequestSlotV1] = []
     seen_paths: set[str] = set()
@@ -570,6 +624,7 @@ def canonicalize_request_slots(
         count=len(canonical_slots),
         datum_bindings=tuple(canonical_bindings),
         datum_declines=tuple(canonical_declines),
+        candidate_refutations=envelope.candidate_refutations,
     )
 
 
@@ -591,6 +646,11 @@ def _render_prompt(request: RequestSlotProducerInputV1) -> str:
             ensure_ascii=True,
             separators=(",", ":"),
         ),
+        detected_output_candidates=json.dumps(
+            list(request.detected_output_candidates),
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
     )
 
 
@@ -606,31 +666,57 @@ def _parse_envelope(raw: object) -> RequestSlotEnvelopeV1 | None:
         return None
 
 
+# Fields the contract carries for the record rather than to be acted on. Two attempts that named
+# the same slots and bindings describe one request, so letting a differing rationale list refuse the
+# whole contract left a turn with no requested output at all (SKY-13226).
+_INFORMATIONAL_CONTRACT_FIELDS: frozenset[str] = frozenset({"candidate_refutations"})
+
+
+def request_slot_contract_disagreements(
+    first: RequestSlotContractV1,
+    second: RequestSlotContractV1,
+) -> tuple[str, ...]:
+    """Dotted paths of the fields two classifier attempts disagreed on — names only, never values.
+
+    A run that degrades on oscillation records that it happened but not what moved, which leaves the
+    difference between a producer flipping one judgment and one drifting wholesale unmeasurable.
+    """
+    fields: list[str] = []
+    for name in ("version", "request_digest", "count"):
+        if getattr(first, name) != getattr(second, name):
+            fields.append(name)
+    if len(first.slots) != len(second.slots):
+        fields.append("slots.count")
+    else:
+        for index, (first_slot, second_slot) in enumerate(zip(first.slots, second.slots, strict=True)):
+            for name in ("ordinal", "source_id", "plane", "pinability", "antecedent_family"):
+                if getattr(first_slot, name) != getattr(second_slot, name):
+                    fields.append(f"slots.{index}.{name}")
+            if not (
+                first_slot.source_start < second_slot.source_end and second_slot.source_start < first_slot.source_end
+            ):
+                fields.append(f"slots.{index}.source_span")
+    if len(first.datum_bindings) != len(second.datum_bindings):
+        fields.append("datum_bindings.count")
+    else:
+        for index, (first_binding, second_binding) in enumerate(
+            zip(first.datum_bindings, second.datum_bindings, strict=True)
+        ):
+            for name in ("criterion_index", "datum_field", "datum_value", "criterion_outcome_sha256", "slot_id"):
+                if getattr(first_binding, name) != getattr(second_binding, name):
+                    fields.append(f"datum_bindings.{index}.{name}")
+    if first.datum_declines != second.datum_declines:
+        fields.append("datum_declines")
+    if first.candidate_refutations != second.candidate_refutations:
+        fields.append("candidate_refutations")
+    return tuple(fields)
+
+
 def request_slot_contracts_agree(
     first: RequestSlotContractV1,
     second: RequestSlotContractV1,
 ) -> bool:
-    if first.version != second.version or first.request_digest != second.request_digest or first.count != second.count:
-        return False
-    slots_agree = all(
-        first_slot.ordinal == second_slot.ordinal
-        and first_slot.source_id == second_slot.source_id
-        and first_slot.plane == second_slot.plane
-        and first_slot.pinability == second_slot.pinability
-        and first_slot.antecedent_family == second_slot.antecedent_family
-        and first_slot.source_start < second_slot.source_end
-        and second_slot.source_start < first_slot.source_end
-        for first_slot, second_slot in zip(first.slots, second.slots, strict=True)
-    )
-    bindings_agree = len(first.datum_bindings) == len(second.datum_bindings) and all(
-        first_binding.criterion_index == second_binding.criterion_index
-        and first_binding.datum_field == second_binding.datum_field
-        and first_binding.datum_value == second_binding.datum_value
-        and first_binding.criterion_outcome_sha256 == second_binding.criterion_outcome_sha256
-        and first_binding.slot_id == second_binding.slot_id
-        for first_binding, second_binding in zip(first.datum_bindings, second.datum_bindings, strict=True)
-    )
-    return slots_agree and bindings_agree and first.datum_declines == second.datum_declines
+    return not request_slot_contract_disagreements(first, second)
 
 
 async def produce_request_slots(
@@ -687,8 +773,18 @@ async def produce_request_slots(
         except ValueError:
             last_failure = RequestSlotProducerFailureKind.INVALID_OUTPUT
             continue
-        if candidate_contract is not None and request_slot_contracts_agree(candidate_contract, contract):
-            return RequestSlotProducerResult.success(candidate_contract, attempts=attempt)
+        if candidate_contract is not None:
+            disagreements = request_slot_contract_disagreements(candidate_contract, contract)
+            decisive = tuple(field for field in disagreements if field not in _INFORMATIONAL_CONTRACT_FIELDS)
+            if not decisive:
+                if disagreements:
+                    LOG.info(
+                        "request-slot classifier agreed despite informational differences",
+                        attempt=attempt,
+                        fields=disagreements,
+                    )
+                return RequestSlotProducerResult.success(candidate_contract, attempts=attempt)
+            LOG.info("request-slot classifier attempts disagreed", attempt=attempt, fields=disagreements)
         candidate_contract = contract
 
     if candidate_contract is not None:

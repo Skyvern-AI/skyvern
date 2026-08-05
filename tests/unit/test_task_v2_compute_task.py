@@ -156,6 +156,20 @@ class TestGenerateComputeTask:
         CodeBlock.is_safe_code(block.code)
 
     @pytest.mark.asyncio
+    async def test_generated_block_uses_the_code_first_editor_shape(self) -> None:
+        with _patch_service({"code": SAFE_SNIPPET}):
+            block, block_yaml_list, _ = await task_v2_service._generate_compute_task(
+                task_v2=_make_task_v2(),
+                workflow_id="w_test",
+                plan="pick the cheapest tier",
+                task_history=GATHERED,
+            )
+        # A non-null prompt is what makes the editor render the code-first node. It stays
+        # empty: a fabricated goal would arm runtime self-heal on a data-only block.
+        assert block_yaml_list[0].prompt == ""
+        assert block.prompt == ""
+
+    @pytest.mark.asyncio
     async def test_generated_block_executes_to_expected_output(self) -> None:
         with _patch_service({"code": SAFE_SNIPPET}):
             block, _, _ = await task_v2_service._generate_compute_task(

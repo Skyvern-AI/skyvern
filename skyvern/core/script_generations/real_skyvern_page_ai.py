@@ -17,9 +17,15 @@ from skyvern.exceptions import NoTOTPSecretFound, SkyvernActionFailed, WorkflowR
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import validate_download_url
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
+from skyvern.forge.sdk.api.llm.api_handler_factory import (
+    get_org_aware_primary_llm_api_handler,
+    get_org_aware_secondary_llm_api_handler,
+)
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_prompt_type_handler
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import is_unresolved_totp_value
 from skyvern.schemas.workflows import BlockStatus
@@ -66,6 +72,16 @@ SELECT_OPTION_GOAL = """- The intention to select an option: {intention}.
 
 UPLOAD_GOAL = """- The intention to upload a file: {intention}.
 - The overall goal that the user wants to achieve: {prompt}."""
+
+
+async def _resolve_assist_llm_handler(prompt_type: str, default: LLMAPIHandler) -> LLMAPIHandler:
+    """LLM_CONFIG_BY_PROMPT_TYPE payload wins; else the org-aware secondary handler, matching prior behavior."""
+    org_aware_default = get_org_aware_secondary_llm_api_handler(default=default)
+    context = skyvern_context.current()
+    distinct_id = (context.workflow_run_id or context.task_id) if context else None
+    if not context or not distinct_id:
+        return org_aware_default
+    return await resolve_prompt_type_handler(prompt_type, distinct_id, context.organization_id, org_aware_default)
 
 
 async def _get_element_id_by_selector(selector: str, page: Page) -> str | None:
@@ -237,7 +253,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
                 user_context=context.prompt,
             )
-            json_response = await app.SINGLE_CLICK_AGENT_LLM_API_HANDLER(
+            llm_handler = await _resolve_assist_llm_handler(
+                "single-click-action", app.SINGLE_CLICK_AGENT_LLM_API_HANDLER
+            )
+            json_response = await llm_handler(
                 prompt=single_click_prompt,
                 prompt_name="single-click-action",
                 step=step,
@@ -398,7 +417,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         goal=prompt,
                         data=data,
                     )
-                    json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                    llm_handler = await _resolve_assist_llm_handler(
+                        "script-generation-input-text-generatiion", app.SINGLE_INPUT_AGENT_LLM_API_HANDLER
+                    )
+                    json_response = await llm_handler(
                         prompt=script_generation_input_text_prompt,
                         prompt_name="script-generation-input-text-generatiion",
                         step=step,
@@ -434,7 +456,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         elements=element_tree,
                         local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
                     )
-                    json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                    llm_handler = await _resolve_assist_llm_handler(
+                        "single-input-action", app.SINGLE_INPUT_AGENT_LLM_API_HANDLER
+                    )
+                    json_response = await llm_handler(
                         prompt=single_input_prompt,
                         prompt_name="single-input-action",
                         step=step,
@@ -513,7 +538,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         data=data,
                         goal=prompt,
                     )
-                    json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                    llm_handler = await _resolve_assist_llm_handler(
+                        "script-generation-file-url-generation", app.SINGLE_INPUT_AGENT_LLM_API_HANDLER
+                    )
+                    json_response = await llm_handler(
                         prompt=script_generation_file_url_prompt,
                         prompt_name="script-generation-file-url-generation",
                         step=step,
@@ -547,7 +575,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         elements=element_tree,
                         local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
                     )
-                    json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                    llm_handler = await _resolve_assist_llm_handler(
+                        "single-upload-action", app.SINGLE_INPUT_AGENT_LLM_API_HANDLER
+                    )
+                    json_response = await llm_handler(
                         prompt=single_upload_prompt,
                         prompt_name="single-upload-action",
                         step=step,
@@ -618,7 +649,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         elements=element_tree,
                         local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
                     )
-                    json_response = await app.SELECT_AGENT_LLM_API_HANDLER(
+                    llm_handler = await _resolve_assist_llm_handler(
+                        "single-select-action", app.SELECT_AGENT_LLM_API_HANDLER
+                    )
+                    json_response = await llm_handler(
                         prompt=single_select_prompt,
                         prompt_name="single-select-action",
                         step=step,
@@ -749,7 +783,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             )
 
         try:
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
+            json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=classify_prompt,
                 prompt_name="page-classify",
                 step=step,
@@ -1464,7 +1498,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 organization_id=context.organization_id,
             )
 
-        result = await app.EXTRACTION_LLM_API_HANDLER(
+        result = await get_org_aware_primary_llm_api_handler(default=app.EXTRACTION_LLM_API_HANDLER)(
             prompt=extract_information_prompt,
             step=step,
             screenshots=self.scraped_page.screenshots,
@@ -1541,7 +1575,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 organization_id=context.organization_id,
             )
 
-        result = await app.EXTRACTION_LLM_API_HANDLER(
+        result = await get_org_aware_primary_llm_api_handler(default=app.EXTRACTION_LLM_API_HANDLER)(
             prompt=locate_element_prompt,
             step=step,
             screenshots=scraped_page_refreshed.screenshots,
@@ -1627,7 +1661,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
             navigation_goal=prompt,
         )
 
-        json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+        infer_llm_handler = await _resolve_assist_llm_handler(
+            "infer-action-type", app.SINGLE_INPUT_AGENT_LLM_API_HANDLER
+        )
+        json_response = await infer_llm_handler(
             prompt=infer_action_type_prompt,
             prompt_name="infer-action-type",
             step=step,
@@ -1683,6 +1720,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         else:
             LOG.warning("ai_act: unknown action type", action_type=action_type, prompt=prompt)
             return
+        llm_handler = await _resolve_assist_llm_handler(template, llm_handler)
 
         local_datetime = datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat()
         single_action_prompt = prompt_engine.load_prompt(

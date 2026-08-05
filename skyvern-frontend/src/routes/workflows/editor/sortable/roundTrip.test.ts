@@ -58,6 +58,7 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   scriptCacheKey: null,
   aiFallback: true,
   enableSelfHealing: false,
+  maskSecrets: false,
   runSequentially: false,
   sequentialKey: null,
   finallyBlockLabel: null,
@@ -543,6 +544,7 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
       ...DEFAULT_SETTINGS,
       errorCodeMapping: { OUT_OF_STOCK: "item unavailable" },
       finallyBlockLabel: "B5",
+      maskSecrets: true,
       workflowSystemPrompt: "always double-check totals",
     };
     const { nodes } = getElements(buildFiveBlockFixture(), settings, true);
@@ -551,6 +553,7 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
       OUT_OF_STOCK: "item unavailable",
     });
     expect(recovered.finallyBlockLabel).toBe("B5");
+    expect(recovered.maskSecrets).toBe(true);
     expect(recovered.workflowSystemPrompt).toBe("always double-check totals");
   });
 });

@@ -20,7 +20,7 @@ from skyvern.forge.sdk.routes.streaming.registries import (
     add_cdp_input_channel,
     del_cdp_input_channel,
     stream_ref_dec,
-    stream_ref_inc,
+    try_stream_ref_inc,
 )
 from skyvern.forge.sdk.routes.streaming.screencast import _resolve_working_page, wait_for_browser_state
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
@@ -371,6 +371,7 @@ async def cdp_input_stream(
 
     cdp_session: CDPSession | None = None
     input_session: ActivePageCdpInputSession | None = None
+    stream_registered = False
     try:
         deadline = time.monotonic() + 120
         while True:
@@ -382,8 +383,12 @@ async def cdp_input_stream(
                 LOG.info("CDP input: workflow run not found", workflow_run_id=workflow_run_id)
                 await websocket.close(code=4404, reason="workflow_run_not_found")
                 return
-            if workflow_run.status == WorkflowRunStatus.running or workflow_run.status.is_final():
+            if workflow_run.status == WorkflowRunStatus.running:
                 break
+            if workflow_run.status.is_final():
+                LOG.info("CDP input: workflow run already finalized", workflow_run_id=workflow_run_id)
+                await websocket.close(code=4409, reason="workflow_run_closing")
+                return
             if workflow_run.status == WorkflowRunStatus.paused:
                 break
             if time.monotonic() >= deadline:
@@ -391,6 +396,12 @@ async def cdp_input_stream(
                 await websocket.close(code=4408, reason="wait_timeout")
                 return
             await asyncio.sleep(1)
+
+        if not try_stream_ref_inc(workflow_run_id):
+            LOG.info("CDP input: workflow run cleanup already started", workflow_run_id=workflow_run_id)
+            await websocket.close(code=4409, reason="workflow_run_closing")
+            return
+        stream_registered = True
 
         browser_state = await wait_for_browser_state(workflow_run_id, "workflow_run")
         if browser_state is None:
@@ -404,8 +415,6 @@ async def cdp_input_stream(
             LOG.warning("CDP input: no working page", workflow_run_id=workflow_run_id)
             await websocket.close(code=4410, reason="no_working_page")
             return
-        stream_ref_inc(workflow_run_id)
-
         LOG.info("CDP input channel ready", workflow_run_id=workflow_run_id, client_id=client_id)
         await websocket.send_json({"kind": "ready"})
 
@@ -420,7 +429,7 @@ async def cdp_input_stream(
     except Exception:
         LOG.warning("CDP input: unexpected error", workflow_run_id=workflow_run_id, exc_info=True)
     finally:
-        if cdp_session is not None:
+        if stream_registered:
             await stream_ref_dec(workflow_run_id)
         if input_session is not None:
             await input_session.close()

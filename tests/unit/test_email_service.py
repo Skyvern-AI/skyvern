@@ -963,7 +963,7 @@ async def test_outlook_otp_search_filters_and_orders_candidates(monkeypatch: pyt
         ),
         _outlook_otp_message("old", received_datetime="2026-07-30T11:59:59Z"),
         _outlook_otp_message("mismatch", recipient="other@example.com"),
-        _outlook_otp_message("no_keyword", subject="Sign-in alert", body="A new sign-in was detected."),
+        _outlook_otp_message("no_keyword", subject="Weekly digest", body="Here is what happened this week."),
         _outlook_otp_message("junk", parentFolderId="junk_id"),
         _outlook_otp_message("deleted", parentFolderId="deleted_id"),
         _outlook_otp_message("sent", parentFolderId="sent_id"),

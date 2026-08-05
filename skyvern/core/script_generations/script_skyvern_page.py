@@ -38,6 +38,7 @@ from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
     list_files_in_directory,
 )
+from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
@@ -46,7 +47,7 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import generate_totp_code
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services.otp_service import poll_otp_value
-from skyvern.utils.url_validators import prepend_scheme_and_validate_url
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -434,7 +435,7 @@ class ScriptSkyvernPage(SkyvernPage):
             )
 
             # Call secondary LLM to generate reasoning
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
+            json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=reasoning_prompt,
                 prompt_name="generate-action-reasoning",
                 organization_id=context.organization_id,
@@ -998,6 +999,15 @@ class ScriptSkyvernPage(SkyvernPage):
                                     totp_code = generate_totp_code(totp_secret)
                                     # Cache the code for subsequent digit requests in this sequence
                                     self._totp_sequence_cache[cache_key] = totp_code
+                                    try:
+                                        workflow_run_context.register_runtime_otp_value(totp_code)
+                                    except Exception:
+                                        LOG.debug(
+                                            "Failed to register runtime TOTP for redaction",
+                                            workflow_run_id=workflow_run_id,
+                                            credential_key=key,
+                                            exc_info=True,
+                                        )
                                     LOG.info(
                                         "Generated fresh TOTP and cached for sequence",
                                         field_name=field_name,
@@ -1030,7 +1040,7 @@ class ScriptSkyvernPage(SkyvernPage):
 
     async def goto(self, url: str, **kwargs: Any) -> None:
         url = render_template(url)
-        url = prepend_scheme_and_validate_url(url)
+        url = await asyncio.to_thread(validate_fetch_url, url)
 
         # Print navigation in script mode
         context = skyvern_context.current()

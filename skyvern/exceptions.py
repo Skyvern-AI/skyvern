@@ -140,6 +140,13 @@ def _is_browser_connection_error(message: str) -> bool:
     return any(pattern in message for pattern in _BROWSER_CONNECTION_PATTERNS)
 
 
+def _is_session_closed_error(message: str) -> bool:
+    # The session router closes with (4410, "session closed") when the session was already closed;
+    # match the reason text, not the bare code — 4410 is reused elsewhere with other reasons.
+    # Message selection only: redaction routing must keep the broad _is_browser_connection_error net.
+    return "session closed" in message.lower()
+
+
 # A raw CDP connect failure (e.g. from playwright.chromium.connect_over_cdp) echoes the
 # endpoint URL, which can carry the remote-browser vendor host, a session-bearing path/query,
 # or credentials embedded as user:pass@host. The devtools socket is always ws/wss, so a ws/wss
@@ -165,6 +172,12 @@ def get_user_facing_exception_message(exception: Exception) -> str:
 
     raw = str(exception)
     if _is_browser_connection_error(raw):
+        if _is_session_closed_error(raw):
+            return (
+                "Failed to connect to the browser session because the session is already closed. "
+                "Start a new browser session to continue. "
+                "If this is unexpected, contact support@skyvern.com."
+            )
         return (
             f"Failed to connect to the browser session. "
             f"This is usually caused by high demand and is transient. {_BROWSER_CONNECTION_GUIDANCE}"
@@ -235,6 +248,16 @@ class SecretInputMismatch(SkyvernException):
 
 class ConditionalBranchEvaluationError(SkyvernException):
     """A conditional block could not resolve which branch to take."""
+
+
+class BranchEvaluationContextTooLargeError(ConditionalBranchEvaluationError):
+    """Branch evaluation cannot proceed without silently dropping required context."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Workflow branch evaluation context is too large to process safely. "
+            "Reduce the workflow input or prior block output size, then retry."
+        )
 
 
 class MalformedBranchEvaluationError(ConditionalBranchEvaluationError):
@@ -548,6 +571,16 @@ class FailedToNavigateToUrl(SkyvernException):
         self.url = url
         self.error_message = error_message
         super().__init__(f"Failed to navigate to url {url}. Error message: {error_message}")
+
+
+class BlockedNavigationDestination(FailedToNavigateToUrl):
+    """A navigation target (or one of its redirect hops) resolves to a private, link-local,
+    loopback, metadata, or local-resource destination. A subclass of FailedToNavigateToUrl so
+    existing navigation error handling treats it as a permanent failure and never retries it."""
+
+    def __init__(self, url: str, reason: str) -> None:
+        self.reason = reason
+        super().__init__(url=url, error_message=f"blocked navigation destination: {reason}")
 
 
 class FailedToReloadPage(SkyvernException):
@@ -1197,6 +1230,10 @@ class BlockedHost(SkyvernHTTPException):
         )
 
 
+class UnresolvableHost(BlockedHost):
+    pass
+
+
 class InvalidWorkflowParameter(SkyvernHTTPException):
     def __init__(self, expected_parameter_type: str, value: str, workflow_permanent_id: str | None = None) -> None:
         message = f"Invalid workflow parameter. Expected parameter type: {expected_parameter_type}. Value: {value}."
@@ -1471,6 +1508,13 @@ class AzureConfigurationError(AzureBaseError):
 class ScriptTerminationException(SkyvernException):
     def __init__(self, reason: str | None = None) -> None:
         super().__init__(reason)
+
+
+class InProcessScriptExecutionDenied(SkyvernException):
+    def __init__(self, *, seam: str, selection_reason: str) -> None:
+        self.seam = seam
+        self.selection_reason = selection_reason
+        super().__init__(f"In-process script execution denied at {seam}: {selection_reason}")
 
 
 class IllegitCompleteScriptTermination(ScriptTerminationException):
