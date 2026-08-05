@@ -5,13 +5,16 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT
 from skyvern.errors.errors import UserDefinedError
+from skyvern.exceptions import BlockedHost
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import ActionStatus, ClickAction, DownloadFileAction
 from skyvern.webeye.actions.handler import (
@@ -1538,6 +1541,70 @@ async def test_handle_download_file_action_with_byte_data() -> None:
             # Verify file content
             with open(expected_file_path, "rb") as f:
                 assert f.read() == test_bytes
+
+
+def _download_redirect_chain(*urls: str) -> SimpleNamespace:
+    """page.goto-style response whose followed redirect chain visited ``urls`` in order."""
+    request: SimpleNamespace | None = None
+    for url in urls:
+        request = SimpleNamespace(url=url, redirected_from=request)
+    return SimpleNamespace(request=request)
+
+
+def _refuse_metadata_hop(url: str) -> str:
+    if "169.254.169.254" in url:
+        raise BlockedHost(host=url)
+    return url
+
+
+@pytest.mark.asyncio
+async def test_handle_download_file_action_refuses_a_blocked_redirect_hop() -> None:
+    """A public download_url that redirects to the metadata endpoint must fail closed."""
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(now, organization)
+    step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
+
+    page = MagicMock()
+    page.goto = AsyncMock(
+        return_value=_download_redirect_chain(
+            "https://example.com/file.pdf", "http://169.254.169.254/latest/meta-data/"
+        )
+    )
+    browser_state = MagicMock()
+    scraped_page = ScrapedPage(
+        elements=[],
+        element_tree=[],
+        element_tree_trimmed=[],
+        _browser_state=browser_state,
+        _clean_up_func=AsyncMock(return_value=[]),
+        _scrape_exclude=None,
+    )
+
+    action = DownloadFileAction(
+        file_name="downloaded_file.pdf",
+        download_url="https://example.com/file.pdf",
+        organization_id=task.organization_id,
+        task_id=task.task_id,
+        step_id=step.step_id,
+    )
+
+    with (
+        patch("skyvern.webeye.actions.handler.initialize_download_dir", return_value="/tmp"),
+        patch("skyvern.webeye.actions.handler.validate_fetch_url", side_effect=_refuse_metadata_hop),
+    ):
+        result = await handle_download_file_action(action, page, scraped_page, task, step)
+
+    # This handler wraps its whole body in ``except Exception -> ActionFailure``, so a blocked hop
+    # surfaces as a failed action rather than propagating. The pre-existing entry-URL check on this
+    # path already behaves the same way; what matters is that it never reports success.
+    assert len(result) == 1
+    assert isinstance(result[0], ActionFailure)
+    assert result[0].exception_type == BlockedHost.__name__
+    assert page.goto.await_args_list == [
+        call("https://example.com/file.pdf", timeout=settings.BROWSER_LOADING_TIMEOUT_MS),
+        call("about:blank"),
+    ]
 
 
 @pytest.mark.asyncio
