@@ -16,15 +16,14 @@ import pytest
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
-    POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE,
     CopilotNonRetriableNavError,
-    _check_enforcement,
     _extract_url_from_nav_error,
     _maybe_raise_non_retriable_nav,
     _needs_failed_test_nudge,
     _needs_suspicious_success_nudge,
     _non_retriable_nav_error_nudge,
     _repeated_frontier_failure_nudge,
+    enforcement_decision,
 )
 from skyvern.forge.sdk.copilot.tools import (
     _detect_non_retriable_nav_error,
@@ -264,8 +263,8 @@ def test_nudge_helper_fires_first_time() -> None:
     ctx.last_test_non_retriable_nav_error = _DNS_FAILURE_REASON
     result = _non_retriable_nav_error_nudge(ctx)
     assert result is not None
-    nudge, signature = result
-    assert nudge == POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE
+    rule, signature = result
+    assert rule == "post_non_retriable_nav_error_stop"
     assert signature  # non-empty
 
 
@@ -299,11 +298,11 @@ def test_nudge_helper_returns_none_when_flag_unset() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _check_enforcement — branch ordering and latching
+# enforcement_decision — branch ordering and latching
 # ---------------------------------------------------------------------------
 
 
-def test_check_enforcement_returns_non_retriable_nudge_before_failed_test() -> None:
+def test_enforcement_decision_returns_non_retriable_nudge_before_failed_test() -> None:
     # Conditions that would normally trigger POST_FAILED_TEST_NUDGE (last_test
     # failed, test_after_update_done=True) must yield the non-retriable stop
     # nudge instead when the flag is set.
@@ -312,27 +311,27 @@ def test_check_enforcement_returns_non_retriable_nudge_before_failed_test() -> N
     ctx.last_test_ok = False
     ctx.last_test_failure_reason = _DNS_FAILURE_REASON
     ctx.last_test_non_retriable_nav_error = _DNS_FAILURE_REASON
-    nudge = _check_enforcement(ctx)
-    assert nudge == POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE
+    nudge = enforcement_decision(ctx)
+    assert nudge.rule == "post_non_retriable_nav_error_stop"
     # Emission latched for future calls with same signature.
     assert ctx.non_retriable_nav_error_last_emitted_signature
 
 
-def test_check_enforcement_one_shot_per_signature() -> None:
+def test_enforcement_decision_one_shot_per_signature() -> None:
     ctx = _fresh_context()
     ctx.test_after_update_done = True
     ctx.last_test_ok = False
     ctx.last_test_failure_reason = _DNS_FAILURE_REASON
     ctx.last_test_non_retriable_nav_error = _DNS_FAILURE_REASON
-    first = _check_enforcement(ctx)
-    assert first == POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE
+    first = enforcement_decision(ctx)
+    assert first.rule == "post_non_retriable_nav_error_stop"
     # Same signature on next iteration: nudge returns None (and does NOT
     # fall through to POST_FAILED_TEST_NUDGE thanks to competing-branch
     # suppression).
-    assert _check_enforcement(ctx) is None
+    assert enforcement_decision(ctx) is None
 
 
-def test_check_enforcement_pre_empts_post_navigate_nudge() -> None:
+def test_enforcement_decision_pre_empts_post_navigate_nudge() -> None:
     # Codex review P2-1: a navigate-hygiene state (navigate_called=True,
     # observation_after_navigate=False) must not steal the nudge slot when
     # a non-retriable nav error is also present — POST_NAVIGATE_NUDGE tells
@@ -343,10 +342,10 @@ def test_check_enforcement_pre_empts_post_navigate_nudge() -> None:
     ctx.observation_after_navigate = False
     ctx.navigate_enforcement_done = False
     ctx.last_test_non_retriable_nav_error = _DNS_FAILURE_REASON
-    assert _check_enforcement(ctx) == POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE
+    assert enforcement_decision(ctx).rule == "post_non_retriable_nav_error_stop"
 
 
-def test_check_enforcement_pre_empts_post_update_nudge() -> None:
+def test_enforcement_decision_pre_empts_post_update_nudge() -> None:
     # Similar P2-1 case: an update-without-test state must not pre-empt the
     # terminal stop. In practice P2-2 clears the flag on update, but if a
     # race leaves the flag set, stop-nudge still wins.
@@ -354,7 +353,7 @@ def test_check_enforcement_pre_empts_post_update_nudge() -> None:
     ctx.update_workflow_called = True
     ctx.test_after_update_done = False
     ctx.last_test_non_retriable_nav_error = _DNS_FAILURE_REASON
-    assert _check_enforcement(ctx) == POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE
+    assert enforcement_decision(ctx).rule == "post_non_retriable_nav_error_stop"
 
 
 # ---------------------------------------------------------------------------
@@ -489,11 +488,11 @@ def test_full_flow_record_then_check_then_raise() -> None:
         },
     )
     # Enforcement fires the stop nudge.
-    nudge = _check_enforcement(ctx)
-    assert nudge == POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE
+    nudge = enforcement_decision(ctx)
+    assert nudge.rule == "post_non_retriable_nav_error_stop"
     # Same signature on next iteration: no nudge, and the exit-path guard
     # raises because last_test_ok is still False.
-    assert _check_enforcement(ctx) is None
+    assert enforcement_decision(ctx) is None
     with pytest.raises(CopilotNonRetriableNavError):
         _maybe_raise_non_retriable_nav(ctx)
 
@@ -505,7 +504,7 @@ def test_full_flow_cleared_after_successful_run() -> None:
         ctx,
         {"ok": False, "data": {"blocks": [{"failure_reason": _DNS_FAILURE_REASON}]}},
     )
-    assert _check_enforcement(ctx) == POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE
+    assert enforcement_decision(ctx).rule == "post_non_retriable_nav_error_stop"
     # Then a real success happens.
     _record_run_blocks_result(
         ctx,

@@ -67,8 +67,8 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
 )
 from skyvern.forge.sdk.copilot.enforcement import (
     NUDGE_SENTINEL,
-    _check_enforcement,
     _elapsed_run_seconds,
+    enforcement_decision,
     run_with_enforcement,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -437,7 +437,7 @@ async def test_skip_clears_stale_last_test_ok_from_the_diagnosed_failure(monkeyp
 
     assert resume_msgs is not None
     assert ctx.last_test_ok is None
-    assert _check_enforcement(ctx, result=None, config=config) is None
+    assert enforcement_decision(ctx, result=None, config=config) is None
 
 
 @pytest.mark.asyncio
@@ -935,7 +935,7 @@ async def test_credential_pause_preempts_a_concurrent_synthesized_offer(monkeypa
     calls: list[dict[str, Any]] = []
 
     def fake_synthesized_offer(_ctx: Any) -> dict[str, Any] | None:
-        # _check_enforcement runs after the Runner call, so `calls` already has
+        # enforcement_decision runs after the Runner call, so `calls` already has
         # 1 entry on the pre-pause finalize check; gone by the post-resume check
         # (2 entries), so the test isolates the preemption itself.
         return {"role": "user", "content": "offer to add the reopened block"} if len(calls) <= 1 else None
@@ -1343,7 +1343,7 @@ async def test_resolve_credential_pause_rejections_are_typed() -> None:
 
 def _failed_test_ctx() -> CopilotContext:
     """A real CopilotContext (all enforcement fields defaulted) with just the
-    failed-test + missing-credential-diagnosis fields set, so _check_enforcement
+    failed-test + missing-credential-diagnosis fields set, so enforcement_decision
     doesn't AttributeError on some unrelated field this hand-picked set omits.
     """
     ctx = make_copilot_context()
@@ -1362,7 +1362,7 @@ def test_missing_credential_failure_suppresses_generic_failed_test_nudge_when_pa
     ctx = _failed_test_ctx()
     config = CopilotConfig(credential_pause_enabled=True)
 
-    nudge = _check_enforcement(ctx, result=None, config=config)
+    nudge = enforcement_decision(ctx, result=None, config=config)
 
     assert nudge is None
     assert ctx.failed_test_nudge_count == 0
@@ -1373,7 +1373,7 @@ def test_missing_credential_failure_still_nudges_when_kill_switch_off() -> None:
     ctx = _failed_test_ctx()
     config = CopilotConfig(credential_pause_enabled=False)
 
-    nudge = _check_enforcement(ctx, result=None, config=config)
+    nudge = enforcement_decision(ctx, result=None, config=config)
 
     assert nudge is not None
     assert ctx.failed_test_nudge_count == 1
@@ -1384,7 +1384,7 @@ def test_missing_credential_failure_nudges_normally_once_pause_already_used() ->
     ctx.credential_pause_used = True
     config = CopilotConfig(credential_pause_enabled=True)
 
-    nudge = _check_enforcement(ctx, result=None, config=config)
+    nudge = enforcement_decision(ctx, result=None, config=config)
 
     assert nudge is not None
     assert ctx.failed_test_nudge_count == 1
@@ -1413,7 +1413,7 @@ def test_skipped_run_suppresses_post_update_nudge_when_pause_enabled() -> None:
     ctx = _skipped_run_ctx()
     config = CopilotConfig(credential_pause_enabled=True)
 
-    nudge = _check_enforcement(ctx, result=None, config=config)
+    nudge = enforcement_decision(ctx, result=None, config=config)
 
     assert nudge is None
 
@@ -1422,10 +1422,10 @@ def test_skipped_run_still_nudges_post_update_when_kill_switch_off() -> None:
     ctx = _skipped_run_ctx()
     config = CopilotConfig(credential_pause_enabled=False)
 
-    nudge = _check_enforcement(ctx, result=None, config=config)
+    nudge = enforcement_decision(ctx, result=None, config=config)
 
     assert nudge is not None
-    assert "updated the workflow but did not test it" in nudge
+    assert "updated the workflow but did not test it" in nudge.message
 
 
 def test_workflow_credential_inputs_unbound_skip_does_not_nudge_post_update() -> None:
@@ -1443,10 +1443,10 @@ def test_workflow_credential_inputs_unbound_skip_does_not_nudge_post_update() ->
     ctx.request_policy = RequestPolicy()
     config = CopilotConfig(credential_pause_enabled=True)
 
-    assert _check_enforcement(ctx, result=None, config=config) is None
+    assert enforcement_decision(ctx, result=None, config=config) is None
 
     ctx.credential_pause_used = True
-    assert _check_enforcement(ctx, result=None, config=config) is None
+    assert enforcement_decision(ctx, result=None, config=config) is None
 
 
 @pytest.mark.asyncio

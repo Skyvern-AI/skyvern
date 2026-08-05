@@ -24,7 +24,6 @@ from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
-    PRESENT_COMPLETION_CONTRACT_ASK_RETRY,
     _response_coverage_nudge,
 )
 from skyvern.forge.sdk.copilot.loop_detection import tool_step_identity
@@ -1239,6 +1238,24 @@ def test_allows_explicit_unresolved_credential_id_for_untested_draft() -> None:
     )
 
     assert verdict.allowed
+
+
+def test_rejects_credential_ref_the_user_did_not_state_even_for_untested_draft() -> None:
+    """A cred_ ref carried only in credential_refs (model-authored or negated) is not draft-bindable (SKY-13552)."""
+    verdict = evaluate_output_policy(
+        request_policy=_policy(
+            resolved_credentials=[],
+            credential_input_kind="credential_id",
+            credential_refs=["cred_carried"],
+            invalid_credential_ids=[],
+            allow_missing_credentials_in_draft=True,
+            allow_run_blocks=False,
+        ),
+        workflow_yaml=_workflow_yaml().replace("cred_safe", "cred_carried"),
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE in verdict.reason_codes
 
 
 def test_rejects_unrequested_credential_id_even_when_untested_draft_allows_missing_credentials() -> None:
@@ -2975,7 +2992,7 @@ def test_seam_ordering_avoidable_ask_defers_then_recycle_fires() -> None:
     assert diagnostics["deferred_reason_codes"] == [OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION.value]
     assert diagnostics["final_output_policy_allowed"] is True
 
-    assert _response_coverage_nudge(ctx, _AVOIDABLE_ASK) == PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+    assert _response_coverage_nudge(ctx, _AVOIDABLE_ASK).rule == "present_completion_contract_ask_retry"
 
 
 @pytest.mark.asyncio
@@ -3017,7 +3034,8 @@ def test_avoidable_deferral_iff_recycle_admits(
         **marker,
     )
 
-    recycle_admits = _response_coverage_nudge(ctx, _AVOIDABLE_ASK) == PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+    recycle_decision = _response_coverage_nudge(ctx, _AVOIDABLE_ASK)
+    recycle_admits = recycle_decision is not None and recycle_decision.rule == "present_completion_contract_ask_retry"
     assert recycle_admits is expected_admit
 
     _, _, diagnostics = agent_module._evaluate_copilot_final_output_policy(ctx, _AVOIDABLE_ASK)
