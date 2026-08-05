@@ -6,7 +6,7 @@ Covers four surfaces:
   entry must land on ``last_failure_category_top``.
 - ``_needs_per_tool_budget_nudge`` — fires while under the per-streak cap,
   stops once the cap is reached.
-- ``_check_enforcement`` ordering — the budget nudge must pre-empt the
+- ``enforcement_decision`` ordering — the budget nudge must pre-empt the
   generic ``POST_FAILED_TEST_NUDGE`` and the repeated-frontier escalation.
 - ``compute_failure_signature`` — the run_id baked into the watchdog
   message must not make consecutive trips hash differently.
@@ -21,6 +21,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from skyvern.forge.sdk.copilot.config import (
+    POST_ANTI_BOT_FAILED_TEST_NUDGE,
+    POST_PER_TOOL_BUDGET_NUDGE,
+)
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
@@ -34,12 +38,9 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
 from skyvern.forge.sdk.copilot.enforcement import (
     CURRENT_PAGE_CHALLENGE_ADVISORY_REASON_CODE,
     MAX_PER_TOOL_BUDGET_NUDGES,
-    POST_ANTI_BOT_FAILED_TEST_NUDGE,
-    POST_FAILED_TEST_NUDGE,
-    POST_PER_TOOL_BUDGET_NUDGE,
     REPEATED_FRONTIER_STREAK_ESCALATE_AT,
-    _check_enforcement,
     _needs_per_tool_budget_nudge,
+    enforcement_decision,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import (
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
@@ -323,7 +324,7 @@ def test_gate_does_not_fire_after_cap_reached() -> None:
     assert not _needs_per_tool_budget_nudge(ctx)
 
 
-def test_check_enforcement_emits_budget_nudge_before_failed_test() -> None:
+def test_enforcement_decision_emits_budget_nudge_before_failed_test() -> None:
     """A budget trip also looks like a failed test (last_test_ok=False), so
     without the dedicated path it would land in POST_FAILED_TEST_NUDGE. The
     budget nudge must pre-empt it."""
@@ -333,12 +334,12 @@ def test_check_enforcement_emits_budget_nudge_before_failed_test() -> None:
     ctx.last_test_ok = False
     ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
 
-    nudge = _check_enforcement(ctx)
-    assert nudge == POST_PER_TOOL_BUDGET_NUDGE
+    nudge = enforcement_decision(ctx)
+    assert nudge.rule == "post_per_tool_budget"
     assert ctx.per_tool_budget_nudge_count == 1
 
 
-def test_check_enforcement_halts_before_budget_when_structured_challenge_observed() -> None:
+def test_enforcement_decision_halts_before_budget_when_structured_challenge_observed() -> None:
     ctx = _fresh_context()
     ctx.update_workflow_called = True
     ctx.test_after_update_done = True
@@ -356,7 +357,7 @@ def test_check_enforcement_halts_before_budget_when_structured_challenge_observe
     }
 
     with pytest.raises(CopilotTurnHalt) as exc_info:
-        _check_enforcement(ctx)
+        enforcement_decision(ctx)
 
     assert exc_info.value.halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
     assert exc_info.value.halt.extra["run_outcome_reason_code"] == "terminal_challenge_blocker"
@@ -367,7 +368,7 @@ def test_check_enforcement_halts_before_budget_when_structured_challenge_observe
     assert ctx.per_tool_budget_nudge_count == 0
 
 
-def test_check_enforcement_keeps_text_only_anti_bot_diagnostic_non_terminal() -> None:
+def test_enforcement_decision_keeps_text_only_anti_bot_diagnostic_non_terminal() -> None:
     ctx = _fresh_context()
     ctx.update_workflow_called = True
     ctx.test_after_update_done = True
@@ -375,9 +376,9 @@ def test_check_enforcement_keeps_text_only_anti_bot_diagnostic_non_terminal() ->
     ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
     ctx.last_test_anti_bot = "possible challenge mentioned in free text"
 
-    nudge = _check_enforcement(ctx)
+    nudge = enforcement_decision(ctx)
 
-    assert nudge == POST_ANTI_BOT_FAILED_TEST_NUDGE
+    assert nudge.rule == "post_anti_bot_failed_test"
     assert ctx.failed_test_nudge_count == 1
     assert ctx.per_tool_budget_nudge_count == 0
     assert ctx.turn_halt is None
@@ -405,7 +406,7 @@ def test_final_reply_after_post_run_observation_bypasses_stale_budget_and_anti_b
     assert evidence.current_url_observed_after_workflow_run is True
     assert evidence.current_url_may_encode_runtime_state is True
 
-    assert _check_enforcement(ctx, _reply_result("Observed result: CRED-000123 expires 01/31/2030.")) is None
+    assert enforcement_decision(ctx, _reply_result("Observed result: CRED-000123 expires 01/31/2030.")) is None
 
 
 def test_progress_reply_after_post_run_observation_still_gets_anti_bot_nudge() -> None:
@@ -423,12 +424,12 @@ def test_progress_reply_after_post_run_observation_still_gets_anti_bot_nudge() -
         url="https://example.com/registry/search",
     )
 
-    nudge = _check_enforcement(ctx, _reply_result("I will now proceed to inspect the result page."))
+    nudge = enforcement_decision(ctx, _reply_result("I will now proceed to inspect the result page."))
 
-    assert nudge == POST_ANTI_BOT_FAILED_TEST_NUDGE
+    assert nudge.rule == "post_anti_bot_failed_test"
 
 
-def test_check_enforcement_emits_budget_nudge_before_repeated_frontier_warn() -> None:
+def test_enforcement_decision_emits_budget_nudge_before_repeated_frontier_warn() -> None:
     """The budget trip is structural (chain too long) and must not be silently
     consumed by the repeated-frontier escalation, even when both signals fire
     at the same iteration."""
@@ -439,11 +440,11 @@ def test_check_enforcement_emits_budget_nudge_before_repeated_frontier_warn() ->
     ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
     ctx.repeated_failure_streak_count = REPEATED_FRONTIER_STREAK_ESCALATE_AT
 
-    nudge = _check_enforcement(ctx)
-    assert nudge == POST_PER_TOOL_BUDGET_NUDGE
+    nudge = enforcement_decision(ctx)
+    assert nudge.rule == "post_per_tool_budget"
 
 
-def test_check_enforcement_falls_through_to_failed_test_after_budget_cap() -> None:
+def test_enforcement_decision_falls_through_to_failed_test_after_budget_cap() -> None:
     ctx = _fresh_context()
     ctx.update_workflow_called = True
     ctx.test_after_update_done = True
@@ -451,8 +452,8 @@ def test_check_enforcement_falls_through_to_failed_test_after_budget_cap() -> No
     ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
     ctx.per_tool_budget_nudge_count = MAX_PER_TOOL_BUDGET_NUDGES
 
-    nudge = _check_enforcement(ctx)
-    assert nudge == POST_FAILED_TEST_NUDGE
+    nudge = enforcement_decision(ctx)
+    assert nudge.rule == "post_failed_test"
 
 
 def test_failure_signature_is_stable_across_budget_trips_with_different_run_ids() -> None:
@@ -567,7 +568,7 @@ def test_non_budget_canceled_reconciliation_suppresses_failed_test_nudge() -> No
 
     assert ctx.pending_reconciliation_run_id == "wr_1"
     assert ctx.pending_reconciliation_requires_user_input is True
-    assert _check_enforcement(ctx) is None
+    assert enforcement_decision(ctx) is None
 
 
 def test_block_running_after_non_budget_canceled_inspection_does_not_request_get_results_again() -> None:
