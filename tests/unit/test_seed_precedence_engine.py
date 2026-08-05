@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import LoginBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     CredentialParameter,
@@ -808,14 +809,31 @@ def _output_parameter(key: str) -> OutputParameter:
     return OutputParameter(output_parameter_id=f"{key}_id", key=key, workflow_id="wf", created_at=now, modified_at=now)
 
 
-def _login_block(label: str, credential_param: CredentialParameter | WorkflowParameter) -> LoginBlock:
+def _login_block(
+    label: str,
+    credential_param: CredentialParameter | WorkflowParameter,
+    *,
+    url: str = "https://example.com/login",
+) -> LoginBlock:
     return LoginBlock(
-        url="https://example.com/login",
+        url=url,
         label=label,
         title=label,
         navigation_goal="log in",
         output_parameter=_output_parameter(f"{label}_out"),
         parameters=[credential_param],
+    )
+
+
+def _string_parameter(key: str) -> WorkflowParameter:
+    now = datetime.now(timezone.utc)
+    return WorkflowParameter(
+        key=key,
+        workflow_parameter_id=f"wp_{key}",
+        workflow_parameter_type=WorkflowParameterType.STRING,
+        workflow_id="wf_test",
+        created_at=now,
+        modified_at=now,
     )
 
 
@@ -1216,3 +1234,165 @@ async def test_login_block_no_cached_browser_still_credential_seeds(monkeypatch:
         browser_profile_id="cred_profile_x",
         browser_seed_source=BrowserSeedSource.credential,
     )
+
+
+async def _prepare_login_block_profile_boot(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    url: str,
+    values: dict[str, str],
+    get_or_create: AsyncMock,
+    get_workflow_run: AsyncMock | None = None,
+) -> tuple[object, AsyncMock, LoginBlock]:
+    context = WorkflowRunContext(
+        workflow_title="Workflow",
+        workflow_id="wf_test",
+        workflow_permanent_id="wpid",
+        workflow_run_id="wr_test",
+        aws_client=MagicMock(),
+    )
+    context.values.update(values)
+    for key in values:
+        context.parameters[key] = _string_parameter(key)
+    # The stub app auto-mocks WORKFLOW_CONTEXT_MANAGER attributes as AsyncMocks, so the real manager is
+    # installed here to exercise the actual context lookup the renderer does.
+    context_manager = WorkflowContextManager()
+    context_manager.workflow_run_contexts["wr_test"] = context
+    monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", context_manager)
+
+    svc = WorkflowService()
+    monkeypatch.setattr(svc, "_apply_login_block_credential_proxy_pin", AsyncMock())
+    monkeypatch.setattr(svc, "_resolve_login_block_browser_profile_id", AsyncMock(return_value="cred_profile_x"))
+    monkeypatch.setattr(
+        svc,
+        "_evaluate_debug_session_profile_decision",
+        AsyncMock(return_value=SimpleNamespace(incompatible_reason=None, attach_browser_session_id=None)),
+    )
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *a, **k: None)
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_or_create_for_workflow_run", get_or_create)
+    update = AsyncMock()
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run", update)
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "get_workflow_run",
+        get_workflow_run or AsyncMock(return_value=None),
+    )
+
+    block = _login_block("login", _credential_parameter("login", "cred_1"), url=url)
+    run = SimpleNamespace(
+        browser_seed_source=BrowserSeedSource.credential,
+        start_fresh_browser=False,
+        workflow_permanent_id="wpid",
+    )
+    result = await svc._prepare_login_block_browser_profile(
+        block=block,
+        workflow_run=run,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        browser_session_id=None,
+    )
+    return result, update, block
+
+
+@pytest.mark.parametrize(
+    ("raw_url", "values", "expected_url"),
+    [
+        pytest.param(
+            "{{ some_url_parameter }}",
+            {"some_url_parameter": "login.example/session"},
+            "https://login.example/session",
+            id="templated",
+        ),
+        pytest.param(
+            "https://login.example/session",
+            {},
+            "https://login.example/session",
+            id="literal",
+        ),
+        pytest.param(
+            "some_url_parameter",
+            {"some_url_parameter": "https://login.example/session"},
+            "https://login.example/session",
+            id="direct_parameter_key",
+        ),
+        pytest.param(
+            # Pins the resolution ORDER: the direct key must be substituted BEFORE jinja runs, or the
+            # nested template survives unrendered.
+            "url_param",
+            {"url_param": "{{ host }}/login", "host": "login.example"},
+            "https://login.example/login",
+            id="direct_parameter_key_holding_a_template",
+        ),
+        pytest.param(
+            "login.example/session",
+            {},
+            "https://login.example/session",
+            id="schemeless_literal_is_normalized",
+        ),
+        pytest.param(
+            "https://www.www.login.example/session",
+            {},
+            "https://www.www.login.example/session",
+            id="schemed_literal_is_passed_through_uncanonicalized",
+        ),
+        pytest.param(
+            "not a url",
+            {},
+            "not a url",
+            id="schemeless_literal_that_fails_validation_keeps_raw",
+        ),
+        pytest.param(
+            "{{ some_url_parameter }}",
+            {"some_url_parameter": "not a url"},
+            "{{ some_url_parameter }}",
+            id="renders_to_invalid_url_keeps_raw",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_login_block_profile_boot_resolves_url(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_url: str,
+    values: dict[str, str],
+    expected_url: str,
+) -> None:
+    page = SimpleNamespace(url=expected_url, wait_for_load_state=AsyncMock())
+    get_or_create = AsyncMock(return_value=SimpleNamespace(get_working_page=AsyncMock(return_value=page)))
+
+    _, _, block = await _prepare_login_block_profile_boot(
+        monkeypatch,
+        url=raw_url,
+        values=values,
+        get_or_create=get_or_create,
+    )
+
+    assert get_or_create.await_args.kwargs["url"] == expected_url
+    assert block.url == raw_url
+
+
+@pytest.mark.asyncio
+async def test_login_block_profile_boot_unresolved_url_degrades_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    get_or_create = AsyncMock(side_effect=RuntimeError("profile boot failed"))
+    degraded_run = SimpleNamespace(
+        browser_seed_source=BrowserSeedSource.degraded_fresh,
+        browser_profile_id=None,
+    )
+
+    raw_url = "{{ missing_url_parameter }}"
+    result, update, _ = await _prepare_login_block_profile_boot(
+        monkeypatch,
+        url=raw_url,
+        values={},
+        get_or_create=get_or_create,
+        get_workflow_run=AsyncMock(side_effect=[None, degraded_run]),
+    )
+
+    assert get_or_create.await_args.kwargs["url"] == raw_url
+    assert update.await_args_list[-1].kwargs == {
+        "workflow_run_id": "wr_test",
+        "browser_profile_id": None,
+        "browser_seed_source": BrowserSeedSource.degraded_fresh,
+    }
+    assert result is degraded_run
