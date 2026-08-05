@@ -5553,9 +5553,10 @@ async def wrapper({default_args}):
         if page is None:
             # A session can arrive holding a context with no tab, leaving nothing to adopt.
             # Opening one can still raise when the CDP path does not deliver this client the
-            # target announcement for the tab it creates (SKY-13338); the cloud CDP proxy
-            # fans announcements out to late autoAttach clients, so a failure here now
-            # points at a direct (non-proxied) multi-client connection.
+            # target announcement for the tab it creates. The cloud CDP proxy backfills late
+            # autoAttach clients, diverts createTarget, and fans out unsolicited targets, so
+            # a failure means the announcement was still missed; see the cdp-proxy runbook's
+            # multi-client autoAttach section.
             try:
                 page = await browser_state.get_or_create_page()
             except Exception as e:
