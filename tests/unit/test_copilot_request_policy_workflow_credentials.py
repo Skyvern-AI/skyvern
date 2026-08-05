@@ -33,6 +33,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _classification_from_raw,
     _clean_email_list,
     _exact_credential_name_candidates,
+    _ground_login_target_urls,
     _resolve_credentials,
     _saved_credential_names_mentioned,
     _seed_prior_approved_credentials,
@@ -3408,3 +3409,40 @@ async def test_basic_auth_in_a_login_url_never_reaches_the_admission_log() -> No
     assert "hunter2" not in logged
     assert "admin:" not in logged
     assert "code=abc" not in logged
+
+
+class TestGroundLoginTargetUrls:
+    """The half that enforces "the user wrote it" — the whole basis of the release-origin claim."""
+
+    @staticmethod
+    def _ground(login_page_urls: list[str], user_message: str) -> list[str]:
+        policy = RequestPolicy(login_page_urls=login_page_urls)
+        _ground_login_target_urls(policy, user_message)
+        return policy.grounded_login_target_urls
+
+    def test_a_url_only_the_classifier_named_is_dropped(self) -> None:
+        assert self._ground(["https://portal.example/login"], "log in with my saved credential") == []
+
+    def test_a_url_written_in_this_message_survives(self) -> None:
+        assert self._ground(
+            ["https://portal.example/login"],
+            "sign in at https://portal.example/login with my saved credential",
+        ) == ["https://portal.example/login"]
+
+    def test_another_path_on_the_same_written_origin_survives(self) -> None:
+        assert self._ground(
+            ["https://portal.example/login"],
+            "read https://portal.example/reports/2026 for me",
+        ) == ["https://portal.example/login"]
+
+    def test_a_second_written_origin_is_kept_so_the_fill_seam_can_refuse_both(self) -> None:
+        grounded = self._ground(
+            ["https://portal.example/login", "https://tracker.example/login"],
+            "sign in at https://portal.example/login then file it at https://tracker.example/login",
+        )
+        assert len(grounded) == 2
+
+    def test_an_origin_written_only_in_an_earlier_turn_is_dropped(self) -> None:
+        # Grounding reads the message asking for the fill, never the conversation: a link pasted in an
+        # earlier turn for another purpose must not license that origin for a later credential request.
+        assert self._ground(["https://evil.example/login"], "sign in with my bank credential") == []

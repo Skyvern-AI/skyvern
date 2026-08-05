@@ -61,6 +61,7 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         secret_scrub_values=[],
         scouted_credential_field_inventory_by_credential_id={},
         org_credentials_for_turn=None,
+        vault_login_uris_by_credential_id={},
     )
     for key, value in overrides.items():
         setattr(ns, key, value)
@@ -693,6 +694,195 @@ class TestCredentialFillLivePageAdmission:
         assert "intended login origin" in result["error"]
         assert page.fill_calls == []
 
+    async def _unbound_grant(
+        self,
+        *,
+        page_url: str | None,
+        login_page_urls: list[str],
+        named: bool,
+        org_credentials: list[SimpleNamespace],
+    ) -> tuple[Any, str | None]:
+        """Grant for a resolved credential carrying no saved login URL."""
+        policy = RequestPolicy(
+            resolved_credentials=[_resolved_credential(tested_url=None)],
+            login_page_urls=login_page_urls,
+            grounded_login_target_urls=login_page_urls,
+        )
+        if named:
+            policy.current_turn_named_credential_ids = {"cred_123"}
+        ctx = _ctx(request_policy=policy)
+        with (
+            patch(
+                "skyvern.forge.app.DATABASE.credentials.get_credentials",
+                new=AsyncMock(return_value=org_credentials),
+            ),
+            patch.object(credential_fill_module, "_live_working_page_url", AsyncMock(return_value=page_url)),
+        ):
+            return await credential_fill_module._credential_fill_origin_grant(ctx, "cred_123")
+
+    @pytest.mark.asyncio
+    async def test_a_named_credential_is_bound_by_the_login_page_the_request_asked_for(self) -> None:
+        """Naming a credential answers *which* one; the login page the request named answers *where*.
+
+        A credential saved without a login URL is unbound rather than disowned, so the request's own
+        login target can supply the origin once something outside the model has settled which
+        credential is meant.
+        """
+        grant, error = await self._unbound_grant(
+            page_url=_FIXTURE_LOGIN_URL,
+            login_page_urls=[_FIXTURE_LOGIN_URL],
+            named=True,
+            org_credentials=[_org_credential("cred_123", "authtest simple", None)],
+        )
+
+        assert error is None
+        assert grant is not None
+        assert credential_fill_module._still_on_admitted_site(_FIXTURE_LOGIN_URL, grant.intended_url)
+
+    @pytest.mark.asyncio
+    async def test_the_only_saved_credential_needs_no_naming(self) -> None:
+        """An org with one login has nothing to disambiguate, so elimination answers for the user."""
+        grant, error = await self._unbound_grant(
+            page_url=_FIXTURE_LOGIN_URL,
+            login_page_urls=[_FIXTURE_LOGIN_URL],
+            named=False,
+            org_credentials=[_org_credential("cred_123", "authtest simple", None)],
+        )
+
+        assert error is None
+        assert grant is not None
+
+    @pytest.mark.asyncio
+    async def test_a_card_or_secret_does_not_count_against_the_only_saved_login(self) -> None:
+        """Elimination counts logins, so a saved card leaves the one password still unambiguous."""
+        grant, error = await self._unbound_grant(
+            page_url=_FIXTURE_LOGIN_URL,
+            login_page_urls=[_FIXTURE_LOGIN_URL],
+            named=False,
+            org_credentials=[
+                _org_credential("cred_123", "authtest simple", None),
+                _org_credential("cred_card", "company card", None, CredentialType.CREDIT_CARD),
+            ],
+        )
+
+        assert error is None
+        assert grant is not None
+
+    @pytest.mark.asyncio
+    async def test_naming_several_credentials_settles_which_one_no_better_than_naming_none(self) -> None:
+        """Two names leave the model choosing whose password reaches the page, which is not an answer."""
+        policy = RequestPolicy(
+            resolved_credentials=[_resolved_credential(tested_url=None)],
+            login_page_urls=[_FIXTURE_LOGIN_URL],
+            grounded_login_target_urls=[_FIXTURE_LOGIN_URL],
+        )
+        policy.current_turn_named_credential_ids = {"cred_123", "cred_other"}
+        ctx = _ctx(request_policy=policy)
+        with (
+            patch(
+                "skyvern.forge.app.DATABASE.credentials.get_credentials",
+                new=AsyncMock(
+                    return_value=[
+                        _org_credential("cred_123", "authtest simple", None),
+                        _org_credential("cred_other", "billing", None),
+                    ]
+                ),
+            ),
+            patch.object(credential_fill_module, "_live_working_page_url", AsyncMock(return_value=_FIXTURE_LOGIN_URL)),
+        ):
+            grant, error = await credential_fill_module._credential_fill_origin_grant(ctx, "cred_123")
+
+        assert grant is None
+        assert error is not None
+
+    @pytest.mark.asyncio
+    async def test_a_credential_already_bound_elsewhere_leaves_the_unbound_one_sole(self) -> None:
+        """Turn start resolves the sole URL-less credential; counting bound ones too would re-ask here."""
+        grant, error = await self._unbound_grant(
+            page_url=_FIXTURE_LOGIN_URL,
+            login_page_urls=[_FIXTURE_LOGIN_URL],
+            named=False,
+            org_credentials=[
+                _org_credential("cred_123", "authtest simple", None),
+                _org_credential("cred_bound", "billing", "https://billing.example.com/login"),
+            ],
+        )
+
+        assert error is None
+        assert grant is not None
+
+    @pytest.mark.asyncio
+    async def test_one_unnamed_credential_among_several_asks_rather_than_refusing(self) -> None:
+        """Ambiguity is a question. Only an absence of any non-model evidence is a refusal."""
+        grant, error = await self._unbound_grant(
+            page_url=_FIXTURE_LOGIN_URL,
+            login_page_urls=[_FIXTURE_LOGIN_URL],
+            named=False,
+            org_credentials=[
+                _org_credential("cred_123", "authtest simple", None),
+                _org_credential("cred_other", "billing", None),
+            ],
+        )
+
+        assert grant is None
+        assert error is not None
+        # Only an exact name or a cred_ id is read back off the next message, so an ask that would
+        # settle for "yes" re-asks forever — the loop this seam exists to end.
+        assert "exact name" in error and "cred_" in error
+
+    @pytest.mark.asyncio
+    async def test_an_unbound_credential_is_refused_on_a_page_the_request_never_asked_for(self) -> None:
+        """The lookalike case: naming a credential does not license the page the browser drifted to."""
+        grant, error = await self._unbound_grant(
+            page_url="https://authenticationtest.com.example.net/simpleFormAuth/",
+            login_page_urls=[_FIXTURE_LOGIN_URL],
+            named=True,
+            org_credentials=[_org_credential("cred_123", "authtest simple", None)],
+        )
+
+        assert grant is None
+        assert error is not None
+        assert "intended login origin" in error
+
+    @pytest.mark.asyncio
+    async def test_a_request_naming_two_sign_in_sites_grounds_neither(self) -> None:
+        """One request routinely spans two logins — read a total here, file it there.
+
+        Neither site can vouch for the other's password, and nothing at this seam knows which of them
+        the credential belongs to, so a second sign-in target withdraws the grant instead of widening it.
+        """
+        for page_url in (_FIXTURE_LOGIN_URL, "https://tracker-b.example/login"):
+            grant, error = await self._unbound_grant(
+                page_url=page_url,
+                login_page_urls=[_FIXTURE_LOGIN_URL, "https://tracker-b.example/login"],
+                named=True,
+                org_credentials=[_org_credential("cred_123", "authtest simple", None)],
+            )
+
+            assert grant is None, f"a two-site request must not vouch for {page_url}"
+            assert error is not None
+            assert "intended login origin" in error
+
+    @pytest.mark.asyncio
+    async def test_a_login_target_the_user_never_wrote_cannot_vouch(self) -> None:
+        """The classifier says which URL is a sign-in page; it does not get to author the URL."""
+        policy = RequestPolicy(
+            resolved_credentials=[_resolved_credential(tested_url=None)],
+            login_page_urls=[_FIXTURE_LOGIN_URL],
+            grounded_login_target_urls=[],
+        )
+        policy.current_turn_named_credential_ids = {"cred_123"}
+        ctx = _ctx(request_policy=policy)
+        with (
+            patch("skyvern.forge.app.DATABASE.credentials.get_credentials", new=AsyncMock(return_value=[])),
+            patch.object(credential_fill_module, "_live_working_page_url", AsyncMock(return_value=_FIXTURE_LOGIN_URL)),
+        ):
+            grant, error = await credential_fill_module._credential_fill_origin_grant(ctx, "cred_123")
+
+        assert grant is None
+        assert error is not None
+        assert "intended login origin" in error
+
     @pytest.mark.asyncio
     async def test_live_page_admitted_credential_short_circuits_without_an_org_lookup(self) -> None:
         error, _, load_mock = await self._gate(
@@ -1058,3 +1248,79 @@ class TestObservationSeamCredentialBinding:
 
         assert "resolved_login_credential_id" not in result
         load_mock.assert_not_awaited()
+
+
+class TestVaultNamedSiteGrant:
+    """A credential goes where its own vault entry says it belongs, without a test run first."""
+
+    async def _grant(self, *, vault_uris: list[str], page_url: str) -> tuple[Any, str | None]:
+        policy = RequestPolicy(resolved_credentials=[_resolved_credential(tested_url=None)])
+        ctx = _ctx(request_policy=policy, vault_login_uris_by_credential_id={"cred_123": vault_uris})
+        with patch.object(credential_fill_module, "_live_working_page_url", AsyncMock(return_value=page_url)):
+            return await credential_fill_module._credential_fill_origin_grant(ctx, "cred_123")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "page_url",
+        [
+            "https://example.com/login",
+            "https://eu.example.com/login",
+            "https://usercontent.example.com/uploads/x",
+        ],
+    )
+    async def test_the_vault_site_covers_the_whole_site(self, page_url: str) -> None:
+        grant, error = await self._grant(vault_uris=["https://example.com"], page_url=page_url)
+
+        assert error is None
+        assert grant is not None and grant.whole_site is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "page_url",
+        [
+            "https://example.com.evil.test/login",
+            "https://example-login.test/login",
+            "https://bob.github.io/login",
+        ],
+    )
+    async def test_another_site_is_refused(self, page_url: str) -> None:
+        grant, error = await self._grant(
+            vault_uris=["https://example.com", "https://alice.github.io"], page_url=page_url
+        )
+
+        assert grant is None
+        assert error is not None
+
+    @pytest.mark.asyncio
+    async def test_a_whole_site_grant_still_cannot_leave_that_site(self) -> None:
+        grant, _ = await self._grant(vault_uris=["https://example.com"], page_url="https://eu.example.com/login")
+
+        assert grant is not None
+        assert credential_fill_module._within_grant("https://other.example.com/step2", grant)
+        assert not credential_fill_module._within_grant("https://example.com.evil.test/step2", grant)
+
+    @pytest.mark.parametrize(
+        "page_url,reachable",
+        [
+            ("https://eu.example.com/login", True),
+            ("https://usercontent.example.com/x", True),
+            ("http://example.com/login", False),
+            ("http://eu.example.com/login", False),
+            ("https://example.com:8443/login", False),
+            ("https://example.com.evil.test/login", False),
+        ],
+    )
+    def test_a_site_wide_grant_moves_between_hosts_but_not_schemes_or_ports(
+        self, page_url: str, reachable: bool
+    ) -> None:
+        """Host mobility is the point; reaching the same site in cleartext or on another port is not."""
+        grant = credential_fill_module._CredentialFillOriginGrant("https://example.com/login", whole_site=True)
+
+        assert credential_fill_module._within_grant(page_url, grant) is reachable
+
+    def test_a_tested_credential_keeps_the_tighter_scope(self) -> None:
+        """Evidence naming one page grants one origin; only a site-level entry grants a site."""
+        page_grant = credential_fill_module._CredentialFillOriginGrant("https://eu.example.com/login")
+
+        assert not credential_fill_module._within_grant("https://other.example.com/login", page_grant)
+        assert credential_fill_module._within_grant("https://eu.example.com/step2", page_grant)
