@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import socket
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from skyvern.exceptions import BlockedNavigationDestination, FailedToNavigateToUrl
-from skyvern.webeye.navigation import navigate_with_retry, validate_navigation_destination
+from skyvern.exceptions import BlockedHost, BlockedNavigationDestination, FailedToNavigateToUrl, UnresolvableHost
+from skyvern.webeye.navigation import (
+    navigate_with_retry,
+    revalidate_redirect_chain,
+    validate_navigation_destination,
+)
 from skyvern.webeye.real_browser_state import RealBrowserState
 
 
@@ -401,3 +406,80 @@ async def test_navigate_with_retry_revalidates_every_redirect_hop() -> None:
         )
 
     settle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_revalidate_redirect_chain_checks_every_hop_and_the_final_destination() -> None:
+    response = _redirect_response(
+        "https://entry.example.test/a",
+        "https://mid.example.test/b",
+        "https://final.example.test/c",
+    )
+
+    seen: list[str] = []
+    reset_page = AsyncMock()
+    await revalidate_redirect_chain(response, seen.append, reset_page)
+
+    assert sorted(seen) == [
+        "https://entry.example.test/a",
+        "https://final.example.test/c",
+        "https://mid.example.test/b",
+    ]
+    reset_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_revalidate_redirect_chain_propagates_the_validators_exception() -> None:
+    response = _redirect_response(
+        "https://entry.example.test/a",
+        "http://169.254.169.254/latest/meta-data/",
+    )
+
+    refusal = BlockedHost("169.254.169.254")
+    reset_page = AsyncMock()
+
+    def refuse_metadata(url: str) -> None:
+        if "169.254.169.254" in url:
+            raise refusal
+
+    with pytest.raises(BlockedHost) as exc_info:
+        await revalidate_redirect_chain(response, refuse_metadata, reset_page)
+
+    assert exc_info.value is refusal
+    reset_page.assert_awaited_once_with("about:blank")
+
+
+@pytest.mark.parametrize("refusal", [BlockedHost("blocked.test"), UnresolvableHost("unresolvable.test")])
+@pytest.mark.asyncio
+async def test_revalidate_redirect_chain_preserves_refusal_when_page_reset_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    refusal: BlockedHost,
+) -> None:
+    response = _redirect_response(
+        "https://entry.example.test/a",
+        "http://169.254.169.254/latest/meta-data/",
+    )
+    reset_page = AsyncMock(side_effect=RuntimeError("reset failed"))
+    log_exception = MagicMock()
+    monkeypatch.setattr("skyvern.webeye.navigation.LOG.exception", log_exception)
+
+    def refuse_metadata(url: str) -> None:
+        if "169.254.169.254" in url:
+            raise refusal
+
+    with pytest.raises(type(refusal)) as exc_info:
+        await revalidate_redirect_chain(response, refuse_metadata, reset_page)
+
+    assert exc_info.value is refusal
+    reset_page.assert_awaited_once_with("about:blank")
+    log_exception.assert_called_once_with("Failed to reset page after redirect refusal")
+
+
+@pytest.mark.asyncio
+async def test_revalidate_redirect_chain_tolerates_a_response_without_a_request() -> None:
+    calls: list[str] = []
+
+    await revalidate_redirect_chain(None, calls.append)
+    await revalidate_redirect_chain(SimpleNamespace(request=None), calls.append)
+
+    assert calls == []
