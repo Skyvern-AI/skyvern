@@ -70,6 +70,8 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "scouted_interactions",
     "scout_trajectory",
     "requested_output_designations",
+    "resolved_designation_fingerprints",
+    "last_bound_requested_output_extraction_plan",
     "pending_scout_source_url",
     "pending_scout_typed_value",
     "pending_scout_role_name",
