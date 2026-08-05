@@ -963,20 +963,29 @@ def build_turn_intent(
         authority.may_run_blocks = False
         authority.requires_user_input = True
     elif mode == TurnIntentMode.DIAGNOSE:
-        authority.may_update_workflow = False
-        retest_mandated = (
-            request_policy.testing_intent == "require_test"
-            and request_policy.allow_run_blocks
-            and classification is not None
-            and classification.mode == TurnIntentMode.DIAGNOSE
+        classifier_chose_diagnose = classification is not None and classification.mode == TurnIntentMode.DIAGNOSE
+        # An affirmative, confident diagnose classification says which context the turn needs; it does not
+        # withdraw the authority RequestPolicy granted. Authority is still withheld on the routes that never
+        # asserted the user wants a repair: a declared diagnose-first turn (fix_origin), a DIAGNOSE reached
+        # by recovery from UNKNOWN or a classifier failure, and a low-confidence guess — which must not
+        # out-rank an equally unsure edit, downgraded to CLARIFY above.
+        diagnose_earns_authority = (
+            classifier_chose_diagnose and not fix_origin and confidence >= _LOW_CONFIDENCE_MUTATION_THRESHOLD
         )
-        if retest_mandated:
-            # RequestPolicy owns testing policy; an explicit require_test re-run must not be inverted
-            # by the diagnose classification.
-            authority.may_run_blocks = True
-            reason_codes.append(TurnIntentReasonCode.TESTING_INTENT_RUN_OVERRIDES_DIAGNOSE)
-        else:
-            authority.may_run_blocks = False
+        if not diagnose_earns_authority:
+            authority.may_update_workflow = False
+            retest_mandated = (
+                request_policy.testing_intent == "require_test"
+                and request_policy.allow_run_blocks
+                and classifier_chose_diagnose
+            )
+            if retest_mandated:
+                # RequestPolicy owns testing policy; an explicit require_test re-run must not be inverted
+                # by the diagnose classification.
+                authority.may_run_blocks = True
+                reason_codes.append(TurnIntentReasonCode.TESTING_INTENT_RUN_OVERRIDES_DIAGNOSE)
+            else:
+                authority.may_run_blocks = False
         if RequiredContextKey.LATEST_RUN_RESULT not in required_context:
             required_context.append(RequiredContextKey.LATEST_RUN_RESULT)
 
