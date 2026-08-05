@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE
 
 RunOutcomeVerdict = Literal["evaluating", "demonstrated", "not_demonstrated", "not_evaluated"]
 RecordedRunOutcomeVerdict = Literal["demonstrated", "not_demonstrated", "not_evaluated"]
+RunOutcomeRole = Literal["adjudicated", "interim_build_test"]
 RunOutcomeReasonCode = Literal[
     "blocker_reported",
     "terminal_challenge_blocker",
@@ -42,6 +43,7 @@ class RecordedRunOutcome:
     reason_code: RunOutcomeReasonCode | None = None
     display_reason: str | None = None
     workflow_run_id: str | None = None
+    role: RunOutcomeRole = "adjudicated"
 
 
 def run_outcome_display_reason(text: str | None) -> str | None:

@@ -102,6 +102,7 @@ from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_USER_FACING_REASON,
     RecordedRunOutcome,
     RunOutcomeReasonCode,
+    RunOutcomeRole,
     RunOutcomeVerdict,
     run_outcome_display_reason,
     trusted_terminal_challenge_category_name,
@@ -3345,9 +3346,15 @@ def _adjudicated_run_outcome(
     committed = _same_run_committed_demonstrated_outcome(copilot_ctx)
     if committed is not None:
         return committed
+    # last_test_suspicious_success can also mark a turn's de-facto-final run — a repair
+    # ceiling stops the build loop rather than continuing — so this interim tag neutralizes
+    # only the live row; the honest turn-level amber is still surfaced by the terminal
+    # envelope, which anchors interim verdicts when no adjudicated outcome exists in the
+    # turn (test_run_anchor_keeps_interim_amber_when_no_adjudicated_outcome).
     if copilot_ctx.last_test_suspicious_success:
         return RecordedRunOutcome(
             verdict="not_demonstrated",
+            role="interim_build_test",
             reason_code="outcome_not_demonstrated",
             display_reason=run_outcome_display_reason(copilot_ctx.last_test_failure_reason),
         )
@@ -3381,6 +3388,7 @@ async def _send_run_outcome_update(
     verdict: RunOutcomeVerdict,
     reason_code: RunOutcomeReasonCode | None,
     display_reason: str | None,
+    role: RunOutcomeRole = "adjudicated",
 ) -> None:
     stream = getattr(copilot_ctx, "stream", None)
     if stream is None:
@@ -3397,6 +3405,7 @@ async def _send_run_outcome_update(
                 workflow_run_block_ids=list(getattr(copilot_ctx, "last_run_blocks_block_ids", []) or []),
                 block_labels=list(getattr(copilot_ctx, "last_run_blocks_block_labels", []) or []),
                 verdict=verdict,
+                role=role,
                 reason_code=reason_code,
                 display_reason=display_reason,
                 iteration=iteration,
@@ -3449,6 +3458,7 @@ async def _verify_and_record_run_blocks_result(
             copilot_ctx,
             result,
             verdict=final.verdict,
+            role=final.role,
             reason_code=final.reason_code,
             display_reason=final.display_reason,
         )

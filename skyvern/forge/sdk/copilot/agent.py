@@ -2176,6 +2176,7 @@ def _build_narrative_payload(
             }
             if recorded_outcome is not None and label in outcome_labels:
                 block_entry["outcome"] = recorded_outcome.verdict
+                block_entry["outcomeRole"] = recorded_outcome.role
                 if recorded_outcome.display_reason is not None:
                     block_entry["outcomeReason"] = recorded_outcome.display_reason
             blocks.append(block_entry)
