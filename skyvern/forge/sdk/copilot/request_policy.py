@@ -608,6 +608,9 @@ class RequestPolicy:
     completion_contract: str | None = None
     completion_criteria: list[CompletionCriterion] = field(default_factory=list)
     resolved_credentials: list[Credential] = field(default_factory=list)
+    # Credentials bound this turn without a user ask (deterministic URL/urlless resolution + live-page
+    # sole-match); read-only telemetry for the auto-bind receipt, never a run-authority source.
+    auto_bound_credentials: list[Credential] = field(default_factory=list)
     # credential_id -> the login page URL that granted it, so each later fill can confirm the
     # browser has not left that site and a redirect cannot inherit the grant.
     live_page_admitted_urls: dict[str, str] = field(default_factory=dict)
@@ -5126,6 +5129,7 @@ async def _resolve_credentials(
         )
         if resolution.verdict == "resolved":
             policy.resolved_credentials = list(resolution.candidates)
+            policy.auto_bound_credentials = list(resolution.candidates)
             return
         if resolution.verdict == "ambiguous":
             # Found-but-unbound keeps the unresolved-login override from
@@ -5283,6 +5287,7 @@ def _record_live_page_admission(policy: RequestPolicy, candidates: Sequence[Cred
     for candidate in candidates:
         if candidate.credential_id not in already_resolved:
             policy.live_page_admitted_urls[candidate.credential_id] = page_url
+            policy.auto_bound_credentials.append(candidate)
 
 
 async def resolve_credential_for_live_page(
