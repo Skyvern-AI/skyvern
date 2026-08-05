@@ -300,6 +300,31 @@ def test_inactivity_timeout_is_not_infrastructure() -> None:
     assert "PAGE_LOAD_TIMEOUT" in categories
 
 
+def test_secure_codeblock_runner_unavailable_classifies_as_infrastructure() -> None:
+    reason = "code block failed. failure reason: Secure CodeBlock runner is unavailable. Please retry."
+    categories = _categories_for(reason, fallback_to_unknown=True)
+
+    assert categories[0] == "INFRASTRUCTURE_ERROR"
+    assert "UNKNOWN" not in categories
+
+
+def test_secure_codeblock_runner_unavailable_carries_a_reason_code() -> None:
+    reason = "code block failed. failure reason: Secure CodeBlock runner is unavailable. Please retry."
+    result = _classify(reason, fallback_to_unknown=True)
+
+    infra = [entry for entry in result if entry["category"] == "INFRASTRUCTURE_ERROR"]
+    assert len(infra) == 1
+    assert infra[0]["reason_code"] == "secure_codeblock_runner_unavailable"
+
+
+def test_ordinary_user_code_failure_is_not_infrastructure() -> None:
+    # A block that reached the sandbox and raised is a user-code fault, not a deploy fault.
+    reason = "code block failed. failure reason: CodeBlock failed while running user code."
+    categories = _categories_for(reason, fallback_to_unknown=True)
+
+    assert "INFRASTRUCTURE_ERROR" not in categories
+
+
 @pytest.mark.asyncio
 async def test_page_analysis_timeout_reason_ranks_page_load_timeout() -> None:
     browser_state = MagicMock()
