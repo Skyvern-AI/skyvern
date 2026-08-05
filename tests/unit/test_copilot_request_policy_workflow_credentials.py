@@ -2994,6 +2994,51 @@ class TestLivePageCredentialAdmission:
         emitted = [entry for entry in logs if entry["event"] == "copilot credential live-page admission"]
         assert [(entry["seam"], entry["outcome"]) for entry in emitted] == [("fill", "admitted")]
 
+    @pytest.mark.asyncio
+    async def test_an_input_that_is_not_a_page_abstains_and_never_steers_the_user(self) -> None:
+        with capture_logs() as logs:
+            admission, load_mock = await _admit(
+                RequestPolicy(),
+                credential_id="cred_analytics",
+                page_url="current_page",
+                org_credentials=[_cred("analytics", "cred_analytics", _SAVED_LOGIN_URL)],
+            )
+
+        emitted = [entry for entry in logs if entry["event"] == "copilot credential live-page admission"]
+        assert admission.admitted is False
+        assert admission.steer is None
+        assert [(entry["seam"], entry["outcome"]) for entry in emitted] == [("fill", "abstain")]
+        load_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("page_url", "logged_identity"),
+        [
+            # Userinfo, query, fragment, params and path each carry the secret; none is identity.
+            ("scout:hunter2@current_page", "scout:"),
+            ("data:text/html,hunter2", "data:"),
+            ("current_page;jsessionid=hunter2", "current_page"),
+            ("custom://current_page?token=hunter2", "custom://current_page"),
+            ("custom://current_page#token=hunter2", "custom://current_page"),
+            ("custom://current_page/reset/hunter2", "custom://current_page"),
+            ("custom://current_page/x%3Ftoken=hunter2", "custom://current_page"),
+        ],
+    )
+    async def test_an_unresolvable_input_never_carries_a_secret_into_the_log(
+        self, page_url: str, logged_identity: str
+    ) -> None:
+        with capture_logs() as logs:
+            await _admit(
+                RequestPolicy(),
+                credential_id="cred_analytics",
+                page_url=page_url,
+                org_credentials=[_cred("analytics", "cred_analytics", _SAVED_LOGIN_URL)],
+            )
+
+        emitted = [entry for entry in logs if entry["event"] == "copilot credential live-page admission"]
+        assert "hunter2" not in emitted[0]["page_url"]
+        assert emitted[0]["page_url"] == logged_identity
+
 
 async def _resolve_live_page(
     policy: RequestPolicy,
@@ -3066,6 +3111,37 @@ class TestLivePageCredentialObservation:
         assert record.verdict == "no_match"
         assert policy.resolved_credentials == []
         assert policy.live_page_admitted_urls == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("page_url", "logged_identity"),
+        [
+            ("current_page", "current_page"),
+            ("about:blank", "about:"),
+            ("//analytics.example.com/login", "//analytics.example.com"),
+            # Too malformed to parse, so there is no identity to name and the outcome carries it.
+            ("http://[", ""),
+            ("http://[::1", ""),
+        ],
+    )
+    async def test_an_input_that_is_not_a_page_abstains_instead_of_claiming_no_match(
+        self, page_url: str, logged_identity: str
+    ) -> None:
+        policy = RequestPolicy()
+        with capture_logs() as logs:
+            record, load_mock = await _resolve_live_page(
+                policy,
+                page_url=page_url,
+                org_credentials=[_cred("analytics", "cred_analytics", _SAVED_LOGIN_URL)],
+            )
+
+        emitted = [entry for entry in logs if entry["event"] == "copilot credential live-page admission"]
+        assert record.verdict == "abstain"
+        assert [(entry["seam"], entry["outcome"]) for entry in emitted] == [("page_observation", "abstain")]
+        assert emitted[0]["page_url"] == logged_identity
+        assert policy.resolved_credentials == []
+        assert policy.live_page_resolution is None
+        load_mock.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_card_credential_never_binds_as_a_login(self) -> None:
