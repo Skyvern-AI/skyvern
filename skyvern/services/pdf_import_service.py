@@ -15,6 +15,11 @@ from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
 
 LOG = structlog.get_logger(__name__)
 
+# Pre-compile regex patterns for better performance
+_WORKFLOW_PREFIX_PATTERN = re.compile(r"\{\{\s*workflow\.([a-zA-Z0-9_\.]+)\s*\}\}")
+_PARAMETERS_PREFIX_PATTERN = re.compile(r"\{\{\s*parameters\.([a-zA-Z0-9_\.]+)\s*\}\}")
+_JINJA_VARIABLE_PATTERN = re.compile(r"\{\{\s*([^\}\s\|]+)\s*[^}]*\}\}")
+
 
 class PDFImportService:
     @staticmethod
@@ -30,12 +35,12 @@ class PDFImportService:
         def strip_prefixes(text: str) -> tuple[str, set[str]]:
             # Replace {{ workflow.xxx }} and {{ parameters.xxx }} with {{ xxx }}
             cleaned = text
-            cleaned = re.sub(r"\{\{\s*workflow\.([a-zA-Z0-9_\.]+)\s*\}\}", r"{{ \1 }}", cleaned)
-            cleaned = re.sub(r"\{\{\s*parameters\.([a-zA-Z0-9_\.]+)\s*\}\}", r"{{ \1 }}", cleaned)
+            cleaned = _WORKFLOW_PREFIX_PATTERN.sub(r"{{ \1 }}", cleaned)
+            cleaned = _PARAMETERS_PREFIX_PATTERN.sub(r"{{ \1 }}", cleaned)
 
             # Collect jinja variable names (take first segment before any dot)
             used: set[str] = set()
-            for match in re.finditer(r"\{\{\s*([^\}\s\|]+)\s*[^}]*\}\}", cleaned):
+            for match in _JINJA_VARIABLE_PATTERN.finditer(cleaned):
                 var = match.group(1)
                 # Use base segment before dot to match parameter keys
                 base = var.split(".")[0]
