@@ -1,14 +1,21 @@
-from datetime import datetime
+from collections.abc import Iterator
+from datetime import datetime, timedelta
+from time import time as current_time
 from types import SimpleNamespace
 
 import jwt
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from freezegun import freeze_time
 
 from skyvern.config import settings
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.core.security import create_access_token
-from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.routes.routers import legacy_base_router
+from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
+from skyvern.forge.sdk.services import org_auth_service, org_auth_token_service
 from skyvern.forge.sdk.services.org_auth_service import (
     _get_api_key_debug_fields,
     _normalize_api_key_with_flags,
@@ -224,3 +231,550 @@ def test_invalidate_cached_org_handles_empty_cache() -> None:
 
     # Should not raise.
     org_auth_service.invalidate_cached_org("anything")
+
+
+class _FakeOrganizationsRepository:
+    def __init__(self, organization: Organization) -> None:
+        self.organization = organization
+        self.tokens: dict[tuple[OrganizationAuthTokenType, str], OrganizationAuthToken] = {}
+        self.rows: dict[str, OrganizationAuthToken] = {}
+        self.create_calls = 0
+        self.validation_calls = 0
+        self.validation_token_types: list[OrganizationAuthTokenType] = []
+
+    async def get_organization(self, organization_id: str) -> Organization | None:
+        if organization_id == self.organization.organization_id:
+            return self.organization
+        return None
+
+    async def create_org_auth_token(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+        token: str,
+    ) -> OrganizationAuthToken:
+        now = datetime.utcnow()
+        self.create_calls += 1
+        auth_token = OrganizationAuthToken(
+            id=f"test-token-id-{self.create_calls}",
+            organization_id=organization_id,
+            token_type=token_type,
+            token=token,
+            valid=True,
+            created_at=now,
+            modified_at=now,
+        )
+        self.tokens[(token_type, token)] = auth_token
+        self.rows[auth_token.id] = auth_token
+        return auth_token
+
+    async def get_valid_org_auth_token(
+        self,
+        organization_id: str,
+        token_type: str,
+    ) -> OrganizationAuthToken | None:
+        return next(
+            (
+                token
+                for token in self.rows.values()
+                if token.organization_id == organization_id and token.token_type.value == token_type and token.valid
+            ),
+            None,
+        )
+
+    async def get_valid_org_auth_tokens(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+    ) -> list[OrganizationAuthToken]:
+        return sorted(
+            (
+                token
+                for token in self.rows.values()
+                if token.organization_id == organization_id and token.token_type == token_type and token.valid
+            ),
+            key=lambda token: token.created_at,
+            reverse=True,
+        )
+
+    async def delete_org_auth_tokens(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+        token_ids: list[str],
+    ) -> None:
+        for token_id in token_ids:
+            token = self.rows.get(token_id)
+            if token is None or token.organization_id != organization_id or token.token_type != token_type:
+                continue
+            self.rows.pop(token_id)
+            if self.tokens.get((token_type, token.token)) is token:
+                self.tokens.pop((token_type, token.token))
+
+    async def validate_org_auth_token(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+        token: str,
+        valid: bool | None = None,
+    ) -> OrganizationAuthToken | None:
+        self.validation_calls += 1
+        self.validation_token_types.append(token_type)
+        auth_token = self.tokens.get((token_type, token))
+        if auth_token is None or auth_token.organization_id != organization_id:
+            return None
+        if valid is not None and auth_token.valid is not valid:
+            return None
+        return auth_token
+
+
+class _FakeAgentDB:
+    def __init__(self, organizations: _FakeOrganizationsRepository) -> None:
+        self.organizations = organizations
+
+
+@pytest.fixture(autouse=True)
+def _clear_current_org_cache() -> Iterator[None]:
+    org_auth_service._current_org_cache.clear()
+    yield
+    org_auth_service._current_org_cache.clear()
+
+
+async def _mint_ui_session_token(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    valid: bool = True,
+) -> tuple[str, _FakeAgentDB, _FakeOrganizationsRepository]:
+    monkeypatch.setattr(settings, "SECRET_KEY", "unit-test-ui-session-secret-canary-value")
+    monkeypatch.setattr(settings, "UI_SESSION_TOKEN_TTL_MINUTES", 2)
+    monkeypatch.setattr(org_auth_service.app, "AGENT_FUNCTION", AgentFunction())
+    organization = _make_org("org-ui-session")
+    repository = _FakeOrganizationsRepository(organization)
+    db = _FakeAgentDB(repository)
+    monkeypatch.setattr(org_auth_token_service.app, "DATABASE", db)
+
+    auth_token, _ = await org_auth_token_service.create_org_ui_session_token(organization.organization_id)
+    auth_token.valid = valid
+    return auth_token.token, db, repository
+
+
+async def _mint_api_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[str, _FakeAgentDB, _FakeOrganizationsRepository]:
+    monkeypatch.setattr(settings, "SECRET_KEY", "unit-test-api-route-secret-canary")
+    monkeypatch.setattr(org_auth_service.app, "AGENT_FUNCTION", AgentFunction())
+    organization = _make_org("org-api-route")
+    repository = _FakeOrganizationsRepository(organization)
+    db = _FakeAgentDB(repository)
+    token = create_access_token(organization.organization_id, expires_delta=timedelta(hours=1))
+    await repository.create_org_auth_token(
+        organization_id=organization.organization_id,
+        token_type=OrganizationAuthTokenType.api,
+        token=token,
+    )
+    monkeypatch.setattr(org_auth_service.app, "DATABASE", db)
+    return token, db, repository
+
+
+def _organization_routes_client() -> TestClient:
+    fastapi_app = FastAPI()
+    fastapi_app.include_router(legacy_base_router, prefix="/api/v1")
+    return TestClient(fastapi_app)
+
+
+@pytest.mark.asyncio
+async def test_freshly_minted_ui_session_token_authenticates(monkeypatch: pytest.MonkeyPatch) -> None:
+    issued_after = current_time()
+
+    token, db, repository = await _mint_ui_session_token(monkeypatch)
+    payload = jwt.decode(
+        token,
+        settings.SECRET_KEY,
+        algorithms=[settings.SIGNATURE_ALGORITHM],
+        options={"verify_exp": False},
+    )
+
+    assert payload["token_type"] == OrganizationAuthTokenType.ui_session.value
+    assert payload["exp"] == pytest.approx(issued_after + 120, abs=2)
+    assert repository.tokens[(OrganizationAuthTokenType.ui_session, token)].valid is True
+
+    organization = await org_auth_service.get_current_org_cached(token, db)
+
+    assert organization.organization_id == "org-ui-session"
+    assert repository.validation_token_types == [OrganizationAuthTokenType.ui_session]
+
+
+@pytest.mark.asyncio
+async def test_expired_ui_session_token_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    token, db, repository = await _mint_ui_session_token(monkeypatch)
+    payload = jwt.decode(
+        token,
+        settings.SECRET_KEY,
+        algorithms=[settings.SIGNATURE_ALGORITHM],
+        options={"verify_exp": False},
+    )
+    monkeypatch.setattr(org_auth_service.time, "time", lambda: payload["exp"] + 1)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await org_auth_service.get_current_org_cached(token, db)
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "Auth token is expired"
+    assert repository.validation_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_ui_session_expiry_is_checked_before_cached_authentication(monkeypatch: pytest.MonkeyPatch) -> None:
+    token, db, repository = await _mint_ui_session_token(monkeypatch)
+    payload = jwt.decode(
+        token,
+        settings.SECRET_KEY,
+        algorithms=[settings.SIGNATURE_ALGORITHM],
+        options={"verify_exp": False},
+    )
+
+    organization = await org_auth_service.get_current_org_cached(token, db)
+    validation_calls = repository.validation_calls
+    assert organization.organization_id == "org-ui-session"
+
+    monkeypatch.setattr(org_auth_service.time, "time", lambda: payload["exp"] + 1)
+    with pytest.raises(HTTPException) as exc_info:
+        await org_auth_service.get_current_org_cached(token, db)
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "Auth token is expired"
+    assert repository.validation_calls == validation_calls
+
+
+@pytest.mark.asyncio
+async def test_expired_api_token_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "SECRET_KEY", "unit-test-api-token-secret-canary-value")
+    organization = _make_org("org-api-token")
+    repository = _FakeOrganizationsRepository(organization)
+    db = _FakeAgentDB(repository)
+    token = create_access_token(organization.organization_id, expires_delta=timedelta(seconds=-1))
+    await repository.create_org_auth_token(
+        organization_id=organization.organization_id,
+        token_type=OrganizationAuthTokenType.api,
+        token=token,
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        await org_auth_service.get_current_org_cached(token, db)
+
+    assert excinfo.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_unexpired_api_token_authenticates(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "SECRET_KEY", "unit-test-api-token-secret-canary-value")
+    organization = _make_org("org-api-token-valid")
+    repository = _FakeOrganizationsRepository(organization)
+    db = _FakeAgentDB(repository)
+    token = create_access_token(organization.organization_id, expires_delta=timedelta(hours=1))
+    await repository.create_org_auth_token(
+        organization_id=organization.organization_id,
+        token_type=OrganizationAuthTokenType.api,
+        token=token,
+    )
+
+    resolved_organization = await org_auth_service.get_current_org_cached(token, db)
+
+    assert resolved_organization.organization_id == organization.organization_id
+
+
+@pytest.mark.asyncio
+async def test_cached_api_authentication_decodes_once_before_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "SECRET_KEY", "unit-test-cached-api-secret-canary-value")
+    organization = _make_org("org-api-token-cached")
+    repository = _FakeOrganizationsRepository(organization)
+    db = _FakeAgentDB(repository)
+    token = create_access_token(organization.organization_id, expires_delta=timedelta(hours=1))
+    await repository.create_org_auth_token(
+        organization_id=organization.organization_id,
+        token_type=OrganizationAuthTokenType.api,
+        token=token,
+    )
+    await org_auth_service.get_current_org_cached(token, db)
+
+    decode = org_auth_service.jwt.decode
+    decode_calls = 0
+
+    def count_decode(*args: object, **kwargs: object) -> dict:
+        nonlocal decode_calls
+        decode_calls += 1
+        return decode(*args, **kwargs)
+
+    monkeypatch.setattr(org_auth_service.jwt, "decode", count_decode)
+
+    resolved_organization = await org_auth_service.get_current_org_cached(token, db)
+
+    assert resolved_organization.organization_id == organization.organization_id
+    assert decode_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_repeated_ui_session_mints_keep_token_rows_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "SECRET_KEY", "unit-test-bounded-ui-session-secret-canary")
+    monkeypatch.setattr(settings, "UI_SESSION_TOKEN_TTL_MINUTES", 2)
+    organization = _make_org("org-ui-session-bounded")
+    repository = _FakeOrganizationsRepository(organization)
+    db = _FakeAgentDB(repository)
+    monkeypatch.setattr(org_auth_token_service.app, "DATABASE", db)
+
+    with freeze_time("2030-01-01T00:00:00Z") as frozen_time:
+        first_token, _ = await org_auth_token_service.create_org_ui_session_token(organization.organization_id)
+        for _ in range(5):
+            reused_token, _ = await org_auth_token_service.create_org_ui_session_token(organization.organization_id)
+            assert reused_token.token == first_token.token
+        assert repository.create_calls == 1
+
+        for _ in range(6):
+            frozen_time.tick(delta=timedelta(seconds=61))
+            await org_auth_token_service.create_org_ui_session_token(organization.organization_id)
+
+    assert len(repository.rows) <= 2
+
+
+@pytest.mark.asyncio
+async def test_revoking_a_ui_session_token_takes_effect_despite_the_auth_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token, db, repository = await _mint_ui_session_token(monkeypatch)
+
+    # Authenticate once so a cached entry would exist for this token.
+    organization = await org_auth_service.get_current_org_cached(token, db)
+    assert organization.organization_id == "org-ui-session"
+
+    for auth_token in repository.tokens.values():
+        auth_token.valid = False
+
+    with pytest.raises(HTTPException) as exc_info:
+        await org_auth_service.get_current_org_cached(token, db)
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_revoked_ui_session_token_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    token, db, _ = await _mint_ui_session_token(monkeypatch, valid=False)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await org_auth_service.get_current_org_cached(token, db)
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "Invalid credentials"
+
+
+@pytest.mark.asyncio
+async def test_ui_session_token_is_not_accepted_by_api_only_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
+    token, db, _ = await _mint_ui_session_token(monkeypatch)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await org_auth_service.resolve_org_from_api_key(token, db)
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "Invalid credentials"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix", ["", "/"])
+async def test_self_hosted_api_key_route_rejects_ui_session_token(
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+) -> None:
+    token, _, _ = await _mint_ui_session_token(monkeypatch)
+
+    with _organization_routes_client() as client:
+        response = client.get(
+            f"/api/v1/organizations/org-ui-session/apikeys{suffix}",
+            headers={"x-api-key": token},
+        )
+
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix", ["", "/"])
+async def test_api_key_route_accepts_api_token(
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+) -> None:
+    token, _, _ = await _mint_api_token(monkeypatch)
+
+    with _organization_routes_client() as client:
+        response = client.get(
+            f"/api/v1/organizations/org-api-route/apikeys{suffix}",
+            headers={"x-api-key": token},
+        )
+
+    assert response.status_code == 200
+    assert len(response.json()["api_keys"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_self_hosted_credential_gate_accepts_ui_session_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    token, db, _ = await _mint_ui_session_token(monkeypatch)
+    monkeypatch.setattr(org_auth_service.app, "AGENT_FUNCTION", AgentFunction())
+    monkeypatch.setattr(org_auth_service.app, "DATABASE", db)
+
+    organization = await org_auth_service.get_current_org_for_credential_routes(x_api_key=token)
+
+    assert organization.organization_id == "org-ui-session"
+
+
+@pytest.mark.asyncio
+async def test_ordinary_organization_route_accepts_ui_session_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    token, _, _ = await _mint_ui_session_token(monkeypatch)
+
+    with _organization_routes_client() as client:
+        response = client.get(
+            "/api/v1/organizations/me",
+            headers={"x-api-key": token},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["organization_id"] == "org-ui-session"
+
+
+@pytest.mark.parametrize("expires_at", [float("nan"), float("inf"), float("-inf")])
+def test_ui_session_expiration_rejects_non_finite_values(
+    monkeypatch: pytest.MonkeyPatch,
+    expires_at: float,
+) -> None:
+    monkeypatch.setattr(
+        org_auth_token_service.jwt,
+        "decode",
+        lambda *_args, **_kwargs: {
+            "sub": "org-ui-session",
+            "token_type": OrganizationAuthTokenType.ui_session.value,
+            "exp": expires_at,
+        },
+    )
+
+    result = org_auth_token_service._ui_session_expiration(
+        SimpleNamespace(token="non-finite-exp-token-canary"),
+        "org-ui-session",
+    )
+
+    assert result is None
+
+
+def test_ui_session_expiration_accepts_large_integer(monkeypatch: pytest.MonkeyPatch) -> None:
+    expires_at = 10**1000
+    monkeypatch.setattr(
+        org_auth_token_service.jwt,
+        "decode",
+        lambda *_args, **_kwargs: {
+            "sub": "org-ui-session",
+            "token_type": OrganizationAuthTokenType.ui_session.value,
+            "exp": expires_at,
+        },
+    )
+
+    result = org_auth_token_service._ui_session_expiration(
+        SimpleNamespace(token="large-exp-token-canary"),
+        "org-ui-session",
+    )
+
+    assert result == expires_at
+
+
+@pytest.mark.asyncio
+async def test_ui_session_row_without_signed_type_claim_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "SECRET_KEY", "unit-test-missing-claim-secret-canary")
+    organization = _make_org("org-ui-session")
+    repository = _FakeOrganizationsRepository(organization)
+    db = _FakeAgentDB(repository)
+    token = create_access_token(organization.organization_id, expires_delta=timedelta(minutes=2))
+    await repository.create_org_auth_token(
+        organization_id=organization.organization_id,
+        token_type=OrganizationAuthTokenType.ui_session,
+        token=token,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await org_auth_service.get_current_org_cached(token, db)
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "Invalid credentials"
+
+
+def test_credential_bearing_routes_use_the_deployment_aware_gate() -> None:
+    import inspect
+    from typing import Annotated, get_args, get_origin
+
+    from skyvern.forge.sdk.routes import agent_protocol
+    from skyvern.forge.sdk.routes import credentials as credentials_routes
+    from skyvern.forge.sdk.routes import custom_llms, google_oauth, microsoft_oauth
+
+    # Every module holding credential- or credential-config-bearing routes. Enumerated from the
+    # modules rather than listed by name, so a newly added route fails this test instead of silently
+    # defaulting to the permissive dependency. Intentional exemptions must be named with a reason.
+    # cloud/ modules are covered by tests/cloud/; this file syncs to the OSS repo where they do
+    # not exist.
+    CREDENTIAL_ROUTE_MODULES = (
+        credentials_routes,
+        custom_llms,
+        google_oauth,
+        microsoft_oauth,
+    )
+    EXEMPT_FROM_CREDENTIAL_GATE: dict[str, str] = {}
+
+    def route_dependencies(handler: object) -> set[object]:
+        # Both declaration styles count: `x = Depends(dep)` and `Annotated[T, Depends(dep)]`. Reading
+        # only defaults makes every Annotated route invisible, which is how the OAuth modules stayed
+        # ungated while this test reported green.
+        dependencies: set[object] = set()
+        for parameter in inspect.signature(handler).parameters.values():
+            if parameter.default is not inspect.Parameter.empty:
+                dependencies.add(getattr(parameter.default, "dependency", None))
+            if get_origin(parameter.annotation) is Annotated:
+                for metadata in get_args(parameter.annotation)[1:]:
+                    dependencies.add(getattr(metadata, "dependency", None))
+        return dependencies
+
+    def is_org_authed_route(handler: object, module: object) -> bool:
+        if not callable(handler) or getattr(handler, "__module__", None) != module.__name__:
+            return False
+        return bool(
+            route_dependencies(handler)
+            & {
+                org_auth_service.get_current_org,
+                org_auth_service.get_current_org_for_credential_routes,
+            }
+        )
+
+    credential_route_handlers = {
+        f"{module.__name__}.{name}": handler
+        for module in CREDENTIAL_ROUTE_MODULES
+        for name, handler in vars(module).items()
+        if is_org_authed_route(handler, module)
+    }
+    assert credential_route_handlers, "found no credential routes to check — the enumeration broke"
+
+    for name, handler in sorted(credential_route_handlers.items()):
+        if name in EXEMPT_FROM_CREDENTIAL_GATE:
+            continue
+        dependencies = route_dependencies(handler)
+        assert org_auth_service.get_current_org_for_credential_routes in dependencies, (
+            f"{name} must use the deployment-aware credential gate"
+        )
+        assert org_auth_service.get_current_org not in dependencies, (
+            f"{name} still accepts a ui_session token via the ungated dependency"
+        )
+
+    api_key_route_dependencies = {
+        getattr(parameter.default, "dependency", None)
+        for parameter in inspect.signature(agent_protocol.get_api_keys).parameters.values()
+        if parameter.default is not inspect.Parameter.empty
+    }
+    assert org_auth_service.get_current_org_with_api_token in api_key_route_dependencies
+    assert org_auth_service.get_current_org_for_credential_routes not in api_key_route_dependencies
+
+    api_key_resolver_dependencies = {
+        getattr(parameter.default, "dependency", None)
+        for parameter in inspect.signature(org_auth_service.get_current_org_with_api_token).parameters.values()
+        if parameter.default is not inspect.Parameter.empty
+    }
+    assert org_auth_service.get_current_org_for_credential_routes not in api_key_resolver_dependencies
