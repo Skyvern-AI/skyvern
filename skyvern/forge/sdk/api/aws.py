@@ -28,7 +28,7 @@ add_type("application/zstd", ".zst")
 
 _S3_OPERATION_RETRIES = 2
 # get_object on a missing key raises NoSuchKey; head-style paths use 404/NotFound.
-_S3_NOT_FOUND_ERROR_CODES = frozenset({"NoSuchKey", "NotFound", "404"})
+S3_NOT_FOUND_ERROR_CODES = frozenset({"NoSuchKey", "NotFound", "404"})
 # Long-lived holders (e.g. the storage singleton on persistent-sessions workers) must not reuse a
 # session past the 1-hour projected web-identity token expiry (SKY-8743, SKY-13210).
 _SESSION_TTL_SECONDS: float = 45 * 60
@@ -122,7 +122,7 @@ class AsyncAWSClient:
     def _is_not_found_error(self, error: Exception) -> bool:
         """Check if an exception is a missing-object (terminal not-found) error."""
         return (
-            isinstance(error, ClientError) and error.response.get("Error", {}).get("Code") in _S3_NOT_FOUND_ERROR_CODES
+            isinstance(error, ClientError) and error.response.get("Error", {}).get("Code") in S3_NOT_FOUND_ERROR_CODES
         )
 
     def _error_code(self, error: Exception) -> str:
