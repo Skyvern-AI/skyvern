@@ -684,9 +684,11 @@ async def test_resolver_exact_name_is_independent_of_classifier_label(
 
 
 @pytest.mark.asyncio
-async def test_explicit_id_wins_and_skips_name_and_url_scan() -> None:
+async def test_explicit_id_and_explicit_name_resolve_together() -> None:
+    """Both stated references resolve; neither preempts the other (SKY-13552)."""
+    named = _cred("named-login", "cred_named")
     by_ids = AsyncMock(return_value=[_cred("id-login", "cred_explicit")])
-    load_mock = AsyncMock(side_effect=AssertionError("organization scan should not run after an ID hit"))
+    load_mock = AsyncMock(return_value=[named])
     policy = RequestPolicy(
         credential_input_kind="credential_id",
         credential_refs=["cred_explicit", "named-login"],
@@ -696,14 +698,14 @@ async def test_explicit_id_wins_and_skips_name_and_url_scan() -> None:
     await _resolve_direct(
         policy,
         user_message="Use credential ID cred_explicit and the saved credential named named-login.",
-        org_credentials=[],
+        org_credentials=[named],
         get_credentials=load_mock,
         get_credentials_by_ids=by_ids,
     )
 
-    assert [candidate.credential_id for candidate in policy.resolved_credentials] == ["cred_explicit"]
+    assert [candidate.credential_id for candidate in policy.resolved_credentials] == ["cred_explicit", "cred_named"]
+    assert policy.requires_user_clarification is False
     by_ids.assert_awaited_once_with(["cred_explicit"], organization_id="o_test")
-    load_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -711,7 +713,6 @@ async def test_explicit_id_wins_for_non_id_label_and_competing_url_match() -> No
     explicit = _cred("id-login", "cred_explicit")
     competing = _cred("url-login", "cred_url", tested_url="https://portal.example.com/login")
     by_ids = AsyncMock(return_value=[explicit])
-    load_mock = AsyncMock(side_effect=AssertionError("organization scan should not run after an ID hit"))
     policy = RequestPolicy(
         credential_input_kind="website_stored_credential",
         credential_refs=["cred_explicit"],
@@ -722,13 +723,12 @@ async def test_explicit_id_wins_for_non_id_label_and_competing_url_match() -> No
         policy,
         user_message="Use credential ID cred_explicit for https://portal.example.com/login.",
         org_credentials=[competing],
-        get_credentials=load_mock,
         get_credentials_by_ids=by_ids,
     )
 
     assert [candidate.credential_id for candidate in policy.resolved_credentials] == ["cred_explicit"]
+    assert policy.auto_bound_credentials == []
     by_ids.assert_awaited_once_with(["cred_explicit"], organization_id="o_test")
-    load_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -774,6 +774,7 @@ async def test_classifier_id_absent_from_current_message_does_not_resolve() -> N
         "Avoid using cred_prod.",
         "Exclude credential ID cred_prod.",
         "Do not use the old workflow because it still mentions credential ID cred_prod.",
+        "Do not use the old workflow because it mentions cred_prod.",
         "Do not use this credential, credential ID cred_prod.",
     ],
 )
@@ -801,12 +802,14 @@ async def test_negated_explicit_id_does_not_resolve(user_message: str) -> None:
     [
         "Use this as a documentation example: cred_prod.",
         "Use the staging workflow; the notes mention cred_prod.",
-        "Do not use the old workflow because it mentions cred_prod.",
         'Document the string "cred_prod" in the workflow notes.',
+        "cred_prod\n\ncan you use this credential to log into the portal?",
+        "Here's a credential you can use to test: cred_prod",
     ],
 )
-async def test_unrelated_explicit_id_mention_does_not_resolve(user_message: str) -> None:
-    by_ids = AsyncMock(side_effect=AssertionError("unrelated credential IDs must not be resolved"))
+async def test_stated_explicit_id_resolves_regardless_of_prose_shape(user_message: str) -> None:
+    """A cred_ ID the user typed is supplied, whatever surrounds it; only negation withdraws it (SKY-13552)."""
+    by_ids = AsyncMock(return_value=[_cred("prod-login", "cred_prod")])
     policy = RequestPolicy(
         credential_input_kind="credential_id",
         credential_refs=["cred_prod"],
@@ -819,8 +822,9 @@ async def test_unrelated_explicit_id_mention_does_not_resolve(user_message: str)
         get_credentials_by_ids=by_ids,
     )
 
-    assert policy.resolved_credentials == []
-    by_ids.assert_not_awaited()
+    assert [candidate.credential_id for candidate in policy.resolved_credentials] == ["cred_prod"]
+    assert policy.requires_user_clarification is False
+    by_ids.assert_awaited_once_with(["cred_prod"], organization_id="o_test")
 
 
 @pytest.mark.asyncio
@@ -979,8 +983,8 @@ async def test_bare_id_appositive_negation_revokes_earlier_authority() -> None:
 
 
 @pytest.mark.asyncio
-async def test_invalid_explicit_id_does_not_fall_through_to_name() -> None:
-    load_mock = AsyncMock(side_effect=AssertionError("organization scan should not run after an explicit ID"))
+async def test_invalid_explicit_id_with_unknown_name_asks_instead_of_inferring() -> None:
+    """Nothing stated resolved, so the turn asks; it never falls through to the inference tiers."""
     policy = RequestPolicy(
         credential_input_kind="credential_id",
         credential_refs=["cred_missing", "named-login"],
@@ -990,14 +994,34 @@ async def test_invalid_explicit_id_does_not_fall_through_to_name() -> None:
         policy,
         user_message="Use credential ID cred_missing and the saved credential named named-login.",
         org_credentials=[],
-        get_credentials=load_mock,
     )
 
     assert policy.invalid_credential_ids == ["cred_missing"]
+    assert policy.resolved_credentials == []
     assert policy.clarification_reason == "credential_name_unresolved"
-    assert policy.credential_ask_card_answerable is False
-    assert credential_pause_reason(SimpleNamespace(request_policy=policy)) is None
-    load_mock.assert_not_awaited()
+    assert policy.requires_user_clarification is True
+
+
+@pytest.mark.asyncio
+async def test_invalid_explicit_id_rides_along_when_another_stated_reference_resolves() -> None:
+    """An unresolvable stated ID never blocks a stated reference that did resolve (SKY-13552)."""
+    by_ids = AsyncMock(return_value=[_cred("real-login", "cred_real")])
+    policy = RequestPolicy(
+        credential_input_kind="credential_id",
+        credential_refs=["cred_real", "cred_missing"],
+    )
+
+    await _resolve_direct(
+        policy,
+        user_message="Use cred_real and cred_missing to log in.",
+        org_credentials=[],
+        get_credentials_by_ids=by_ids,
+    )
+
+    assert [candidate.credential_id for candidate in policy.resolved_credentials] == ["cred_real"]
+    assert policy.invalid_credential_ids == ["cred_missing"]
+    assert policy.requires_user_clarification is False
+    assert policy.allow_run_blocks is True
 
 
 @pytest.mark.asyncio
@@ -1553,7 +1577,7 @@ async def test_website_kind_explicit_name_wins_over_url_matched_card() -> None:
 
 
 @pytest.mark.asyncio
-async def test_success_credential_id_intent_is_not_overridden_by_name_scan() -> None:
+async def test_success_credential_id_and_stated_name_both_resolve() -> None:
     by_ids = AsyncMock(return_value=[_cred("real", "cred_real")])
     load_mock = AsyncMock(return_value=[_cred("mock-portal-login", "cred_login")])
     policy = await _build_with_forced_classifier(
@@ -1563,14 +1587,13 @@ async def test_success_credential_id_intent_is_not_overridden_by_name_scan() -> 
             credential_refs=["cred_real"],
             classifier_status="success",
         ),
-        org_credentials=[],
+        org_credentials=[_cred("mock-portal-login", "cred_login")],
         get_credentials=load_mock,
         get_credentials_by_ids=by_ids,
     )
 
     assert policy.credential_input_kind == "credential_id"
-    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_real"]
-    load_mock.assert_not_awaited()
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_real", "cred_login"]
 
 
 @pytest.mark.asyncio
