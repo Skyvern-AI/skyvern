@@ -356,6 +356,25 @@ def test_output_schema_ask_auto_answers_when_the_contract_only_holds_anonymous_s
     assert events[0]["resolved_refs"] == []
 
 
+def test_output_schema_ask_with_covered_refs_routes_to_the_declaring_read() -> None:
+    # The asker has usually already named a candidate page value; the answer routes it to the read
+    # that binds (declare output_path on the read) instead of licensing a freehand representation,
+    # which is what left the designation route unused (SKY-13485).
+    ctx = _mid_build_ctx(_output_path_contract_policy())
+
+    with capture_logs() as logs:
+        nudge = _response_coverage_nudge(ctx, _output_schema_ask([_REQUESTED_OUTPUT_PATHS[1]]))
+
+    assert nudge is not None
+    assert nudge != PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+    assert _REQUESTED_OUTPUT_PATHS[1] in nudge
+    assert "output_path" in nudge
+    assert "reasonable representation" not in nudge
+    events = [entry for entry in logs if entry["event"] == "copilot_ask_subject_auto_answered"]
+    assert len(events) == 1
+    assert events[0]["resolved_refs"] == [_REQUESTED_OUTPUT_PATHS[1]]
+
+
 def test_output_schema_ask_passes_through_when_any_requested_path_is_nameable() -> None:
     policy = _output_path_contract_policy(
         completion_criteria=[
