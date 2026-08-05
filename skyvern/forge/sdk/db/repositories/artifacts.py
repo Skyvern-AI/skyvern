@@ -100,8 +100,13 @@ class ArtifactsRepository(BaseRepository):
                 .returning(ArtifactModel)
             )
             artifact = await session.scalar(query)
+            if artifact is None:
+                return None
+            # Read the row before committing: commit expires the instance, and the
+            # refetch it would trigger runs outside the async greenlet context.
+            converted = convert_to_artifact(artifact, self.debug_enabled)
             await session.commit()
-            return convert_to_artifact(artifact, self.debug_enabled) if artifact else None
+            return converted
 
     @traced(name="skyvern.db.bulk_create_artifacts")
     @db_operation("bulk_create_artifacts")

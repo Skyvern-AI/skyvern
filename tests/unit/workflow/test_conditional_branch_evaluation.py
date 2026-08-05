@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import skyvern.forge.sdk.workflow.models.block as block_module
-from skyvern.exceptions import ConditionalBranchEvaluationError
+from skyvern.exceptions import BranchEvaluationContextTooLargeError, ConditionalBranchEvaluationError
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.workflow.models.block import (
     BranchCondition,
@@ -19,6 +19,11 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.schemas.workflows import BlockResult
+
+BRANCH_CONTEXT_TOO_LARGE_FAILURE_REASON = (
+    "Workflow branch evaluation context is too large to process safely. "
+    "Reduce the workflow input or prior block output size, then retry."
+)
 
 
 def _output_parameter(key: str) -> OutputParameter:
@@ -195,6 +200,144 @@ async def test_mixed_prompt_conditions_keep_browser_session() -> None:
 
     assert mock_extraction.execute.call_args.kwargs["browser_session_id"] == "bs_test"
     evaluation_context.build_llm_safe_context_snapshot.assert_called_once()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_oversized_branch_context_trips_before_extraction_and_returns_stable_failure() -> None:
+    block = _conditional_block()
+    oversized_context_value = "oversized-context-value " * 200_000
+
+    with (
+        patch.object(
+            BranchEvaluationContext,
+            "build_llm_safe_context_snapshot",
+            return_value={"sensitive_customer_key": oversized_context_value},
+        ),
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+        patch("skyvern.forge.sdk.workflow.models.block.diagnostic_fingerprint", return_value="key-fingerprint"),
+        patch.object(block_module.LOG, "warning") as mock_warning,
+        patch.object(
+            block_module.app.WORKFLOW_CONTEXT_MANAGER,
+            "get_workflow_run_context",
+            new=MagicMock(return_value=None),
+        ),
+        patch.object(ConditionalBlock, "build_block_result", new_callable=AsyncMock) as mock_build_result,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(
+            return_value=_failed_extraction_result(block.output_parameter, "downstream prompt failed")
+        )
+        mock_extraction_cls.return_value = mock_extraction
+        mock_build_result.return_value = BlockResult(
+            success=False,
+            output_parameter=block.output_parameter,
+            output_parameter_value=None,
+            failure_reason=BRANCH_CONTEXT_TOO_LARGE_FAILURE_REASON,
+        )
+
+        result = await block.execute(
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="org_test",
+        )
+
+    assert result.failure_reason == BRANCH_CONTEXT_TOO_LARGE_FAILURE_REASON
+    assert mock_build_result.await_args.kwargs["failure_reason"] == BRANCH_CONTEXT_TOO_LARGE_FAILURE_REASON
+    mock_extraction_cls.assert_not_called()
+
+    circuit_logs = [
+        call
+        for call in mock_warning.call_args_list
+        if call.args[0] == "conditional_branch_context_circuit_breaker_tripped"
+    ]
+    assert len(circuit_logs) == 1
+    circuit_log = circuit_logs[0]
+    assert circuit_log.kwargs["goal_token_count"] > 180_000
+    assert circuit_log.kwargs["max_goal_tokens"] == 150_000
+    assert circuit_log.kwargs["reserved_tokens"] == 30_000
+    assert circuit_log.kwargs["context_key_count"] == 1
+    assert circuit_log.kwargs["top_context_contributors"] == [
+        {
+            "key_fingerprint": "key-fingerprint",
+            "serialized_bytes": len(f'"{oversized_context_value}"'.encode()),
+            "token_count": circuit_log.kwargs["top_context_contributors"][0]["token_count"],
+        }
+    ]
+    assert "sensitive_customer_key" not in str(circuit_log)
+    assert oversized_context_value not in str(circuit_log)
+
+
+@pytest.mark.asyncio
+async def test_branch_goal_at_reserved_budget_boundary_still_executes_unchanged() -> None:
+    block = _conditional_block()
+    branch = block.branch_conditions[0]
+    evaluation_context = BranchEvaluationContext(workflow_run_context=None, template_renderer=lambda expr: expr)
+    evaluation_context.build_llm_safe_context_snapshot = MagicMock(return_value={"plan": "premium"})  # type: ignore[method-assign]
+
+    def _token_count(value: str) -> int:
+        return 150_000 if value == "goal-at-boundary" else 2
+
+    with (
+        patch(
+            "skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt",
+            return_value="goal-at-boundary",
+        ) as mock_prompt,
+        patch("skyvern.forge.sdk.workflow.models.block.count_tokens", side_effect=_token_count) as mock_count_tokens,
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(
+            return_value=_extraction_result(
+                block.output_parameter,
+                [{"condition_index": 1, "reasoning": "ok", "result": True}],
+            )
+        )
+        mock_extraction_cls.return_value = mock_extraction
+
+        results, _, extraction_goal, _ = await block._evaluate_prompt_branches(
+            branches=[branch],
+            evaluation_context=evaluation_context,
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="org_test",
+        )
+
+    assert results == [True]
+    assert extraction_goal == "goal-at-boundary"
+    assert mock_extraction_cls.call_args.kwargs["data_extraction_goal"] == "goal-at-boundary"
+    assert mock_prompt.call_args.kwargs["context_json"] == '{"plan": "premium"}'
+    assert any(call.args == ("goal-at-boundary",) for call in mock_count_tokens.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_branch_goal_above_reserved_budget_trips_before_extraction() -> None:
+    block = _conditional_block()
+    branch = block.branch_conditions[0]
+    evaluation_context = BranchEvaluationContext(workflow_run_context=None, template_renderer=lambda expr: expr)
+    evaluation_context.build_llm_safe_context_snapshot = MagicMock(return_value={"plan": "premium"})  # type: ignore[method-assign]
+
+    def _token_count(value: str) -> int:
+        return 150_001 if value == "goal-above-boundary" else 2
+
+    with (
+        patch(
+            "skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt",
+            return_value="goal-above-boundary",
+        ),
+        patch("skyvern.forge.sdk.workflow.models.block.count_tokens", side_effect=_token_count),
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+        patch("skyvern.forge.sdk.workflow.models.block.diagnostic_fingerprint", return_value="key-fingerprint"),
+    ):
+        with pytest.raises(BranchEvaluationContextTooLargeError):
+            await block._evaluate_prompt_branches(
+                branches=[branch],
+                evaluation_context=evaluation_context,
+                workflow_run_id="wr_test",
+                workflow_run_block_id="wrb_test",
+                organization_id="org_test",
+            )
+
+    mock_extraction_cls.assert_not_called()
 
 
 @pytest.mark.asyncio

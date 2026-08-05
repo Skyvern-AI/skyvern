@@ -9,8 +9,13 @@ import pytest
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.workflow.models.block import LoginBlock
-from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, OutputParameter
-from skyvern.forge.sdk.workflow.service import WorkflowService, _credential_id_from_setup_parameter
+from skyvern.forge.sdk.workflow.models.parameter import (
+    CredentialParameter,
+    OutputParameter,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
+from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.services.workflow_service import workflow_request_body_from_existing_run
 
@@ -705,10 +710,15 @@ async def test_maybe_pin_active_credential_applies_without_seed(monkeypatch: pyt
     assert update_run.await_args.kwargs["extra_http_headers"] == {"x-sky-proxy": "ps_active"}
 
 
-# --- credential id extraction (rotation-aware) -------------------------------
+# --- credential parameter builder (shared) -----------------------------------
 
 
-def _credential_parameter(key: str, credential_id: str, credential_ids: list[str] | None = None) -> CredentialParameter:
+def _credential_parameter(
+    key: str,
+    credential_id: str,
+    credential_ids: list[str] | None = None,
+    fallback_credential_ids: list[str] | None = None,
+) -> CredentialParameter:
     now = datetime.now(timezone.utc)
     return CredentialParameter(
         key=key,
@@ -716,24 +726,10 @@ def _credential_parameter(key: str, credential_id: str, credential_ids: list[str
         workflow_id="wf_test",
         credential_id=credential_id,
         credential_ids=credential_ids or [],
+        fallback_credential_ids=fallback_credential_ids or [],
         created_at=now,
         modified_at=now,
     )
-
-
-def test_credential_id_prefers_run_selection_over_static() -> None:
-    # Rotation: the per-run selected credential (in parameter_values, keyed by parameter key) wins.
-    param = _credential_parameter("login", credential_id="cred_static", credential_ids=["cred_a", "cred_b"])
-    assert _credential_id_from_setup_parameter(param, {"login": "cred_b"}) == "cred_b"
-
-
-def test_credential_id_falls_back_to_static_credential_id() -> None:
-    param = _credential_parameter("login", credential_id="cred_static")
-    assert _credential_id_from_setup_parameter(param, {}) == "cred_static"
-
-
-def test_credential_id_none_for_unrelated_parameter() -> None:
-    assert _credential_id_from_setup_parameter(SimpleNamespace(key="not_a_cred"), {}) is None
 
 
 # --- retry re-resolves instead of pinning ------------------------------------
@@ -812,7 +808,7 @@ def _output_parameter(key: str) -> OutputParameter:
     return OutputParameter(output_parameter_id=f"{key}_id", key=key, workflow_id="wf", created_at=now, modified_at=now)
 
 
-def _login_block(label: str, credential_param: CredentialParameter) -> LoginBlock:
+def _login_block(label: str, credential_param: CredentialParameter | WorkflowParameter) -> LoginBlock:
     return LoginBlock(
         url="https://example.com/login",
         label=label,
@@ -820,6 +816,19 @@ def _login_block(label: str, credential_param: CredentialParameter) -> LoginBloc
         navigation_goal="log in",
         output_parameter=_output_parameter(f"{label}_out"),
         parameters=[credential_param],
+    )
+
+
+def _workflow_credential_parameter(key: str, default_value: str | None) -> WorkflowParameter:
+    now = datetime.now(timezone.utc)
+    return WorkflowParameter(
+        key=key,
+        workflow_parameter_id=f"wp_{key}",
+        workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+        workflow_id="wf_test",
+        default_value=default_value,
+        created_at=now,
+        modified_at=now,
     )
 
 
@@ -832,6 +841,7 @@ def _workflow_with_blocks(*blocks: LoginBlock) -> SimpleNamespace:
 
 @pytest.mark.asyncio
 async def test_setup_credential_resolves_single_login_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})  # no run context at setup
     monkeypatch.setattr(
         app.DATABASE.credentials,
         "get_credential",
@@ -846,8 +856,9 @@ async def test_setup_credential_resolves_single_login_block(monkeypatch: pytest.
 
     result = await WorkflowService()._resolve_credential_browser_profile_id_for_setup(
         workflow=workflow,  # type: ignore[arg-type]
-        parameter_values={},
+        workflow_run_id="wr_test",
         organization_id="o_test",
+        parameter_values={},
     )
 
     assert result == "bp_cred"
@@ -864,8 +875,9 @@ async def test_setup_credential_defers_when_multiple_login_blocks(monkeypatch: p
 
     result = await WorkflowService()._resolve_credential_browser_profile_id_for_setup(
         workflow=workflow,  # type: ignore[arg-type]
-        parameter_values={},
+        workflow_run_id="wr_test",
         organization_id="o_test",
+        parameter_values={},
     )
 
     # Ambiguous which login block executes -> defer to the mid-run stamp, don't even look one up.
@@ -875,6 +887,7 @@ async def test_setup_credential_defers_when_multiple_login_blocks(monkeypatch: p
 
 @pytest.mark.asyncio
 async def test_setup_credential_best_effort_on_profile_lookup_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})  # no run context at setup
     monkeypatch.setattr(
         app.DATABASE.credentials,
         "get_credential",
@@ -890,11 +903,230 @@ async def test_setup_credential_best_effort_on_profile_lookup_failure(monkeypatc
     # A transient failure degrades to a fresh seed instead of failing setup.
     result = await WorkflowService()._resolve_credential_browser_profile_id_for_setup(
         workflow=workflow,  # type: ignore[arg-type]
-        parameter_values={},
+        workflow_run_id="wr_test",
         organization_id="o_test",
+        parameter_values={},
     )
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_setup_credential_resolves_pool_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The defect surface: a pool credential (credential_ids) is invisible to the old in-memory setup
+    # extractor, so setup seeded fresh while the block resolved the pool selection. That split brain only
+    # bites when a cached-script / pre-navigating block opens the browser before the login block, locking
+    # the mid-run loader out (get_or_create returns the already-open context) — leaving setup as the only
+    # loader that can seed. Setup must resolve the pool selection via the SAME rich path as the block.
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
+    # The run's rotation selection is already persisted (select_credential_for_run is idempotent per run).
+    monkeypatch.setattr(
+        app.DATABASE.workflow_run_credential_selections,
+        "get_selection",
+        AsyncMock(return_value="cred_pool"),
+    )
+    get_credential = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_pool"))
+    monkeypatch.setattr(app.DATABASE.credentials, "get_credential", get_credential)
+    monkeypatch.setattr(
+        app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_pool")),
+    )
+    workflow = _workflow_with_blocks(
+        _login_block("login", _credential_parameter("login", "cred_primary", credential_ids=["cred_a", "cred_pool"]))
+    )
+
+    result = await WorkflowService()._resolve_credential_browser_profile_id_for_setup(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        parameter_values={},
+    )
+
+    assert result == "bp_pool"
+    assert get_credential.await_args.kwargs["credential_id"] == "cred_pool"  # pool selection, not the static id
+
+
+@pytest.mark.asyncio
+async def test_setup_credential_resolves_fallback_db_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A fallback retry persists a DB credential selection that differs from the parameter's static id.
+    # The old in-memory extractor returned the static (primary) id, seeding the wrong account's profile;
+    # the block resolved the DB selection. Setup must read the same DB selection.
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
+    monkeypatch.setattr(
+        app.DATABASE.workflow_run_credential_selections,
+        "get_selection",
+        AsyncMock(return_value="cred_fallback"),
+    )
+    get_credential = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_fallback"))
+    monkeypatch.setattr(app.DATABASE.credentials, "get_credential", get_credential)
+    monkeypatch.setattr(
+        app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_fallback")),
+    )
+    workflow = _workflow_with_blocks(
+        _login_block("login", _credential_parameter("login", "cred_primary", fallback_credential_ids=["cred_fallback"]))
+    )
+
+    result = await WorkflowService()._resolve_credential_browser_profile_id_for_setup(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        parameter_values={},
+    )
+
+    assert result == "bp_fallback"
+    assert get_credential.await_args.kwargs["credential_id"] == "cred_fallback"  # DB selection wins over static
+
+
+@pytest.mark.asyncio
+async def test_setup_credential_uses_same_rich_resolver_as_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression pin: setup resolves the single login block's credential through the identical resolver
+    # the mid-run stamp uses (_resolve_login_block_credential_ids), so the two can never disagree.
+    svc = WorkflowService()
+    rich = AsyncMock(return_value=["cred_rich"])
+    monkeypatch.setattr(svc, "_resolve_login_block_credential_ids", rich)
+    monkeypatch.setattr(
+        app.DATABASE.credentials,
+        "get_credential",
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_rich")),
+    )
+    monkeypatch.setattr(
+        app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_rich")),
+    )
+    workflow = _workflow_with_blocks(_login_block("login", _credential_parameter("login", "cred_static")))
+
+    result = await svc._resolve_credential_browser_profile_id_for_setup(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        parameter_values={},
+    )
+
+    assert result == "bp_rich"
+    rich.assert_awaited_once()
+    assert rich.await_args.args[1:] == ("wr_test", "o_test", "wpid_test")
+
+
+@pytest.mark.asyncio
+async def test_setup_pin_resolves_pool_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The sibling pin resolver had the identical gap: a pool/DB-selected credential was invisible, so a
+    # pinning credential's dedicated IP was not applied at setup. It now resolves via the same rich path.
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
+    monkeypatch.setattr(
+        app.DATABASE.workflow_run_credential_selections,
+        "get_selection",
+        AsyncMock(return_value="cred_pool"),
+    )
+    monkeypatch.setattr(
+        app.DATABASE.credentials,
+        "get_credential",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                credential_id="cred_pool", pin_saved_session_ip=True, proxy_session_id="ps_pool"
+            )
+        ),
+    )
+    workflow = _workflow_with_blocks(
+        _login_block("login", _credential_parameter("login", "cred_primary", credential_ids=["cred_a", "cred_pool"]))
+    )
+
+    result = await WorkflowService()._resolve_active_credential_pin_for_setup(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        parameter_values={},
+    )
+
+    assert result == ("cred_pool", "ps_pool")
+
+
+@pytest.mark.asyncio
+async def test_setup_credential_prefers_request_value_over_default_for_workflow_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Setup runs before run parameters are persisted, so a request-supplied WorkflowParameter/CREDENTIAL_ID
+    # value lives only in the in-memory render params. Seeding must use it, not the parameter default, or a
+    # cached-script run seeds the wrong account.
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
+    get_credential = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_request"))
+    monkeypatch.setattr(app.DATABASE.credentials, "get_credential", get_credential)
+    monkeypatch.setattr(
+        app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_request")),
+    )
+    workflow = _workflow_with_blocks(
+        _login_block("login", _workflow_credential_parameter("login_wp", "cred_default_a"))
+    )
+
+    result = await WorkflowService()._resolve_credential_browser_profile_id_for_setup(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        parameter_values={"login_wp": "cred_request_b"},
+    )
+
+    assert result == "bp_request"
+    assert get_credential.await_args.kwargs["credential_id"] == "cred_request_b"  # request value, not the default
+
+
+@pytest.mark.asyncio
+async def test_setup_credential_resolves_dereferenced_binding_for_fallback_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A fallback-configured CredentialParameter whose credential_id indirectly references another parameter
+    # is dereferenced by the render pipeline into the in-memory params. With no persisted fallback selection
+    # yet, the rich resolver would return the raw reference; setup must use the dereferenced value.
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
+    monkeypatch.setattr(app.DATABASE.workflow_run_credential_selections, "get_selection", AsyncMock(return_value=None))
+    get_credential = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_deref"))
+    monkeypatch.setattr(app.DATABASE.credentials, "get_credential", get_credential)
+    monkeypatch.setattr(
+        app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_deref")),
+    )
+    workflow = _workflow_with_blocks(
+        _login_block("login", _credential_parameter("login_cred", "raw_reference", fallback_credential_ids=["fb"]))
+    )
+
+    result = await WorkflowService()._resolve_credential_browser_profile_id_for_setup(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        parameter_values={"login_cred": "cred_deref_b"},
+    )
+
+    assert result == "bp_deref"
+    assert get_credential.await_args.kwargs["credential_id"] == "cred_deref_b"  # dereferenced, not "raw_reference"
+
+
+@pytest.mark.asyncio
+async def test_setup_pin_prefers_request_value_over_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The pin resolver shares the setup credential resolution, so a request-supplied credential's pin must
+    # win over the parameter default's pin.
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
+    get_credential = AsyncMock(
+        return_value=SimpleNamespace(credential_id="cred_b", pin_saved_session_ip=True, proxy_session_id="ps_b")
+    )
+    monkeypatch.setattr(app.DATABASE.credentials, "get_credential", get_credential)
+    workflow = _workflow_with_blocks(
+        _login_block("login", _workflow_credential_parameter("login_wp", "cred_default_a"))
+    )
+
+    result = await WorkflowService()._resolve_active_credential_pin_for_setup(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        parameter_values={"login_wp": "cred_b"},
+    )
+
+    assert result == ("cred_b", "ps_b")
+    assert get_credential.await_args.kwargs["credential_id"] == "cred_b"  # request value, not the default
 
 
 @pytest.mark.asyncio

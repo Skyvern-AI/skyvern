@@ -15,6 +15,8 @@ import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.config import settings
+from skyvern.exceptions import BlockedHost, InvalidUrl, SkyvernHTTPException
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.utils import dom as dom_module
 from skyvern.webeye.utils.dom import InteractiveElement, SkyvernElement
 
@@ -74,6 +76,21 @@ class TestTryNavigateViaHref:
             "evaluate",
             AsyncMock(return_value=None),
         )
+        monkeypatch.setattr(dom_module, "validate_fetch_url", lambda url: url, raising=False)
+
+    @pytest.mark.asyncio
+    async def test_dom_try_navigate_via_href_rejects_loopback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        elem = _make_anchor_element(href="http://127.0.0.1/internal")
+        page = _make_page()
+        monkeypatch.setattr(dom_module, "validate_fetch_url", validate_fetch_url)
+
+        with pytest.raises(SkyvernHTTPException):
+            await elem.try_navigate_via_href(page=page)
+
+        elem.get_frame().goto.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_browser_normalized_href_is_preferred(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -285,6 +302,18 @@ class TestTryNavigateViaHref:
 
         assert result == "https://portal.example.com/statement.pdf"
         page.goto.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dom_navigate_to_a_href_rejects_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
+    elem = _make_anchor_element(href="http://127.0.0.1/internal", target="_blank")
+    page = _make_page()
+    monkeypatch.setattr(dom_module, "validate_fetch_url", validate_fetch_url, raising=False)
+
+    with pytest.raises(SkyvernHTTPException):
+        await elem.navigate_to_a_href(page=page)
+
+    page.goto.assert_not_awaited()
 
 
 class TestChainClickBlockedAnchorNavigation:
@@ -717,6 +746,7 @@ def _make_ladder_element(*, tag: str = "button", **stubs: object) -> SkyvernElem
     elem.get_element_handler = AsyncMock(return_value=MagicMock())  # type: ignore[method-assign]
     elem.locator = MagicMock()
     elem.navigate_to_a_href = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    elem.resolve_http_href = AsyncMock(return_value=None)  # type: ignore[method-assign]
     elem.find_label_for = AsyncMock(return_value=None)  # type: ignore[method-assign]
     elem.find_element_in_label_children = AsyncMock(return_value=None)  # type: ignore[method-assign]
     elem.find_bound_label_by_attr_id = AsyncMock(return_value=None)  # type: ignore[method-assign]
@@ -766,6 +796,282 @@ async def _run_ladder(
         action=action,
         skyvern_element=elem,
     )
+
+
+class TestChainClickNavigationDestinationGuard:
+    @staticmethod
+    async def _run(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        navigation_result: str | None = None,
+        navigation_error: Exception | None = None,
+        locator_error: Exception | None = None,
+    ) -> tuple[list, SkyvernElement, AsyncMock, AsyncMock]:
+        from skyvern.webeye.actions import handler as handler_module
+        from skyvern.webeye.actions.actions import ClickAction
+
+        navigate = AsyncMock(side_effect=navigation_error, return_value=navigation_result)
+        locator_click = AsyncMock(side_effect=locator_error)
+        monkeypatch.setattr(handler_module.EventStrategyFactory, "click_element", locator_click)
+        monkeypatch.setattr(handler_module.skyvern_context, "current", MagicMock(return_value=None))
+        monkeypatch.setattr(handler_module, "resolve_engine_selection_for_task", MagicMock(return_value=None))
+
+        elem = _make_ladder_element(tag=InteractiveElement.A, navigate_to_a_href=navigate)
+        elem.locator.click = AsyncMock()
+        page = MagicMock()
+        page.url = "https://portal.example.com/dashboard"
+        page.on = MagicMock()
+        page.remove_listener = MagicMock()
+        task = MagicMock()
+        task.organization_id = "org_test"
+
+        results = await handler_module.chain_click(
+            task=task,
+            scraped_page=MagicMock(),
+            page=page,
+            action=ClickAction(element_id="AAA3"),
+            skyvern_element=elem,
+        )
+        return results, elem, navigate, locator_click
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_host_reaches_coordinate_click(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        def fails_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+            raise OSError("dns unavailable")
+
+        monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", fails_dns)
+        with pytest.raises(BlockedHost) as exc_info:
+            validate_fetch_url("https://unresolvable.example.test/target")
+
+        results, elem, navigate, locator_click = await self._run(
+            monkeypatch,
+            navigation_error=exc_info.value,
+        )
+
+        assert isinstance(results[-1], ActionSuccess)
+        navigate.assert_awaited_once()
+        locator_click.assert_not_awaited()
+        elem.coordinate_click.assert_awaited_once()
+        elem.click_in_javascript.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_blocked_host_is_terminal_without_any_click(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionFailure
+
+        results, elem, navigate, locator_click = await self._run(
+            monkeypatch,
+            navigation_error=BlockedHost("127.0.0.1"),
+        )
+
+        assert len(results) == 1
+        assert isinstance(results[0], ActionFailure)
+        navigate.assert_awaited_once()
+        locator_click.assert_not_awaited()
+        elem.locator.click.assert_not_awaited()
+        elem.coordinate_click.assert_not_awaited()
+        elem.click_in_javascript.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_too_long_url_with_blocked_host_is_terminal_without_any_click(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.webeye.actions.responses import ActionFailure
+
+        url = "http://169.254.169.254/latest/meta-data/#" + "x" * 2100
+        assert len(url) > 2083
+        with pytest.raises(BlockedHost) as exc_info:
+            validate_fetch_url(url)
+
+        results, elem, navigate, locator_click = await self._run(
+            monkeypatch,
+            navigation_error=exc_info.value,
+        )
+
+        assert len(results) == 1
+        assert isinstance(results[0], ActionFailure)
+        navigate.assert_awaited_once()
+        locator_click.assert_not_awaited()
+        elem.locator.click.assert_not_awaited()
+        elem.coordinate_click.assert_not_awaited()
+        elem.click_in_javascript.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_permitted_href_navigation_still_succeeds_without_click(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        results, elem, navigate, locator_click = await self._run(
+            monkeypatch,
+            navigation_result="https://other.example.net/target",
+        )
+
+        assert len(results) == 1
+        assert isinstance(results[0], ActionSuccess)
+        navigate.assert_awaited_once()
+        locator_click.assert_not_awaited()
+        elem.locator.click.assert_not_awaited()
+        elem.coordinate_click.assert_not_awaited()
+        elem.click_in_javascript.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_invalid_url_still_reaches_click_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        results, elem, navigate, locator_click = await self._run(
+            monkeypatch,
+            navigation_error=InvalidUrl("not-a-url"),
+        )
+
+        assert isinstance(results[-1], ActionSuccess)
+        navigate.assert_awaited_once()
+        locator_click.assert_not_awaited()
+        elem.coordinate_click.assert_awaited_once()
+        elem.click_in_javascript.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_security_click_failure_still_reaches_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        results, elem, navigate, locator_click = await self._run(
+            monkeypatch,
+            locator_error=RuntimeError("click failed"),
+        )
+
+        assert isinstance(results[-1], ActionSuccess)
+        navigate.assert_awaited_once()
+        locator_click.assert_awaited_once()
+        elem.coordinate_click.assert_awaited_once()
+        elem.click_in_javascript.assert_not_awaited()
+
+
+class TestChainClickPreDispatchAnchorGuard:
+    @staticmethod
+    async def _run(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        href: str,
+        validator: MagicMock | None = None,
+    ) -> tuple[list, SkyvernElement, AsyncMock, MagicMock]:
+        from skyvern.webeye.actions import handler as handler_module
+        from skyvern.webeye.actions.actions import ClickAction
+
+        click_element = AsyncMock(return_value=None)
+        monkeypatch.setattr(handler_module.EventStrategyFactory, "click_element", click_element)
+        monkeypatch.setattr(handler_module.skyvern_context, "current", MagicMock(return_value=None))
+        monkeypatch.setattr(handler_module, "resolve_engine_selection_for_task", MagicMock(return_value=None))
+        if validator is not None:
+            monkeypatch.setattr(handler_module, "validate_fetch_url", validator)
+
+        elem = _make_ladder_element(tag=InteractiveElement.A)
+        elem.locator.click = AsyncMock()
+        del elem.resolve_http_href
+
+        async def _get_attr(name: str, mode: str = "dynamic", **_: object) -> str | None:
+            return href if name == "href" else None
+
+        elem.get_attr = AsyncMock(side_effect=_get_attr)  # type: ignore[method-assign]
+
+        page = MagicMock()
+        page.url = "https://portal.example.com/dashboard"
+        page.on = MagicMock()
+        page.remove_listener = MagicMock()
+
+        frame = MagicMock()
+        frame.url = page.url
+        elem.get_frame = MagicMock(return_value=frame)  # type: ignore[method-assign]
+        monkeypatch.setattr(dom_module.SkyvernFrame, "evaluate", AsyncMock(return_value=href))
+
+        task = MagicMock()
+        task.organization_id = "org_test"
+
+        results = await handler_module.chain_click(
+            task=task,
+            scraped_page=MagicMock(),
+            page=page,
+            action=ClickAction(element_id="AAA3"),
+            skyvern_element=elem,
+        )
+        return results, elem, click_element, page
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "href",
+        [
+            "http://127.0.0.1/internal",
+            "http://169.254.169.254/latest/meta-data/",
+        ],
+    )
+    async def test_blocked_href_is_terminal_before_physical_click(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        href: str,
+    ) -> None:
+        from skyvern.webeye.actions.responses import ActionFailure
+
+        results, elem, click_element, _ = await self._run(monkeypatch, href=href)
+
+        assert len(results) == 1
+        assert isinstance(results[0], ActionFailure)
+        click_element.assert_not_awaited()
+        elem.locator.click.assert_not_awaited()
+        elem.coordinate_click.assert_not_awaited()
+        elem.click_in_javascript.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_public_href_uses_physical_click_after_validation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        href = "https://example.com/target"
+        validator = MagicMock(side_effect=lambda url: url)
+
+        results, elem, click_element, page = await self._run(monkeypatch, href=href, validator=validator)
+
+        assert len(results) == 1
+        assert isinstance(results[0], ActionSuccess)
+        validator.assert_called_once_with(href)
+        click_element.assert_awaited_once_with(page, elem.locator, timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        elem.coordinate_click.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_href_reaches_coordinate_click(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        def fails_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+            raise OSError("dns unavailable")
+
+        monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", fails_dns)
+        href = "https://unresolvable.example.test/target"
+        validator = MagicMock(wraps=validate_fetch_url)
+
+        results, elem, click_element, _ = await self._run(monkeypatch, href=href, validator=validator)
+
+        assert isinstance(results[-1], ActionSuccess)
+        validator.assert_called_once_with(href)
+        click_element.assert_not_awaited()
+        elem.coordinate_click.assert_awaited_once()
+        elem.click_in_javascript.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("href", ["javascript:void(0)", "#section"])
+    async def test_non_http_href_clicks_without_validation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        href: str,
+    ) -> None:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        validator = MagicMock(side_effect=AssertionError("validation must not run"))
+
+        results, elem, click_element, page = await self._run(monkeypatch, href=href, validator=validator)
+
+        assert len(results) == 1
+        assert isinstance(results[0], ActionSuccess)
+        validator.assert_not_called()
+        click_element.assert_awaited_once_with(page, elem.locator, timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        elem.coordinate_click.assert_not_awaited()
 
 
 class TestChainClickFallbackPostDispatchGuard:

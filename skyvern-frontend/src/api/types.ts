@@ -180,6 +180,7 @@ export type TaskApiResponse = {
   screenshot_url: string | null;
   recording_url: string | null;
   recording_archived?: boolean;
+  browser_console_log_url?: string | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
@@ -221,6 +222,8 @@ export type User = {
 export type OrganizationApiResponse = {
   created_at: string;
   modified_at: string;
+  default_llm_key?: string | null;
+  default_secondary_llm_key?: string | null;
   max_retries_per_step: number | null;
   max_steps_per_run: number | null;
   // Optional because the field is added in a backend image rollout; until
@@ -292,7 +295,11 @@ export type ClearOrganizationAuthTokenResponse = {
   success: boolean;
 };
 
-export type CustomLLMProvider = "openai_compatible" | "ollama" | "openrouter";
+export type CustomLLMProvider =
+  | "openai_compatible"
+  | "ollama"
+  | "openrouter"
+  | "gemini";
 
 export type CustomLLMConfig = {
   display_name: string;
@@ -306,6 +313,7 @@ export type CustomLLMConfig = {
   max_completion_tokens?: number | null;
   temperature?: number | null;
   reasoning_effort?: string | null;
+  extra_parameters?: Record<string, unknown> | null;
 };
 
 export type CustomLLM = {
@@ -779,6 +787,10 @@ export type DebugSessionApiResponse = {
   pbs_browser_profile_id: string | null;
 };
 
+export type DebugSessionViewerStateApiResponse = {
+  active_run_session_id: string | null;
+};
+
 export type DebugLoginBlockCompatibilityResponse = {
   compatible: boolean;
   reason: "pbs_no_profile" | "pbs_different_profile" | null;
@@ -1048,6 +1060,7 @@ export type CredentialApiResponse = {
   tested_url?: string | null;
   user_context?: string | null;
   save_browser_session_intent?: boolean | null;
+  run_sequentially?: boolean | null;
   folder_id?: string | null;
   proxy_location?: ProxyLocation | null;
   proxy_session_id?: string | null;

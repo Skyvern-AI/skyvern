@@ -299,6 +299,16 @@ describe("summarizeWorkflowChanges (snapshot baseline)", () => {
     ).toEqual(["Toggled persist browser session"]);
   });
 
+  it("names a secret masking toggle", () => {
+    const base = snapshotOf(saveData({ settings: { maskSecrets: false } }));
+    expect(
+      summarizeWorkflowChanges(
+        saveData({ settings: { maskSecrets: true } }),
+        base,
+      ),
+    ).toEqual(["Toggled secret masking"]);
+  });
+
   it("groups a browser-profile change into one line", () => {
     const base = snapshotOf(
       saveData({
@@ -345,6 +355,7 @@ describe("summarizeWorkflowChanges (snapshot baseline)", () => {
       scriptCacheKey: "c",
       aiFallback: true,
       enableSelfHealing: false,
+      maskSecrets: false,
       runSequentially: true,
       sequentialKey: "s",
       finallyBlockLabel: "f",

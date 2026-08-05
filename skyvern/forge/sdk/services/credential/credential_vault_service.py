@@ -49,6 +49,66 @@ class CredentialVaultService(ABC):
     async def get_credential_item(self, db_credential: Credential) -> CredentialItem:
         """Retrieve the full credential data from the vault."""
 
+    async def _enqueue_orphaned_vault_item_cleanup(
+        self,
+        *,
+        organization_id: str,
+        item_id: str,
+        vault_type: CredentialVaultType,
+    ) -> bool:
+        try:
+            return bool(
+                await app.AGENT_FUNCTION.on_credential_item_orphaned(
+                    organization_id=organization_id,
+                    item_id=item_id,
+                    vault_type=vault_type,
+                )
+            )
+        except Exception:
+            LOG.error(
+                "Durable vault-item cleanup enqueue failed; item requires manual reconciliation",
+                organization_id=organization_id,
+                item_id=item_id,
+                vault_type=vault_type,
+                exc_info=True,
+            )
+            raise
+
+    async def _run_task_to_completion(
+        self,
+        awaitable: Awaitable[None],
+        *,
+        suppress_cancellation: bool = False,
+        cancellation_failure_message: str | None = None,
+        log_context: dict[str, object] | None = None,
+    ) -> None:
+        task = asyncio.ensure_future(awaitable)
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                cancellation = cancellation or exc
+            except Exception:
+                if cancellation is None:
+                    raise
+                break
+
+        if cancellation is None:
+            task.result()
+            return
+
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            if cancellation_failure_message:
+                LOG.error(cancellation_failure_message, **(log_context or {}), exc_info=True)
+
+        if not suppress_cancellation:
+            raise cancellation
+
     async def _reclaim_orphaned_vault_item(
         self,
         *,
@@ -76,31 +136,17 @@ class CredentialVaultService(ABC):
                     vault_type=vault_type,
                     exc_info=True,
                 )
-            # The caller invokes this inside `except BaseException: ... ; raise`, so a durable-enqueue
-            # failure must not escape _run(): it would replace the in-flight exception (e.g. the
-            # write-lease cancellation the caller is re-raising) with an unrelated one. Log and swallow so
-            # the caller's bare `raise` always re-raises the original.
             try:
-                await app.AGENT_FUNCTION.on_credential_item_orphaned(
+                await self._enqueue_orphaned_vault_item_cleanup(
                     organization_id=organization_id,
                     item_id=item_id,
                     vault_type=vault_type,
                 )
             except Exception:
-                LOG.error(
-                    "Durable vault-item cleanup enqueue failed; item may stay orphaned until the reaper reclaims it",
-                    organization_id=organization_id,
-                    item_id=item_id,
-                    vault_type=vault_type,
-                    exc_info=True,
-                )
+                # The original failure or cancellation must win over a failed fallback enqueue.
+                pass
 
-        reclaim = asyncio.ensure_future(_run())
-        while not reclaim.done():
-            try:
-                await asyncio.shield(reclaim)
-            except asyncio.CancelledError:
-                continue
+        await self._run_task_to_completion(_run(), suppress_cancellation=True)
 
     async def _preserve_omitted_credit_card_fields(
         self,

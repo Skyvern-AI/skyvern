@@ -29,6 +29,7 @@ class WorkflowRunBlock(BaseModel):
     engine: RunEngine | None = None
     task_id: str | None = None
     url: str | None = None
+    final_url: str | None = None
     navigation_goal: str | None = None
     navigation_payload: dict[str, Any] | list | str | None = None
     data_extraction_goal: str | None = None

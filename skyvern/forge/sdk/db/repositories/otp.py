@@ -266,5 +266,10 @@ class OTPRepository(BaseRepository):
                 .returning(TOTPCodeModel)
             )
             row = (await session.scalars(query)).one_or_none()
+            if row is None:
+                return None
+            # Read the row before committing: commit expires the instance, and the
+            # refetch it would trigger runs outside the async greenlet context.
+            promoted = TOTPCode.model_validate(row)
             await session.commit()
-            return TOTPCode.model_validate(row) if row else None
+            return promoted

@@ -14,7 +14,10 @@ GMAIL_API_BASE = gmail_client.GMAIL_API_BASE
 GmailAPIError = gmail_client.GmailAPIError
 LOG = structlog.get_logger()
 
-_OTP_QUERY_TERMS = "(verification OR verify OR code OR passcode OR otp OR 2fa OR one-time OR password)"
+_OTP_QUERY_TERMS = (
+    '(verification OR verify OR code OR passcode OR otp OR 2fa OR one-time OR password OR "sign in" OR "sign-in" '
+    'OR signin OR "log in" OR "log-in" OR login OR "magic link" OR "access link")'
+)
 _SAFE_EMAIL_QUERY_IDENTIFIER = SAFE_EMAIL_ADDRESS_PATTERN
 _decode = gmail_client.decode
 _get_json = gmail_client.get_json

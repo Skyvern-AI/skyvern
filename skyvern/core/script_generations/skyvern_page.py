@@ -23,11 +23,13 @@ from skyvern.exceptions import NoTOTPSecretFound, ScriptTerminationException, Sk
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import download_file as download_file_from_url
+from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.services.credentials import is_unresolved_totp_value
 from skyvern.library.ai_locator import AILocator
 from skyvern.services.script_reviewer_v3.redaction import redact_sensitive_value
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.browser_engine import BrowserEngineSelection
@@ -168,6 +170,7 @@ class SkyvernPage(Page):
         return decorator
 
     async def goto(self, url: str, **kwargs: Any) -> None:
+        url = await asyncio.to_thread(validate_fetch_url, url)
         timeout = kwargs.pop("timeout", settings.BROWSER_LOADING_TIMEOUT_MS)
         await self.page.goto(url, timeout=timeout, **kwargs)
 
@@ -546,6 +549,7 @@ class SkyvernPage(Page):
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         _skip_element_prep: bool = False,
+        _direct_fill_release_guard: Callable[[str | None], None] | None = None,
         **kwargs: Any,
     ) -> str: ...
 
@@ -561,6 +565,7 @@ class SkyvernPage(Page):
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         _skip_element_prep: bool = False,
+        _direct_fill_release_guard: Callable[[str | None], None] | None = None,
         **kwargs: Any,
     ) -> str: ...
 
@@ -577,6 +582,7 @@ class SkyvernPage(Page):
         totp_url: str | None = None,
         recoverable_marker_id: int | None = None,
         _skip_element_prep: bool = False,
+        _direct_fill_release_guard: Callable[[str | None], None] | None = None,
         **kwargs: Any,
     ) -> str:
         """Fill an input field using a CSS selector, AI-powered prompt matching, or both.
@@ -594,6 +600,8 @@ class SkyvernPage(Page):
             mode: When ``"direct"``, perform a raw Playwright fill with no AI
                 fallback or element preparation.  The action is still recorded
                 in the DB so it appears in the timeline.
+            _direct_fill_release_guard: Internal synchronous guard invoked with the
+                resolved element frame URL immediately before a direct fill.
             totp_identifier: TOTP identifier for time-based one-time password fields.
             totp_url: URL to fetch TOTP codes from for authentication.
 
@@ -633,11 +641,25 @@ class SkyvernPage(Page):
             )
             timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
             locator = self._locator_scope.locator(selector).first
-            await locator.fill(value, timeout=timeout, **kwargs)
-            # locator.fill already emits `input`; only the change/blur a JS gate may also need are missing.
+            element = None
+            if _direct_fill_release_guard is not None:
+                element = await locator.element_handle(timeout=timeout)
+                if element is None:
+                    raise RuntimeError("Direct fill could not resolve an element before the release check.")
+                owner_frame = await element.owner_frame()
+                _direct_fill_release_guard(owner_frame.url if owner_frame is not None else None)
+                # A document-bound handle cannot re-resolve onto a page/frame that navigates after
+                # the guard. It detaches and fails instead of releasing the value on the new origin.
+                await element.fill(value, timeout=timeout, **kwargs)
+            else:
+                await locator.fill(value, timeout=timeout, **kwargs)
+            # Direct fill already emits `input`; only the change/blur a JS gate may also need are missing.
             for event_name in ("change", "blur"):
                 try:
-                    await locator.dispatch_event(event_name, timeout=timeout)
+                    if element is not None:
+                        await element.dispatch_event(event_name)
+                    else:
+                        await locator.dispatch_event(event_name, timeout=timeout)
                 except Exception:
                     LOG.debug("direct fill: dispatch_event failed", dispatched_event=event_name, exc_info=True)
             return value
@@ -1689,7 +1711,7 @@ class SkyvernPage(Page):
             if skyvern_ctx:
                 skyvern_ctx.script_llm_call_count += 1
 
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
+            json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt_text,
                 prompt_name="form-field-mapper",
                 organization_id=org_id,
@@ -2102,7 +2124,7 @@ class SkyvernPage(Page):
             if skyvern_ctx:
                 skyvern_ctx.script_llm_call_count += 1
 
-            result = await app.SECONDARY_LLM_API_HANDLER(
+            result = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt_text,
                 prompt_name="form-validate-mapping",
                 organization_id=org_id,
@@ -2736,7 +2758,7 @@ class SkyvernPage(Page):
             org_id = skyvern_ctx.organization_id if skyvern_ctx else None
             if skyvern_ctx:
                 skyvern_ctx.script_llm_call_count += 1
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
+            json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt,
                 prompt_name="select-from-group",
                 organization_id=org_id,
@@ -2988,7 +3010,7 @@ class SkyvernPage(Page):
             org_id = skyvern_ctx.organization_id if skyvern_ctx else None
             if skyvern_ctx:
                 skyvern_ctx.script_llm_call_count += 1
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
+            json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt,
                 prompt_name="batch-form-fill-plan",
                 organization_id=org_id,
@@ -3399,7 +3421,7 @@ class SkyvernPage(Page):
             skyvern_ctx = skyvern_context.current()
             org_id = skyvern_ctx.organization_id if skyvern_ctx else None
 
-            result = await app.SECONDARY_LLM_API_HANDLER(
+            result = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt_text,
                 prompt_name="quality-audit",
                 organization_id=org_id,

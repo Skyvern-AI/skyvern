@@ -33,6 +33,7 @@ import structlog
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.credential_resolution import loggable_origin, url_parts
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisFailureType, RepairNextAction
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.schemas.credentials import Credential
@@ -239,7 +240,12 @@ def credential_pause_reason(ctx: Any) -> str | None:
     """
     policy = getattr(ctx, "request_policy", None)
     skip_test = isinstance(policy, RequestPolicy) and policy.testing_intent == "skip_test"
-    if isinstance(policy, RequestPolicy) and policy.clarification_reason == "login_credentials_unresolved":
+    if isinstance(policy, RequestPolicy) and (
+        policy.clarification_reason == "login_credentials_unresolved"
+        # Every ask the credential card can answer resumes through the same typed contract, so
+        # the reason literal no longer distinguishes them -- `card_answerable` does.
+        or (policy.requires_user_clarification and policy.credential_ask_card_answerable)
+    ):
         return "login_credentials_unresolved"
 
     if getattr(ctx, "last_run_skipped_unbound_credentials", False) and not skip_test:
@@ -302,6 +308,27 @@ def _defang(text: str) -> str:
     return re.sub(r"\s+", " ", text).replace('"', "").strip()[:200]
 
 
+def _bind_connected_credential_origin(policy: RequestPolicy, credential: Credential) -> str | None:
+    """Stamp the server-held origin this ask was formed against, so a card-created credential with
+    no ``tested_url`` still has an intended origin at the fill seam. Written directly rather than
+    through ``_record_live_page_admission``, which skips already-resolved ids and would stamp
+    nothing here.
+    """
+    ask_urls = policy.credential_ask_login_page_urls or policy.login_page_urls
+    by_origin: dict[str, str] = {}
+    for url in ask_urls:
+        parts = url_parts(url)
+        if parts is None:
+            continue
+        *_, origin = parts
+        by_origin[origin] = url
+    if len(by_origin) != 1:
+        return None
+    admitted_url = next(iter(by_origin.values()))
+    policy.live_page_admitted_urls[credential.credential_id] = admitted_url
+    return admitted_url
+
+
 def _apply_connected_credential_to_policy(ctx: Any, policy: RequestPolicy, credential: Credential) -> None:
     """Grant the resumed loop run authority for ``credential``.
 
@@ -316,6 +343,13 @@ def _apply_connected_credential_to_policy(ctx: Any, policy: RequestPolicy, crede
     """
     ctx.test_after_update_done = False
     ctx.credential_pause_connected_credential_id = credential.credential_id
+    admitted_url = _bind_connected_credential_origin(policy, credential)
+    LOG.info(
+        "copilot_credential_pause_connected",
+        card_answerable=policy.credential_ask_card_answerable,
+        credential_id=credential.credential_id,
+        bound_origin=loggable_origin(admitted_url) if admitted_url else None,
+    )
     policy.resolved_credentials.append(credential)
     policy.allow_run_blocks = True
     policy.clarification_reason = "none"
@@ -435,7 +469,11 @@ async def _run_credential_pause(
 
     policy = getattr(ctx, "request_policy", None)
     login_page_urls = list(policy.login_page_urls) if isinstance(policy, RequestPolicy) else []
-    credential_refs = list(policy.credential_refs) if isinstance(policy, RequestPolicy) else []
+    # The FE credential card fetches the full org list itself; these ride the frame as `credential_refs`
+    # and seed the picker's "Suggested" group (pinned first), so the user still sees the full list.
+    credential_refs: list[str] = []
+    if isinstance(policy, RequestPolicy):
+        credential_refs = list(policy.credential_ask_candidate_ids or policy.credential_refs)
     timeout_seconds = copilot_config.credential_pause_timeout_seconds
     now = datetime.now(timezone.utc)
 

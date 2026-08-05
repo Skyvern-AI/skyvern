@@ -1,15 +1,8 @@
+import { useState } from "react";
+
 import { GarbageIcon } from "@/components/icons/GarbageIcon";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -28,7 +21,6 @@ import {
   DotsHorizontalIcon,
   DownloadIcon,
   MixerHorizontalIcon,
-  ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useWorkflowRowActions } from "./hooks/useWorkflowRowActions";
 import { WorkflowApiResponse } from "./types/workflowTypes";
@@ -56,9 +48,10 @@ function WorkflowActions({
     isDeleting,
     isTogglingTemplate,
   } = useWorkflowRowActions(workflow);
+  const [deleteOpen, setDeleteOpen] = useState(false);
 
   return (
-    <Dialog>
+    <>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button
@@ -122,38 +115,30 @@ function WorkflowActions({
               </DropdownMenuSubContent>
             </DropdownMenuPortal>
           </DropdownMenuSub>
-          <DialogTrigger>
-            <DropdownMenuItem className="p-2">
-              <GarbageIcon className="mr-2 h-4 w-4 text-destructive" />
-              Delete Agent
-            </DropdownMenuItem>
-          </DialogTrigger>
+          <DropdownMenuItem
+            className="p-2"
+            onSelect={() => setDeleteOpen(true)}
+          >
+            <GarbageIcon className="mr-2 h-4 w-4 text-destructive" />
+            Delete Agent
+          </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
-      <DialogContent onCloseAutoFocus={(e) => e.preventDefault()}>
-        <DialogHeader>
-          <DialogTitle>Are you sure?</DialogTitle>
-          <DialogDescription>
+      <ConfirmDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        title="Delete agent?"
+        description={
+          <p>
             The agent{" "}
             <span className="font-semibold text-primary">{workflow.title}</span>{" "}
-            will be deleted.
-          </DialogDescription>
-        </DialogHeader>
-        <DialogFooter>
-          <DialogClose asChild>
-            <Button variant="secondary">Cancel</Button>
-          </DialogClose>
-          <Button
-            variant="destructive"
-            onClick={() => deleteWorkflow({ onSuccess: onSuccessfullyDeleted })}
-            disabled={isDeleting}
-          >
-            {isDeleting && <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />}
-            Delete
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+            will be permanently deleted.
+          </p>
+        }
+        isPending={isDeleting}
+        onConfirm={() => deleteWorkflow({ onSuccess: onSuccessfullyDeleted })}
+      />
+    </>
   );
 }
 

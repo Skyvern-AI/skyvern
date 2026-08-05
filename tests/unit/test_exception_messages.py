@@ -333,6 +333,7 @@ def test_browser_connection_error_connect_over_cdp_websocket() -> None:
     assert "Call log" not in message
     assert "WebSocket" not in message
     assert "Failed to connect to the browser session" in message
+    assert "high demand" in message
     assert "try re-running" in message
 
 
@@ -342,6 +343,55 @@ def test_browser_connection_error_websocket_closed() -> None:
     message = get_user_facing_exception_message(Exception(raw_error))
     assert "Failed to connect to the browser session" in message
     assert "try re-running" in message
+
+
+def test_session_closed_error_does_not_claim_high_demand() -> None:
+    # SKY-13502: a session-router lifecycle close (4410 "session closed") means the session was
+    # already closed before the connect — "high demand" asserts a cause that was never
+    # established, and retry advice cannot help a closed session.
+    raw_error = (
+        "BrowserType.connect_over_cdp: Target page, context or browser has been closed "
+        "Call log: - <ws connecting> wss://sessions.skyvern.com/pbs_000000000000000000 "
+        "- <ws error> error WebSocket was closed before the connection code=4410 reason=session closed"
+    )
+    message = get_user_facing_exception_message(Exception(raw_error))
+    assert "high demand" not in message
+    assert "re-run" not in message
+    assert "already closed" in message
+    assert "sessions.skyvern.com" not in message
+    assert "wss://" not in message
+
+
+def test_session_closed_requires_reason_text_not_bare_close_code() -> None:
+    # Close code 4410 is reused for other outcomes (e.g. the live-view stream closes with
+    # reason "no_working_page"), so the bare code must not trigger the session-closed story.
+    raw_error = (
+        "BrowserType.connect_over_cdp: WebSocket error: wss://sessions.skyvern.com/pbs_000000000000000000 "
+        "- <ws error> error WebSocket was closed before the connection code=4410 reason=no_working_page"
+    )
+    message = get_user_facing_exception_message(Exception(raw_error))
+    assert "already closed" not in message
+    assert "Failed to connect to the browser session" in message
+
+
+def test_unknown_error_still_redacts_cdp_endpoints_for_session_closed_error() -> None:
+    # SKY-13502 split _is_browser_connection_error's consumers: the narrow session-closed test
+    # picks the message, but redaction routing must keep the broad net — a session-closed CDP
+    # failure still echoes endpoint URLs carrying host, session tokens, or credentials.
+    inner_exception = Exception(
+        "browserType.connectOverCDP: WebSocket error: "
+        "wss://user:secret@remote.example.internal/session/tok-9f3a?apiKey=SEKRET "
+        "fetching https://remote.example.internal/json/version?token=SEKRET failed "
+        "WebSocket was closed before the connection code=4410 reason=session closed"
+    )
+    message = str(UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception))
+
+    assert "wss://" not in message
+    assert "https://" not in message
+    assert "SEKRET" not in message
+    assert "tok-9f3a" not in message
+    assert "remote.example.internal" not in message
+    assert "[remote browser endpoint]" in message
 
 
 def test_non_browser_error_not_intercepted() -> None:

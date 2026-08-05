@@ -207,9 +207,10 @@ class Settings(BaseSettings):
     COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
     COPILOT_TURN_INTENT_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
     COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
-    # Consecutive repair runs that make no newly-verified forward progress before the
-    # copilot stops re-running and escalates honestly. Set very high to disable the ceiling.
-    COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
+    # A capture that runs out of time yields no page evidence at all, so the scout falls back to
+    # dumping the page. Measured attaches on a live dashboard reach 8.6s; the former 4s bound cut the
+    # tail off and a third of captures returned nothing.
+    COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 12.0
     # Bounded settle-then-re-perceive after a non-advancing click on a precondition-gated control:
     # re-probe the side-effect-free extractor a few times (hard-capped) until a just-issued AJAX populates.
     COPILOT_CLICK_SETTLE_MAX_PROBES: int = 3
@@ -287,6 +288,11 @@ class Settings(BaseSettings):
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
     AWS_S3_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
     AWS_S3_BUCKET_UPLOADS: str = "skyvern-uploads"
+    # ISO-8601 UTC timestamp. Runs created at/after it that have zero DOWNLOAD artifact
+    # rows skip the legacy S3 LIST fallback in get_downloaded_files — such runs register
+    # every download as a row at save time (SKY-8861), so the LIST can only return empty.
+    # None keeps the LIST fallback for every run.
+    DOWNLOADS_EMPTY_S3_LISTING_CUTOVER: str | None = None
 
     # Azure Blob Storage settings
     AZURE_STORAGE_ACCOUNT_NAME: str | None = None
@@ -405,6 +411,11 @@ class Settings(BaseSettings):
     WORKFLOW_COPILOT_LITE_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
+    # The client-side timeout is a per-read gap applied per SDK attempt, so a provider that drips
+    # keep-alive bytes can hold a call open forever; the hard deadline bounds it in wall-clock time.
+    # Only the direct AsyncOpenAI client path (api_handler_factory.LLMCaller) applies this today.
+    ENFORCE_LLM_HARD_DEADLINE: bool = True
+    LLM_HARD_DEADLINE_GRACE_SECONDS: float = Field(default=10.0, ge=0)
     LLM_CONFIG_MAX_TOKENS: int = 4096
     LLM_CONFIG_TEMPERATURE: float = 0
     LLM_CONFIG_SUPPORT_VISION: bool = True  # Whether the model supports vision
@@ -676,6 +687,8 @@ class Settings(BaseSettings):
     ENABLE_CSS_SVG_PARSING: bool = True
 
     ENABLE_LOG_ARTIFACTS: bool = False
+    ENABLE_SECRET_ARTIFACT_REDACTION: bool = True
+    ENABLE_SECRET_VISUAL_MASKING: bool = True
     # Deployment-level fail-closed override; takes precedence over all CodeBlock entitlements.
     DISABLE_CODE_BLOCK_EXECUTION: bool = False
     ENABLE_CODE_BLOCK: bool = True
@@ -847,6 +860,10 @@ class Settings(BaseSettings):
         except (TypeError, ValueError):
             LOG.warning("Invalid WORKER_STALL_DUMP_SECONDS=%r; using default 0", value)
             return 0
+
+    @property
+    def is_skyvern_base_url_explicitly_configured(self) -> bool:
+        return "SKYVERN_BASE_URL" in self.model_fields_set
 
     def get_model_name_to_llm_key(self, organization_id: str | None = None) -> dict[str, dict[str, str]]:
         """

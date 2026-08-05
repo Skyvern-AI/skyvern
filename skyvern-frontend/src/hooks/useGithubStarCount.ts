@@ -16,14 +16,14 @@ const starCountFormatter = new Intl.NumberFormat("en-US", {
 });
 
 function useGithubStarCount({ enabled = true }: Options = {}) {
-  return useQuery<number>({
+  return useQuery<number | null>({
     queryKey: ["githubStarCount", "skyvern-ai/skyvern"],
     queryFn: async () => {
       const response = await fetch(GITHUB_REPO_API_URL, {
         headers: { Accept: "application/vnd.github+json" },
       });
       if (!response.ok) {
-        throw new Error(`GitHub API ${response.status}`);
+        return null;
       }
       const data: GithubRepoResponse = await response.json();
       return data.stargazers_count;

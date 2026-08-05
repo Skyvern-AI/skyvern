@@ -117,16 +117,38 @@ class AzureCredentialVaultService(CredentialVaultService):
         self,
         credential: Credential,
     ) -> None:
-        # Empty the secret value before deleting the DB row: a transient vault failure then aborts the whole
-        # delete with the row (and its item_id) intact for a retry, instead of orphaning a still-readable
-        # secret with no DB pointer left to scrub it. The slow full-vault delete is deferred to
-        # post_delete_credential_item so customers do not have to wait.
-        await self._client.create_or_update_secret(
-            vault_name=self._vault_name,
+        previous_secret_value = await self._client.get_secret(
             secret_name=credential.item_id,
-            secret_value="",
+            vault_name=self._vault_name,
         )
-        await app.DATABASE.credentials.delete_credential(credential.credential_id, credential.organization_id)
+        if previous_secret_value is None:
+            # Vault item already gone (prior partial delete); nothing to scrub, and the row must stay deletable.
+            await app.DATABASE.credentials.delete_credential(credential.credential_id, credential.organization_id)
+            return
+
+        try:
+            await self._client.create_or_update_secret(
+                vault_name=self._vault_name,
+                secret_name=credential.item_id,
+                secret_value="",
+            )
+            await app.DATABASE.credentials.delete_credential(credential.credential_id, credential.organization_id)
+        except BaseException:
+            try:
+                await self._client.create_or_update_secret(
+                    vault_name=self._vault_name,
+                    secret_name=credential.item_id,
+                    secret_value=previous_secret_value,
+                )
+            except BaseException:
+                LOG.error(
+                    "Failed to restore Azure vault secret after credential deletion failed",
+                    credential_id=credential.credential_id,
+                    item_id=credential.item_id,
+                    organization_id=credential.organization_id,
+                    exc_info=True,
+                )
+            raise
 
     async def post_delete_credential_item(self, item_id: str, _organization_id: str | None = None) -> bool:
         """

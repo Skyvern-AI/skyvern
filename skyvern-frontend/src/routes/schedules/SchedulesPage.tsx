@@ -36,14 +36,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   Select,
   SelectContent,
@@ -674,77 +667,43 @@ function SchedulesPage() {
       )}
 
       {/* Bulk delete confirmation dialog */}
-      <Dialog
+      <ConfirmDialog
         open={bulkDeleteDialog.open}
         onOpenChange={(open) => {
-          if (!open && !isBulkOperating) {
+          if (!open) {
             setBulkDeleteDialog({ open: false, count: 0 });
           }
         }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete {bulkDeleteDialog.count} Schedules</DialogTitle>
-            <DialogDescription>
-              Are you sure you want to delete {bulkDeleteDialog.count}{" "}
-              {bulkDeleteDialog.count === 1 ? "schedule" : "schedules"}? This
-              action cannot be undone.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="secondary"
-              disabled={isBulkOperating}
-              onClick={() => setBulkDeleteDialog({ open: false, count: 0 })}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              disabled={isBulkOperating}
-              onClick={handleBulkDeleteConfirm}
-            >
-              {isBulkOperating ? "Deleting..." : "Delete"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        title={`Delete ${bulkDeleteDialog.count} schedule${
+          bulkDeleteDialog.count === 1 ? "" : "s"
+        }?`}
+        description={
+          <p>
+            {bulkDeleteDialog.count}{" "}
+            {bulkDeleteDialog.count === 1 ? "schedule" : "schedules"} will be
+            permanently deleted.
+          </p>
+        }
+        itemCount={bulkDeleteDialog.count}
+        isPending={isBulkOperating}
+        onConfirm={() => {
+          void handleBulkDeleteConfirm();
+        }}
+      />
 
       {/* Delete confirmation dialog */}
-      <Dialog
+      <ConfirmDialog
         open={deleteDialog.open}
         onOpenChange={(open) => {
-          if (!open && !deleteMutation.isPending) {
+          if (!open) {
             setDeleteDialog({ open: false, schedule: null });
           }
         }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete Schedule</DialogTitle>
-            <DialogDescription>
-              Are you sure you want to delete this schedule? This action cannot
-              be undone.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="secondary"
-              disabled={deleteMutation.isPending}
-              onClick={() => setDeleteDialog({ open: false, schedule: null })}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              disabled={deleteMutation.isPending}
-              onClick={handleDeleteConfirm}
-            >
-              {deleteMutation.isPending ? "Deleting..." : "Delete"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        title="Delete schedule?"
+        description={<p>This schedule will be permanently deleted.</p>}
+        isPending={deleteMutation.isPending}
+        onConfirm={handleDeleteConfirm}
+      />
 
       {/* Create Schedule Dialog */}
       <CreateOrgScheduleDialog

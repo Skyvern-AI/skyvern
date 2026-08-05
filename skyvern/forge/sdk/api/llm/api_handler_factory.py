@@ -6,6 +6,7 @@ import re
 import time
 import warnings
 from asyncio import CancelledError
+from json import JSONDecodeError
 from typing import Any, AsyncIterator, Protocol, runtime_checkable
 
 import litellm
@@ -26,7 +27,12 @@ from skyvern.forge import app
 from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler, dummy_llm_api_handler
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
-from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
+from skyvern.forge.sdk.api.llm.custom_llm_registry import (
+    CUSTOM_LLM_KEY_PREFIX,
+    custom_llm_passthrough_parameters,
+    is_custom_llm_key,
+    is_custom_llm_owned_by_organization,
+)
 from skyvern.forge.sdk.api.llm.exceptions import (
     DuplicateCustomLLMProviderError,
     InvalidLLMConfigError,
@@ -63,6 +69,7 @@ from skyvern.schemas.llm import (
 )
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
 from skyvern.utils.image_token_estimator import estimate_image_cost, estimate_image_tokens, provider_image_tokens
+from skyvern.utils.secret_redaction import redact_secrets_from_text
 from skyvern.utils.url_validators import validate_fetch_url
 
 # Keep this server-only side effect out of the package __init__ so the legacy
@@ -111,6 +118,56 @@ def _build_custom_llm_http_client(llm_key: str, llm_config: LLMConfig) -> AsyncO
     return _NoRedirectAsyncHTTPHandler()
 
 
+# Deduped once per process on purpose: the reasons are a fixed, low-cardinality set, and an
+# unusable timeout shape recurs on every call.
+_hard_deadline_disabled_reasons: set[str] = set()
+
+
+def _log_unusable_hard_deadline_input(reason: str, value: Any) -> None:
+    if reason in _hard_deadline_disabled_reasons:
+        return
+    _hard_deadline_disabled_reasons.add(reason)
+    LOG.warning(
+        "LLM hard deadline disabled for an unusable input",
+        reason=reason,
+        value_type=type(value).__name__,
+        value=repr(value),
+    )
+
+
+# The openai SDK retries a failed attempt itself, and `timeout` applies per attempt, so one
+# call may legitimately span (max_retries + 1) timeouts.
+def _openai_client_attempts(openai_client: Any) -> int | None:
+    max_retries = openai_client.max_retries
+    if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
+        _log_unusable_hard_deadline_input("client_max_retries", max_retries)
+        return None
+    return max_retries + 1
+
+
+# The provider timeout is an httpx read timeout — a gap between reads, which keep-alive bytes
+# reset indefinitely. Returns the wall-clock budget for one call, or None when unenforceable.
+def _llm_hard_deadline_seconds(timeout: Any, attempts: int | None) -> float | None:
+    if not settings.ENFORCE_LLM_HARD_DEADLINE or attempts is None:
+        return None
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        _log_unusable_hard_deadline_input("timeout", timeout)
+        return None
+    deadline = attempts * float(timeout) + settings.LLM_HARD_DEADLINE_GRACE_SECONDS
+    # Unreachable given the checks above and the ge=0 grace; kept so a future input can't slip a
+    # non-positive deadline into asyncio.timeout, where it would cancel the call immediately.
+    if deadline <= 0:
+        _log_unusable_hard_deadline_input("deadline", deadline)
+        return None
+    return deadline
+
+
+# Some libraries re-raise a JSONDecodeError built through __new__, which leaves `doc` unset.
+def _json_error_body_length(error: JSONDecodeError) -> int | None:
+    doc = getattr(error, "doc", None)
+    return len(doc) if isinstance(doc, str) else None
+
+
 async def _validate_custom_llm_api_base(llm_key: str, llm_config: LLMConfig | LLMRouterConfig) -> None:
     if not is_custom_llm_key(llm_key) or SettingsManager.get_settings().ALLOW_CUSTOM_LLM_LOCAL_API_BASES:
         return
@@ -126,6 +183,13 @@ async def _validate_custom_llm_api_base(llm_key: str, llm_config: LLMConfig | LL
 # standard; we halve it at the cost sites (flex = 50% of standard, Google Vertex SKU).
 _VERTEX_FLEX_TRAFFIC_TYPE = "ON_DEMAND_FLEX"
 _VERTEX_FLEX_COST_MULTIPLIER = 0.5
+
+# litellm's ModelInfo schema has no field combining a service tier with the above-272k
+# threshold, so get_model_info() drops our *_above_272k_tokens_flex keys and prices a
+# flex-tagged, long-context OpenAI-direct GPT-5.6 call at the untiered standard rate.
+_OPENAI_GPT5_6_MODEL_PREFIX = "gpt-5.6-"
+_OPENAI_GPT5_6_LONG_CONTEXT_THRESHOLD = 272_000
+_OPENAI_GPT5_6_FLEX_LONG_CONTEXT_MULTIPLIER = 0.5
 
 # Canonical span name for all LLM chokepoints. Milestone 1 of the agent
 # profiling project — keep consistent so SigNoz aggregations can query across
@@ -259,6 +323,131 @@ def _set_llm_context_attrs(
     span.set_attribute("screenshots_included", bool(screenshots))
     span.set_attribute("screenshot_count", len(screenshots) if screenshots else 0)
     span.set_attribute("speculative", bool(is_speculative_step))
+
+
+def _current_secret_values_for_redaction() -> set[str]:
+    if not settings.ENABLE_SECRET_ARTIFACT_REDACTION:
+        return set()
+
+    try:
+        context = skyvern_context.current()
+        secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(
+            context.workflow_run_id if context else None,
+            exclude_runtime_otp=True,
+        )
+    except Exception:
+        return set()
+    return secret_values
+
+
+def _redact_prompt_text(text: str | None, secret_values: set[str]) -> str | None:
+    if text is None:
+        return None
+
+    if not secret_values:
+        return text
+
+    return redact_secrets_from_text(text, secret_values)
+
+
+def _redact_content_blocks(blocks: list[Any], secret_values: set[str]) -> tuple[list[Any], bool]:
+    redacted_blocks: list[Any] = []
+    changed = False
+    for block in blocks:
+        redacted_block, block_changed = _redact_content_block(block, secret_values)
+        redacted_blocks.append(redacted_block)
+        changed = changed or block_changed
+    return (redacted_blocks, True) if changed else (blocks, False)
+
+
+def _redact_content_value(content: Any, secret_values: set[str]) -> tuple[Any, bool]:
+    if isinstance(content, str):
+        redacted_content = redact_secrets_from_text(content, secret_values)
+        return redacted_content, redacted_content != content
+    if isinstance(content, list):
+        return _redact_content_blocks(content, secret_values)
+    return content, False
+
+
+def _redact_content_block(block: Any, secret_values: set[str]) -> tuple[Any, bool]:
+    if not isinstance(block, dict):
+        return block, False
+
+    block_type = block.get("type")
+    if block_type == "text":
+        text = block.get("text")
+        if not isinstance(text, str):
+            return block, False
+        redacted_text = redact_secrets_from_text(text, secret_values)
+        if redacted_text == text:
+            return block, False
+        return {**block, "text": redacted_text}, True
+
+    if block_type == "tool_result":
+        content = block.get("content")
+        redacted_content, content_changed = _redact_content_value(content, secret_values)
+        if not content_changed:
+            return block, False
+        return {**block, "content": redacted_content}, True
+
+    return block, False
+
+
+def _redact_tool_calls(tool_calls: list[Any], secret_values: set[str]) -> tuple[list[Any], bool]:
+    redacted_tool_calls: list[Any] = []
+    changed = False
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            redacted_tool_calls.append(tool_call)
+            continue
+        function = tool_call.get("function")
+        if not isinstance(function, dict):
+            redacted_tool_calls.append(tool_call)
+            continue
+        arguments = function.get("arguments")
+        if not isinstance(arguments, str):
+            redacted_tool_calls.append(tool_call)
+            continue
+        redacted_arguments = redact_secrets_from_text(arguments, secret_values)
+        if redacted_arguments == arguments:
+            redacted_tool_calls.append(tool_call)
+            continue
+        redacted_function = {**function, "arguments": redacted_arguments}
+        redacted_tool_calls.append({**tool_call, "function": redacted_function})
+        changed = True
+    return (redacted_tool_calls, True) if changed else (tool_calls, False)
+
+
+def _redact_message_text_content(
+    messages: list[dict[str, Any]] | None,
+    secret_values: set[str],
+) -> list[dict[str, Any]] | None:
+    if messages is None or not secret_values:
+        return messages
+
+    redacted_messages: list[dict[str, Any]] = []
+    changed = False
+    for message in messages:
+        redacted_message = message
+        content = message.get("content")
+        if isinstance(content, str):
+            redacted_content = redact_secrets_from_text(content, secret_values)
+            if redacted_content != content:
+                redacted_message = {**redacted_message, "content": redacted_content}
+                changed = True
+        elif isinstance(content, list):
+            redacted_content_blocks, content_changed = _redact_content_blocks(content, secret_values)
+            if content_changed:
+                redacted_message = {**redacted_message, "content": redacted_content_blocks}
+                changed = True
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            redacted_tool_calls, tool_calls_changed = _redact_tool_calls(tool_calls, secret_values)
+            if tool_calls_changed:
+                redacted_message = {**redacted_message, "tool_calls": redacted_tool_calls}
+                changed = True
+        redacted_messages.append(redacted_message)
+    return redacted_messages if changed else messages
 
 
 def _enrich_llm_span(
@@ -435,6 +624,18 @@ def _slim_log_fields(context: SkyvernContext | None, prompt_name: str | None) ->
         "prompt_schema_variant": effective_prompt_schema_variant(assigned, prompt_name),
         "prompt_schema_variant_assigned": assigned,
     }
+
+
+def _response_routing_metadata(response: object) -> tuple[str | None, str | None]:
+    provider = getattr(response, "provider", None)
+    if provider is None:
+        hidden_params = getattr(response, "_hidden_params", None)
+        provider = hidden_params.get("custom_llm_provider") if isinstance(hidden_params, dict) else None
+    service_tier = getattr(response, "service_tier", None)
+    return (
+        provider if isinstance(provider, str) else None,
+        service_tier if isinstance(service_tier, str) else None,
+    )
 
 
 @runtime_checkable
@@ -615,6 +816,7 @@ VALID_GEMINI_3_REASONING_EFFORTS: tuple[str, ...] = ("minimal", "low", "medium",
 
 class LLMAPIHandlerFactory:
     _custom_handlers: dict[str, LLMAPIHandler] = {}
+    _handler_cache: dict[str, tuple[LLMConfig, LLMAPIHandler]] = {}
     _router_handler_cache: dict[str, LLMAPIHandler] = {}
     _thinking_budget_settings: dict[str, int] | None = None
     _prompt_caching_settings: dict[str, bool] | None = None
@@ -762,10 +964,10 @@ class LLMAPIHandlerFactory:
 
     @staticmethod
     def _completion_cost(response: ModelResponse | CustomStreamWrapper) -> float:
-        """litellm completion cost, with the Vertex Gemini flex tier billed at 50%.
-
-        Flex is 50% of standard, but litellm reports both at the standard rate, so the
-        discount is applied here. Internal cost tracking only — never customer-facing.
+        """litellm completion cost, with two known litellm gaps corrected here: the Vertex
+        Gemini flex tier, and long-context OpenAI-direct GPT-5.6 flex calls. Both bill at
+        the standard rate in litellm and are halved post hoc. Internal cost tracking only
+        — never customer-facing.
         """
         try:
             cost = litellm.completion_cost(completion_response=response)
@@ -776,7 +978,24 @@ class LLMAPIHandlerFactory:
         provider_specific = hidden_params.get("provider_specific_fields") if isinstance(hidden_params, dict) else None
         if isinstance(provider_specific, dict) and provider_specific.get("traffic_type") == _VERTEX_FLEX_TRAFFIC_TYPE:
             return cost * _VERTEX_FLEX_COST_MULTIPLIER
+        if LLMAPIHandlerFactory._is_openai_direct_gpt5_6_long_context_flex(response, hidden_params):
+            return cost * _OPENAI_GPT5_6_FLEX_LONG_CONTEXT_MULTIPLIER
         return cost
+
+    @staticmethod
+    def _is_openai_direct_gpt5_6_long_context_flex(
+        response: ModelResponse | CustomStreamWrapper, hidden_params: object
+    ) -> bool:
+        if getattr(response, "service_tier", None) != "flex":
+            return False
+        # litellm_model_name keeps the pre-request model string (unlike response.model,
+        # which litellm strips to the bare provider label), so "azure/" still excludes Azure.
+        requested_model = hidden_params.get("litellm_model_name") if isinstance(hidden_params, dict) else None
+        if not isinstance(requested_model, str) or not requested_model.startswith(_OPENAI_GPT5_6_MODEL_PREFIX):
+            return False
+        usage = getattr(response, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+        return bool(prompt_tokens and prompt_tokens > _OPENAI_GPT5_6_LONG_CONTEXT_THRESHOLD)
 
     @staticmethod
     def _apply_thinking_budget_optimization(
@@ -926,6 +1145,15 @@ class LLMAPIHandlerFactory:
                 budget=clamped_budget,
                 model=model_label,
             )
+
+    @staticmethod
+    def _custom_llm_owns_thinking(llm_key: str, parameters: dict[str, Any]) -> bool:
+        """Whether a custom LLM supplied its own thinking payload via extra_parameters.
+
+        When it did, the platform's default thinking-budget optimization must be skipped so it
+        neither overwrites the customer budget nor in-place mutates the shared config dict. SKY-13345.
+        """
+        return is_custom_llm_key(llm_key) and ("thinking" in parameters or "thinking_level" in parameters)
 
     @staticmethod
     def _is_gemini_3_model(llm_config: LLMConfig | LLMRouterConfig) -> bool:
@@ -1143,6 +1371,23 @@ class LLMAPIHandlerFactory:
             if flex_handler is not None:
                 return flex_handler
             return default
+        context = skyvern_context.current()
+        if context is not None and override_llm_key == context.org_default_llm_key:
+            return _resolve_org_default_llm_handler(
+                override_llm_key,
+                context.organization_id if context else None,
+                default,
+            )
+        organization_id = context.organization_id if context is not None else None
+        if is_custom_llm_key(override_llm_key) and not _custom_key_belongs_to_run_org(
+            override_llm_key, organization_id
+        ):
+            LOG.warning(
+                "Rejecting custom LLM override key not owned by the run's organization, using default",
+                llm_key=override_llm_key,
+                organization_id=organization_id,
+            )
+            return default
         try:
             # Explicit overrides should honor the exact model choice and skip experimentation reroutes.
             return LLMAPIHandlerFactory.get_llm_api_handler(override_llm_key)
@@ -1274,6 +1519,12 @@ class LLMAPIHandlerFactory:
                 )
 
             context = skyvern_context.current()
+            secret_values = _current_secret_values_for_redaction()
+            prompt = _redact_prompt_text(prompt, secret_values) or ""
+            system_prompt = _redact_prompt_text(system_prompt, secret_values)
+            redacted_cached_static_prompt = (
+                _redact_prompt_text(context.cached_static_prompt, secret_values) if context else None
+            )
             is_speculative_step = step.is_speculative if step else False
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
                 step, is_speculative_step, task_v2, thought, ai_suggestion
@@ -1370,7 +1621,7 @@ class LLMAPIHandlerFactory:
                 try:
                     if (
                         context
-                        and context.cached_static_prompt
+                        and redacted_cached_static_prompt
                         and prompt_name == EXTRACT_ACTION_PROMPT_NAME  # Only inject for extract-actions
                         and isinstance(llm_config, LLMConfig)
                         and isinstance(llm_config.model_name, str)
@@ -1388,7 +1639,7 @@ class LLMAPIHandlerFactory:
                                 "content": [
                                     {
                                         "type": "text",
-                                        "text": context.cached_static_prompt,
+                                        "text": redacted_cached_static_prompt,
                                     }
                                 ],
                             }
@@ -1440,9 +1691,9 @@ class LLMAPIHandlerFactory:
 
                     # Strip static prompt from the request messages because it's already in the cache
                     # Sending it again causes double-billing (once cached, once uncached)
-                    if context and context.cached_static_prompt:
+                    if redacted_cached_static_prompt:
                         prompt_stripped = LLMAPIHandlerFactory._strip_static_prompt_from_messages(
-                            active_messages, context.cached_static_prompt
+                            active_messages, redacted_cached_static_prompt
                         )
 
                         if prompt_stripped:
@@ -1701,6 +1952,20 @@ class LLMAPIHandlerFactory:
                         duration_seconds=duration_seconds,
                     )
                     raise SkyvernContextWindowExceededError(model=main_model_group, prompt_name=prompt_name) from e
+                except JSONDecodeError as e:
+                    # A dead upstream can answer HTTP 200 with an empty or truncated body. Already
+                    # retryable through the ValueError branch below, but logged there as a token limit.
+                    duration_seconds = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "error")
+                    LOG.warning(
+                        "LLM response body was not parseable JSON",
+                        llm_key=llm_key,
+                        model=main_model_group,
+                        prompt_name=prompt_name,
+                        body_length=_json_error_body_length(e),
+                        duration_seconds=duration_seconds,
+                    )
+                    raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except ValueError as e:
                     duration_seconds = time.perf_counter() - start_time
                     _llm_span.set_attribute("status", "error")
@@ -1886,6 +2151,7 @@ class LLMAPIHandlerFactory:
                 image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
                     screenshots, model_used or main_model_group, response
                 )
+                resolved_provider, service_tier = _response_routing_metadata(response)
                 LOG.info(
                     "LLM API handler duration metrics",
                     llm_key=llm_key,
@@ -1907,7 +2173,8 @@ class LLMAPIHandlerFactory:
                     image_tokens=image_tokens if image_tokens > 0 else None,
                     image_cost=image_cost if image_cost > 0 else None,
                     image_tokens_source=image_source,
-                    service_tier=getattr(response, "service_tier", None),
+                    resolved_provider=resolved_provider,
+                    service_tier=service_tier,
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_slim_log_fields(context, prompt_name),
                     **_enrich_tree_log_fields(context, step),
@@ -1987,6 +2254,9 @@ class LLMAPIHandlerFactory:
         llm_key: str,
         base_parameters: dict[str, Any] | None = None,
     ) -> LLMAPIHandler:
+        if settings.ENV == "local" and LLMConfigRegistry.get_config_issue(llm_key):
+            return dummy_llm_api_handler
+
         try:
             llm_config = LLMConfigRegistry.get_config(llm_key)
         except InvalidLLMConfigError:
@@ -1995,19 +2265,30 @@ class LLMAPIHandlerFactory:
         if LLMConfigRegistry.is_router_config(llm_key):
             return LLMAPIHandlerFactory.get_llm_api_handler_with_router(llm_key)
 
+        assert isinstance(llm_config, LLMConfig)
+        should_cache_handler = not base_parameters
+        if should_cache_handler:
+            cached = LLMAPIHandlerFactory._handler_cache.get(llm_key)
+            if cached is not None and cached[0] is llm_config:
+                return cached[1]
+
         # For OpenRouter models, use LLMCaller which has native OpenRouter support.
         # Registry keys (e.g. OPENROUTER_DEEPSEEK_V4_FLASH) also route here when their
         # model_name is openrouter/* so usage.cost is tracked in get_call_stats.
         if LLMAPIHandlerFactory._openrouter_model_name(llm_key, llm_config):
             llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
-            return llm_caller.call
+            handler = llm_caller.call
+            if should_cache_handler:
+                LLMAPIHandlerFactory._handler_cache[llm_key] = (llm_config, handler)
+            return handler
 
         # For GitHub Copilot via OPENAI_COMPATIBLE, use LLMCaller for a custom header
         if llm_key == "OPENAI_COMPATIBLE" and LLMAPIHandlerFactory.is_github_copilot_endpoint():
             llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
-            return llm_caller.call
-
-        assert isinstance(llm_config, LLMConfig)
+            handler = llm_caller.call
+            if should_cache_handler:
+                LLMAPIHandlerFactory._handler_cache[llm_key] = (llm_config, handler)
+            return handler
 
         @traced(name=LLM_REQUEST_SPAN_NAME, tags=[llm_key])
         async def llm_api_handler(
@@ -2048,8 +2329,14 @@ class LLMAPIHandlerFactory:
             if "timeout" not in active_parameters:
                 active_parameters["timeout"] = settings.LLM_CONFIG_TIMEOUT
 
+            # A custom LLM may declare its own thinking budget via extra_parameters; the platform's
+            # default thinking-budget optimization must not overwrite it (nor in-place mutate the
+            # nested dict retained in llm_config.litellm_params via the shallow merge above). SKY-13345.
+            customer_owns_thinking = LLMAPIHandlerFactory._custom_llm_owns_thinking(llm_key, active_parameters)
             # Apply thinking budget optimization if settings are available
-            if (
+            if customer_owns_thinking:
+                pass
+            elif (
                 LLMAPIHandlerFactory._thinking_budget_settings
                 and prompt_name in LLMAPIHandlerFactory._thinking_budget_settings
             ):
@@ -2069,6 +2356,12 @@ class LLMAPIHandlerFactory:
                 )
 
             context = skyvern_context.current()
+            secret_values = _current_secret_values_for_redaction()
+            prompt = _redact_prompt_text(prompt, secret_values) or ""
+            system_prompt = _redact_prompt_text(system_prompt, secret_values)
+            redacted_cached_static_prompt = (
+                _redact_prompt_text(context.cached_static_prompt, secret_values) if context else None
+            )
             is_speculative_step = step.is_speculative if step else False
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
                 step, is_speculative_step, task_v2, thought, ai_suggestion
@@ -2150,7 +2443,7 @@ class LLMAPIHandlerFactory:
                 try:
                     if (
                         context
-                        and context.cached_static_prompt
+                        and redacted_cached_static_prompt
                         and prompt_name == EXTRACT_ACTION_PROMPT_NAME  # Only inject for extract-actions
                         and isinstance(llm_config, LLMConfig)
                         and isinstance(llm_config.model_name, str)
@@ -2168,7 +2461,7 @@ class LLMAPIHandlerFactory:
                                 "content": [
                                     {
                                         "type": "text",
-                                        "text": context.cached_static_prompt,
+                                        "text": redacted_cached_static_prompt,
                                     }
                                 ],
                             }
@@ -2235,10 +2528,10 @@ class LLMAPIHandlerFactory:
                 # Strip static prompt from the request messages because it's already in the cache
                 # Sending it again causes double-billing (once cached, once uncached)
                 active_messages = messages
-                if vertex_cache_attached and context and context.cached_static_prompt:
+                if vertex_cache_attached and redacted_cached_static_prompt:
                     active_messages = copy.deepcopy(messages)
                     prompt_stripped = LLMAPIHandlerFactory._strip_static_prompt_from_messages(
-                        active_messages, context.cached_static_prompt
+                        active_messages, redacted_cached_static_prompt
                     )
 
                     if prompt_stripped:
@@ -2316,6 +2609,20 @@ class LLMAPIHandlerFactory:
                         duration_seconds=duration_seconds,
                     )
                     raise LLMProviderError(llm_key, cause=e) from e
+                except JSONDecodeError as e:
+                    # A dead upstream can answer HTTP 200 with an empty or truncated body, which fails
+                    # parsing after the status check; that is a transient fault, not a bad request.
+                    duration_seconds = time.perf_counter() - start_time
+                    _llm_span.set_attribute("status", "error")
+                    LOG.warning(
+                        "LLM response body was not parseable JSON",
+                        llm_key=llm_key,
+                        model=model_name,
+                        prompt_name=prompt_name,
+                        body_length=_json_error_body_length(e),
+                        duration_seconds=duration_seconds,
+                    )
+                    raise LLMProviderErrorRetryableTask(llm_key, cause=e) from e
                 except Exception as e:
                     duration_seconds = time.perf_counter() - start_time
                     _llm_span.set_attribute("status", "error")
@@ -2448,6 +2755,7 @@ class LLMAPIHandlerFactory:
                 image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
                     screenshots, actual_model or llm_config.model_name, response
                 )
+                resolved_provider, service_tier = _response_routing_metadata(response)
                 LOG.info(
                     "LLM API handler duration metrics",
                     llm_key=llm_key,
@@ -2469,7 +2777,8 @@ class LLMAPIHandlerFactory:
                     image_tokens=image_tokens if image_tokens > 0 else None,
                     image_cost=image_cost if image_cost > 0 else None,
                     image_tokens_source=image_source,
-                    service_tier=getattr(response, "service_tier", None),
+                    resolved_provider=resolved_provider,
+                    service_tier=service_tier,
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_slim_log_fields(context, prompt_name),
                     **_enrich_tree_log_fields(context, step),
@@ -2550,6 +2859,8 @@ class LLMAPIHandlerFactory:
                         )
 
         llm_api_handler.llm_key = llm_key  # type: ignore[attr-defined]
+        if should_cache_handler:
+            LLMAPIHandlerFactory._handler_cache[llm_key] = (llm_config, llm_api_handler)
         return llm_api_handler
 
     @staticmethod
@@ -2619,6 +2930,70 @@ class LLMAPIHandlerFactory:
             return
         cls._gemini_3_reasoning_effort_override = normalized
         LOG.info("Gemini 3 reasoning_effort override applied", value=normalized)
+
+
+def _custom_key_belongs_to_run_org(llm_key: str, organization_id: str | None) -> bool:
+    if organization_id is None:
+        return False
+    custom_llm_id = llm_key.removeprefix(CUSTOM_LLM_KEY_PREFIX)
+    return is_custom_llm_owned_by_organization(custom_llm_id, organization_id)
+
+
+def _resolve_org_default_llm_handler(
+    llm_key: str,
+    organization_id: str | None,
+    fallback: LLMAPIHandler,
+) -> LLMAPIHandler:
+    try:
+        if is_custom_llm_key(llm_key) and not _custom_key_belongs_to_run_org(llm_key, organization_id):
+            LOG.warning(
+                "Organization default LLM key is not owned by the run's organization, using default",
+                llm_key=llm_key,
+                organization_id=organization_id,
+            )
+            return fallback
+        if not LLMConfigRegistry.is_registered(llm_key):
+            raise InvalidLLMConfigError(llm_key)
+        return LLMAPIHandlerFactory.get_llm_api_handler(llm_key)
+    except Exception:
+        LOG.warning(
+            "Failed to resolve organization default LLM API handler, using default",
+            llm_key=llm_key,
+            exc_info=True,
+        )
+        return fallback
+
+
+def _get_org_aware_llm_api_handler(
+    llm_key: str | None,
+    organization_id: str | None,
+    default: LLMAPIHandler | None,
+    platform_fallback: LLMAPIHandler,
+) -> LLMAPIHandler:
+    fallback = default or platform_fallback
+    if not llm_key:
+        return fallback
+    return _resolve_org_default_llm_handler(llm_key, organization_id, fallback)
+
+
+def get_org_aware_secondary_llm_api_handler(default: LLMAPIHandler | None = None) -> LLMAPIHandler:
+    context = skyvern_context.current()
+    return _get_org_aware_llm_api_handler(
+        context.org_default_secondary_llm_key if context is not None else None,
+        context.organization_id if context is not None else None,
+        default,
+        app.SECONDARY_LLM_API_HANDLER,
+    )
+
+
+def get_org_aware_primary_llm_api_handler(default: LLMAPIHandler | None = None) -> LLMAPIHandler:
+    context = skyvern_context.current()
+    return _get_org_aware_llm_api_handler(
+        context.org_default_llm_key if context is not None else None,
+        context.organization_id if context is not None else None,
+        default,
+        app.LLM_API_HANDLER,
+    )
 
 
 class LLMCaller:
@@ -2718,6 +3093,9 @@ class LLMCaller:
             active_parameters.update(self.llm_config.litellm_params)  # type: ignore
 
         context = skyvern_context.current()
+        secret_values = _current_secret_values_for_redaction()
+        original_prompt = prompt
+        prompt = _redact_prompt_text(prompt, secret_values)
         is_speculative_step = step.is_speculative if step else False
         should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
             step, is_speculative_step, task_v2, thought, ai_suggestion
@@ -2810,9 +3188,15 @@ class LLMCaller:
                 message_pattern = "anthropic"
 
             if use_message_history:
-                # self.message_history will be updated in place
+                redacted_message_history = _redact_message_text_content(self.message_history, secret_values)
                 messages = await llm_messages_builder_with_history(
                     prompt,
+                    screenshots,
+                    redacted_message_history,
+                    message_pattern=message_pattern,
+                )
+                message_history_after_success = await llm_messages_builder_with_history(
+                    original_prompt,
                     screenshots,
                     self.message_history,
                     message_pattern=message_pattern,
@@ -2823,6 +3207,7 @@ class LLMCaller:
                     screenshots,
                     message_pattern=message_pattern,
                 )
+                message_history_after_success = None
             llm_request_payload = {
                 "model": self.llm_key if openrouter_model_name and self.openai_client else self.llm_config.model_name,
                 "messages": messages,
@@ -2853,9 +3238,9 @@ class LLMCaller:
                     **active_parameters,
                 )
                 llm_duration_seconds = time.perf_counter() - t_llm_request
-                if use_message_history:
+                if use_message_history and message_history_after_success is not None:
                     # only update message_history when the request is successful
-                    self.message_history = messages
+                    self.message_history = message_history_after_success
             # Error paths only set status=error, not token/cost attrs via
             # _enrich_llm_span — no response object exists so there's nothing to report.
             except litellm.exceptions.ContextWindowExceededError as e:
@@ -2867,9 +3252,11 @@ class LLMCaller:
                 )
                 raise SkyvernContextWindowExceededError(model=self.llm_config.model_name) from e
             except litellm.exceptions.RateLimitError as e:
+                # Rate limits are transient, and this path no longer leans on SDK-level retries, so
+                # the step-level retry (bounded by max_retries_per_step) is what absorbs them.
                 _llm_span.set_attribute("status", "rate_limited")
                 LOG.warning("LLM request rate limited", llm_key=self.llm_key)
-                raise LLMProviderError(self.llm_key, cause=e) from e
+                raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except litellm.exceptions.APIError as e:
                 _llm_span.set_attribute("status", "error")
                 raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
@@ -2897,10 +3284,27 @@ class LLMCaller:
             except RateLimitError as e:
                 _llm_span.set_attribute("status", "rate_limited")
                 LOG.warning("LLM request rate limited", llm_key=self.llm_key)
-                raise LLMProviderError(self.llm_key, cause=e) from e
+                raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except APIError as e:
                 _llm_span.set_attribute("status", "error")
                 raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
+            except JSONDecodeError as e:
+                # A dead upstream can answer HTTP 200 with an empty or truncated body, which fails
+                # parsing after the status check; that is a transient fault, not a bad request.
+                _llm_span.set_attribute("status", "error")
+                LOG.warning(
+                    "LLM response body was not parseable JSON",
+                    llm_key=self.llm_key,
+                    model=self.llm_config.model_name,
+                    body_length=_json_error_body_length(e),
+                    error=str(e),
+                )
+                raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
+            except LLMProviderError:
+                # Already classified (retryable or not) by the dispatch path; re-wrapping it below
+                # would erase that and log it as an unexpected failure.
+                _llm_span.set_attribute("status", "error")
+                raise
             except Exception as e:
                 _llm_span.set_attribute("status", "error")
                 LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
@@ -2959,6 +3363,7 @@ class LLMCaller:
             image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
                 screenshots, actual_model or self.llm_config.model_name, response
             )
+            resolved_provider, service_tier = _response_routing_metadata(response)
             LOG.info(
                 "LLM API handler duration metrics",
                 llm_key=self.llm_key,
@@ -2982,6 +3387,8 @@ class LLMCaller:
                 image_tokens=image_tokens if image_tokens > 0 else None,
                 image_cost=image_cost if image_cost > 0 else None,
                 image_tokens_source=image_source,
+                resolved_provider=resolved_provider,
+                service_tier=service_tier,
                 llm_screenshots_enabled=llm_screenshots_enabled,
                 **_slim_log_fields(context, prompt_name),
                 **_enrich_tree_log_fields(context, step),
@@ -3111,6 +3518,9 @@ class LLMCaller:
                 api_key=litellm_params.get("api_key") or settings.OPENROUTER_API_KEY,
                 base_url=litellm_params.get("api_base") or settings.OPENROUTER_API_BASE,
                 http_client=ForgeAsyncHttpxClientWrapper(follow_redirects=False),
+                # An SDK retry re-spends the whole timeout against a stalled provider; leave
+                # transient failures to the step-level retry instead.
+                max_retries=0,
             )
         if openai_client:
             # Extract OpenRouter-specific and GitHub Copilot-specific parameters
@@ -3141,15 +3551,68 @@ class LLMCaller:
                 openai_params["service_tier"] = active_parameters["service_tier"]
             if active_parameters.get("reasoning_effort"):
                 openai_params["reasoning_effort"] = active_parameters["reasoning_effort"]
+            extra_body = active_parameters.get("extra_body")
+            if isinstance(extra_body, dict):
+                request_extra_body = dict(extra_body)
+                for parameter_name in openai_params:
+                    request_extra_body.pop(parameter_name, None)
+                if request_extra_body:
+                    openai_params["extra_body"] = request_extra_body
 
+            # Custom OpenRouter models declare provider-specific passthrough (e.g. top_p,
+            # extra_headers) via extra_parameters. The openai client only accepts known top-level
+            # kwargs, so forward the rest through extra_body / extra_headers rather than dropping
+            # them. SKY-13345.
+            if self._custom_openrouter and isinstance(self.llm_config, LLMConfig):
+                passthrough = custom_llm_passthrough_parameters(self.llm_config.litellm_params)
+                for already_mapped in (
+                    "max_completion_tokens",
+                    "max_tokens",
+                    "temperature",
+                    "service_tier",
+                    "reasoning_effort",
+                    "extra_body",
+                ):
+                    passthrough.pop(already_mapped, None)
+                passthrough_headers = passthrough.pop("extra_headers", None)
+                if isinstance(passthrough_headers, dict):
+                    extra_headers.update({str(key): str(value) for key, value in passthrough_headers.items()})
+                if passthrough:
+                    request_extra_body = dict(openai_params.get("extra_body") or {})
+                    for key, value in passthrough.items():
+                        request_extra_body.setdefault(key, value)
+                    openai_params["extra_body"] = request_extra_body
+
+            attempts = _openai_client_attempts(openai_client) if settings.ENFORCE_LLM_HARD_DEADLINE else None
+            deadline = _llm_hard_deadline_seconds(timeout, attempts)
             try:
-                completion = await openai_client.chat.completions.create(
+                provider_call = openai_client.chat.completions.create(
                     model=self.llm_key,
                     messages=messages,
                     extra_headers=extra_headers if extra_headers else None,
                     timeout=timeout,
                     **openai_params,
                 )
+                if deadline is None:
+                    completion = await provider_call
+                else:
+                    try:
+                        async with asyncio.timeout(deadline) as deadline_scope:
+                            completion = await provider_call
+                    except TimeoutError as e:
+                        # A TimeoutError the scope did not raise came from inside the request;
+                        # relabelling it as a deadline hit would bury its real cause.
+                        if not deadline_scope.expired():
+                            raise
+                        LOG.warning(
+                            "LLM request exceeded its hard deadline",
+                            llm_key=self.llm_key,
+                            model=self.llm_config.model_name,
+                            timeout=timeout,
+                            attempts=attempts,
+                            deadline=deadline,
+                        )
+                        raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
                 # Convert OpenAI ChatCompletion to litellm ModelResponse format
                 # litellm.utils.convert_to_model_response_object expects a dict
                 return litellm.ModelResponse(**completion.model_dump())

@@ -53,6 +53,8 @@ async def test_destructive_tools_flagged() -> None:
         "skyvern_clear_session_storage",
         "skyvern_clear_local_storage",
         "skyvern_credential_delete",
+        "skyvern_onepassword_config_clear",
+        "skyvern_bitwarden_config_clear",
         "skyvern_folder_delete",
         "skyvern_workflow_delete",
         "skyvern_workflow_cancel",
@@ -84,6 +86,10 @@ async def test_read_only_sampling_marked_read_only() -> None:
         "skyvern_get_html",
         "skyvern_workflow_list",
         "skyvern_workflow_get",
+        "skyvern_onepassword_items",
+        "skyvern_onepassword_config_get",
+        "skyvern_bitwarden_items",
+        "skyvern_bitwarden_config_get",
     }
 
     for name in expected_ro:
@@ -127,6 +133,8 @@ async def test_open_world_sampling_matches_policy() -> None:
         "skyvern_workflow_list",
         "skyvern_folder_create",
         "skyvern_credential_list",
+        "skyvern_onepassword_items",
+        "skyvern_bitwarden_items",
         "skyvern_script_get_code",
     }
 

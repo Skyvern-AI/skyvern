@@ -1,0 +1,145 @@
+Skyvern signs every webhook and TOTP request with your API key using HMAC-SHA256, so you can verify the request actually came from Skyvern before acting on it.
+
+**Headers sent with every request:**
+- `x-skyvern-signature`: HMAC-SHA256 signature of the payload, hex-encoded
+- `x-skyvern-timestamp`: Unix timestamp when the request was sent
+- `Content-Type: application/json`
+
+Copy the verifier for your language and reject the request whenever it returns false.
+
+<Warning>
+**If you copied a verifier from this page before August 2026, re-check it.** Earlier versions
+of these examples were permissive: the TypeScript example called `crypto.timingSafeEqual()`
+without using its return value, so any signature of the right length was accepted, and the
+TOTP examples compared signatures with `==`. Replace them with the verifiers below.
+</Warning>
+
+<CodeGroup>
+```python Python
+import hashlib
+import hmac
+import os
+
+from fastapi import HTTPException, Request
+
+SKYVERN_API_KEY = os.environ["SKYVERN_API_KEY"]
+
+
+def verify_skyvern_signature(raw_body: bytes, signature: str | None) -> bool:
+    if not signature:
+        return False
+    expected = hmac.new(
+        SKYVERN_API_KEY.encode("utf-8"),
+        msg=raw_body,
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+    # Compared as bytes: compare_digest raises TypeError on a non-ASCII str,
+    # and the signature header is attacker-controlled.
+    return hmac.compare_digest(signature.encode("utf-8"), expected.encode("utf-8"))
+
+
+async def handle_webhook(request: Request):
+    raw_body = await request.body()
+    signature = request.headers.get("x-skyvern-signature")
+
+    if not verify_skyvern_signature(raw_body, signature):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    data = await request.json()
+    # Process the request...
+```
+
+```typescript TypeScript
+import crypto from "crypto";
+import express from "express";
+
+function verifySkyvernSignature(rawBody: Buffer, signature: unknown): boolean {
+  if (typeof signature !== "string" || signature.length === 0) {
+    return false;
+  }
+  const apiKey = process.env.SKYVERN_API_KEY;
+  if (!apiKey) {
+    throw new Error("SKYVERN_API_KEY is not set");
+  }
+  const expected = crypto.createHmac("sha256", apiKey).update(rawBody).digest("hex");
+  const received = Buffer.from(signature, "utf8");
+  const digest = Buffer.from(expected, "utf8");
+  // timingSafeEqual throws unless both buffers are the same length, so compare
+  // lengths first and return its result -- never discard it.
+  return received.length === digest.length && crypto.timingSafeEqual(received, digest);
+}
+
+app.post("/webhook", express.raw({ type: "application/json" }), (req, res) => {
+  if (!verifySkyvernSignature(req.body, req.headers["x-skyvern-signature"])) {
+    return res.status(401).send("Invalid signature");
+  }
+
+  const data = JSON.parse(req.body);
+  // Process the request...
+  res.status(200).send("OK");
+});
+```
+
+```go Go
+package main
+
+import (
+    "crypto/hmac"
+    "crypto/sha256"
+    "encoding/hex"
+    "io"
+    "net/http"
+    "os"
+)
+
+func verifySkyvernSignature(rawBody []byte, signature string) bool {
+    apiKey := os.Getenv("SKYVERN_API_KEY")
+    // Without this, an unset key would sign with "" -- a key an attacker also knows.
+    if signature == "" || apiKey == "" {
+        return false
+    }
+    mac := hmac.New(sha256.New, []byte(apiKey))
+    mac.Write(rawBody)
+    expected := hex.EncodeToString(mac.Sum(nil))
+    return hmac.Equal([]byte(signature), []byte(expected))
+}
+
+func webhookHandler(w http.ResponseWriter, r *http.Request) {
+    rawBody, err := io.ReadAll(r.Body)
+    if err != nil {
+        http.Error(w, "Failed to read request body", http.StatusBadRequest)
+        return
+    }
+
+    if !verifySkyvernSignature(rawBody, r.Header.Get("x-skyvern-signature")) {
+        http.Error(w, "Invalid signature", http.StatusUnauthorized)
+        return
+    }
+
+    // Process the request...
+    w.WriteHeader(http.StatusOK)
+}
+```
+</CodeGroup>
+
+<Warning>
+**Act on the comparison result, and reject a missing signature.** A constant-time
+comparison only protects you if you branch on what it returns. Two ways to get this
+wrong: calling `crypto.timingSafeEqual()` for its side effects and treating "it did not
+throw" as success — it only throws on a length mismatch, so every wrong-but-64-character
+signature passes — or computing a verdict and never checking it. A request that arrives
+with no `x-skyvern-signature` header at all must be rejected, not crash your handler.
+</Warning>
+
+<Note>
+**Use constant-time comparison** to prevent timing attacks:
+- Python: `hmac.compare_digest()`
+- TypeScript: `crypto.timingSafeEqual()`
+- Go: `hmac.Equal()`
+
+Never use simple equality operators (`==` or `===`) for signature comparison as they are vulnerable to timing attacks.
+</Note>
+
+<Warning>
+**Always validate against the raw request body bytes.** Skyvern normalizes JSON before signing: it removes whitespace (using compact separators) and converts whole-number floats to integers (`3.0` becomes `3`). If you parse the JSON and re-serialize it, the byte representation will differ and signature validation will fail.
+</Warning>

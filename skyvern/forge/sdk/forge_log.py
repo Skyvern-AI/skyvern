@@ -1,22 +1,22 @@
 import logging
 import random
-import re
 import sys
 from pathlib import Path
 from types import TracebackType
 from typing import Any
 
 import structlog
-from structlog.typing import EventDict
+from structlog.typing import EventDict, Processor
 
 from skyvern._version import __version__
 from skyvern.config import settings
+from skyvern.forge.log_redaction import (
+    REDACTED,
+    is_sensitive_key,
+    redact_bearer_tokens_in_text,
+    redact_sensitive_fields,
+)
 from skyvern.forge.sdk.core import skyvern_context
-
-# Bearer JWTs occasionally leak into log messages via WebSocket connection
-# URLs that pass `?token=Bearer%20<jwt>` as a query string. Redact before
-# anything ships to Datadog. Matches both raw and URL-encoded forms.
-_BEARER_TOKEN_RE = re.compile(r"(?i)(token=)(?:Bearer(?:%20|\s+))?[A-Za-z0-9._%-]+")
 
 LOGGING_LEVEL_MAP: dict[str, int] = {
     "DEBUG": logging.DEBUG,
@@ -142,6 +142,8 @@ def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: Ev
             event_dict["task_v2_id"] = context.task_v2_id
         if context.browser_session_id:
             event_dict["browser_session_id"] = context.browser_session_id
+        if context.copilot_session_id:
+            event_dict["copilot_session_id"] = context.copilot_session_id
         if context.browser_container_ip:
             event_dict["browser_container_ip"] = context.browser_container_ip
         if context.browser_container_task_arn:
@@ -202,14 +204,41 @@ def redact_registered_secrets(logger: logging.Logger, method_name: str, event_di
 
 
 def redact_bearer_tokens(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
-    """Redact Bearer JWTs from any string value in the event dict.
+    """Redact Bearer credentials from every top-level string value in the event dict.
 
-    Defense-in-depth for log lines that interpolate URLs containing
-    `?token=Bearer%20<jwt>` (e.g. WebSocket connection URLs).
+    Covers `?token=Bearer%20<jwt>` query strings (e.g. WebSocket connection URLs),
+    `Authorization: Bearer <token>` header values, and bare `Bearer <token>` runs in
+    exception strings. Bearer credentials nested inside structured kwargs are handled
+    by ``redact_sensitive_event_fields`` below, which recurses into their strings.
     """
     for key, value in list(event_dict.items()):
-        if isinstance(value, str) and "token=" in value:
-            event_dict[key] = _BEARER_TOKEN_RE.sub(r"\1<redacted>", value)
+        if isinstance(value, str):
+            event_dict[key] = redact_bearer_tokens_in_text(value)
+    return event_dict
+
+
+def redact_sensitive_event_fields(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    """Mask sensitive-named kwargs (auth headers, tokens, credentials) before rendering.
+
+    Reuses the shared field redactor so structured kwargs such as
+    ``headers={"Authorization": ...}``, ``payload={...}``, or ``response_body={...}``
+    are masked before ``add_kv_pairs_to_msg`` folds them into the rendered line.
+    Top-level keys whose name is sensitive are masked outright; every other
+    non-string value is redacted recursively — models, tuples and sets included,
+    since the formatter renders those in full too. Plain string values are left to
+    the bearer / registered-secret redactors above.
+
+    Each kwarg is guarded independently: a caller-supplied container whose iteration
+    raises must not take down the whole log call, so it fails closed to ``REDACTED``.
+    """
+    for key, value in list(event_dict.items()):
+        try:
+            if is_sensitive_key(key):
+                event_dict[key] = REDACTED
+            elif not isinstance(value, str):
+                event_dict[key] = redact_sensitive_fields(value)
+        except Exception:
+            event_dict[key] = REDACTED
     return event_dict
 
 
@@ -372,6 +401,22 @@ def add_error_processor(logger: logging.Logger, method_name: str, event_dict: Ev
     return event_dict
 
 
+def exception_log_fields(exc: BaseException) -> dict[str, str]:
+    """The error_type/error_category/exception_hash fields add_error_processor derives from exc_info.
+
+    For callsites that want these dashboard fields on a log line that deliberately omits the
+    traceback (e.g. a warning downgraded from an exception log).
+    """
+    exc_type = type(exc)
+    fields = {
+        "error_type": f"{exc_type.__module__}.{exc_type.__name__}",
+        "error_category": _categorize_exception(exc_type, exc_type.__name__),
+    }
+    if exc.__traceback__ is not None:
+        fields["exception_hash"] = _generate_exception_hash(exc_type, exc.__traceback__)
+    return fields
+
+
 def _generate_exception_hash(exc_type: type, tb: TracebackType) -> str:
     """
     Generate a stable hash for an exception based on:
@@ -495,7 +540,11 @@ def setup_logger() -> None:
         [
             redact_bearer_tokens,
             redact_registered_secrets,
+            # After compaction: that pass is a log-volume control that trims Action
+            # models down to a few fields, and redaction would otherwise expand them
+            # into full dicts before it ran.
             compact_action_objects,
+            redact_sensitive_event_fields,
             structlog.processors.EventRenamer("msg"),
             add_kv_pairs_to_msg,
             structlog.processors.CallsiteParameterAdder(
@@ -513,6 +562,7 @@ def setup_logger() -> None:
             redact_bearer_tokens,
             redact_registered_secrets,
             compact_action_objects,
+            redact_sensitive_event_fields,
             structlog.processors.CallsiteParameterAdder(
                 {
                     structlog.processors.CallsiteParameter.FILENAME,
@@ -537,6 +587,13 @@ def setup_logger() -> None:
         + additional_processors
         + [skyvern_logs_processor, sample_logs_processor, structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
     )
+    # Foreign stdlib records never run the structlog chain above, so without these two a
+    # record reaches Datadog with an empty message (its remapper reads `msg`, not `event`)
+    # and no `organization_id` to group on. Order matters: `add_kv_pairs_to_msg` reads `msg`.
+    foreign_msg_chain: list[Processor] = (
+        [structlog.processors.EventRenamer("msg"), add_kv_pairs_to_msg] if settings.JSON_LOGGING else []
+    )
+
     handler = logging.StreamHandler()
     handler.setFormatter(
         structlog.stdlib.ProcessorFormatter(
@@ -547,7 +604,8 @@ def setup_logger() -> None:
                 structlog.stdlib.ExtraAdder(),
                 add_error_processor,
                 structlog.processors.format_exc_info,
-            ],
+            ]
+            + foreign_msg_chain,
             processors=[
                 structlog.stdlib.add_log_level,
                 structlog.stdlib.add_logger_name,
@@ -559,6 +617,9 @@ def setup_logger() -> None:
                 # exc_info to a string by now, so a secret in the exception text is reachable.
                 # These stay duplicated in the structlog chain above on purpose: that pass also
                 # guards `context.log`, which is persisted to the per-run S3 log artifact.
+                # `redact_sensitive_event_fields` is deliberately NOT duplicated here: foreign
+                # records carry only string values, and native records arrive already redacted,
+                # so it could only re-walk every structured kwarg a second time.
                 redact_bearer_tokens,
                 redact_registered_secrets,
                 renderer,
@@ -571,7 +632,7 @@ def setup_logger() -> None:
     # Root at WARNING so third-party loggers (temporalio, grpc, litellm, …)
     # only surface warnings and errors.  Our packages get the configured level.
     root_logger.setLevel(logging.WARNING)
-    for name in ("skyvern", "cloud", "workers", "scripts", "browser_controller"):
+    for name in ("skyvern", "cloud", "workers", "scripts", "browser_controller", "codeblock"):
         logging.getLogger(name).setLevel(LOG_LEVEL_VAL)
 
     # uvicorn calls logging.config.dictConfig(LOGGING_CONFIG) during its own

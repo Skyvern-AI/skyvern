@@ -60,6 +60,7 @@ const startNodeData: WorkflowStartNodeData = {
   scriptCacheKey: null,
   aiFallback: true,
   enableSelfHealing: false,
+  maskSecrets: false,
   runSequentially: false,
   sequentialKey: null,
   finallyBlockLabel: null,

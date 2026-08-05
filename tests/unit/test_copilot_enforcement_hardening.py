@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -52,6 +53,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _recover_from_context_overflow,
     _scouted_spine_missing_text,
     _strip_input_images,
+    _witnessed_values_by_path,
     register_no_progress_interaction_click,
     reset_no_progress_interaction_count,
     synthesized_trajectory_reaches_goal,
@@ -589,3 +591,50 @@ def test_repair_obligation_releases_the_turn_once_its_rounds_are_spent() -> None
 
     ctx.repair_obligation_nudge_count = MAX_REPAIR_OBLIGATION_NUDGES
     assert _check_enforcement(ctx, result) is None
+
+
+class TestWitnessArbitration:
+    def _ctx(self, reads: list[str]) -> SimpleNamespace:
+        packet = {
+            "source_tool": "inspect_page_for_composition",
+            "key_value_relations": [
+                {"key_text": "logs found", "value_text": "1.41K", "visible": True, "value_visible": True}
+            ],
+        }
+        return SimpleNamespace(
+            flow_evidence=[{"evidence": packet, "reached_via": "current_page", "had_bounded_schema": True, "step": 0}],
+            scout_trajectory=[
+                {
+                    "tool_name": "read_value",
+                    "read_output_path": "output.azure_error_count",
+                    "read_output_path_source": "declared",
+                    "read_result_value": value,
+                }
+                for value in reads
+            ],
+        )
+
+    def test_conflicting_reads_resolve_to_the_value_the_page_still_shows(self) -> None:
+        # Live shape (SKY-13226): a login-form probe and the real read both claimed the path; dropping
+        # the pair left the one requested output with no witness at all.
+        ctx = self._ctx(['{"passwordId":"password"}', "1.41K"])
+        assert _witnessed_values_by_path(ctx) == {"output.azure_error_count": "1.41K"}
+
+    def test_a_conflict_the_page_corroborates_for_none_still_carries_no_witness(self) -> None:
+        ctx = self._ctx(["junk-a", "junk-b"])
+        assert _witnessed_values_by_path(ctx) == {}
+
+    def test_a_read_that_only_inherited_the_path_witnesses_nothing(self) -> None:
+        # An early probe of a login form was promoted to the requested output because it was the only
+        # path on offer, and its JSON then stood as the witness for a figure the page had not shown.
+        ctx = self._ctx([])
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "read_value",
+                "read_output_path": "output.azure_error_count",
+                "read_output_path_source": "elimination",
+                "read_result_value": '{"passwordId": "password"}',
+            }
+        ]
+
+        assert _witnessed_values_by_path(ctx) == {}

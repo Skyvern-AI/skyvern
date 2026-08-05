@@ -15,6 +15,8 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module = ForgeApp()
     fake_app_module.DATABASE = _LazyNamespace()
     fake_app_module.WORKFLOW_CONTEXT_MANAGER = _LazyNamespace()
+    fake_app_module.WORKFLOW_CONTEXT_MANAGER.mask_secrets_enabled_for_run = MagicMock(return_value=False)
+    fake_app_module.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run = MagicMock(return_value=set())
     fake_app_module.WORKFLOW_SERVICE = _LazyNamespace()
     fake_app_module.BROWSER_MANAGER = _LazyNamespace()
     # get_for_task is a sync lookup returning None when no browser state is registered; _LazyNamespace

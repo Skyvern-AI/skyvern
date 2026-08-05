@@ -204,6 +204,44 @@ describe("NarrativeView — phase checklist (SKY-11970)", () => {
     expect(screen.queryByText(/revising after failed verify/)).toBeNull();
   });
 
+  it("REGRESSION PIN (SKY-12969): a mid-login code-only offer render keeps Explore active — no premature done, no 'Writing the workflow code…'", () => {
+    // The synthesis lane renders an offer (turn.draft) while the scout is still
+    // filling credentials, with zero authoring tools. Explore must stay active
+    // and Draft must not claim the phase.
+    const codeOnlyMidScout: TurnNarrativeState = {
+      ...EMPTY_NARRATIVE,
+      turnId: "turn-1",
+      turnIndex: 0,
+      mode: "build",
+      designStarted: true,
+      terminal: null,
+      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
+      designActivity: [
+        activityEntry({
+          id: "tc-1",
+          kind: "tool_call",
+          toolName: "navigate_browser",
+          displayLabel: "Opening page",
+        }),
+        activityEntry({
+          id: "tc-2",
+          kind: "tool_call",
+          toolName: "fill_credential_field",
+          displayLabel: "Filling credentials",
+        }),
+      ],
+    };
+    render(<NarrativeView turn={codeOnlyMidScout} uxV1 />);
+    const exploreLabel = screen.getByText("Explore site");
+    // Active rows render inert (no toggle button) with a spinner + sr-only word;
+    // a completed row would render neither.
+    expect(exploreLabel.closest("button")).toBeNull();
+    const exploreRow = exploreLabel.closest("div")!;
+    expect(exploreRow.querySelector(".animate-spin")).toBeTruthy();
+    expect(exploreRow.textContent).toContain("Active");
+    expect(screen.queryByText("Writing the workflow code…")).toBeNull();
+  });
+
   it("REGRESSION PIN: Test-run stays expandable when blocks exist even with an empty test-activity bucket (Codex catch)", () => {
     const historyRowNoTestActivity: TurnNarrativeState = {
       ...EMPTY_NARRATIVE,

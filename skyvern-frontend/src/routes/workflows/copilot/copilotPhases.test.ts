@@ -238,11 +238,21 @@ describe("derivePhases — live progression", () => {
     expect(phase(derivePhases(t), "draft").status).toBe("pending");
   });
 
-  it("draft goes active once the drafting-gap client hint fires, before any block runs", () => {
-    const t = turn({ draftingSignaledAt: 1000 });
+  it("REGRESSION PIN (SKY-12969): the drafting-gap silence hint alone never completes Explore mid-scout", () => {
+    // The 8s drafting-gap heuristic fires on any tool-call silence — including a
+    // scout thinking-pause during login/2FA before the synthesis lane sets
+    // turn.draft. A phase claim must derive from recorded authoring activity,
+    // not the absence of frames, so a bare draftingSignaledAt leaves Explore
+    // active and Draft pending.
+    const t = turn({
+      draftingSignaledAt: 1000,
+      designActivity: [
+        entry({ id: "1", kind: "tool_call", toolName: "navigate_browser" }),
+      ],
+    });
     const rows = derivePhases(t);
-    expect(phase(rows, "explore").status).toBe("done");
-    expect(phase(rows, "draft").status).toBe("active");
+    expect(phase(rows, "explore").status).toBe("active");
+    expect(phase(rows, "draft").status).toBe("pending");
     expect(phase(rows, "test").status).toBe("pending");
   });
 
@@ -319,6 +329,176 @@ describe("derivePhases — terminal", () => {
     const rows = derivePhases(t);
     expect(phase(rows, "explore").status).toBe("fail");
     expect(phase(rows, "done").status).toBe("fail");
+  });
+});
+
+describe("derivePhases — SKY-12969 code-only incremental build (concurrent draft)", () => {
+  // Mirrors the production session: scout tool completions interleaved with the
+  // synthesis lane's offer renders (turn.draft) at trajectory 1 and 4, zero
+  // AUTHORING_TOOLS entries, user-cancel terminal.
+  const OFFER = { blockCount: 1, blockLabels: ["block_1"], summary: null };
+  const scoutTools = [
+    "navigate_browser",
+    "evaluate",
+    "evaluate",
+    "take_screenshot",
+    "evaluate",
+    "fill_credential_field",
+    "fill_credential_field",
+    "evaluate",
+    "click",
+    "fill_credential_field",
+    "click",
+  ];
+  const scout = (n: number): ActivityEntry[] =>
+    scoutTools
+      .slice(0, n)
+      .map((toolName, i) =>
+        entry({ id: `s${i}`, kind: "tool_call", toolName }),
+      );
+
+  it("AC1: Explore stays active (never done) while the scout is mid-login and an offer has already rendered", () => {
+    // Screenshot-1 instant: 10 scout completions, offer rendered (turn.draft set
+    // by the synthesis lane), no authoring tool, live browser still on 2FA.
+    const midScout = turn({
+      terminal: null,
+      draft: OFFER,
+      designActivity: scout(10),
+    });
+    const rows = derivePhases(midScout);
+    expect(phase(rows, "explore").status).toBe("active");
+    expect(phase(rows, "draft").status).toBe("pending");
+    // An active Explore row shows no done-stub — its count cannot be claimed
+    // complete while it is still growing.
+    expect(phase(rows, "explore").stub).toBeNull();
+  });
+
+  it("AC1: the growing step count never lands under a completed row", () => {
+    const at10 = derivePhases(
+      turn({ terminal: null, draft: OFFER, designActivity: scout(10) }),
+    );
+    const at11 = derivePhases(
+      turn({ terminal: null, draft: OFFER, designActivity: scout(11) }),
+    );
+    expect(phase(at10, "explore").status).toBe("active");
+    expect(phase(at11, "explore").status).toBe("active");
+    expect(phase(at11, "explore").entries.length).toBeGreaterThan(
+      phase(at10, "explore").entries.length,
+    );
+  });
+
+  it("AC1: a user-cancel mid-login marks Explore stopped (not done); Draft stays pending", () => {
+    const cancelled = turn({
+      terminal: "response",
+      cancelled: true,
+      designEnded: true,
+      draft: OFFER,
+      designActivity: scout(11),
+    });
+    const rows = derivePhases(cancelled);
+    expect(phase(rows, "explore").status).toBe("stopped");
+    expect(phase(rows, "draft").status).toBe("pending");
+    expect(phase(rows, "done").status).toBe("stopped");
+  });
+
+  it("AC1/ruling: a healthy (non-cancelled) response terminal carrying the proposal resolves the phases done, count frozen", () => {
+    // The user let the same turn finish: scout completed, proposal offered, no
+    // authoring tool, no run. The turn is over — Explore genuinely ended, so the
+    // row completes WITH its final count (count-immutability holds).
+    const healthy = turn({
+      terminal: "response",
+      cancelled: false,
+      designEnded: true,
+      draft: OFFER,
+      designActivity: scout(11),
+    });
+    const rows = derivePhases(healthy);
+    expect(phase(rows, "explore").status).toBe("done");
+    expect(phase(rows, "draft").status).toBe("done");
+    expect(phase(rows, "test").status).toBe("notrun");
+    expect(phase(rows, "done").status).toBe("done");
+    expect(phase(rows, "explore").stub).toBe("11 steps");
+  });
+
+  it("AC1: hydration parity — a draft-only authoring turn resolves identically live and after reload", () => {
+    // authoringCount is client-only and resets to 0 on a history reload; the
+    // hydrated designActivity still carries the update_workflow entry, so
+    // authoringSeen keeps Explore/Draft resolved to done both ways (no jump).
+    const authored = [
+      entry({ id: "1", kind: "tool_call", toolName: "navigate_browser" }),
+      entry({ id: "2", kind: "tool_call", toolName: "update_workflow" }),
+    ];
+    const live = turn({
+      terminal: "response",
+      designEnded: true,
+      authoringCount: 1,
+      draft: OFFER,
+      designActivity: authored,
+    });
+    const hydrated = turn({
+      terminal: "response",
+      designEnded: true,
+      authoringCount: 0,
+      draft: OFFER,
+      designActivity: authored,
+    });
+    expect(derivePhases(hydrated).map((r) => r.status)).toEqual(
+      derivePhases(live).map((r) => r.status),
+    );
+    expect(phase(derivePhases(hydrated), "explore").status).toBe("done");
+    expect(phase(derivePhases(hydrated), "draft").status).toBe("done");
+  });
+
+  it("AC2 regression: a failed-verify redraft still re-activates Draft exactly as today", () => {
+    // The 11970 redraft beat re-activates Draft from activitySeq vs the
+    // verdict snapshot, independent of any draft artifact.
+    const t = turn({
+      terminal: null,
+      designEnded: true,
+      authoringCount: 1,
+      activitySeq: 3,
+      draft: OFFER,
+      blocks: [block({ state: "completed" })],
+      lastRunOutcome: {
+        verdict: "not_demonstrated",
+        displayReason: "outcome not confirmed",
+        activitySeqAtVerdict: 2,
+      },
+      designActivity: [
+        entry({ id: "1", kind: "tool_call", toolName: "navigate_browser" }),
+        entry({
+          id: "2",
+          kind: "tool_call",
+          toolName: "update_and_run_blocks",
+        }),
+        entry({
+          id: "3",
+          kind: "tool_call",
+          toolName: "inspect_current_workflow",
+        }),
+      ],
+    });
+    const rows = derivePhases(t);
+    expect(phase(rows, "draft").status).toBe("active");
+    expect(phase(rows, "test").status).toBe("done");
+  });
+
+  it("AC1/parity: a cancelled terminal with authoring evidence but an aged-out activity list still resolves Explore done, Draft stopped", () => {
+    // The reducer grafts the uncapped authoringCount across the terminal swap;
+    // the derivation must honor it so an authoring turn whose sole authoring
+    // entry evicted from the 50-capped activity list doesn't flip Explore back
+    // to stopped after the swap (SKY-11970 live/terminal parity).
+    const cancelledEvicted = turn({
+      terminal: "response",
+      cancelled: true,
+      designEnded: true,
+      authoringCount: 1,
+      draft: OFFER,
+      designActivity: [],
+    });
+    const rows = derivePhases(cancelledEvicted);
+    expect(phase(rows, "explore").status).toBe("done");
+    expect(phase(rows, "draft").status).toBe("stopped");
   });
 });
 

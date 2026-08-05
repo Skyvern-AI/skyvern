@@ -2,7 +2,15 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, List
 
-from pydantic import BaseModel, Field, computed_field, field_serializer, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationInfo,
+    computed_field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 from typing_extensions import Self, deprecated
 
 from skyvern.forge.sdk.db.enums import BrowserSeedSource, WorkflowRunTriggerType
@@ -21,7 +29,12 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
-from skyvern.schemas.runs import ProxyLocationInput, ScriptRunResponse
+from skyvern.schemas.runs import (
+    BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY,
+    ProxyLocationInput,
+    ScriptRunResponse,
+    _validate_browser_address,
+)
 from skyvern.schemas.workflows import WorkflowStatus
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import validate_url
@@ -62,6 +75,13 @@ class WorkflowRequestBody(BaseModel):
     @classmethod
     def validate_run_metadata(cls, v: dict[str, str] | None) -> dict[str, str] | None:
         return normalize_run_metadata(v)
+
+    @field_validator("browser_address")
+    @classmethod
+    def validate_browser_address(cls, browser_address: str | None, info: ValidationInfo) -> str | None:
+        if info.context and info.context.get(BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY):
+            return browser_address
+        return _validate_browser_address(browser_address)
 
     @model_validator(mode="after")
     def _reject_start_fresh_with_session(self) -> Self:
@@ -172,6 +192,7 @@ class Workflow(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     persist_browser_session: bool = False
+    mask_secrets: bool = False
     pin_saved_session_ip: bool = False
     browser_profile_id: str | None = None
     browser_profile_key: str | None = None
