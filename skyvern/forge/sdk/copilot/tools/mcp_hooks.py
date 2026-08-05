@@ -9,6 +9,7 @@ from typing import Any
 import structlog
 
 from skyvern.config import settings
+from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.build_phase import (
     BuildPhase,
@@ -22,8 +23,21 @@ from skyvern.forge.sdk.copilot.config import (
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials
-from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
+from skyvern.forge.sdk.copilot.enforcement import (
+    _requested_output_labels_by_path,
+    requested_output_extraction_plan,
+    requested_output_paths_for_derivation,
+    unbound_requested_output_paths_for_designation,
+)
+from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
+from skyvern.forge.sdk.copilot.output_designation_resolution import (
+    RESOLUTION_PROMPT_TEMPLATE,
+    coerce_resolution,
+    designation_opportunity,
+    render_candidates,
+    render_requested_paths,
+)
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, resolve_credential_for_live_page
 from skyvern.forge.sdk.copilot.request_slots import is_canonical_request_slot_path
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction
@@ -1072,6 +1086,69 @@ def _unread_requested_output_paths(ctx: AgentContext) -> list[str]:
     return sorted(requested - claimed)
 
 
+async def resolve_requested_output_designation_from_page_evidence(ctx: AgentContext) -> None:
+    """Decide which value this packet shows for a requested output nothing has bound yet.
+
+    Fires on the page evidence rather than on an authoring step, a tool the model chose to call, or
+    a question it happened to ask — all of which can precede the value's render and none of which
+    re-fire after it (SKY-13485). Selecting nothing is a first-class answer: no write is refused and
+    a structurally different packet can offer the decision again.
+    """
+    # tools/__init__ imports this module, so the acceptance helper cannot be imported at top level.
+    from skyvern.forge.sdk.copilot.tools import _accept_requested_output_reads
+
+    if not requested_output_paths_for_derivation(ctx):
+        return
+    opportunity = designation_opportunity(
+        unbound_paths=unbound_requested_output_paths_for_designation(ctx),
+        flow_evidence=ctx.flow_evidence,
+        resolved_fingerprints=ctx.resolved_designation_fingerprints,
+    )
+    if opportunity is None:
+        return
+    handler = await resolve_main_copilot_handler(ctx.workflow_permanent_id, ctx.organization_id)
+    if handler is None:
+        return
+    prompt = prompt_engine.load_prompt(
+        template=RESOLUTION_PROMPT_TEMPLATE,
+        requested_paths=render_requested_paths(opportunity, _requested_output_labels_by_path(ctx)),
+        candidates=render_candidates(opportunity),
+        page_context=opportunity.page_context,
+    )
+    try:
+        raw = await asyncio.wait_for(
+            handler(prompt=prompt, prompt_name=RESOLUTION_PROMPT_TEMPLATE),
+            timeout=settings.COPILOT_OUTPUT_DESIGNATION_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        # Deliberately leaves the fingerprint unrecorded: a judge that timed out decided nothing, and
+        # this page is the only one that can answer for this path.
+        LOG.info("copilot_requested_output_designation_resolution", decision="unavailable", exc_info=True)
+        return
+    reads = coerce_resolution(raw, opportunity)
+    LOG.info(
+        "copilot_requested_output_designation_resolution",
+        decision="selected" if reads else "none",
+        requested_paths=list(opportunity.unbound_paths),
+        candidate_labels=[candidate.label for candidate in opportunity.candidates],
+        selected=[{"output_path": read["output_path"], "candidate_label": read["label"]} for read in reads],
+    )
+    if not reads:
+        # A judged abstention is a decision; the same offer should not be re-asked.
+        ctx.resolved_designation_fingerprints.add(opportunity.fingerprint)
+        return
+    rejected = await _accept_requested_output_reads(ctx, reads, offered_by="page_evidence_resolution")
+    if len(rejected) < len(reads):
+        # Only a designation the live page actually pinned settles this offer. A probe that missed
+        # because the metric ticked between capture and probe left the path unbound, and the
+        # fingerprint excludes values, so recording it here would suppress the tile forever.
+        ctx.resolved_designation_fingerprints.add(opportunity.fingerprint)
+    # Bind now, at the observation that resolved it: reach, completeness and ownership all read the
+    # retained plan, and deriving it later inside imposition let the same trajectory be unowned on
+    # one attempt and owned on the next.
+    requested_output_extraction_plan(ctx)
+
+
 async def _evaluate_post_hook(
     result: dict[str, Any],
     raw: dict[str, Any],
@@ -1136,13 +1213,17 @@ async def _evaluate_post_hook(
             data["claimed_output_read_hint"] = (
                 f"That expression gathered candidates rather than evaluating to one value, so nothing "
                 f"records what {claimed_path} is. Read the single value on its own — an expression whose "
-                f"result is just that value — and pass output_path={claimed_path} on that call."
+                f"result is just that value — and pass output_path={claimed_path} on that call. If you can "
+                f"see the value but not author an expression that returns just it, call "
+                f'inspect_page_for_composition(target_url="current_page") with requested_output_reads naming '
+                f"{claimed_path} and the value as rendered, and the page will pin it."
             )
             LOG.info(
                 "copilot_scouted_read_claimed_output_without_value",
                 read_output_path=claimed_path,
                 read_result_shape=recorded.get("read_result_shape"),
             )
+    await resolve_requested_output_designation_from_page_evidence(ctx)
     unread_requested = _unread_requested_output_paths(ctx)
     if unread_requested:
         data["requested_outputs_still_unread"] = unread_requested

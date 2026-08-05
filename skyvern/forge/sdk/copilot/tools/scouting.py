@@ -1406,7 +1406,7 @@ _EVALUATE_ACTIONABLE_ACT_INSTRUCTION = (
 _EVALUATE_RESULT_COMPOSITION_INSTRUCTION = (
     "Loaded results are already visible on the current page; inspect this page for composition or author an "
     "extraction/validation block from the loaded results instead of re-reading it. For each requested output "
-    "value you can see, pass it to synthesize_demonstrated_block's requested_output_reads as the value exactly "
+    "value you can see, pass it to inspect_page_for_composition's requested_output_reads as the value exactly "
     "as rendered plus the label above it, and the page will pin the read for you."
 )
 
