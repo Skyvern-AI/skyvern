@@ -576,6 +576,7 @@ class ExtensionRelayServer:
         self._site: web.TCPSite | None = None
         self._websocket: web.WebSocketResponse | None = None
         self._connection_lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
         self._connected_event = asyncio.Event()
         self._request_ids = itertools.count(1)
         self._pending: dict[str, asyncio.Future[dict]] = {}
@@ -649,7 +650,7 @@ class ExtensionRelayServer:
         future: asyncio.Future[dict] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
         try:
-            await websocket.send_json(frame)
+            await self._send_json(websocket, frame)
         except (ConnectionError, RuntimeError):
             pending = self._pending.pop(request_id, None)
             if pending is not None:
@@ -670,6 +671,7 @@ class ExtensionRelayServer:
             raise
 
     async def _handle_pair_page(self, _request: web.Request) -> web.Response:
+        LOG.info("browser_extension_pair_page_served")
         return web.Response(
             text=_PAIR_PAGE,
             content_type="text/html",
@@ -705,19 +707,24 @@ class ExtensionRelayServer:
 
         payload = await _read_json_object(request)
         supplied_nonce = payload.get("nonce") if payload is not None else None
+        valid_payload = (
+            payload is not None
+            and type(payload.get("v")) is int
+            and payload["v"] == PROTOCOL_VERSION
+            and isinstance(supplied_nonce, str)
+        )
         nonce_matches = secrets.compare_digest(
             active_nonce or ("0" * 43),
             supplied_nonce if isinstance(supplied_nonce, str) else "",
         )
         expired = created_at is None or time.monotonic() - created_at >= _PAIRING_NONCE_TTL_SECONDS
-        if (
-            payload is None
-            or type(payload.get("v")) is not int
-            or payload["v"] != PROTOCOL_VERSION
-            or not nonce_matches
-            or expired
-        ):
+        if not valid_payload:
+            LOG.info("browser_extension_pair_claim", outcome="bad_payload")
             return web.json_response({"error": "invalid_nonce"}, status=403, headers={"Cache-Control": "no-store"})
+        if not nonce_matches or expired:
+            LOG.info("browser_extension_pair_claim", outcome="expired_or_unknown_nonce")
+            return web.json_response({"error": "invalid_nonce"}, status=403, headers={"Cache-Control": "no-store"})
+        LOG.info("browser_extension_pair_claim", outcome="ok")
         return web.json_response(
             {"v": PROTOCOL_VERSION, "port": self.bound_port, "token": self._token},
             headers={"Cache-Control": "no-store"},
@@ -726,58 +733,76 @@ class ExtensionRelayServer:
     async def _handle_websocket(self, request: web.Request) -> web.WebSocketResponse:
         websocket = web.WebSocketResponse(max_msg_size=_MAX_WS_MESSAGE_BYTES)
         await websocket.prepare(request)
+        LOG.info("browser_extension_websocket_opened", remote_address=request.remote)
 
-        origin = request.headers.get("Origin")
-        if origin is not None and not _is_extension_origin(origin):
-            await websocket.close(code=_AUTH_CLOSE_CODE, message=b"authentication failed")
-            return websocket
-
-        server_nonce, challenge = build_challenge()
-        await websocket.send_str(challenge)
         try:
-            proof_frame = await websocket.receive(timeout=_AUTH_TIMEOUT_SECONDS)
+            origin = request.headers.get("Origin")
+            if origin is not None and not _is_extension_origin(origin):
+                await self._reject_authentication(websocket, "invalid_origin")
+                return websocket
+
+            server_nonce, challenge = build_challenge()
+            await websocket.send_str(challenge)
+            try:
+                proof_frame = await websocket.receive(timeout=_AUTH_TIMEOUT_SECONDS)
+            except TimeoutError:
+                await self._reject_authentication(websocket, "timeout")
+                return websocket
             if proof_frame.type is not WSMsgType.TEXT:
-                raise BrowserExtensionError("Authentication proof must be a text frame")
-            proof = parse_extension_message(proof_frame.data)
+                await self._reject_authentication(websocket, "bad_payload")
+                return websocket
+            try:
+                proof = parse_extension_message(proof_frame.data)
+            except BrowserExtensionError:
+                await self._reject_authentication(websocket, _auth_parse_failure_reason(proof_frame.data))
+                return websocket
             if proof.kind != "auth.proof" or proof.client_nonce is None or proof.proof is None:
-                raise BrowserExtensionError("Authentication proof is missing")
+                await self._reject_authentication(websocket, "bad_payload")
+                return websocket
             if not _is_valid_client_nonce(proof.client_nonce):
-                raise BrowserExtensionError("Authentication nonce is invalid")
+                await self._reject_authentication(websocket, "bad_nonce")
+                return websocket
             if not verify_ext_proof(self._token, server_nonce, proof.client_nonce, proof.proof):
-                raise BrowserExtensionError("Authentication proof is invalid")
-        except (BrowserExtensionError, TimeoutError):
-            await websocket.close(code=_AUTH_CLOSE_CODE, message=b"authentication failed")
+                await self._reject_authentication(websocket, "bad_proof")
+                return websocket
+
+            await self._send_json(
+                websocket,
+                {
+                    "v": 1,
+                    "type": "auth.ok",
+                    "serverProof": compute_server_proof(self._token, proof.client_nonce, server_nonce),
+                },
+            )
+            LOG.info("browser_extension_auth_succeeded")
+            await self._activate_connection(websocket)
+
+            loop = asyncio.get_running_loop()
+            last_inbound = loop.time()
+            keepalive_task = asyncio.create_task(self._run_keepalive(websocket, lambda: last_inbound))
+            try:
+                async for message in websocket:
+                    last_inbound = loop.time()
+                    if self._websocket is not websocket:
+                        break
+                    if message.type is WSMsgType.TEXT:
+                        await self._handle_text_frame(websocket, message.data)
+                    elif message.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR}:
+                        break
+                    else:
+                        LOG.warning("browser extension sent a non-text frame")
+            finally:
+                keepalive_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await keepalive_task
+                await self._handle_disconnect(websocket)
             return websocket
-
-        await websocket.send_json(
-            {
-                "v": 1,
-                "type": "auth.ok",
-                "serverProof": compute_server_proof(self._token, proof.client_nonce, server_nonce),
-            }
-        )
-        await self._activate_connection(websocket)
-
-        loop = asyncio.get_running_loop()
-        last_inbound = loop.time()
-        keepalive_task = asyncio.create_task(self._run_keepalive(websocket, lambda: last_inbound))
-        try:
-            async for message in websocket:
-                last_inbound = loop.time()
-                if self._websocket is not websocket:
-                    break
-                if message.type is WSMsgType.TEXT:
-                    await self._handle_text_frame(websocket, message.data)
-                elif message.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR}:
-                    break
-                else:
-                    LOG.warning("browser extension sent a non-text frame")
         finally:
-            keepalive_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await keepalive_task
-            await self._handle_disconnect(websocket)
-        return websocket
+            LOG.info("browser_extension_websocket_closed", close_code=websocket.close_code)
+
+    async def _reject_authentication(self, websocket: web.WebSocketResponse, reason: str) -> None:
+        LOG.info("browser_extension_auth_failed", reason=reason)
+        await websocket.close(code=_AUTH_CLOSE_CODE, message=b"authentication failed")
 
     async def _activate_connection(self, websocket: web.WebSocketResponse) -> None:
         async with self._connection_lock:
@@ -786,6 +811,7 @@ class ExtensionRelayServer:
             self._connected_event.clear()
 
         if previous is not None and previous is not websocket:
+            LOG.info("browser_extension_websocket_replaced")
             self._fail_pending_requests()
             self.scoped_tabs = []
             await self._call_on_disconnect()
@@ -806,7 +832,11 @@ class ExtensionRelayServer:
             if message.event == "extension.hello":
                 await self._mark_hello_processed(websocket)
         elif message.kind == "ping":
-            await websocket.send_json({"v": 1, "type": "pong"})
+            await self._send_json(websocket, {"v": 1, "type": "pong"})
+
+    async def _send_json(self, websocket: web.WebSocketResponse, frame: dict) -> None:
+        async with self._send_lock:
+            await websocket.send_json(frame)
 
     async def _mark_hello_processed(self, websocket: web.WebSocketResponse) -> None:
         async with self._connection_lock:
@@ -871,7 +901,7 @@ class ExtensionRelayServer:
                 return
             if now >= next_ping:
                 try:
-                    await websocket.send_json({"v": 1, "type": "ping"})
+                    await self._send_json(websocket, {"v": 1, "type": "ping"})
                 except (ConnectionError, RuntimeError):
                     return
                 next_ping = now + _PING_INTERVAL_SECONDS
@@ -918,6 +948,16 @@ async def _read_json_object(request: web.Request) -> dict | None:
     except (json.JSONDecodeError, UnicodeDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _auth_parse_failure_reason(raw: str) -> str:
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return "bad_payload"
+    if isinstance(payload, dict) and type(payload.get("v")) is int and payload["v"] != PROTOCOL_VERSION:
+        return "protocol_mismatch"
+    return "bad_payload"
 
 
 def _is_valid_client_nonce(client_nonce: str) -> bool:

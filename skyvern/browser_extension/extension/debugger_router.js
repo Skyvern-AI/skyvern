@@ -8,12 +8,20 @@ import {
   requireTabId,
 } from "./protocol.js";
 
+const CHILD_AUTO_ATTACH_TIMEOUT_MS = 2_000;
+const LEAF_TARGET_TYPES = new Set([
+  "service_worker",
+  "shared_worker",
+  "worker",
+]);
+
 export class DebuggerRouter {
   constructor({ tabScope, sendEvent, onAttachedChange }) {
     this.tabScope = tabScope;
     this.sendEvent = sendEvent;
     this.onAttachedChange = onAttachedChange;
     this.attachedTabs = new Set();
+    this.childTargets = new Map();
 
     chrome.debugger.onEvent.addListener((source, method, params) => {
       void this.handleDebuggerEvent(source, method, params);
@@ -71,6 +79,7 @@ export class DebuggerRouter {
         );
       }
       this.attachedTabs.delete(tabId);
+      this.forgetChildTargets(tabId);
       this.onAttachedChange();
       return {};
     });
@@ -79,7 +88,10 @@ export class DebuggerRouter {
   async send(args) {
     const values = requireArgs(args);
     const tabId = requireTabId(values.tabId);
-    return this.tabScope.runTabOperation(tabId, async () => {
+    let commandPromise;
+    let commandError;
+    let skippedLeafAutoAttach = false;
+    await this.tabScope.runTabOperation(tabId, async () => {
       await this.ensureStillControllableLocked(tabId);
       if (!this.attachedTabs.has(tabId)) {
         throw new ProtocolError(
@@ -116,28 +128,85 @@ export class DebuggerRouter {
           "CDP parameters must be an object.",
         );
       }
+      const childTarget = this.childTargets.get(values.sessionId);
+      if (
+        values.method === "Target.setAutoAttach" &&
+        childTarget?.tabId === tabId &&
+        LEAF_TARGET_TYPES.has(childTarget?.type)
+      ) {
+        skippedLeafAutoAttach = true;
+        return;
+      }
 
       const target =
         values.sessionId === undefined
           ? { tabId }
           : { tabId, sessionId: values.sessionId };
-      let result;
+      // Initiate under the per-tab chain, then release it before awaiting the response.
       try {
-        result = await chrome.debugger.sendCommand(
-          target,
-          values.method,
-          values.params ?? {},
-        );
-      } catch {
-        await this.ensureStillControllableLocked(tabId);
+        commandPromise =
+          values.method === "Target.setAutoAttach" &&
+          values.sessionId !== undefined
+            ? this.sendCommandWithTimeout(
+                target,
+                values.method,
+                values.params ?? {},
+                CHILD_AUTO_ATTACH_TIMEOUT_MS,
+              )
+            : chrome.debugger.sendCommand(
+                target,
+                values.method,
+                values.params ?? {},
+              );
+      } catch (error) {
+        commandError = error;
+      }
+    });
+    if (skippedLeafAutoAttach) {
+      return { result: {} };
+    }
+
+    let result;
+    try {
+      if (commandError !== undefined) {
+        throw commandError;
+      }
+      result = await commandPromise;
+    } catch {
+      await this.assertCanSend(tabId);
+      throw new ProtocolError(
+        ERROR_CODES.CDP_ERROR,
+        "Chrome rejected the CDP command.",
+      );
+    }
+    await this.assertCanSend(tabId);
+    return { result: result ?? {} };
+  }
+
+  async assertCanSend(tabId) {
+    return this.tabScope.runTabOperation(tabId, async () => {
+      await this.ensureStillControllableLocked(tabId);
+      if (!this.attachedTabs.has(tabId)) {
         throw new ProtocolError(
-          ERROR_CODES.CDP_ERROR,
-          "Chrome rejected the CDP command.",
+          ERROR_CODES.DEBUGGER_DETACHED,
+          "The debugger is not attached to this tab.",
         );
       }
-      await this.ensureStillControllableLocked(tabId);
-      return { result: result ?? {} };
     });
+  }
+
+  async sendCommandWithTimeout(target, method, params, timeoutMs) {
+    let timeoutId;
+    try {
+      return await Promise.race([
+        chrome.debugger.sendCommand(target, method, params),
+        new Promise((_, reject) => {
+          timeoutId = setTimeout(() => reject(new Error("timeout")), timeoutMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeoutId);
+    }
   }
 
   async detachIfAttached(tabId) {
@@ -154,10 +223,12 @@ export class DebuggerRouter {
       await chrome.debugger.detach({ tabId });
     } catch {
       this.attachedTabs.delete(tabId);
+      this.forgetChildTargets(tabId);
       this.onAttachedChange();
       return;
     }
     this.attachedTabs.delete(tabId);
+    this.forgetChildTargets(tabId);
     this.onAttachedChange();
   }
 
@@ -197,6 +268,23 @@ export class DebuggerRouter {
     if (typeof source.sessionId === "string") {
       eventParams.sessionId = source.sessionId;
     }
+    const childSessionId = params?.sessionId;
+    if (
+      method === "Target.attachedToTarget" &&
+      typeof childSessionId === "string" &&
+      params.targetInfo !== null &&
+      typeof params.targetInfo === "object"
+    ) {
+      this.childTargets.set(childSessionId, {
+        tabId: source.tabId,
+        type: params.targetInfo.type,
+      });
+    } else if (
+      method === "Target.detachedFromTarget" &&
+      typeof childSessionId === "string"
+    ) {
+      this.childTargets.delete(childSessionId);
+    }
     this.sendEvent(EVENTS.DEBUGGER_EVENT, eventParams);
   }
 
@@ -206,6 +294,7 @@ export class DebuggerRouter {
     }
     await this.tabScope.runTabOperation(source.tabId, async () => {
       this.attachedTabs.delete(source.tabId);
+      this.forgetChildTargets(source.tabId);
       this.onAttachedChange();
       this.sendEvent(EVENTS.DEBUGGER_DETACHED, {
         tabId: source.tabId,
@@ -213,5 +302,13 @@ export class DebuggerRouter {
       });
       await this.tabScope.handleDebuggerDetachLocked(source.tabId);
     });
+  }
+
+  forgetChildTargets(tabId) {
+    for (const [sessionId, target] of this.childTargets) {
+      if (target.tabId === tabId) {
+        this.childTargets.delete(sessionId);
+      }
+    }
   }
 }

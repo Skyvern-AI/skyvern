@@ -385,14 +385,14 @@ export class TabScope {
     const scopedGroupId = this.scopedGroupIds.get(tabId);
     this.scopedGroupIds.delete(tabId);
     try {
-      await this.persistScope();
+      if (detach && this.debuggerRouter !== null) {
+        await this.debuggerRouter.detachIfAttachedLocked(tabId);
+      }
     } finally {
-      await this.ungroupTabLocked(tabId, scopedGroupId);
       try {
-        if (detach && this.debuggerRouter !== null) {
-          await this.debuggerRouter.detachIfAttachedLocked(tabId);
-        }
+        await this.persistScope();
       } finally {
+        await this.ungroupTabLocked(tabId, scopedGroupId);
         this.sendEvent(EVENTS.SCOPE_TAB_REMOVED, { tabId, reason });
       }
     }
