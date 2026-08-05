@@ -21,6 +21,7 @@ import unicodedata
 import uuid
 import zipfile
 from collections import defaultdict, deque
+from collections.abc import Sequence
 from datetime import date, datetime, time, timezone
 from email.message import EmailMessage
 from functools import partial
@@ -59,6 +60,7 @@ from skyvern.constants import (
 )
 from skyvern.exceptions import (
     AzureConfigurationError,
+    BranchEvaluationContextTooLargeError,
     CodeBlockRunnerSelectionError,
     ConditionalBranchEvaluationError,
     ContextParameterValueNotFound,
@@ -70,7 +72,9 @@ from skyvern.exceptions import (
     MissingStarterUrl,
     NoTOTPVerificationCodeFound,
     PDFParsingError,
+    ScriptTerminationException,
     SkyvernException,
+    SyncTriggeredSequentialCredentialUnsupported,
     TaskNotFound,
     UnexpectedTaskStatus,
     get_user_facing_exception_message,
@@ -92,7 +96,11 @@ from skyvern.forge.sdk.api.files import (
     validate_local_file_path,
 )
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.api_handler_factory import (
+    LLMAPIHandlerFactory,
+    get_org_aware_primary_llm_api_handler,
+    get_org_aware_secondary_llm_api_handler,
+)
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_model_name
 from skyvern.forge.sdk.api.llm.exceptions import (
     EmptyLLMResponseError,
@@ -103,6 +111,10 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
+from skyvern.forge.sdk.copilot.reached_download_target import (
+    block_output_has_registered_download,
+    code_is_download_intent,
+)
 from skyvern.forge.sdk.copilot.runtime import _browser_context_is_attachable
 from skyvern.forge.sdk.copilot.self_heal_recovery import SelfHealRecoveryResult, run_self_heal_recovery
 from skyvern.forge.sdk.copilot.turn_origin import HealAdoptionFailed, TurnOrigin
@@ -152,7 +164,9 @@ from skyvern.forge.sdk.workflow.models._jinja import (
     _JSON_TYPE_MARKER,
     _json_type_filter,
     jinja_json_finalize_strict_env,
+    mask_jinja_in_python_comments,
     render_templates_in_json_value,
+    restore_jinja_masked_comments,
 )
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     CODE_BLOCK_FILENAME,
@@ -190,6 +204,7 @@ from skyvern.schemas.workflows import (
 from skyvern.services import otp_service
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.self_heal_cap import check_and_increment_self_heal_cap
+from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
 from skyvern.utils.token_counter import count_tokens
@@ -198,6 +213,7 @@ from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
 from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
 if TYPE_CHECKING:
@@ -365,7 +381,7 @@ def _format_payload_path_segment(key: str) -> str:
 
 
 # ForLoop constants
-DEFAULT_MAX_LOOP_ITERATIONS = 500
+DEFAULT_MAX_LOOP_ITERATIONS = 1000
 MAX_LOOP_OVER_VALUE_LOG_CHARS = 2000
 # Persist accumulated loop output to DB every N iterations to survive timeouts.
 # Trades up to N-1 iterations of data loss for O(N/K) writes instead of O(N).
@@ -425,6 +441,16 @@ def _maybe_truncate_loop_outputs(
     outputs_with_loop_values.append(last)
 
 
+def build_block_failure_output(failure_reason: str, error_codes: Sequence[str]) -> dict[str, Any]:
+    # SKY-7939: also surface the failure in `outputs.<block_label>` so callers
+    # can tell which block failed without cross-referencing the timeline.
+    return {
+        "status": BlockStatus.failed.value,
+        "failure_reason": failure_reason,
+        "errors": [{"error_code": code, "reasoning": failure_reason, "confidence_float": 1.0} for code in error_codes],
+    }
+
+
 class Block(BaseModel, abc.ABC):
     """Base class for workflow nodes (see branching spec [[s-4bnl]] for metadata semantics)."""
 
@@ -463,16 +489,16 @@ class Block(BaseModel, abc.ABC):
     # value left by a prior for-loop iteration.
     _output_recorded_this_execution: bool = PrivateAttr(default=False)
 
+    def _own_llm_key(self) -> str | None:
+        return None
+
     @property
     def override_llm_key(self) -> str | None:
         return self.override_llm_key_for_organization(None)
 
     def override_llm_key_for_organization(self, organization_id: str | None) -> str | None:
-        """
-        If the `Block` has a `model` defined, then return the mapped llm_key for it.
-
-        Otherwise return `None`.
-        """
+        """Resolve an explicit model mapping or the block's own LLM key."""
+        own_llm_key = self._own_llm_key() or None
         if self.model:
             model_name = self.model.get("model_name")
             if model_name:
@@ -482,8 +508,9 @@ class Block(BaseModel, abc.ABC):
                     return llm_key
                 if is_custom_llm_model_name(model_name):
                     raise ValueError("Custom LLM model not found for organization")
+                return own_llm_key
 
-        return None
+        return own_llm_key
 
     async def record_output_parameter_value(
         self,
@@ -914,23 +941,48 @@ class Block(BaseModel, abc.ABC):
                 },
                 exclude_none=True,
             )
+            # The description is a pure function of the rendered prompt, and a
+            # workflow's blocks are identical run over run — cache on a hash of the
+            # prompt itself so repeat runs skip the LLM call entirely and a template
+            # change naturally invalidates the cache. output_parameter is reduced to
+            # its key first: its row ids/timestamps vary per workflow revision
+            # without changing what the description says. Cache failures fall
+            # through to generation; only non-empty summaries are cached.
+            prompt_block_data = dict(block_data)
+            output_parameter_data = prompt_block_data.get("output_parameter")
+            if isinstance(output_parameter_data, dict):
+                prompt_block_data["output_parameter"] = output_parameter_data.get("key")
             description_generation_prompt = prompt_engine.load_prompt(
                 "generate_workflow_run_block_description",
-                block=block_data,
+                block=prompt_block_data,
             )
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
-                prompt=description_generation_prompt,
-                prompt_name="generate-workflow-run-block-description",
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-            )
-            description = json_response.get("summary")
-            LOG.info(
-                "Generated description for the workflow run block",
-                sampling=True,
-                description=description,
-                workflow_run_block_id=workflow_run_block_id,
-            )
+            cache_key = "wrb-description:" + hashlib.sha256(description_generation_prompt.encode()).hexdigest()
+            try:
+                cached_description = await app.CACHE.get(cache_key)
+            except Exception:
+                LOG.debug("Failed to read cached workflow run block description", exc_info=True)
+                cached_description = None
+            if isinstance(cached_description, str) and cached_description:
+                description = cached_description
+            else:
+                json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
+                    prompt=description_generation_prompt,
+                    prompt_name="generate-workflow-run-block-description",
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+                description = json_response.get("summary")
+                LOG.info(
+                    "Generated description for the workflow run block",
+                    sampling=True,
+                    description=description,
+                    workflow_run_block_id=workflow_run_block_id,
+                )
+                if isinstance(description, str) and description:
+                    try:
+                        await app.CACHE.set(cache_key, description)
+                    except Exception:
+                        LOG.debug("Failed to cache workflow run block description", exc_info=True)
         except Exception as e:
             LOG.exception("Failed to generate description for the workflow run block", error=e)
 
@@ -1105,6 +1157,7 @@ class BaseTaskBlock(Block):
     title: str = ""
     engine: RunEngine = RunEngine.skyvern_v1
     complete_criterion: str | None = None
+    complete_criterion_is_untrusted: bool = False
     terminate_criterion: str | None = None
     navigation_goal: str | None = None
     data_extraction_goal: str | None = None
@@ -1557,6 +1610,8 @@ class BaseTaskBlock(Block):
             try:
                 current_context = skyvern_context.ensure_context()
                 current_context.task_id = task.task_id
+                previous_complete_criterion_is_untrusted = current_context.complete_criterion_is_untrusted
+                current_context.complete_criterion_is_untrusted = self.complete_criterion_is_untrusted
                 close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
                 await app.agent.execute_step(
                     organization=organization,
@@ -1580,6 +1635,7 @@ class BaseTaskBlock(Block):
                 raise e
             finally:
                 current_context.task_id = None
+                current_context.complete_criterion_is_untrusted = previous_complete_criterion_is_untrusted
 
             # Check task status
             updated_task = await app.DATABASE.tasks.get_task(
@@ -2443,6 +2499,61 @@ class ForLoopBlock(Block):
                 exc_info=True,
             )
 
+    async def _get_loop_browser_state(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None,
+    ) -> BrowserState | None:
+        if browser_session_id:
+            return await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
+        return app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+
+    async def _snapshot_loop_baseline_pages(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None,
+    ) -> set[Page] | None:
+        """Pre-loop tabs to preserve, or None when they could not be determined.
+
+        None and an empty set must stay distinct: closing everything opened after an empty
+        baseline closes every tab, so a failed snapshot has to suppress the reset entirely.
+        """
+        if not settings.RESET_BROWSER_TABS_BETWEEN_LOOP_ITERATIONS:
+            return None
+        try:
+            browser_state = await self._get_loop_browser_state(workflow_run_id, organization_id, browser_session_id)
+            if isinstance(browser_state, RealBrowserState):
+                return set(browser_state.open_pages())
+        except Exception:
+            LOG.warning(
+                "Failed to snapshot baseline browser tabs for loop",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+        return None
+
+    async def _reset_browser_tabs_for_iteration(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None,
+        baseline_pages: set[Page] | None,
+    ) -> None:
+        if not settings.RESET_BROWSER_TABS_BETWEEN_LOOP_ITERATIONS or baseline_pages is None:
+            return
+        try:
+            browser_state = await self._get_loop_browser_state(workflow_run_id, organization_id, browser_session_id)
+            if isinstance(browser_state, RealBrowserState):
+                await browser_state.close_pages_opened_after(baseline_pages)
+        except Exception:
+            LOG.warning(
+                "Failed to reset browser tabs between loop iterations",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+
     async def execute_loop_helper(
         self,
         workflow_run_id: str,
@@ -2458,6 +2569,10 @@ class ForLoopBlock(Block):
 
         start_label, label_to_block, default_next_map = self._build_loop_graph(self.loop_blocks)
         conditional_scopes = compute_conditional_scopes(label_to_block, default_next_map)
+
+        loop_baseline_pages = await self._snapshot_loop_baseline_pages(
+            workflow_run_id, organization_id, browser_session_id
+        )
 
         for loop_idx, loop_over_value in enumerate(loop_over_values):
             # Check max_iterations limit
@@ -2490,6 +2605,11 @@ class ForLoopBlock(Block):
                     + f"...[truncated, original size: {len(loop_over_value_repr)}]"
                 )
             LOG.info("Starting loop iteration", loop_idx=loop_idx, loop_over_value=loop_over_value_repr)
+
+            if loop_idx > 0:
+                await self._reset_browser_tabs_for_iteration(
+                    workflow_run_id, organization_id, browser_session_id, loop_baseline_pages
+                )
 
             # Capture baseline downloaded files for per-iteration scoping (SKY-7005).
             # Download-producing child blocks re-capture their own per-block baseline
@@ -2923,7 +3043,7 @@ class WhileLoopBlock(Block):
     first). If the condition is false on the first check, the body never runs and the block
     returns success with an empty output list.
 
-    Safety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (500). Reaching the cap is
+    Safety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (1000). Reaching the cap is
     treated as a failure so that a misbehaving condition can never spin forever.
     """
 
@@ -3616,6 +3736,18 @@ class CodeBlockCaptchaError(Exception):
     """Sanitized CAPTCHA-primitive error with no site, selector, vendor, or token details."""
 
 
+CODE_BLOCK_TAB_OPEN_FAILURE_REASON = "Code block could not open a tab in the browser session; the session's browser may be held by another Playwright client"
+
+
+def _page_open_error_label(error: BaseException) -> str:
+    # Playwright maps only TimeoutError/TargetClosedError to their own Python classes; every
+    # other driver failure is the base Error whose .name carries the real class (e.g. TypeError).
+    name = getattr(error, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    return type(error).__name__
+
+
 _CODE_BLOCK_CAPTCHA_CHECKBOX_SELECTOR = ", ".join(
     (
         'input[type="checkbox"][id*="captcha" i]',
@@ -3649,6 +3781,8 @@ _CODE_BLOCK_RECAPTCHA_RESPONSE_SELECTOR = 'textarea[name="g-recaptcha-response"]
 _CODE_BLOCK_RECAPTCHA_ANCHOR_HOSTS = ("www.google.com", "www.recaptcha.net")
 _CODE_BLOCK_RECAPTCHA_ANCHOR_PATHS = ("/recaptcha/api2/anchor", "/recaptcha/enterprise/anchor")
 _CODE_BLOCK_RECAPTCHA_ANCHOR_ARM_TIMEOUT_SECONDS = 5
+# The extension arm polls a solver over the network; the scout caller has no enclosing bound.
+_CODE_BLOCK_EXTENSION_ARM_TIMEOUT_SECONDS = 12
 # Google's widget flips aria-checked after its own animation; a shorter wait reads as unsolved.
 _CODE_BLOCK_RECAPTCHA_ANCHOR_SETTLE_MS = 2_000
 _CODE_BLOCK_CAPTCHA_CONTINUE_SELECTOR = ", ".join(
@@ -3778,8 +3912,9 @@ async def _code_block_solve_captcha_builtin(
         LOG.info("code block CAPTCHA anchor frame arm did not solve", arm="recaptcha_anchor_frame")
 
     try:
-        if await app.AGENT_FUNCTION.auto_solve_captchas(page):
-            return
+        async with asyncio.timeout(_CODE_BLOCK_EXTENSION_ARM_TIMEOUT_SECONDS):
+            if await app.AGENT_FUNCTION.auto_solve_captchas(page):
+                return
     except Exception:
         LOG.info("code block CAPTCHA extension arm did not solve", arm="extension")
 
@@ -4178,7 +4313,11 @@ async def wrapper({default_args}):
         return self.parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        self.code = self.format_block_parameter_template_from_workflow_run_context(self.code, workflow_run_context)
+        masked_code, masked_comments = mask_jinja_in_python_comments(self.code)
+        rendered_code = self.format_block_parameter_template_from_workflow_run_context(
+            masked_code, workflow_run_context
+        )
+        self.code = restore_jinja_masked_comments(rendered_code, masked_comments)
         if self.prompt:
             self.prompt = self.format_block_parameter_template_from_workflow_run_context(
                 self.prompt, workflow_run_context
@@ -4406,6 +4545,12 @@ async def wrapper({default_args}):
 
     def _compose_heal_goal(self, *, workflow_run_context: WorkflowRunContext, failing_line: int | None) -> str:
         safe_main = workflow_run_context.mask_secrets_in_data(self.prompt or "")
+        # Steps are a code-derived outline, not an authored goal, so they may only narrow one.
+        # The harness path reaches here without the floor path's `if not self.prompt` gate, and
+        # a goal-less block would otherwise aim the recovery agent at a live page with a bare
+        # step description and no context.
+        if not self.prompt:
+            return safe_main
         matched_step = self._match_step_for_failing_line(failing_line) if failing_line is not None else None
         if matched_step is None or not matched_step.description:
             return safe_main
@@ -4421,6 +4566,61 @@ async def wrapper({default_args}):
         )
         return compose_mini_goal(main_goal=safe_main, mini_goal=safe_mini)
 
+    async def _record_unregistered_download_intent(
+        self,
+        *,
+        engine: str,
+        registered: bool,
+        output: object,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+    ) -> None:
+        """Record a block that authors a browser download but registered no file.
+
+        Telemetry only, and deliberately not outcome authority: the AST shape is evadable and
+        authorship is not a promise. The outcome belongs to the workflow's persisted completion
+        contract, graded at run finalization; this record's deletion condition is that coverage.
+        Emitted from every execution engine so the prevalence it measures is not engine-biased.
+        """
+        if registered or not code_is_download_intent(self.code):
+            return
+        LOG.warning(
+            "codeblock.download_intent_unregistered",
+            engine=engine,
+            copilot_authored=await self._workflow_is_copilot_authored(workflow_run_context),
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            block_label=self.label,
+            code_sha256=hashlib.sha256(self.code.encode()).hexdigest(),
+            result_keys=sorted(output.keys()) if isinstance(output, dict) else None,
+            organization_id=organization_id,
+        )
+
+    async def _workflow_is_copilot_authored(self, workflow_run_context: WorkflowRunContext) -> bool:
+        workflow = workflow_run_context.workflow
+        if workflow is None:
+            return False
+        if "copilot" in (workflow.created_by, workflow.edited_by):
+            return True
+        # User saves re-stamp both fields with the user id, so the current version alone is
+        # not durable; fall back to lineage (copilot stamps every version it writes and
+        # back-stamps v1 on copilot-born workflows). A lookup failure must fail closed —
+        # callers gate copilot-only behavior on this, and it must never mask a block failure.
+        try:
+            return await app.DATABASE.workflows.is_workflow_copilot_authored(
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=workflow.organization_id,
+            )
+        except Exception:
+            LOG.warning(
+                "Copilot-lineage lookup failed; failing closed",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                exc_info=True,
+            )
+            return False
+
     async def _self_heal_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
         # User-facing per-workflow setting, restricted to copilot-authored workflows —
         # pre-copilot code blocks must never gain agentic recovery from the toggle alone.
@@ -4430,24 +4630,7 @@ async def wrapper({default_args}):
         workflow = workflow_run_context.workflow
         if workflow is None or not workflow.enable_self_healing:
             return False
-        if "copilot" in (workflow.created_by, workflow.edited_by):
-            return True
-        # User saves re-stamp both fields with the user id, so the current version alone is
-        # not durable; fall back to lineage (copilot stamps every version it writes and
-        # back-stamps v1 on copilot-born workflows). This runs inside the block's exception
-        # handler — a lookup failure must fail closed, never mask the original block failure.
-        try:
-            return await app.DATABASE.workflows.is_workflow_copilot_authored(
-                workflow_permanent_id=workflow.workflow_permanent_id,
-                organization_id=workflow.organization_id,
-            )
-        except Exception:
-            LOG.warning(
-                "Self-heal copilot-lineage lookup failed; failing closed (no heal)",
-                workflow_permanent_id=workflow.workflow_permanent_id,
-                exc_info=True,
-            )
-            return False
+        return await self._workflow_is_copilot_authored(workflow_run_context)
 
     def _is_healable_page_failure(
         self,
@@ -4762,9 +4945,9 @@ async def wrapper({default_args}):
             or failure.healability_hint is not None
         )
         if not has_structured:
-            # No healability_hint to disambiguate, so only the page-class code heals blind;
+            # No healability_hint to disambiguate, so only the page-class codes heal blind;
             # user_code_error is ambiguous (could be a bare `raise`) and stays fail-closed.
-            if failure.error_code == "unsupported_page_operation":
+            if failure.error_code in {"unsupported_page_operation", "browser_operation_failed"}:
                 return HealClassification(healable=True, skip_reason=None)
             return HealClassification(
                 healable=False,
@@ -4890,6 +5073,104 @@ async def wrapper({default_args}):
                 exc_info=True,
             )
 
+    async def _capture_failure_evidence(
+        self,
+        *,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        browser_state: BrowserState | None,
+        page: Page | None,
+    ) -> None:
+        """Persist the page the block died on, so the copilot repair loop can see it.
+
+        Entirely best-effort: this runs inside the failure path, so it must never raise and
+        never change the block outcome.
+        """
+        if not organization_id:
+            return
+        live_browser_state = browser_state or app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
+        if not live_browser_state:
+            return
+        try:
+            screenshot = await live_browser_state.take_fullpage_screenshot()
+        except Exception:
+            LOG.warning(
+                "Failed to capture the at-failure screenshot for a code block",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+            screenshot = None
+        final_url: str | None = None
+        try:
+            failure_page = page or await live_browser_state.get_or_create_page()
+            # A failing login/MFA step can leave a credential or a generated OTP in the query
+            # string, and this URL is persisted and logged; mask before it leaves the page.
+            final_url = workflow_run_context.mask_secrets_in_data(failure_page.url) if failure_page else None
+        except Exception:
+            LOG.warning(
+                "Failed to read the at-failure URL for a code block",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+
+        try:
+            workflow_run_block = await app.DATABASE.observer.update_workflow_run_block(
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                final_url=final_url,
+            )
+            if screenshot:
+                await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
+                    workflow_run_block=workflow_run_block,
+                    artifact_type=ArtifactType.SCREENSHOT_LLM,
+                    data=screenshot,
+                )
+        except Exception:
+            LOG.warning(
+                "Failed to persist the at-failure evidence for a code block",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+
+    async def _failed_result_with_evidence(
+        self,
+        *,
+        failure_reason: str,
+        status: BlockStatus,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        browser_state: BrowserState | None,
+        page: Page | None,
+    ) -> BlockResult:
+        """Fail a code block after recording the page it died on.
+
+        Every non-healable exit routes through here so a new one inherits the capture instead of
+        silently reopening the blindness this closes.
+        """
+        await self._capture_failure_evidence(
+            workflow_run_context=workflow_run_context,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            browser_state=browser_state,
+            page=page,
+        )
+        return await self.build_block_result(
+            success=False,
+            failure_reason=failure_reason,
+            output_parameter_value=None,
+            status=status,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
     async def _resolve_failure_with_heal(
         self,
         *,
@@ -4906,6 +5187,17 @@ async def wrapper({default_args}):
         browser_state: BrowserState | None = None,
         page: Page | None = None,
     ) -> BlockResult:
+        # Capture before the healable branch: a non-healable failure is exactly the case the
+        # repair loop has the least to go on.
+        await self._capture_failure_evidence(
+            workflow_run_context=workflow_run_context,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            browser_state=browser_state,
+            page=page,
+        )
+
         async def _finalize_heal_result(result: BlockResult | None) -> BlockResult:
             if result is not None:
                 output_obligation = self._output_obligation_for_heal_result(result)
@@ -5258,15 +5550,30 @@ async def wrapper({default_args}):
             )
 
         page = await browser_state.get_working_page()
-        if not page:
-            return await self.build_block_result(
-                success=False,
-                failure_reason="No page found to run the code block",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-            )
+        if page is None:
+            # A session can arrive holding a context with no tab, leaving nothing to adopt. Opening
+            # one can raise even on a live context: when another Playwright client enabled autoAttach
+            # first, it owns target announcements and this connection stays blind to pages
+            # (SKY-13338) — no reconnect or retry from here can fix that.
+            try:
+                page = await browser_state.get_or_create_page()
+            except Exception as e:
+                LOG.exception(
+                    "Failed to open a page to run the code block",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    block_label=self.label,
+                )
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=f"{CODE_BLOCK_TAB_OPEN_FAILURE_REASON} ({_page_open_error_label(e)})",
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
 
         await self._ensure_run_recording_artifact(
             browser_state=browser_state,
@@ -5414,17 +5721,30 @@ async def wrapper({default_args}):
                         secure_classification = self._classify_secure_runner_failure(secure_failure)
 
                         async def build_secure_failure_result() -> BlockResult:
-                            if secure_code_block_result.block_result is not None:
-                                return secure_code_block_result.block_result
+                            engine_block_result = secure_code_block_result.block_result
+                            if engine_block_result is not None:
+                                await self.record_output_parameter_value(
+                                    workflow_run_context,
+                                    workflow_run_id,
+                                    engine_block_result.output_parameter_value,
+                                )
+                                return engine_block_result
+                            secure_failure_reason = (
+                                secure_failure.failure_reason or "Code block failed in the secure runner"
+                            )
+                            secure_error_codes = [secure_failure.error_code] if secure_failure.error_code else []
+                            failure_output = build_block_failure_output(secure_failure_reason, secure_error_codes)
+                            await self.record_output_parameter_value(
+                                workflow_run_context, workflow_run_id, failure_output
+                            )
                             return await self.build_block_result(
                                 success=False,
-                                failure_reason=(
-                                    secure_failure.failure_reason or "Code block failed in the secure runner"
-                                ),
-                                output_parameter_value=None,
+                                failure_reason=secure_failure_reason,
+                                output_parameter_value=failure_output,
                                 status=BlockStatus.failed,
                                 workflow_run_block_id=workflow_run_block_id,
                                 organization_id=organization_id,
+                                error_codes=secure_error_codes or None,
                             )
 
                         return await self._resolve_failure_with_heal(
@@ -5449,24 +5769,48 @@ async def wrapper({default_args}):
                             block_label=self.label,
                         )
                         await recorder.finalize(success=False)
-                        return await self.build_block_result(
-                            success=False,
+                        return await self._failed_result_with_evidence(
                             failure_reason="Secure code block runner returned no result",
-                            output_parameter_value=None,
                             status=BlockStatus.failed,
+                            workflow_run_context=workflow_run_context,
+                            workflow_run_id=workflow_run_id,
                             workflow_run_block_id=workflow_run_block_id,
                             organization_id=organization_id,
+                            browser_state=browser_state,
+                            page=page,
                         )
                     # failure=None does not imply success: infra arms (no browser/page, runner raise,
                     # invalid output) return a failed block_result with no healable failure metadata.
                     if not secure_code_block_result.block_result.success:
+                        # No healable metadata means the repair loop has even less to go on here
+                        # than on the healable path, so the page evidence matters more, not less.
+                        await self._capture_failure_evidence(
+                            workflow_run_context=workflow_run_context,
+                            workflow_run_id=workflow_run_id,
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                            browser_state=browser_state,
+                            page=page,
+                        )
                         await recorder.finalize(success=False)
                         return secure_code_block_result.block_result
                     await recorder.finalize(success=True)
+                    secure_output = secure_code_block_result.block_result.output_parameter_value
+                    await self._record_unregistered_download_intent(
+                        engine="secure_runner",
+                        # The sidecar registers into the block output, so that payload is the
+                        # registration evidence here — the inline directory diff never runs.
+                        registered=block_output_has_registered_download(secure_output),
+                        output=secure_output,
+                        workflow_run_context=workflow_run_context,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
                     await self.record_output_parameter_value(
                         workflow_run_context,
                         workflow_run_id,
-                        secure_code_block_result.block_result.output_parameter_value,
+                        secure_output,
                     )
                     return secure_code_block_result.block_result
                 LOG.warning(
@@ -5492,29 +5836,48 @@ async def wrapper({default_args}):
         except InsecureCodeDetected as e:
             await recorder.persist(recorder.recorded_actions())
             await recorder.finalize(success=False)
-            return await self.build_block_result(
-                success=False,
+            return await self._failed_result_with_evidence(
                 failure_reason=str(e),
-                output_parameter_value=None,
                 status=BlockStatus.failed,
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
+                browser_state=browser_state,
+                page=page,
             )
         except asyncio.TimeoutError:
             await recorder.persist(recorder.recorded_actions())
             await recorder.finalize(success=False)
-            return await self.build_block_result(
-                success=False,
+            return await self._failed_result_with_evidence(
                 failure_reason=(
                     "Failed to execute code block. Reason: TimeoutError: code block exceeded "
                     f"{settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS} seconds"
                 ),
-                output_parameter_value=None,
                 status=BlockStatus.failed,
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
+                browser_state=browser_state,
+                page=page,
             )
         except Exception as e:
+            # Exact type, not isinstance: the IllegitCompleteScriptTermination subclass means the
+            # complete-verifier rejected the block, which is a failure to heal, not an intentional stop.
+            if type(e) is ScriptTerminationException:
+                await recorder.persist(recorder.recorded_actions())
+                await recorder.finalize(success=False)
+                return await self._failed_result_with_evidence(
+                    failure_reason=workflow_run_context.mask_secrets_in_data(str(e)),
+                    status=BlockStatus.terminated,
+                    workflow_run_context=workflow_run_context,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    browser_state=browser_state,
+                    page=page,
+                )
             exc = CustomizedCodeException(e)
             failing_line = user_code_line_from_exception(e)
             # User code can raise an exception carrying a resolved secret (e.g.
@@ -5612,6 +5975,16 @@ async def wrapper({default_args}):
             result["downloaded_files"] = [fi.model_dump() for fi in downloaded_files]
             result["downloaded_file_urls"] = [fi.url for fi in downloaded_files]
             result["downloaded_file_artifact_ids"] = [fi.artifact_id for fi in downloaded_files if fi.artifact_id]
+
+        await self._record_unregistered_download_intent(
+            engine="inline",
+            registered=bool(downloaded_files),
+            output=result,
+            workflow_run_context=workflow_run_context,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
 
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result)
         return await self.build_block_result(
@@ -5819,6 +6192,9 @@ class TextPromptBlock(Block):
     schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
     schema_validation_max_errors: ClassVar[int] = SCHEMA_VALIDATION_MAX_ERRORS
 
+    def _own_llm_key(self) -> str | None:
+        return self.llm_key
+
     def get_all_parameters(
         self,
         workflow_run_id: str,
@@ -5978,7 +6354,7 @@ class TextPromptBlock(Block):
         if prompt_config_handler:
             return prompt_config_handler
 
-        secondary_handler = app.SECONDARY_LLM_API_HANDLER
+        secondary_handler = get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)
         if secondary_handler:
             return secondary_handler
 
@@ -5987,7 +6363,7 @@ class TextPromptBlock(Block):
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )
-        return app.LLM_API_HANDLER
+        return get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)
 
     async def execute(
         self,
@@ -6936,7 +7312,9 @@ class FileDestinationBlock(Block):
             candidate_file_names=candidate_file_names,
         )
         llm_key = self.override_llm_key_for_organization(organization_id)
-        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=app.LLM_API_HANDLER)
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+            llm_key, default=get_org_aware_primary_llm_api_handler()
+        )
 
         workflow_run_block = None
         try:
@@ -8074,7 +8452,7 @@ class FileParserBlock(Block):
             posthog_handler = await get_llm_handler_for_prompt_type(prompt_type, distinct_id, organization_id)
             if posthog_handler:
                 return posthog_handler
-        return app.LLM_API_HANDLER
+        return get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)
 
     async def _ocr_pdf_pages(
         self,
@@ -8500,77 +8878,6 @@ class FileParserBlock(Block):
             return await self._parse_docx_file(file_path)
         return None
 
-    async def _parse_zip_contents(
-        self,
-        extracted_files: list[dict[str, Any]],
-        workflow_run_block_id: str | None = None,
-        organization_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Parse every supported file extracted from a ZIP for combined AI extraction.
-
-        Returns [{"file_name", "content"}, ...]. Unsupported or unparseable files are skipped;
-        total content is truncated at a file boundary once MAX_FILE_PARSE_INPUT_TOKENS is reached.
-        """
-        content_entries: list[dict[str, Any]] = []
-        current_tokens = 0
-        for file_info in extracted_files:
-            inner_path: str = file_info["file_path"]
-            file_name: str = file_info["file_name"]
-            try:
-                inner_file_type = self._detect_file_type_from_url(inner_path, file_path=inner_path)
-            except InvalidFileType as e:
-                LOG.warning("FileParserBlock Skipping unsupported file in ZIP", file_name=file_name, error=str(e))
-                continue
-            if inner_file_type == FileType.ZIP:
-                LOG.warning("FileParserBlock Skipping nested ZIP archive", file_name=file_name)
-                continue
-            try:
-                content = await self._parse_file_of_type(
-                    inner_file_type,
-                    inner_path,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
-            except Exception as e:
-                LOG.warning(
-                    "FileParserBlock Failed to parse file in ZIP, skipping it", file_name=file_name, error=str(e)
-                )
-                continue
-            if content is None:
-                LOG.warning(
-                    "FileParserBlock Skipping file with unsupported type in ZIP",
-                    file_name=file_name,
-                    detected_file_type=inner_file_type,
-                )
-                continue
-            entry = {"file_name": file_name, "content": content}
-            entry_tokens = count_tokens(json.dumps(entry, separators=(",", ":"), default=str))
-            if current_tokens + entry_tokens > MAX_FILE_PARSE_INPUT_TOKENS:
-                if not content_entries:
-                    raise InvalidFileType(
-                        file_url=self.file_url,
-                        file_type=self.file_type,
-                        error=f"File '{file_name}' in the ZIP archive alone exceeds the maximum extraction input size",
-                    )
-                LOG.warning(
-                    "FileParserBlock ZIP content exceeds token limit, truncating at file boundary",
-                    file_url=self.file_url,
-                    files_included=len(content_entries),
-                    total_files=len(extracted_files),
-                    max_tokens=MAX_FILE_PARSE_INPUT_TOKENS,
-                )
-                break
-            current_tokens += entry_tokens
-            content_entries.append(entry)
-
-        if not content_entries:
-            raise InvalidFileType(
-                file_url=self.file_url,
-                file_type=self.file_type,
-                error="ZIP archive contains no parseable files (supported: CSV, Excel, PDF, image, DOCX)",
-            )
-        return content_entries
-
     async def _extract_with_ai(
         self,
         content: str | list[dict[str, Any]],
@@ -8661,16 +8968,8 @@ class FileParserBlock(Block):
         organization_id: str | None,
         failure_reason: str,
     ) -> BlockResult:
-        # SKY-7939: also surface the failure in `outputs.<block_label>` so callers
-        # can tell which block failed without cross-referencing the timeline.
         error_codes = self.get_failure_error_codes()
-        failure_output: dict[str, Any] = {
-            "status": BlockStatus.failed.value,
-            "failure_reason": failure_reason,
-            "errors": [
-                {"error_code": code, "reasoning": failure_reason, "confidence_float": 1.0} for code in error_codes
-            ],
-        }
+        failure_output = build_block_failure_output(failure_reason, error_codes)
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, failure_output)
         return await self.build_block_result(
             success=False,
@@ -8789,14 +9088,7 @@ class FileParserBlock(Block):
                 extracted_zip_files = await asyncio.to_thread(
                     self._extract_zip_file, file_path, workflow_run_id, workflow_run_block_id
                 )
-                if self.json_schema:
-                    parsed_data = await self._parse_zip_contents(
-                        extracted_zip_files,
-                        workflow_run_block_id=workflow_run_block_id,
-                        organization_id=organization_id,
-                    )
-                else:
-                    parsed_data = extracted_zip_files
+                parsed_data = extracted_zip_files
             else:
                 maybe_parsed = await self._parse_file_of_type(
                     self.file_type,
@@ -8822,7 +9114,6 @@ class FileParserBlock(Block):
                 f"Failed to parse {self.file_type} file: {str(e)}",
             )
 
-        # If json_schema is provided, use AI to extract structured data
         final_data: Any
         LOG.debug(
             "FileParserBlock JSON schema check",
@@ -8831,7 +9122,14 @@ class FileParserBlock(Block):
             json_schema=self.json_schema,
         )
 
-        if self.json_schema:
+        if self.file_type == FileType.ZIP:
+            if self.json_schema:
+                LOG.warning(
+                    "FileParserBlock json_schema is ignored for ZIP archives; returning extracted file list",
+                    file_url=self.file_url,
+                )
+            final_data = parsed_data
+        elif self.json_schema:
             try:
                 ai_extracted_data = await self._extract_with_ai(
                     parsed_data,
@@ -8977,7 +9275,7 @@ class PDFParserBlock(Block):
         prompt_for_attempt = llm_prompt
         for attempt in range(self.schema_validation_max_attempts):
             try:
-                llm_response = await app.LLM_API_HANDLER(
+                llm_response = await get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)(
                     prompt=prompt_for_attempt,
                     prompt_name="extract-information-from-file-text",
                     # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
@@ -9684,8 +9982,16 @@ class TaskV2Block(Block):
     url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    max_iterations: int = settings.MAX_ITERATIONS_PER_TASK_V2
-    max_steps: int = settings.MAX_STEPS_PER_TASK_V2
+    # These documented defaults must stay literals; reading the setting here would put an
+    # environment value back into the published OpenAPI document.
+    max_iterations: int = Field(
+        default_factory=lambda: settings.MAX_ITERATIONS_PER_TASK_V2,
+        json_schema_extra={"default": 50},
+    )
+    max_steps: int = Field(
+        default_factory=lambda: settings.MAX_STEPS_PER_TASK_V2,
+        json_schema_extra={"default": 25},
+    )
 
     def _resolve_totp_identifier(self, workflow_run_context: WorkflowRunContext) -> str | None:
         if self.totp_identifier:
@@ -11235,6 +11541,32 @@ def _parse_single_evaluation(
 # recovers most of them while still failing loudly when the model is persistently wrong.
 MAX_PROMPT_BRANCH_EVAL_ATTEMPTS = 2
 
+# Reserve 30k downstream tokens, about 4.7x the measured 6.4k non-goal overhead; this is not a
+# large-page bound, so the generic guard remains. Fail closed because truncation could silently change branch selection.
+BRANCH_EVALUATION_DOWNSTREAM_TOKEN_RESERVE = 30_000
+BRANCH_EVALUATION_GOAL_MAX_TOKENS = PROMPT_HARD_CEILING_TOKENS - BRANCH_EVALUATION_DOWNSTREAM_TOKEN_RESERVE
+BRANCH_CONTEXT_CIRCUIT_BREAKER_EVENT = "conditional_branch_context_circuit_breaker_tripped"
+BRANCH_CONTEXT_CONTRIBUTOR_LIMIT = 5
+
+
+def _largest_branch_context_contributors(context_snapshot: dict[str, Any]) -> list[dict[str, int | str]]:
+    """Return privacy-safe sizes for the largest snapshot values, never their keys or contents."""
+    largest_values: list[tuple[int, str, str]] = []
+    for key, value in context_snapshot.items():
+        serialized_value = json.dumps(value, default=str)
+        largest_values.append((len(serialized_value.encode("utf-8")), key, serialized_value))
+        largest_values.sort(key=lambda item: item[0], reverse=True)
+        del largest_values[BRANCH_CONTEXT_CONTRIBUTOR_LIMIT:]
+
+    return [
+        {
+            "key_fingerprint": diagnostic_fingerprint(key),
+            "serialized_bytes": serialized_bytes,
+            "token_count": count_tokens(serialized_value),
+        }
+        for serialized_bytes, key, serialized_value in largest_values
+    ]
+
 
 def _build_branch_evaluation_schema(num_branches: int) -> dict[str, Any]:
     """Strict JSON schema for the batched branch-evaluation LLM call.
@@ -11586,6 +11918,7 @@ async def _evaluate_prompt_branch_conditions_batch(
 
         rendered_expressions.append(rendered_expression)
 
+    context_snapshot: dict[str, Any] = {}
     if has_any_pure_natlang:
         context_snapshot = evaluation_context.build_llm_safe_context_snapshot()
         context_json = json.dumps(context_snapshot, default=str)
@@ -11597,6 +11930,27 @@ async def _evaluate_prompt_branch_conditions_batch(
         conditions=rendered_expressions,
         context_json=context_json,
     )
+
+    goal_token_count = count_tokens(extraction_goal)
+    if goal_token_count > BRANCH_EVALUATION_GOAL_MAX_TOKENS:
+        context_token_count = count_tokens(context_json) if context_json is not None else 0
+        context_serialized_bytes = len(context_json.encode("utf-8")) if context_json is not None else 0
+        LOG.warning(
+            BRANCH_CONTEXT_CIRCUIT_BREAKER_EVENT,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            workflow_id=workflow_id,
+            organization_id=organization_id,
+            block_label=log_label,
+            goal_token_count=goal_token_count,
+            max_goal_tokens=BRANCH_EVALUATION_GOAL_MAX_TOKENS,
+            reserved_tokens=BRANCH_EVALUATION_DOWNSTREAM_TOKEN_RESERVE,
+            context_token_count=context_token_count,
+            context_serialized_bytes=context_serialized_bytes,
+            context_key_count=len(context_snapshot),
+            top_context_contributors=_largest_branch_context_contributors(context_snapshot),
+        )
+        raise BranchEvaluationContextTooLargeError
 
     data_schema = _build_branch_evaluation_schema(len(branches))
 
@@ -11847,6 +12201,8 @@ class ConditionalBlock(Block):
                     branch.id: rendered
                     for branch, rendered in zip(natural_language_branches, prompt_rendered_expressions, strict=False)
                 }
+            except BranchEvaluationContextTooLargeError as exc:
+                failure_reason = get_user_facing_exception_message(exc)
             except Exception as exc:
                 failure_reason = f"Failed to evaluate natural language branches: {str(exc)}"
                 LOG.error(
@@ -12385,86 +12741,105 @@ class WorkflowTriggerBlock(Block):
                     trigger_type=inherited_trigger_type,
                 )
             ):
+                # A self-created fresh session must be closed on every exit from this block —
+                # including the setup-failure and sequential-credential fence early returns — so the
+                # cleanup lives in a finally rather than only on the normal execute path below.
+                triggered_run_id: str | None = None
                 try:
-                    triggered_workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
-                        request_id=None,
-                        workflow_request=workflow_request,
-                        workflow_permanent_id=resolved_workflow_permanent_id,
-                        organization=organization,
+                    try:
+                        triggered_workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
+                            request_id=None,
+                            workflow_request=workflow_request,
+                            workflow_permanent_id=resolved_workflow_permanent_id,
+                            organization=organization,
+                            parent_workflow_run_id=workflow_run_id,
+                            ignore_inherited_workflow_system_prompt=self.ignore_workflow_system_prompt,
+                            trigger_type=inherited_trigger_type,
+                        )
+                    except Exception as e:
+                        error_msg = get_user_facing_exception_message(e)
+                        return await _fail(f"Failed to setup triggered workflow run: {error_msg}")
+
+                    triggered_run_id = triggered_workflow_run.workflow_run_id
+
+                    # A synchronous child runs inline via execute_workflow below: it never queues, never
+                    # gets a queued_at, and never reaches the Temporal V2 serialization gate. setup stamped
+                    # its sequential_credential_id, but the gate filters queued_at IS NOT NULL, so a
+                    # concurrent run sharing that credential would not see this child as a blocker. Fail
+                    # closed before it uses the credential — the same fence the scheduled path applies.
+                    if triggered_workflow_run.sequential_credential_id:
+                        fence = SyncTriggeredSequentialCredentialUnsupported(triggered_run_id)
+                        await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+                            workflow_run_id=triggered_run_id,
+                            failure_reason=str(fence),
+                        )
+                        return await _fail(str(fence))
+
+                    LOG.info(
+                        "Triggered workflow run (sync)",
                         parent_workflow_run_id=workflow_run_id,
-                        ignore_inherited_workflow_system_prompt=self.ignore_workflow_system_prompt,
-                        trigger_type=inherited_trigger_type,
+                        triggered_workflow_run_id=triggered_run_id,
+                        triggered_workflow_permanent_id=resolved_workflow_permanent_id,
                     )
-                except Exception as e:
-                    error_msg = get_user_facing_exception_message(e)
-                    return await _fail(f"Failed to setup triggered workflow run: {error_msg}")
 
-                triggered_run_id = triggered_workflow_run.workflow_run_id
-
-                LOG.info(
-                    "Triggered workflow run (sync)",
-                    parent_workflow_run_id=workflow_run_id,
-                    triggered_workflow_run_id=triggered_run_id,
-                    triggered_workflow_permanent_id=resolved_workflow_permanent_id,
-                )
-
-                try:
-                    # The opt-out flag is persisted on the child's workflow_run row at
-                    # spawn time (setup_workflow_run above), so execute_workflow reads
-                    # it from the DB. This works identically for sync and async triggers.
-                    final_run = await app.WORKFLOW_SERVICE.execute_workflow(
-                        workflow_run_id=triggered_run_id,
-                        api_key=None,
-                        organization=organization,
-                        browser_session_id=resolved_browser_session_id,
-                    )
-                    success = final_run.status == WorkflowRunStatus.completed
-                    output_data = {
-                        "workflow_run_id": triggered_run_id,
-                        "workflow_permanent_id": resolved_workflow_permanent_id,
-                        "status": str(final_run.status),
-                        "failure_reason": final_run.failure_reason,
-                    }
-                    # Include the child workflow's output parameters so downstream
-                    # blocks can reference them (e.g. block_3_output.outputs.block_2_output)
                     try:
-                        child_output_params = (
-                            await app.WORKFLOW_SERVICE.get_output_parameter_workflow_run_output_parameter_tuples(
-                                workflow_id=final_run.workflow_id,
-                                workflow_run_id=triggered_run_id,
+                        # The opt-out flag is persisted on the child's workflow_run row at
+                        # spawn time (setup_workflow_run above), so execute_workflow reads
+                        # it from the DB. This works identically for sync and async triggers.
+                        final_run = await app.WORKFLOW_SERVICE.execute_workflow(
+                            workflow_run_id=triggered_run_id,
+                            api_key=None,
+                            organization=organization,
+                            browser_session_id=resolved_browser_session_id,
+                        )
+                        success = final_run.status == WorkflowRunStatus.completed
+                        output_data = {
+                            "workflow_run_id": triggered_run_id,
+                            "workflow_permanent_id": resolved_workflow_permanent_id,
+                            "status": str(final_run.status),
+                            "failure_reason": final_run.failure_reason,
+                        }
+                        # Include the child workflow's output parameters so downstream
+                        # blocks can reference them (e.g. block_3_output.outputs.block_2_output)
+                        try:
+                            child_output_params = (
+                                await app.WORKFLOW_SERVICE.get_output_parameter_workflow_run_output_parameter_tuples(
+                                    workflow_id=final_run.workflow_id,
+                                    workflow_run_id=triggered_run_id,
+                                )
                             )
-                        )
-                        child_outputs: dict[str, Any] = {}
-                        for output_param, run_output_param in child_output_params:
-                            child_outputs[output_param.key] = run_output_param.value
-                        output_data["outputs"] = child_outputs
-                    except Exception:
-                        LOG.warning(
-                            "Failed to fetch child workflow outputs",
-                            triggered_workflow_run_id=triggered_run_id,
-                            exc_info=True,
-                        )
-                except Exception as e:
-                    error_msg = get_user_facing_exception_message(e)
-                    output_data = {
-                        "workflow_run_id": triggered_run_id,
-                        "workflow_permanent_id": resolved_workflow_permanent_id,
-                        "status": "failed",
-                        "failure_reason": f"Triggered workflow execution failed: {error_msg}",
-                    }
-                    success = False
-                if created_fresh_session and resolved_browser_session_id:
-                    try:
-                        await app.PERSISTENT_SESSIONS_MANAGER.close_session(
-                            organization_id, resolved_browser_session_id
-                        )
-                    except Exception:
-                        LOG.warning(
-                            "Failed to close child browser session",
-                            child_browser_session_id=resolved_browser_session_id,
-                            triggered_workflow_run_id=triggered_run_id,
-                            exc_info=True,
-                        )
+                            child_outputs: dict[str, Any] = {}
+                            for output_param, run_output_param in child_output_params:
+                                child_outputs[output_param.key] = run_output_param.value
+                            output_data["outputs"] = child_outputs
+                        except Exception:
+                            LOG.warning(
+                                "Failed to fetch child workflow outputs",
+                                triggered_workflow_run_id=triggered_run_id,
+                                exc_info=True,
+                            )
+                    except Exception as e:
+                        error_msg = get_user_facing_exception_message(e)
+                        output_data = {
+                            "workflow_run_id": triggered_run_id,
+                            "workflow_permanent_id": resolved_workflow_permanent_id,
+                            "status": "failed",
+                            "failure_reason": f"Triggered workflow execution failed: {error_msg}",
+                        }
+                        success = False
+                finally:
+                    if created_fresh_session and resolved_browser_session_id:
+                        try:
+                            await app.PERSISTENT_SESSIONS_MANAGER.close_session(
+                                organization_id, resolved_browser_session_id
+                            )
+                        except Exception:
+                            LOG.warning(
+                                "Failed to close child browser session",
+                                child_browser_session_id=resolved_browser_session_id,
+                                triggered_workflow_run_id=triggered_run_id,
+                                exc_info=True,
+                            )
         else:
             # Fire and forget: dispatch the child workflow via Temporal so it
             # gets its own independent worker process. This ensures the child

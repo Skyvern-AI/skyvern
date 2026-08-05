@@ -65,13 +65,13 @@ async def _cleanup_mcp_resources() -> None:
     from skyvern.cli.core.action_log import shutdown_action_log_worker  # noqa: PLC0415
     from skyvern.cli.core.client import close_skyvern  # noqa: PLC0415
     from skyvern.cli.core.mcp_http_auth import close_auth_db  # noqa: PLC0415
-    from skyvern.cli.core.session_manager import close_current_session  # noqa: PLC0415
+    from skyvern.cli.core.session_manager import close_all_sessions  # noqa: PLC0415
 
     try:
         await shutdown_action_log_worker()
     finally:
         try:
-            await close_current_session()
+            await close_all_sessions()
         finally:
             try:
                 await close_skyvern()
@@ -622,7 +622,10 @@ def run_mcp(
     except Exception:
         LOG.warning("local_browser_profile_startup_sweep_failed", exc_info=True)
     from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware  # noqa: PLC0415
-    from skyvern.cli.core.session_manager import set_stateless_http_mode  # noqa: PLC0415
+    from skyvern.cli.core.session_manager import (  # noqa: PLC0415
+        set_stateless_http_mode,
+        set_stdio_local_file_access_enabled,
+    )
     from skyvern.cli.mcp_tools import mcp  # noqa: PLC0415
     from skyvern.cli.mcp_tools.telemetry import configure_mcp_telemetry_runtime  # noqa: PLC0415
 
@@ -632,6 +635,7 @@ def run_mcp(
     # EOF dispatches the SIGINT cleanup handler; finally covers normal returns, with atexit as the last backstop.
     atexit.register(_cleanup_mcp_resources_sync)
     set_stateless_http_mode(stateless_http_enabled)
+    set_stdio_local_file_access_enabled(transport == "stdio")
     set_concise_responses(not verbose)
     eof_watcher_stop: threading.Event | None = None
     shutdown_complete: threading.Event | None = None
@@ -669,6 +673,7 @@ def run_mcp(
             eof_watcher_stop.set()
         try:
             set_stateless_http_mode(False)
+            set_stdio_local_file_access_enabled(False)
             set_concise_responses(False)
         finally:
             for handled_signal, original_handler in original_signal_handlers.items():

@@ -218,7 +218,9 @@ Send text to the LLM for processing without browser interaction. Useful for summ
 
 ### File Parser
 
-Parse PDFs, CSVs, Excel files, and images to extract structured data.
+Parse PDFs, CSVs, Excel files, images, DOCX files, and ZIP archives.
+
+ZIP inputs are unzipped, and the block outputs the extracted file list as `file_name`, `file_path`, and `file_size`. Data Schema is ignored for ZIP inputs; loop over the file list and pass each `file_path` to another File Parser block to parse individual files.
 
 | Field | Type | Description |
 |-------|------|-------------|

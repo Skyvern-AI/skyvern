@@ -1,4 +1,4 @@
-"""Builders + closed `TurnIntentMode -> ResponseKind` mapping for `TurnOutcome`.
+"""Builders + deterministic `TurnIntent -> ResponseKind` mapping for `TurnOutcome`.
 
 Schema types live in ``schemas/copilot_turn_outcome.py`` so chat-history
 schemas can embed ``TurnOutcome`` without importing copilot business logic.
@@ -22,43 +22,6 @@ LOG = structlog.get_logger()
 IDENTICAL_REPLY_BLOCKED_TERMINAL_REASON = "identical_reply_blocked"
 CopilotComposerMode = Literal["ask", "build", "code"]
 
-REPEATED_REPLY_ESCALATION_TEMPLATES: dict[ResponseKind, str] = {
-    ResponseKind.BUILD: (
-        "I've offered the same change twice and it isn't moving us forward."
-        " Tell me one concrete edit you want to make to the workflow"
-        " (e.g. a step to add, a page to open, a field to extract) and I'll"
-        " build that exact thing."
-    ),
-    ResponseKind.CLARIFY: (
-        "I've asked the same clarification twice. Let me try a different"
-        " angle — please confirm the single next concrete step you'd like me"
-        " to take, and I'll act on that."
-    ),
-    ResponseKind.DIAGNOSE: (
-        "I've explained that the same way twice. Either the explanation"
-        " isn't matching what you're seeing, or I'm missing context — could"
-        " you share what you actually see, or paste the exact error, so I can"
-        " try a different angle?"
-    ),
-    ResponseKind.REFUSE: (
-        "I've refused that the same way twice. If you want me to reconsider,"
-        " tell me what's different about this case and I'll re-evaluate."
-    ),
-}
-
-
-HANDOFF_REPLY = (
-    "I haven't been able to help with this through repeated attempts. Please"
-    " rephrase the request with more specifics, or use the Help link so a"
-    " teammate can take a closer look."
-)
-
-
-def escalation_reply_for(attempted_kind: ResponseKind) -> str:
-    return REPEATED_REPLY_ESCALATION_TEMPLATES.get(
-        attempted_kind, REPEATED_REPLY_ESCALATION_TEMPLATES[ResponseKind.CLARIFY]
-    )
-
 
 def apply_repeated_reply_guard(
     *,
@@ -70,18 +33,12 @@ def apply_repeated_reply_guard(
     turn_intent: TurnIntent | None = None,
     tool_calls: Iterable[str] = (),
 ) -> tuple[str, TurnOutcome]:
-    """Centralized post-output guard. Returns ``(final_text, outcome)``.
+    """Centralized post-output record. Returns ``(final_text, outcome)``.
 
-    When the signature of ``final_text`` is in ``blocked_signatures``, rewrites
-    to the escalation template keyed by ``attempted_kind`` and returns a
-    ``RECOVER`` outcome that records the original signature in its
-    ``blocked_signatures`` so the ban survives to the next turn. If the
-    escalation template itself collides with an already-banned signature
-    (a back-to-back ``RECOVER`` loop), falls back to a generic hand-off so
-    the system cannot self-amplify on the same recovery text. Otherwise
-    returns the original text with a record carrying the inherited bans
-    forward. The rewritten signature is also added to ``blocked_signatures``
-    so a future turn cannot re-emit the same escalation text.
+    The model's reply is never rewritten: a repeat is the turn's true state, and replacing it with
+    escalation prose both invents words the model did not say and — when it also minted a terminal
+    reason — ended turns over a chat-presentation concern. Signatures are still recorded and carried
+    forward so repetition stays visible downstream.
 
     Pass ``turn_intent`` and ``tool_calls`` to preserve trace metadata on
     the outcome; otherwise the minimal-shape builder is used.
@@ -90,29 +47,7 @@ def apply_repeated_reply_guard(
     tool_calls_list = list(tool_calls)
     original_signature = compute_signature(final_text)
     if inherited and original_signature in inherited:
-        rewritten = escalation_reply_for(attempted_kind)
-        rewritten_signature = compute_signature(rewritten)
-        if rewritten_signature in inherited:
-            rewritten = HANDOFF_REPLY
-            rewritten_signature = compute_signature(rewritten)
-        intent_summary: dict[str, Any] = {}
-        if turn_intent is not None:
-            try:
-                intent_summary = dict(turn_intent.to_trace_data())
-            except Exception as exc:
-                LOG.warning(
-                    "Failed to serialize TurnIntent trace data for RECOVER outcome; using empty dict",
-                    exc_info=exc,
-                )
-        return rewritten, TurnOutcome(
-            turn_intent_summary=intent_summary,
-            response_kind=ResponseKind.RECOVER,
-            reason_code=IDENTICAL_REPLY_BLOCKED_TERMINAL_REASON,
-            normalized_reply_signature=rewritten_signature,
-            tool_calls=[str(c) for c in tool_calls_list if c],
-            terminal_reason=IDENTICAL_REPLY_BLOCKED_TERMINAL_REASON,
-            blocked_signatures=_dedup_signatures([*inherited, original_signature, rewritten_signature]),
-        )
+        LOG.info("copilot_repeated_reply_observed", normalized_reply_signature=original_signature)
     if turn_intent is not None or tool_calls_list:
         return final_text, build_turn_outcome(
             final_text,
@@ -139,7 +74,7 @@ _RESPONSE_KIND_BY_MODE: dict[TurnIntentMode, ResponseKind] = {
     TurnIntentMode.CLARIFY: ResponseKind.CLARIFY,
     TurnIntentMode.UNKNOWN: ResponseKind.CLARIFY,
     TurnIntentMode.DIAGNOSE: ResponseKind.DIAGNOSE,
-    TurnIntentMode.DOCS_ANSWER: ResponseKind.DIAGNOSE,
+    TurnIntentMode.ANSWER: ResponseKind.ANSWER,
     TurnIntentMode.REFUSE: ResponseKind.REFUSE,
 }
 
@@ -152,8 +87,13 @@ if _missing_modes:
 
 
 def derive_response_kind(turn_intent: TurnIntent | None) -> ResponseKind:
-    """Closed mapping. ``RECOVER`` is set only by the enforcement guard."""
+    """Closed mapping with an effect-based fallback for safe unknown explanations.
+
+    ``RECOVER`` is set only by the enforcement guard.
+    """
     mode = getattr(turn_intent, "mode", None)
+    if isinstance(turn_intent, TurnIntent) and mode is TurnIntentMode.UNKNOWN and turn_intent.is_inline_only:
+        return ResponseKind.ANSWER
     if isinstance(mode, TurnIntentMode):
         return _RESPONSE_KIND_BY_MODE[mode]
     return ResponseKind.CLARIFY

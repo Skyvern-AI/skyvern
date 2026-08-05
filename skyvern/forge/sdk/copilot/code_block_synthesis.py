@@ -54,6 +54,10 @@ LOG = structlog.get_logger()
 
 _MAX_STEPS = 60
 _INDENT = "    "
+# A dashboard renders the tile before the figure it will hold, so a designated read waits for the
+# value rather than reporting the empty frame it lands in first.
+_DESIGNATED_VALUE_SETTLE_POLLS = 60
+_DESIGNATED_VALUE_SETTLE_INTERVAL_MS = 500
 _DOMCONTENTLOADED = "domcontentloaded"
 _ENTRY_TARGET_VAR = "_scout_entry_target"
 _DOWNLOAD_TARGET_VAR = "_scout_download_target"
@@ -252,6 +256,85 @@ def first_matched_post_fill_submit_index(
     return None
 
 
+_LOGIN_SUBMIT_NAME_PATTERN = re.compile(
+    r"^(?:log in|login|sign in|authenticate)(?: now| securely| to continue)?$",
+    re.I,
+)
+_LOGIN_SUBMIT_SELECTOR_PATTERN = re.compile(
+    r"^(?:(?:log in|login|sign in|authenticate)(?: submit| button| btn)?|"
+    r"(?:submit|button|btn) (?:log in|login|sign in|authenticate))$",
+    re.I,
+)
+
+
+def last_scout_credential_fill_index(trajectory: Sequence[Any]) -> int | None:
+    # Boundary past the ENTIRE credential flow, including a runtime-only OTP/MFA fill. Keying only on
+    # username/password let an MFA step (fill totp -> verify-click) form a durable entry->commit past
+    # the boundary and falsely release the terminal-action gate on a login-only trajectory.
+    last_index: int | None = None
+    for index, item in enumerate(trajectory):
+        if isinstance(item, Mapping) and str(item.get("tool_name") or "").strip() == CREDENTIAL_FILL_TOOL_NAME:
+            last_index = index
+    return last_index
+
+
+def first_stable_login_submit_index(interactions: Sequence[Mapping[str, Any]], credential_index: int) -> int | None:
+    for index, interaction in enumerate(interactions[credential_index + 1 :], start=credential_index + 1):
+        tool_name = str(interaction.get("tool_name") or "").strip()
+        if tool_name == "press_key" and str(interaction.get("key") or "").strip() == "Enter":
+            return index
+        if tool_name != "click":
+            continue
+        accessible_name = re.sub(r"[^a-z0-9]+", " ", str(interaction.get("accessible_name") or "").lower()).strip()
+        selector = re.sub(r"[^a-z0-9]+", " ", str(interaction.get("selector") or "").lower()).strip()
+        if _LOGIN_SUBMIT_NAME_PATTERN.fullmatch(accessible_name) or _LOGIN_SUBMIT_SELECTOR_PATTERN.fullmatch(selector):
+            return index
+    return None
+
+
+def credential_submit_boundary_index(interactions: Sequence[Mapping[str, Any]], credential_index: int) -> int | None:
+    """The submit that commits the scout's login: a stable login-submit identity, else the first submit
+    after the latest credential fill on that fill's own page. None when neither identifies one."""
+    submit_index = first_stable_login_submit_index(interactions, credential_index)
+    if submit_index is not None:
+        return submit_index
+    latest_fill_source_url = str(interactions[credential_index].get("source_url") or "").strip()
+    if not latest_fill_source_url:
+        return None
+    return first_matched_post_fill_submit_index(interactions, credential_index, {latest_fill_source_url})
+
+
+def credential_segment_bounds(trajectory: Sequence[Mapping[str, Any]]) -> list[tuple[int, int]] | None:
+    """Inclusive trajectory bounds for each durable segment of a credentialed scout: the login flow up
+    to its submit, the business steps that follow, and the value read. None when the trajectory carries
+    no credential fill or no identifiable submit, which leaves the single-block shape in effect."""
+    fill_index = last_scout_credential_fill_index(trajectory)
+    if fill_index is None:
+        return None
+    submit_index = credential_submit_boundary_index(trajectory, fill_index)
+    if submit_index is None:
+        return None
+    last_index = len(trajectory) - 1
+    if submit_index >= last_index:
+        return None
+    first_read = next(
+        (
+            index
+            for index in range(submit_index + 1, len(trajectory))
+            if str(trajectory[index].get("tool_name") or "") == "read_value"
+        ),
+        None,
+    )
+    bounds = [(0, submit_index)]
+    if first_read is None:
+        bounds.append((submit_index + 1, last_index))
+    else:
+        if first_read > submit_index + 1:
+            bounds.append((submit_index + 1, first_read - 1))
+        bounds.append((first_read, last_index))
+    return bounds
+
+
 def _captcha_boundary_indices(trajectory: Sequence[Mapping[str, Any]]) -> set[int]:
     """Return typed challenge points plus credential-associated submit boundaries."""
     boundaries = {
@@ -346,6 +429,10 @@ _STRUCTURAL_DISMISSAL_SELECTOR_PATTERN = re.compile(
     re.I,
 )
 
+# Ceiling for a wait the scout proved must succeed (entry target, replayed read, extraction
+# container). A wait returns the moment its condition holds, so a fast page pays nothing; only a
+# genuinely absent state pays the full budget. Distinct from the deliberate 1s speculative probes.
+_REQUIRED_STATE_TIMEOUT_MS = 120_000
 _SYNTHESIZED_BLOCK_LABEL = "scout_synthesized_browser_steps"
 
 # Names the code-block executor reserves in its exec() namespace (block.py build_safe_vars
@@ -448,6 +535,10 @@ class SynthesizedCodeBlock:
     notes: list[str] = field(default_factory=list)
     diagnostics: SynthesisDiagnostics = field(default_factory=SynthesisDiagnostics)
     steps: list[dict[str, Any]] = field(default_factory=list)
+    # Durable segments of a credentialed trajectory (login / business / read), each synthesized from
+    # its own slice so it is self-contained and independently runnable. Empty when the trajectory has
+    # no credential boundary, which leaves the single-block shape in effect.
+    segments: list[SynthesizedCodeBlock] = field(default_factory=list)
     interaction_code: str = ""
     extraction_code: str = ""
     extraction_fingerprint: str = ""
@@ -1809,6 +1900,14 @@ def _locator_expr(
         return _get_by_role_expr(role, name)
 
     notes.append("dropped an interaction with no selector and no role/name")
+    if diagnostics is not None:
+        diagnostics.dropped_interactions.append(
+            {
+                "trajectory_index": trajectory_index if trajectory_index is not None else -1,
+                "tool_name": tool_name,
+                "reason_code": "missing_selector_and_role_name",
+            }
+        )
     return ""
 
 
@@ -2090,16 +2189,33 @@ def synthesize_code_block(
     reached_download_target: ReachedDownloadTarget | None = None,
     parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None,
     file_match_transform: SameMonthFileMatchTransform | None = None,
+    emit_read_return: bool = True,
+    _segment_pass: bool = False,
 ) -> SynthesizedCodeBlock | None:
     """Deterministically synthesize a code block from a scout trajectory, or None if empty."""
     if not trajectory:
         return None
+    # A named path keeps only its latest read: a re-read of the same requested value is a
+    # refinement, including one that corrects a stale selector. The anonymous path is shared by every
+    # read of an unnamed request, so there a different expression is an unrelated probe.
+    latest_read_by_identity: dict[tuple[str, str], int] = {}
+    for i, step in enumerate(trajectory):
+        if str(step.get("tool_name") or "") == "read_value":
+            path = str(step.get("read_output_path") or "")
+            expression = str(step.get("read_expression") or "") if path == "output.scouted_read" else ""
+            latest_read_by_identity[(path, expression)] = i
+    if latest_read_by_identity:
+        keep = set(latest_read_by_identity.values())
+        trajectory = [
+            step for i, step in enumerate(trajectory) if str(step.get("tool_name") or "") != "read_value" or i in keep
+        ]
 
     lines: list[str] = []
     notes: list[str] = []
     parameters: list[dict[str, str]] = []
     diagnostics = SynthesisDiagnostics()
     steps: list[dict[str, Any]] = []
+    read_bindings: list[tuple[str, str]] = []
     used_param_keys: set[str] = set()
     typed_param_keys: dict[tuple[str, str, str, str], str] = {}
     credential_param_keys: dict[str, str] = {}
@@ -2279,6 +2395,12 @@ def synthesize_code_block(
             record["lane"] = lane
         diagnostics.emitted_interactions.append(record)
 
+    def already_recorded(trajectory_index: int) -> bool:
+        return any(
+            record.get("trajectory_index") == trajectory_index
+            for record in (*diagnostics.emitted_interactions, *diagnostics.dropped_interactions)
+        )
+
     entry_url = ""
     entry_index = -1
     entry_replay_condition_active = False
@@ -2324,6 +2446,18 @@ def synthesize_code_block(
             if compile_download_target and reached_download_target is not None
             else ""
         )
+        # Which element proves the block is where the flow starts is a separate question from which
+        # step it resumes at: a scout that opened a password-reset link before signing in anchored the
+        # whole login on the link it then clicked away from, while still needing to replay that click.
+        # The anchor prefers a durable target - something the flow fills or selects - and the replay
+        # start is left exactly where it was.
+        durable_anchor_target, _durable_anchor_index = _entry_target_locator(
+            entry_trajectory, strict_selectors=strict_selectors, prefer_durable=True
+        )
+        if fallback_entry_target and durable_anchor_target:
+            # Re-anchoring to the first-touched element after navigating would put the block back on
+            # the link it clicked away from, so the durable target is the anchor on both paths.
+            fallback_entry_target = durable_anchor_target
         entry_target = download_entry_target if download_entry_target else fallback_entry_target
         entry_replay_condition_active = bool(download_entry_target and fallback_entry_target)
         entry_replay_start_index = (
@@ -2367,7 +2501,14 @@ def synthesize_code_block(
                 for interaction in entry_trajectory
             )
         )
+        login_guard_last_index: int | None = None
         if login_only_presence_guard_active:
+            credential_index = last_scout_credential_fill_index(entry_trajectory)
+            login_guard_last_index = (
+                credential_submit_boundary_index(entry_trajectory, credential_index)
+                if credential_index is not None
+                else None
+            )
             notes.append(
                 "login rung fills only when the credential form is present, so an authenticated replay skips it"
             )
@@ -2433,9 +2574,13 @@ def synthesize_code_block(
                         line_start=recovery_line_start,
                         lane="entry_recovery",
                     )
-                lines.append(f'{_INDENT * recovery_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible")')
+                lines.append(
+                    f'{_INDENT * recovery_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible", timeout={_REQUIRED_STATE_TIMEOUT_MS})'
+                )
             elif not login_only_presence_guard_active:
-                lines.append(f'{_INDENT * post_goto_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible")')
+                lines.append(
+                    f'{_INDENT * post_goto_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible", timeout={_REQUIRED_STATE_TIMEOUT_MS})'
+                )
         else:
             lines.append(
                 f"{_INDENT}await page.goto("
@@ -2468,7 +2613,11 @@ def synthesize_code_block(
             return _INDENT * 2
         if entry_post_auth_resume_index and trajectory_index < entry_post_auth_resume_index:
             return _INDENT * 2
-        if login_only_presence_guard_active:
+        # The guard exists so an authenticated replay skips the login. Indenting past its submit
+        # would skip the value read too, and the block then returns a name it never bound.
+        if login_only_presence_guard_active and (
+            login_guard_last_index is None or trajectory_index <= login_guard_last_index
+        ):
             return _INDENT * 2
         return _INDENT
 
@@ -2494,17 +2643,15 @@ def synthesize_code_block(
         diagnostics.grounded_submit_binding_fingerprints.append(parameter_binding_snapshot.fingerprint)
         snapshot_recovery_emitted = True
 
+    truncated_at_index = len(trajectory)
     for trajectory_index, interaction in enumerate(trajectory):
         if emitted >= _MAX_STEPS:
             diagnostics.truncated = True
             notes.append(f"trajectory truncated at {_MAX_STEPS} steps")
+            truncated_at_index = trajectory_index
             break
         if entry_replay_start_index and trajectory_index < entry_replay_start_index:
-            already_recorded = any(
-                record.get("trajectory_index") == trajectory_index
-                for record in (*diagnostics.emitted_interactions, *diagnostics.dropped_interactions)
-            )
-            if not already_recorded:
+            if not already_recorded(trajectory_index):
                 diagnostics.forgiven_interactions.append(
                     {
                         "trajectory_index": trajectory_index,
@@ -2542,13 +2689,14 @@ def synthesize_code_block(
                 record_emission(trajectory_index, tool_name, "press", locator, line_start=line_start)
             else:
                 if strict_selectors:
-                    diagnostics.dropped_interactions.append(
-                        {
-                            "trajectory_index": trajectory_index,
-                            "tool_name": tool_name,
-                            "reason_code": "missing_selector",
-                        }
-                    )
+                    if not already_recorded(trajectory_index):
+                        diagnostics.dropped_interactions.append(
+                            {
+                                "trajectory_index": trajectory_index,
+                                "tool_name": tool_name,
+                                "reason_code": "missing_selector",
+                            }
+                        )
                     continue
                 lines.append(f"{action_indent}await page.keyboard.press({_py_str(key)})")
                 record_emission(trajectory_index, tool_name, "press", "page.keyboard", line_start=line_start)
@@ -2556,6 +2704,43 @@ def synthesize_code_block(
             if trajectory_index in captcha_boundary_indices:
                 lines.append(f"{action_indent}await solve_captcha(page)")
             append_step(f"Press {key}", "keypress", line_start)
+            emitted += 1
+            continue
+
+        if tool_name == "read_value":
+            expression = str(interaction.get("read_expression") or "").strip()
+            output_path = str(interaction.get("read_output_path") or "").strip()
+            if not expression or not output_path.startswith("output."):
+                diagnostics.dropped_interactions.append(
+                    {"trajectory_index": trajectory_index, "tool_name": tool_name, "reason_code": "missing_read"}
+                )
+                continue
+            line_start = len(lines) + 1
+            variable = f"_read_value_{len(read_bindings)}"
+            # A read is only recorded once it returns something, so an empty replay contradicts the
+            # proof whatever shape that proof had; an empty collection here is absence, not a correct
+            # answer for a request that legitimately has none.
+            absent = '(None, "", [], {})'
+            lines.append(f"{action_indent}{variable} = await page.evaluate({expression!r})")
+            poll_rounds = _REQUIRED_STATE_TIMEOUT_MS // 1000
+            lines.append(f"{action_indent}for _ in range({poll_rounds}):")
+            lines.append(f"{action_indent}{_INDENT}if {variable} not in {absent}:")
+            lines.append(f"{action_indent}{_INDENT * 2}break")
+            lines.append(f"{action_indent}{_INDENT}await page.wait_for_timeout(1000)")
+            lines.append(f"{action_indent}{_INDENT}{variable} = await page.evaluate({expression!r})")
+            # The scout only records a read that returned something, so an absent replay contradicts
+            # the proof this read was built from. Returning the absent value instead reports success
+            # while the requested field carries nothing.
+            lines.append(f"{action_indent}if {variable} in {absent}:")
+            # Exception is the only type the runtime code sandbox resolves; a narrower one fails the
+            # sandbox name check.
+            lines.append(
+                f"{action_indent}{_INDENT}raise Exception("
+                f"{f'{output_path} was not present on the page: '!r} + {expression!r})"
+            )
+            read_bindings.append((output_path, variable))
+            record_emission(trajectory_index, tool_name, "evaluate", "page", line_start=line_start, lane="page_read")
+            append_step(f"Read {output_path.removeprefix('output.')}", "extract", line_start)
             emitted += 1
             continue
 
@@ -2571,6 +2756,9 @@ def synthesize_code_block(
                 continue
             line_start = len(lines) + 1
             lines.append(f"{action_indent}await page.wait_for_timeout({duration_ms})")
+            record_emission(
+                trajectory_index, tool_name, "wait_for_timeout", "page", line_start=line_start, lane="page_wait"
+            )
             append_step(f"Wait {max(duration_ms // 1000, 1)}s", "wait", line_start)
             emitted += 1
             continue
@@ -2702,6 +2890,9 @@ def synthesize_code_block(
                 parameters.append({"key": credential_param_key, "credential_id": credential_id})
             lines.append(f"{action_indent}{credential_fill_source(locator, credential_param_key, credential_field)}")
             record_emission(trajectory_index, tool_name, "fill", locator, line_start=line_start)
+            # action_type values are ActionType members held as string literals, the same vocabulary
+            # code_block_steps.py uses; there is no credential-fill member, and a fill is text entry.
+            append_step(f"Fill {credential_field}", "input_text", line_start)
         elif tool_name == "select_option":
             emit_snapshot_recovery(trajectory_index, action_indent)
             value = str(interaction.get("value") or "").strip()
@@ -2726,6 +2917,9 @@ def synthesize_code_block(
             # Non-strict only: recording trajectories carry deliberate hovers; the
             # strict-imposition envelope keeps treating hover as unsupported.
             lines.append(f"{action_indent}await {locator}.hover()")
+            record_emission(
+                trajectory_index, tool_name, "hover", locator, line_start=line_start, lane="recording_hover"
+            )
             append_step(f"Hover over {_step_target(interaction)}", "hover", line_start)
         else:
             notes.append(f"skipped unsupported interaction tool_name={tool_name!r}")
@@ -2807,6 +3001,22 @@ def synthesize_code_block(
                     lane="readonly_skip",
                 )
 
+    # Single reconciliation point for the retained manifest: a branch that neither emits, drops, nor forgives
+    # its index lands here as a drop. The post-truncation tail is unvisited, so the truncation finding owns it.
+    laned_indices = _recorded_partition_indices(diagnostics)
+    for trajectory_index in diagnostics.retained_trajectory_indices:
+        if trajectory_index >= truncated_at_index or trajectory_index in laned_indices:
+            continue
+        unaccounted = trajectory[trajectory_index]
+        diagnostics.dropped_interactions.append(
+            {
+                "trajectory_index": trajectory_index,
+                "tool_name": str(unaccounted.get("tool_name") or ""),
+                "selector": str(unaccounted.get("selector") or "").strip(),
+                "reason_code": "unaccounted_branch",
+            }
+        )
+
     if compile_download_target and reached_download_target is not None:
         # The download affordance is observed in nav_targets, not necessarily a trajectory click, so the
         # download is an appended terminal step compiled from the typed target — never an in-place click upgrade.
@@ -2845,12 +3055,48 @@ def synthesize_code_block(
         lines.append(f"{_INDENT * 2}del {scout_var}")
         lines.append(f"{_INDENT}except Exception:")
         lines.append(f"{_INDENT * 2}pass")
+    if read_bindings and emit_read_return:
+        return_root = _ExtractionReturnNode()
+        # Distinct reads that share a path (only the anonymous path can) each keep their value under
+        # a suffixed key: choosing one would silently discard evidence.
+        seen_paths: dict[str, int] = {}
+        for output_path, variable in read_bindings:
+            occurrence = seen_paths.get(output_path, 0)
+            seen_paths[output_path] = occurrence + 1
+            keyed_path = output_path if occurrence == 0 else f"{output_path}_{occurrence + 1}"
+            _set_return_expression(return_root, output_path_segments(keyed_path.removeprefix("output.")), variable)
+        lines.append(f"{_INDENT}return {_return_node_expression(return_root)}")
     if steps:
         steps[-1]["line_end"] = len(lines)
 
     diagnostics.emitted_interaction_count = emitted
     code = "\n".join(lines) + "\n"
-    return SynthesizedCodeBlock(code=code, parameters=parameters, notes=notes, diagnostics=diagnostics, steps=steps)
+    segments: list[SynthesizedCodeBlock] = []
+    if not _segment_pass:
+        # Each segment is synthesized from its own slice rather than sliced out of the code above, so it
+        # carries its own prelude and guards and is valid, correctly scoped, and independently runnable.
+        for start, end in credential_segment_bounds(trajectory) or []:
+            segment = synthesize_code_block(
+                trajectory[start : end + 1],
+                strict_selectors=strict_selectors,
+                reached_download_target=reached_download_target,
+                parameter_binding_snapshot=parameter_binding_snapshot,
+                file_match_transform=file_match_transform,
+                emit_read_return=emit_read_return,
+                _segment_pass=True,
+            )
+            if segment is None or not segment.diagnostics.emitted_interaction_count:
+                segments = []
+                break
+            segments.append(segment)
+    return SynthesizedCodeBlock(
+        code=code,
+        parameters=parameters,
+        notes=notes,
+        diagnostics=diagnostics,
+        steps=steps,
+        segments=segments if len(segments) >= 2 else [],
+    )
 
 
 SCOUTED_SPINE_UNDER_BUILD_REASON_CODE = "scouted_spine_under_build"
@@ -3131,7 +3377,8 @@ def spine_partition_findings(
 ) -> list[ObligationFinding]:
     """Partition-exhaustiveness obligation over the full retained-index manifest: an uncovered required
     rung, a dropped interaction the allowlist does not forgive, a retained index in no record lane, or a
-    truncation are each a typed under-build finding. Forgiveness names the reason; it never absolves."""
+    truncation are each a typed under-build finding. Forgiveness names the reason; it never absolves.
+    Truncation supersedes the per-index lane check — the tail was never visited, so it reports once."""
     findings: list[ObligationFinding] = []
     for record in uncovered_required_emitted_interactions(diagnostics.emitted_interactions, draft_calls):
         index = record.get("trajectory_index")
@@ -3154,12 +3401,13 @@ def spine_partition_findings(
                 trajectory_index=index if isinstance(index, int) else None,
             )
         )
+    if diagnostics.truncated:
+        findings.append(ObligationFinding(kind=TRUNCATED_FINDING))
+        return findings
     recorded = _recorded_partition_indices(diagnostics)
     for index in diagnostics.retained_trajectory_indices:
         if index not in recorded:
             findings.append(ObligationFinding(kind=UNRECORDED_INDEX_FINDING, trajectory_index=index))
-    if diagnostics.truncated:
-        findings.append(ObligationFinding(kind=TRUNCATED_FINDING))
     return findings
 
 
@@ -3242,30 +3490,75 @@ def _array_prefix(binding: LiveReadBinding) -> tuple[tuple[str, bool], ...]:
     return _array_prefix_of_segments(output_path_segments(binding.output_path))
 
 
+def _scalar_label_proof_statements(binding: LiveReadBinding, children: str) -> list[str]:
+    """Re-read the label that proves this value's identity, wherever it lives.
+
+    A tile that renders its heading and its figure in separate branches has no container holding both,
+    so proving the label only as the value's first sibling makes such a value unreadable. A tile that
+    prints its figure first ("1.22K logs found") keeps the label beside it but not at child zero.
+    """
+    anchor = (
+        f"page.locator({json.dumps(binding.label_selector)})"
+        if binding.label_selector
+        else f"{children}.nth({binding.label_child_index})"
+    )
+    target = f"{anchor}.first" if binding.label_selector else anchor
+    return [
+        f"if not await {target}.is_visible():",
+        f'{_INDENT}raise Exception("Observed scalar label is no longer visible")',
+        f"if (await {target}.inner_text()).strip() != {json.dumps(binding.relation_label)}:",
+        f'{_INDENT}raise Exception("Observed scalar label changed")',
+    ]
+
+
 def _key_value_scalar_read_statements(binding: LiveReadBinding, variable: str, *, guard_empty: bool) -> list[str]:
     container = f"page.locator({json.dumps(binding.selector)})"
     target = f"{container}.nth({binding.selector_index})"
+    if binding.child_count == 0:
+        # A designated read: the model pointed at the value element itself, so the read takes its
+        # text directly — no child-slot walk, and no label pin, since the value is what changes.
+        statements = [
+            f'await {container}.first.wait_for(state="visible", timeout={_REQUIRED_STATE_TIMEOUT_MS})',
+            f"if await {container}.count() != {binding.selector_count}:",
+            f'{_INDENT}raise Exception("Designated value selector cardinality changed")',
+            f"if not await {target}.is_visible():",
+            f'{_INDENT}raise Exception("Designated value element is no longer visible")',
+            # The container renders before the figure does on a page still resolving its query, and
+            # reading once there returns the empty frame the value lands in a moment later.
+            f"{variable} = (await {target}.inner_text()).strip()",
+            f"for _ in range({_DESIGNATED_VALUE_SETTLE_POLLS}):",
+            f"{_INDENT}if {variable}:",
+            f"{_INDENT * 2}break",
+            f"{_INDENT}await page.wait_for_timeout({_DESIGNATED_VALUE_SETTLE_INTERVAL_MS})",
+            f"{_INDENT}{variable} = (await {target}.inner_text()).strip()",
+        ]
+        if guard_empty:
+            statements.extend(
+                [
+                    f"if not {variable}:",
+                    f'{_INDENT}raise Exception("Designated value element is empty")',
+                ]
+            )
+        return statements
     children = f'{target}.locator(":scope > *")'
     statements = [
+        f'await {container}.first.wait_for(state="visible", timeout={_REQUIRED_STATE_TIMEOUT_MS})',
         f"if await {container}.count() != {binding.selector_count}:",
-        f'{_INDENT}raise ValueError("Observed scalar selector cardinality changed")',
+        f'{_INDENT}raise Exception("Observed scalar selector cardinality changed")',
         f"if not await {target}.is_visible():",
-        f'{_INDENT}raise ValueError("Observed scalar relation is no longer visible")',
+        f'{_INDENT}raise Exception("Observed scalar relation is no longer visible")',
         f"if await {children}.count() != {binding.child_count}:",
-        f'{_INDENT}raise ValueError("Observed scalar direct-child shape changed")',
-        f"if not await {children}.nth(0).is_visible():",
-        f'{_INDENT}raise ValueError("Observed scalar label is no longer visible")',
-        f"if (await {children}.nth(0).inner_text()).strip() != {json.dumps(binding.relation_label)}:",
-        f'{_INDENT}raise ValueError("Observed scalar label changed")',
+        f'{_INDENT}raise Exception("Observed scalar direct-child shape changed")',
+        *(_scalar_label_proof_statements(binding, children) if binding.identified_by_label else []),
         f"if not await {children}.nth({binding.child_index}).is_visible():",
-        f'{_INDENT}raise ValueError("Observed scalar value is no longer visible")',
+        f'{_INDENT}raise Exception("Observed scalar value is no longer visible")',
         f"{variable} = (await {children}.nth({binding.child_index}).inner_text()).strip()",
     ]
     if guard_empty:
         statements.extend(
             [
                 f"if not {variable}:",
-                f'{_INDENT}raise ValueError("Observed scalar value is empty")',
+                f'{_INDENT}raise Exception("Observed scalar value is empty")',
             ]
         )
     return statements
@@ -3294,20 +3587,20 @@ def _table_group_read_lines(
     rows = f"page.locator({json.dumps(row_selector)})"
     headers = f'{table}.nth({exemplar.selector_index}).locator(":scope > thead > tr > th")'
     lines.append(f"if await {table}.count() != {exemplar.selector_count}:")
-    lines.append(f'{_INDENT}raise ValueError("Observed table identity changed")')
+    lines.append(f'{_INDENT}raise Exception("Observed table identity changed")')
     lines.append(f"if not await {table}.nth({exemplar.selector_index}).is_visible():")
-    lines.append(f'{_INDENT}raise ValueError("Observed table is no longer visible")')
+    lines.append(f'{_INDENT}raise Exception("Observed table is no longer visible")')
     lines.append(f'if await {selected_table}.locator(":scope table").count() != 0:')
-    lines.append(f'{_INDENT}raise ValueError("Observed table gained a nested table")')
+    lines.append(f'{_INDENT}raise Exception("Observed table gained a nested table")')
     lines.append(f'if await {table}.nth({exemplar.selector_index}).locator("[colspan], [rowspan]").count() != 0:')
-    lines.append(f'{_INDENT}raise ValueError("Observed table gained spanning cells")')
+    lines.append(f'{_INDENT}raise Exception("Observed table gained spanning cells")')
     lines.append(f"if await {headers}.count() != {len(exemplar.headers)}:")
-    lines.append(f'{_INDENT}raise ValueError("Observed table header cardinality changed")')
+    lines.append(f'{_INDENT}raise Exception("Observed table header cardinality changed")')
     for header_index, header_text in enumerate(exemplar.headers):
         lines.append(f"if (await {headers}.nth({header_index}).inner_text()).strip() != {json.dumps(header_text)}:")
-        lines.append(f'{_INDENT}raise ValueError("Observed table header identity changed")')
+        lines.append(f'{_INDENT}raise Exception("Observed table header identity changed")')
     lines.append(f"if await {rows}.count() != {row_count}:")
-    lines.append(f'{_INDENT}raise ValueError("Observed table row count changed")')
+    lines.append(f'{_INDENT}raise Exception("Observed table row count changed")')
     row_expressions: list[str] = []
     if not assemble_as_literal:
         lines.append(f"{records_variable} = []")
@@ -3315,23 +3608,23 @@ def _table_group_read_lines(
         row = f"{rows}.nth({row_index})"
         cells = f'{row}.locator(":scope > th, :scope > td")'
         lines.append(f"if not await {row}.is_visible():")
-        lines.append(f'{_INDENT}raise ValueError("Observed table row is no longer visible")')
+        lines.append(f'{_INDENT}raise Exception("Observed table row is no longer visible")')
         lines.append(f"if await {cells}.count() != {exemplar.row_cell_counts[row_index]}:")
-        lines.append(f'{_INDENT}raise ValueError("Observed table direct-cell cardinality changed")')
+        lines.append(f'{_INDENT}raise Exception("Observed table direct-cell cardinality changed")')
         lines.append(f'if await {row}.locator(":scope > th").count() != 0:')
-        lines.append(f'{_INDENT}raise ValueError("Observed table row gained a row header")')
+        lines.append(f'{_INDENT}raise Exception("Observed table row gained a row header")')
         lines.append(
             f'if " ".join((await {row}.inner_text()).split()) != {json.dumps(exemplar.row_identities[row_index])}:'
         )
-        lines.append(f'{_INDENT}raise ValueError("Observed table row identity changed")')
+        lines.append(f'{_INDENT}raise Exception("Observed table row identity changed")')
         for binding_index, binding in enumerate(sorted(bindings, key=lambda item: item.output_path)):
             value_variable = f"{cell_variable_base}_{group_index}_{row_index}_{binding_index}"
             lines.append(f"if not await {cells}.nth({binding.column_index}).is_visible():")
-            lines.append(f'{_INDENT}raise ValueError("Observed table cell is no longer visible")')
+            lines.append(f'{_INDENT}raise Exception("Observed table cell is no longer visible")')
             lines.append(f"{value_variable} = (await {cells}.nth({binding.column_index}).inner_text()).strip()")
             if guard_empty:
                 lines.append(f"if not {value_variable}:")
-                lines.append(f'{_INDENT}raise ValueError("Observed table cell value is empty")')
+                lines.append(f'{_INDENT}raise Exception("Observed table cell value is empty")')
             _set_return_expression(
                 record_root, output_path_segments(binding.output_path)[len(prefix) :], value_variable
             )
@@ -3604,14 +3897,17 @@ def produce_covered_static_return_envelope(
 
 
 def _trajectory_contains_reveal(trajectory: Sequence[Mapping[str, Any]], plan: RequestedOutputExtractionPlan) -> bool:
+    if plan.reveal is None:
+        return True
+    reveal = plan.reveal
     return any(
         str(interaction.get("tool_name") or "") == "click"
         and (
-            (bool(plan.reveal.selector) and str(interaction.get("selector") or "") == plan.reveal.selector)
+            (bool(reveal.selector) and str(interaction.get("selector") or "") == reveal.selector)
             or (
-                bool(plan.reveal.role and plan.reveal.name)
-                and str(interaction.get("role") or "") == plan.reveal.role
-                and str(interaction.get("accessible_name") or "") == plan.reveal.name
+                bool(reveal.role and reveal.name)
+                and str(interaction.get("role") or "") == reveal.role
+                and str(interaction.get("accessible_name") or "") == reveal.name
             )
         )
         for interaction in trajectory
@@ -3629,12 +3925,15 @@ def synthesize_code_block_with_extraction(
 ) -> SynthesizedCodeBlock | None:
     if not _trajectory_contains_reveal(trajectory, extraction_plan):
         return None
+    # The suffix carries the terminal return; a base read-return here would sit above the appended
+    # suffix and make it unreachable.
     interaction = synthesize_code_block(
         trajectory,
         strict_selectors=strict_selectors,
         reached_download_target=reached_download_target,
         parameter_binding_snapshot=parameter_binding_snapshot,
         file_match_transform=file_match_transform,
+        emit_read_return=False,
     )
     suffix = synthesize_extraction_suffix(extraction_plan)
     if interaction is None or suffix is None:

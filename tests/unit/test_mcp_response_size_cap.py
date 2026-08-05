@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from skyvern.cli.core.result import Artifact, BrowserContext
+from skyvern.cli.mcp_tools import browser as mcp_browser
+from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.response import (
     MCP_MAX_RESPONSE_CHARS,
     size_capped,
@@ -131,6 +136,20 @@ def test_truncate_response_non_dict_overflow_wraps_into_envelope() -> None:
     assert "ok" not in result
 
 
+def test_truncate_response_preserves_screenshot_artifact_on_overflow() -> None:
+    screenshot = {"kind": "screenshot", "path": "/tmp/screenshot.png", "mime": "image/png"}
+    result = truncate_response(
+        {
+            "ok": True,
+            "data": {"inline": True, "mime": "image/png", "data": "x" * (MCP_MAX_RESPONSE_CHARS + 100)},
+            "artifacts": [screenshot],
+        }
+    )
+
+    assert result["artifacts"] == [screenshot]
+    assert result["ok"] is False
+
+
 def test_truncate_response_unserializable_input_returned_as_is() -> None:
     # object() is not JSON-serializable; json.dumps(..., default=str) stringifies
     # it, so the helper returns the payload unchanged (size is small).
@@ -194,3 +213,129 @@ async def test_size_capped_decorator_preserves_signature() -> None:
     result = await typed_tool(1, y="override")
     assert result == {"x": 1, "y": "override"}
     assert typed_tool.__name__ == "typed_tool"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "kwargs"),
+    [
+        pytest.param("skyvern_extract", {"prompt": "read the table"}, id="extract"),
+        pytest.param("skyvern_extract_and_screenshot", {"prompt": "read the table"}, id="extract-and-screenshot"),
+        pytest.param(
+            "skyvern_navigate_extract_and_screenshot",
+            {"url": "https://example.test", "prompt": "read the table"},
+            id="navigate-extract-and-screenshot",
+        ),
+    ],
+)
+async def test_every_registered_extract_tool_caps_an_oversize_extraction(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str, kwargs: dict[str, Any]
+) -> None:
+    """The paired capture tools return the same AI extraction as skyvern_extract, so they need the
+    same envelope: an extraction that overflows the tool-result limit must not be handed back raw."""
+    oversize = {"rows": "y" * (MCP_MAX_RESPONSE_CHARS + 1_000)}
+    ctx = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    page = SimpleNamespace(page=SimpleNamespace())
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+    monkeypatch.setattr(mcp_browser, "validate_fetch_url", lambda url: url)
+    monkeypatch.setattr(mcp_browser, "get_current_session", lambda: SimpleNamespace(_working_frame=None))
+    monkeypatch.setattr(mcp_browser, "clear_session_ref_map", Mock())
+    monkeypatch.setattr(mcp_browser, "do_extract", AsyncMock(return_value=SimpleNamespace(extracted=oversize)))
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_navigate",
+        AsyncMock(return_value=SimpleNamespace(url="https://example.test", title="Example")),
+    )
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
+    monkeypatch.setattr(
+        mcp_browser,
+        "save_artifact",
+        Mock(return_value=Artifact(kind="screenshot", path="/tmp/shot.png", mime="image/png", bytes=3)),
+    )
+
+    tool = await mcp.get_tool(tool_name)
+    result = await tool.fn(**kwargs)
+
+    assert result["_truncated"] is True
+    assert len(json.dumps(result, ensure_ascii=False)) <= MCP_MAX_RESPONSE_CHARS
+
+
+def _stub_browser(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    page = SimpleNamespace(
+        page=SimpleNamespace(),
+        _working_frame=None,
+        url="https://example.test",
+        evaluate=AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+    monkeypatch.setattr(mcp_browser, "validate_fetch_url", lambda url: url)
+    monkeypatch.setattr(mcp_browser, "get_current_session", lambda: SimpleNamespace(_working_frame=None))
+    monkeypatch.setattr(mcp_browser, "clear_session_ref_map", Mock())
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_navigate",
+        AsyncMock(return_value=SimpleNamespace(url="https://example.test", title="Example")),
+    )
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
+    monkeypatch.setattr(
+        mcp_browser,
+        "save_artifact",
+        Mock(return_value=Artifact(kind="screenshot", path="/tmp/shot.png", mime="image/png", bytes=3)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_navigate_and_screenshot_caps_an_oversize_inline_screenshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`inline=True` puts a full-resolution base64 PNG straight into the tool result, so this tool needs
+    the same envelope as its `*_and_screenshot` siblings — otherwise a big page blows the caller's
+    tool-result limit with no truncation warning."""
+    _stub_browser(monkeypatch)
+    oversize_png = b"\x89PNG" + b"z" * MCP_MAX_RESPONSE_CHARS
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=oversize_png)))
+
+    tool = await mcp.get_tool("skyvern_navigate_and_screenshot")
+    result = await tool.fn(url="https://example.test", inline=True)
+
+    assert result["_truncated"] is True
+    assert result["ok"] is False
+    assert result["error"]["code"] == "RESPONSE_TOO_LARGE"
+    assert "inline screenshot" in result["error"]["message"].lower()
+    assert len(json.dumps(result, ensure_ascii=False)) <= MCP_MAX_RESPONSE_CHARS
+
+
+@pytest.mark.asyncio
+async def test_evaluate_and_screenshot_caps_an_oversize_evaluation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The JS expression scrapes the DOM, so its return value is as unbounded as an AI extraction."""
+    _stub_browser(monkeypatch)
+    ctx = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    page = SimpleNamespace(
+        page=SimpleNamespace(),
+        _working_frame=None,
+        url="https://example.test",
+        evaluate=AsyncMock(return_value="y" * (MCP_MAX_RESPONSE_CHARS + 1_000)),
+    )
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+
+    tool = await mcp.get_tool("skyvern_evaluate_and_screenshot")
+    result = await tool.fn(expression="document.body.innerText")
+
+    assert result["_truncated"] is True
+    assert len(json.dumps(result, ensure_ascii=False)) <= MCP_MAX_RESPONSE_CHARS
+
+
+@pytest.mark.asyncio
+async def test_every_paired_capture_tool_is_registered_size_capped() -> None:
+    async def _probe() -> dict[str, Any]:
+        return {}
+
+    paired_tools = [
+        tool
+        for tool in await mcp.list_tools()
+        if tool.name.endswith("_and_screenshot") or "screenshot" in tool.parameters.get("properties", {})
+    ]
+
+    assert paired_tools
+    for registered_tool in paired_tools:
+        tool = await mcp.get_tool(registered_tool.name)
+        assert tool.fn.__code__ is size_capped(_probe).__code__, f"{registered_tool.name} is not wrapped in size_capped"

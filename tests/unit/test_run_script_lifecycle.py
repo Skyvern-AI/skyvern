@@ -173,7 +173,13 @@ async def test_run_script_persistent_session_closes_reusable_and_releases(monkey
     path = _write_script(tmp_path, SUCCESS_SCRIPT)
     await run_script(path, script_id="scr_1", organization_id="org_1", browser_session_id="sess_1")
     state.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=False)
-    sessions.release_browser_session.assert_awaited_once_with("sess_1", organization_id="org_1")
+    sessions.release_browser_session.assert_awaited_once_with(
+        session_id="sess_1",
+        organization_id="org_1",
+        expected_runnable_id=None,
+        expected_runnable_generation_id=None,
+        expected_browser_state=None,
+    )
     assert [c[0] for c in order.method_calls] == ["close", "release"]
     assert "scr_1" not in manager.pages
 

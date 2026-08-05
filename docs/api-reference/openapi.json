@@ -3819,7 +3819,8 @@
                 "$ref": "#/components/schemas/CreateBrowserSessionRequest",
                 "default": {
                   "timeout": 60,
-                  "generate_browser_profile": false
+                  "generate_browser_profile": false,
+                  "needs_live_view": false
                 }
               }
             }
@@ -4170,6 +4171,39 @@
           "403": {
             "description": "Unauthorized - Invalid or missing authentication"
           },
+          "503": {
+            "description": "Downloaded files could not be returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "detail"
+                  ],
+                  "properties": {
+                    "detail": {
+                      "type": "object",
+                      "required": [
+                        "code",
+                        "retryable"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "downloaded_files_unavailable"
+                          ]
+                        },
+                        "retryable": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -4246,6 +4280,9 @@
                 }
               }
             }
+          },
+          "402": {
+            "description": "Insufficient credits to parse OTP content"
           },
           "422": {
             "description": "Validation Error",
@@ -8003,6 +8040,30 @@
             "title": "Skip Auto Complete Tab",
             "default": false
           },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
           "created_at": {
             "anyOf": [
               {
@@ -8140,6 +8201,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -8564,6 +8630,7 @@
         "enum": [
           "click",
           "input_text",
+          "paste_text",
           "upload_file",
           "download_file",
           "select_option",
@@ -11109,7 +11176,6 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 1440.0,
                 "minimum": 5.0
               },
               {
@@ -11117,7 +11183,7 @@
               }
             ],
             "title": "Timeout",
-            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.",
+            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be at least 5; values above 240 are capped at 240. Defaults to 60.",
             "default": 60
           },
           "proxy_location": {
@@ -11194,6 +11260,12 @@
             "type": "boolean",
             "title": "Generate Browser Profile",
             "description": "When true, the session's browser profile (cookies, localStorage, etc.) is saved to storage when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid storing profiles for sessions that never need them. Sessions started with a browser_profile_id always persist their profile regardless of this flag.",
+            "default": false
+          },
+          "needs_live_view": {
+            "type": "boolean",
+            "title": "Needs Live View",
+            "description": "Whether a person will watch this session's browser live. Defaults to false, which suits unattended automation; the Skyvern app sets it because a session opened in the UI is watched. It requests a capability, not a particular browser, and cannot be used to select where the session runs.",
             "default": false
           }
         },
@@ -11754,6 +11826,11 @@
             "title": "Save Browser Session Intent",
             "description": "Whether the user intends to save a browser session, regardless of test outcome"
           },
+          "run_sequentially": {
+            "type": "boolean",
+            "title": "Run Sequentially",
+            "default": false
+          },
           "folder_id": {
             "anyOf": [
               {
@@ -12123,6 +12200,11 @@
               }
             ],
             "title": "Reasoning Effort"
+          },
+          "extra_parameters": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Extra Parameters"
           }
         },
         "type": "object",
@@ -12166,7 +12248,8 @@
         "enum": [
           "openai_compatible",
           "ollama",
-          "openrouter"
+          "openrouter",
+          "gemini"
         ],
         "title": "CustomLLMProvider"
       },
@@ -13125,6 +13208,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -13780,6 +13868,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -17119,6 +17212,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -17807,6 +17905,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -18605,6 +18708,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -18985,6 +19093,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -19191,6 +19304,21 @@
               "user@example.com",
               "+14155550123"
             ]
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata",
+            "description": "Optional additional password credential metadata fields"
           }
         },
         "type": "object",
@@ -21705,7 +21833,8 @@
                 "type": "null"
               }
             ],
-            "description": "Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.",
+            "description": "Deprecated compatibility field. Skyvern auto-detects the OTP type from content, so this value does not constrain extraction.",
+            "deprecated": true,
             "examples": [
               "totp",
               "magic_link"
@@ -21869,7 +21998,8 @@
                 "type": "null"
               }
             ],
-            "description": "Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.",
+            "description": "Deprecated compatibility field. Skyvern auto-detects the OTP type from content, so this value does not constrain extraction.",
+            "deprecated": true,
             "examples": [
               "totp",
               "magic_link"
@@ -22515,6 +22645,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -24744,6 +24879,7 @@
           "authenticator",
           "email",
           "text",
+          "passkey",
           "none"
         ],
         "title": "TotpType",
@@ -25174,6 +25310,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -25612,6 +25753,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -26404,7 +26550,7 @@
           "condition"
         ],
         "title": "WhileLoopBlock",
-        "description": "Loop block driven by a runtime condition. Iterates while ``condition`` evaluates truthy.\n\nTop-of-loop semantics: the condition is evaluated *before* each iteration (including the\nfirst). If the condition is false on the first check, the body never runs and the block\nreturns success with an empty output list.\n\nSafety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (500). Reaching the cap is\ntreated as a failure so that a misbehaving condition can never spin forever."
+        "description": "Loop block driven by a runtime condition. Iterates while ``condition`` evaluates truthy.\n\nTop-of-loop semantics: the condition is evaluated *before* each iteration (including the\nfirst). If the condition is false on the first check, the body never runs and the block\nreturns success with an empty output list.\n\nSafety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (1000). Reaching the cap is\ntreated as a failure so that a misbehaving condition can never spin forever."
       },
       "WhileLoopBlockYAML": {
         "properties": {
@@ -26667,6 +26813,11 @@
           "persist_browser_session": {
             "type": "boolean",
             "title": "Persist Browser Session",
+            "default": false
+          },
+          "mask_secrets": {
+            "type": "boolean",
+            "title": "Mask Secrets",
             "default": false
           },
           "pin_saved_session_ip": {
@@ -26996,6 +27147,18 @@
             "type": "boolean",
             "title": "Persist Browser Session",
             "default": false
+          },
+          "mask_secrets": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mask Secrets",
+            "description": "Visually mask secrets as they are typed in the browser, hiding them from screenshots, recordings, and the live view."
           },
           "pin_saved_session_ip": {
             "type": "boolean",
@@ -27423,6 +27586,19 @@
               }
             ],
             "title": "Workflow System Prompt"
+          },
+          "completion_contract": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completion Contract",
+            "description": "Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand."
           }
         },
         "type": "object",
@@ -27666,6 +27842,19 @@
               }
             ],
             "title": "Workflow System Prompt"
+          },
+          "completion_contract": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completion Contract",
+            "description": "Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand."
           }
         },
         "type": "object",
@@ -28208,6 +28397,17 @@
             ],
             "title": "Sequential Key"
           },
+          "sequential_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sequential Credential Id"
+          },
           "ai_fallback": {
             "anyOf": [
               {
@@ -28482,6 +28682,17 @@
               }
             ],
             "title": "Url"
+          },
+          "final_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Final Url"
           },
           "navigation_goal": {
             "anyOf": [

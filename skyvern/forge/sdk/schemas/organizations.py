@@ -26,6 +26,8 @@ class Organization(BaseModel):
             "Bounded between 1 hour (3600) and 7 days (604800)."
         ),
     )
+    default_llm_key: str | None = None
+    default_secondary_llm_key: str | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -213,5 +215,33 @@ class OrganizationUpdate(BaseModel):
             "When true, resets ``artifact_url_expiry_seconds`` to NULL — the org will use "
             "the global 12-hour default. Mutually exclusive with a non-null value in "
             "``artifact_url_expiry_seconds`` (the clear flag wins)."
+        ),
+    )
+    default_llm_key: str | None = Field(
+        None,
+        description=(
+            "Custom LLM registry key to use as the org's Smart LLM. Pass null to leave the current value unchanged. "
+            "Set ``clear_default_llm_key`` to true to use the Skyvern Default."
+        ),
+    )
+    clear_default_llm_key: bool = Field(
+        False,
+        description=(
+            "When true, resets ``default_llm_key`` to NULL so the org uses the Skyvern Default. Mutually exclusive "
+            "with a non-null value in ``default_llm_key`` (the clear flag wins)."
+        ),
+    )
+    default_secondary_llm_key: str | None = Field(
+        None,
+        description=(
+            "Custom LLM registry key to use as the org's Fast LLM. Pass null to leave the current value unchanged. "
+            "Set ``clear_default_secondary_llm_key`` to true to use the Skyvern Default."
+        ),
+    )
+    clear_default_secondary_llm_key: bool = Field(
+        False,
+        description=(
+            "When true, resets ``default_secondary_llm_key`` to NULL so the org uses the Skyvern Default. Mutually "
+            "exclusive with a non-null value in ``default_secondary_llm_key`` (the clear flag wins)."
         ),
     )

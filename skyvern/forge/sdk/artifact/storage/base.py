@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from typing import BinaryIO, cast
 
 from skyvern.forge import app
@@ -304,6 +305,7 @@ class BaseStorage(ABC):
         local_file_path: str,
         remote_path: str,
         date: str | None = None,
+        recording_finalized_at: datetime | None = None,
     ) -> str:
         pass
 

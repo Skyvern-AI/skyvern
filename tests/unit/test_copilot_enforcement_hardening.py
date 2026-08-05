@@ -17,22 +17,18 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from skyvern.forge.sdk.copilot.agent import (
-    _finalize_result_with_blocker_override,
-    _with_scouted_spine_missing_steps,
-)
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     clear_terminal_evidence_on_workflow_edit,
-    maybe_clear_blocker_signal_on_tool_success,
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import UNFORGIVEN_DROP_FINDING, ObligationFinding
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
     DiagnosisRepairContract,
@@ -42,44 +38,29 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     VerificationResult,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
-    MAX_CODE_AUTHORING_GUARDRAIL_REJECTS,
-    MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS,
-    MAX_NO_PROGRESS_INTERACTION_ATTEMPTS,
-    MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES,
     POST_FAILED_TEST_INSPECT_FIRST_NUDGE,
     POST_FAILED_TEST_NUDGE,
     POST_NAVIGATE_NUDGE,
     POST_PER_TOOL_BUDGET_NUDGE,
     POST_PER_TOOL_BUDGET_STOP_NUDGE,
     POST_SUSPICIOUS_SUCCESS_NUDGE,
-    PROBABLE_SITE_BLOCK_STREAK_STOP_AT,
     SCREENSHOT_PLACEHOLDER,
-    CopilotNonRetriableNavError,
     _check_enforcement,
     _code_authoring_reject_count_resets,
     _is_context_window_error,
-    _maybe_raise_non_retriable_nav,
     _needs_inspect_before_repair_nudge,
     _prune_input_list,
-    _record_code_authoring_guardrail_reject,
     _recover_from_context_overflow,
     _scouted_spine_missing_text,
     _strip_input_images,
-    code_authoring_churn_stop_would_claim,
+    _witnessed_values_by_path,
     register_no_progress_interaction_click,
     reset_no_progress_interaction_count,
     synthesized_trajectory_reaches_goal,
 )
 from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
-from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
 from skyvern.forge.sdk.copilot.streaming_adapter import _update_enforcement_from_tool
 from skyvern.forge.sdk.copilot.tools.workflow_update import _pre_persist_scouted_spine_result
-from skyvern.forge.sdk.copilot.turn_halt import (
-    ADVISORY_DISPATCH_STALLED_REASON_CODE,
-    CopilotTurnHalt,
-    TurnHaltKind,
-    expire_output_contract_ladder_at_turn_end,
-)
 from skyvern.forge.sdk.copilot.turn_ownership import TurnClaimant
 from tests.unit.conftest import make_copilot_context as _fresh_context
 
@@ -378,92 +359,6 @@ def test_is_context_window_error_matches_only_overflow_variants(msg: str, expect
     assert _is_context_window_error(Exception(msg)) is expected
 
 
-def test_code_authoring_churn_backstop_raises_at_ceiling() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-
-    with pytest.raises(CopilotTurnHalt) as excinfo:
-        _check_enforcement(ctx)
-
-    assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
-    assert signal.internal_reason_code == "code_authoring_guardrail_churn"
-
-
-def test_code_authoring_churn_backstop_does_not_raise_below_ceiling() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
-
-    assert _check_enforcement(ctx) is None
-
-
-def test_code_authoring_churn_backstop_defers_to_terminal_blocker() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-    terminal = CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text="A site verification challenge blocked the run.",
-        user_facing_reason="The site's verification challenge blocked the run.",
-        recovery_hint="report_blocker_to_user",
-        internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
-        blocked_tool="update_and_run_blocks",
-    )
-    ctx.blocker_signal = terminal
-
-    with pytest.raises(CopilotTurnHalt) as excinfo:
-        _check_enforcement(ctx)
-
-    assert excinfo.value.halt.kind is TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
-    assert ctx.blocker_signal is terminal
-
-
-def test_code_authoring_churn_backstop_defers_to_newly_detected_site_block() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-    ctx.probable_site_block_streak_count = PROBABLE_SITE_BLOCK_STREAK_STOP_AT
-    assert ctx.blocker_signal is None
-
-    with pytest.raises(CopilotTurnHalt) as excinfo:
-        _check_enforcement(ctx)
-
-    assert excinfo.value.halt.kind is TurnHaltKind.PROBABLE_SITE_BLOCK
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
-    assert signal.internal_reason_code == "probable_site_block_stop"
-
-
-def test_code_authoring_churn_backstop_fires_when_site_block_nudge_cap_spent() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-    ctx.probable_site_block_streak_count = PROBABLE_SITE_BLOCK_STREAK_STOP_AT
-    ctx.probable_site_block_stop_nudge_count = MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES
-
-    with pytest.raises(CopilotTurnHalt) as excinfo:
-        _check_enforcement(ctx)
-
-    assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
-    assert signal.internal_reason_code == "code_authoring_guardrail_churn"
-
-
-def test_code_authoring_churn_backstop_yields_to_non_retriable_nav_error() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-    ctx.last_test_ok = False
-    ctx.last_test_non_retriable_nav_error = (
-        "Failed to navigate to url https://does-not-resolve.example. Error message: net::ERR_NAME_NOT_RESOLVED"
-    )
-
-    nudge = _check_enforcement(ctx)
-
-    assert nudge is not None
-    assert ctx.blocker_signal is None
-    with pytest.raises(CopilotNonRetriableNavError):
-        _maybe_raise_non_retriable_nav(ctx)
-
-
 def _repair_streak_contract() -> DiagnosisRepairContract:
     return DiagnosisRepairContract(
         diagnosis_input=DiagnosisInput(source_tool="update_and_run_blocks"),
@@ -478,33 +373,6 @@ def _mark_recorded_run_backed(ctx: CopilotContext) -> None:
     ctx.recorded_persisted_block_run_workflow_run_id = "wr_1"
 
 
-def test_repair_streak_still_reaches_the_code_authoring_churn_backstop() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-    ctx.latest_diagnosis_repair_contract = _repair_streak_contract()
-
-    with pytest.raises(CopilotTurnHalt) as excinfo:
-        _check_enforcement(ctx)
-
-    assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
-    assert signal.internal_reason_code == "code_authoring_guardrail_churn"
-
-
-def test_run_backed_repair_streak_reaches_the_code_authoring_churn_backstop() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-    ctx.latest_diagnosis_repair_contract = _repair_streak_contract()
-    ctx.last_run_blocks_workflow_run_id = "wr_1"
-    _mark_recorded_run_backed(ctx)
-
-    with pytest.raises(CopilotTurnHalt) as excinfo:
-        _check_enforcement(ctx)
-
-    assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
-
-
 def test_workflow_edit_clears_recorded_persisted_run_latch() -> None:
     ctx = _fresh_context()
     ctx.last_run_blocks_workflow_run_id = "wr_1"
@@ -516,139 +384,6 @@ def test_workflow_edit_clears_recorded_persisted_run_latch() -> None:
     assert ctx.recorded_persisted_block_run_workflow_run_id is None
 
 
-def test_credential_priority_churn_raises_at_higher_bound() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS
-    ctx.last_code_authoring_reject_was_credential_priority = True
-
-    with pytest.raises(CopilotTurnHalt) as excinfo:
-        _check_enforcement(ctx)
-
-    assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
-    assert signal.internal_reason_code == "credential_priority_authoring_churn"
-    assert "verify the saved-credential login" in signal.user_facing_reason
-
-
-def test_credential_priority_churn_defers_below_higher_bound() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS - 1
-    ctx.last_code_authoring_reject_was_credential_priority = True
-
-    assert _check_enforcement(ctx) is None
-    assert ctx.blocker_signal is None
-
-
-def test_repair_streak_still_reaches_the_credential_priority_churn() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS
-    ctx.last_code_authoring_reject_was_credential_priority = True
-    ctx.latest_diagnosis_repair_contract = _repair_streak_contract()
-
-    with pytest.raises(CopilotTurnHalt) as excinfo:
-        _check_enforcement(ctx)
-
-    assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
-    assert signal.internal_reason_code == "credential_priority_authoring_churn"
-
-
-def test_run_backed_repair_streak_reaches_the_credential_priority_churn() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS
-    ctx.last_code_authoring_reject_was_credential_priority = True
-    ctx.latest_diagnosis_repair_contract = _repair_streak_contract()
-    ctx.last_run_blocks_workflow_run_id = "wr_1"
-    _mark_recorded_run_backed(ctx)
-
-    with pytest.raises(CopilotTurnHalt) as excinfo:
-        _check_enforcement(ctx)
-
-    assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
-
-
-def test_no_progress_interaction_floor_raises_at_ceiling() -> None:
-    ctx = _fresh_context()
-    ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
-
-    with pytest.raises(CopilotTurnHalt) as excinfo:
-        _check_enforcement(ctx)
-
-    assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
-    assert signal.internal_reason_code == "loop_detected_no_forward_progress_interaction"
-    assert signal.renders_final_reply is True
-    assert signal.recovery_hint == "report_blocker_to_user"
-
-
-def test_no_progress_interaction_floor_does_not_raise_below_ceiling() -> None:
-    ctx = _fresh_context()
-    ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS - 1
-
-    assert _check_enforcement(ctx) is None
-    assert ctx.blocker_signal is None
-
-
-def test_repair_streak_still_reaches_the_no_progress_interaction_floor() -> None:
-    ctx = _fresh_context()
-    ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
-    ctx.latest_diagnosis_repair_contract = _repair_streak_contract()
-
-    with pytest.raises(CopilotTurnHalt) as excinfo:
-        _check_enforcement(ctx)
-
-    assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
-    assert signal.internal_reason_code == "loop_detected_no_forward_progress_interaction"
-
-
-def test_run_backed_repair_streak_reaches_the_no_progress_interaction_floor() -> None:
-    # A repeated identical repair now steers instead of ending the turn, so a genuine terminal
-    # halt beneath it is the one that fires.
-    ctx = _fresh_context()
-    ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
-    ctx.latest_diagnosis_repair_contract = _repair_streak_contract()
-    ctx.last_run_blocks_workflow_run_id = "wr_1"
-    _mark_recorded_run_backed(ctx)
-
-    with pytest.raises(CopilotTurnHalt) as excinfo:
-        _check_enforcement(ctx)
-
-    assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
-
-
-def test_no_progress_interaction_floor_yields_to_non_retriable_nav_error() -> None:
-    ctx = _fresh_context()
-    ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
-    ctx.last_test_ok = False
-    ctx.last_test_non_retriable_nav_error = (
-        "Failed to navigate to url https://does-not-resolve.example. Error message: net::ERR_NAME_NOT_RESOLVED"
-    )
-
-    nudge = _check_enforcement(ctx)
-
-    assert nudge is not None
-    assert ctx.blocker_signal is None
-    with pytest.raises(CopilotNonRetriableNavError):
-        _maybe_raise_non_retriable_nav(ctx)
-
-
-def test_register_no_progress_interaction_click_stashes_blocker_at_cap() -> None:
-    ctx = _fresh_context()
-    ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS - 1
-
-    register_no_progress_interaction_click(ctx, outcome="click_failed")
-
-    assert ctx.consecutive_no_progress_interaction_count == MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
-    assert signal.internal_reason_code == "loop_detected_no_forward_progress_interaction"
-
-
 def test_register_no_progress_interaction_click_below_cap_does_not_stash() -> None:
     ctx = _fresh_context()
 
@@ -656,24 +391,6 @@ def test_register_no_progress_interaction_click_below_cap_does_not_stash() -> No
 
     assert ctx.consecutive_no_progress_interaction_count == 1
     assert ctx.blocker_signal is None
-
-
-def test_register_no_progress_interaction_click_defers_to_terminal_held_blocker() -> None:
-    ctx = _fresh_context()
-    ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS - 1
-    terminal = CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text="The site appears to be blocking this session.",
-        user_facing_reason="The site looks like it is blocking automated access.",
-        recovery_hint="report_blocker_to_user",
-        internal_reason_code="probable_site_block_stop",
-        blocked_tool="update_and_run_blocks",
-    )
-    ctx.blocker_signal = terminal
-
-    register_no_progress_interaction_click(ctx, outcome="click_failed")
-
-    assert ctx.blocker_signal is terminal
 
 
 def test_reset_no_progress_interaction_count_clears_counter() -> None:
@@ -685,140 +402,8 @@ def test_reset_no_progress_interaction_count_clears_counter() -> None:
     assert ctx.consecutive_no_progress_interaction_count == 0
 
 
-def _hit_no_progress_cap(ctx: CopilotContext) -> CopilotToolBlockerSignal:
-    for _ in range(MAX_NO_PROGRESS_INTERACTION_ATTEMPTS):
-        register_no_progress_interaction_click(ctx, outcome="hollow")
-    held = ctx.blocker_signal
-    assert isinstance(held, CopilotToolBlockerSignal)
-    assert held.internal_reason_code == "loop_detected_no_forward_progress_interaction"
-    assert held.renders_final_reply is True
-    return held
-
-
-def test_no_progress_reset_clears_held_blocker_after_cap() -> None:
-    ctx = _fresh_context()
-    _hit_no_progress_cap(ctx)
-
-    reset_no_progress_interaction_count(ctx)
-
-    assert ctx.consecutive_no_progress_interaction_count == 0
-    assert ctx.blocker_signal is None
-    assert ctx.latest_tool_blocker_signal is None
-
-
-def test_no_progress_reset_at_progress_seam_stops_re_halt() -> None:
-    ctx = _fresh_context()
-    _hit_no_progress_cap(ctx)
-
-    reset_no_progress_interaction_count(ctx)
-
-    assert ctx.consecutive_no_progress_interaction_count == 0
-    assert ctx.blocker_signal is None
-    assert _check_enforcement(ctx) is None
-
-
-@pytest.mark.parametrize("recovery_tool", ["evaluate", "inspect_page_for_composition"])
-def test_no_progress_held_blocker_survives_progress_tool_success(recovery_tool: str) -> None:
-    ctx = _fresh_context()
-    held = _hit_no_progress_cap(ctx)
-
-    maybe_clear_blocker_signal_on_tool_success(ctx, recovery_tool)
-
-    assert ctx.blocker_signal is held
-
-
 def _grant_output_contract_ladder(ctx: CopilotContext) -> None:
     ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
-
-
-def test_inline_churn_reject_yields_to_live_ladder_and_keeps_count() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
-    _grant_output_contract_ladder(ctx)
-
-    _record_code_authoring_guardrail_reject(ctx)
-
-    assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-    assert ctx.blocker_signal is None
-    assert ctx.turn_halt is None
-    assert any(
-        event.fingerprint == "output_contract_actuation>code_authoring_guardrail_churn"
-        for event in ctx.gate_precedence_conflict_events
-    )
-
-
-def test_inline_churn_reject_stashes_when_no_owner_is_live() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
-
-    _record_code_authoring_guardrail_reject(ctx)
-
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
-    assert signal.internal_reason_code == "code_authoring_guardrail_churn"
-    assert signal.renders_final_reply is True
-
-
-def test_churn_backstop_yields_to_live_ladder_without_halt_or_stash() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
-    _grant_output_contract_ladder(ctx)
-
-    assert _check_enforcement(ctx) is None
-
-    assert ctx.blocker_signal is None
-    assert ctx.turn_halt is None
-    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.GRANTED
-    assert any(
-        event.fingerprint == "output_contract_actuation>code_authoring_guardrail_churn"
-        for event in ctx.gate_precedence_conflict_events
-    )
-
-
-def test_no_progress_backstop_yields_to_live_ladder() -> None:
-    ctx = _fresh_context()
-    ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
-    _grant_output_contract_ladder(ctx)
-
-    assert _check_enforcement(ctx) is None
-
-    assert ctx.blocker_signal is None
-    assert ctx.turn_halt is None
-    assert any(
-        event.fingerprint == "output_contract_actuation>loop_detected" for event in ctx.gate_precedence_conflict_events
-    )
-
-
-def test_register_no_progress_click_yields_to_live_ladder() -> None:
-    ctx = _fresh_context()
-    ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS - 1
-    _grant_output_contract_ladder(ctx)
-
-    register_no_progress_interaction_click(ctx, outcome="failed")
-
-    assert ctx.consecutive_no_progress_interaction_count == MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
-    assert ctx.blocker_signal is None
-
-
-def test_grant_plus_ceiling_reject_in_one_call_reaches_stalled_terminal_not_churn_reply() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
-    _grant_output_contract_ladder(ctx)
-    ctx.output_contract_pending_run_evidence["sig_a"] = ["output.confirmation_number"]
-
-    _record_code_authoring_guardrail_reject(ctx)
-    assert _check_enforcement(ctx) is None
-    assert ctx.blocker_signal is None
-    assert ctx.turn_halt is None
-
-    halt = expire_output_contract_ladder_at_turn_end(ctx)
-
-    assert halt is not None
-    assert ctx.turn_halt is halt
-    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
-    assert signal.internal_reason_code == ADVISORY_DISPATCH_STALLED_REASON_CODE
 
 
 def test_single_captured_interaction_trajectory_never_reaches_goal() -> None:
@@ -848,28 +433,6 @@ def test_scouted_spine_missing_text_renders_non_uncovered_families() -> None:
     assert "fill_credential_field" in text
 
 
-def test_missing_steps_listed_on_give_up_offer_and_anchored_in_held_signal() -> None:
-    ctx = _fresh_context()
-    ctx.has_staged_proposal = True
-    ctx.blocker_signal = CopilotToolBlockerSignal(
-        blocker_kind="loop_detected",
-        agent_steering_text="The repair made no progress.",
-        user_facing_reason="I kept the draft.",
-        recovery_hint="report_blocker_to_user",
-        internal_reason_code="loop_detected_generic",
-        blocked_tool="update_workflow",
-    )
-    reply = _with_scouted_spine_missing_steps(ctx, "I kept the draft.", "`fill` on '#totp'")
-    assert "`fill` on '#totp'" in reply
-    assert "`fill` on '#totp'" in ctx.blocker_signal.user_facing_reason
-
-
-def test_missing_steps_not_appended_without_staged_proposal() -> None:
-    ctx = _fresh_context()
-    ctx.has_staged_proposal = False
-    assert _with_scouted_spine_missing_steps(ctx, "base", "`fill` on '#totp'") == "base"
-
-
 def _unrelated_owner_give_up_ctx(internal_reason_code: str) -> tuple[CopilotContext, str]:
     ctx = _fresh_context()
     ctx.has_staged_proposal = True
@@ -895,33 +458,6 @@ def _unrelated_owner_give_up_ctx(internal_reason_code: str) -> tuple[CopilotCont
     )
     ctx.blocker_signal_claimant = TurnClaimant.OUTPUT_CONTRACT_ACTUATION
     return ctx, unrelated_reason
-
-
-def test_finalizer_names_missing_steps_when_unrelated_blocker_renders_give_up() -> None:
-    ctx, unrelated_reason = _unrelated_owner_give_up_ctx("output_contract_actuation_exhausted")
-    result = AgentResult(user_response="agent prose", updated_workflow=None, global_llm_context=None)
-
-    overridden = _finalize_result_with_blocker_override(ctx, result, exit_site="test")
-
-    assert "#search-submit" in overridden.user_response
-    assert ctx.blocker_signal.user_facing_reason == unrelated_reason
-    assert ctx.blocker_signal_claimant is TurnClaimant.OUTPUT_CONTRACT_ACTUATION
-
-
-@pytest.mark.parametrize(
-    "internal_reason_code",
-    ["loop_detected_generic", "completion_contract_unsatisfied", "output_contract_actuation_exhausted"],
-)
-def test_finalizer_render_exit_names_missing_steps_per_owner(internal_reason_code: str) -> None:
-    ctx, unrelated_reason = _unrelated_owner_give_up_ctx(internal_reason_code)
-    result = AgentResult(user_response="agent prose", updated_workflow=None, global_llm_context=None)
-
-    overridden = _finalize_result_with_blocker_override(ctx, result, exit_site="test")
-
-    assert "#search-submit" in overridden.user_response
-    assert overridden.user_response.count("This draft is still missing steps you demonstrated:") == 1
-    assert ctx.blocker_signal.user_facing_reason == unrelated_reason
-    assert ctx.blocker_signal_claimant is TurnClaimant.OUTPUT_CONTRACT_ACTUATION
 
 
 def test_same_omission_spine_violation_still_refused_after_change() -> None:
@@ -959,70 +495,146 @@ def test_reject_count_resets_only_on_non_repeat_without_frontier_unchanged() -> 
     assert _code_authoring_reject_count_resets(True, False) is False
 
 
-def test_churn_stop_would_claim_true_at_ceiling_and_mutates_nothing() -> None:
+# ---------------------------------------------------------------------------
+# Repair obligation — a turn may not finalize a draft its own build test disproved
+# ---------------------------------------------------------------------------
+
+
+class _FakeFinalResult:
+    """Minimal stand-in for RunResultStreaming carrying one final model response."""
+
+    def __init__(self, response_type: str, user_response: str) -> None:
+        self._payload = json.dumps({"type": response_type, "user_response": user_response})
+
+    @property
+    def final_output(self) -> str:
+        return self._payload
+
+
+def _failed_run_ctx(next_action: Any, *, observed: bool = True) -> Any:
     ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
-
-    assert code_authoring_churn_stop_would_claim(ctx) is True
-    assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
-    assert ctx.blocker_signal is None
-
-
-def test_churn_stop_would_claim_false_below_ceiling() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 2
-
-    assert code_authoring_churn_stop_would_claim(ctx) is False
+    ctx.test_after_update_done = True
+    ctx.last_test_ok = False
+    ctx.latest_diagnosis_repair_contract = _repair_contract(next_action)
+    if observed:
+        ctx.post_run_page_observation_after_failed_test = True
+        ctx.post_run_page_observation_tool = "inspect_page_for_composition"
+        ctx.post_run_page_observation_workflow_run_id = "wr_x"
+        ctx.last_run_blocks_workflow_run_id = "wr_x"
+    return ctx
 
 
-def test_churn_stop_would_claim_false_when_terminal_blocker_held() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
-    ctx.blocker_signal = CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text="A site verification challenge blocked the run.",
-        user_facing_reason="The site's verification challenge blocked the run.",
-        recovery_hint="report_blocker_to_user",
-        internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
-        blocked_tool="update_and_run_blocks",
-    )
+def test_observed_reply_cannot_finalize_while_repair_is_owed() -> None:
+    """The production shape: failed run -> inspect once -> report the blocker -> turn ends."""
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
 
-    assert code_authoring_churn_stop_would_claim(ctx) is False
+    ctx = _failed_run_ctx(RepairNextAction.REPAIR)
+    result = _FakeFinalResult("REPLY", "The latest bill link opens an email-delivery form.")
+
+    assert _check_enforcement(ctx, result) is not None
 
 
-def test_churn_stop_would_claim_yields_to_stronger_live_owner_and_mutates_nothing() -> None:
-    ctx = _fresh_context()
-    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
-    ctx.output_contract_actuation_by_signature = {"sig": OutputContractAdvisoryState.GRANTED}
+def test_observed_reply_finalizes_once_repair_is_discharged() -> None:
+    """A contract that no longer asks for repair releases the turn — the obligation is typed."""
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
 
-    assert code_authoring_churn_stop_would_claim(ctx) is False
-    assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
-    assert ctx.blocker_signal is None
+    ctx = _failed_run_ctx(RepairNextAction.NO_CHANGE)
+    result = _FakeFinalResult("REPLY", "Downloaded the latest invoice.")
 
-
-def test_churn_stop_would_claim_matches_recorder_claim_at_ceiling() -> None:
-    predicate_ctx = _fresh_context()
-    predicate_ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
-    recorder_ctx = _fresh_context()
-    recorder_ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
-
-    would_claim = code_authoring_churn_stop_would_claim(predicate_ctx)
-    _record_code_authoring_guardrail_reject(recorder_ctx)
-
-    assert would_claim is True
-    claimed = recorder_ctx.blocker_signal
-    assert isinstance(claimed, CopilotToolBlockerSignal)
-    assert claimed.internal_reason_code == "code_authoring_guardrail_churn"
+    assert _check_enforcement(ctx, result) is None
 
 
-def test_churn_stop_would_claim_matches_recorder_no_claim_below_ceiling() -> None:
-    predicate_ctx = _fresh_context()
-    predicate_ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 2
-    recorder_ctx = _fresh_context()
-    recorder_ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 2
+def test_ask_question_still_finalizes_while_repair_is_owed() -> None:
+    """Needing the user is a legitimate exit; another repair round cannot supply the answer."""
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
 
-    would_claim = code_authoring_churn_stop_would_claim(predicate_ctx)
-    _record_code_authoring_guardrail_reject(recorder_ctx)
+    ctx = _failed_run_ctx(RepairNextAction.REPAIR)
+    ctx.failed_test_nudge_count = 99  # counters exhausted
+    result = _FakeFinalResult("ASK_QUESTION", "Which account should I use?")
 
-    assert would_claim is False
-    assert recorder_ctx.blocker_signal is None
+    assert _check_enforcement(ctx, result) is None
+
+
+def test_exhausted_nudge_counters_do_not_release_an_open_repair_obligation() -> None:
+    """Counters bound nudge repetition; they were never evidence the failure was addressed."""
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+
+    ctx = _failed_run_ctx(RepairNextAction.REPAIR)
+    ctx.failed_test_nudge_count = 99
+    result = _FakeFinalResult("REPLY", "I drafted the workflow; it attempts to download the bill.")
+
+    assert _check_enforcement(ctx, result) == POST_FAILED_TEST_NUDGE
+
+
+def test_stop_decision_releases_the_turn_even_with_counters_exhausted() -> None:
+    """Typed terminal evidence, not a counter, is what ends a repairable failure."""
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+
+    ctx = _failed_run_ctx(RepairNextAction.STOP)
+    ctx.failed_test_nudge_count = 99
+    result = _FakeFinalResult("REPLY", "This site requires a mailed statement request.")
+
+    assert _check_enforcement(ctx, result) is None
+
+
+def test_repair_obligation_releases_the_turn_once_its_rounds_are_spent() -> None:
+    """A failure that looks repairable but is not must still be reportable, not re-nudged forever."""
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+    from skyvern.forge.sdk.copilot.enforcement import MAX_REPAIR_OBLIGATION_NUDGES
+
+    ctx = _failed_run_ctx(RepairNextAction.REPAIR)
+    ctx.failed_test_nudge_count = 99
+    result = _FakeFinalResult("REPLY", "This site offers no downloadable statement.")
+
+    # Held open while rounds remain.
+    assert _check_enforcement(ctx, result) == POST_FAILED_TEST_NUDGE
+
+    ctx.repair_obligation_nudge_count = MAX_REPAIR_OBLIGATION_NUDGES
+    assert _check_enforcement(ctx, result) is None
+
+
+class TestWitnessArbitration:
+    def _ctx(self, reads: list[str]) -> SimpleNamespace:
+        packet = {
+            "source_tool": "inspect_page_for_composition",
+            "key_value_relations": [
+                {"key_text": "logs found", "value_text": "1.41K", "visible": True, "value_visible": True}
+            ],
+        }
+        return SimpleNamespace(
+            flow_evidence=[{"evidence": packet, "reached_via": "current_page", "had_bounded_schema": True, "step": 0}],
+            scout_trajectory=[
+                {
+                    "tool_name": "read_value",
+                    "read_output_path": "output.azure_error_count",
+                    "read_output_path_source": "declared",
+                    "read_result_value": value,
+                }
+                for value in reads
+            ],
+        )
+
+    def test_conflicting_reads_resolve_to_the_value_the_page_still_shows(self) -> None:
+        # Live shape (SKY-13226): a login-form probe and the real read both claimed the path; dropping
+        # the pair left the one requested output with no witness at all.
+        ctx = self._ctx(['{"passwordId":"password"}', "1.41K"])
+        assert _witnessed_values_by_path(ctx) == {"output.azure_error_count": "1.41K"}
+
+    def test_a_conflict_the_page_corroborates_for_none_still_carries_no_witness(self) -> None:
+        ctx = self._ctx(["junk-a", "junk-b"])
+        assert _witnessed_values_by_path(ctx) == {}
+
+    def test_a_read_that_only_inherited_the_path_witnesses_nothing(self) -> None:
+        # An early probe of a login form was promoted to the requested output because it was the only
+        # path on offer, and its JSON then stood as the witness for a figure the page had not shown.
+        ctx = self._ctx([])
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "read_value",
+                "read_output_path": "output.azure_error_count",
+                "read_output_path_source": "elimination",
+                "read_result_value": '{"passwordId": "password"}',
+            }
+        ]
+
+        assert _witnessed_values_by_path(ctx) == {}

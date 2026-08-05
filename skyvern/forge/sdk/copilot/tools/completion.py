@@ -58,6 +58,7 @@ from skyvern.forge.sdk.copilot.output_utils import iter_failure_reasons
 from skyvern.forge.sdk.copilot.reached_download_target import (
     DOWNLOAD_KIND_ATTRIBUTE,
     DOWNLOAD_KIND_EXTENSION,
+    DOWNLOAD_KIND_OBSERVED,
     DOWNLOAD_KIND_REGISTERED,
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS,
@@ -90,7 +91,6 @@ from ._shared import (
     _workflow_output_parameter_payloads,
 )
 from .blockers import (
-    _active_run_terminal_evidence_detected,
     _analyze_run_blocks,
     _artifact_challenge_flag_from_result,
     _run_blocks_structured_blocker_message,
@@ -98,7 +98,9 @@ from .blockers import (
 
 LOG = structlog.get_logger()
 
-_TYPED_DOWNLOAD_KINDS = frozenset({DOWNLOAD_KIND_REGISTERED, DOWNLOAD_KIND_ATTRIBUTE, DOWNLOAD_KIND_EXTENSION})
+_TYPED_DOWNLOAD_KINDS = frozenset(
+    {DOWNLOAD_KIND_REGISTERED, DOWNLOAD_KIND_ATTRIBUTE, DOWNLOAD_KIND_EXTENSION, DOWNLOAD_KIND_OBSERVED}
+)
 _POST_RUN_PAGE_OBSERVATION_LABEL = "post_run_page_observation"
 _REGISTERED_ARTIFACT_OBSERVATION_LABEL = "registered_artifact_observation"
 # Stamp keys the same-run gate reads; they are dropped from the graded payload so the run id
@@ -847,7 +849,6 @@ def _completion_evidence_payload(output: Any) -> Any:
 
 _ARTIFACT_HEALTH_EXCLUDED_CATEGORIES = frozenset(
     {
-        "ACTIVE_RUN_TERMINAL_EVIDENCE",
         "ANTI_BOT_DETECTION",
         "AUTH_FAILURE",
         "BROWSER_ERROR",
@@ -900,8 +901,6 @@ def _is_unfinished_run_verification_candidate(copilot_ctx: Any, result: dict[str
     even though the run did not finish cleanly — recognition must not key on run status.
     """
     if bool(result.get("ok", False)):
-        return False
-    if _active_run_terminal_evidence_detected(result):
         return False
     if _run_blocks_structured_blocker_message(result, copilot_ctx):
         return False
@@ -1908,24 +1907,27 @@ def _tool_visible_result_after_completion_verification(
     result: dict[str, Any],
     completion_verification: CompletionVerificationResult | None,
 ) -> dict[str, Any]:
+    result["turn_seconds_remaining"] = _copilot_seconds_remaining(copilot_ctx)
     if outcome_fully_verified(copilot_ctx):
         return result
     outcome_unverified_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
     if outcome_unverified_reason is None:
         return result
     data = result.get("data")
-    run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
-    if (
-        copilot_ctx.delivered_unverified_terminal
-        and isinstance(run_id, str)
-        and run_id == copilot_ctx.delivered_unverified_workflow_run_id
-    ):
-        return result
     if not _outcome_failure_warrants_repair(copilot_ctx, completion_verification):
         return result
 
     copied_data = dict(data) if isinstance(data, dict) else {}
-    copied_data["failure_reason"] = outcome_unverified_reason
+    # Every outcome-unverified reason asserts a run that completed, so substituting it for a raised
+    # block's own reason told the agent a failed run had completed and sent repair at the extraction
+    # instead of at the failing call. Append it as subordinate context instead.
+    run_failure_reason = next(iter_failure_reasons(result), "")
+    agent_facing_reason = (
+        f"{run_failure_reason.rstrip('. ')}. Completion verification also reported: {outcome_unverified_reason}"
+        if run_failure_reason
+        else outcome_unverified_reason
+    )
+    copied_data["failure_reason"] = agent_facing_reason
     copied_data["completion_verification"] = (
         completion_verification.to_trace_data() if completion_verification is not None else None
     )
@@ -1943,7 +1945,7 @@ def _tool_visible_result_after_completion_verification(
     return {
         **result,
         "ok": False,
-        "error": outcome_unverified_reason,
+        "error": agent_facing_reason,
         "data": copied_data,
     }
 

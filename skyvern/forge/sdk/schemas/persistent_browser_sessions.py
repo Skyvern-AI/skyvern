@@ -70,6 +70,7 @@ class PersistentBrowserSession(BaseModel):
     organization_id: str
     runnable_type: str | None = None
     runnable_id: str | None = None
+    runnable_generation_id: str | None = None
     browser_address: str | None = None
     ip_address: str | None = None
     # Server-side only: the upstream CDP endpoint and the adapter that dials it. browser_address
@@ -103,6 +104,17 @@ class PersistentBrowserSession(BaseModel):
     # False once a requested browser_profile_id failed to load at launch (fell back to a fresh profile),
     # so teardown exported under the session id rather than the bp_ id.
     browser_profile_loaded: bool = True
+
+    @property
+    def is_browser_ready(self) -> bool:
+        """Whether a browser exists for this session and can be connected to.
+
+        Keyed on upstream_cdp_url and NOT on browser_address: a client-facing address can be
+        minted when the session is created, before anything is provisioned, so its presence says
+        only that an address was issued. The session worker writes this column in the same call
+        that starts the session clock, which is what makes it the readiness signal.
+        """
+        return bool(self.upstream_cdp_url)
 
     @field_validator("proxy_location", mode="before")
     @classmethod

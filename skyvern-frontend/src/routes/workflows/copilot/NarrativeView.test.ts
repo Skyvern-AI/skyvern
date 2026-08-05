@@ -636,9 +636,22 @@ describe("condenseActivityEntries", () => {
 
   it("leaves a still-pending retry visible, tagged with the attempt count", () => {
     const s = reduceEvents([
-      toolCall({ tool_call_id: "c1", tool_name: "extract" }),
-      toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
-      toolCall({ tool_call_id: "c2", tool_name: "extract" }),
+      toolCall({
+        tool_call_id: "c1",
+        tool_name: "extract",
+        display_label: "Extracting",
+      }),
+      toolResult({
+        tool_call_id: "c1",
+        tool_name: "extract",
+        success: false,
+        display_label: "Extracting",
+      }),
+      toolCall({
+        tool_call_id: "c2",
+        tool_name: "extract",
+        display_label: "Extracting",
+      }),
     ]);
     const condensed = condenseActivityEntries(s.designActivity);
     expect(condensed).toHaveLength(1);
@@ -951,6 +964,13 @@ describe("hydrateNarrativeFromPayload — terminal adjudication fields", () => {
     expect(turn?.verifiedSuccess).toBe(true);
   });
 
+  it("hydrates the answer response kind from persisted payloads", () => {
+    const turn = hydrateNarrativeFromPayload(
+      reproClarifyPayload({ responseKind: "answer" }),
+    );
+    expect(turn?.responseKind).toBe("answer");
+  });
+
   it("treats absent fields as null", () => {
     const turn = hydrateNarrativeFromPayload(reproClarifyPayload());
     expect(turn?.responseKind).toBeNull();
@@ -1179,6 +1199,7 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     ["recover", "Question"],
     ["refuse", "Declined"],
     ["diagnose", "Answered"],
+    ["answer", "Answered"],
   ] as const)(
     "maps non-build kind %s to %s with qa accent",
     (kind, headline) => {
@@ -1431,6 +1452,7 @@ describe("computeTurnSummary — uxV1 disposition-first reorder (SKY-12136)", ()
   it.each([
     ["refuse", "Declined"],
     ["diagnose", "Answered"],
+    ["answer", "Answered"],
   ] as const)(
     "leaves %s as %s under uxV1 — only the clarify/Question case renames",
     (kind, headline) => {

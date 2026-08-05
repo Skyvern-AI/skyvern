@@ -1,21 +1,35 @@
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
 
 import structlog
+import tldextract
 
 from skyvern.cli.core.session_manager import get_page
 from skyvern.forge import app
+from skyvern.forge.sdk.browser_action_policy import BrowserOrigin, canonicalize_origin
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, url_parts
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import (
+    RequestPolicy,
+    admit_credential_for_live_page,
+    loggable_origin,
+)
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session, mcp_browser_context
 from skyvern.forge.sdk.copilot.secret_scrub import (
     REDACTED_SECRET_PLACEHOLDER,
     register_secret_scrub_value,
     scrub_secrets_from_text,
 )
-from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential, TotpType
+from skyvern.forge.sdk.schemas.credentials import (
+    Credential,
+    CredentialType,
+    CredentialVaultType,
+    PasswordCredential,
+    TotpType,
+)
 from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize_totp_config
 
 from .banned_blocks import _copilot_block_authoring_policy
@@ -43,6 +57,14 @@ _CREDENTIAL_FILL_FIELDS = frozenset({"username", "password", "totp"})
 _CREDENTIAL_FILL_TIMEOUT_MS = 15000
 
 
+@dataclass(frozen=True)
+class _CredentialFillOriginGrant:
+    intended_url: str
+    # A vault entry names a site, not a page, so a grant it produced travels that whole site. One
+    # earned from a tested URL or a page match stays on the origin that proved it.
+    whole_site: bool = False
+
+
 async def _normalize_totp_config_for_organization(totp_secret: str, organization_id: str) -> str:
     enterprise_totp_secret = await app.AGENT_FUNCTION.parse_enterprise_totp_secret(
         totp_secret,
@@ -68,7 +90,7 @@ def _scrub_secret_from_text(text: str, secret_value: str) -> str:
     return text.replace(secret_value, REDACTED_SECRET_PLACEHOLDER)
 
 
-def _credential_fill_policy_error(copilot_ctx: AgentContext, credential_id: str) -> str | None:
+def _credential_fill_prerequisite_error(copilot_ctx: AgentContext, credential_id: str) -> str | None:
     if _copilot_block_authoring_policy(copilot_ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return (
             "fill_credential_field is only available in code-only browser authoring mode. "
@@ -80,10 +102,85 @@ def _credential_fill_policy_error(copilot_ctx: AgentContext, credential_id: str)
             "Saved-credential scouting is not authorized for this request. "
             "Ask the user for the required credential or clarification before filling credential fields."
         )
+    return None
+
+
+def _still_on_admitted_site(current_url: str | None, admitted_url: str) -> bool:
+    """Whether the browser is still on the origin whose login page granted this credential.
+
+    Compared at origin, not at the tier that granted it: a real sign-in walks email -> password ->
+    one-time code across several paths of the same site, and refusing those would refuse the login
+    the grant exists for. What it still stops is the secret following a redirect off the site.
+    """
+    admitted_parts = url_parts(admitted_url)
+    current_parts = url_parts(current_url or "")
+    admitted_origin = canonicalize_origin(admitted_parts[2]) if admitted_parts else None
+    current_origin = canonicalize_origin(current_parts[2]) if current_parts else None
+    return bool(current_origin and admitted_origin and current_origin == admitted_origin)
+
+
+# Private PSL entries are included so hosts that hand strangers a subdomain each -- github.io,
+# vercel.app, s3.amazonaws.com -- stay separate sites rather than collapsing into one.
+_SITE_EXTRACT = tldextract.TLDExtract(include_psl_private_domains=True)
+
+
+def _site_of(url: str | None) -> tuple[str, int | None, str] | None:
+    """A URL's site: scheme and port alongside its domain under the public suffix.
+
+    Scheme and port ride along so a site-wide grant moves between a site's hosts without also
+    reaching it over plaintext or on another port, which the origin comparison would refuse.
+    """
+    parts = url_parts(url or "")
+    origin = canonicalize_origin(parts[2]) if parts else None
+    if origin is None:
+        return None
+    extracted = _SITE_EXTRACT(origin.host)
+    # tldextract renamed this property; read the new name where the installed version has it.
+    site = (
+        extracted.top_domain_under_public_suffix
+        if hasattr(extracted, "top_domain_under_public_suffix")
+        else extracted.registered_domain
+    )
+    return (origin.scheme, origin.port, site) if site else None
+
+
+def _same_site(current_url: str | None, granted_url: str) -> bool:
+    current, granted = _site_of(current_url), _site_of(granted_url)
+    return bool(current and granted and current == granted)
+
+
+def _within_grant(current_url: str | None, grant: _CredentialFillOriginGrant) -> bool:
+    if grant.whole_site:
+        return _same_site(current_url, grant.intended_url)
+    return _still_on_admitted_site(current_url, grant.intended_url)
+
+
+class _CredentialFillOriginMismatchError(Exception):
+    pass
+
+
+def _credential_fill_origin_mismatch_error() -> str:
+    return (
+        "The browser left this credential's intended login origin before it could be filled. "
+        "Re-inspect the current page and fill again if the sign-in is still in progress there."
+    )
+
+
+def _credential_fill_release_guard(grant: _CredentialFillOriginGrant) -> Callable[[str | None], None]:
+    """Bind the fill grant to the resolved element's document at the release seam."""
+
+    def guard(target_url: str | None) -> None:
+        if not _within_grant(target_url, grant):
+            raise _CredentialFillOriginMismatchError
+
+    return guard
+
+
+def _credential_fill_authority_error(copilot_ctx: AgentContext, credential_id: str) -> str | None:
+    policy = copilot_ctx.request_policy
     resolved_ids = {
         credential.credential_id
-        for credential in policy.resolved_credentials
-        if isinstance(getattr(credential, "credential_id", None), str)
+        for credential in (policy.resolved_credentials if isinstance(policy, RequestPolicy) else [])
     }
     if credential_id not in resolved_ids:
         return (
@@ -93,6 +190,152 @@ def _credential_fill_policy_error(copilot_ctx: AgentContext, credential_id: str)
             "credential to use, or bind the credential as an untested draft parameter without running it."
         )
     return None
+
+
+def _resolved_credential_intended_url(policy: RequestPolicy, credential_id: str) -> str | None:
+    admitted_url = policy.live_page_admitted_urls.get(credential_id)
+    if admitted_url:
+        return admitted_url
+    return next(
+        (
+            credential.tested_url
+            for credential in policy.resolved_credentials
+            if credential.credential_id == credential_id and credential.tested_url
+        ),
+        None,
+    )
+
+
+async def _vault_named_sites(copilot_ctx: AgentContext, credential_id: str) -> list[str]:
+    """The sites this credential's own vault entry names, as the user saved them.
+
+    Read straight from the vault rather than the DB row, so a credential nobody has run the test flow
+    against still knows where it belongs. Only Bitwarden items carry these; the other vaults store no
+    URL for an item, so their credentials fall through to the request-grounded route below.
+    """
+    cached = copilot_ctx.vault_login_uris_by_credential_id.get(credential_id)
+    if cached is not None:
+        return cached
+    uris: list[str] = []
+    try:
+        db_credential = await app.DATABASE.credentials.get_credential(
+            credential_id, organization_id=copilot_ctx.organization_id
+        )
+        if db_credential is not None:
+            service = app.CREDENTIAL_VAULT_SERVICES.get(db_credential.vault_type or CredentialVaultType.BITWARDEN)
+            if service is not None:
+                uris = list((await service.get_credential_item(db_credential)).login_uris)
+    except Exception:
+        # Not cached: a vault read that failed once says nothing about where the credential belongs,
+        # and caching the empty answer would refuse every later fill this turn for a transient fault.
+        LOG.info("copilot could not read the vault entry's sites", credential_id=credential_id, exc_info=True)
+        return []
+    copilot_ctx.vault_login_uris_by_credential_id[credential_id] = uris
+    return uris
+
+
+def _missing_credential_origin_error(credential_id: str) -> str:
+    return (
+        f"Credential `{credential_id}` has no intended login origin, so it cannot be filled into the live browser. "
+        "Test the saved credential against its login page to bind it to that site, then inspect the page and retry."
+    )
+
+
+def _sole_grounded_login_target(policy: RequestPolicy) -> str | None:
+    """The one sign-in page this request grounds in the user's own words, if there is exactly one; a
+    request naming several grounds none, since nothing here can tell which of them a password belongs to.
+    """
+    by_origin: dict[BrowserOrigin, str] = {}
+    for url in policy.grounded_login_target_urls:
+        parts = url_parts(url)
+        origin = canonicalize_origin(parts[2]) if parts else None
+        if origin is not None:
+            by_origin[origin] = url
+    if len(by_origin) != 1:
+        return None
+    return next(iter(by_origin.values()))
+
+
+async def _sole_org_password_credential_id(
+    load_org_credentials: Callable[[], Awaitable[list[Credential]]],
+) -> str | None:
+    """The one saved password credential carrying no login URL, where elimination answers the
+    which-credential question a name would otherwise have to. Counts the pool turn start resolves from
+    (``allow_urlless_sole``), so a credential resolved there is never re-asked about here.
+    """
+    unbound = [
+        credential
+        for credential in await load_org_credentials()
+        if credential.credential_type == CredentialType.PASSWORD and not credential.tested_url
+    ]
+    return unbound[0].credential_id if len(unbound) == 1 else None
+
+
+def _ambiguous_unbound_credential_steer(credential_id: str, page_url: str) -> str:
+    origin = loggable_origin(page_url)
+    return (
+        f"`{credential_id}` has no saved login page, so it is not established that it belongs to {origin}. "
+        "Ask the user to say which saved credential to use *and* to name the sign-in page, for example "
+        f'"use <exact name or cred_ id> at {origin}". A reply carrying only the credential grounds no '
+        "origin and refuses again, and a bare yes authorizes nothing."
+    )
+
+
+async def _credential_fill_origin_grant(
+    copilot_ctx: AgentContext, credential_id: str
+) -> tuple[_CredentialFillOriginGrant | None, str | None]:
+    """Authorize a fill only when something other than the model binds this credential to an origin; the
+    grant is consumed at the release seam, so a credential nothing vouches for gets none and cannot release.
+    """
+    prerequisite_error = _credential_fill_prerequisite_error(copilot_ctx, credential_id)
+    if prerequisite_error:
+        return None, prerequisite_error
+    policy = copilot_ctx.request_policy
+    authority_error = _credential_fill_authority_error(copilot_ctx, credential_id)
+
+    async def load_once() -> list[Credential]:
+        if copilot_ctx.org_credentials_for_turn is None:
+            copilot_ctx.org_credentials_for_turn = await load_credentials(copilot_ctx.organization_id)
+        return copilot_ctx.org_credentials_for_turn
+
+    if not authority_error:
+        if not isinstance(policy, RequestPolicy):
+            return None, _missing_credential_origin_error(credential_id)
+        intended_url = _resolved_credential_intended_url(policy, credential_id)
+        if intended_url:
+            return _CredentialFillOriginGrant(intended_url), None
+        # A credential saved without a login URL has no record of where it belongs, but that is an
+        # absent answer rather than a contrary one. The sign-in page the user themselves named can
+        # supply the origin, provided something other than the model settled which credential to use.
+        page_url = await _live_working_page_url(copilot_ctx) or ""
+        # The vault entry names the site the user filed this credential under, so it answers where
+        # the secret belongs without anyone having to run the test flow first.
+        if page_url and any(_same_site(page_url, uri) for uri in await _vault_named_sites(copilot_ctx, credential_id)):
+            return _CredentialFillOriginGrant(page_url, whole_site=True), None
+        grounded_target = _sole_grounded_login_target(policy)
+        if not page_url or grounded_target is None or not _still_on_admitted_site(page_url, grounded_target):
+            return None, _missing_credential_origin_error(credential_id)
+        if policy.current_turn_named_credential_ids == {credential_id}:
+            return _CredentialFillOriginGrant(page_url), None
+        if credential_id == await _sole_org_password_credential_id(load_once):
+            return _CredentialFillOriginGrant(page_url), None
+        return None, _ambiguous_unbound_credential_steer(credential_id, page_url)
+
+    if not isinstance(policy, RequestPolicy):
+        return None, authority_error
+
+    admission = await admit_credential_for_live_page(
+        policy,
+        organization_id=copilot_ctx.organization_id,
+        credential_id=credential_id,
+        page_url=await _live_working_page_url(copilot_ctx) or "",
+        load_org_credentials=load_once,
+    )
+    if admission.admitted and admission.page_url:
+        return _CredentialFillOriginGrant(admission.page_url), None
+    if admission.admitted:
+        return None, _missing_credential_origin_error(credential_id)
+    return None, admission.steer or authority_error
 
 
 async def _resolve_credential_fill_value(
@@ -201,15 +444,15 @@ async def _fill_credential_field_impl(
         return finish({"ok": False, "error": "fill_credential_field requires a CSS selector for the input field."})
     if field not in _CREDENTIAL_FILL_FIELDS:
         return finish({"ok": False, "error": "fill_credential_field `field` must be one of: username, password, totp."})
-    policy_error = _credential_fill_policy_error(copilot_ctx, credential_id)
-    if policy_error:
+    origin_grant, policy_error = await _credential_fill_origin_grant(copilot_ctx, credential_id)
+    if policy_error or origin_grant is None:
         LOG.info(
             "copilot fill_credential_field rejected tool-side",
             credential_id=credential_id,
             field=field,
             organization_id=copilot_ctx.organization_id,
         )
-        return finish({"ok": False, "error": policy_error})
+        return finish({"ok": False, "error": policy_error or _missing_credential_origin_error(credential_id)})
 
     value, credential_name, resolve_error = await _resolve_credential_fill_value(copilot_ctx, credential_id, field)
     if resolve_error or value is None:
@@ -222,7 +465,15 @@ async def _fill_credential_field_impl(
     try:
         async with mcp_browser_context(copilot_ctx):
             page, _ = await get_page(session_id=copilot_ctx.browser_session_id)
-            await page.fill(selector, value, mode="direct", timeout=_CREDENTIAL_FILL_TIMEOUT_MS)
+            await page.fill(
+                selector,
+                value,
+                mode="direct",
+                timeout=_CREDENTIAL_FILL_TIMEOUT_MS,
+                _direct_fill_release_guard=_credential_fill_release_guard(origin_grant),
+            )
+    except _CredentialFillOriginMismatchError:
+        return finish({"ok": False, "error": _credential_fill_origin_mismatch_error()})
     except Exception as exc:
         error_text = scrub_secrets_from_text(copilot_ctx, _scrub_secret_from_text(str(exc), value))
         LOG.info(

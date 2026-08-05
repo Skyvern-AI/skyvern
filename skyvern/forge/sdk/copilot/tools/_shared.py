@@ -17,14 +17,23 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
-    COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION as _COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
-)
-from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS as _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS,
 )
-from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, parse_composition_structured
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    composition_structured_evidence_expression,
+)
+from skyvern.forge.sdk.copilot.composition_evidence import (
+    clearable_dismiss_texts,
+    has_bounded_page_schema,
+    packet_describes_a_clearable_overlay,
+    parse_composition_structured,
+)
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS, _elapsed_run_seconds
+from skyvern.forge.sdk.copilot.enforcement import (
+    TOTAL_TIMEOUT_SECONDS,
+    _elapsed_run_seconds,
+    _requested_output_labels_by_path,
+)
 from skyvern.forge.sdk.copilot.runtime import AgentContext, resolve_browser_state_for_context
 from skyvern.forge.sdk.copilot.task_output_envelope import (
     _TASK_ENVELOPE_BLOCK_TYPES,
@@ -243,13 +252,7 @@ def _has_meaningful_registered_output_payload(data: Mapping[str, Any]) -> bool:
 
 BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
 
-_CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS = BLOCK_RUNNING_TOOLS | {"fill_credential_field"}
-
-
 WORKFLOW_MUTATION_TOOLS = frozenset({"update_workflow", "update_and_run_blocks"})
-
-
-ANSWER_ONLY_CONTEXT_TOOLS = frozenset({"get_run_results"})
 
 
 CREDENTIAL_METADATA_TOOLS = frozenset({"list_credentials"})
@@ -651,6 +654,8 @@ def _append_flow_evidence(copilot_ctx: Any, evidence: dict[str, Any], *, reached
             "evidence": evidence,
             "reached_via": reached_via,
             "had_bounded_schema": has_bounded_page_schema(evidence),
+            "obstructed": packet_describes_a_clearable_overlay(evidence),
+            "dismiss_texts": sorted(clearable_dismiss_texts(evidence)),
             "step": step,
         }
     )
@@ -718,6 +723,19 @@ async def _composition_get_html(copilot_ctx: Any, *, skip_raw: bool = False) -> 
     return "", str(error) if error else None, False, True
 
 
+def _requested_capture_targets(copilot_ctx: object) -> tuple[str, ...]:
+    """The labels this turn asked for, so capture resolves them rather than guessing which relations matter."""
+    if not isinstance(copilot_ctx, AgentContext):
+        return ()
+    targets: list[str] = []
+    for labels in _requested_output_labels_by_path(copilot_ctx).values():
+        for label in labels:
+            text = label.strip()
+            if text and text not in targets:
+                targets.append(text)
+    return tuple(targets)
+
+
 async def _composition_get_structured_evidence(
     copilot_ctx: Any,
     *,
@@ -733,7 +751,8 @@ async def _composition_get_structured_evidence(
         try:
             result = await asyncio.wait_for(
                 server.call_internal_tool(
-                    "skyvern_evaluate", {"expression": _COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION}
+                    "skyvern_evaluate",
+                    {"expression": composition_structured_evidence_expression(_requested_capture_targets(copilot_ctx))},
                 ),
                 timeout=timeout_seconds,
             )

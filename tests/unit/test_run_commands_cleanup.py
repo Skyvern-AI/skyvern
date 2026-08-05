@@ -24,18 +24,18 @@ def _reset_cleanup_state() -> None:
 async def test_cleanup_mcp_resources_closes_auth_db(monkeypatch: pytest.MonkeyPatch) -> None:
     order: list[str] = []
     shutdown_action_log_worker = AsyncMock(side_effect=lambda: order.append("action_log"))
-    close_current_session = AsyncMock(side_effect=lambda: order.append("session"))
+    close_all_sessions = AsyncMock(side_effect=lambda: order.append("session"))
     close_skyvern = AsyncMock(side_effect=lambda: order.append("client"))
     close_auth_db = AsyncMock(side_effect=lambda: order.append("auth"))
 
     monkeypatch.setattr("skyvern.cli.core.action_log.shutdown_action_log_worker", shutdown_action_log_worker)
-    monkeypatch.setattr("skyvern.cli.core.session_manager.close_current_session", close_current_session)
+    monkeypatch.setattr("skyvern.cli.core.session_manager.close_all_sessions", close_all_sessions)
     monkeypatch.setattr("skyvern.cli.core.client.close_skyvern", close_skyvern)
     monkeypatch.setattr("skyvern.cli.core.mcp_http_auth.close_auth_db", close_auth_db)
 
     await run_commands._cleanup_mcp_resources()
 
-    close_current_session.assert_awaited_once()
+    close_all_sessions.assert_awaited_once()
     close_skyvern.assert_awaited_once()
     close_auth_db.assert_awaited_once()
     assert order == ["action_log", "session", "client", "auth"]
@@ -43,20 +43,20 @@ async def test_cleanup_mcp_resources_closes_auth_db(monkeypatch: pytest.MonkeyPa
 
 @pytest.mark.asyncio
 async def test_cleanup_mcp_resources_closes_auth_db_on_skyvern_close_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    close_current_session = AsyncMock()
+    close_all_sessions = AsyncMock()
     close_auth_db = AsyncMock()
 
     async def _failing_close_skyvern() -> None:
         raise RuntimeError("close failed")
 
-    monkeypatch.setattr("skyvern.cli.core.session_manager.close_current_session", close_current_session)
+    monkeypatch.setattr("skyvern.cli.core.session_manager.close_all_sessions", close_all_sessions)
     monkeypatch.setattr("skyvern.cli.core.client.close_skyvern", _failing_close_skyvern)
     monkeypatch.setattr("skyvern.cli.core.mcp_http_auth.close_auth_db", close_auth_db)
 
     with pytest.raises(RuntimeError, match="close failed"):
         await run_commands._cleanup_mcp_resources()
 
-    close_current_session.assert_awaited_once()
+    close_all_sessions.assert_awaited_once()
     close_auth_db.assert_awaited_once()
 
 

@@ -84,7 +84,13 @@ from skyvern.forge.sdk.api.files import (
     resolve_run_download_id,
     wait_for_download_finished,
 )
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCaller, LLMCallerManager
+from skyvern.forge.sdk.api.llm.api_handler_factory import (
+    LLMAPIHandlerFactory,
+    LLMCaller,
+    LLMCallerManager,
+    get_org_aware_primary_llm_api_handler,
+    get_org_aware_secondary_llm_api_handler,
+)
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import (
     LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE,
@@ -110,6 +116,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
@@ -162,6 +169,7 @@ from skyvern.utils.prompt_engine import (
     load_prompt_with_elements,
 )
 from skyvern.utils.prompt_truncation import truncate_extraction_schema, truncate_page_html_for_summary
+from skyvern.utils.secret_redaction import redact_console_log_bytes, redact_har_bytes, redact_secrets_from_text
 from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import strip_query_params
 from skyvern.webeye.actions.action_types import ActionType
@@ -191,11 +199,13 @@ from skyvern.webeye.actions.parse_actions import (
     parse_ui_tars_actions,
 )
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
+from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
     download_filename_from_suffix,
     settle_browser_downloads_for_context,
 )
+from skyvern.webeye.dom_inspection import read_current_url
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context
 
@@ -377,7 +387,7 @@ def _schedule_summary_shadow_check_for_hit(
         return await app.AGENT_FUNCTION.should_shadow_extraction_cache_hit(task)
 
     async def _shadow_llm_call() -> Any:
-        return await app.EXTRACTION_LLM_API_HANDLER(
+        return await get_org_aware_primary_llm_api_handler(default=app.EXTRACTION_LLM_API_HANDLER)(
             prompt=summary_prompt,
             step=None,
             prompt_name="data-extraction-summary",
@@ -491,7 +501,7 @@ async def resolve_validation_evidence_route(
         local_datetime=local_datetime,
         mode=mode,
         min_confidence=min_confidence,
-        llm_handler=app.SECONDARY_LLM_API_HANDLER,
+        llm_handler=get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER),
         step=step,
     )
 
@@ -994,7 +1004,7 @@ class ForgeAgent:
                 page = await browser_state.must_get_working_page()
                 current_url = page.url
                 if current_url.rstrip("/") != task.url.rstrip("/"):
-                    await page.goto(task.url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+                    await browser_state.navigate_to_url(page=page, url=task.url)
                 step = await self.update_step(
                     step, status=StepStatus.completed, is_last=True, output=AgentStepOutput(action_results=[])
                 )
@@ -1291,8 +1301,8 @@ class ForgeAgent:
         except FailedToSendWebhook:
             LOG.exception(
                 "Failed to send webhook",
-                task=task,
-                step=step,
+                task_id=task.task_id,
+                step_id=step.step_id,
             )
             return step, detailed_output, next_step
         except FailedToNavigateToUrl as e:
@@ -1855,6 +1865,7 @@ class ForgeAgent:
                     "Detected the signal to reload the page, going to reload and skip the rest of the actions",
                     step_order=step.order,
                 )
+                reload_started_at = naive_utc_now()
                 await browser_state.reload_page()
                 context.refresh_working_page = False
                 action_result = ActionSuccess()
@@ -1875,6 +1886,8 @@ class ForgeAgent:
                 # _generate_step_actions stamps, and this action never went through it.
                 preflight_action(action, observed_page(), site="internal_refresh")
                 detailed_agent_step_output.actions_and_results[action_idx] = (action, [action_result])
+                action.started_at = reload_started_at
+                action.finished_at = naive_utc_now()
                 action.action_id = (await app.DATABASE.workflow_params.create_action(action=action)).action_id
                 artifact_tracker.task = asyncio.create_task(
                     self.record_artifacts_after_action(task, step, browser_state, engine, action)
@@ -2321,7 +2334,7 @@ class ForgeAgent:
                     llm_key_override = None
 
                 llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                    llm_key_override, default=app.LLM_API_HANDLER
+                    llm_key_override, default=get_org_aware_primary_llm_api_handler()
                 )
                 # Add caching flag to context for monitoring
                 if use_caching:
@@ -2575,7 +2588,7 @@ class ForgeAgent:
                     assistant_reasoning=reasoning,
                     assistant_message=assistant_message,
                 )
-                skyvern_response = await app.LLM_API_HANDLER(
+                skyvern_response = await get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)(
                     prompt=skyvern_repsonse_prompt,
                     prompt_name="cua-answer-question",
                     step=step,
@@ -2930,7 +2943,7 @@ class ForgeAgent:
 
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 task.llm_key,
-                default=app.LLM_API_HANDLER,
+                default=get_org_aware_primary_llm_api_handler(),
             )
 
             self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)
@@ -3265,6 +3278,9 @@ class ForgeAgent:
             navigation_goal=unwrapped_goals.navigation_goal,
             navigation_payload=task.navigation_payload,
             complete_criterion=unwrapped_goals.complete_criterion,
+            complete_criterion_is_untrusted=bool(
+                unwrapped_goals.complete_criterion and _ctx and _ctx.complete_criterion_is_untrusted
+            ),
             terminate_criterion=unwrapped_goals.terminate_criterion,
             big_goal_context=unwrapped_goals.big_goal_context,
             action_history=actions_and_results_str,
@@ -3306,9 +3322,9 @@ class ForgeAgent:
             )
 
         if use_check_user_goal_handler:
-            default_handler = app.CHECK_USER_GOAL_LLM_API_HANDLER
+            default_handler = get_org_aware_secondary_llm_api_handler(default=app.CHECK_USER_GOAL_LLM_API_HANDLER)
         else:
-            default_handler = app.LLM_API_HANDLER
+            default_handler = get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)
 
         distinct_id_for_override = task.workflow_run_id if task.workflow_run_id else task.task_id
         default_handler = await resolve_check_user_goal_handler(
@@ -3440,7 +3456,10 @@ class ForgeAgent:
 
         skyvern_frame: SkyvernFrame | None = None
         try:
-            skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
+            skyvern_frame = await SkyvernFrame.create_instance(
+                frame=working_page,
+                engine_selection=browser_state.engine_selection,
+            )
             await skyvern_frame.safe_wait_for_animation_end(caller="post_action_artifact")
         except Exception:
             LOG.info("Failed to wait for animation end, ignore it", exc_info=True)
@@ -3533,7 +3552,10 @@ class ForgeAgent:
 
         try:
             if skyvern_frame is None:
-                skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
+                skyvern_frame = await SkyvernFrame.create_instance(
+                    frame=working_page,
+                    engine_selection=browser_state.engine_selection,
+                )
             html = await skyvern_frame.get_content()
             _ctx = skyvern_context.current()
             # Encode once to fix the html_bytes char-vs-byte mismatch and avoid a
@@ -3680,7 +3702,11 @@ class ForgeAgent:
 
         return await browser_state.scrape_website(
             url=task.url,
-            cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step),
+            cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(
+                task=task,
+                step=step,
+                engine_selection=browser_state.engine_selection,
+            ),
             scrape_exclude=app.scrape_exclude,
             max_screenshot_number=max_screenshot_number,
             draw_boxes=draw_boxes,
@@ -3983,15 +4009,20 @@ class ForgeAgent:
         slim_output: str | None = None,
         has_data_extraction_goal: bool = False,
         enable_new_planner_actions: bool = False,
+        planner_mini_goal_improvements: bool = False,
+        extra_action_guidance: str | None = None,
     ) -> str:
         """
         Build a short-but-unique cache variant identifier so extract-action prompts that
-        differ meaningfully (OTP, close-page availability, complete criteria, slim output,
+        differ meaningfully (OTP, close-page availability, complete-criterion presence, slim output,
         data extraction goal availability, new planner actions) do not reuse the same Vertex cache object.
         """
         variant_parts: list[str] = []
         if verification_code_check:
             variant_parts.append("vc")
+        if extra_action_guidance:
+            digest = hashlib.sha256(extra_action_guidance.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
+            variant_parts.append(f"g{digest}")
         if show_close_page_action:
             variant_parts.append("cp")
         if show_new_tab_action:
@@ -4002,14 +4033,14 @@ class ForgeAgent:
             variant_parts.append("de")
         if enable_new_planner_actions:
             variant_parts.append("np")
+        if planner_mini_goal_improvements:
+            variant_parts.append("oi")
         if enriched_tree_enabled:
             variant_parts.append("et")
         if enriched_tree_enabled and not llm_screenshots_enabled:
             variant_parts.append("ni")
         if complete_criterion:
-            normalized = " ".join(complete_criterion.split())
-            digest = hashlib.sha256(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()[:6]
-            variant_parts.append(f"cc{digest}")
+            variant_parts.append("cc")
         if slim_output:
             variant_parts.append(f"slim_{slim_output}")
         return "-".join(variant_parts) if variant_parts else "std"
@@ -4173,11 +4204,11 @@ class ForgeAgent:
 
         # Generate the extract action prompt
         navigation_goal = task.navigation_goal
+        context = skyvern_context.ensure_context()
+        complete_criterion_is_untrusted = bool(task.complete_criterion and context.complete_criterion_is_untrusted)
         starting_url = task.url
         page = await browser_state.get_working_page()
-        current_url = (
-            await SkyvernFrame.evaluate(frame=page, expression="() => document.location.href") if page else starting_url
-        )
+        current_url = await read_current_url(page) if page else starting_url
         final_navigation_payload = self._build_navigation_payload(
             task, expire_verification_code=expire_verification_code, step=step, scraped_page=scraped_page
         )
@@ -4195,7 +4226,7 @@ class ForgeAgent:
                 "infer-action-type", navigation_goal=navigation_goal, prompt_name="infer-action-type"
             )
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                task.llm_key, default=app.LLM_API_HANDLER
+                task.llm_key, default=get_org_aware_primary_llm_api_handler()
             )
             json_response = await llm_api_handler(
                 prompt=prompt, step=step, prompt_name="infer-action-type", system_prompt=task.workflow_system_prompt
@@ -4230,7 +4261,6 @@ class ForgeAgent:
 
         # Validation evidence router (SKY-10620 Route B)
         error_code_mapping_str = json.dumps(task.error_code_mapping) if task.error_code_mapping else None
-        context = skyvern_context.ensure_context()
         local_datetime = datetime.now(context.tz_info).isoformat()
         if task_type == TaskType.validation:
             router_result = await resolve_validation_evidence_route(
@@ -4281,7 +4311,7 @@ class ForgeAgent:
         effective_llm_key = task.llm_key
         if not effective_llm_key:
             handler_for_key = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                task.llm_key, default=app.LLM_API_HANDLER
+                task.llm_key, default=get_org_aware_primary_llm_api_handler()
             )
             effective_llm_key = getattr(handler_for_key, "llm_key", None)
         cache_enabled = prompt_caching_settings.get(EXTRACT_ACTION_PROMPT_NAME) or prompt_caching_settings.get(
@@ -4332,6 +4362,25 @@ class ForgeAgent:
             task.workflow_run_id if task.workflow_run_id else task.task_id,
             properties={"task_url": task.url, "organization_id": task.organization_id},
         )
+        extra_action_guidance = await app.AGENT_FUNCTION.get_extra_extract_action_guidance(task)
+
+        # Offer PASTE_TEXT (fill a spreadsheet grid with one tab/newline block) only under the umbrella,
+        # so grid-fill guidance is scoped to the eval org until proven out.
+        planner_mini_goal_improvements = settings.PLANNER_MINI_GOAL_IMPROVEMENTS
+        if not planner_mini_goal_improvements:
+            try:
+                planner_mini_goal_improvements = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                    "PLANNER_MINI_GOAL_IMPROVEMENTS",
+                    task.organization_id,
+                    properties={"organization_id": task.organization_id},
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to resolve PLANNER_MINI_GOAL_IMPROVEMENTS feature flag; using settings default",
+                    organization_id=task.organization_id,
+                    exc_info=True,
+                )
+                planner_mini_goal_improvements = settings.PLANNER_MINI_GOAL_IMPROVEMENTS
 
         # Format-then-clear so a render failure can't drop the signal permanently;
         # gate on extract-action template since other task types don't render it.
@@ -4353,11 +4402,14 @@ class ForgeAgent:
                     "current_url": current_url,
                     "data_extraction_goal": task.data_extraction_goal,
                     "enable_new_planner_actions": enable_new_planner_actions,
+                    "planner_mini_goal_improvements": planner_mini_goal_improvements,
                     "action_history": actions_and_results_str,
                     "error_code_mapping_str": error_code_mapping_str,
                     "local_datetime": local_datetime,
                     "verification_code_check": verification_code_check,
+                    "extra_action_guidance": extra_action_guidance,
                     "complete_criterion": task.complete_criterion.strip() if task.complete_criterion else None,
+                    "complete_criterion_is_untrusted": complete_criterion_is_untrusted,
                     "terminate_criterion": task.terminate_criterion.strip() if task.terminate_criterion else None,
                     "show_close_page_action": show_close_page_action,
                     "show_new_tab_action": show_new_tab_action,
@@ -4370,6 +4422,7 @@ class ForgeAgent:
                 }
                 cache_variant = self._build_extract_action_cache_variant(
                     verification_code_check=verification_code_check,
+                    extra_action_guidance=extra_action_guidance,
                     show_close_page_action=show_close_page_action,
                     show_new_tab_action=show_new_tab_action,
                     show_switch_tab_action=show_switch_tab_action,
@@ -4379,6 +4432,7 @@ class ForgeAgent:
                     slim_output=slim_output,
                     has_data_extraction_goal=bool(task.data_extraction_goal),
                     enable_new_planner_actions=enable_new_planner_actions,
+                    planner_mini_goal_improvements=planner_mini_goal_improvements,
                 )
                 static_prompt = prompt_engine.load_prompt(f"{template}-static", **prompt_kwargs)
                 dynamic_prompt = prompt_engine.load_prompt(
@@ -4386,6 +4440,9 @@ class ForgeAgent:
                     elements=elements_for_prompt,
                     **prompt_kwargs,
                 )
+                secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
+                if settings.ENABLE_SECRET_ARTIFACT_REDACTION and secret_values:
+                    static_prompt = redact_secrets_from_text(static_prompt, secret_values)
 
                 # Store static prompt for caching and continue sending it alongside the dynamic section.
                 # Vertex explicit caching expects the static content to still be present in the request so the
@@ -4478,11 +4535,14 @@ class ForgeAgent:
                 current_url=current_url,
                 data_extraction_goal=task.data_extraction_goal,
                 enable_new_planner_actions=enable_new_planner_actions,
+                planner_mini_goal_improvements=planner_mini_goal_improvements,
                 action_history=actions_and_results_str,
                 error_code_mapping_str=error_code_mapping_str,
                 local_datetime=local_datetime,
                 verification_code_check=verification_code_check,
+                extra_action_guidance=extra_action_guidance,
                 complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
+                complete_criterion_is_untrusted=complete_criterion_is_untrusted,
                 terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
                 show_close_page_action=show_close_page_action,
                 show_new_tab_action=show_new_tab_action,
@@ -5278,34 +5338,74 @@ class ForgeAgent:
             LOG.debug("Uploading video artifacts", number_of_video_artifacts=len(video_artifacts))
             for video_artifact in video_artifacts:
                 if video_artifact.video_artifact_id:
-                    await app.ARTIFACT_MANAGER.update_artifact_data(
-                        artifact_id=video_artifact.video_artifact_id,
-                        organization_id=task.organization_id,
-                        data=video_artifact.video_data,
-                    )
+                    try:
+                        if video_artifact.video_file_extension:
+                            await app.ARTIFACT_MANAGER.update_artifact_data(
+                                artifact_id=video_artifact.video_artifact_id,
+                                organization_id=task.organization_id,
+                                data=video_artifact.video_data,
+                                file_extension=video_artifact.video_file_extension,
+                            )
+                        else:
+                            await app.ARTIFACT_MANAGER.update_artifact_data(
+                                artifact_id=video_artifact.video_artifact_id,
+                                organization_id=task.organization_id,
+                                data=video_artifact.video_data,
+                            )
+                    except Exception:
+                        LOG.warning(
+                            "Failed to upload task video artifact",
+                            task_id=task.task_id,
+                            organization_id=task.organization_id,
+                            video_artifact_id=video_artifact.video_artifact_id,
+                            exc_info=True,
+                        )
                     continue
-                # A teardown-attached recording has no pre-registered artifact row.
-                # Prefer collected video bytes; use the on-disk path only when no bytes were returned.
+
                 video_path = video_artifact.video_path
                 if video_artifact.video_data:
-                    video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                        step=last_step,
-                        artifact_type=ArtifactType.RECORDING,
-                        data=video_artifact.video_data,
-                    )
+                    if video_artifact.video_file_extension:
+                        video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                            step=last_step,
+                            artifact_type=ArtifactType.RECORDING,
+                            data=video_artifact.video_data,
+                            file_extension=video_artifact.video_file_extension,
+                        )
+                    else:
+                        video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                            step=last_step,
+                            artifact_type=ArtifactType.RECORDING,
+                            data=video_artifact.video_data,
+                        )
                 elif video_path and os.path.exists(video_path):
-                    video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                        step=last_step,
-                        artifact_type=ArtifactType.RECORDING,
-                        path=video_path,
-                    )
+                    if video_artifact.video_file_extension:
+                        video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                            step=last_step,
+                            artifact_type=ArtifactType.RECORDING,
+                            path=video_path,
+                            file_extension=video_artifact.video_file_extension,
+                        )
+                    else:
+                        video_artifact.video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                            step=last_step,
+                            artifact_type=ArtifactType.RECORDING,
+                            path=video_path,
+                        )
                 else:
                     continue
 
             _ctx = skyvern_context.current()
             _use_bundling = _ctx.use_artifact_bundling if _ctx else False
+            redaction_enabled = settings.ENABLE_SECRET_ARTIFACT_REDACTION
+            secret_values = (
+                app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
+                if redaction_enabled
+                else set()
+            )
 
             har_data = await app.BROWSER_MANAGER.get_har_data(task_id=task.task_id, browser_state=browser_state)
+            if redaction_enabled:
+                har_data = await asyncio.to_thread(redact_har_bytes, har_data, secret_values)
             if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
                 submission_shadow.schedule_submission_signal_shadow(
                     har_data=har_data,
@@ -5319,6 +5419,8 @@ class ForgeAgent:
             browser_log = await app.BROWSER_MANAGER.get_browser_console_log(
                 task_id=task.task_id, browser_state=browser_state
             )
+            if redaction_enabled:
+                browser_log = await asyncio.to_thread(redact_console_log_bytes, browser_log, secret_values)
             LOG.debug("Uploading browser log", browser_log_size=len(browser_log))
 
             trace_data: bytes | None = None
@@ -5742,6 +5844,7 @@ class ForgeAgent:
                 task=task,
                 step=step,
                 page=page,
+                engine_selection=browser_state.engine_selection,
             )
             failure_reason = f"Reached the maximum steps ({max_steps_per_run}). Possible failure reasons: {generated_failure_reason.reasoning}"
             errors = [ReachMaxStepsError().model_dump()] + [
@@ -5845,6 +5948,7 @@ class ForgeAgent:
                 step=step,
                 page=page,
                 max_retries=max_retries_per_step,
+                engine_selection=browser_state.engine_selection if browser_state is not None else None,
             )
 
             # Only pass new errors — update_task() appends to existing errors in the DB
@@ -5924,6 +6028,7 @@ class ForgeAgent:
         task: Task,
         step: Step,
         page: Page | None,
+        engine_selection: BrowserEngineSelection | None,
     ) -> MaxStepsReasonResponse:
         steps_results = []
         llm_errors: list[str] = []
@@ -5991,7 +6096,12 @@ class ForgeAgent:
 
             screenshots: list[bytes] = []
             if page is not None:
-                screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=page.url, scroll=scroll)
+                screenshots = await SkyvernFrame.take_split_screenshots(
+                    page=page,
+                    url=page.url,
+                    scroll=scroll,
+                    engine_selection=engine_selection,
+                )
 
             prompt = prompt_engine.load_prompt(
                 "summarize-max-steps-reason",
@@ -6002,7 +6112,7 @@ class ForgeAgent:
                 error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
-            json_response = await app.LLM_API_HANDLER(
+            json_response = await get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)(
                 prompt=prompt,
                 screenshots=screenshots,
                 step=step,
@@ -6045,6 +6155,7 @@ class ForgeAgent:
         step: Step,
         page: Page | None,
         max_retries: int,
+        engine_selection: BrowserEngineSelection | None,
     ) -> MaxStepsReasonResponse:
         html = ""
         screenshots: list[bytes] = []
@@ -6134,11 +6245,16 @@ class ForgeAgent:
                 )
 
             if page is not None:
-                skyvern_frame = await SkyvernFrame.create_instance(frame=page)
+                skyvern_frame = await SkyvernFrame.create_instance(frame=page, engine_selection=engine_selection)
                 html = truncate_page_html_for_summary(await skyvern_frame.get_content())
                 # scroll=False: one current-viewport shot (the failing region) is enough for a
                 # failure summary; avoids 10 full-page strips. SKY-10626.
-                screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=page.url, scroll=False)
+                screenshots = await SkyvernFrame.take_split_screenshots(
+                    page=page,
+                    url=page.url,
+                    scroll=False,
+                    engine_selection=engine_selection,
+                )
 
             prompt = prompt_engine.load_prompt(
                 "summarize-max-retries-reason",
@@ -6150,7 +6266,7 @@ class ForgeAgent:
                 error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
+            json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt,
                 screenshots=screenshots,
                 step=step,
@@ -6456,6 +6572,7 @@ class ForgeAgent:
                 task=task,
                 step=step,
                 page=page,
+                engine_selection=browser_state.engine_selection if browser_state is not None else None,
             )
             failure_reason = f"Reached the maximum steps ({max_steps_per_run}). Possible failure reasons: {generated_failure_reason.reasoning}"
             errors = [ReachMaxStepsError().model_dump()] + [
@@ -6632,7 +6749,7 @@ class ForgeAgent:
         if await service_utils.is_cua_task(task=task):
             llm_key_override = None
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            llm_key_override, default=app.LLM_API_HANDLER
+            llm_key_override, default=get_org_aware_primary_llm_api_handler()
         )
         # Add caching flag to context for monitoring
         if use_caching:
@@ -6812,7 +6929,9 @@ class ForgeAgent:
                         fallback_reason="cross_run_miss",
                         cache_path="agent",
                     )
-                data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
+                data_extraction_summary_resp = await get_org_aware_primary_llm_api_handler(
+                    default=app.EXTRACTION_LLM_API_HANDLER
+                )(
                     prompt=prompt,
                     step=step,
                     prompt_name="data-extraction-summary",

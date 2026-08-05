@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import copy
 import json
 import os
@@ -35,6 +36,7 @@ from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_
 from skyvern.errors.errors import TOTPExpiredError, UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     ActionExecutionTimeout,
+    BlockedHost,
     CaptchaSolveError,
     CardNumberInputMismatch,
     EmptySelect,
@@ -72,6 +74,7 @@ from skyvern.exceptions import (
     SecretInputMismatch,
     SkyvernException,
     SkyvernPageAnalysisTimeout,
+    UnresolvableHost,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
@@ -84,7 +87,12 @@ from skyvern.forge.sdk.api.files import (
     make_temp_directory,
     resolve_run_download_id,
 )
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCallerManager
+from skyvern.forge.sdk.api.llm.api_handler_factory import (
+    LLMAPIHandlerFactory,
+    LLMCallerManager,
+    get_org_aware_primary_llm_api_handler,
+    get_org_aware_secondary_llm_api_handler,
+)
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
 from skyvern.forge.sdk.browser_action_preflight import preflight_action, preflight_derived_action
@@ -93,6 +101,7 @@ from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener, ensure_context
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.experimentation.llm_prompt_config import (
     resolve_check_user_goal_handler,
@@ -135,6 +144,7 @@ from skyvern.webeye.actions.actions import (
     DownloadFileAction,
     InputOrSelectContext,
     InputTextAction,
+    PasteTextAction,
     ScrapeResult,
     SelectOption,
     SelectOptionAction,
@@ -142,14 +152,16 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
-from skyvern.webeye.browser_engine import BrowserEngineSelection, resolve_engine_selection_for_task
+from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_factory import initialize_download_dir, resolve_artifact_path
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
+    DOWNLOAD_DESTINATION_ERRORS,
     DOWNLOAD_MIME_TYPES,
     MAX_FILE_SIZE_BYTES,
     download_filename_from_suffix,
     extract_filename,
+    fetch_download_through_request_context,
     is_download_response,
     normalize_download_filename,
     settle_browser_downloads_for_context,
@@ -176,7 +188,15 @@ from skyvern.webeye.utils.dom import (
     is_incompatible_text_input_error,
     is_post_dispatch_click_timeout,
 )
-from skyvern.webeye.utils.page import SkyvernFrame, _all_page_frames, take_element_screenshot
+from skyvern.webeye.utils.page import (
+    SkyvernFrame,
+    _all_page_frames,
+    _blob_url_origin,
+    apply_secret_visual_mask_to_active_element,
+    probe_blob_action_freshness,
+    take_element_screenshot,
+    teardown_blob_url_retention,
+)
 
 LOG = structlog.get_logger()
 
@@ -186,6 +206,11 @@ DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE = (
     "No file download was observed or credited after this action. "
     "If the goal still requires this file, keep trying to download it rather than reporting the goal complete."
 )
+SENSITIVE_CLIPBOARD_CLEAR_FAILED_FOLLOWUP_MESSAGE = (
+    "The sensitive paste completed, but the clipboard could not be cleared. "
+    "Do not repeat the paste; stop and report the clipboard safety failure."
+)
+_PASTE_TEXT_CLIPBOARD_LOCK = asyncio.Lock()
 
 FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
 COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
@@ -233,6 +258,7 @@ class CustomSelectFamilyOutcome(StrEnum):
     llm_fallback_post_click_unverified = "llm_fallback_post_click_unverified"
     success_precommit = "success_precommit"
     success_verified = "success_verified"
+    terminal_llm_fallback_exception = "terminal_llm_fallback_exception"
     terminal_post_click_exception = "terminal_post_click_exception"
     terminal_unverified_reset = "terminal_unverified_reset"
     terminal_unverified_click = "terminal_unverified_click"
@@ -242,6 +268,9 @@ class CustomSelectFamilyOutcome(StrEnum):
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_IN_FLIGHT_EXTENSION_MAX_SECONDS = 120
 DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS = 1.0
+# Cap the event-time blob read so a stalled read never consumes the whole download-wait budget;
+# on timeout the save_as + fan-out fallback still gets its chance.
+EAGER_BLOB_READ_TIMEOUT_SECONDS = 5.0
 DOWNLOAD_DUPLICATE_STEM_SUFFIX_RE = re.compile(r"(?:\s+\(\d{1,3}\)|_\d{1,3})$")
 SELECT_SHADOW_MATCH_APOSTROPHE_RE = re.compile(r"['`‘’]")
 SELECT_SHADOW_MATCH_WORD_RE = re.compile(r"\w+")
@@ -249,6 +278,47 @@ SELECT_SHADOW_MATCH_WORD_RE = re.compile(r"\w+")
 
 def _select_shadow_match_enabled() -> bool:
     return settings.SKYVERN_SELECT_SHADOW_MATCH
+
+
+def _is_totp_sentinel(value: Any) -> bool:
+    return value in {BitwardenConstants.TOTP, OnePasswordConstants.TOTP, AzureVaultConstants.TOTP}
+
+
+async def _apply_secret_visual_mask_if_needed(
+    skyvern_element: SkyvernElement,
+    *,
+    workflow_run_id: str | None,
+    is_secret_value: bool,
+    is_totp_value: bool,
+    is_totp_sequence: bool = False,
+) -> None:
+    if not settings.ENABLE_SECRET_VISUAL_MASKING or not app.WORKFLOW_CONTEXT_MANAGER.mask_secrets_enabled_for_run(
+        workflow_run_id
+    ):
+        return
+    if is_secret_value or is_totp_value or is_totp_sequence:
+        await skyvern_element.apply_secret_visual_mask()
+
+
+async def _apply_active_element_secret_visual_mask_if_needed(
+    page: Page, text: str | None, workflow_run_id: str | None
+) -> None:
+    if (
+        not settings.ENABLE_SECRET_VISUAL_MASKING
+        or not text
+        or not app.WORKFLOW_CONTEXT_MANAGER.mask_secrets_enabled_for_run(workflow_run_id)
+    ):
+        return
+    try:
+        secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(
+            workflow_run_id,
+            respect_artifact_redaction_flag=False,
+        )
+    except Exception:
+        LOG.warning("Failed to resolve secret values for active element masking", exc_info=True)
+        return
+    if isinstance(secret_values, set) and text in secret_values:
+        await apply_secret_visual_mask_to_active_element(page)
 
 
 def _normalize_select_shadow_text(text: Any | None) -> str:
@@ -556,12 +626,16 @@ async def _reset_autocomplete_for_llm_fallback(
     text: str,
     task: Task,
     step: Step,
+    engine_selection: BrowserEngineSelection | None = UNSET_SELECTION,
 ) -> tuple[IncrementalScrapePage, list[dict], list[dict], str, list[str]]:
+    if engine_selection is UNSET_SELECTION:
+        engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
     await current_incremental_scraped.stop_listen_dom_increment()
     await skyvern_element.input_clear()
 
     incremental_scraped = IncrementalScrapePage(
-        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
+        skyvern_frame=skyvern_frame,
+        engine_selection=engine_selection,
     )
     await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
     await skyvern_element.press_fill(text)
@@ -571,6 +645,7 @@ async def _reset_autocomplete_for_llm_fallback(
             task=task,
             step=step,
             check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+            engine_selection=engine_selection,
         ),
     )
 
@@ -752,11 +827,136 @@ def _blob_download_candidate_pages(download: Download, page: Page) -> list[Page]
     return candidates
 
 
+async def _read_adopted_session_blob_bytes(
+    download: Download,
+    page: Page,
+    workflow_run_id: str | None = None,
+) -> bytes | None:
+    """Read a blob: download's bytes by fanning out over its candidate pages, owner first.
+
+    Returns the bytes from the first page that owns the blob (``b""`` is a valid zero-byte
+    read), or ``None`` when no open page can resolve it.
+    """
+    for candidate in _blob_download_candidate_pages(download, page):
+        blob_bytes = await SkyvernFrame.read_blob_url_bytes(
+            page=candidate,
+            blob_url=download.url,
+            workflow_run_id=workflow_run_id,
+            max_size_bytes=MAX_FILE_SIZE_BYTES,
+            probe=True,
+        )
+        if blob_bytes is not None:
+            return blob_bytes
+    return None
+
+
+class _EagerAdoptedBlobCapture:
+    """Read an adopted-session blob download's bytes the instant the download event fires.
+
+    A blob: URL only resolves inside the document that minted it, and that document is
+    frequently torn down (navigation, ``revokeObjectURL``, tab close) before the ~1s download
+    poll runs ``_save_adopted_session_download`` — so the post-hoc fan-out reads a context in
+    which the owner is already gone. Reading here, at the download event, captures the bytes
+    while the owner is still live. Armed only for adopted/persistent sessions and blob: URLs.
+    """
+
+    def __init__(self, *, enabled: bool, clicked_page: Page, workflow_run_id: str | None) -> None:
+        self._enabled = enabled
+        self._clicked_page = clicked_page
+        self._workflow_run_id = workflow_run_id
+        self._task: asyncio.Task[None] | None = None
+        self._bytes: bytes | None = None
+
+    def maybe_start(self, download: Download) -> None:
+        if not self._enabled or self._task is not None:
+            return
+        if not (download.url or "").startswith("blob:"):
+            return
+        self._task = asyncio.create_task(self._run(download))
+
+    async def _run(self, download: Download) -> None:
+        try:
+            self._bytes = await _read_adopted_session_blob_bytes(
+                download, self._clicked_page, workflow_run_id=self._workflow_run_id
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOG.debug(
+                "Eager adopted-session blob capture failed",
+                workflow_run_id=self._workflow_run_id,
+                exc_info=True,
+            )
+
+    async def result(self, timeout: float) -> bytes | None:
+        if self._task is None:
+            return None
+        try:
+            # Shield so the timeout unblocks us without tearing the read down mid-flight; on timeout
+            # we then cancel+drain below so save_as/fan-out never run while the read still holds bytes.
+            await asyncio.wait_for(asyncio.shield(self._task), timeout=timeout)
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Eager adopted-session blob capture did not finish before it was needed",
+                workflow_run_id=self._workflow_run_id,
+            )
+            await self.aclose()
+        except Exception:
+            LOG.debug(
+                "Eager adopted-session blob capture result raised",
+                workflow_run_id=self._workflow_run_id,
+                exc_info=True,
+            )
+        return self._bytes
+
+    async def aclose(self) -> None:
+        task = self._task
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            # Swallow the cancellation we requested, but if this coroutine is itself being
+            # cancelled, re-raise so the enclosing timeout/cancel scope still observes it.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+        except Exception:
+            LOG.debug(
+                "Eager adopted-session blob capture cleanup raised",
+                workflow_run_id=self._workflow_run_id,
+                exc_info=True,
+            )
+
+
+async def _close_eager_capture_then_teardown_retention(
+    eager_blob_capture: _EagerAdoptedBlobCapture,
+    page: Page,
+    *,
+    browser_session_id: str | None,
+    workflow_run_id: str | None,
+) -> None:
+    # aclose() can re-raise CancelledError when the enclosing action is cancelled; the retention
+    # wrapper patches page-realm URL.createObjectURL/revokeObjectURL and must be torn down anyway, or
+    # a cancelled adopted session leaks the patched globals. The original cancellation still
+    # propagates after the finally, and a teardown failure stays fail-open/debug-only.
+    try:
+        await eager_blob_capture.aclose()
+    finally:
+        if browser_session_id:
+            try:
+                await teardown_blob_url_retention(page, workflow_run_id=workflow_run_id)
+            except Exception:
+                LOG.debug("Failed to tear down blob URL retention", workflow_run_id=workflow_run_id)
+
+
 async def _save_adopted_session_download(
     download: Download,
     page: Page,
     download_dir: Path,
     workflow_run_id: str | None = None,
+    eager_blob_bytes: bytes | None = None,
 ) -> Path | None:
     """Land an adopted-session download's bytes into download_dir, returning the file path or None.
 
@@ -764,6 +964,19 @@ async def _save_adopted_session_download(
     deferred save_as runs.
     """
     download_target = _download_target_path(download_dir, download.suggested_filename)
+    # Non-empty bytes captured at download-event time (blob owner still alive) win outright: skip
+    # save_as, which returns empty for blobs anyway. A zero-byte eager capture is indistinguishable
+    # from an unreadable one and would be a false success, so fall through to save_as + fan-out
+    # (matching _persist_captured_download's empty-file handling and the CDP interceptor).
+    if download.url.startswith("blob:") and eager_blob_bytes:
+        download_target.write_bytes(eager_blob_bytes)
+        return download_target
+    if download.url.startswith("blob:") and eager_blob_bytes == b"":
+        LOG.warning(
+            "Eager adopted-session blob capture returned zero bytes; falling through to save_as/fan-out",
+            download_dir=str(download_dir),
+            workflow_run_id=workflow_run_id,
+        )
     persisted = await _persist_captured_download(
         download, target=download_target, timeout=BROWSER_DOWNLOAD_MAX_WAIT_TIME
     )
@@ -789,27 +1002,43 @@ async def _save_adopted_session_download(
     # owns the blob. That document may be a different tab than the one clicked, so
     # probe every open page (owner first) rather than reading from ``page`` alone.
     if download.url.startswith("blob:"):
-        candidate_pages = _blob_download_candidate_pages(download, page)
-        blob_bytes: bytes | None = None
-        for candidate in candidate_pages:
-            blob_bytes = await SkyvernFrame.read_blob_url_bytes(
-                page=candidate, blob_url=download.url, workflow_run_id=workflow_run_id, probe=True
-            )
-            if blob_bytes is not None:
-                break
+        blob_bytes = await _read_adopted_session_blob_bytes(download, page, workflow_run_id=workflow_run_id)
         if blob_bytes is None:
+            # The download event's own blob is unreadable (owner torn down / remote-CDP), but the
+            # statement is often still displayed in a live same-origin blob: PDF iframe whose bytes
+            # are recoverable. Bounded by the same budget as blocked-inline-PDF recovery.
+            recovered_bytes: bytes | None = None
+            try:
+                async with asyncio.timeout(_BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS):
+                    recovered_bytes = await _recover_adopted_session_blob_pdf_iframe(page, download, workflow_run_id)
+            except asyncio.TimeoutError:
+                LOG.warning(
+                    "Adopted-session blob PDF iframe recovery exceeded its budget; treating as no recovery",
+                    workflow_run_id=workflow_run_id,
+                    recovery_budget_seconds=_BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS,
+                )
+            if recovered_bytes is not None:
+                download_target.write_bytes(recovered_bytes)
+                LOG.info(
+                    "Recovered adopted-session statement from a live blob: PDF iframe",
+                    download_dir=str(download_dir),
+                    workflow_run_id=workflow_run_id,
+                    recovered_bytes=len(recovered_bytes),
+                    download_target=str(download_target),
+                )
+                return download_target
             LOG.warning(
                 "Adopted-session blob download could not be read from any open page",
                 download_dir=str(download_dir),
                 workflow_run_id=workflow_run_id,
-                candidate_page_count=len(candidate_pages),
+                candidate_page_count=len(_blob_download_candidate_pages(download, page)),
             )
             return None
         download_target.write_bytes(blob_bytes)
         return download_target
 
     try:
-        response = await page.context.request.get(download.url)
+        response = await fetch_download_through_request_context(page.context.request, download.url)
         if response.status != 200:
             LOG.error(
                 "Adopted-session download url re-fetch returned non-200 status",
@@ -827,6 +1056,14 @@ async def _save_adopted_session_download(
             return None
         download_target.write_bytes(body)
         return download_target
+    except DOWNLOAD_DESTINATION_ERRORS as e:
+        LOG.error(
+            "Adopted-session download destination refused",
+            download_dir=str(download_dir),
+            workflow_run_id=workflow_run_id,
+            reason=str(e),
+        )
+        return None
     except Exception:
         LOG.error(
             "Adopted-session download url re-fetch failed",
@@ -942,6 +1179,142 @@ def _looks_like_pdf(data: bytes) -> bool:
     # pages that merely mention the marker further down are rejected.
     header = data[3:] if data[:3] == b"\xef\xbb\xbf" else data
     return header[:5] == b"%PDF-"
+
+
+_BLOB_IFRAME_SRC_TITLE_JS = (
+    "() => Array.from(document.querySelectorAll('iframe')).map((f) => [f.src || '', f.title || ''])"
+)
+
+
+def _strip_url_fragment(url: str) -> str:
+    return url.split("#", 1)[0]
+
+
+async def _blob_iframe_src_titles(page: Page) -> dict[str, str]:
+    """Map each blob: <iframe> src (fragment-stripped) to its title attribute, across every frame."""
+    mapping: dict[str, str] = {}
+    main_frame = page.main_frame
+    for frame in _all_page_frames(page):
+        target: Page | Frame = page if frame is main_frame else frame
+        try:
+            pairs = await SkyvernFrame.evaluate(frame=target, expression=_BLOB_IFRAME_SRC_TITLE_JS)
+        except Exception:
+            continue
+        if not isinstance(pairs, list):
+            continue
+        for pair in pairs:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                continue
+            src, title = pair
+            if isinstance(src, str) and src.startswith("blob:"):
+                mapping.setdefault(_strip_url_fragment(src), title if isinstance(title, str) else "")
+    return mapping
+
+
+async def _read_blob_pdf_bytes(page: Page, blob_url: str, workflow_run_id: str | None) -> bytes | None:
+    """Read a blob: URL and return its bytes only when they are a non-empty PDF, else None."""
+    data = await SkyvernFrame.read_blob_url_bytes(
+        page=page,
+        blob_url=blob_url,
+        workflow_run_id=workflow_run_id,
+        max_size_bytes=MAX_FILE_SIZE_BYTES,
+        probe=True,
+    )
+    if data and _looks_like_pdf(data):
+        return data
+    return None
+
+
+async def _recover_adopted_session_blob_pdf_iframe(
+    page: Page, download: Download, workflow_run_id: str | None
+) -> bytes | None:
+    """Best-effort recovery of a statement PDF from a live same-origin blob: <iframe> when the download's own bytes are lost.
+
+    An adopted/persistent session can fire a client-side blob download whose bytes are unrecoverable
+    (empty ``save_as`` and an unfetchable download URL) while the statement is still displayed in a
+    same-origin ``blob:`` PDF iframe — a different, still-live object readable from the document that
+    minted it. Candidates come from the iframe ``src`` attribute, not ``frame.url``: Chromium's built-in
+    PDF viewer reports the framed document's URL as ``about:blank`` while the element keeps its blob src.
+
+    Matching the download's suggested filename against exactly one iframe title basename is a
+    conservative correlation, not proof that the iframe holds the requested document — a stale iframe
+    left from an earlier same-named document could still match. It is chosen because it is far safer
+    than trusting whatever single PDF happens to be on screen. No suggested filename, no match, or
+    several equally-titled matches all fail closed (return None) — an ambiguous or unmatched viewer is
+    never saved. The matched candidate is scoped to the download's blob origin, capped at
+    ``MAX_FILE_SIZE_BYTES``, and must carry PDF magic. Because this is a best-effort backstop, any
+    page/frame access error during candidate discovery or reading also fails closed.
+    """
+    download_origin = _blob_url_origin(download.url)
+    if download_origin is None:
+        return None
+
+    suggested = os.path.basename(download.suggested_filename or "").strip().lower()
+    if not suggested:
+        # Non-sensitive: reason + booleans/counts only, never filename/title/blob URL/domain.
+        LOG.info(
+            "Adopted-session blob PDF iframe recovery skipped",
+            workflow_run_id=workflow_run_id,
+            reason="missing_suggested_filename",
+        )
+        return None
+
+    try:
+        src_titles = await _blob_iframe_src_titles(page)
+        same_origin_candidates = [src for src in src_titles if _blob_url_origin(src) == download_origin]
+        named = [
+            src for src in same_origin_candidates if os.path.basename(src_titles[src]).strip().lower() == suggested
+        ]
+
+        if len(named) == 1:
+            # Freshness gate: the candidate blob must be a live key in this action window's retention
+            # Map, proving it was minted through the pre-click wrapper. A lingering iframe reusing a
+            # common filename would otherwise pass the title/PDF gates and save the wrong document.
+            freshness = await probe_blob_action_freshness(page, named[0], workflow_run_id=workflow_run_id)
+            if not freshness.retained:
+                LOG.info(
+                    "Adopted-session blob PDF iframe recovery skipped",
+                    workflow_run_id=workflow_run_id,
+                    reason="not_action_fresh" if freshness.state_observed else "retention_state_unobservable",
+                )
+                return None
+            # The single filename match must itself be a real PDF; otherwise fail closed rather than
+            # fall back to any other on-screen blob iframe.
+            return await _read_blob_pdf_bytes(page, named[0], workflow_run_id)
+
+        if len(named) > 1:
+            LOG.warning(
+                "Adopted-session blob PDF iframe recovery skipped",
+                workflow_run_id=workflow_run_id,
+                reason="duplicate_filename_match",
+                candidate_count=len(same_origin_candidates),
+                match_count=len(named),
+            )
+        elif not same_origin_candidates:
+            LOG.info(
+                "Adopted-session blob PDF iframe recovery skipped",
+                workflow_run_id=workflow_run_id,
+                reason="no_same_origin_blob_iframe",
+                candidate_count=0,
+            )
+        else:
+            LOG.info(
+                "Adopted-session blob PDF iframe recovery skipped",
+                workflow_run_id=workflow_run_id,
+                reason="no_filename_title_match",
+                candidate_count=len(same_origin_candidates),
+            )
+        return None
+    except Exception as exc:
+        # Best-effort backstop: a page/frame torn down mid-discovery (e.g. remote session closing)
+        # must fail closed, not raise. CancelledError (BaseException) still propagates.
+        LOG.warning(
+            "Adopted-session blob PDF iframe recovery skipped",
+            workflow_run_id=workflow_run_id,
+            reason="recovery_error",
+            error_type=type(exc).__name__,
+        )
+        return None
 
 
 async def _collect_inline_iframe_src_candidates(page: Page) -> list[str]:
@@ -1333,12 +1706,15 @@ async def filter_out_elements(
 
 
 def clean_and_remove_element_tree_factory(
-    task: Task, step: Step, check_filter_funcs: list[CheckFilterOutElementIDFunc]
+    task: Task,
+    step: Step,
+    check_filter_funcs: list[CheckFilterOutElementIDFunc],
+    engine_selection: BrowserEngineSelection | None = UNSET_SELECTION,
 ) -> CleanupElementTreeFunc:
     async def helper_func(frame: Page | Frame, url: str, element_tree: list[dict]) -> list[dict]:
-        element_tree = await app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step)(
-            frame, url, element_tree
-        )
+        element_tree = await app.AGENT_FUNCTION.cleanup_element_tree_factory(
+            task=task, step=step, engine_selection=engine_selection
+        )(frame, url, element_tree)
         for check_filter in check_filter_funcs:
             element_tree = await filter_out_elements(frame=frame, element_tree=element_tree, check_filter=check_filter)
 
@@ -1374,7 +1750,7 @@ async def check_phone_number_format(
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
 
-    json_response = await app.SECONDARY_LLM_API_HANDLER(
+    json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
         prompt=prompt, step=step, prompt_name="check-phone-number-format"
     )
 
@@ -2298,7 +2674,9 @@ async def check_date_format(
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
 
-    json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="check-date-format")
+    json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
+        prompt=prompt, step=step, prompt_name="check-date-format"
+    )
 
     check_date_format_response = CheckDateFormatResponse.model_validate(json_response)
     if check_date_format_response.is_current_format_correct or not check_date_format_response.recommended_date:
@@ -2592,6 +2970,10 @@ class ActionHandler:
         # Re-evaluated here, against the page as it is now, before anything downstream looks up a
         # browser, chooses the download-capturing path or persists a row.
         preflight_action(action, page, site="handle_action")
+        action.started_at = naive_utc_now()
+        # Hydrated/cached actions can arrive with a prior finished_at; clear it so the
+        # exceptional-exit fallback below stamps this execution, not the previous one.
+        action.finished_at = None
         browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
         # TODO: maybe support all action types in the future(?)
         trigger_download_action = (
@@ -2750,6 +3132,7 @@ class ActionHandler:
                                 LOG.warning("Failed to remove captured download listener", exc_info=True)
                         if not false_click_download_event.done():
                             false_click_download_event.cancel()
+            action.finished_at = naive_utc_now()
             persisted_action = await app.DATABASE.workflow_params.create_action(action=action)
             action.action_id = persisted_action.action_id
             return results
@@ -2758,10 +3141,23 @@ class ActionHandler:
         run_id = resolve_run_download_id(context, fallback_run_id=task.workflow_run_id or task.task_id)
         download_dir = Path(get_download_dir(run_id=run_id))
         download_event: asyncio.Future[Download] = asyncio.get_running_loop().create_future()
+        eager_blob_capture = _EagerAdoptedBlobCapture(
+            enabled=bool(task.browser_session_id),
+            clicked_page=page,
+            workflow_run_id=task.workflow_run_id,
+        )
+        download_popup_callbacks: list[tuple[Page, Callable[[Download], None]]] = []
 
         def _capture_download_event(download: Download) -> None:
             if not download_event.done():
                 download_event.set_result(download)
+            eager_blob_capture.maybe_start(download)
+
+        def _register_download_popup(popup_page: Page) -> None:
+            # A blob download frequently mints its document in a new tab, so the download event
+            # fires on the popup, not the clicked page. Capture there too so the owner is read live.
+            popup_page.on("download", _capture_download_event)
+            download_popup_callbacks.append((popup_page, _capture_download_event))
 
         def _download_signal_identity(file: str) -> str:
             return file.removesuffix(BROWSER_DOWNLOADING_SUFFIX)
@@ -2847,6 +3243,7 @@ class ActionHandler:
             else BROWSER_DOWNLOAD_TIMEOUT,
         )
         download_triggered = False
+        working_page_replaced_after_close = False
         xhr_fallback_moved_paths: set[str] = set()
         transient_text_observer = TransientPageTextObserver(
             page,
@@ -2855,6 +3252,10 @@ class ActionHandler:
             workflow_run_id=task.workflow_run_id,
         )
         page.on("download", _capture_download_event)
+        # Popup-owned blob downloads only matter for adopted/persistent sessions; managed sessions
+        # keep their existing single-page download behavior with no popup-download wiring.
+        if task.browser_session_id:
+            page.on("popup", _register_download_popup)
         try:
             await transient_text_observer.start(scan_initial_visible_state=False)
             xhr_capture.enable()
@@ -2867,12 +3268,65 @@ class ActionHandler:
                     page=page,
                     action=action,
                 )
+            # The execution window ends when the inner action completes: the download wait
+            # below (up to BROWSER_DOWNLOAD_TIMEOUT) is settle observation, excluded to match
+            # the cached-script writer's semantics.
+            action.finished_at = naive_utc_now()
             if not results:
                 return results
             # Let request events already queued by the action enter before closing admission.
             await asyncio.sleep(0)
             xhr_capture.seal_in_flight_requests()
-            # Deliberately reinstall and rescan in case the action replaced the document or exposed initial visible text.
+            if browser_state is not None and page.is_closed():
+                LOG.warning(
+                    "Working page closed during download action; recreating it before continuing",
+                    workflow_run_id=task.workflow_run_id,
+                )
+                xhr_capture.disable()
+                recovered_page: Page | None = None
+                recovery_timeout_seconds = (
+                    float(task.download_timeout) if task.download_timeout is not None else BROWSER_DOWNLOAD_TIMEOUT
+                )
+                try:
+                    async with asyncio.timeout(recovery_timeout_seconds):
+                        recovered_page = await browser_state.new_page()
+                        await browser_state.navigate_to_url(page=recovered_page, url=page_url_before_download)
+                        await browser_state.set_active_page(recovered_page)
+                except Exception:
+                    LOG.warning(
+                        "Failed to recreate working page after download action closed it",
+                        workflow_run_id=task.workflow_run_id,
+                        exc_info=True,
+                    )
+                    if recovered_page is not None:
+                        try:
+                            await recovered_page.close()
+                        except Exception:
+                            LOG.warning(
+                                "Failed to close replacement page after working page recovery failed",
+                                workflow_run_id=task.workflow_run_id,
+                                exc_info=True,
+                            )
+                else:
+                    assert recovered_page is not None
+                    working_page_replaced_after_close = True
+                    try:
+                        _remove_download_listener(page, _capture_download_event)
+                    except Exception:
+                        LOG.warning("Failed to remove download listener from closed page", exc_info=True)
+                    page = recovered_page
+                    page.on("download", _capture_download_event)
+                    recovered_text_observer = TransientPageTextObserver(
+                        page,
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        workflow_run_id=task.workflow_run_id,
+                    )
+                    recovered_text_observer.events.extend(transient_text_observer.events)
+                    await transient_text_observer.stop()
+                    transient_text_observer = recovered_text_observer
+            # Deliberately reinstall and rescan in case the action replaced the document or exposed initial
+            # visible text.
             await transient_text_observer.start(scan_initial_visible_state=True)
             if task.download_timeout is not None:
                 download_wait_hard_timeout_seconds = float(task.download_timeout)
@@ -2955,6 +3409,12 @@ class ActionHandler:
                                     page,
                                     download_dir,
                                     workflow_run_id=task.workflow_run_id,
+                                    eager_blob_bytes=await eager_blob_capture.result(
+                                        timeout=min(
+                                            EAGER_BLOB_READ_TIMEOUT_SECONDS,
+                                            _remaining_download_wait_seconds(),
+                                        )
+                                    ),
                                 )
                                 if saved_path is not None:
                                     download_event_fallback_used = True
@@ -3162,6 +3622,8 @@ class ActionHandler:
                     if isinstance(results[-1], ActionSuccess):
                         results[-1].needs_followup = True
                         results[-1].followup_message = DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE
+                if working_page_replaced_after_close:
+                    results[-1].skip_remaining_actions = True
                 action.download_triggered = False
                 return results
             results[-1].download_triggered = True
@@ -3189,8 +3651,29 @@ class ActionHandler:
                         post_settle_extra_file_count=len(post_settle_extra_paths),
                         post_settle_extra_files=sorted(os.path.basename(fp) for fp in post_settle_extra_paths),
                     )
+            if working_page_replaced_after_close:
+                results[-1].skip_remaining_actions = True
             return results
         finally:
+            # Fallback for exceptional exits that never reached the post-action stamp.
+            if action.finished_at is None:
+                action.finished_at = naive_utc_now()
+            await _close_eager_capture_then_teardown_retention(
+                eager_blob_capture,
+                page,
+                browser_session_id=task.browser_session_id,
+                workflow_run_id=task.workflow_run_id,
+            )
+            for observed_popup, popup_callback in download_popup_callbacks:
+                try:
+                    _remove_download_listener(observed_popup, popup_callback)
+                except Exception:
+                    LOG.warning("Failed to remove download popup listener", exc_info=True)
+            if task.browser_session_id:
+                try:
+                    _remove_popup_listener(page, _register_download_popup)
+                except Exception:
+                    LOG.warning("Failed to remove download popup registrar", exc_info=True)
             try:
                 await transient_text_observer.stop()
             finally:
@@ -3209,15 +3692,20 @@ class ActionHandler:
                     initial_page_count=initial_page_count,
                     page_count_after_download=page_count_after_download,
                 )
-                if page_count_after_download > initial_page_count:
+                extra_page_count = page_count_after_download - initial_page_count
+                if extra_page_count > 0:
                     LOG.info(
-                        "Download triggered, closing the extra page",
+                        "Download triggered, closing extra pages",
+                        extra_page_count=extra_page_count,
                     )
 
-                    if page == pages_after_download[-1]:
-                        LOG.warning("The extra page is the current page, closing it")
-                    # close the extra page
-                    await pages_after_download[-1].close()
+                    for extra_page in reversed(pages_after_download):
+                        if extra_page_count <= 0:
+                            break
+                        if extra_page == page:
+                            continue
+                        await extra_page.close()
+                        extra_page_count -= 1
 
                 blank_page_urls = {"about:blank", ":"}
                 if page.url in blank_page_urls and page_url_before_download not in blank_page_urls:
@@ -3269,6 +3757,10 @@ class ActionHandler:
         try:
             async with asyncio.timeout(execution_timeout_seconds) as execution_timeout_scope:
                 if action.action_type in ActionHandler._handled_action_types:
+                    if isinstance(action, PasteTextAction) and not await _is_paste_text_action_enabled(task):
+                        actions_result.append(ActionFailure(Exception("PASTE_TEXT action is disabled")))
+                        return actions_result
+
                     invalid_web_action_check = check_for_invalid_web_action(action, page, scraped_page, task, step)
                     if invalid_web_action_check:
                         actions_result.extend(invalid_web_action_check)
@@ -3381,6 +3873,24 @@ def _resolve_action_execution_timeout(action: actions.Action) -> float:
     return base
 
 
+async def _is_paste_text_action_enabled(task: Task) -> bool:
+    if settings.PLANNER_MINI_GOAL_IMPROVEMENTS:
+        return True
+    try:
+        return await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            "PLANNER_MINI_GOAL_IMPROVEMENTS",
+            task.organization_id,
+            properties={"organization_id": task.organization_id},
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to resolve PASTE_TEXT execution gate; refusing execution",
+            organization_id=task.organization_id,
+            exc_info=True,
+        )
+        return False
+
+
 def check_for_invalid_web_action(
     action: actions.Action,
     page: Page,
@@ -3391,7 +3901,7 @@ def check_for_invalid_web_action(
     if isinstance(action, ClickAction) and action.x is not None and action.y is not None:
         return []
 
-    if isinstance(action, InputTextAction) and not action.element_id:
+    if isinstance(action, (InputTextAction, PasteTextAction)) and not action.element_id:
         return []
 
     if isinstance(action, WebAction) and action.element_id not in scraped_page.id_to_element_dict:
@@ -3562,10 +4072,13 @@ async def handle_click_action(
     else:
         incremental_scraped: IncrementalScrapePage | None = None
         try:
-            skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
+            engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
+            skyvern_frame = await SkyvernFrame.create_instance(
+                skyvern_element.get_frame(), engine_selection=engine_selection
+            )
             incremental_scraped = IncrementalScrapePage(
                 skyvern_frame=skyvern_frame,
-                engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER),
+                engine_selection=engine_selection,
             )
             await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
@@ -3692,7 +4205,10 @@ async def handle_sequential_click_for_dropdown(
 
     incremental_elements = await incremental_scraped.get_incremental_element_tree(
         clean_and_remove_element_tree_factory(
-            task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
+            task=task,
+            step=step,
+            check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+            engine_selection=skyvern_frame.engine_selection,
         ),
     )
 
@@ -3727,7 +4243,9 @@ async def handle_sequential_click_for_dropdown(
     prompt = await _build_after_click_verify_prompt(task, scraped_page_after_open, new_element_ids, action_history_str)
     distinct_id_for_override = task.workflow_run_id if task.workflow_run_id else task.task_id
     check_user_goal_handler = await resolve_check_user_goal_handler(
-        distinct_id_for_override, task.organization_id, app.CHECK_USER_GOAL_LLM_API_HANDLER
+        distinct_id_for_override,
+        task.organization_id,
+        get_org_aware_secondary_llm_api_handler(default=app.CHECK_USER_GOAL_LLM_API_HANDLER),
     )
     response = await check_user_goal_handler(
         prompt=prompt,
@@ -3755,7 +4273,9 @@ async def handle_sequential_click_for_dropdown(
         ),
         skyvern_element=anchor_element,
         element_tree_builder=scraped_page,
+        task=task,
         step=step,
+        engine_selection=skyvern_frame.engine_selection,
     )
 
     if dropdown_select_context.is_date_related:
@@ -3784,6 +4304,7 @@ async def handle_sequential_click_for_dropdown(
         scraped_page=scraped_page,
         step=step,
         task=task,
+        engine_selection=skyvern_frame.engine_selection,
         entry_action_type="click",
         scraped_page_after_open=scraped_page_after_open,
         new_interactable_element_ids=new_interactable_element_ids,
@@ -4090,8 +4611,10 @@ async def handle_input_text_action(
                 cua_text = generate_totp_value_from_secret(cua_totp_secret)
             except NoTOTPSecretFound as exc:
                 return [ActionFailure(exc)]
+            _register_runtime_otp_value_best_effort(task.workflow_run_id, cua_text)
         elif is_unresolved_totp_value(cua_text):
             return [ActionFailure(NoTOTPSecretFound())]
+        await _apply_active_element_secret_visual_mask_if_needed(page, cua_text, task.workflow_run_id)
         await EventStrategyFactory.type_text(page, None, cua_text)
         return [ActionSuccess()]
 
@@ -4147,7 +4670,7 @@ async def handle_input_text_action(
                 can_input_text = True
 
     engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
-    skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
+    skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame(), engine_selection=engine_selection)
     incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame, engine_selection=engine_selection)
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
 
@@ -4176,6 +4699,7 @@ async def handle_input_text_action(
                 select_text = generate_totp_value_from_secret(totp_secret)
             except NoTOTPSecretFound as exc:
                 return [ActionFailure(exc)]
+            _register_runtime_otp_value_best_effort(task.workflow_run_id, select_text)
         select_action = SelectOptionAction(
             reasoning=action.reasoning,
             element_id=skyvern_element.get_id(),
@@ -4219,7 +4743,9 @@ async def handle_input_text_action(
         action=action,
         element_tree_builder=scraped_page,
         skyvern_element=skyvern_element,
+        task=task,
         step=step,
+        engine_selection=engine_selection,
     )
     if not can_input_text:
         target_is_hidden = target_hidden if target_hidden is not None else await skyvern_element.has_hidden_attr()
@@ -4303,7 +4829,10 @@ async def handle_input_text_action(
         await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=wait_sec, caller="input_text.autocomplete")
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
-                task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
+                task=task,
+                step=step,
+                check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+                engine_selection=engine_selection,
             ),
         )
         if len(incremental_element) == 0:
@@ -4338,6 +4867,10 @@ async def handle_input_text_action(
                 if select_result is not None:
                     if select_result.action_result and select_result.action_result.success:
                         try_to_quit_dropdown = False
+                        return [select_result.action_result]
+
+                    if _is_terminal_custom_select_failure(select_result.action_result):
+                        auto_complete_hacky_flag = False
                         return [select_result.action_result]
 
                     if select_result.dropdown_menu is None:
@@ -4455,6 +4988,14 @@ async def handle_input_text_action(
                 exc_info=True,
             )
 
+    await _apply_secret_visual_mask_if_needed(
+        skyvern_element,
+        workflow_run_id=task.workflow_run_id,
+        is_secret_value=is_secret_value,
+        is_totp_value=is_totp_value,
+        is_totp_sequence=is_multi_field_totp,
+    )
+
     # TODO: some elements are supported to use `locator.press_sequentially()` to fill in the data
     # we need find a better way to detect the attribute in the future
     class_name: str | None = await skyvern_element.get_attr("class")
@@ -4464,6 +5005,7 @@ async def handle_input_text_action(
                 text = generate_totp_value_from_secret(totp_secret)
             except NoTOTPSecretFound as exc:
                 return [ActionFailure(exc)]
+            _register_runtime_otp_value_best_effort(task.workflow_run_id, text)
         await skyvern_element.press_fill(text=text)
         return [ActionSuccess()]
 
@@ -4514,6 +5056,13 @@ async def handle_input_text_action(
                     tel_e164_fallback = _nanp_e164_fallback(
                         tel_source_text or "", pattern=tel_pattern, maxlength=tel_maxlength
                     )
+                await _apply_secret_visual_mask_if_needed(
+                    skyvern_element,
+                    workflow_run_id=task.workflow_run_id,
+                    is_secret_value=is_secret_value,
+                    is_totp_value=is_totp_value,
+                    is_totp_sequence=is_multi_field_totp,
+                )
     except Exception:
         LOG.info(
             "Failed to find the blocking element, continue with the original element",
@@ -4526,6 +5075,7 @@ async def handle_input_text_action(
             text = generate_totp_value_from_secret(totp_secret)
         except NoTOTPSecretFound as exc:
             return [ActionFailure(exc)]
+        _register_runtime_otp_value_best_effort(task.workflow_run_id, text)
         await skyvern_element.input(text)
         return [ActionSuccess()]
 
@@ -4705,6 +5255,7 @@ async def handle_input_text_action(
                     task=task,
                     step=step,
                     check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+                    engine_selection=engine_selection,
                 ),
             )
             if len(incremental_element) > 0:
@@ -4740,6 +5291,9 @@ async def handle_input_text_action(
                         # the next queued action would clobber it (a trailing Enter/Return); next step re-scrapes.
                         if action.stop_batch_after_dropdown_select:
                             select_result.action_result.skip_remaining_actions = True
+                        return [select_result.action_result]
+                    if select_result and _is_terminal_custom_select_failure(select_result.action_result):
+                        auto_complete_hacky_flag = False
                         return [select_result.action_result]
                 elif (
                     input_or_select_context is not None
@@ -4777,6 +5331,9 @@ async def handle_input_text_action(
                         auto_complete_hacky_flag = False
                         if action.stop_batch_after_dropdown_select:
                             select_result.action_result.skip_remaining_actions = True
+                        return [select_result.action_result]
+                    if select_result and _is_terminal_custom_select_failure(select_result.action_result):
+                        auto_complete_hacky_flag = False
                         return [select_result.action_result]
         except SkyvernPageAnalysisTimeout as inc_error:
             # A page-analysis timeout after both incremental attempts previously arrived here as a
@@ -4909,7 +5466,7 @@ async def _wait_for_upload_processing(page: Page, engine_selection: BrowserEngin
         # Settle delay: let the page react to the file-input change and mount
         # upload UI (spinner, progress bar, XHR) before polling for readiness.
         await asyncio.sleep(0.5)
-        skyvern_frame = await SkyvernFrame.create_instance(page)
+        skyvern_frame = await SkyvernFrame.create_instance(page, engine_selection=engine_selection)
         await skyvern_frame.wait_for_page_ready(
             loading_indicator_timeout_ms=3000,
             network_idle_timeout_ms=3000,
@@ -5002,14 +5559,13 @@ async def handle_upload_file_action(
     if is_file_input:
         LOG.info("Taking UploadFileAction. Found file input tag", action=action)
         if file_path:
+            engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
             await locator.set_input_files(
                 file_path,
                 timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
             )
 
-            await _wait_for_upload_processing(
-                page, engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
-            )
+            await _wait_for_upload_processing(page, engine_selection=engine_selection)
 
             return [ActionSuccess()]
         else:
@@ -5116,6 +5672,7 @@ async def handle_select_option_action(
 ) -> list[ActionResult]:
     dom = DomUtil(scraped_page, page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
+    engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
 
     tag_name = skyvern_element.get_tag_name()
     element_dict = scraped_page.id_to_element_dict[action.element_id]
@@ -5216,7 +5773,12 @@ async def handle_select_option_action(
         if select_is_visible:
             try:
                 normal_select_result = await normal_select(
-                    action=action, skyvern_element=skyvern_element, builder=dom.scraped_page, task=task, step=step
+                    action=action,
+                    skyvern_element=skyvern_element,
+                    builder=dom.scraped_page,
+                    task=task,
+                    step=step,
+                    engine_selection=engine_selection,
                 )
             except Exception as e:
                 # normal_select can raise before returning (e.g. an LLM/provider error). Don't lose
@@ -5314,10 +5876,8 @@ async def handle_select_option_action(
     )
 
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
-    skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
-    incremental_scraped = IncrementalScrapePage(
-        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
-    )
+    skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame(), engine_selection=engine_selection)
+    incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame, engine_selection=engine_selection)
     is_open = False
     suggested_value: str | None = None
     results: list[ActionResult] = []
@@ -5331,7 +5891,7 @@ async def handle_select_option_action(
             page=page,
             dom=dom,
             timeout=timeout,
-            engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER),
+            engine_selection=engine_selection,
         )
         # The click opens the widget: mark it open now (not only on the incremental path below) so the
         # finally cleanup dismisses it on every exit — including an emerging-path optional miss that
@@ -5342,7 +5902,10 @@ async def handle_select_option_action(
 
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
-                task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
+                task=task,
+                step=step,
+                check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+                engine_selection=engine_selection,
             ),
         )
 
@@ -5357,12 +5920,20 @@ async def handle_select_option_action(
             await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="select_option.arrowdown")
             incremental_element = await incremental_scraped.get_incremental_element_tree(
                 clean_and_remove_element_tree_factory(
-                    task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
+                    task=task,
+                    step=step,
+                    check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+                    engine_selection=engine_selection,
                 ),
             )
 
         input_or_select_context = await _get_input_or_select_context(
-            action=action, element_tree_builder=scraped_page, step=step, skyvern_element=skyvern_element
+            action=action,
+            element_tree_builder=scraped_page,
+            task=task,
+            step=step,
+            skyvern_element=skyvern_element,
+            engine_selection=engine_selection,
         )
 
         if len(incremental_element) == 0:
@@ -5383,6 +5954,7 @@ async def handle_select_option_action(
                     task=task,
                     step=step,
                     entry_action_type=entry_action_type,
+                    engine_selection=engine_selection,
                 )
             )
             return results
@@ -5709,6 +6281,7 @@ async def handle_extract_action(
             scraped_page=scraped_page,
             task=task,
             step=step,
+            page=page,
         )
         extracted_data = scrape_action_result.scraped_data
         return [ActionSuccess(data=extracted_data)]
@@ -5842,6 +6415,182 @@ async def handle_keypress_action(
     step: Step,
 ) -> list[ActionResult]:
     await handler_utils.keypress(page, action.keys, hold=action.hold, duration=action.duration, repeat=action.repeat)
+    return [ActionSuccess()]
+
+
+async def _write_clipboard_text_in_isolated_world(page: Page, text: str) -> None:
+    cdp_session = await page.context.new_cdp_session(page)
+    try:
+        frame_tree = await cdp_session.send("Page.getFrameTree")
+        frame_id = frame_tree["frameTree"]["frame"]["id"]
+        isolated_world = await cdp_session.send(
+            "Page.createIsolatedWorld",
+            {"frameId": frame_id, "worldName": "skyvern-paste-text"},
+        )
+        result = await cdp_session.send(
+            "Runtime.callFunctionOn",
+            {
+                "functionDeclaration": (
+                    "function(text) {"
+                    "if (!navigator.clipboard) { throw new Error('navigator.clipboard is undefined'); }"
+                    "return navigator.clipboard.writeText(text);"
+                    "}"
+                ),
+                "arguments": [{"value": text}],
+                "executionContextId": isolated_world["executionContextId"],
+                "awaitPromise": True,
+                "returnByValue": True,
+            },
+        )
+        if "exceptionDetails" in result:
+            exception_details = result["exceptionDetails"]
+            description = (
+                (exception_details.get("exception") or {}).get("description")
+                or result.get("result", {}).get("description")
+                or exception_details.get("text")
+            )
+            raise RuntimeError(description or "clipboard write failed")
+    finally:
+        with contextlib.suppress(Exception):
+            await cdp_session.detach()
+
+
+async def _clear_clipboard_after_paste(page: Page) -> bool:
+    try:
+        await _write_clipboard_text_in_isolated_world(page, "")
+        return True
+    except Exception:
+        LOG.warning("paste_text: clipboard clear failed; retrying after navigation settles", exc_info=True)
+
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+    except Exception:
+        LOG.debug("paste_text: page did not settle before clipboard clear retry", exc_info=True)
+
+    try:
+        parsed = urllib.parse.urlparse(page.url)
+        origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else None
+        if origin is not None:
+            await page.context.grant_permissions(["clipboard-write"], origin=origin)
+        await _write_clipboard_text_in_isolated_world(page, "")
+        return True
+    except Exception:
+        LOG.error(
+            "paste_text: clipboard clear failed after navigation-aware retry; pasted text may remain on the clipboard",
+            exc_info=True,
+        )
+        return False
+
+
+@traced(name="skyvern.agent.action.paste_text")
+async def handle_paste_text_action(
+    action: actions.PasteTextAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    resolved_sensitive_text = False
+    text_result = get_actual_value_of_parameter_if_secret_with_task(task, action.text)
+    if text_result is None:
+        return [ActionFailure(FailedToFetchSecret())]
+    paste_text = text_result
+    if task.workflow_run_id is not None:
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
+        if workflow_run_context is not None:
+            resolved_sensitive_text = workflow_run_context.get_original_secret_value_or_none(action.text) is not None
+            placeholder_tokens = workflow_run_context.find_embedded_placeholder_tokens(action.text)
+            if placeholder_tokens:
+                paste_text = action.text
+                for token in placeholder_tokens:
+                    if workflow_run_context.get_original_secret_value_or_none(token) is not None:
+                        resolved_sensitive_text = True
+                    token_value = get_actual_value_of_parameter_if_secret_with_task(task, token)
+                    if token_value is None:
+                        return [ActionFailure(FailedToFetchSecret())]
+                    if is_unresolved_totp_placeholder(token_value):
+                        return [ActionFailure(NoTOTPSecretFound())]
+                    if is_unresolved_totp_value(token_value):
+                        resolved_sensitive_text = True
+                        try:
+                            token_value = generate_totp_value_with_task(task, token)
+                        except NoTOTPSecretFound as exc:
+                            return [ActionFailure(exc)]
+                    paste_text = paste_text.replace(token, token_value, 1)
+
+    if is_unresolved_totp_placeholder(paste_text):
+        return [ActionFailure(NoTOTPSecretFound())]
+    if is_unresolved_totp_value(paste_text):
+        resolved_sensitive_text = True
+        try:
+            paste_text = generate_totp_value_with_task(task, action.text)
+        except NoTOTPSecretFound as exc:
+            return [ActionFailure(exc)]
+
+    if resolved_sensitive_text and not action.element_id:
+        return [ActionFailure(MissingElement(element_id=action.element_id))]
+
+    # Focus the anchor cell so the paste lands at the intended top-left position.
+    if action.element_id:
+        dom = DomUtil(scraped_page, page)
+        skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
+        locator = skyvern_element.get_locator()
+        try:
+            await locator.scroll_into_view_if_needed(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        except Exception:
+            LOG.debug("paste_text: scroll_into_view_if_needed failed", exc_info=True)
+        # Best-effort focus: a grid's inline cell-editing box intercepts pointer events, so a strict
+        # click times out. force clicks through, and a failure still lets the paste land at the
+        # current selection.
+        try:
+            await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS, force=True)
+        except Exception as exc:
+            if resolved_sensitive_text:
+                LOG.warning("paste_text: refusing sensitive paste because target focus failed", exc_info=True)
+                return [ActionFailure(exc)]
+            LOG.debug("paste_text: focus click failed; pasting at current selection", exc_info=True)
+        # Exit any inline cell editor the focus opened, then anchor the grid selection at the
+        # top-left cell (Ctrl+Home) so the block distributes across cells from A1, rather than
+        # landing in the formula/name bar as a single merged value.
+        await handler_utils.keypress(page, ["Escape"])
+        await handler_utils.keypress(page, ["ctrl", "Home"])
+
+    # Canvas grid editors expose no per-cell DOM, so cell-by-cell typing truncates.
+    # Set the clipboard and paste so a tab/newline-separated block fills the grid in one atomic operation.
+    # Grant only clipboard write and scope it to this page's origin; skip when no origin can be determined
+    # so later navigations in the same context never inherit a context-wide clipboard grant.
+    try:
+        parsed = urllib.parse.urlparse(page.url)
+        origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else None
+        if origin is None:
+            LOG.debug(
+                "paste_text: skipping clipboard permissions grant because page origin is unavailable", url=page.url
+            )
+        else:
+            await page.context.grant_permissions(["clipboard-write"], origin=origin)
+    except Exception:
+        LOG.debug("paste_text: grant clipboard permissions failed (may already be granted)", exc_info=True)
+    async with _PASTE_TEXT_CLIPBOARD_LOCK:
+        # navigator.clipboard is undefined outside a secure context, so this throws on plain-http pages.
+        try:
+            await _write_clipboard_text_in_isolated_world(page, paste_text)
+        except Exception as e:
+            LOG.info("paste_text: clipboard write unavailable on this page", exc_info=True)
+            return [ActionFailure(e)]
+        try:
+            await handler_utils.keypress(page, ["ControlOrMeta", "v"])
+        finally:
+            clipboard_cleared = await _clear_clipboard_after_paste(page)
+
+    if resolved_sensitive_text and not clipboard_cleared:
+        return [
+            ActionResult(
+                success=True,
+                needs_followup=True,
+                followup_message=SENSITIVE_CLIPBOARD_CLEAR_FAILED_FOLLOWUP_MESSAGE,
+                skip_remaining_actions=True,
+            )
+        ]
     return [ActionSuccess()]
 
 
@@ -6070,6 +6819,7 @@ async def handle_execute_js_action(
 ActionHandler.register_action_type(ActionType.SOLVE_CAPTCHA, handle_solve_captcha_action)
 ActionHandler.register_action_type(ActionType.CLICK, handle_click_action)
 ActionHandler.register_action_type(ActionType.INPUT_TEXT, handle_input_text_action)
+ActionHandler.register_action_type(ActionType.PASTE_TEXT, handle_paste_text_action)
 ActionHandler.register_action_type(ActionType.UPLOAD_FILE, handle_upload_file_action)
 ActionHandler.register_action_type(ActionType.DOWNLOAD_FILE, handle_download_file_action)
 ActionHandler.register_action_type(ActionType.NULL_ACTION, handle_null_action)
@@ -6166,8 +6916,23 @@ def generate_totp_value_from_secret(totp_secret: str | None) -> str:
         raise NoTOTPSecretFound() from exc
 
 
+def _register_runtime_otp_value_best_effort(workflow_run_id: str | None, code: str) -> None:
+    if not workflow_run_id or not code:
+        return
+    try:
+        app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id).register_runtime_otp_value(code)
+    except Exception:
+        LOG.debug(
+            "Failed to register runtime TOTP for redaction",
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+
+
 def generate_totp_value(workflow_run_id: str, parameter: str) -> str:
-    return generate_totp_value_from_secret(get_totp_secret(workflow_run_id, parameter))
+    code = generate_totp_value_from_secret(get_totp_secret(workflow_run_id, parameter))
+    _register_runtime_otp_value_best_effort(workflow_run_id, code)
+    return code
 
 
 def generate_totp_value_with_task(task: Task, parameter: str) -> str:
@@ -6272,6 +7037,8 @@ async def chain_click(
     action_results: list[ActionResult] = []
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
+            if resolved_href := await skyvern_element.resolve_http_href(page):
+                await asyncio.to_thread(validate_fetch_url, resolved_href)
             if click_count == 1:
                 # Route through the active cursor strategy so alternate profiles can
                 # dispatch their own click sequence (explicit mouse.down/up).
@@ -6293,6 +7060,12 @@ async def chain_click(
                 locator=locator,
             )
             action_results = [ActionSuccess()]
+            return action_results
+
+        # The browser resolves through the run proxy and may reach hosts the worker cannot;
+        # worker resolution failure is not a policy signal.
+        if isinstance(e, BlockedHost) and not isinstance(e, UnresolvableHost):
+            action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
             return action_results
 
         action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
@@ -6692,7 +7465,7 @@ async def choose_auto_completion_dropdown(
     engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
 
     current_frame = skyvern_element.get_frame()
-    skyvern_frame = await SkyvernFrame.create_instance(current_frame)
+    skyvern_frame = await SkyvernFrame.create_instance(current_frame, engine_selection=engine_selection)
     incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame, engine_selection=engine_selection)
     await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
@@ -6702,7 +7475,10 @@ async def choose_auto_completion_dropdown(
         await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="autocomplete.fill")
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
-                task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
+                task=task,
+                step=step,
+                check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+                engine_selection=engine_selection,
             ),
         )
 
@@ -6729,9 +7505,9 @@ async def choose_auto_completion_dropdown(
             confirmed_preserved_list.append(current_element)
 
         if len(confirmed_preserved_list) > 0:
-            confirmed_preserved_list = await app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step)(
-                skyvern_frame.get_frame(), skyvern_frame.get_frame().url, copy.deepcopy(confirmed_preserved_list)
-            )
+            confirmed_preserved_list = await app.AGENT_FUNCTION.cleanup_element_tree_factory(
+                task=task, step=step, engine_selection=engine_selection
+            )(skyvern_frame.get_frame(), skyvern_frame.get_frame().url, copy.deepcopy(confirmed_preserved_list))
             confirmed_preserved_list = trim_element_tree(copy.deepcopy(confirmed_preserved_list))
 
         incremental_element.extend(confirmed_preserved_list)
@@ -6783,6 +7559,7 @@ async def choose_auto_completion_dropdown(
                                 text=text,
                                 task=task,
                                 step=step,
+                                engine_selection=engine_selection,
                             )
                             result.incremental_elements = copy.deepcopy(fallback_incremental_elements)
                             cleaned_incremental_element = shadow_candidate_elements
@@ -6835,6 +7612,7 @@ async def choose_auto_completion_dropdown(
                                 text=text,
                                 task=task,
                                 step=step,
+                                engine_selection=engine_selection,
                             )
                             result.incremental_elements = copy.deepcopy(fallback_incremental_elements)
                             cleaned_incremental_element = shadow_candidate_elements
@@ -6864,6 +7642,7 @@ async def choose_auto_completion_dropdown(
                             text=text,
                             task=task,
                             step=step,
+                            engine_selection=engine_selection,
                         )
                         result.incremental_elements = copy.deepcopy(fallback_incremental_elements)
                         cleaned_incremental_element = shadow_candidate_elements
@@ -6939,7 +7718,7 @@ async def choose_auto_completion_dropdown(
             slim_output=slim_output,
         )
         LOG.info("Confirm if it's an auto completion dropdown", sampling=True)
-        json_response = await app.AUTO_COMPLETION_LLM_API_HANDLER(
+        json_response = await get_org_aware_secondary_llm_api_handler(default=app.AUTO_COMPLETION_LLM_API_HANDLER)(
             prompt=auto_completion_confirm_prompt, step=step, prompt_name="auto-completion-choose-option"
         )
         element_id = json_response.get("id", "")
@@ -7122,7 +7901,7 @@ async def input_or_auto_complete_input(
         )
         if collapse_autocomplete_fanout_enabled and action is not None:
             action.set_has_mini_agent()
-        json_respone = await app.SECONDARY_LLM_API_HANDLER(
+        json_respone = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
             prompt=prompt, step=step, prompt_name="auto-completion-potential-answers"
         )
         values: list[dict] = json_respone.get("potential_values", [])
@@ -7178,7 +7957,7 @@ async def input_or_auto_complete_input(
                 popped_up_elements="".join([json_to_html(element) for element in cleaned_new_elements]),
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
-            json_respone = await app.SECONDARY_LLM_API_HANDLER(
+            json_respone = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt, step=step, prompt_name="auto-completion-tweak-value"
             )
             context_reasoning = json_respone.get("reasoning")
@@ -7239,9 +8018,11 @@ async def discover_and_select_from_full_dropdown(
         return None
 
     current_frame = skyvern_element.get_frame()
-    skyvern_frame = await SkyvernFrame.create_instance(current_frame)
+    engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
+    skyvern_frame = await SkyvernFrame.create_instance(current_frame, engine_selection=engine_selection)
     incremental_scraped = IncrementalScrapePage(
-        skyvern_frame=skyvern_frame, engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
+        skyvern_frame=skyvern_frame,
+        engine_selection=engine_selection,
     )
     await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
@@ -7264,6 +8045,7 @@ async def discover_and_select_from_full_dropdown(
             task=task,
             step=step,
             check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+            engine_selection=engine_selection,
         )
         incremental_element = await incremental_scraped.get_incremental_element_tree(cleanup_func)
 
@@ -7276,7 +8058,7 @@ async def discover_and_select_from_full_dropdown(
             try:
                 await skyvern_element.press_key("ArrowDown")
             except Exception as exc:
-                if not _is_selected_engine_timeout(exc, resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)):
+                if not _is_selected_engine_timeout(exc, engine_selection):
                     raise
                 LOG.info(
                     "Timeout pressing ArrowDown in discover fallback, continuing",
@@ -7346,7 +8128,7 @@ async def discover_and_select_from_full_dropdown(
             element_id=skyvern_element.get_id(),
             original_text=original_text,
         )
-        json_response = await app.AUTO_COMPLETION_LLM_API_HANDLER(
+        json_response = await get_org_aware_secondary_llm_api_handler(default=app.AUTO_COMPLETION_LLM_API_HANDLER)(
             prompt=prompt, step=step, prompt_name="auto-completion-choose-option"
         )
 
@@ -7507,6 +8289,7 @@ async def sequentially_select_from_dropdown(
                 task=task,
                 step=step,
                 check_filter_funcs=check_filter_funcs,
+                engine_selection=skyvern_frame.engine_selection,
             )
         )
         if len(secondary_increment_element) == 0:
@@ -7553,7 +8336,10 @@ async def sequentially_select_from_dropdown(
             task.llm_key,
             task.workflow_run_id if task.workflow_run_id else task.task_id,
             task.organization_id,
-            LLMAPIHandlerFactory.get_override_llm_api_handler(task.llm_key, default=app.SECONDARY_LLM_API_HANDLER),
+            LLMAPIHandlerFactory.get_override_llm_api_handler(
+                task.llm_key,
+                default=get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER),
+            ),
         )
         json_response = await llm_api_handler(
             prompt=prompt, screenshots=[screenshot], step=step, prompt_name="confirm-multi-selection-finish"
@@ -7833,6 +8619,7 @@ _CUSTOM_SELECT_COMMITTED_STATE_JS = r"""
     const expectedLabel = args.expectedLabel;
     const anchorIsComboboxInput = args.anchorIsComboboxInput;
     const allowAriaSelectedOptionTokens = args.allowAriaSelectedOptionTokens !== false;
+    const allowSingleValueScope = args.allowSingleValueScope === true;
     const normalize = (value) => (value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
     const splitValues = (value) => {
         const normalized = normalize(value);
@@ -7860,6 +8647,11 @@ _CUSTOM_SELECT_COMMITTED_STATE_JS = r"""
         "fieldset",
         ".field"
     ];
+    const singleValueSelector = [
+        "[class*='single-value']",
+        "[class*='singleValue']",
+        "[class*='multi-value__label']"
+    ].join(",");
     // Nearest matching ancestor wins; never scope to the whole form or a bare
     // parent container — sibling fields showing the target label must not
     // pre-confirm this one. With no recognized field wrapper, fall back to the
@@ -7867,10 +8659,32 @@ _CUSTOM_SELECT_COMMITTED_STATE_JS = r"""
     const scopeCandidates = scopeSelectors
         .map((selector) => anchor.closest?.(selector))
         .filter(Boolean);
+    // Some combobox libraries render the committed value beside the input, invisible to
+    // input-value read-back.
+    if (allowSingleValueScope && anchorIsComboboxInput) {
+        let ancestor = anchor.parentElement;
+        for (let hops = 1; ancestor && hops <= 4; hops += 1, ancestor = ancestor.parentElement) {
+            const triggers = ancestor.querySelectorAll?.(triggerSelector);
+            if (
+                ancestor.querySelector?.(singleValueSelector)
+                && triggers?.length === 1
+                && (triggers[0] === anchor || anchor.contains?.(triggers[0]))
+            ) {
+                scopeCandidates.push(ancestor);
+                break;
+            }
+        }
+    }
     const scopeRoot = (
         scopeCandidates.reduce((closest, el) => (!closest || closest.contains(el) ? el : closest), null)
         || anchor
     );
+    const expandedState = anchor.getAttribute?.("aria-expanded")
+        || anchor.closest?.("[aria-expanded]")?.getAttribute("aria-expanded");
+    // While the widget reports open, every reflected surface (tokens, single-value nodes,
+    // hidden inputs, trigger text) can mirror the typed filter rather than a commitment;
+    // the strict posture trusts read-back only once closed.
+    const strictReflectionClosed = !(allowSingleValueScope && anchorIsComboboxInput) || expandedState === "false";
     const tokenSelectors = [
         ...(allowAriaSelectedOptionTokens ? ["[role='option'][aria-selected='true']"] : []),
         "[data-automation-id='selectedItem']",
@@ -7878,18 +8692,34 @@ _CUSTOM_SELECT_COMMITTED_STATE_JS = r"""
         ".chip",
         "[class*='token']"
     ].join(",");
-    for (const token of scopeRoot.querySelectorAll(tokenSelectors)) {
-        if (matchesExpected(token.textContent) || matchesExpected(token.getAttribute("aria-label"))) return true;
+    if (strictReflectionClosed) {
+        for (const token of scopeRoot.querySelectorAll(tokenSelectors)) {
+            if (matchesExpected(token.textContent) || matchesExpected(token.getAttribute("aria-label"))) {
+                return {matched: true, branch: "scope_token"};
+            }
+        }
     }
-    for (const hidden of scopeRoot.querySelectorAll("input[type='hidden']")) {
-        if (matchesExpected(hidden.value)) return true;
+    if (strictReflectionClosed && allowSingleValueScope && anchorIsComboboxInput) {
+        for (const singleValue of scopeRoot.querySelectorAll(singleValueSelector)) {
+            if (
+                matchesExpected(singleValue.textContent)
+                || matchesExpected(singleValue.getAttribute("aria-label"))
+            ) {
+                return {matched: true, branch: "scope_single_value"};
+            }
+        }
+    }
+    if (strictReflectionClosed) {
+        for (const hidden of scopeRoot.querySelectorAll("input[type='hidden']")) {
+            if (matchesExpected(hidden.value)) return {matched: true, branch: "scope_hidden_input"};
+        }
     }
     const activeId = anchor.getAttribute?.("aria-activedescendant");
-    if (allowAriaSelectedOptionTokens && activeId) {
+    if (strictReflectionClosed && allowAriaSelectedOptionTokens && activeId) {
         const active = scopeRoot.querySelector(`#${CSS.escape(activeId)}`);
         if (active && active.getAttribute("aria-selected") === "true") {
             if (matchesExpected(active.textContent) || matchesExpected(active.getAttribute("aria-label"))) {
-                return true;
+                return {matched: true, branch: "scope_token"};
             }
         }
     }
@@ -7906,26 +8736,28 @@ _CUSTOM_SELECT_COMMITTED_STATE_JS = r"""
         ...(scopeRoot.matches?.(triggerSelector) ? [scopeRoot] : []),
         ...scopeRoot.querySelectorAll(triggerSelector)
     ];
-    for (const el of triggerCandidates) {
-        if (!el || seen.has(el) || !scopeRoot.contains(el)) continue;
-        seen.add(el);
-        if (reflectedValues(el).some(matchesExpected)) return true;
+    if (strictReflectionClosed) {
+        for (const el of triggerCandidates) {
+            if (!el || seen.has(el) || !scopeRoot.contains(el)) continue;
+            seen.add(el);
+            if (reflectedValues(el).some(matchesExpected)) {
+                return {matched: true, branch: "scope_trigger_text"};
+            }
+        }
     }
     // A combobox <input> may still hold the user-typed filter text; raw value equality alone is not
     // a committed signal. Only trust it when the dropdown has closed (aria-expanded=false).
     if (anchorIsComboboxInput) {
         const valueMatches = matchesExpected(anchor.value) || matchesExpected(anchor.getAttribute("value"));
-        if (valueMatches) {
-            const expanded = anchor.getAttribute("aria-expanded")
-                || anchor.closest?.("[aria-expanded]")?.getAttribute("aria-expanded");
-            if (expanded === "false") return true;
+        if (valueMatches && expandedState === "false") {
+            return {matched: true, branch: "scope_input_value"};
         }
-        return false;
+        return {matched: false, branch: "none"};
     }
     for (const el of seen) {
-        if (reflectedValues(el).some((value) => normalize(value))) return false;
+        if (reflectedValues(el).some((value) => normalize(value))) return {matched: false, branch: "none"};
     }
-    return false;
+    return {matched: false, branch: "none"};
 }
 """
 
@@ -7986,9 +8818,10 @@ async def _custom_select_scope_confirms_committed(
     matched_label: str | None,
     expected_label: str,
     allow_aria_selected_option_tokens: bool,
-) -> bool:
+    allow_single_value_scope: bool,
+) -> tuple[bool, str]:
     if readback_scope_element is None:
-        return False
+        return False, "none"
 
     try:
         committed = await _evaluate_element_scoped(
@@ -7998,6 +8831,7 @@ async def _custom_select_scope_confirms_committed(
                 "expectedLabel": expected_label,
                 "anchorIsComboboxInput": anchor_is_combobox_input,
                 "allowAriaSelectedOptionTokens": allow_aria_selected_option_tokens,
+                "allowSingleValueScope": allow_single_value_scope,
             },
         )
     except Exception:
@@ -8007,9 +8841,11 @@ async def _custom_select_scope_confirms_committed(
             matched_label=matched_label,
             exc_info=True,
         )
-        return False
+        return False, "none"
 
-    return committed is True
+    if not isinstance(committed, dict):
+        return False, "none"
+    return bool(committed.get("matched")), str(committed.get("branch") or "none")
 
 
 async def _verify_custom_select_option(
@@ -8019,13 +8855,19 @@ async def _verify_custom_select_option(
     anchor_is_combobox_input: bool,
     matched_element_id: str,
     matched_label: str | None,
-) -> bool:
+    use_strict_verification: bool,
+) -> tuple[bool, str]:
     expected_label = _normalize_select_shadow_text(matched_label)
     if not expected_label:
-        return False
+        return False, "none"
 
-    if _custom_select_matched_state_confirms(await _read_custom_select_matched_state(matched_element), expected_label):
-        return True
+    matched_state_confirms = (
+        _custom_select_matched_state_confirms_pre_click
+        if use_strict_verification
+        else _custom_select_matched_state_confirms
+    )
+    if matched_state_confirms(await _read_custom_select_matched_state(matched_element), expected_label):
+        return True, "matched_state"
 
     return await _custom_select_scope_confirms_committed(
         readback_scope_element=readback_scope_element,
@@ -8033,10 +8875,14 @@ async def _verify_custom_select_option(
         matched_element_id=matched_element_id,
         matched_label=matched_label,
         expected_label=expected_label,
-        allow_aria_selected_option_tokens=True,
+        allow_aria_selected_option_tokens=not use_strict_verification,
+        allow_single_value_scope=use_strict_verification,
     )
 
 
+# input_text_converted is excluded: its anchor is frequently not an <input>, so the reset path that
+# contains an unverified click does not exist for it.
+_EXECUTABLE_CUSTOM_SELECT_ENTRIES = ("select_option", "input_text")
 _CUSTOM_SELECT_VERIFY_SETTLE_RETRY_DELAYS_SECONDS = (0.15, 0.15)
 
 
@@ -8047,7 +8893,8 @@ async def _verify_custom_select_option_with_settle(
     anchor_is_combobox_input: bool,
     matched_element_id: str,
     matched_label: str | None,
-) -> bool:
+    use_strict_verification: bool,
+) -> tuple[bool, str]:
     """Retry the read-back a couple of times before giving up.
 
     Some frameworks commit ``aria-selected``/trigger-text reflection on the next render tick
@@ -8057,15 +8904,17 @@ async def _verify_custom_select_option_with_settle(
     for delay_seconds in (0.0, *_CUSTOM_SELECT_VERIFY_SETTLE_RETRY_DELAYS_SECONDS):
         if delay_seconds:
             await asyncio.sleep(delay_seconds)
-        if await _verify_custom_select_option(
+        verified, branch = await _verify_custom_select_option(
             matched_element=matched_element,
             readback_scope_element=readback_scope_element,
             anchor_is_combobox_input=anchor_is_combobox_input,
             matched_element_id=matched_element_id,
             matched_label=matched_label,
-        ):
-            return True
-    return False
+            use_strict_verification=use_strict_verification,
+        )
+        if verified:
+            return True, branch
+    return False, "none"
 
 
 async def _resolve_custom_select_readback_scope_element(
@@ -8117,7 +8966,17 @@ def _terminal_custom_select_failure(
         "Deterministic custom-select click could not be verified by matched element read-back",
     )
     action_failure.skip_remaining_actions = True
+    action_failure.data = {"_terminal_custom_select_failure": True}
     return action_failure, matched_label
+
+
+def _is_terminal_custom_select_failure(action_result: ActionResult | None) -> bool:
+    return (
+        isinstance(action_result, ActionFailure)
+        and bool(action_result.skip_remaining_actions)
+        and isinstance(action_result.data, dict)
+        and action_result.data.get("_terminal_custom_select_failure") is True
+    )
 
 
 async def _select_deterministic_custom_option(
@@ -8135,13 +8994,22 @@ async def _select_deterministic_custom_option(
     selection_group_id: str | None = None,
     select_depth: int = 0,
     on_click_attempted: Callable[[], None] | None = None,
+    on_reset_fallback: Callable[[Callable[[CustomSelectFamilyOutcome], None]], None] | None = None,
+    engine_selection: BrowserEngineSelection | None = UNSET_SELECTION,
 ) -> tuple[ActionResult, str | None] | None:
+    if engine_selection is UNSET_SELECTION:
+        engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
+
     started_at = time.monotonic()
     selection_group_id = selection_group_id or str(uuid.uuid4())
     option_count: int | None = None
     eligible = False
     match_tier: str | None = None
     attempted = False
+    # emit can run before these values are otherwise assigned and swallows exceptions, so initialize
+    # both before the closure is defined.
+    anchor_is_combobox_input = False
+    verify_branch: str | None = None
     click_attempted = False
     script_mode_run = False
 
@@ -8167,10 +9035,15 @@ async def _select_deterministic_custom_option(
                 option_count=option_count,
                 attempted=attempted,
                 click_attempted=click_attempted,
+                anchor_is_combobox_input=anchor_is_combobox_input,
+                verify_branch=verify_branch,
                 verified_success=outcome
                 in {CustomSelectFamilyOutcome.success_precommit, CustomSelectFamilyOutcome.success_verified},
                 outcome=outcome.value,
-                llm_fallback_requested=outcome.value.startswith("llm_fallback_"),
+                llm_fallback_requested=(
+                    outcome.value.startswith("llm_fallback_")
+                    or outcome == CustomSelectFamilyOutcome.terminal_llm_fallback_exception
+                ),
                 duration_ms=int((time.monotonic() - started_at) * 1000),
             )
         except Exception:
@@ -8240,7 +9113,6 @@ async def _select_deterministic_custom_option(
         return None
 
     readback_scope_element: SkyvernElement | None = None
-    anchor_is_combobox_input = False
     try:
         selected_element = await get_skyvern_element(element_id)
         if await selected_element.get_attr("role") == "listbox":
@@ -8264,20 +9136,29 @@ async def _select_deterministic_custom_option(
             matched_label=matched_label,
         )
         anchor_is_combobox_input = await _anchor_is_combobox_input(readback_scope_element)
+        allow_single_value_scope = (
+            entry_action_type in _EXECUTABLE_CUSTOM_SELECT_ENTRIES and entry_action_type != "select_option"
+        )
+
+        if entry_action_type == "input_text" and not anchor_is_combobox_input:
+            execute = False
 
         expected_label = _normalize_select_shadow_text(matched_label)
         if expected_label:
             if _custom_select_matched_state_confirms_pre_click(matched_state, expected_label):
+                verify_branch = "matched_state"
                 emit(CustomSelectFamilyOutcome.success_precommit)
                 return ActionSuccess(), matched_label
-            if await _custom_select_scope_confirms_committed(
+            committed, verify_branch = await _custom_select_scope_confirms_committed(
                 readback_scope_element=readback_scope_element,
                 anchor_is_combobox_input=anchor_is_combobox_input,
                 matched_element_id=element_id,
                 matched_label=matched_label,
                 expected_label=expected_label,
                 allow_aria_selected_option_tokens=False,
-            ):
+                allow_single_value_scope=allow_single_value_scope,
+            )
+            if committed:
                 emit(CustomSelectFamilyOutcome.success_precommit)
                 return ActionSuccess(), matched_label
 
@@ -8286,18 +9167,34 @@ async def _select_deterministic_custom_option(
             return None
 
         await selected_element.scroll_into_view()
+        # Captured before the click: the click itself can mutate the anchor, and the reset must
+        # restore the pre-click text, not the mutation.
+        pre_click_anchor_value: str | None = None
+        if allow_single_value_scope and anchor_is_combobox_input and readback_scope_element is not None:
+            pre_click_anchor_value = await get_input_value(
+                readback_scope_element.get_tag_name(),
+                readback_scope_element.get_locator(),
+                engine_selection=engine_selection,
+            )
+            if pre_click_anchor_value is None:
+                LOG.info(
+                    "Anchor value unreadable before deterministic click; falling back to LLM path",
+                    target_value=target_value,
+                    matched_element_id=element_id,
+                )
+                emit(CustomSelectFamilyOutcome.llm_fallback_pre_click_error)
+                return None
         click_attempted = True
         if on_click_attempted is not None:
             on_click_attempted()
-        await selected_element.click(
-            page=page, engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
-        )
-        verified = await _verify_custom_select_option_with_settle(
+        await selected_element.click(page=page, engine_selection=engine_selection)
+        verified, verify_branch = await _verify_custom_select_option_with_settle(
             matched_element=selected_element,
             readback_scope_element=readback_scope_element,
             anchor_is_combobox_input=anchor_is_combobox_input,
             matched_element_id=element_id,
             matched_label=matched_label,
+            use_strict_verification=anchor_is_combobox_input and allow_single_value_scope,
         )
         if verified:
             emit(CustomSelectFamilyOutcome.success_verified)
@@ -8329,16 +9226,20 @@ async def _select_deterministic_custom_option(
         reset_verified = await _reset_custom_select_combobox_input(
             readback_scope_element,
             page,
-            engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER),
+            engine_selection=engine_selection,
+            restore_value=pre_click_anchor_value if entry_action_type != "select_option" else None,
         )
         if reset_verified:
+            if on_reset_fallback is not None:
+                on_reset_fallback(emit)
+            else:
+                emit(CustomSelectFamilyOutcome.llm_fallback_reset_verified)
             LOG.info(
                 "Deterministic custom-select read-back inconclusive on combobox input; routing to LLM fallback",
                 target_value=target_value,
                 matched_element_id=element_id,
                 matched_label=matched_label,
             )
-            emit(CustomSelectFamilyOutcome.llm_fallback_reset_verified)
             return None
         LOG.info(
             "Deterministic custom-select combobox reset failed; returning failure to avoid replaying over mutated widget",
@@ -8373,6 +9274,7 @@ async def _reset_custom_select_combobox_input(
     element: SkyvernElement | None,
     page: Page,
     engine_selection: BrowserEngineSelection | None = None,
+    restore_value: str | None = None,
 ) -> bool:
     if element is None:
         return False
@@ -8380,7 +9282,16 @@ async def _reset_custom_select_combobox_input(
         locator = element.get_locator()
         await locator.fill("")
         await element.click(page=page, engine_selection=engine_selection)
-        return await get_input_value(element.get_tag_name(), locator, engine_selection=engine_selection) == ""
+        reset_verified = await get_input_value(element.get_tag_name(), locator, engine_selection=engine_selection) == ""
+        if not reset_verified:
+            return False
+        if restore_value:
+            await locator.fill(restore_value)
+            return (
+                await get_input_value(element.get_tag_name(), locator, engine_selection=engine_selection)
+                == restore_value
+            )
+        return True
     except Exception:
         LOG.info(
             "Failed to reset custom-select combobox input before LLM fallback",
@@ -8445,12 +9356,15 @@ async def select_from_emerging_elements(
     entry_action_type: str = "select_option",
     scraped_page_after_open: ScrapedPage | None = None,
     new_interactable_element_ids: list[str] | None = None,
+    engine_selection: BrowserEngineSelection | None = UNSET_SELECTION,
 ) -> ActionResult:
     """
     This is the function to select an element from the new showing elements.
     Currently mainly used for the dropdown menu selection.
     """
 
+    if engine_selection is UNSET_SELECTION:
+        engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
     selection_group_id = str(uuid.uuid4())
     # TODO: support to handle the case when options are loaded by scroll
     scraped_page_after_open = scraped_page_after_open or await scraped_page.generate_scraped_page_without_screenshots()
@@ -8531,6 +9445,7 @@ async def select_from_emerging_elements(
         selection_group_id=selection_group_id,
         select_depth=0,
         on_click_attempted=_mark_widget_mutated,
+        engine_selection=engine_selection,
     )
     if deterministic_result is not None:
         action_result, _matched_label = deterministic_result
@@ -8550,7 +9465,9 @@ async def select_from_emerging_elements(
     )
     LOG.info("Calling LLM to find the match element", sampling=True)
 
-    json_response = await app.CUSTOM_SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
+    json_response = await get_org_aware_secondary_llm_api_handler(default=app.CUSTOM_SELECT_AGENT_LLM_API_HANDLER)(
+        prompt=prompt, step=step, prompt_name="custom-select"
+    )
     value: str | None = json_response.get("value", None)
     LOG.info(
         "LLM response for the matched element",
@@ -8594,16 +9511,24 @@ async def select_from_emerging_elements(
 
     if value is not None and action_type == ActionType.INPUT_TEXT:
         actual_value = get_actual_value_of_parameter_if_secret_with_task(task, value)
+        is_dropdown_secret_value = actual_value != value
+        is_dropdown_totp_value = _is_totp_sentinel(actual_value)
         LOG.info(
             "No clickable option found, but found input element to search",
             element_id=element_id,
         )
         input_element = await dom_after_open.get_skyvern_element_by_id(element_id)
         await input_element.scroll_into_view()
+        await _apply_secret_visual_mask_if_needed(
+            input_element,
+            workflow_run_id=task.workflow_run_id,
+            is_secret_value=is_dropdown_secret_value,
+            is_totp_value=is_dropdown_totp_value,
+        )
         current_text = await get_input_value(
             input_element.get_tag_name(),
             input_element.get_locator(),
-            engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER),
+            engine_selection=engine_selection,
         )
         if current_text == actual_value:
             return ActionSuccess()
@@ -8625,9 +9550,7 @@ async def select_from_emerging_elements(
             return ActionFailure(exception=InteractWithDropdownContainer(element_id=element_id))
 
     await selected_element.scroll_into_view()
-    await selected_element.click(
-        page=page, engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
-    )
+    await selected_element.click(page=page, engine_selection=engine_selection)
     return ActionSuccess()
 
 
@@ -8691,19 +9614,52 @@ async def select_from_dropdown(
             )
 
     trimmed_element_tree = await incremental_scraped.get_incremental_element_tree(
-        clean_and_remove_element_tree_factory(task=task, step=step, check_filter_funcs=check_filter_funcs),
+        clean_and_remove_element_tree_factory(
+            task=task,
+            step=step,
+            check_filter_funcs=check_filter_funcs,
+            engine_selection=skyvern_frame.engine_selection,
+        ),
     )
     incremental_scraped.set_element_tree_trimmed(trimmed_element_tree)
     html = incremental_scraped.build_element_tree(html_need_skyvern_attrs=True)
 
     widget_mutated = False
+    post_reset_fallback = False
+    post_reset_fallback_emit: Callable[[CustomSelectFamilyOutcome], None] | None = None
+    selection_group_id = selection_group_id or str(uuid.uuid4())
 
     def _mark_widget_mutated() -> None:
         nonlocal widget_mutated
         widget_mutated = True
 
+    def _mark_post_reset_fallback(emit: Callable[[CustomSelectFamilyOutcome], None]) -> None:
+        nonlocal post_reset_fallback, post_reset_fallback_emit
+        post_reset_fallback = True
+        post_reset_fallback_emit = emit
+
+    def _emit_post_reset_fallback_outcome(outcome: CustomSelectFamilyOutcome) -> None:
+        if post_reset_fallback_emit is not None:
+            post_reset_fallback_emit(outcome)
+
+    def _terminal_post_reset_fallback_result() -> CustomSingleSelectResult:
+        _emit_post_reset_fallback_outcome(CustomSelectFamilyOutcome.terminal_llm_fallback_exception)
+        action_failure, _ = _terminal_custom_select_failure(
+            target_value=target_value,
+            matched_label=single_select_result.value,
+        )
+        single_select_result.reasoning = "LLM fallback failed after deterministic combobox reset"
+        single_select_result.value = single_select_result.value or target_value
+        single_select_result.action_type = ActionType.CLICK
+        single_select_result.action_result = action_failure
+        return single_select_result
+
+    def _proceeded_post_reset_fallback_result() -> CustomSingleSelectResult:
+        _emit_post_reset_fallback_outcome(CustomSelectFamilyOutcome.llm_fallback_reset_verified)
+        return single_select_result
+
     deterministic_result = await _select_deterministic_custom_option(
-        execute=entry_action_type == "select_option",
+        execute=entry_action_type in _EXECUTABLE_CUSTOM_SELECT_ENTRIES,
         target_value=target_value,
         get_option_candidates=lambda: _custom_select_candidates_from_elements(trimmed_element_tree),
         field_context=context.model_dump(),
@@ -8713,9 +9669,15 @@ async def select_from_dropdown(
         task=task,
         step=step,
         entry_action_type=entry_action_type,
-        selection_group_id=selection_group_id or str(uuid.uuid4()),
+        selection_group_id=selection_group_id,
         select_depth=len(select_history),
         on_click_attempted=_mark_widget_mutated,
+        on_reset_fallback=(
+            _mark_post_reset_fallback
+            if entry_action_type in _EXECUTABLE_CUSTOM_SELECT_ENTRIES and entry_action_type != "select_option"
+            else None
+        ),
+        engine_selection=skyvern_frame.engine_selection,
     )
     if deterministic_result is not None:
         action_result, matched_label = deterministic_result
@@ -8728,163 +9690,206 @@ async def select_from_dropdown(
         return single_select_result
 
     skyvern_context = ensure_context()
-    prompt = prompt_engine.load_prompt(
-        "custom-select",
-        is_date_related=context.is_date_related,
-        field_information=context.field if not context.intention else context.intention,
-        required_field=context.is_required,
-        target_value=target_value,
-        navigation_goal=task.navigation_goal,
-        navigation_payload_str=json.dumps(task.navigation_payload),
-        elements=html,
-        select_history=json.dumps(build_sequential_select_history(select_history)) if select_history else "",
-        local_datetime=datetime.now(skyvern_context.tz_info).isoformat(),
-    )
-
-    LOG.info("Calling LLM to find the match element", sampling=True)
-    json_response = await app.CUSTOM_SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
-    value: str | None = json_response.get("value", None)
-    single_select_result.value = value
-    select_reason: str | None = json_response.get("reasoning", None)
-    single_select_result.reasoning = select_reason
-
-    LOG.info(
-        "LLM response for the matched element",
-        sampling=True,
-        matched_value=value,
-        response=json_response,
-    )
-
-    # Check the no-match shape before ``ActionType`` coercion — coercing an empty
-    # string raises ValueError and would mask the OPTION_NOT_AVAILABLE signal.
-    raw_action_type: str = (json_response.get("action_type") or "").lower()
-    element_id: str | None = json_response.get("id", None)
-    _log_select_shadow_match(
-        prompt_name="custom-select/dropdown",
-        target_value=target_value,
-        get_candidates=lambda: _select_shadow_candidates_from_elements(trimmed_element_tree),
-        agreement=lambda candidates, matched_index: _select_shadow_agrees_with_element_choice(
-            candidates,
-            matched_index,
-            llm_element_id=element_id,
-            llm_value=value,
-        ),
-    )
-    if not element_id or raw_action_type not in (ActionType.CLICK.value, ActionType.INPUT_TEXT.value):
-        raise _no_match_exception_for_dropdown(
-            reasoning=json_response.get("reasoning"),
+    try:
+        prompt = prompt_engine.load_prompt(
+            "custom-select",
+            is_date_related=context.is_date_related,
+            field_information=context.field if not context.intention else context.intention,
+            required_field=context.is_required,
             target_value=target_value,
-            observed_options=_collect_option_texts(trimmed_element_tree),
-            transient_fallback_element_id=skyvern_element.get_id(),
-            widget_mutated=widget_mutated,
+            navigation_goal=task.navigation_goal,
+            navigation_payload_str=json.dumps(task.navigation_payload),
+            elements=html,
+            select_history=json.dumps(build_sequential_select_history(select_history)) if select_history else "",
+            local_datetime=datetime.now(skyvern_context.tz_info).isoformat(),
         )
-    single_select_result.action_type = ActionType(raw_action_type)
-    action_type = single_select_result.action_type
+        LOG.info("Calling LLM to find the match element", sampling=True)
+        json_response = await get_org_aware_secondary_llm_api_handler(default=app.CUSTOM_SELECT_AGENT_LLM_API_HANDLER)(
+            prompt=prompt,
+            step=step,
+            prompt_name="custom-select",
+        )
 
-    if not force_select and target_value:
-        if not json_response.get("relevant", False):
+        if post_reset_fallback and not isinstance(json_response, dict):
+            raise TypeError("Custom-select LLM response must be a dictionary")
+        value: str | None = json_response.get("value", None)
+        single_select_result.value = value
+        select_reason: str | None = json_response.get("reasoning", None)
+        single_select_result.reasoning = select_reason
+
+        LOG.info(
+            "LLM response for the matched element",
+            sampling=True,
+            matched_value=value,
+            response=json_response,
+        )
+
+        # Check the no-match shape before ``ActionType`` coercion — coercing an empty
+        # string raises ValueError and would mask the OPTION_NOT_AVAILABLE signal.
+        raw_action_type: str = (json_response.get("action_type") or "").lower()
+        element_id: str | None = json_response.get("id", None)
+        _log_select_shadow_match(
+            prompt_name="custom-select/dropdown",
+            target_value=target_value,
+            get_candidates=lambda: _select_shadow_candidates_from_elements(trimmed_element_tree),
+            agreement=lambda candidates, matched_index: _select_shadow_agrees_with_element_choice(
+                candidates,
+                matched_index,
+                llm_element_id=element_id,
+                llm_value=value,
+            ),
+        )
+        if not element_id or raw_action_type not in (ActionType.CLICK.value, ActionType.INPUT_TEXT.value):
+            raise _no_match_exception_for_dropdown(
+                reasoning=json_response.get("reasoning"),
+                target_value=target_value,
+                observed_options=_collect_option_texts(trimmed_element_tree),
+                transient_fallback_element_id=skyvern_element.get_id(),
+                widget_mutated=widget_mutated,
+            )
+        single_select_result.action_type = ActionType(raw_action_type)
+        action_type = single_select_result.action_type
+
+        if not force_select and target_value and not json_response.get("relevant", False):
             LOG.info(
                 "The selected option is not relevant to the target value",
                 element_id=element_id,
             )
+            if post_reset_fallback:
+                return _terminal_post_reset_fallback_result()
             return single_select_result
 
-    if value is not None and action_type == ActionType.INPUT_TEXT:
-        LOG.info(
-            "No clickable option found, but found input element to search",
-            element_id=element_id,
-        )
-        try:
-            actual_value = get_actual_value_of_parameter_if_secret_with_task(task, value)
-            input_element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
-            await input_element.scroll_into_view()
-            current_text = await get_input_value(
-                input_element.get_tag_name(),
-                input_element.get_locator(),
-                engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER),
+        # A value-less or empty-value input_text response would either clear the anchor and type
+        # nothing, or fall through to a click that focuses without committing — never a post-reset
+        # success.
+        if post_reset_fallback and action_type == ActionType.INPUT_TEXT and not value:
+            return _terminal_post_reset_fallback_result()
+
+        if value is not None and action_type == ActionType.INPUT_TEXT:
+            LOG.info(
+                "No clickable option found, but found input element to search",
+                element_id=element_id,
             )
-            if current_text == actual_value:
-                single_select_result.action_result = ActionSuccess()
-                return single_select_result
-
-            if await input_element.is_readonly(dynamic=True):
-                LOG.warning(
-                    "Try to input text on a readonly element",
-                    element_id=element_id,
-                    task_id=task.task_id,
-                    step_id=step.step_id,
+            try:
+                actual_value = get_actual_value_of_parameter_if_secret_with_task(task, value)
+                is_dropdown_secret_value = actual_value != value
+                is_dropdown_totp_value = _is_totp_sentinel(actual_value)
+                input_element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
+                await input_element.scroll_into_view()
+                await _apply_secret_visual_mask_if_needed(
+                    input_element,
+                    workflow_run_id=task.workflow_run_id,
+                    is_secret_value=is_dropdown_secret_value,
+                    is_totp_value=is_dropdown_totp_value,
                 )
-                single_select_result.action_result = ActionFailure(InputToReadonlyElement(element_id=element_id))
+                current_text = await get_input_value(
+                    input_element.get_tag_name(),
+                    input_element.get_locator(),
+                    engine_selection=skyvern_frame.engine_selection,
+                )
+                if current_text == actual_value and not post_reset_fallback:
+                    single_select_result.action_result = ActionSuccess()
+                    return single_select_result
+
+                if await input_element.is_readonly(dynamic=True):
+                    LOG.warning(
+                        "Try to input text on a readonly element",
+                        element_id=element_id,
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                    )
+                    single_select_result.action_result = ActionFailure(InputToReadonlyElement(element_id=element_id))
+                    if post_reset_fallback:
+                        return _terminal_post_reset_fallback_result()
+                    return single_select_result
+
+                await input_element.input_clear()
+                await input_element.input_sequentially(actual_value)
+                single_select_result.action_result = ActionSuccess()
+                return _proceeded_post_reset_fallback_result()
+            except Exception as e:
+                single_select_result.action_result = ActionFailure(exception=e)
+                if post_reset_fallback:
+                    return _terminal_post_reset_fallback_result()
                 return single_select_result
 
-            await input_element.input_clear()
-            await input_element.input_sequentially(actual_value)
+        try:
+            selected_element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
+            # TODO Some popup dropdowns include <select> element, we only handle the <select> element now, to prevent infinite recursion. Need to support more types of dropdowns.
+            if selected_element.get_tag_name() == InteractiveElement.SELECT and value:
+                await selected_element.scroll_into_view()
+                action = SelectOptionAction(
+                    reasoning=select_reason,
+                    element_id=element_id,
+                    option=SelectOption(label=value),
+                    input_or_select_context=context,
+                )
+                results = await normal_select(
+                    action=action,
+                    skyvern_element=selected_element,
+                    task=task,
+                    step=step,
+                    builder=incremental_scraped,
+                    engine_selection=skyvern_frame.engine_selection,
+                )
+                assert len(results) > 0
+                single_select_result.action_result = results[0]
+                if post_reset_fallback and not isinstance(results[0], ActionSuccess):
+                    return _terminal_post_reset_fallback_result()
+                return _proceeded_post_reset_fallback_result()
+
+            if await selected_element.get_attr("role") == "listbox":
+                single_select_result.action_result = ActionFailure(
+                    exception=InteractWithDropdownContainer(element_id=element_id)
+                )
+                if post_reset_fallback:
+                    return _terminal_post_reset_fallback_result()
+                return single_select_result
+
+            await selected_element.scroll_into_view()
+            await selected_element.click(
+                page=page,
+                timeout=timeout,
+                engine_selection=skyvern_frame.engine_selection,
+            )
             single_select_result.action_result = ActionSuccess()
+            return _proceeded_post_reset_fallback_result()
+        except (MissingElement, MissingElementDict, MissingElementInCSSMap, MultipleElementsFound):
+            if not value:
+                raise
+
+        # sometimes we have multiple elements pointed to the same value,
+        # but only one option is clickable on the page
+        LOG.debug(
+            "Searching option with the same value in incremental elements",
+            value=value,
+            elements=incremental_scraped.element_tree,
+        )
+        locator = await incremental_scraped.select_one_element_by_value(value=value)
+        if not locator:
+            single_select_result.action_result = ActionFailure(exception=MissingElement())
+            if post_reset_fallback:
+                return _terminal_post_reset_fallback_result()
             return single_select_result
+
+        try:
+            LOG.info(
+                "Find an alternative option with the same value. Try to select the option.",
+                value=value,
+            )
+            await EventStrategyFactory.move_to_element(page, locator)
+            await locator.click(timeout=timeout)
+            single_select_result.action_result = ActionSuccess()
+            return _proceeded_post_reset_fallback_result()
         except Exception as e:
             single_select_result.action_result = ActionFailure(exception=e)
+            if post_reset_fallback:
+                return _terminal_post_reset_fallback_result()
             return single_select_result
-
-    try:
-        selected_element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
-        # TODO Some popup dropdowns include <select> element, we only handle the <select> element now, to prevent infinite recursion. Need to support more types of dropdowns.
-        if selected_element.get_tag_name() == InteractiveElement.SELECT and value:
-            await selected_element.scroll_into_view()
-            action = SelectOptionAction(
-                reasoning=select_reason,
-                element_id=element_id,
-                option=SelectOption(label=value),
-                input_or_select_context=context,
-            )
-            results = await normal_select(
-                action=action, skyvern_element=selected_element, task=task, step=step, builder=incremental_scraped
-            )
-            assert len(results) > 0
-            single_select_result.action_result = results[0]
-            return single_select_result
-
-        if await selected_element.get_attr("role") == "listbox":
-            single_select_result.action_result = ActionFailure(
-                exception=InteractWithDropdownContainer(element_id=element_id)
-            )
-            return single_select_result
-
-        await selected_element.scroll_into_view()
-        await selected_element.click(
-            page=page,
-            timeout=timeout,
-            engine_selection=resolve_engine_selection_for_task(task, app.BROWSER_MANAGER),
-        )
-        single_select_result.action_result = ActionSuccess()
-        return single_select_result
-    except (MissingElement, MissingElementDict, MissingElementInCSSMap, MultipleElementsFound):
-        if not value:
-            raise
-
-    # sometimes we have multiple elements pointed to the same value,
-    # but only one option is clickable on the page
-    LOG.debug(
-        "Searching option with the same value in incremental elements",
-        value=value,
-        elements=incremental_scraped.element_tree,
-    )
-    locator = await incremental_scraped.select_one_element_by_value(value=value)
-    if not locator:
-        single_select_result.action_result = ActionFailure(exception=MissingElement())
-        return single_select_result
-
-    try:
-        LOG.info(
-            "Find an alternative option with the same value. Try to select the option.",
-            value=value,
-        )
-        await EventStrategyFactory.move_to_element(page, locator)
-        await locator.click(timeout=timeout)
-        single_select_result.action_result = ActionSuccess()
-        return single_select_result
-    except Exception as e:
-        single_select_result.action_result = ActionFailure(exception=e)
-        return single_select_result
+    except Exception:
+        if post_reset_fallback:
+            return _terminal_post_reset_fallback_result()
+        raise
 
 
 def _no_element_matched_failure(value: str, reason: str) -> ActionFailure:
@@ -8906,7 +9911,10 @@ async def select_from_dropdown_by_value(
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
     await incremental_scraped.get_incremental_element_tree(
         clean_and_remove_element_tree_factory(
-            task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
+            task=task,
+            step=step,
+            check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+            engine_selection=skyvern_frame.engine_selection,
         ),
     )
 
@@ -8943,7 +9951,10 @@ async def select_from_dropdown_by_value(
     async def continue_callback(incre_scraped: IncrementalScrapePage) -> bool:
         await incre_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
-                task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
+                task=task,
+                step=step,
+                check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
+                engine_selection=skyvern_frame.engine_selection,
             ),
         )
 
@@ -9069,7 +10080,9 @@ async def locate_dropdown_menu(
         x, y = await skyvern_frame.get_scroll_x_y()
         try:
             screenshot = await take_element_screenshot(
-                head_element.get_locator(), timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS
+                head_element.get_locator(),
+                timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS,
+                engine_selection=skyvern_frame.engine_selection,
             )
         except FailedToTakeScreenshot:
             LOG.debug(
@@ -9090,7 +10103,7 @@ async def locate_dropdown_menu(
             "Confirm if it's an opened dropdown menu",
             element=element_dict,
         )
-        json_response = await app.SECONDARY_LLM_API_HANDLER(
+        json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
             prompt=dropdown_confirm_prompt, screenshots=[screenshot], step=step, prompt_name="opened-dropdown-confirm"
         )
         is_opened_dropdown_menu = json_response.get("is_opened_dropdown_menu")
@@ -9209,6 +10222,7 @@ async def normal_select(
     task: Task,
     step: Step,
     builder: ElementTreeBuilder,
+    engine_selection: BrowserEngineSelection | None = UNSET_SELECTION,
 ) -> List[ActionResult]:
     collapse_select_fanout_enabled = await _is_collapse_select_fanout_enabled(task)
     if not collapse_select_fanout_enabled:
@@ -9228,8 +10242,10 @@ async def normal_select(
     input_or_select_context = await _get_input_or_select_context(
         action=action,
         element_tree_builder=builder,
+        task=task,
         step=step,
         skyvern_element=skyvern_element,
+        engine_selection=engine_selection,
     )
     LOG.debug(
         "Parsed input/select context",
@@ -9290,7 +10306,9 @@ async def normal_select(
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
 
-    json_response = await app.NORMAL_SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="normal-select")
+    json_response = await get_org_aware_secondary_llm_api_handler(default=app.NORMAL_SELECT_AGENT_LLM_API_HANDLER)(
+        prompt=prompt, step=step, prompt_name="normal-select"
+    )
     index: int | None = json_response.get("index")
     value: str | None = json_response.get("value")
     _log_select_shadow_match(
@@ -9432,7 +10450,8 @@ def _schedule_extraction_shadow_check_for_hit(
     extract_information_prompt: str,
 ) -> None:
     shadow_llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-        llm_key_override, default=app.EXTRACTION_LLM_API_HANDLER
+        llm_key_override,
+        default=get_org_aware_primary_llm_api_handler(default=app.EXTRACTION_LLM_API_HANDLER),
     )
     shadow_schema = task.extracted_information_schema
     # Snapshot screenshots at schedule time — scraped_page is mutable
@@ -9494,6 +10513,8 @@ async def extract_information_for_navigation_goal(
     task: Task,
     step: Step,
     scraped_page: ScrapedPage,
+    *,
+    page: Page,
 ) -> ScrapeResult:
     """
     Scrapes a webpage and returns the scraped response, including:
@@ -9512,6 +10533,15 @@ async def extract_information_for_navigation_goal(
     context.scrape_trigger = "extraction"
     context.scrape_screenshots_consumed = True
     scraped_page_refreshed = await scraped_page.refresh()
+    # Complete-row harvest for a server-windowed virtualized data grid, injected into
+    # the prompt below. Behind an AgentFunction seam (framework-specific collectors are
+    # deployment overrides) and a fail-open boundary so collection never blocks extraction.
+    virtualized_grid_rows: str | None = None
+    try:
+        virtualized_grid_rows = await app.AGENT_FUNCTION.collect_virtualized_grid_rows(task=task, page=page)
+    except Exception:
+        virtualized_grid_rows = None
+        LOG.warning("virtualized_grid_collection_failed")
 
     # task.workflow_permanent_id is None on most fetch paths (tasks table has
     # no such column); fall back to context. SKY-8992.
@@ -9557,7 +10587,11 @@ async def extract_information_for_navigation_goal(
         extracted_text=extracted_text_for_prompt,
         error_code_mapping_str=error_code_mapping_str,
         local_datetime=local_datetime_str,
+        virtualized_grid_rows=virtualized_grid_rows,
     )
+    post_ceiling_grid_rows = post_ceiling_kwargs.get("virtualized_grid_rows")
+    if virtualized_grid_rows is not None and post_ceiling_grid_rows is None:
+        LOG.warning("virtualized_grid_rows_dropped_from_prompt")
 
     # Self-heal guard: on the second retry onward (``retry_index > 1``) the
     # previous attempts' cached result is suspect — the first retry already
@@ -9606,6 +10640,7 @@ async def extract_information_for_navigation_goal(
             previous_extracted_information=post_ceiling_kwargs["previous_extracted_information"],
             llm_key=llm_key_override,
             workflow_system_prompt=task.workflow_system_prompt,
+            virtualized_grid_rows=post_ceiling_grid_rows,
         )
         if is_retry_step:
             # Proactively evict the in-run entry. The cross-run tier will be
@@ -9801,7 +10836,7 @@ async def extract_information_for_navigation_goal(
 
     # Use the appropriate LLM handler based on the feature flag
     llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-        llm_key_override, default=app.EXTRACTION_LLM_API_HANDLER
+        llm_key_override, default=get_org_aware_primary_llm_api_handler(default=app.EXTRACTION_LLM_API_HANDLER)
     )
     json_response = await llm_api_handler(
         prompt=extract_information_prompt,
@@ -9950,13 +10985,17 @@ async def _get_input_or_select_context(
     element_tree_builder: ElementTreeBuilder,
     step: Step,
     ancestor_depth: int = 5,
+    task: Task | None = None,
+    engine_selection: BrowserEngineSelection | None = UNSET_SELECTION,
 ) -> InputOrSelectContext:
     # Early return optimization: if action already has input_or_select_context, use it
     if not isinstance(action, AbstractActionForContextParse) and action.input_or_select_context is not None:
         return action.input_or_select_context
 
     # Ancestor depth optimization: use ancestor element for deep DOM structures
-    skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
+    if engine_selection is UNSET_SELECTION:
+        engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
+    skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame(), engine_selection=engine_selection)
     try:
         depth = await skyvern_frame.get_element_dom_depth(await skyvern_element.get_element_handler())
     except Exception:
@@ -9974,7 +11013,9 @@ async def _get_input_or_select_context(
                     starter=element_handle,
                     frame=skyvern_element.get_frame_id(),
                 )
-                clean_up_func = app.AGENT_FUNCTION.cleanup_element_tree_factory(step=step)
+                clean_up_func = app.AGENT_FUNCTION.cleanup_element_tree_factory(
+                    step=step, engine_selection=engine_selection
+                )
                 element_tree = await clean_up_func(skyvern_element.get_frame(), "", copy.deepcopy(element_tree))
                 element_tree_trimmed = trim_element_tree(copy.deepcopy(element_tree))
                 element_tree_builder = ScrapedPage(
@@ -9998,7 +11039,7 @@ async def _get_input_or_select_context(
         slim_output=slim_output,
     )
     # Use centralized parse-select handler (set at init or via scripts)
-    json_response = await app.PARSE_SELECT_LLM_API_HANDLER(
+    json_response = await get_org_aware_secondary_llm_api_handler(default=app.PARSE_SELECT_LLM_API_HANDLER)(
         prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
     )
 
@@ -10074,7 +11115,7 @@ async def extract_user_defined_errors(
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
         reasoning=reasoning,
     )
-    json_response = await app.EXTRACTION_LLM_API_HANDLER(
+    json_response = await get_org_aware_primary_llm_api_handler(default=app.EXTRACTION_LLM_API_HANDLER)(
         prompt=prompt,
         screenshots=scraped_page_refreshed.screenshots,
         step=step,

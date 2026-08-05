@@ -5,6 +5,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -12,13 +13,10 @@ import {
   CREDENTIAL_REQUIRED_FRAME_BY_REASON,
   CREDENTIAL_REQUIRED_FRAME_MINIMAL,
   CREDENTIAL_REQUIRED_FRAME_NO_MESSAGE,
-  MANY_MATCHING_CREDENTIALS,
-  NO_MATCHING_CREDENTIALS,
-  ONE_MATCHING_CREDENTIAL,
   RESOLVED_OUTCOME_CONNECTED,
+  RESOLVED_OUTCOME_CONNECTED_UNNAMED,
   RESOLVED_OUTCOME_SKIPPED,
   RESOLVED_OUTCOME_TIMEOUT,
-  TWO_MATCHING_CREDENTIALS,
   buildCredentialRequiredFrame,
 } from "./CredentialCard.fixtures";
 import {
@@ -28,48 +26,87 @@ import {
   type CredentialRequiredReason,
 } from "./CredentialCard";
 
-vi.mock("@/components/ui/select", () => ({
-  Select: ({
+const { getClientMock, credsData, credsFail } = vi.hoisted(() => {
+  const data = {
+    current: [] as Array<{
+      credential_id: string;
+      name: string;
+      credential_type?: string;
+      credential?: { username: string };
+    }>,
+  };
+  const fail = { current: false };
+  const get = vi.fn((path: string) =>
+    path === "/credentials"
+      ? fail.current
+        ? Promise.reject(new Error("network"))
+        : Promise.resolve({ data: data.current })
+      : Promise.resolve({ data: {} }),
+  );
+  return {
+    getClientMock: vi.fn(() => Promise.resolve({ get })),
+    credsData: data,
+    credsFail: fail,
+  };
+});
+
+vi.mock("@/api/AxiosClient", () => ({ getClient: getClientMock }));
+vi.mock("@/hooks/useCredentialGetter", () => ({
+  useCredentialGetter: () => null,
+}));
+
+// Radix Popover + cmdk misbehave in jsdom (portals, pointer capture); stub them to plain wrappers so
+// the picker's items render inline and are directly clickable, mirroring the Select mock below.
+vi.mock("@/components/ui/popover", () => ({
+  Popover: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
+  PopoverTrigger: ({ children }: { children?: ReactNode }) => (
+    <div>{children}</div>
+  ),
+  PopoverContent: ({ children }: { children?: ReactNode }) => (
+    <div>{children}</div>
+  ),
+}));
+vi.mock("@/components/ui/command", () => ({
+  Command: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
+  CommandInput: ({ placeholder }: { placeholder?: string }) => (
+    <input placeholder={placeholder} />
+  ),
+  CommandList: ({ children }: { children?: ReactNode }) => (
+    <div>{children}</div>
+  ),
+  CommandEmpty: ({ children }: { children?: ReactNode }) => (
+    <div>{children}</div>
+  ),
+  CommandGroup: ({
     children,
-    onValueChange,
-    disabled,
+    heading,
   }: {
     children?: ReactNode;
-    onValueChange?: (value: string) => void;
-    disabled?: boolean;
+    heading?: string;
   }) => (
-    <div data-testid="mock-select">
-      <button
-        type="button"
-        data-testid="mock-select-pick-acme"
-        disabled={disabled}
-        onClick={() => onValueChange?.("cred_acme")}
-      >
-        pick acme (mock)
-      </button>
+    <div>
+      {heading ? <div>{heading}</div> : null}
       {children}
     </div>
   ),
-  SelectTrigger: ({ children }: { children?: ReactNode }) => (
-    <div>{children}</div>
-  ),
-  SelectValue: ({ placeholder }: { placeholder?: string }) => (
-    <span>{placeholder}</span>
-  ),
-  SelectContent: ({ children }: { children?: ReactNode }) => (
-    <div>{children}</div>
-  ),
-  SelectItem: ({
+  CommandItem: ({
     children,
-    value,
+    onSelect,
   }: {
     children?: ReactNode;
-    value: string;
-  }) => <div data-testid={`select-item-${value}`}>{children}</div>,
+    onSelect?: () => void;
+    value?: string;
+  }) => (
+    <button type="button" onClick={() => onSelect?.()}>
+      {children}
+    </button>
+  ),
 }));
 
 afterEach(() => {
   cleanup();
+  credsData.current = [];
+  credsFail.current = false;
   vi.clearAllMocks();
 });
 
@@ -214,75 +251,6 @@ describe("CredentialCard content", () => {
   });
 });
 
-describe("CredentialCard secondary slot branching", () => {
-  it("shows CTA only when no stored credentials match", () => {
-    render(
-      <CredentialCard
-        frame={buildCredentialRequiredFrame()}
-        mode="terminal"
-        matchingCredentials={NO_MATCHING_CREDENTIALS}
-        onConnect={vi.fn()}
-        onSkip={vi.fn()}
-      />,
-    );
-    expect(
-      screen.getByRole("button", { name: "Connect credential" }),
-    ).toBeTruthy();
-    expect(screen.queryByText(/Use '.+'\?/)).toBeNull();
-    expect(screen.queryByTestId("mock-select")).toBeNull();
-  });
-
-  it("shows a confirm chip when exactly one credential matches", () => {
-    render(
-      <CredentialCard
-        frame={buildCredentialRequiredFrame()}
-        mode="terminal"
-        matchingCredentials={ONE_MATCHING_CREDENTIAL}
-        onConnect={vi.fn()}
-        onSkip={vi.fn()}
-      />,
-    );
-    expect(
-      screen.getByRole("button", { name: "Use 'HN login'?" }),
-    ).toBeTruthy();
-    expect(screen.queryByTestId("mock-select")).toBeNull();
-  });
-
-  it("shows a dropdown when several credentials match", () => {
-    render(
-      <CredentialCard
-        frame={buildCredentialRequiredFrame()}
-        mode="terminal"
-        matchingCredentials={MANY_MATCHING_CREDENTIALS}
-        onConnect={vi.fn()}
-        onSkip={vi.fn()}
-      />,
-    );
-    expect(screen.getByTestId("mock-select")).toBeTruthy();
-    expect(screen.getByTestId("select-item-cred_hn").textContent).toBe(
-      "HN login",
-    );
-    expect(screen.getByTestId("select-item-cred_acme").textContent).toBe(
-      "Acme portal",
-    );
-    expect(screen.queryByText(/Use '.+'\?/)).toBeNull();
-  });
-
-  it("shows a dropdown, not a chip, at exactly two matching credentials", () => {
-    render(
-      <CredentialCard
-        frame={buildCredentialRequiredFrame()}
-        mode="terminal"
-        matchingCredentials={TWO_MATCHING_CREDENTIALS}
-        onConnect={vi.fn()}
-        onSkip={vi.fn()}
-      />,
-    );
-    expect(screen.getByTestId("mock-select")).toBeTruthy();
-    expect(screen.queryByText(/Use '.+'\?/)).toBeNull();
-  });
-});
-
 describe("CredentialCard callbacks", () => {
   it("calls onConnect(undefined) when the primary CTA is clicked", () => {
     const onConnect = vi.fn();
@@ -296,36 +264,6 @@ describe("CredentialCard callbacks", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Connect credential" }));
     expect(onConnect).toHaveBeenCalledWith(undefined);
-  });
-
-  it("calls onConnect(credentialId) when the confirm chip is clicked", () => {
-    const onConnect = vi.fn();
-    render(
-      <CredentialCard
-        frame={buildCredentialRequiredFrame()}
-        mode="terminal"
-        matchingCredentials={ONE_MATCHING_CREDENTIAL}
-        onConnect={onConnect}
-        onSkip={vi.fn()}
-      />,
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Use 'HN login'?" }));
-    expect(onConnect).toHaveBeenCalledWith("cred_hn");
-  });
-
-  it("calls onConnect(credentialId) when a dropdown option is picked", () => {
-    const onConnect = vi.fn();
-    render(
-      <CredentialCard
-        frame={buildCredentialRequiredFrame()}
-        mode="terminal"
-        matchingCredentials={MANY_MATCHING_CREDENTIALS}
-        onConnect={onConnect}
-        onSkip={vi.fn()}
-      />,
-    );
-    fireEvent.click(screen.getByTestId("mock-select-pick-acme"));
-    expect(onConnect).toHaveBeenCalledWith("cred_acme");
   });
 
   it("calls onSkip when the dismiss button is clicked", () => {
@@ -343,6 +281,229 @@ describe("CredentialCard callbacks", () => {
   });
 });
 
+describe("CredentialCard terminal org-credential picker", () => {
+  it("fetches the org credentials and renders them as a picker, in API order", async () => {
+    credsData.current = [
+      { credential_id: "cred_new", name: "Newest" },
+      { credential_id: "cred_old", name: "Oldest" },
+    ];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="terminal"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    // Most-recent-first is the API's order (created_at desc); the card renders it as-is.
+    const newest = await screen.findByRole("button", { name: "Newest" });
+    const oldest = screen.getByRole("button", { name: "Oldest" });
+    expect(
+      newest.compareDocumentPosition(oldest) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(getClientMock).toHaveBeenCalled();
+  });
+
+  it("sends the credential id and name when a stored credential is picked", async () => {
+    const onConnect = vi.fn();
+    credsData.current = [{ credential_id: "cred_hn", name: "HN login" }];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="terminal"
+        onConnect={onConnect}
+        onSkip={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "HN login" }));
+    expect(onConnect).toHaveBeenCalledWith("cred_hn", "HN login");
+  });
+
+  it("degrades to the Connect-credential CTA only when the org has no credentials", async () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="terminal"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(getClientMock).toHaveBeenCalled());
+    expect(
+      screen.getByRole("button", { name: "Connect credential" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("combobox")).toBeNull();
+  });
+
+  it("degrades to the CTA when the fetch fails, without caching an empty list", async () => {
+    credsFail.current = true;
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="terminal"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(getClientMock).toHaveBeenCalled());
+    expect(
+      screen.getByRole("button", { name: "Connect credential" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("combobox")).toBeNull();
+  });
+
+  it("does not fetch for a terminal receipt (resolved outcome)", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="terminal"
+        resolvedOutcome={RESOLVED_OUTCOME_CONNECTED}
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(getClientMock).not.toHaveBeenCalled();
+  });
+
+  it("labels each row with its username so identical names stay distinguishable", async () => {
+    credsData.current = [
+      {
+        credential_id: "cred_1",
+        name: "prod",
+        credential_type: "password",
+        credential: { username: "prod-us@example.com" },
+      },
+      {
+        credential_id: "cred_2",
+        name: "prod",
+        credential_type: "password",
+        credential: { username: "prod-eu@example.com" },
+      },
+    ];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="terminal"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText("prod-us@example.com")).toBeTruthy();
+    expect(screen.getByText("prod-eu@example.com")).toBeTruthy();
+  });
+
+  it("re-fetches the list when reloadKey changes so a just-created credential appears", async () => {
+    credsData.current = [{ credential_id: "cred_old", name: "Old login" }];
+    const { rerender } = render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        reloadKey={0}
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText("Old login")).toBeTruthy();
+    // The parent bumps reloadKey after a create; the one-shot fetch must re-run and surface the new one.
+    credsData.current = [
+      { credential_id: "cred_old", name: "Old login" },
+      { credential_id: "cred_new", name: "New login" },
+    ];
+    rerender(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        reloadKey={1}
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText("New login")).toBeTruthy();
+  });
+
+  it("pins the frame's credential_refs under a Suggested group, full list still complete", async () => {
+    credsData.current = [
+      { credential_id: "cred_sug", name: "Suggested login" },
+      { credential_id: "cred_a", name: "Other A" },
+      { credential_id: "cred_b", name: "Other B" },
+    ];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame({ credential_refs: ["cred_sug"] })}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText("Suggested")).toBeTruthy();
+    expect(screen.getByText("All credentials")).toBeTruthy();
+    // Every credential is still present (the suggestion is pinned, not a filter).
+    expect(
+      screen.getByRole("button", { name: "Suggested login" }),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Other A" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Other B" })).toBeTruthy();
+  });
+
+  it("sends the suggested credential's id when it is picked", async () => {
+    const onConnect = vi.fn();
+    credsData.current = [
+      { credential_id: "cred_sug", name: "Suggested login" },
+      { credential_id: "cred_a", name: "Other A" },
+    ];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame({ credential_refs: ["cred_sug"] })}
+        mode="inline-pause"
+        onConnect={onConnect}
+        onSkip={vi.fn()}
+      />,
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Suggested login" }),
+    );
+    expect(onConnect).toHaveBeenCalledWith("cred_sug", "Suggested login");
+  });
+
+  it("renders a plain list with no Suggested group when the frame has no credential_refs", async () => {
+    credsData.current = [
+      { credential_id: "cred_a", name: "Login A" },
+      { credential_id: "cred_b", name: "Login B" },
+    ];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame({ credential_refs: [] })}
+        mode="terminal"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(await screen.findByRole("button", { name: "Login A" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Login B" })).toBeTruthy();
+    expect(screen.queryByText("Suggested")).toBeNull();
+    expect(screen.queryByText("All credentials")).toBeNull();
+  });
+
+  it("does not submit a pick after the inline pause has expired", async () => {
+    const onConnect = vi.fn();
+    credsData.current = [{ credential_id: "cred_a", name: "Login A" }];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame({
+          expires_at: new Date(Date.now() - 1000).toISOString(),
+        })}
+        mode="inline-pause"
+        onConnect={onConnect}
+        onSkip={vi.fn()}
+      />,
+    );
+    // The row still renders (the always-open popover mock ignores `open`), but the expiry guard
+    // blocks the pick so no already-rejected resume token is submitted.
+    fireEvent.click(await screen.findByRole("button", { name: "Login A" }));
+    expect(onConnect).not.toHaveBeenCalled();
+  });
+});
+
 describe("CredentialCard keyboard reachability", () => {
   // jsdom doesn't move focus on a synthetic Tab keypress the way a real
   // browser does, so this can't honestly simulate Tab traversal — that was
@@ -350,21 +511,21 @@ describe("CredentialCard keyboard reachability", () => {
   // honestly: every interactive control is a legitimate, individually
   // focusable target (no accidental tabIndex=-1 / non-focusable element),
   // and a disabled control is correctly excluded.
-  it("lets every enabled control receive focus individually", () => {
+  it("lets every enabled control receive focus individually", async () => {
+    credsData.current = [{ credential_id: "cred_hn", name: "HN login" }];
     render(
       <CredentialCard
         frame={buildCredentialRequiredFrame()}
-        mode="terminal"
-        matchingCredentials={MANY_MATCHING_CREDENTIALS}
+        mode="inline-pause"
         onConnect={vi.fn()}
         onSkip={vi.fn()}
       />,
     );
+    const picker = await screen.findByRole("combobox");
     const skip = screen.getByRole("button", { name: "Skip for now" });
     const connect = screen.getByRole("button", { name: "Connect credential" });
-    const dropdown = screen.getByTestId("mock-select-pick-acme");
 
-    for (const el of [skip, connect, dropdown]) {
+    for (const el of [skip, connect, picker]) {
       el.focus();
       expect(document.activeElement).toBe(el);
     }
@@ -520,7 +681,6 @@ describe("CredentialCard countdown (inline-pause vs terminal)", () => {
       <CredentialCard
         frame={frame}
         mode="inline-pause"
-        matchingCredentials={ONE_MATCHING_CREDENTIAL}
         onConnect={onConnect}
         onSkip={onSkip}
       />,
@@ -533,14 +693,11 @@ describe("CredentialCard countdown (inline-pause vs terminal)", () => {
     const connectButton = screen.getByRole("button", {
       name: "Connect credential",
     });
-    const chipButton = screen.getByRole("button", { name: "Use 'HN login'?" });
     const skipButton = screen.getByRole("button", { name: "Skip for now" });
     expect(connectButton.hasAttribute("disabled")).toBe(true);
-    expect(chipButton.hasAttribute("disabled")).toBe(true);
     expect(skipButton.hasAttribute("disabled")).toBe(true);
 
     fireEvent.click(connectButton);
-    fireEvent.click(chipButton);
     fireEvent.click(skipButton);
     expect(onConnect).not.toHaveBeenCalled();
     expect(onSkip).not.toHaveBeenCalled();
@@ -641,7 +798,6 @@ describe("CredentialCard historical (resolvedOutcome) rendering", () => {
       <CredentialCard
         frame={buildCredentialRequiredFrame()}
         mode="terminal"
-        matchingCredentials={ONE_MATCHING_CREDENTIAL}
         resolvedOutcome={RESOLVED_OUTCOME_CONNECTED}
         onConnect={onConnect}
         onSkip={onSkip}
@@ -660,7 +816,6 @@ describe("CredentialCard historical (resolvedOutcome) rendering", () => {
       <CredentialCard
         frame={buildCredentialRequiredFrame()}
         mode="terminal"
-        matchingCredentials={ONE_MATCHING_CREDENTIAL}
         resolvedOutcome={RESOLVED_OUTCOME_CONNECTED}
         continued
         onConnect={vi.fn()}
@@ -676,8 +831,7 @@ describe("CredentialCard historical (resolvedOutcome) rendering", () => {
       <CredentialCard
         frame={buildCredentialRequiredFrame()}
         mode="terminal"
-        matchingCredentials={NO_MATCHING_CREDENTIALS}
-        resolvedOutcome={RESOLVED_OUTCOME_CONNECTED}
+        resolvedOutcome={RESOLVED_OUTCOME_CONNECTED_UNNAMED}
         continued
         onConnect={vi.fn()}
         onSkip={vi.fn()}
@@ -691,8 +845,7 @@ describe("CredentialCard historical (resolvedOutcome) rendering", () => {
       <CredentialCard
         frame={buildCredentialRequiredFrame()}
         mode="terminal"
-        matchingCredentials={NO_MATCHING_CREDENTIALS}
-        resolvedOutcome={RESOLVED_OUTCOME_CONNECTED}
+        resolvedOutcome={RESOLVED_OUTCOME_CONNECTED_UNNAMED}
         onConnect={vi.fn()}
         onSkip={vi.fn()}
       />,

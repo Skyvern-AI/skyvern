@@ -5,16 +5,17 @@ from typing import Any
 from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
 
 import httpx
-from pydantic import HttpUrl, ValidationError
+from pydantic import AnyHttpUrl, HttpUrl, ValidationError
 
 from skyvern.config import settings
-from skyvern.exceptions import BlockedHost, InvalidUrl, SkyvernHTTPException
+from skyvern.exceptions import BlockedHost, InvalidUrl, SkyvernHTTPException, UnresolvableHost
 
 SAFE_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 MAX_SAFE_REDIRECTS = 10
 
 _BLOCKED_INTERNAL_HOSTNAMES = frozenset({"localhost", "metadata.google.internal", "kubernetes.default.svc"})
 _BLOCKED_INTERNAL_SUFFIXES = (".local", ".localhost", ".internal", ".cluster.local")
+_LOCAL_BROWSER_HOSTNAMES = frozenset({"localhost", "host.docker.internal"})
 _BLOCKED_IP_NETWORKS = tuple(
     ipaddress.ip_network(network)
     for network in (
@@ -68,11 +69,17 @@ def collapse_duplicate_www_prefix(url: str) -> str:
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
-def prepend_scheme_and_validate_url(url: str) -> str:
+def _prepend_scheme(url: str) -> str:
     if not url:
         return url
 
-    parsed_url = urlparse(url=url)
+    try:
+        parsed_url = urlparse(url=url)
+    except ValueError as error:
+        # Malformed authorities (e.g. an unterminated IPv6 literal like ``http://[``) make
+        # stdlib urlparse raise a raw ValueError; surface it as the typed InvalidUrl so
+        # callers get one contract instead of a leaking parser error.
+        raise InvalidUrl(url=url) from error
     if parsed_url.scheme and parsed_url.scheme not in ["http", "https"]:
         raise InvalidUrl(url=url)
 
@@ -80,7 +87,13 @@ def prepend_scheme_and_validate_url(url: str) -> str:
     if not parsed_url.scheme:
         url = f"https://{url}"
 
-    url = collapse_duplicate_www_prefix(url)
+    return collapse_duplicate_www_prefix(url)
+
+
+def prepend_scheme_and_validate_url(url: str) -> str:
+    url = _prepend_scheme(url)
+    if not url:
+        return url
 
     try:
         HttpUrl(url)
@@ -88,6 +101,28 @@ def prepend_scheme_and_validate_url(url: str) -> str:
         raise InvalidUrl(url=url)
 
     return url
+
+
+def canonical_navigation_host(url: str) -> str | None:
+    """Host a browser resolves ``url`` against, via pydantic's WHATWG URL model.
+
+    The WHATWG parser (what the browser uses) canonicalizes numeric IPv4 literals
+    (decimal/octal/hex/shortened) and backslash authority tricks to the host the
+    browser truly connects to, unlike stdlib ``urlparse`` which can diverge. Raises
+    ``InvalidUrl`` for non-http(s) schemes and malformed URLs; returns ``None`` when
+    there is no host.
+    """
+    # _prepend_scheme (not prepend_scheme_and_validate_url) plus AnyHttpUrl: both parse with the
+    # same WHATWG canonicalization, but HttpUrl's 2083-char ceiling makes a long, ordinary public
+    # link fail to parse and so read as a blocked internal host. _prepend_scheme still rejects
+    # non-http(s) schemes.
+    validated_url = _prepend_scheme(url)
+    if not validated_url:
+        return None
+    try:
+        return AnyHttpUrl(validated_url).host
+    except ValidationError:
+        return None
 
 
 def _normalize_host(host: str) -> str:
@@ -110,6 +145,21 @@ def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return bool(
         ip.is_private or ip.is_link_local or ip.is_loopback or ip.is_reserved or ip.is_multicast or ip.is_unspecified
     )
+
+
+def is_allowed_local_browser_host(host: str) -> bool:
+    if settings.ENV != "local":
+        return False
+    normalized = _normalize_host(host)
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return normalized in _LOCAL_BROWSER_HOSTNAMES
+
+
+def validate_browser_host(host: str, *, resolve_dns: bool = False) -> None:
+    if not is_allowed_local_browser_host(host) and is_blocked_host(host, resolve_dns=resolve_dns):
+        raise BlockedHost(host=host)
 
 
 def _is_allowed_host(host: str) -> bool:
@@ -167,6 +217,11 @@ def is_blocked_host(host: str, *, resolve_dns: bool = False) -> bool:
 
     try:
         resolve_fetch_host_ips(normalized)
+    except UnresolvableHost:
+        # UnresolvableHost subclasses BlockedHost, so it must be caught first. The browser resolves
+        # through the run proxy and may reach hosts the worker cannot; worker resolution failure is
+        # not a policy signal. Literal internal IPs and internal names are refused above, before DNS.
+        return False
     except BlockedHost:
         return True
     return False
@@ -199,7 +254,7 @@ def resolve_fetch_host_ips(host: str) -> tuple[str, ...]:
     try:
         infos = socket.getaddrinfo(normalized, None, type=socket.SOCK_STREAM)
     except (OSError, UnicodeError):
-        raise BlockedHost(host=host)
+        raise UnresolvableHost(host=host)
 
     resolved_ips: list[str] = []
     for info in infos:
@@ -218,8 +273,38 @@ def resolve_fetch_host_ips(host: str) -> tuple[str, ...]:
             resolved_ips.append(resolved_ip_str)
 
     if not resolved_ips:
-        raise BlockedHost(host=host)
+        raise UnresolvableHost(host=host)
     return tuple(resolved_ips)
+
+
+def _raise_if_best_effort_fetch_host_is_blocked(url: str) -> None:
+    # Browsers treat a backslash in the authority as a separator; urlsplit does not, which would
+    # otherwise let "http://<blocked-ip>\.example.com" read as an unrelated host here while the
+    # browser still navigates to the blocked one. Only ever used to block, never to permit.
+    candidate = url.replace("\\", "/")
+    try:
+        parsed = urlsplit(candidate)
+        # Non-http(s) schemes are already refused by the caller's parse error; resolving their
+        # hosts would block the caller's event loop on DNS for a URL that gets refused anyway.
+        if parsed.scheme and parsed.scheme not in ("http", "https"):
+            return
+        if not parsed.scheme:
+            parsed = urlsplit(f"https://{candidate}")
+        host = parsed.hostname
+    except (UnicodeError, ValueError):
+        return
+
+    if not host:
+        return
+
+    try:
+        resolve_fetch_host_ips(host)
+    except UnresolvableHost:
+        return
+    except BlockedHost:
+        raise
+    except Exception:
+        return
 
 
 def validate_url(url: str) -> str | None:
@@ -240,9 +325,10 @@ def validate_url(url: str) -> str | None:
 
 def validate_fetch_url_with_resolved_ips(url: str) -> tuple[str, tuple[str, ...]]:
     try:
-        url = prepend_scheme_and_validate_url(url=url)
-        v = HttpUrl(url=url)
+        url = _prepend_scheme(url=url)
+        v = AnyHttpUrl(url=url)
     except Exception as e:
+        _raise_if_best_effort_fetch_host_is_blocked(url)
         raise SkyvernHTTPException(message=str(e), status_code=HTTPStatus.BAD_REQUEST)
 
     if not v.host:

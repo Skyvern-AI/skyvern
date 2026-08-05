@@ -469,6 +469,7 @@ class ObserverRepository(BaseRepository):
         status: BlockStatus | None = None,
         output: dict | list | str | None = None,
         failure_reason: str | None = None,
+        final_url: str | None = None,
         task_id: str | None = None,
         loop_values: list | None = None,
         current_value: str | None = None,
@@ -528,6 +529,8 @@ class ObserverRepository(BaseRepository):
                     workflow_run_block.task_id = task_id
                 if failure_reason:
                     workflow_run_block.failure_reason = failure_reason
+                if final_url:
+                    workflow_run_block.final_url = final_url
                 # Use `is not None` instead of truthiness checks so that falsy
                 # values like current_index=0, empty loop_values=[], or
                 # current_value="" are correctly persisted. Without this,

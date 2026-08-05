@@ -72,6 +72,7 @@ _BROWSER_PRIMITIVE_TOOLS: frozenset[str] = frozenset(
         "press_key",
         "console_messages",
         "get_browser_screenshot",
+        "wait_for_either_state",
     }
 )
 _MUTATION_TOOLS: frozenset[str] = frozenset(

@@ -728,6 +728,7 @@ def test_discover_switch_targets_finds_claude_code_and_codex(
     monkeypatch.setattr("skyvern.cli.mcp_commands._codex_config_path", lambda: codex_config)
     monkeypatch.setattr("skyvern.cli.mcp_commands._openclaw_config_path", lambda: openclaw_config)
     monkeypatch.setattr("skyvern.cli.mcp_commands._hermes_config_path", lambda: tmp_path / "missing-hermes.yaml")
+    monkeypatch.setattr("skyvern.cli.mcp_commands._opencode_config_path", lambda: tmp_path / "missing-hermes.json")
 
     discovered, missing = _discover_switch_targets()
 
@@ -760,6 +761,7 @@ def test_discover_switch_targets_reports_openclaw_invalid_nested_structure(
     monkeypatch.setattr("skyvern.cli.mcp_commands._codex_config_path", lambda: tmp_path / "missing-f.toml")
     monkeypatch.setattr("skyvern.cli.mcp_commands._openclaw_config_path", lambda: openclaw_config)
     monkeypatch.setattr("skyvern.cli.mcp_commands._hermes_config_path", lambda: tmp_path / "missing-g.yaml")
+    monkeypatch.setattr("skyvern.cli.mcp_commands._opencode_config_path", lambda: tmp_path / "missing-g.json")
 
     discovered, _missing = _discover_switch_targets()
 

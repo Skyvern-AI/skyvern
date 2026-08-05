@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import importlib.metadata
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable, cast
 
 import structlog
 from playwright.async_api import Error as _PlaywrightError
@@ -49,6 +49,7 @@ LOG = structlog.get_logger()
 BrowserDriverStarter = Callable[[], Awaitable[Playwright]]
 BrowserEngineErrorLoader = Callable[[], "tuple[type[BaseException], type[BaseException]]"]
 BrowserEngineRichErrorLoader = Callable[[], "BrowserEngineRichErrorTypes"]
+UNSET_SELECTION = cast("BrowserEngineSelection | None", object())
 
 STOCK_ENGINE_NAME = "playwright"
 RUSTWRIGHT_ENGINE_NAME = "rustwright"

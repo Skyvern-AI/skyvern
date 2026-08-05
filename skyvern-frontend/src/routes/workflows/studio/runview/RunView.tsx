@@ -27,6 +27,7 @@ import { findActiveItem } from "../../workflowRun/workflowTimelineUtils";
 import { getOrderedRunParameters } from "../../utils";
 import {
   buildFilmstrip,
+  ELAPSED_NEVER_STARTED,
   formatElapsed,
   formatRunTimesTooltip,
   runHasOutputs,
@@ -335,14 +336,16 @@ export function RunView({
       runParameters,
     );
     const meta: RunInputMeta[] = [];
-    const pushMeta = (label: string, value: unknown) => {
+    const pushMeta = (
+      label: string,
+      value: unknown,
+      href?: (value: string) => string,
+    ) => {
       if (value === null || value === undefined || value === "") {
         return;
       }
-      meta.push({
-        label,
-        value: typeof value === "string" ? value : JSON.stringify(value),
-      });
+      const text = typeof value === "string" ? value : JSON.stringify(value);
+      meta.push({ label, value: text, to: href?.(text) });
     };
     pushMeta("Webhook URL", workflowRun?.webhook_callback_url);
     // Task 2.0 runs store TOTP config on task_v2, not the top-level run.
@@ -357,7 +360,16 @@ export function RunView({
     );
     pushMeta("Proxy", workflowRun?.proxy_location);
     pushMeta("Extra HTTP headers", workflowRun?.extra_http_headers);
-    pushMeta("Browser session", workflowRun?.browser_session_id);
+    pushMeta(
+      "Browser session",
+      workflowRun?.browser_session_id,
+      (id) => `/browser-session/${id}/stream`,
+    );
+    pushMeta(
+      "Browser profile",
+      workflowRun?.browser_profile_id,
+      (id) => `/browser-profiles/${id}`,
+    );
     pushMeta("Run with", workflowRun?.run_with);
     pushMeta("Max screenshot scrolls", workflowRun?.max_screenshot_scrolls);
     return { parameters, blockPrompts, meta };
@@ -381,10 +393,16 @@ export function RunView({
     return <RunPlaceholder loading={isLoading || runIdPending} />;
   }
 
-  const elapsed = formatElapsed(
-    workflowRun.started_at ?? workflowRun.created_at ?? null,
+  // Same rule as the summary strip: created_at is always set, so falling back to
+  // it shows a queued run an elapsed time it never accrued. The never-started
+  // sentinel is dropped so the timeline omits the value entirely rather than
+  // rendering a bare dash.
+  const elapsedValue = formatElapsed(
+    workflowRun.started_at ?? null,
     finalized ? (workflowRun.finished_at ?? null) : null,
   );
+  const elapsed =
+    elapsedValue === ELAPSED_NEVER_STARTED ? undefined : elapsedValue;
   const elapsedTitle = formatRunTimesTooltip(workflowRun);
   const failureReason = formatFailureReason(
     workflowRun.failure_reason ?? "The run failed.",

@@ -26,10 +26,16 @@ class CreateBrowserSessionRequest(BaseModel):
 
     timeout: int | None = Field(
         default=DEFAULT_TIMEOUT,
-        description=f"Timeout in minutes for the session. Timeout is applied after the session is started. Must be between {MIN_TIMEOUT} and {MAX_TIMEOUT}. Defaults to {DEFAULT_TIMEOUT}.",
+        description=f"Timeout in minutes for the session. Timeout is applied after the session is started. Must be at least {MIN_TIMEOUT}; values above {MAX_TIMEOUT} are capped at {MAX_TIMEOUT}. Defaults to {DEFAULT_TIMEOUT}.",
         ge=MIN_TIMEOUT,
-        le=MAX_TIMEOUT,
     )
+
+    @field_validator("timeout")
+    @classmethod
+    def clamp_timeout_to_max(cls, timeout: int | None) -> int | None:
+        # Clamped rather than rejected so callers still sending the old 24h ceiling keep working.
+        return None if timeout is None else min(timeout, MAX_TIMEOUT)
+
     proxy_location: ProxyLocationInput = Field(
         default=None,
         description=PROXY_LOCATION_DOC_STRING + " Can also be a GeoTarget object for granular city/state targeting: "
@@ -80,6 +86,13 @@ class CreateBrowserSessionRequest(BaseModel):
         "when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid "
         "storing profiles for sessions that never need them. Sessions started with a browser_profile_id always "
         "persist their profile regardless of this flag.",
+    )
+
+    needs_live_view: bool = Field(
+        default=False,
+        description="Whether a person will watch this session's browser live. Defaults to false, which suits "
+        "unattended automation; the Skyvern app sets it because a session opened in the UI is watched. It requests "
+        "a capability, not a particular browser, and cannot be used to select where the session runs.",
     )
 
 

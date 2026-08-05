@@ -24,6 +24,7 @@ from skyvern.config import settings
 from skyvern.webeye.cdp_connection import (
     connect_over_cdp_with_diagnostics,
     is_local_pbs_cdp_url,
+    redact_cdp_url,
     resolve_local_pbs_cdp_url,
 )
 from skyvern.webeye.main_world_eval import evaluate_in_main_world
@@ -84,7 +85,9 @@ class CdpChannel:
     def identity(self) -> t.Dict[str, t.Any]:
         base = self.vnc_channel.identity
 
-        return base | {"cdp_url": self.url}
+        # This mapping is splatted into every log line this channel writes, and the url it holds
+        # is the session's own address — which carries the session token.
+        return base | {"cdp_url": redact_cdp_url(self.url)}
 
     async def connect(self, cdp_url: str | None = None) -> t.Self:
         """
@@ -134,7 +137,12 @@ class CdpChannel:
             close_task = asyncio.create_task(self.close())
             close_task.add_done_callback(lambda _: asyncio.create_task(self.connect()))  # TODO: avoid blind reconnect
 
-        self.browser = await connect_over_cdp_with_diagnostics(pw, url, headers=headers if headers else None)
+        self.browser = await connect_over_cdp_with_diagnostics(
+            pw,
+            url,
+            headers=headers if headers else None,
+            validate_browser_address=False,
+        )
         self.browser.on("disconnected", on_close)
 
         await self.apply_download_behavior(self.browser)

@@ -188,7 +188,7 @@ export function RunPaneViewToggles() {
                 type="button"
                 onClick={focusBrowserPane}
                 aria-label="Live"
-                className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-border px-2.5 text-[11px] font-medium text-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-[11px] font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-success" />
                 {compact ? null : "Live"}
@@ -241,7 +241,7 @@ export function RunPaneActions() {
             type="button"
             aria-label="API & Webhooks"
             className={cn(
-              "inline-flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-border text-[11px] font-medium",
+              "inline-flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md text-[11px] font-medium",
               compact ? "w-7 justify-center px-0" : "px-2",
               "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
               "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",

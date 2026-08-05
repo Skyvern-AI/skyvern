@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 import structlog
 from agents import function_tool
 from agents.run_context import RunContextWrapper
+from typing_extensions import TypedDict
 
 from skyvern.forge import app as app
 from skyvern.forge.sdk.copilot.build_phase import (
@@ -23,16 +25,15 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import workflow_target_url as workflow_target_url
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.failure_tracking import (
-    ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY as ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
-)
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
+from skyvern.forge.sdk.copilot.output_extraction_plan import value_designation_probe_expression
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY as _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
 )
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -42,7 +43,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import apply_block_edit, delete_blo
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 from ._shared import _COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS
-from ._shared import _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS as _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS
+from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS as _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
 from ._shared import _FAILED_BLOCK_STATUSES as _FAILED_BLOCK_STATUSES
 from ._shared import BLOCK_RUNNING_TOOLS as BLOCK_RUNNING_TOOLS
 from ._shared import COPILOT_FINAL_REPLY_RESERVE_SECONDS as COPILOT_FINAL_REPLY_RESERVE_SECONDS
@@ -62,7 +63,6 @@ from .banned_blocks import _COPILOT_BANNED_BLOCK_TYPES as _COPILOT_BANNED_BLOCK_
 from .banned_blocks import _banned_block_reject_message as _banned_block_reject_message
 from .banned_blocks import _detect_new_banned_blocks as _detect_new_banned_blocks
 from .banned_blocks import _record_banned_block_reject_span as _record_banned_block_reject_span
-from .blockers import REPEATED_ACTION_STREAK_ABORT_AT as REPEATED_ACTION_STREAK_ABORT_AT
 from .blockers import _active_block_run_budget_seconds as _active_block_run_budget_seconds
 from .blockers import _analyze_run_blocks as _analyze_run_blocks
 from .blockers import _build_loop_blocker_signal as _build_loop_blocker_signal
@@ -91,11 +91,6 @@ from .completion import _outcome_unverified_reason as _outcome_unverified_reason
 from .completion import (
     _tool_visible_result_after_completion_verification,
 )
-from .composition_capture import (
-    _active_run_terminal_evidence_needs_visual_fallback as _active_run_terminal_evidence_needs_visual_fallback,
-)
-from .composition_capture import _active_run_terminal_evidence_result as _active_run_terminal_evidence_result
-from .composition_capture import _active_run_terminal_evidence_sample as _active_run_terminal_evidence_sample
 from .composition_capture import _capture_composition_evidence as _capture_composition_evidence
 from .composition_capture import (
     _composition_evidence_after_navigation_failure as _composition_evidence_after_navigation_failure,
@@ -107,7 +102,8 @@ from .composition_capture import (
 )
 from .composition_capture import _normalized_inspect_url as _normalized_inspect_url
 from .composition_capture import _same_inspect_target as _same_inspect_target
-from .credential_fill import _credential_fill_policy_error as _credential_fill_policy_error
+from .credential_fill import _credential_fill_authority_error as _credential_fill_authority_error
+from .credential_fill import _credential_fill_prerequisite_error as _credential_fill_prerequisite_error
 from .credential_fill import (
     _fill_credential_field_impl,
 )
@@ -164,6 +160,9 @@ from .guardrails import (
     _request_policy_allows_update_and_skip_run,
 )
 from .guardrails import _turn_intent_tool_error as _turn_intent_tool_error
+from .integrations import (
+    _list_integrations,
+)
 from .mcp_hooks import _build_skyvern_mcp_overlays as _build_skyvern_mcp_overlays
 from .mcp_hooks import _click_post_hook as _click_post_hook
 from .mcp_hooks import _click_pre_hook as _click_pre_hook
@@ -190,7 +189,6 @@ from .run_execution import _attach_action_traces as _attach_action_traces
 from .run_execution import _cancel_run_task_if_not_final as _cancel_run_task_if_not_final
 from .run_execution import _composition_anti_bot_reason as _composition_anti_bot_reason
 from .run_execution import _detect_non_retriable_nav_error as _detect_non_retriable_nav_error
-from .run_execution import _detect_probable_site_block_wall as _detect_probable_site_block_wall
 from .run_execution import (
     _diagnosis_repair_tool_error,
     _frontier_run_size_result,
@@ -212,7 +210,6 @@ from .run_execution import (
     _verify_and_record_run_blocks_result,
 )
 from .run_execution import _watchdog_error_message as _watchdog_error_message
-from .run_execution import _watchdog_exit_allows_terminal_promotion as _watchdog_exit_allows_terminal_promotion
 from .run_execution import _watchdog_user_failure_reason as _watchdog_user_failure_reason
 from .scouting import _MAX_SCOUTED_INTERACTIONS as _MAX_SCOUTED_INTERACTIONS
 from .scouting import _capture_accessible_role_name as _capture_accessible_role_name
@@ -470,19 +467,122 @@ async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
     return await _persist_block_scoped_edit(copilot_ctx, "delete_block", workflow_yaml, arguments)
 
 
+_MAX_REQUESTED_OUTPUT_READS = 8
+
+# Probe outcomes that located the designated value without resolving it to a single element.
+_DESIGNATION_ERRORS_THAT_SAW_THE_VALUE = frozenset({"text-ambiguous", "path-unstable"})
+
+
+class RequestedOutputRead(TypedDict, total=False):
+    output_path: str
+    value_text: str
+    label: str
+
+
+async def _validate_requested_output_reads(
+    copilot_ctx: AgentContext, reads: list[RequestedOutputRead]
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Resolve each designated value against the live page; keep what pins, report what does not."""
+    validated: list[dict[str, Any]] = []
+    rejected: list[dict[str, str]] = []
+    server = copilot_ctx.discovery_mcp_server
+    if len(reads) > _MAX_REQUESTED_OUTPUT_READS:
+        rejected.append({"output_path": "", "error": f"only the first {_MAX_REQUESTED_OUTPUT_READS} reads were probed"})
+    for read in reads[:_MAX_REQUESTED_OUTPUT_READS]:
+        raw_path = str(read.get("output_path") or "")
+        value_text = str(read.get("value_text") or "").strip()
+        label = str(read.get("label") or "").strip()
+        # The model designates by the output's own name; "output." is our internal path prefix.
+        output_path = raw_path if raw_path.startswith("output.") else f"output.{raw_path}"
+        if not raw_path or not value_text:
+            rejected.append({"output_path": raw_path, "error": "malformed"})
+            continue
+        if server is None:
+            rejected.append({"output_path": output_path, "error": "no-browser"})
+            continue
+        expression = value_designation_probe_expression(value_text, label)
+        try:
+            raw = await asyncio.wait_for(
+                server.call_internal_tool("skyvern_evaluate", {"expression": expression}),
+                timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            rejected.append({"output_path": output_path, "error": "probe-failed"})
+            continue
+        payload = (raw.get("data") or {}).get("result") if isinstance(raw, dict) and raw.get("ok") else None
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (TypeError, ValueError):
+                payload = None
+        if not isinstance(payload, dict) or payload.get("error") or not isinstance(payload.get("text"), str):
+            error = str(payload.get("error")) if isinstance(payload, dict) and payload.get("error") else "no-result"
+            detail = {"output_path": output_path, "error": error, "value_text": value_text[:40]}
+            if isinstance(payload, dict):
+                for field_name in ("match_count", "visible_count"):
+                    if payload.get(field_name) is not None:
+                        detail[field_name] = str(payload[field_name])
+            rejected.append(detail)
+            # The probe failed to pin one element, not to find the value: several leaves showed it,
+            # or no stable path reached the one that did. The value is still what the model read off
+            # the page, and the relation capture carries its own uniqueness proof for it.
+            if error in _DESIGNATION_ERRORS_THAT_SAW_THE_VALUE and isinstance(payload, dict):
+                validated.append(
+                    {
+                        "output_path": output_path,
+                        "selector": "",
+                        "text": str(payload.get("text") or value_text),
+                        "url": str(payload.get("url") or ""),
+                    }
+                )
+            continue
+        resolved_selector = payload.get("selector")
+        validated.append(
+            {
+                "output_path": output_path,
+                "selector": resolved_selector if isinstance(resolved_selector, str) else "",
+                "match_count": payload.get("match_count"),
+                "position": payload.get("position"),
+                "text": payload["text"],
+                "url": payload.get("url") or "",
+            }
+        )
+    return validated, rejected
+
+
 @function_tool(name_override="synthesize_demonstrated_block")
-async def synthesize_demonstrated_block_tool(ctx: RunContextWrapper) -> str:
+async def synthesize_demonstrated_block_tool(
+    ctx: RunContextWrapper,
+    requested_output_reads: list[RequestedOutputRead] | None = None,
+) -> str:
     """Return code-block source built from the steps you already performed in the browser.
 
     This is compiled from your recorded interactions, so it reflects what actually happened rather
     than what you remember doing. Use it as the body of a code block instead of writing the steps
     again from memory, and edit it if the block needs to do more.
+
+    When the request asks the workflow to return values you can see on the page, pass
+    requested_output_reads: for each requested output, `value_text` is the value exactly as it is
+    rendered ("8.9K", not 8900) and `label` is the heading it sits under. The page resolves those to
+    the element and compiles a pinned deterministic read; you do not need to know its markup.
     """
     copilot_ctx = ctx.context
-    arguments: dict[str, Any] = {}
+    arguments: dict[str, Any] = {"requested_output_reads": requested_output_reads or []}
     loop_error = _tool_loop_error(copilot_ctx, "synthesize_demonstrated_block", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
+    rejected: list[dict[str, str]] = []
+    if requested_output_reads:
+        validated, rejected = await _validate_requested_output_reads(copilot_ctx, requested_output_reads)
+        copilot_ctx.requested_output_designations = validated
+        LOG.info(
+            "copilot_requested_output_designations",
+            pinned=[{"output_path": d["output_path"], "text": d["text"][:40]} for d in validated if d["selector"]],
+            value_only=[
+                {"output_path": d["output_path"], "text": d["text"][:40]} for d in validated if not d["selector"]
+            ],
+            rejected=rejected,
+        )
     source = _demonstrated_step_sources(copilot_ctx)
     if not source:
         result = {
@@ -490,7 +590,10 @@ async def synthesize_demonstrated_block_tool(ctx: RunContextWrapper) -> str:
             "error": "Nothing has been demonstrated in the browser yet, so there are no steps to compile.",
         }
     else:
-        result = {"ok": True, "data": {"code": source}}
+        data: dict[str, Any] = {"code": source}
+        if rejected:
+            data["rejected_output_reads"] = rejected
+        result = {"ok": True, "data": data}
     record_tool_step_result_for_ctx(copilot_ctx, "synthesize_demonstrated_block", arguments, result)
     return json.dumps(result)
 
@@ -524,6 +627,42 @@ async def list_credentials_tool(
     result = await _list_credentials(arguments, copilot_ctx)
     record_tool_step_result_for_ctx(copilot_ctx, "list_credentials", arguments, result)
     sanitized = sanitize_tool_result_for_llm("list_credentials", result)
+    return json.dumps(sanitized)
+
+
+@function_tool(name_override="list_integrations")
+async def list_integrations_tool(ctx: RunContextWrapper) -> str:
+    """List the organization's connected Google and Microsoft accounts (metadata only —
+    never tokens). Each entry has `connection_id`, `provider`, `name`, `state`, and
+    `scopes_granted`.
+
+    These are OAuth connections made on the Integrations page, NOT the stored
+    login credentials returned by `list_credentials` — the two lists are disjoint,
+    so check this one before concluding the user has no Google or Microsoft access.
+    Blocks such as `google_sheets_write` take a `connection_id` from here directly
+    as their credential field. Not paginated; one call returns every connection.
+
+    Match on `scopes_granted`, not on `provider` alone: connections are granted per
+    product, so a Sheets connection cannot read Gmail and binding it to a mail block
+    fails at run time. Only a connection whose `state` is `active` can be used — an
+    expired grant stays listed so you can ask the user to reconnect that account
+    rather than tell them nothing is connected.
+    """
+    copilot_ctx = ctx.context
+    arguments: dict[str, Any] = {}
+    loop_error = _tool_loop_error(copilot_ctx, "list_integrations", arguments)
+    if loop_error:
+        return json.dumps({"ok": False, "error": loop_error})
+
+    authority_error = _authority_tool_error(copilot_ctx, "list_integrations")
+    if authority_error:
+        result = {"ok": False, "error": authority_error}
+        record_tool_step_result_for_ctx(copilot_ctx, "list_integrations", arguments, result)
+        return json.dumps(result)
+
+    result = await _list_integrations(arguments, copilot_ctx)
+    record_tool_step_result_for_ctx(copilot_ctx, "list_integrations", arguments, result)
+    sanitized = sanitize_tool_result_for_llm("list_integrations", result)
     return json.dumps(sanitized)
 
 
@@ -1004,8 +1143,11 @@ async def fill_credential_field_tool(
 
     `selector` must be a CSS selector for the exact input field (no comma-union
     fallbacks — inspect the page first and target the proven field).
-    `credential_id` must be a credential from the request policy's
-    `resolved_credentials`. `field` is one of `username`, `password`, `totp`.
+    `credential_id`: when a page observation returns
+    `resolved_login_credential_id`, the server has already authorized that
+    credential for this login page — pass that id. When it returns
+    `candidate_login_credentials`, ask the user which one to use and pass the
+    `credential_id` they choose. `field` is one of `username`, `password`, `totp`.
 
     This tool only fills; it never clicks or submits. Each successful fill is
     recorded as a scouted interaction, so the SYNTHESIZED CODE BLOCK will bind
@@ -1026,6 +1168,7 @@ NATIVE_TOOLS = [
     delete_block_tool,
     synthesize_demonstrated_block_tool,
     list_credentials_tool,
+    list_integrations_tool,
     run_blocks_tool,
     get_run_results_tool,
     update_and_run_blocks_tool,

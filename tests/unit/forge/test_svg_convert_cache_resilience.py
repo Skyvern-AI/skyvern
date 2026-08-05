@@ -5,7 +5,7 @@ from collections.abc import Generator
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -98,11 +98,58 @@ class _FakeFrame:
 
 
 class _FakeSkyvernFrame:
+    engine_selection = None
+
     def get_frame(self) -> _FakeFrame:
         return _FakeFrame()
 
     async def get_blocking_element_id(self, element: object) -> tuple[None, bool]:
         return None, False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection", [MagicMock(), None])
+async def test_taskless_cleanup_threads_explicit_running_driver_selection(selection: object | None) -> None:
+    frame = MagicMock(url="https://example.com")
+
+    with (
+        patch.object(agent_functions, "_resolve_engine_selection") as resolve,
+        patch.object(agent_functions.settings, "SVG_MAX_PARSING_ELEMENT_CNT", 3000),
+        patch.object(agent_functions.settings, "ENABLE_CSS_SVG_PARSING", False),
+        patch.object(agent_functions, "app", SimpleNamespace(SVG_CSS_CONVERTER_LLM_API_HANDLER=None)),
+        patch.object(
+            agent_functions.SkyvernFrame, "create_instance", new=AsyncMock(return_value=MagicMock())
+        ) as create,
+    ):
+        cleanup = agent_functions.AgentFunction().cleanup_element_tree_factory(engine_selection=selection)
+        await cleanup(frame, frame.url, [])
+
+    resolve.assert_not_called()
+    create.assert_awaited_once_with(frame=frame, engine_selection=selection)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_without_selection_resolves_once_and_reuses_identity() -> None:
+    selection = MagicMock()
+    task = MagicMock()
+    frame = MagicMock(url="https://example.com")
+
+    with (
+        patch.object(agent_functions, "_resolve_engine_selection", return_value=selection) as resolve,
+        patch.object(agent_functions.settings, "SVG_MAX_PARSING_ELEMENT_CNT", 3000),
+        patch.object(agent_functions.settings, "ENABLE_CSS_SVG_PARSING", False),
+        patch.object(agent_functions, "app", SimpleNamespace(SVG_CSS_CONVERTER_LLM_API_HANDLER=None)),
+        patch.object(
+            agent_functions.SkyvernFrame, "create_instance", new=AsyncMock(return_value=MagicMock())
+        ) as create,
+    ):
+        cleanup = agent_functions.AgentFunction().cleanup_element_tree_factory(task=task)
+        await cleanup(frame, frame.url, [])
+        await cleanup(frame, frame.url, [])
+
+    resolve.assert_called_once_with(task)
+    assert create.await_count == 2
+    assert all(call.kwargs["engine_selection"] is selection for call in create.await_args_list)
 
 
 def test_svg_local_invalid_shape_cache_uses_short_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -153,6 +200,39 @@ async def test_svg_convert_does_not_retry_llm_when_cache_set_fails(monkeypatch: 
     assert calls == 1
     assert element["attributes"] == {"alt": "search icon"}
     assert "children" not in element
+
+
+def test_svg_converter_stays_disabled_without_global_or_org_fast(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolver = MagicMock(side_effect=AssertionError("org resolver must not bypass the None gate"))
+    monkeypatch.setattr(
+        agent_functions,
+        "app",
+        SimpleNamespace(SVG_CSS_CONVERTER_LLM_API_HANDLER=None),
+    )
+    monkeypatch.setattr(agent_functions, "get_org_aware_secondary_llm_api_handler", resolver)
+
+    assert agent_functions._get_org_aware_svg_css_converter_llm_api_handler() is None
+    resolver.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_svg_converter_uses_org_fast_when_global_is_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    handler = AsyncMock(return_value={"shape": "search icon", "recognized": True})
+    monkeypatch.setattr(
+        agent_functions,
+        "app",
+        SimpleNamespace(CACHE=_MemoryCache(), SVG_CSS_CONVERTER_LLM_API_HANDLER=None),
+    )
+    resolver = MagicMock(return_value=handler)
+    monkeypatch.setattr(agent_functions, "get_org_aware_secondary_llm_api_handler", resolver)
+    skyvern_context.ensure_context().org_default_secondary_llm_key = "CUSTOM_LLM_oat_fast"
+
+    element = _svg_element()
+    await agent_functions._convert_svg_to_string(element)
+
+    resolver.assert_called_once_with()
+    handler.assert_awaited_once()
+    assert element["attributes"] == {"alt": "search icon"}
 
 
 @pytest.mark.asyncio
@@ -401,20 +481,21 @@ async def test_svg_eligibility_taskless_path_stays_manager_free(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_svg_eligibility_resolves_pinned_selection_when_task_present(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_svg_eligibility_uses_frame_selection_when_task_present(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: list[Any] = []
     selection = SimpleNamespace()
-    browser_manager = SimpleNamespace(
-        get_for_task=lambda task_id, workflow_run_id: SimpleNamespace(engine_selection=selection)
-    )
+    browser_manager = SimpleNamespace(get_for_task=MagicMock())
     monkeypatch.setattr(agent_functions, "app", SimpleNamespace(BROWSER_MANAGER=browser_manager))
     monkeypatch.setattr(agent_functions, "SkyvernElement", _capturing_skyvern_element(captured))
     task = SimpleNamespace(task_id="tsk_1", workflow_run_id="wr_1")
+    skyvern_frame = _FakeSkyvernFrame()
+    skyvern_frame.engine_selection = selection
 
-    eligible = await agent_functions._check_svg_eligibility(_FakeSkyvernFrame(), _svg_element(), task=task)  # type: ignore[arg-type]
+    eligible = await agent_functions._check_svg_eligibility(skyvern_frame, _svg_element(), task=task)  # type: ignore[arg-type]
 
     assert eligible is True
     assert captured == [selection]
+    browser_manager.get_for_task.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -437,16 +518,14 @@ async def test_css_shape_convert_taskless_path_stays_manager_free(monkeypatch: p
 
 
 @pytest.mark.asyncio
-async def test_css_shape_convert_resolves_pinned_selection_when_task_present(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_css_shape_convert_uses_frame_selection_when_task_present(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: list[Any] = []
     selection = SimpleNamespace()
 
     async def handler(**kwargs: Any) -> dict[str, Any]:
         return {"shape": "calendar icon", "recognized": True}
 
-    browser_manager = SimpleNamespace(
-        get_for_task=lambda task_id, workflow_run_id: SimpleNamespace(engine_selection=selection)
-    )
+    browser_manager = SimpleNamespace(get_for_task=MagicMock())
     monkeypatch.setattr(
         agent_functions,
         "app",
@@ -456,7 +535,10 @@ async def test_css_shape_convert_resolves_pinned_selection_when_task_present(mon
     )
     monkeypatch.setattr(agent_functions, "SkyvernElement", _capturing_skyvern_element(captured))
     task = SimpleNamespace(task_id="tsk_1", workflow_run_id="wr_1")
+    skyvern_frame = _FakeSkyvernFrame()
+    skyvern_frame.engine_selection = selection
 
-    await agent_functions._convert_css_shape_to_string(_FakeSkyvernFrame(), _css_shape_element(), task=task)  # type: ignore[arg-type]
+    await agent_functions._convert_css_shape_to_string(skyvern_frame, _css_shape_element(), task=task)  # type: ignore[arg-type]
 
     assert captured == [selection]
+    browser_manager.get_for_task.assert_not_called()

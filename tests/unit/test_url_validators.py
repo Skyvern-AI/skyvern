@@ -3,7 +3,7 @@ import socket
 import pytest
 
 from skyvern.config import settings
-from skyvern.exceptions import BlockedHost
+from skyvern.exceptions import BlockedHost, SkyvernHTTPException, UnresolvableHost
 from skyvern.utils.url_validators import (
     encode_url,
     is_blocked_host,
@@ -183,6 +183,29 @@ def test_is_blocked_host_allows_public_dns_answers(monkeypatch: pytest.MonkeyPat
     assert is_blocked_host("public.example.test", resolve_dns=True) is False
 
 
+def test_is_blocked_host_does_not_treat_worker_dns_failure_as_a_policy_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fails_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        raise OSError("dns unavailable")
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", fails_dns)
+
+    assert is_blocked_host("public.example.test", resolve_dns=True) is False
+
+
+@pytest.mark.parametrize("host", ["10.0.0.5", "127.0.0.1", "169.254.169.254", "localhost"])
+def test_is_blocked_host_still_refuses_internal_targets_without_resolving(
+    monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    def unexpected_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        raise AssertionError("internal targets must be refused before DNS is consulted")
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", unexpected_dns)
+
+    assert is_blocked_host(host, resolve_dns=True) is True
+
+
 def test_validate_fetch_url_blocks_hostname_resolving_private_ip(monkeypatch: pytest.MonkeyPatch) -> None:
     def resolves_to_private(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
         return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.42", port or 0))]
@@ -193,13 +216,112 @@ def test_validate_fetch_url_blocks_hostname_resolving_private_ip(monkeypatch: py
         validate_fetch_url("https://evil.example.test/file.pdf")
 
 
+@pytest.mark.parametrize("blocked_host", ["127.0.0.1", "10.0.0.5", "169.254.169.254"])
+def test_validate_fetch_url_checks_blocked_host_when_url_is_too_long(
+    blocked_host: str,
+) -> None:
+    url = f"http://{blocked_host}/resource?payload=" + "x" * 2100
+    assert len(url) > 2083
+
+    with pytest.raises(BlockedHost) as exc_info:
+        validate_fetch_url(url)
+
+    assert type(exc_info.value) is BlockedHost
+
+
+@pytest.mark.parametrize("url", ["ftp://public.example.test/file", "chrome://settings", "gopher://host/x"])
+def test_validate_fetch_url_refuses_nonhttp_scheme_without_dns(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    def unexpected_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        raise AssertionError("non-http(s) schemes must be refused before DNS is consulted")
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", unexpected_dns)
+
+    with pytest.raises(SkyvernHTTPException):
+        validate_fetch_url(url)
+
+
+@pytest.mark.parametrize("blocked_host", ["169.254.169.254", "127.0.0.1", "10.0.0.5"])
+def test_validate_fetch_url_checks_blocked_host_behind_backslash_authority(
+    blocked_host: str,
+) -> None:
+    # A browser reads the backslash as a separator and navigates to blocked_host, so the
+    # over-length fallback must not be fooled into reading an unrelated host.
+    url = f"http://{blocked_host}\\.example.com/latest/meta-data/#" + "x" * 2100
+    assert len(url) > 2083
+
+    with pytest.raises(BlockedHost) as exc_info:
+        validate_fetch_url(url)
+
+    assert type(exc_info.value) is BlockedHost
+
+
+def test_validate_fetch_url_allows_long_url_with_public_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolves_to_public(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_to_public)
+    url = "https://public.example.test/callback?response=" + "x" * 2100
+    assert len(url) > 2100
+
+    assert validate_fetch_url(url) == url
+
+
+@pytest.mark.parametrize("url", ["http://localhost:8000/", "http://127.0.0.1:3000/"])
+def test_validate_fetch_url_blocks_localhost_and_loopback_without_allowed_hosts(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    monkeypatch.setattr(settings, "ALLOWED_HOSTS", [])
+
+    with pytest.raises(BlockedHost):
+        validate_fetch_url(url)
+
+
+def test_validate_fetch_url_allows_localhost_in_allowed_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolves_to_loopback(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", port or 0))]
+
+    monkeypatch.setattr(settings, "ALLOWED_HOSTS", ["localhost"])
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_to_loopback)
+    url = "http://localhost:8000/"
+
+    assert validate_fetch_url(url) == url
+
+
+@pytest.mark.parametrize("url", ["http://169.254.169.254/", "http://10.0.0.5/"])
+def test_validate_fetch_url_blocks_metadata_and_private_hosts(url: str) -> None:
+    with pytest.raises(BlockedHost):
+        validate_fetch_url(url)
+
+
+def test_validate_fetch_url_blocks_localhost_resolving_to_private_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolves_to_private(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.5", port or 0))]
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_to_private)
+
+    with pytest.raises(BlockedHost):
+        validate_fetch_url("http://localhost:8000/")
+
+
 def test_validate_fetch_url_fails_closed_on_dns_error(monkeypatch: pytest.MonkeyPatch) -> None:
     def fails_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
         raise OSError("dns unavailable")
 
     monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", fails_dns)
 
-    with pytest.raises(BlockedHost):
+    with pytest.raises(BlockedHost) as exc_info:
+        validate_fetch_url("https://unresolvable.example.test/file.pdf")
+
+    assert type(exc_info.value) is UnresolvableHost
+
+
+def test_validate_fetch_url_fails_closed_without_resolved_ips(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolves_without_answers(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return []
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_without_answers)
+
+    with pytest.raises(UnresolvableHost):
         validate_fetch_url("https://unresolvable.example.test/file.pdf")
 
 

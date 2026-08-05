@@ -101,6 +101,7 @@ const mocks = vi.hoisted(() => {
     rfbInstances,
     recordingStore,
     settingsStore,
+    toast: vi.fn(),
   };
 });
 
@@ -123,6 +124,10 @@ vi.mock("@/store/useClientIdStore", () => ({
 
 vi.mock("@/store/SettingsStore", () => ({
   useSettingsStore: () => mocks.settingsStore,
+}));
+
+vi.mock("@/components/ui/use-toast", () => ({
+  toast: mocks.toast,
 }));
 
 vi.mock("@/store/useRecordingStore", () => {
@@ -203,25 +208,30 @@ describe("BrowserStream", () => {
 
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
     vi.clearAllMocks();
     mocks.rfbInstances.length = 0;
   });
 
-  it("supports VNC paste after taking control of a browser session stream", async () => {
+  it("releases and restores held left Cmd around VNC paste", async () => {
     const { container } = renderBrowserStream();
-    const takeControlButton = await screen.findByRole("button", {
-      name: /take control/i,
-    });
+    const takeControlButton = await screen.findByRole(
+      "button",
+      { name: /take control/i },
+      { timeout: 10000 },
+    );
     const stream = container.querySelector(".browser-stream");
+    const canvas = container.querySelector("canvas");
 
     expect(stream).toBeInstanceOf(HTMLElement);
     expect(mocks.rfbInstances).toHaveLength(1);
 
-    fireEvent.keyDown(stream!, { ctrlKey: true, key: "v" });
+    fireEvent.keyDown(stream!, { key: "v", metaKey: true });
     expect(mocks.rfbInstances[0]?.clipboardPasteFrom).not.toHaveBeenCalled();
 
     fireEvent.click(takeControlButton);
-    fireEvent.keyDown(stream!, { ctrlKey: true, key: "v" });
+    fireEvent.keyDown(canvas!, { key: "Meta", code: "MetaLeft" });
+    fireEvent.keyDown(stream!, { key: "v", metaKey: true });
 
     await waitFor(() => {
       expect(mocks.rfbInstances[0]?.clipboardPasteFrom).toHaveBeenCalledWith(
@@ -229,8 +239,250 @@ describe("BrowserStream", () => {
       );
     });
     await waitFor(() => {
-      expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenCalledTimes(4);
+      expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenCalledTimes(6);
     });
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      1,
+      0xffe9,
+      "MetaLeft",
+      false,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      2,
+      0xffe3,
+      "ControlLeft",
+      true,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      3,
+      0x0076,
+      "KeyV",
+      true,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      4,
+      0x0076,
+      "KeyV",
+      false,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      5,
+      0xffe3,
+      "ControlLeft",
+      false,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      6,
+      0xffe9,
+      "MetaLeft",
+      true,
+    );
+  });
+
+  it("clears a held Cmd side when Meta is released elsewhere in the window", async () => {
+    const { container } = renderBrowserStream();
+    const takeControlButton = await screen.findByRole(
+      "button",
+      { name: /take control/i },
+      { timeout: 10000 },
+    );
+    const stream = container.querySelector(".browser-stream");
+    const canvas = container.querySelector("canvas");
+
+    expect(stream).toBeInstanceOf(HTMLElement);
+    expect(mocks.rfbInstances).toHaveLength(1);
+
+    fireEvent.click(takeControlButton);
+    fireEvent.keyDown(canvas!, { key: "Meta", code: "MetaLeft" });
+    fireEvent.keyUp(window, { key: "Meta", code: "MetaLeft" });
+    fireEvent.keyDown(stream!, { key: "v", metaKey: true });
+
+    await waitFor(() => {
+      expect(mocks.rfbInstances[0]?.clipboardPasteFrom).toHaveBeenCalledWith(
+        "https://example.test",
+      );
+    });
+    await waitFor(() => {
+      expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenCalledTimes(8);
+    });
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      1,
+      0xffe9,
+      "AltLeft",
+      false,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      2,
+      0xffea,
+      "AltRight",
+      false,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      3,
+      0xffeb,
+      "MetaLeft",
+      false,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      4,
+      0xffec,
+      "MetaRight",
+      false,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      5,
+      0xffe3,
+      "ControlLeft",
+      true,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      6,
+      0x0076,
+      "KeyV",
+      true,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      7,
+      0x0076,
+      "KeyV",
+      false,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      8,
+      0xffe3,
+      "ControlLeft",
+      false,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).not.toHaveBeenCalledWith(
+      0xffe9,
+      "MetaLeft",
+      true,
+    );
+  });
+
+  it("does not restore a Cmd side whose keydown noVNC never received", async () => {
+    const { container } = renderBrowserStream();
+    const takeControlButton = await screen.findByRole(
+      "button",
+      { name: /take control/i },
+      { timeout: 10000 },
+    );
+    const stream = container.querySelector(".browser-stream");
+
+    expect(stream).toBeInstanceOf(HTMLElement);
+    expect(mocks.rfbInstances).toHaveLength(1);
+
+    fireEvent.click(takeControlButton);
+    fireEvent.keyDown(stream!, { key: "Meta", code: "MetaLeft" });
+    fireEvent.keyDown(stream!, { key: "v", metaKey: true });
+
+    await waitFor(() => {
+      expect(mocks.rfbInstances[0]?.clipboardPasteFrom).toHaveBeenCalledWith(
+        "https://example.test",
+      );
+    });
+    await waitFor(() => {
+      expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenCalledTimes(8);
+    });
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      1,
+      0xffe9,
+      "AltLeft",
+      false,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      2,
+      0xffea,
+      "AltRight",
+      false,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      3,
+      0xffeb,
+      "MetaLeft",
+      false,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      4,
+      0xffec,
+      "MetaRight",
+      false,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      5,
+      0xffe3,
+      "ControlLeft",
+      true,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      6,
+      0x0076,
+      "KeyV",
+      true,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      7,
+      0x0076,
+      "KeyV",
+      false,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).toHaveBeenNthCalledWith(
+      8,
+      0xffe3,
+      "ControlLeft",
+      false,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).not.toHaveBeenCalledWith(
+      0xffe9,
+      expect.any(String),
+      true,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).not.toHaveBeenCalledWith(
+      0xffea,
+      expect.any(String),
+      true,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).not.toHaveBeenCalledWith(
+      0xffeb,
+      expect.any(String),
+      true,
+    );
+    expect(mocks.rfbInstances[0]?.sendKey).not.toHaveBeenCalledWith(
+      0xffec,
+      expect.any(String),
+      true,
+    );
+  });
+
+  it("shows a destructive toast when browser clipboard access fails", async () => {
+    const error = new Error("denied");
+    vi.mocked(navigator.clipboard.readText).mockRejectedValueOnce(error);
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    const { container } = renderBrowserStream();
+    const takeControlButton = await screen.findByRole(
+      "button",
+      { name: /take control/i },
+      { timeout: 10000 },
+    );
+    const stream = container.querySelector(".browser-stream");
+
+    fireEvent.click(takeControlButton);
+    fireEvent.keyDown(stream!, { key: "v", metaKey: true });
+
+    await waitFor(() => {
+      expect(mocks.toast).toHaveBeenCalledWith({
+        title: "Paste failed",
+        description:
+          "Skyvern couldn't read your clipboard. Allow clipboard access for this site and try again.",
+        variant: "destructive",
+      });
+    });
+    expect(mocks.toast).toHaveBeenCalledTimes(1);
+    expect(mocks.rfbInstances[0]?.clipboardPasteFrom).not.toHaveBeenCalled();
+    expect(mocks.rfbInstances[0]?.sendKey).not.toHaveBeenCalled();
+    expect(consoleError).toHaveBeenCalledTimes(1);
   });
 
   it("notifies activity after a VNC framebuffer update completes", async () => {

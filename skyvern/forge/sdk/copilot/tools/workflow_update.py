@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import copy
 import hashlib
 import io
@@ -64,10 +65,11 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     recorded_outcome_from_author_time_reject,
     recorded_outcome_from_authoring_repair_context,
 )
+from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
 from skyvern.forge.sdk.copilot.code_block_preflight import (
     SANDBOX_UNRESOLVED_NAME_REASON_CODE,
     author_time_code_block_diagnostics,
-    sandbox_unresolved_name_diagnostics,
+    sandbox_absent_name_diagnostics,
     sandbox_unresolved_name_repair_diagnostic,
     strip_redundant_sandbox_imports,
 )
@@ -166,8 +168,6 @@ from skyvern.forge.sdk.copilot.output_contracts import (
 )
 from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
 from skyvern.forge.sdk.copilot.output_policy import (
-    OutputPolicyReason,
-    OutputPolicyVerdict,
     demote_author_time_steer_reasons,
     evaluate_output_policy,
     format_output_policy_tool_error,
@@ -1010,9 +1010,9 @@ def _code_block_safety_errors(workflow_yaml: str | None, prior_yaml: str | None)
             f"Code block `{label}` failed the generated-code preflight check: {item.message}"
             for item in author_time_diagnostics
         )
-        unresolved_diagnostics = sandbox_unresolved_name_diagnostics(code, parameter_keys=parameter_keys)
+        absent_diagnostics = sandbox_absent_name_diagnostics(code, parameter_keys=parameter_keys)
         errors.extend(
-            f"Code block `{label}` failed the sandbox name check: {item.message}" for item in unresolved_diagnostics
+            f"Code block `{label}` failed the sandbox name check: {item.message}" for item in absent_diagnostics
         )
     return errors
 
@@ -2750,6 +2750,23 @@ def _metadata_has_mapping_item(raw_metadata: object) -> bool:
     return any(_raw_metadata_item_mapping(item) is not None for item in _code_artifact_metadata_items(raw_metadata))
 
 
+def _goal_paths_rooted_as_the_code_returns_them(required_paths: set[str], code: str) -> set[str]:
+    """Goal paths named the way ``code`` names them.
+
+    A goal path is written in the block's own namespace while a plan-derived extraction returns the
+    requested-output namespace, so one calls the value `visitors` and the other
+    `output.visitors`; compared raw, a value the code returns reads as absent. Re-rooting is applied
+    only where it is what the code actually returns, so a block returning a bare mapping keeps naming
+    its keys bare.
+    """
+    if not required_paths:
+        return required_paths
+    produced = _code_block_produced_output_paths(code)
+    return {
+        f"output.{path}" if path not in produced and f"output.{path}" in produced else path for path in required_paths
+    }
+
+
 def _metadata_item_goal_value_paths(item: Mapping[str, Any] | None) -> set[str]:
     if item is None:
         return set()
@@ -4112,17 +4129,19 @@ def _attempt_separated_spine_split(
     if _browser_surface_contains_full_action_spine(keyed_extraction, reconciled_synthesized):
         return _SpineSplitOutcome(None, ["extraction_retains_full_spine"], None)
 
-    stage_codes = _synthesized_durable_stage_codes(synthesized, source_code=reconciled_synthesized)
+    resolved = _resolve_durable_stages(synthesized, source_code=reconciled_synthesized, reconciliation=reconciliation)
+    stage_codes = resolved.codes
     if len(stage_codes) < 2:
+        _log_durable_stage_derivation_empty(block_label=label, resolved=resolved)
         return _SpineSplitOutcome(None, ["insufficient_durable_stages"], len(stage_codes))
 
     split_violations = _split_selected_output_owner_into_browser_stages(
         parsed=parsed,
         code_block=code_block,
-        synthesized=synthesized,
-        synthesized_code=reconciled_synthesized,
+        stage_codes=stage_codes,
         extraction_code=keyed_extraction,
         parameter_keys=reconciliation.parameter_keys,
+        segmented=resolved.segmented,
     )
     if split_violations:
         return _SpineSplitOutcome(None, split_violations, len(stage_codes))
@@ -5276,7 +5295,12 @@ def _replace_direct_child_local_return(
     if len(returns) != 1:
         return ""
     return_node = returns[0]
-    if not isinstance(return_node.value, ast.Name) or return_node.value.id != child_name:
+    # A single required path and a single returned local leave nothing to choose between, so the
+    # local carries the value whatever the author named it.
+    if not isinstance(return_node.value, ast.Name):
+        return ""
+    returned_name = return_node.value.id
+    if returned_name != child_name and returned_name in declaration_children:
         return ""
     if return_node.end_lineno is None:
         return ""
@@ -5288,7 +5312,7 @@ def _replace_direct_child_local_return(
         return ""
     indent = indent_match.group(0)
     pairs = ", ".join(
-        f'"{name}": None' if name in declaration_children else f'"{name}": {name}' for name in child_names
+        f'"{name}": None' if name in declaration_children else f'"{name}": {returned_name}' for name in child_names
     )
     replacement = f'{indent}return {{"output": {{{pairs}}}}}'
     return "\n".join(
@@ -6785,6 +6809,31 @@ def _is_allowed_browser_read_call(node: ast.Call, bindings: _BrowserBindings) ->
     if func.attr in _LOCATOR_READ_METHODS:
         return _browser_expression_kind(func.value, bindings) == _BrowserExpressionKind.LOCATOR
     return False
+
+
+def _submission_returns_a_value(code: str) -> bool:
+    """Whether the submission hands a value back, read from its syntax rather than its text."""
+    try:
+        tree = ast.parse(textwrap.dedent(code or "").strip())
+    except SyntaxError:
+        return False
+    return any(isinstance(node, ast.Return) and node.value is not None for node in ast.walk(tree))
+
+
+def _submitted_code_fingerprint(code: str) -> dict[str, object]:
+    """Shape of what the author submitted, for attributing a lost extraction after imposition."""
+    stripped = textwrap.dedent(code or "").strip()
+    try:
+        tree: ast.Module | None = ast.parse(stripped)
+    except SyntaxError:
+        tree = None
+    return {
+        "submitted_sha256": hashlib.sha256(stripped.encode()).hexdigest()[:12],
+        "submitted_chars": len(stripped),
+        "submitted_parses": tree is not None,
+        "submitted_returns": tree is not None and any(isinstance(node, ast.Return) for node in ast.walk(tree)),
+        "submitted_reads_page": any(marker in stripped for marker in ("page.evaluate", "inner_text", "text_content")),
+    }
 
 
 def _browser_surface_for_code(code: str) -> tuple[list[_BrowserMutationSignature], list[str], list[str]]:
@@ -8365,24 +8414,115 @@ def _reconcile_synthesized_parameters(
     return _SynthesizedParameterReconciliation(parameter_keys, violations, aliases, repair_context)
 
 
-def _synthesized_durable_stage_codes(synthesized: SynthesizedCodeBlock, *, source_code: str | None = None) -> list[str]:
-    steps = getattr(synthesized, "steps", None)
-    if not isinstance(steps, list) or len(steps) < 2:
-        return []
+class _DurableStageCodes(NamedTuple):
+    codes: list[str]
+    empty_reason: str | None = None
+
+
+def _output_owner_is_referenced(parsed: Mapping[str, Any], output_label: str) -> bool:
+    """True when another block routes to this label. Splitting inserts stages ahead of the owner but
+    leaves the label on the owner, so an inbound jump would enter past the login stages."""
+    if not output_label:
+        return False
+
+    def walk(node: object) -> bool:
+        if isinstance(node, Mapping):
+            for key, value in node.items():
+                if (
+                    key in ("next_block_label", "finally_block_label")
+                    and isinstance(value, str)
+                    and value.strip() == output_label
+                ):
+                    return True
+                if walk(value):
+                    return True
+            return False
+        if isinstance(node, list):
+            return any(walk(item) for item in node)
+        return False
+
+    return walk(parsed.get("workflow_definition"))
+
+
+class _ResolvedDurableStages(NamedTuple):
+    codes: list[str]
+    segmented: bool
+    empty_reason: str | None = None
+
+
+def _resolve_durable_stages(
+    synthesized: SynthesizedCodeBlock,
+    *,
+    source_code: str,
+    reconciliation: _SynthesizedParameterReconciliation | None = None,
+) -> _ResolvedDurableStages:
+    """Segments synthesized per trajectory slice when the scout logged in, else the per-interaction
+    derivation. Segments are generated self-contained, so they need no boundary repair here."""
+    if synthesized.segments:
+        codes = [textwrap.dedent(segment.code).strip() for segment in synthesized.segments]
+        if reconciliation is not None:
+            codes = [_apply_parameter_reconciliation_to_code(code, reconciliation) for code in codes]
+        return _ResolvedDurableStages(codes, True)
+    result = _synthesized_durable_stage_codes(synthesized, source_code=source_code)
+    return _ResolvedDurableStages(result.codes, False, result.empty_reason)
+
+
+def _log_durable_stage_split_without_extraction_boundary(*, block_label: str, stage_count: int) -> None:
+    """The one fused-draft shape the sibling diagnostic cannot see: stages derived, no boundary to split at."""
+    LOG.info(
+        "copilot_durable_stage_split_without_extraction_boundary",
+        block_label=block_label,
+        stage_count=stage_count,
+    )
+
+
+def _log_durable_stage_derivation_empty(*, block_label: str, resolved: _ResolvedDurableStages) -> None:
+    LOG.info(
+        "copilot_durable_stage_derivation_empty",
+        block_label=block_label,
+        empty_reason=resolved.empty_reason or "insufficient_stage_count",
+        stage_count=len(resolved.codes),
+        credential_grouped=resolved.segmented,
+    )
+
+
+def _stage_reads_unbound_scout_local(stage_code: str) -> bool:
+    """Each separated stage becomes an independent CodeBlock with its own scope, so a stage that reads
+    a synthesizer-internal local bound by an earlier stage would raise NameError at runtime."""
+    try:
+        tree = ast.parse(textwrap.dedent(stage_code).strip() or "pass")
+    except SyntaxError:
+        return False
+    bound = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+    return any(
+        node.id in _INTERNAL_SCOUT_VARS and node.id not in bound
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    )
+
+
+def _synthesized_durable_stage_codes(
+    synthesized: SynthesizedCodeBlock,
+    *,
+    source_code: str | None = None,
+) -> _DurableStageCodes:
+    step_ranges = synthesized.steps
+    if not step_ranges:
+        return _DurableStageCodes([], "insufficient_steps")
     lines = textwrap.dedent(source_code if source_code is not None else synthesized.code).strip("\n").splitlines()
     if not lines:
-        return []
+        return _DurableStageCodes([], "empty_source")
     ranges: list[tuple[int, int]] = []
-    for step in steps:
+    for step in step_ranges:
         if not isinstance(step, Mapping):
-            return []
+            return _DurableStageCodes([], "malformed_step")
         start = _coerce_positive_int(step.get("line_start"))
         end = _coerce_positive_int(step.get("line_end"))
         if start is None or end is None or end < start or end > len(lines):
-            return []
+            return _DurableStageCodes([], "invalid_step_line_range")
         ranges.append((start, end))
     if ranges != sorted(ranges):
-        return []
+        return _DurableStageCodes([], "unordered_step_ranges")
     # The witness prelude (runtime charset guards + month helper) sits above the first step range, so the
     # slice would drop it; each separated stage is an independent CodeBlock that must carry its own guards.
     prelude = "\n".join(lines[: ranges[0][0] - 1]).strip()
@@ -8392,7 +8532,18 @@ def _synthesized_durable_stage_codes(synthesized: SynthesizedCodeBlock, *, sourc
         if not body:
             continue
         stage_codes.append(f"{prelude}\n{body}" if prelude else body)
-    return stage_codes
+    if not stage_codes:
+        return _DurableStageCodes([], "empty_stage_bodies")
+    # A slice can start inside a nested block and lose its header. Declining leaves the fused block
+    # persisted, where emitting it fails the whole update later against a label the model never wrote.
+    for code in stage_codes:
+        try:
+            ast.parse(textwrap.dedent(code).strip() or "pass")
+        except SyntaxError:
+            return _DurableStageCodes([], "stage_not_parseable")
+    if any(_stage_reads_unbound_scout_local(code) for code in stage_codes):
+        return _DurableStageCodes([], "stage_reads_cross_stage_local")
+    return _DurableStageCodes(stage_codes)
 
 
 def _top_level_block_list_for_selected_code_block(
@@ -8420,16 +8571,17 @@ def _split_selected_output_owner_into_browser_stages(
     *,
     parsed: Mapping[str, Any],
     code_block: dict[str, Any],
-    synthesized: SynthesizedCodeBlock,
-    synthesized_code: str,
+    stage_codes: list[str],
     extraction_code: str,
     parameter_keys: list[str],
+    segmented: bool,
 ) -> list[str]:
     block_position = _top_level_block_list_for_selected_code_block(parsed, code_block)
     if block_position is None:
         return ["Unable to impose synthesized code block: selected output block insertion point is ambiguous."]
     blocks, selected_index = block_position
-    stage_codes = _synthesized_durable_stage_codes(synthesized, source_code=synthesized_code)
+    if _output_owner_is_referenced(parsed, str(code_block.get("label") or "").strip()):
+        return ["Unable to impose synthesized code block: output owner block is routed to by another block."]
     if len(stage_codes) < 2:
         return ["Unable to impose synthesized code block: synthesized browser stage boundaries are ambiguous."]
     output_label = str(code_block.get("label") or "").strip()
@@ -8451,12 +8603,22 @@ def _split_selected_output_owner_into_browser_stages(
             "label": label,
             "code": code.rstrip() + "\n",
         }
-        if parameter_keys:
-            stage_block["parameter_keys"] = list(parameter_keys)
+        # Per-stage keys, never the whole set: broadcasting would grant a stage that reads no
+        # credential access to the org's saved credential.
+        referenced_keys = _referenced_parameter_keys_in_code(code, parameter_keys) if parameter_keys else []
+        if referenced_keys:
+            stage_block["parameter_keys"] = referenced_keys
         stage_blocks.append(stage_block)
     code_block["code"] = textwrap.dedent(extraction_code).strip() + "\n"
     code_block.pop("parameter_keys", None)
     blocks[selected_index : selected_index + 1] = [*stage_blocks, code_block]
+    LOG.info(
+        "copilot_output_owner_split_into_browser_stages",
+        block_label=output_label,
+        stage_count=len(stage_codes),
+        credential_grouped=segmented,
+        stage_labels=stage_labels,
+    )
     return []
 
 
@@ -8777,10 +8939,27 @@ def _maybe_impose_synthesized_code_block(
     rejection_provenance = list(surface_validation.provenance)
     ambiguous_reject_present = any(record.kind == "ambiguous" for record in surface_validation.provenance)
     submitted_extraction_suffix = _submitted_suffix_after_synthesized_code(submitted_code, synthesized_spine_code)
-    extraction_suffix = submitted_extraction_suffix or synthesized.extraction_code
-    extraction_candidate_source = "submitted" if submitted_extraction_suffix else "generated"
+    # A frozen candidate is an extraction the plan derived from a packet that bound every requested
+    # path, so it reads the element the run proved carries the value. The submitted suffix is the
+    # author's guess at the same read; where the two disagree the proven one is taken rather than the
+    # attempt rejected, and the test run is what says whether it holds.
+    plan_extraction_wins = (
+        imposed_candidate is not None
+        and bool(synthesized.extraction_code)
+        and bool(submitted_extraction_suffix)
+        and submitted_extraction_suffix.strip() != synthesized.extraction_code.strip()
+    )
+    extraction_suffix = (
+        synthesized.extraction_code
+        if plan_extraction_wins
+        else (submitted_extraction_suffix or synthesized.extraction_code)
+    )
+    extraction_candidate_source = (
+        "submitted" if submitted_extraction_suffix and not plan_extraction_wins else "generated"
+    )
     if (
-        submitted_extraction_suffix
+        not plan_extraction_wins
+        and submitted_extraction_suffix
         and synthesized.extraction_code
         and submitted_extraction_suffix.strip() != synthesized.extraction_code.strip()
     ):
@@ -8900,11 +9079,41 @@ def _maybe_impose_synthesized_code_block(
         and not extraction_suffix
         and not _is_submitted_code_synthesized_only(submitted_code, synthesized_spine_code)
     )
-    append_selected_extraction = (
+    # Read-only code that does not restate the spine is appended to it, whatever the metadata said:
+    # the imposed spine would otherwise replace the extraction the author just wrote with nothing.
+    append_selected_extraction = not submitted_contains_full_spine and not selected_mutations and not selected_ambiguous
+    # A draft the surface scan cannot partition is kept and tested rather than replaced by a spine
+    # that carries no extraction: the spine cannot register the value the turn was asked for, so
+    # replacing a returning draft with it trades a testable attempt for a certain miss.
+    preserve_unpartitionable_draft = (
         metadata_declares_goal_values
-        and not submitted_contains_full_spine
-        and not selected_mutations
-        and not selected_ambiguous
+        and not preserve_submitted_extraction
+        and not append_selected_extraction
+        and not extraction_suffix
+        and bool(selected_ambiguous)
+        and _submission_returns_a_value(submitted_code)
+        and not _is_submitted_code_synthesized_only(submitted_code, synthesized_spine_code)
+    )
+    if preserve_unpartitionable_draft:
+        preserve_submitted_extraction = True
+    repair_context = ctx.last_code_authoring_repair_context
+    repairing_runtime_failure = repair_context is not None and repair_context.reason_code == "runtime_block_failure"
+    scouted_since_offer = len(ctx.scout_trajectory) > (ctx.synthesized_block_offered_trajectory_len or 0)
+    LOG.info(
+        "copilot_imposition_submitted_code_disposition",
+        preserve_submitted_extraction=preserve_submitted_extraction,
+        preserve_unpartitionable_draft=preserve_unpartitionable_draft,
+        selected_ambiguous=sorted(selected_ambiguous),
+        append_selected_extraction=append_selected_extraction,
+        repairing_runtime_failure=repairing_runtime_failure,
+        scouted_since_offer=scouted_since_offer,
+        metadata_declares_goal_values=metadata_declares_goal_values,
+        submitted_contains_full_spine=submitted_contains_full_spine,
+        has_extraction_suffix=bool(extraction_suffix),
+        submitted_is_synthesized_only=_is_submitted_code_synthesized_only(submitted_code, synthesized_spine_code),
+        # Whether an author's extraction was dropped is unanswerable once the submission is replaced,
+        # so record its shape rather than the code, which carries credential references.
+        **_submitted_code_fingerprint(submitted_code),
     )
     scrubbed_selected_metadata_label = (
         str(code_block.get("label") or "")
@@ -8945,11 +9154,26 @@ def _maybe_impose_synthesized_code_block(
         split_extraction_code = textwrap.dedent(submitted_code).strip()
     elif preserve_submitted_extraction and reconciled_extraction_suffix:
         split_extraction_code = reconciled_extraction_suffix
-    durable_stage_codes = _synthesized_durable_stage_codes(synthesized, source_code=reconciled_synthesized_code)
+    resolved_stages = _resolve_durable_stages(
+        synthesized, source_code=reconciled_synthesized_code, reconciliation=parameter_reconciliation
+    )
+    durable_stage_codes = resolved_stages.codes
+    split_eligible = metadata_declares_goal_values or resolved_stages.segmented
+    if split_eligible and len(durable_stage_codes) < 2:
+        _log_durable_stage_derivation_empty(block_label=str(code_block.get("label") or ""), resolved=resolved_stages)
+    has_extraction_boundary = bool(extraction_suffix) or append_selected_extraction or preserve_submitted_extraction
+    if split_eligible and len(durable_stage_codes) >= 2 and not has_extraction_boundary:
+        _log_durable_stage_split_without_extraction_boundary(
+            block_label=str(code_block.get("label") or ""),
+            stage_count=len(durable_stage_codes),
+        )
+    # A credential fill in the trajectory opens the split on its own: a value-producing subset that
+    # carries no credential fill reruns on the scout's authenticated session instead of replaying login.
     should_split_output_owner = (
-        metadata_declares_goal_values
+        split_eligible
         and len(durable_stage_codes) >= 2
-        and (bool(extraction_suffix) or append_selected_extraction or preserve_submitted_extraction)
+        and has_extraction_boundary
+        and not _output_owner_is_referenced(parsed, str(code_block.get("label") or "").strip())
     )
     if should_split_output_owner:
         if not split_extraction_code:
@@ -8962,13 +9186,28 @@ def _maybe_impose_synthesized_code_block(
             )
         split_extraction_code = _apply_parameter_reconciliation_to_code(split_extraction_code, parameter_reconciliation)
         target_metadata = _metadata_item_for_block_label(raw_metadata, str(code_block.get("label") or ""))
-        required_split_paths = _metadata_item_goal_value_paths(target_metadata)
+        required_split_paths = _goal_paths_rooted_as_the_code_returns_them(
+            _metadata_item_goal_value_paths(target_metadata), split_extraction_code
+        )
         if required_split_paths:
             split_extraction_code, static_return_violations = _extraction_code_with_value_bearing_static_return(
                 split_extraction_code,
                 required_paths=required_split_paths,
             )
             if static_return_violations:
+                # Which of the extraction candidates this branch was handed, by shape rather than by
+                # code: the submission carries credential references, and the question a refusal here
+                # raises is only ever whether the derived plan's read was available and chosen.
+                LOG.info(
+                    "copilot_split_extraction_static_return_refused",
+                    plan_present=extraction_plan is not None,
+                    plan_produces_paths=sorted(_code_block_produced_output_paths(synthesized.extraction_code)),
+                    suffix_is_plan_extraction=bool(synthesized.extraction_code)
+                    and extraction_suffix.strip() == synthesized.extraction_code.strip(),
+                    has_submitted_suffix=bool(submitted_extraction_suffix),
+                    required_split_paths=sorted(required_split_paths),
+                    produced_paths=sorted(_code_block_produced_output_paths(split_extraction_code)),
+                )
                 return _SynthesizedCodeImpositionResult(
                     workflow_yaml=workflow_yaml,
                     violations=static_return_violations,
@@ -8977,10 +9216,10 @@ def _maybe_impose_synthesized_code_block(
         split_violations = _split_selected_output_owner_into_browser_stages(
             parsed=parsed,
             code_block=code_block,
-            synthesized=synthesized,
-            synthesized_code=reconciled_synthesized_code,
+            stage_codes=durable_stage_codes,
             extraction_code=split_extraction_code,
             parameter_keys=parameter_reconciliation.parameter_keys,
+            segmented=resolved_stages.segmented,
         )
         if split_violations:
             return _SynthesizedCodeImpositionResult(
@@ -10157,6 +10396,31 @@ def _enrich_scout_trajectory_input_correspondences(workflow_yaml: str, ctx: Agen
             interaction.pop("input_correspondences", None)
 
 
+async def _record_canonical_write_ownership(ctx: CopilotContext, workflow: Workflow) -> None:
+    """Stamp the turn's marker with what it just left canonical as.
+
+    Best-effort: a missed stamp only costs this turn its rollback claim, while raising here
+    would fail a write that already succeeded. Canonical is re-read rather than fingerprinted
+    from the in-memory object so the value matches what reconcile computes.
+    """
+    with contextlib.suppress(Exception):
+        workflow_permanent_id = workflow.workflow_permanent_id
+        if not (ctx.workflow_copilot_chat_id and ctx.turn_id and workflow_permanent_id and ctx.organization_id):
+            return
+        persisted = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=ctx.organization_id,
+        )
+        if persisted is None:
+            return
+        await app.DATABASE.workflow_params.record_pending_copilot_turn_canonical_write(
+            organization_id=ctx.organization_id,
+            workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
+            turn_id=ctx.turn_id,
+            fingerprint=workflow_content_fingerprint(persisted.model_dump(mode="json")),
+        )
+
+
 async def _update_workflow(
     params: dict[str, Any],
     ctx: AgentContext,
@@ -10430,7 +10694,6 @@ async def _update_workflow(
                 "steered_reason_codes": [reason.value for reason in output_policy_steered_reasons],
             }
         output_policy_error = format_output_policy_tool_error(output_policy_verdict)
-        _record_code_only_raw_secret_reject_span(ctx, output_policy_verdict)
         LOG.info(
             "copilot output policy tool body verdict",
             **output_policy_trace_data,
@@ -10486,12 +10749,14 @@ async def _update_workflow(
         # Derive plain-language steps from each code block's code so the editor timeline
         # mirrors the actual code (deterministic action_type + line ranges).
         workflow_yaml_with_steps = await apply_derived_code_block_steps(workflow_yaml)
+        prior_workflow = await _get_prior_workflow(ctx)
         workflow = await _process_workflow_yaml(
             workflow_id=ctx.workflow_id,
             workflow_permanent_id=ctx.workflow_permanent_id,
             organization_id=ctx.organization_id,
             workflow_yaml=workflow_yaml_with_steps,
             settings_fallback_yaml=prior_yaml,
+            settings_fallback_workflow=prior_workflow,
             credential_scrub_values=registered_scrub_values(ctx),
         )
         _record_workflow_proxy_location_span(workflow_yaml, workflow)
@@ -10499,7 +10764,6 @@ async def _update_workflow(
         # Param / top-level setting changes go through canonical because
         # prepare_workflow and the runtime parameter-row read consume canonical
         # values; terminal handlers roll back on non-auto-accept.
-        prior_workflow = await _get_prior_workflow(ctx)
         requires_canonical_persist = _workflow_requires_canonical_persist(
             prior_workflow, workflow
         ) or _workflow_needs_contract_readback_persist(
@@ -10521,6 +10785,7 @@ async def _update_workflow(
                 totp_verification_url=workflow.totp_verification_url,
                 totp_identifier=workflow.totp_identifier,
                 persist_browser_session=workflow.persist_browser_session,
+                mask_secrets=getattr(workflow, "mask_secrets", False),
                 pin_saved_session_ip=workflow.pin_saved_session_ip,
                 browser_profile_id=workflow.browser_profile_id,
                 browser_profile_key=workflow.browser_profile_key,
@@ -10540,6 +10805,10 @@ async def _update_workflow(
                 edited_by="copilot",
             )
             ctx.canonical_was_persisted_due_to_param_change = True
+            # isinstance narrows the declared ``AgentContext`` to the marker-aware
+            # ``CopilotContext`` for mypy, matching the narrative-emit seam below.
+            if isinstance(ctx, CopilotContext):
+                await _record_canonical_write_ownership(ctx, workflow)
         ctx.staged_workflow_yaml = workflow_yaml
         ctx.staged_workflow = workflow
         ctx.has_staged_proposal = True
@@ -10607,22 +10876,6 @@ def _record_workflow_proxy_location_span(workflow_yaml: str, workflow: Workflow)
             "input_proxy_location_present": input_present,
             "input_proxy_location": input_proxy_location,
             "effective_proxy_location": effective_proxy_location,
-        },
-    ):
-        pass
-
-
-def _record_code_only_raw_secret_reject_span(ctx: AgentContext, verdict: OutputPolicyVerdict) -> None:
-    if OutputPolicyReason.RAW_SECRET_LEAK not in verdict.reason_codes:
-        return
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return
-    with copilot_span(
-        "update_workflow_code_only_raw_secret_reject",
-        data={
-            "tool_name": "update_workflow",
-            "reason_code": OutputPolicyReason.RAW_SECRET_LEAK.value,
-            "block_authoring_policy": BlockAuthoringPolicy.CODE_ONLY_BROWSER.value,
         },
     ):
         pass

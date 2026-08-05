@@ -4,7 +4,7 @@ import platform
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
@@ -109,6 +109,7 @@ class Settings(BaseSettings):
     DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
     BROWSER_ACTION_MAX_EXECUTION_SECONDS: int = 1200
+    WORKER_STALL_DUMP_SECONDS: int = 0
     # "enforce" is deliberately absent: the policy core can only observe until every sink consumes
     # an exact approval, so an enforcing value must be unrepresentable rather than merely unused.
     BROWSER_ACTION_POLICY_MODE: Literal["disabled", "observe"] = "disabled"
@@ -134,6 +135,21 @@ class Settings(BaseSettings):
     MAX_STEPS_PER_RUN: int = 10
     MAX_STEPS_PER_TASK_V2: int = 25
     MAX_ITERATIONS_PER_TASK_V2: int = 50
+    # Eval-fleet levers below: each one changes task_v2 planner behavior, so they default off and
+    # the benchmark values file turns them on. Do not flip a default to True without an org gate.
+    TASK_V2_SKIP_COMPLETION_CHECK_AFTER_NAVIGATE: bool = False
+    # Carry the planner's required_subgoals leg-checklist forward into the next planner
+    # prompt so it refines rather than re-derives it each iteration.
+    TASK_V2_CARRY_SUBGOALS: bool = False
+    # Final N% of planner iterations: inject a wrap-up directive telling the planner to converge on
+    # open required_subgoals instead of starting new legs (prevents budget exhaustion). 0 disables.
+    TASK_V2_CONVERGE_PCT: int = 0
+    # litellm num_retries for direct (non-router) LLM calls; 0 keeps current behavior.
+    # Raise for low-QPM keys (e.g. local Vertex smoke) so 429s back off and retry instead of failing the run.
+    LLM_DIRECT_NUM_RETRIES: int = 0
+    # Umbrella for specific self-contained mini goals, per-block complete_criterion, and inline loop_values.
+    # Default-off; the eval fleet forces it on and prod opts in per-org via the experimentation flag.
+    PLANNER_MINI_GOAL_IMPROVEMENTS: bool = False
     # Upper bound on the number of open tabs screenshotted at task_v2 completion so the
     # trajectory judge can verify "keep N tabs open" rubrics without unbounded artifact spend.
     MAX_COMPLETION_TAB_SCREENSHOTS_PER_TASK_V2: int = 20
@@ -191,9 +207,10 @@ class Settings(BaseSettings):
     COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
     COPILOT_TURN_INTENT_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
     COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
-    # Consecutive repair runs that make no newly-verified forward progress before the
-    # copilot stops re-running and escalates honestly. Set very high to disable the ceiling.
-    COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
+    # A capture that runs out of time yields no page evidence at all, so the scout falls back to
+    # dumping the page. Measured attaches on a live dashboard reach 8.6s; the former 4s bound cut the
+    # tail off and a third of captures returned nothing.
+    COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 12.0
     # Bounded settle-then-re-perceive after a non-advancing click on a precondition-gated control:
     # re-probe the side-effect-free extractor a few times (hard-capped) until a just-issued AJAX populates.
     COPILOT_CLICK_SETTLE_MAX_PROBES: int = 3
@@ -215,6 +232,9 @@ class Settings(BaseSettings):
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
     WORKFLOW_COPILOT_TERMINAL_ENVELOPE_RENDER: bool = False
     WORKFLOW_COPILOT_QA_TOKEN_BUDGET: int | None = Field(default=None, gt=0)
+    # Process-global override of the per-turn copilot deadline, read once at import;
+    # changing it needs a hard restart. QA/debug only -- unset keeps the 900s default.
+    WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS: int | None = Field(default=None, gt=0)
     # Pause a BUILD turn in place on a typed mid-loop credential ask instead of ending it;
     # the FE resumes the same turn via a credential-connect card. Off = today's turn-terminal behavior.
     # Requires app.CACHE to be a shared cache (Redis) -- a same-process-only cache can't
@@ -225,6 +245,10 @@ class Settings(BaseSettings):
     # Kill switch for the live codegen-progress SSE frame (drafted block labels while an authoring
     # tool call streams). Off restores exact pre-change behavior; old frontends drop the frame either way.
     WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED: bool = True
+    # Local-development escape hatch: run a copilot block test run in the API process when sandbox
+    # dispatch is unavailable, instead of failing closed. Grants nothing on its own -- see
+    # AgentFunction.allow_copilot_inline_code_execution for the conditions it is ANDed with.
+    COPILOT_ALLOW_INLINE_CODE_EXECUTION: bool = False
     # Default code_only for MCP block/workflow tools. Off = permissive.
     MCP_CODE_ONLY_MODE: bool = False
     # Default for the bounded code-block self-heal; off by default.
@@ -264,6 +288,11 @@ class Settings(BaseSettings):
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
     AWS_S3_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
     AWS_S3_BUCKET_UPLOADS: str = "skyvern-uploads"
+    # ISO-8601 UTC timestamp. Runs created at/after it that have zero DOWNLOAD artifact
+    # rows skip the legacy S3 LIST fallback in get_downloaded_files — such runs register
+    # every download as a row at save time (SKY-8861), so the LIST can only return empty.
+    # None keeps the LIST fallback for every run.
+    DOWNLOADS_EMPTY_S3_LISTING_CUTOVER: str | None = None
 
     # Azure Blob Storage settings
     AZURE_STORAGE_ACCOUNT_NAME: str | None = None
@@ -327,6 +356,11 @@ class Settings(BaseSettings):
     BROWSER_LOGS_ENABLED: bool = True
     BROWSER_CURSOR_VISUALIZATION: bool = False
     BROWSER_MAX_PAGES_NUMBER: int = 10
+    # When set, a ForLoopBlock snapshots the open tabs before the loop and, between iterations,
+    # closes only tabs opened during an iteration — preserving the pre-loop baseline (e.g. a
+    # deliverable tab) and the working page. Bounds tab growth in long loops so per-iteration
+    # research tabs don't bloat the open-tabs planner context. Default-off; on for the eval fleet.
+    RESET_BROWSER_TABS_BETWEEN_LOOP_ITERATIONS: bool = False
     BROWSER_ADDITIONAL_ARGS: list[str] = []
 
     # Add extension folders name here to load extension in your browser
@@ -377,6 +411,11 @@ class Settings(BaseSettings):
     WORKFLOW_COPILOT_LITE_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
+    # The client-side timeout is a per-read gap applied per SDK attempt, so a provider that drips
+    # keep-alive bytes can hold a call open forever; the hard deadline bounds it in wall-clock time.
+    # Only the direct AsyncOpenAI client path (api_handler_factory.LLMCaller) applies this today.
+    ENFORCE_LLM_HARD_DEADLINE: bool = True
+    LLM_HARD_DEADLINE_GRACE_SECONDS: float = Field(default=10.0, ge=0)
     LLM_CONFIG_MAX_TOKENS: int = 4096
     LLM_CONFIG_TEMPERATURE: float = 0
     LLM_CONFIG_SUPPORT_VISION: bool = True  # Whether the model supports vision
@@ -396,10 +435,15 @@ class Settings(BaseSettings):
     ENABLE_VERTEX_AI: bool = False
     ENABLE_AZURE_CUA: bool = False
     ENABLE_OPENAI_COMPATIBLE: bool = False
+    ENABLE_XAI: bool = False
     # OPENAI
     OPENAI_API_KEY: str | None = None
     GPT5_REASONING_EFFORT: str | None = "medium"
     OPENAI_CUA_MODEL: str = "computer-use-preview"
+    # xAI
+    XAI_API_KEY: str | None = None
+    XAI_API_BASE: str = "https://api.x.ai/v1"
+    XAI_REASONING_EFFORT: str | None = "medium"
     # ANTHROPIC
     ANTHROPIC_API_KEY: str | None = None
     ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE4.6_SONNET"
@@ -597,7 +641,6 @@ class Settings(BaseSettings):
 
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
-    TOTP_RAW_FALLBACK_ENABLED: bool = False
     TOTP_RAW_CONTENT_MAX_LENGTH: int = 65536
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
     VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 15
@@ -610,7 +653,7 @@ class Settings(BaseSettings):
     OP_SERVICE_ACCOUNT_TOKEN: str | None = None
 
     # Where credentials are stored: skyvern, bitwarden, azure_vault, gcp, or custom
-    CREDENTIAL_VAULT_TYPE: str = "bitwarden"
+    CREDENTIAL_VAULT_TYPE: str = "skyvern"
     ENABLE_LOCAL_CREDENTIAL_VAULT: bool | None = None
     LOCAL_CREDENTIAL_VAULT_PATH: str = str(Path.home() / ".skyvern" / "credential_vault")
     LOCAL_CREDENTIAL_VAULT_KEY: str | None = None
@@ -644,6 +687,10 @@ class Settings(BaseSettings):
     ENABLE_CSS_SVG_PARSING: bool = True
 
     ENABLE_LOG_ARTIFACTS: bool = False
+    ENABLE_SECRET_ARTIFACT_REDACTION: bool = True
+    ENABLE_SECRET_VISUAL_MASKING: bool = True
+    # Deployment-level fail-closed override; takes precedence over all CodeBlock entitlements.
+    DISABLE_CODE_BLOCK_EXECUTION: bool = False
     ENABLE_CODE_BLOCK: bool = True
 
     TASK_BLOCKED_SITE_FALLBACK_URL: str = "https://www.google.com"
@@ -805,6 +852,19 @@ class Settings(BaseSettings):
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"
 
+    @field_validator("WORKER_STALL_DUMP_SECONDS", mode="before")
+    @classmethod
+    def _worker_stall_dump_seconds_or_default(cls, value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            LOG.warning("Invalid WORKER_STALL_DUMP_SECONDS=%r; using default 0", value)
+            return 0
+
+    @property
+    def is_skyvern_base_url_explicitly_configured(self) -> bool:
+        return "SKYVERN_BASE_URL" in self.model_fields_set
+
     def get_model_name_to_llm_key(self, organization_id: str | None = None) -> dict[str, dict[str, str]]:
         """
         Keys are model names available to blocks in the frontend. These map to key names
@@ -835,6 +895,9 @@ class Settings(BaseSettings):
         }
 
         mapping["mercury-2"] = {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"}
+
+        if self.ENABLE_XAI:
+            mapping["grok-4.5"] = {"llm_key": "XAI_GROK_4_5", "label": "Grok 4.5"}
 
         # Their configs are registered only under ENABLE_OPENROUTER, so without it the dropdown
         # would offer models that resolve to unregistered configs and fail at runtime.

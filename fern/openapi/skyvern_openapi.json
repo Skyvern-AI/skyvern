@@ -10714,7 +10714,6 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 1440,
                 "minimum": 5
               },
               {
@@ -10722,7 +10721,7 @@
               }
             ],
             "title": "Timeout",
-            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.",
+            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be at least 5; values above 240 are capped at 240. Defaults to 60.",
             "default": 60
           },
           "proxy_location": {
@@ -20724,7 +20723,8 @@
                 "type": "null"
               }
             ],
-            "description": "Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.",
+            "description": "Deprecated compatibility field. Skyvern auto-detects the OTP type from content, so this value does not constrain extraction.",
+            "deprecated": true,
             "examples": [
               "totp",
               "magic_link"
@@ -20888,7 +20888,8 @@
                 "type": "null"
               }
             ],
-            "description": "Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.",
+            "description": "Deprecated compatibility field. Skyvern auto-detects the OTP type from content, so this value does not constrain extraction.",
+            "deprecated": true,
             "examples": [
               "totp",
               "magic_link"
@@ -23693,6 +23694,7 @@
           "authenticator",
           "email",
           "text",
+          "passkey",
           "none"
         ],
         "title": "TotpType",

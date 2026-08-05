@@ -66,8 +66,9 @@ class TOTPCodeCreate(TOTPCodeBase):
     )
     type: OTPType | None = Field(
         default=None,
-        description="Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.",
+        description="Deprecated compatibility field. Skyvern auto-detects the OTP type from content, so this value does not constrain extraction.",
         examples=["totp", "magic_link"],
+        deprecated=True,
     )
 
     @field_validator("content")
@@ -101,6 +102,22 @@ class RawTOTPCode(BaseModel):
     expired_at: datetime | None
 
 
-class RawTOTPCodeAccepted(BaseModel):
-    totp_code_id: str
+class RawTOTPCodeAccepted(TOTPCode):
     status: Literal["raw_pending"] = "raw_pending"
+
+    @classmethod
+    def from_raw_row(cls, raw_row: RawTOTPCode) -> "RawTOTPCodeAccepted":
+        return cls(
+            totp_code_id=raw_row.totp_code_id,
+            totp_identifier=raw_row.totp_identifier,
+            organization_id=raw_row.organization_id,
+            content=raw_row.content,
+            code="",
+            task_id=raw_row.task_id,
+            workflow_id=raw_row.workflow_id,
+            workflow_run_id=raw_row.workflow_run_id,
+            source=raw_row.source,
+            created_at=raw_row.created_at,
+            modified_at=raw_row.created_at,
+            expired_at=raw_row.expired_at,
+        )

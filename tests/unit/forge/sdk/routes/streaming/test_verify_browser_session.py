@@ -29,6 +29,9 @@ def _make_session(
         organization_id="o_test",
         status=status,
         browser_address=browser_address,
+        # The session worker writes both columns in one call, and readiness is keyed on the
+        # upstream — a row with an address and no upstream is a shape nothing writes.
+        upstream_cdp_url="ws://10.0.0.7:9223/devtools/browser/abc" if browser_address else None,
         created_at=now,
         modified_at=now,
         started_at=started_at,

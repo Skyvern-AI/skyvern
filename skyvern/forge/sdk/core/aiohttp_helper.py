@@ -362,6 +362,7 @@ async def aiohttp_delete(
 ) -> dict[str, Any]:
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
         count = 0
+        last_exception: Exception | None = None
         while count <= retry:
             try:
                 async with session.delete(
@@ -376,8 +377,11 @@ async def aiohttp_delete(
                         raise HttpException(response.status, url)
                     LOG.error(f"Failed to delete data from {url}", status_code=response.status)
                     return {}
-            except Exception:
+            except Exception as exc:
+                last_exception = exc
                 if retry_timeout > 0:
                     await asyncio.sleep(retry_timeout)
                 count += 1
+        if last_exception is not None:
+            raise last_exception
         raise Exception(f"Failed to delete data from {url}")

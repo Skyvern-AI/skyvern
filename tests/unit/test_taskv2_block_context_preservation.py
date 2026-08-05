@@ -235,6 +235,8 @@ async def test_run_task_v2_copies_parent_loop_state_into_child_context(monkeypat
     parent_context = SkyvernContext(
         organization_id="org_parent",
         organization_name="Parent Org",
+        org_default_llm_key="CUSTOM_LLM_oat_parent_smart",
+        org_default_secondary_llm_key="CUSTOM_LLM_oat_parent_fast",
         workflow_run_id="wr_parent",
         root_workflow_run_id="wr_root",
         run_id="wr_parent",
@@ -265,7 +267,12 @@ async def test_run_task_v2_copies_parent_loop_state_into_child_context(monkeypat
         mock_app.WORKFLOW_SERVICE.clean_up_workflow = AsyncMock()
 
         result = await task_v2_service.run_task_v2(
-            organization=SimpleNamespace(organization_id="org_parent", organization_name="Parent Org"),
+            organization=SimpleNamespace(
+                organization_id="org_parent",
+                organization_name="Parent Org",
+                default_llm_key="CUSTOM_LLM_oat_smart",
+                default_secondary_llm_key="CUSTOM_LLM_oat_fast",
+            ),
             task_v2_id="tsk_v2_child",
         )
 
@@ -274,6 +281,8 @@ async def test_run_task_v2_copies_parent_loop_state_into_child_context(monkeypat
     child_context = captured_contexts[0]
     assert child_context.run_id == "wr_parent"
     assert child_context.root_workflow_run_id == "wr_root"
+    assert child_context.org_default_llm_key == "CUSTOM_LLM_oat_smart"
+    assert child_context.org_default_secondary_llm_key == "CUSTOM_LLM_oat_fast"
     assert child_context.loop_internal_state == loop_state
     assert child_context.loop_internal_state is not loop_state
     assert skyvern_context.current() is parent_context

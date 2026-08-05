@@ -224,6 +224,7 @@ def _code_only_browser_schema_guidance() -> list[str]:
         _code_only_browser_validation_guidance(),
         "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
         "Wait for the value the block returns, not for a URL or a navigation. A page reaches its final URL while it is still rendering, so a URL check passes before the value exists and a navigation wait fails on a page that has already arrived.",
+        "Deciding which of two page states you are in costs no wait: wait once on `a.or_(b).first`, then branch with `is_visible()` or `count()`. Build each side to match only visible elements — `page.locator('#x >> visible=true')` — because `.first` is the first match in DOM order, not the first to become visible, so a hidden sign-in form that precedes the signed-in view captures the wait and spends the whole ceiling. That combined entry wait is the only one that gets a long ceiling — give it `timeout=90000`, because a cold first load can hydrate for a minute and the wait returns the instant either state appears, so a fast page pays nothing for the generous window. Do not reuse that ceiling anywhere else: every later wait gets a short one such as `timeout=30000`, because a `wait_for` on a branch that may legitimately be absent spends its whole timeout proving the absence, and every repair attempt pays it again.",
         "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username and <key>.password, and use await <key>.otp() for authenticator, email, or SMS one-time codes. Never put literal secret values in code; scout credential fields with fill_credential_field.",
     ]
 
@@ -257,10 +258,22 @@ Runtime facts:
 - A `credential_id` workflow parameter resolves to a credential object with
   `<key>.username`, `<key>.password`, and `await <key>.otp()` for one-time codes; scout fields with
   `fill_credential_field`, never embed literal secrets.
-- Credentialed login code must be idempotent. After `goto`, wait for either the
-  login form or an already-authenticated page anchor; only fill username/password
-  when the login fields are visible, and after submit wait for a logged-in page
-  anchor instead of relying only on `networkidle`.
+- Credentialed login code must be idempotent. After `goto`, wait once on the two
+  states together, then branch without waiting again. Build each side to match only
+  visible elements, since `.first` takes the first match in DOM order rather than the
+  first to become visible, and a sign-in form that is present but hidden on an
+  already-authenticated page would otherwise capture the wait and hold it to the ceiling:
+  `login_form = page.locator("#login-form >> visible=true")`,
+  `authenticated_anchor = page.locator("#account-menu >> visible=true")`, then
+  `await login_form.or_(authenticated_anchor).first.wait_for(state="visible", timeout=90000)`,
+  then `if await login_form.is_visible():` to fill username/password. The generous window
+  covers a cold first load whose hydration lands well after Playwright's default, and the
+  combined wait still returns the instant either state appears. Waiting on the
+  login form by itself spends the entire timeout proving it is absent whenever the
+  session is already authenticated. That long ceiling belongs to the entry wait alone.
+  After submit, wait for a logged-in page anchor on a short ceiling —
+  `await authenticated_anchor.wait_for(state="visible", timeout=30000)` — instead of
+  relying only on `networkidle`.
 - After a credentialed login submit or navigation commit, call
   `await solve_captcha(page)` before waiting for post-login anchors. This helper
   owns any platform-managed verification challenge; do not locate or interact

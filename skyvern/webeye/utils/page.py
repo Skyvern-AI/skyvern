@@ -9,7 +9,7 @@ import urllib.parse
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
 from io import BytesIO
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import structlog
 from opentelemetry import trace as otel_trace
@@ -25,6 +25,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.webeye.browser_engine import BrowserEngineSelection
+from skyvern.webeye.browser_errors import BrowserTargetClosedError
 from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
 
@@ -33,7 +34,81 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
+SECRET_VISUAL_MASK_STYLE_ID = "skyvern-secret-mask-style"
+SECRET_VISUAL_MASK_ATTRIBUTE = "data-skyvern-secret-mask"
+SECRET_VISUAL_MASK_CSS_RULE = '[data-skyvern-secret-mask="true"] { -webkit-text-security: disc !important; }'
+SECRET_VISUAL_MASK_BLUR_FILTER = "blur(6px)"
+
+_SECRET_VISUAL_MASK_BODY = f"""
+    const ownerDocument = element.ownerDocument;
+    if (!ownerDocument) {{
+        return;
+    }}
+
+    const root = element.getRootNode();
+    const isShadowRoot = root instanceof ShadowRoot;
+    let style = root.querySelector({json.dumps(f"#{SECRET_VISUAL_MASK_STYLE_ID}")});
+    if (!style) {{
+        style = ownerDocument.createElement("style");
+        style.id = {json.dumps(SECRET_VISUAL_MASK_STYLE_ID)};
+        if (isShadowRoot) {{
+            root.appendChild(style);
+        }} else {{
+            (ownerDocument.head || ownerDocument.documentElement).appendChild(style);
+        }}
+    }}
+    style.textContent = {json.dumps(SECRET_VISUAL_MASK_CSS_RULE)};
+
+    element.setAttribute({json.dumps(SECRET_VISUAL_MASK_ATTRIBUTE)}, "true");
+
+    const elementTagName = element.tagName ? element.tagName.toLowerCase() : "";
+    if (elementTagName !== "input" && elementTagName !== "textarea") {{
+        element.style.filter = {json.dumps(SECRET_VISUAL_MASK_BLUR_FILTER)};
+    }}
+"""
+
+SECRET_VISUAL_MASK_SCRIPT = f"""
+    (element) => {{
+        {_SECRET_VISUAL_MASK_BODY}
+    }}
+"""
+
+_SECRET_VISUAL_MASK_ACTIVE_ELEMENT_SCRIPT = f"""
+    () => {{
+        const element = document.activeElement;
+        if (!element) {{
+            return;
+        }}
+
+        const activeElementTagName = element.tagName ? element.tagName.toLowerCase() : "";
+        if (
+            activeElementTagName === "input"
+            && String(element.getAttribute("type") || "").toLowerCase() === "password"
+        ) {{
+            return;
+        }}
+
+        {_SECRET_VISUAL_MASK_BODY}
+    }}
+"""
+
+
+async def apply_secret_visual_mask_to_active_element(page: Page) -> None:
+    try:
+        await SkyvernFrame.evaluate(page, expression=_SECRET_VISUAL_MASK_ACTIVE_ELEMENT_SCRIPT)
+    except Exception:
+        LOG.warning("Failed to apply secret visual mask to active element", exc_info=True)
+
+
 _SCREENSHOT_TARGET_CLOSED_MESSAGE = "Target page, context or browser has been closed"
+_SELECTED_SCREENSHOT_TARGET_CLOSED_MESSAGES = (
+    "target page, context or browser has been closed",
+    "target closed",
+    "target is closed",
+    "target was closed",
+    "target has been closed",
+    "target was disposed",
+)
 
 
 async def _safe_tab_title(page: Page) -> str:
@@ -73,6 +148,58 @@ async def build_open_tabs_context(
             entry += f" ({title})"
         lines.append(entry)
     return "\n".join(lines)
+
+
+async def capture_open_tab_screenshots(
+    browser_state: BrowserState,
+    *,
+    persist: Callable[[bytes], Awaitable[None]],
+    skip_single_tab: bool = False,
+) -> int:
+    """Screenshot every open tab and persist each frame via ``persist``; returns the count.
+
+    Shared end-state per-tab capture. The caller's ``persist`` owns the artifact sink and type.
+    ``skip_single_tab`` returns 0 when only one tab is open, for callers that already capture the
+    active page separately. Best-effort: runs post-success, never raises.
+    """
+    config = SettingsManager.get_settings()
+    captured = 0
+    try:
+        # max_pages=0 enumerates without list_valid_pages' close-oldest behavior, so we never
+        # close the very tabs we are trying to capture.
+        pages = await browser_state.list_valid_pages(max_pages=0)
+        if not pages or (skip_single_tab and len(pages) <= 1):
+            return 0
+        per_tab_timeout = config.BROWSER_SCREENSHOT_TIMEOUT_MS / 1000
+        # Overall budget so a few still-loading tabs can't stall the post-success path.
+        async with asyncio.timeout(config.COMPLETION_TAB_SCREENSHOTS_TOTAL_TIMEOUT_SECONDS):
+            # The cap setting is task_v2-named but governs every caller here.
+            for page in pages[: config.MAX_COMPLETION_TAB_SCREENSHOTS_PER_TASK_V2]:
+                frames: list[bytes] = []
+                try:
+                    async with asyncio.timeout(per_tab_timeout):
+                        try:
+                            # Front each tab so Chromium paints lazily-rendered background content.
+                            await page.bring_to_front()
+                        except Exception:
+                            LOG.debug("Failed to bring tab to front before screenshot", exc_info=True)
+                        frames = await SkyvernFrame.take_split_screenshots(
+                            page=page,
+                            scroll=False,
+                            engine_selection=browser_state.engine_selection,
+                        )
+                except Exception:
+                    LOG.warning("Failed to capture screenshot for an open tab", exc_info=True)
+                    continue
+                for frame in frames:
+                    try:
+                        await persist(frame)
+                        captured += 1
+                    except Exception:
+                        LOG.warning("Failed to persist open-tab screenshot", exc_info=True)
+    except Exception:
+        LOG.warning("Aborted capturing open-tab screenshots", captured=captured, exc_info=True)
+    return captured
 
 
 _JS_TOP_LEVEL_DECL_RE = re.compile(
@@ -119,6 +246,18 @@ def _is_engine_error(exc: BaseException, engine_selection: BrowserEngineSelectio
     return engine_selection.is_engine_error(exc) if engine_selection is not None else isinstance(exc, PlaywrightError)
 
 
+def _is_engine_timeout(exc: BaseException, engine_selection: BrowserEngineSelection | None) -> bool:
+    return (
+        engine_selection.is_engine_timeout_error(exc) if engine_selection is not None else isinstance(exc, TimeoutError)
+    )
+
+
+def _is_readiness_timeout(exc: BaseException, engine_selection: BrowserEngineSelection | None) -> bool:
+    return isinstance(exc, (asyncio.TimeoutError, SkyvernPageAnalysisTimeout)) or _is_engine_timeout(
+        exc, engine_selection
+    )
+
+
 def _is_navigation_context_lost(error_msg: str) -> bool:
     if "Execution context was destroyed" in error_msg:
         return True
@@ -137,7 +276,16 @@ def _is_json_inlinable(arg: Any) -> bool:
     return True
 
 
-async def _dispatch_evaluate(frame: Page | Frame, expression: str, arg: Any | None) -> Any:
+async def _dispatch_evaluate(frame: Page | Frame, expression: str, arg: Any | None, *, force_cdp: bool = False) -> Any:
+    # force_cdp callers require the CDP main-world path regardless of prefix, so
+    # short-circuit before the page/frame/JSON heuristics below. That path
+    # dereferences page-only APIs (``page.context``); a Frame here is a caller
+    # contract violation, so reject it explicitly instead of failing with an
+    # incidental AttributeError deep inside the main-world hook.
+    if force_cdp:
+        if not is_page_like(frame):
+            raise TypeError("force_cdp evaluation requires a top-level Page, not a Frame")
+        return await evaluate_in_main_world(frame, expression, arg, force_cdp=True)
     # Page + prefix + JSON-safe arg → main-world hook (preserves the marker).
     # Iframe Frames and non-JSON args fall back to per-frame evaluate so iframe
     # contexts and Playwright handle-marshalling keep working.
@@ -169,7 +317,11 @@ async def _wait_for_navigation_settle(
         return
 
 
-async def _wait_for_screenshot_load_state(page: Page, timeout_ms: float) -> None:
+async def _wait_for_screenshot_load_state(
+    page: Page,
+    timeout_ms: float,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> None:
     # Best-effort readiness guard before capturing. 'domcontentloaded' fires far
     # earlier than 'load'; pages with streaming/long-polling/SSE/websockets or a
     # persistent spinner may never fire 'load', so a timeout here must be
@@ -178,12 +330,29 @@ async def _wait_for_screenshot_load_state(page: Page, timeout_ms: float) -> None
         return
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
-    except (PlaywrightError, TimeoutError):
+    except Exception as exc:
+        if not _is_engine_error(exc, engine_selection):
+            raise
         LOG.warning("Page did not reach domcontentloaded before screenshot; capturing current state anyway")
 
 
-def _is_screenshot_target_closed(error: BaseException) -> bool:
-    return isinstance(error, PlaywrightError) and _SCREENSHOT_TARGET_CLOSED_MESSAGE in str(error)
+def _is_screenshot_target_closed(
+    error: BaseException,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> bool:
+    if engine_selection is not None:
+        error_message = str(error).lower()
+        if "crash" in error_message:
+            return False
+        if isinstance(engine_selection.classify_error(error), BrowserTargetClosedError) and any(
+            message in error_message for message in _SELECTED_SCREENSHOT_TARGET_CLOSED_MESSAGES
+        ):
+            return True
+        # A bound stock-Playwright selection surfaces its canonical target-close as a base Error, not the
+        # rich TargetClosedError family, so classify_error returns BrowserAutomationError above. Fall back to
+        # the single canonical message only — never a broad substring — so renderer crashes stay generic.
+        return _is_engine_error(error, engine_selection) and _SCREENSHOT_TARGET_CLOSED_MESSAGE.lower() in error_message
+    return _is_engine_error(error, engine_selection) and _SCREENSHOT_TARGET_CLOSED_MESSAGE in str(error)
 
 
 def _load_cursor_overlay_js() -> str:
@@ -205,6 +374,7 @@ async def _page_screenshot_helper(
     file_path: str | None = None,
     full_page: bool = False,
     timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
+    engine_selection: BrowserEngineSelection | None = None,
 ) -> bytes:
     if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
         try:
@@ -218,7 +388,9 @@ async def _page_screenshot_helper(
             full_page=full_page,
             animations="disabled",
         )
-    except TimeoutError as timeout_error:
+    except Exception as timeout_error:
+        if not _is_engine_timeout(timeout_error, engine_selection):
+            raise
         LOG.info(
             f"Timeout error while taking screenshot: {str(timeout_error)}. Going to take a screenshot again with animation allowed."
         )
@@ -242,6 +414,7 @@ async def _current_viewpoint_screenshot_helper(
     full_page: bool = False,
     timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
     mode: ScreenshotMode = ScreenshotMode.DETAILED,
+    engine_selection: BrowserEngineSelection | None = None,
 ) -> bytes:
     if page.is_closed():
         LOG.info(
@@ -262,16 +435,27 @@ async def _current_viewpoint_screenshot_helper(
     try:
         if mode == ScreenshotMode.DETAILED:
             await _wait_for_screenshot_load_state(
-                page, timeout_ms=SettingsManager.get_settings().BROWSER_SCREENSHOT_LOAD_STATE_TIMEOUT_MS
+                page,
+                timeout_ms=SettingsManager.get_settings().BROWSER_SCREENSHOT_LOAD_STATE_TIMEOUT_MS,
+                engine_selection=engine_selection,
             )
         start_time = time.time()
         screenshot: bytes = b""
         if file_path:
             screenshot = await _page_screenshot_helper(
-                page=page, file_path=file_path, full_page=full_page, timeout=timeout
+                page=page,
+                file_path=file_path,
+                full_page=full_page,
+                timeout=timeout,
+                engine_selection=engine_selection,
             )
         else:
-            screenshot = await _page_screenshot_helper(page=page, full_page=full_page, timeout=timeout)
+            screenshot = await _page_screenshot_helper(
+                page=page,
+                full_page=full_page,
+                timeout=timeout,
+                engine_selection=engine_selection,
+            )
         end_time = time.time()
         LOG.debug(
             "Screenshot taking time",
@@ -279,19 +463,21 @@ async def _current_viewpoint_screenshot_helper(
             file_path=file_path,
         )
         return screenshot
-    except TimeoutError as e:
-        LOG.warning(
-            "Screenshot timeout",
-            timeout_ms=timeout,
-            url=url,
-            viewport=viewport_info,
-            full_page=full_page,
-            mode=mode.value if hasattr(mode, "value") else str(mode),
-            error=str(e),
-        )
-        raise FailedToTakeScreenshot(error_message=str(e)) from e
     except Exception as e:
-        if _is_screenshot_target_closed(e):
+        if engine_selection is not None and not _is_engine_error(e, engine_selection):
+            raise
+        if _is_engine_timeout(e, engine_selection):
+            LOG.warning(
+                "Screenshot timeout",
+                timeout_ms=timeout,
+                url=url,
+                viewport=viewport_info,
+                full_page=full_page,
+                mode=mode.value if hasattr(mode, "value") else str(mode),
+                error=str(e),
+            )
+            raise FailedToTakeScreenshot(error_message=str(e)) from e
+        if _is_screenshot_target_closed(e, engine_selection):
             LOG.info(
                 "Skipping screenshot because target closed during capture",
                 url=url,
@@ -314,6 +500,7 @@ async def _current_viewpoint_screenshot_helper(
 async def take_element_screenshot(
     locator: Locator,
     timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
+    engine_selection: BrowserEngineSelection | None = None,
 ) -> bytes:
     try:
         page = locator.page
@@ -324,13 +511,17 @@ async def take_element_screenshot(
         raise FailedToTakeScreenshot(error_message="Page is closed")
     try:
         return await locator.screenshot(timeout=timeout, animations="disabled")
-    except TimeoutError:
+    except Exception as error:
+        if not _is_engine_error(error, engine_selection):
+            raise
+        if not _is_engine_timeout(error, engine_selection):
+            raise FailedToTakeScreenshot(error_message=str(error)) from error
         try:
             return await locator.screenshot(timeout=timeout, animations="allow")
-        except PlaywrightError as retry_error:
+        except Exception as retry_error:
+            if not _is_engine_error(retry_error, engine_selection):
+                raise
             raise FailedToTakeScreenshot(error_message=str(retry_error)) from retry_error
-    except PlaywrightError as e:
-        raise FailedToTakeScreenshot(error_message=str(e)) from e
 
 
 async def _scrolling_screenshots_helper(
@@ -339,9 +530,10 @@ async def _scrolling_screenshots_helper(
     draw_boxes: bool = False,
     max_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
     mode: ScreenshotMode = ScreenshotMode.DETAILED,
+    engine_selection: BrowserEngineSelection | None = None,
 ) -> tuple[list[bytes], list[int]]:
     # page is the main frame and the index must be 0
-    skyvern_page = await SkyvernFrame.create_instance(frame=page)
+    skyvern_page = await SkyvernFrame.create_instance(frame=page, engine_selection=engine_selection)
     frame = "main.frame"
     frame_index = 0
 
@@ -373,7 +565,11 @@ async def _scrolling_screenshots_helper(
                 await skyvern_page.build_tree_from_body(frame_name=frame, frame_index=frame_index)
                 initial_scroll_height = scroll_height
 
-            screenshot = await _current_viewpoint_screenshot_helper(page=page, mode=mode)
+            screenshot = await _current_viewpoint_screenshot_helper(
+                page=page,
+                mode=mode,
+                engine_selection=engine_selection,
+            )
             screenshots.append(screenshot)
             positions.append(int(scroll_y_px))
             scroll_y_px_old = scroll_y_px
@@ -401,7 +597,11 @@ async def _scrolling_screenshots_helper(
             await skyvern_page.build_elements_and_draw_bounding_boxes(frame=frame, frame_index=frame_index)
 
         LOG.debug("Page is not scrollable", url=url, num_screenshots=len(screenshots))
-        screenshot = await _current_viewpoint_screenshot_helper(page=page, mode=mode)
+        screenshot = await _current_viewpoint_screenshot_helper(
+            page=page,
+            mode=mode,
+            engine_selection=engine_selection,
+        )
         screenshots.append(screenshot)
         positions.append(0)
 
@@ -541,6 +741,279 @@ def _all_page_frames(page: Page) -> list[Frame]:
     return frames
 
 
+MAX_RETAINED_BLOB_COUNT = 8
+MAX_RETAINED_BLOB_TOTAL_BYTES = 100 * 1024 * 1024
+
+_BLOB_RETENTION_STATE_KEY = "__skyvernBlobRetention"
+# Stable ownership brand + schema version. A same-name page global is only ever mutated, restored, or
+# trusted as fresh when it carries this brand/version AND the full member schema below; anything else
+# (a page's own global, a corrupt/partial state, or one whose wrappers are no longer the active URL
+# methods) is left untouched and never read as owned.
+_BLOB_RETENTION_BRAND = "skyvern.blobRetention"
+_BLOB_RETENTION_VERSION = 1
+
+# Injected into every retention JS block. `isOwned` validates the complete schema needed for safe
+# exact-native restoration (origCreate/origRevoke), retained-map clearing/revocation (retained/deferred),
+# wrapper identity (wrapCreate/wrapRevoke), and closure neutralization (active). Restores compare each
+# URL method to its exact Skyvern wrapper independently, so a page hook is never clobbered.
+_BLOB_RETENTION_OWNERSHIP_JS = f"""
+    const KEY = '{_BLOB_RETENTION_STATE_KEY}';
+    const BRAND = '{_BLOB_RETENTION_BRAND}';
+    const VERSION = {_BLOB_RETENTION_VERSION};
+    const isOwned = (s) => !!s && s.brand === BRAND && s.version === VERSION
+        && typeof s.origCreate === 'function' && typeof s.origRevoke === 'function'
+        && (s.retained instanceof Map) && (s.deferred instanceof Set)
+        && typeof s.wrapCreate === 'function' && typeof s.wrapRevoke === 'function'
+        && typeof s.active === 'boolean';
+"""
+
+# Wrap URL.createObjectURL/revokeObjectURL in the page realm so a PDF-shaped object URL minted during
+# the action window survives a synchronous revoke long enough for the in-page read to recover its bytes.
+# Both wrappers return their native values; only PDF-typed (or untyped) blobs are retained, bounded by
+# count and total size; every other blob revokes natively so unrelated downloads are unaffected.
+_BLOB_RETENTION_INSTALL_JS = (
+    "(config) => {"
+    + _BLOB_RETENTION_OWNERSHIP_JS
+    + """
+    if (Object.prototype.hasOwnProperty.call(window, KEY)) {
+        const existing = window[KEY];
+        // Any existing own property that is not a valid owned state is foreign (a page's own global,
+        // including a null/undefined placeholder): never overwrite, delete, or modify it, and never touch
+        // the URL methods. Fail open (no retention).
+        if (!isOwned(existing)) return false;
+        // Valid owned stale state (a prior window that never tore down), possibly with the page having
+        // rewrapped one or both URL methods. Neutralize the closures first, settle the deferred revokes,
+        // restore ONLY each method that still directly equals our wrapper (preserve any page hook), clear
+        // the maps, and drop the state — regardless of any wrapper mismatch — so no prior key stays fresh.
+        existing.active = false;
+        try {
+            if (URL.createObjectURL === existing.wrapCreate) URL.createObjectURL = existing.origCreate;
+            if (URL.revokeObjectURL === existing.wrapRevoke) URL.revokeObjectURL = existing.origRevoke;
+            for (const url of existing.deferred) { try { Reflect.apply(existing.origRevoke, URL, [url]); } catch (e) {} }
+            existing.retained.clear();
+            existing.deferred.clear();
+        } catch (e) { return false; }
+        try { delete window[KEY]; } catch (e) {}
+        // If the owned state could not be dropped, do not overwrite it or patch the URL methods.
+        if (Object.prototype.hasOwnProperty.call(window, KEY)) return false;
+    }
+    // Capture whatever the current methods are now — a restored native, or a page hook we preserved. Keep
+    // the exact function objects (not .bind(URL) wrappers) so teardown restores them by identity; call
+    // them with an explicit URL receiver via Reflect.apply at the call sites instead.
+    const origCreate = URL.createObjectURL;
+    const origRevoke = URL.revokeObjectURL;
+    const state = {
+        brand: BRAND,
+        version: VERSION,
+        active: true,
+        origCreate: origCreate,
+        origRevoke: origRevoke,
+        retained: new Map(),
+        deferred: new Set(),
+        totalBytes: 0,
+        maxCount: config.maxCount,
+        maxTotalBytes: config.maxTotalBytes,
+    };
+    // The wrappers retain/defer only while state.active. Once teardown or a stale rearm flips it off,
+    // a closure orphaned inside a third-party wrapper chain degrades to a pure native pass-through.
+    const wrapCreate = function (obj) {
+        const url = Reflect.apply(origCreate, URL, arguments);
+        try {
+            if (state.active && typeof Blob !== 'undefined' && obj instanceof Blob) {
+                const type = (obj.type || '').toLowerCase();
+                const size = obj.size || 0;
+                const pdfish = type === 'application/pdf' || type === '';
+                if (pdfish && state.retained.size < state.maxCount && (state.totalBytes + size) <= state.maxTotalBytes) {
+                    state.retained.set(url, obj);
+                    state.totalBytes += size;
+                }
+            }
+        } catch (e) {}
+        return url;
+    };
+    const wrapRevoke = function (url) {
+        if (state.active && state.retained.has(url)) {
+            state.deferred.add(url);
+            return undefined;
+        }
+        return Reflect.apply(origRevoke, URL, arguments);
+    };
+    state.wrapCreate = wrapCreate;
+    state.wrapRevoke = wrapRevoke;
+    // Publish and verify ownership BEFORE patching either URL method. A non-writable same-name property
+    // makes this assignment a silent no-op; if the state did not take, change nothing else and fail open.
+    try { window[KEY] = state; } catch (e) { return false; }
+    if (window[KEY] !== state) return false;
+    URL.createObjectURL = wrapCreate;
+    URL.revokeObjectURL = wrapRevoke;
+    // Partial patch (e.g. a frozen URL method): roll back only the method that actually took, neutralize
+    // and drop the just-published state, and fail open with the methods at their pre-install identities.
+    if (URL.createObjectURL !== wrapCreate || URL.revokeObjectURL !== wrapRevoke) {
+        state.active = false;
+        if (URL.createObjectURL === wrapCreate) URL.createObjectURL = origCreate;
+        if (URL.revokeObjectURL === wrapRevoke) URL.revokeObjectURL = origRevoke;
+        try { delete window[KEY]; } catch (e) { window[KEY] = undefined; }
+        return false;
+    }
+    return true;
+}
+"""
+)
+
+_BLOB_RETENTION_TEARDOWN_JS = (
+    "() => {"
+    + _BLOB_RETENTION_OWNERSHIP_JS
+    + """
+    const state = window[KEY];
+    if (state === undefined || state === null) return false;
+    // Foreign / corrupt same-name global: never touch a property we do not own.
+    if (!isOwned(state)) return false;
+    // Neutralize first: any wrapper closure still captured in a third-party chain must stop retaining
+    // and deferring the moment we tear down, even though we cannot pull it out of that chain.
+    state.active = false;
+    try {
+        // Restore each URL method independently: if one still directly equals our wrapper, restore that
+        // saved exact method; if the other was replaced later by the page, preserve that later method so
+        // we never clobber it.
+        if (URL.createObjectURL === state.wrapCreate) URL.createObjectURL = state.origCreate;
+        if (URL.revokeObjectURL === state.wrapRevoke) URL.revokeObjectURL = state.origRevoke;
+        for (const url of state.deferred) { try { Reflect.apply(state.origRevoke, URL, [url]); } catch (e) {} }
+        state.retained.clear();
+        state.deferred.clear();
+    } finally {
+        try { delete window[KEY]; } catch (e) { window[KEY] = undefined; }
+    }
+    return true;
+}
+"""
+)
+
+
+async def _evaluate_in_all_frames(page: Page, expression: str, arg: Any, *, workflow_run_id: str | None) -> None:
+    main_frame = page.main_frame
+    for frame in _all_page_frames(page):
+        try:
+            if frame is main_frame:
+                await evaluate_in_main_world(page, expression, arg)
+            else:
+                await frame.evaluate(expression, arg)
+        except Exception:
+            # Best effort: a torn-down or navigating frame just misses this window. No URL/customer
+            # data is logged, and a failure here must never break the action.
+            LOG.debug("blob URL retention could not reach a frame", workflow_run_id=workflow_run_id)
+
+
+async def install_blob_url_retention(
+    page: Page,
+    *,
+    max_retained_count: int = MAX_RETAINED_BLOB_COUNT,
+    max_total_bytes: int = MAX_RETAINED_BLOB_TOTAL_BYTES,
+    workflow_run_id: str | None = None,
+) -> None:
+    """Retain PDF-shaped object URLs minted during the action window against a synchronous revoke.
+
+    Installed into the page's realms before the download-triggering click; paired with
+    ``teardown_blob_url_retention`` which performs the deferred revokes and restores the originals.
+    """
+    config = {"maxCount": max_retained_count, "maxTotalBytes": max_total_bytes}
+    await _evaluate_in_all_frames(page, _BLOB_RETENTION_INSTALL_JS, config, workflow_run_id=workflow_run_id)
+
+
+async def teardown_blob_url_retention(page: Page, *, workflow_run_id: str | None = None) -> None:
+    await _evaluate_in_all_frames(page, _BLOB_RETENTION_TEARDOWN_JS, None, workflow_run_id=workflow_run_id)
+
+
+# Read-only probe of the retention state installed by _BLOB_RETENTION_INSTALL_JS. Returns only
+# booleans: whether this realm exposes a Skyvern-owned retention state, and whether the passed URL is a
+# live key in its retained Map. A foreign / corrupt same-name global fails closed (never trusted). The
+# URL crosses into page JS but never comes back out and is never logged.
+_BLOB_RETENTION_PROBE_JS = (
+    "(url) => {"
+    + _BLOB_RETENTION_OWNERSHIP_JS
+    + """
+    const state = window[KEY];
+    // Require a valid owned AND active state: a stale cleanup can flip active off while retained keys
+    // linger, and those must never be trusted as action-fresh.
+    if (!isOwned(state) || state.active !== true) {
+        return { observed: false, retained: false };
+    }
+    return { observed: true, retained: state.retained.has(url) };
+}
+"""
+)
+
+
+class BlobActionFreshness(NamedTuple):
+    state_observed: bool
+    retained: bool
+
+
+def _blob_freshness_probe_frames(page: Page, blob_origin: str) -> list[Frame]:
+    """Frames to probe for a blob's retention state: those at the blob origin (the creator realm is
+    same-origin as the blob) plus indeterminate-origin frames (``about:blank``/``srcdoc``) that may
+    inherit the creator origin. Main frame first, deduped."""
+    seen: set[int] = set()
+    frames: list[Frame] = []
+    for frame in [page.main_frame, *page.frames]:
+        frame_id = id(frame)
+        if frame_id in seen:
+            continue
+        seen.add(frame_id)
+        try:
+            origin = _frame_origin(frame.url)
+        except Exception:
+            # An unreadable frame url is indeterminate; include it and let the probe best-effort.
+            frames.append(frame)
+            continue
+        if origin == blob_origin or origin is None:
+            frames.append(frame)
+    return frames
+
+
+async def probe_blob_action_freshness(
+    page: Page,
+    blob_url: str,
+    *,
+    workflow_run_id: str | None = None,
+) -> BlobActionFreshness:
+    """Whether ``blob_url`` (fragment-stripped) is a live key in a ``__skyvernBlobRetention.retained``
+    Map in any realm relevant to its origin — proof it was minted through the pre-click retention
+    wrapper during this action window.
+
+    The blob creator realm is not necessarily the frame displaying it (main/parent may mint the blob
+    and assign it to an iframe ``src``), so this probes the blob-origin frames plus indeterminate-origin
+    frames. Main frame routes through ``evaluate_in_main_world``; sub-frames through ``frame.evaluate``.
+    Only booleans cross the boundary; the URL is passed in but never logged or returned. Best-effort per
+    realm: a probe failure in one frame never raises and the verdict rests on the other realms. Returns
+    ``(state_observed, retained)`` — both False when no realm exposes retention state, so the caller
+    fails closed.
+    """
+    blob_origin = _blob_url_origin(blob_url)
+    if blob_origin is None:
+        return BlobActionFreshness(state_observed=False, retained=False)
+
+    frames = _blob_freshness_probe_frames(page, blob_origin)
+    main_frame = page.main_frame
+    state_observed = False
+    retained = False
+    for frame in frames:
+        try:
+            if frame is main_frame:
+                result = await evaluate_in_main_world(page, _BLOB_RETENTION_PROBE_JS, blob_url)
+            else:
+                result = await frame.evaluate(_BLOB_RETENTION_PROBE_JS, blob_url)
+        except Exception:
+            LOG.debug("blob action-freshness probe could not reach a frame", workflow_run_id=workflow_run_id)
+            continue
+        if not isinstance(result, dict):
+            continue
+        if result.get("observed"):
+            state_observed = True
+            if result.get("retained"):
+                retained = True
+    return BlobActionFreshness(state_observed=state_observed, retained=retained)
+
+
 def pop_destination_facts(nodes: object) -> dict[str, dict]:
     """Strip SKY-12875 destination facts out of scraper payloads, in place, at the JS->Python
     boundary. Every downstream consumer — element hashes and cached-action matching, persisted
@@ -599,9 +1072,11 @@ class SkyvernFrame:
         arg: Any | None = None,
         timeout_ms: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
         engine_selection: BrowserEngineSelection | None = None,
+        *,
+        force_cdp: bool = False,
     ) -> Any:
         async def evaluate_expression() -> Any:
-            return await _dispatch_evaluate(frame, expression, arg)
+            return await _dispatch_evaluate(frame, expression, arg, force_cdp=force_cdp)
 
         return await SkyvernFrame._evaluate_expression(
             frame=frame,
@@ -956,10 +1431,15 @@ class SkyvernFrame:
         timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
         mode: ScreenshotMode = ScreenshotMode.DETAILED,
         scrolling_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
+        engine_selection: BrowserEngineSelection | None = None,
     ) -> bytes:
         if scrolling_number <= 0:
             return await _current_viewpoint_screenshot_helper(
-                page=page, file_path=file_path, timeout=timeout, mode=mode
+                page=page,
+                file_path=file_path,
+                timeout=timeout,
+                mode=mode,
+                engine_selection=engine_selection,
             )
 
         if scrolling_number > SettingsManager.get_settings().MAX_NUM_SCREENSHOTS:
@@ -973,14 +1453,17 @@ class SkyvernFrame:
         # use spilt screenshot with lite mode, isntead of fullpage screenshot from playwright
         LOG.debug("Page is fully loaded, agent is about to generate the full page screenshot")
         start_time = time.time()
-        skyvern_frame = await SkyvernFrame.create_instance(frame=page)
+        skyvern_frame = await SkyvernFrame.create_instance(frame=page, engine_selection=engine_selection)
         x: int | None = None
         y: int | None = None
         try:
             x, y = await skyvern_frame.get_scroll_x_y()
             async with asyncio.timeout(timeout):
                 screenshots, positions = await _scrolling_screenshots_helper(
-                    page=page, mode=mode, max_number=scrolling_number
+                    page=page,
+                    mode=mode,
+                    max_number=scrolling_number,
+                    engine_selection=engine_selection,
                 )
                 images = []
 
@@ -1016,7 +1499,11 @@ class SkyvernFrame:
             x = None
             y = None
             return await _current_viewpoint_screenshot_helper(
-                page=page, file_path=file_path, timeout=timeout, full_page=True
+                page=page,
+                file_path=file_path,
+                timeout=timeout,
+                full_page=True,
+                engine_selection=engine_selection,
             )
         finally:
             if x is not None and y is not None:
@@ -1030,9 +1517,16 @@ class SkyvernFrame:
         draw_boxes: bool = False,
         max_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
         scroll: bool = True,
+        engine_selection: BrowserEngineSelection | None = None,
     ) -> list[bytes]:
         if not scroll:
-            return [await _current_viewpoint_screenshot_helper(page=page, mode=ScreenshotMode.DETAILED)]
+            return [
+                await _current_viewpoint_screenshot_helper(
+                    page=page,
+                    mode=ScreenshotMode.DETAILED,
+                    engine_selection=engine_selection,
+                )
+            ]
 
         screenshots, _ = await _scrolling_screenshots_helper(
             page=page,
@@ -1040,6 +1534,7 @@ class SkyvernFrame:
             max_number=max_number,
             draw_boxes=draw_boxes,
             mode=ScreenshotMode.DETAILED,
+            engine_selection=engine_selection,
         )
         return screenshots
 
@@ -1419,11 +1914,11 @@ class SkyvernFrame:
             await self.frame.wait_for_load_state("load", timeout=timeout_ms)
             await self.wait_for_animation_end(timeout_ms=timeout_ms)
             _span.set_attribute("animation_result", "finished")
-        except (TimeoutError, asyncio.TimeoutError, SkyvernPageAnalysisTimeout):
-            _span.set_attribute("animation_result", "timeout")
-            LOG.debug("Timed out waiting for animation end, but ignore it", exc_info=True)
-            return
-        except Exception:
+        except Exception as exc:
+            if _is_readiness_timeout(exc, self.engine_selection):
+                _span.set_attribute("animation_result", "timeout")
+                LOG.debug("Timed out waiting for animation end, but ignore it", exc_info=True)
+                return
             _span.set_attribute("animation_result", "error")
             LOG.debug("Failed to wait for animation end, but ignore it", exc_info=True)
             return
@@ -1470,12 +1965,15 @@ class SkyvernFrame:
             _li_span.set_attribute("timeout_ms", loading_indicator_timeout_ms)
             try:
                 await self._wait_for_loading_indicators_gone(timeout_ms=loading_indicator_timeout_ms)
-            except (TimeoutError, asyncio.TimeoutError, SkyvernPageAnalysisTimeout):
-                loading_indicator_result = "timeout"
-                LOG.info("Loading indicator timeout - some indicators may still be present, proceeding", sampling=True)
-            except Exception:
-                loading_indicator_result = "error"
-                LOG.warning("Failed to check loading indicators, proceeding", exc_info=True)
+            except Exception as exc:
+                if _is_readiness_timeout(exc, self.engine_selection):
+                    loading_indicator_result = "timeout"
+                    LOG.info(
+                        "Loading indicator timeout - some indicators may still be present, proceeding", sampling=True
+                    )
+                else:
+                    loading_indicator_result = "error"
+                    LOG.warning("Failed to check loading indicators, proceeding", exc_info=True)
             finally:
                 _li_span.set_attribute("result", loading_indicator_result)
 
@@ -1486,12 +1984,13 @@ class SkyvernFrame:
             _ni_span.set_attribute("timeout_ms", network_idle_timeout_ms)
             try:
                 await self.frame.wait_for_load_state("networkidle", timeout=network_idle_timeout_ms)
-            except (TimeoutError, asyncio.TimeoutError):
-                network_idle_result = "timeout"
-                LOG.info("Network idle timeout - page may have constant activity, proceeding", sampling=True)
-            except Exception:
-                network_idle_result = "error"
-                LOG.warning("Failed to check network idle, proceeding", exc_info=True)
+            except Exception as exc:
+                if _is_readiness_timeout(exc, self.engine_selection):
+                    network_idle_result = "timeout"
+                    LOG.info("Network idle timeout - page may have constant activity, proceeding", sampling=True)
+                else:
+                    network_idle_result = "error"
+                    LOG.warning("Failed to check network idle, proceeding", exc_info=True)
             finally:
                 _ni_span.set_attribute("result", network_idle_result)
 
@@ -1503,12 +2002,13 @@ class SkyvernFrame:
             _ds_span.set_attribute("stable_ms", dom_stable_ms)
             try:
                 await self._wait_for_dom_stable(stable_ms=dom_stable_ms, timeout_ms=dom_stability_timeout_ms)
-            except (TimeoutError, asyncio.TimeoutError, SkyvernPageAnalysisTimeout):
-                dom_stability_result = "timeout"
-                LOG.warning("DOM stability timeout - DOM may still be changing, proceeding")
-            except Exception:
-                dom_stability_result = "error"
-                LOG.warning("Failed to check DOM stability, proceeding", exc_info=True)
+            except Exception as exc:
+                if _is_readiness_timeout(exc, self.engine_selection):
+                    dom_stability_result = "timeout"
+                    LOG.warning("DOM stability timeout - DOM may still be changing, proceeding")
+                else:
+                    dom_stability_result = "error"
+                    LOG.warning("Failed to check DOM stability, proceeding", exc_info=True)
             finally:
                 _ds_span.set_attribute("result", dom_stability_result)
 

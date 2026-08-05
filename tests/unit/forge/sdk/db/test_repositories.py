@@ -6,6 +6,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+
+from skyvern.forge.sdk.db.models import OrganizationModel
+from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from tests.unit.conftest import MockAsyncSessionCtx, make_mock_session
 
 
 def test_credential_repository_instantiation():
@@ -199,6 +205,43 @@ def test_organizations_repository_instantiation():
     assert hasattr(repo, "validate_org_auth_token")
 
 
+@pytest.mark.asyncio
+async def test_organizations_repository_persists_and_clears_default_llm_keys(sqlite_engine: AsyncEngine) -> None:
+    session_factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    async with session_factory() as session:
+        session.add(OrganizationModel(organization_id="o_defaults", organization_name="Defaults Org"))
+        await session.commit()
+
+    repo = OrganizationsRepository(session_factory=session_factory, debug_enabled=False)
+    updated = await repo.update_organization(
+        "o_defaults",
+        default_llm_key="CUSTOM_LLM_oat_primary",
+        default_secondary_llm_key="CUSTOM_LLM_oat_secondary",
+    )
+
+    assert updated.default_llm_key == "CUSTOM_LLM_oat_primary"
+    assert updated.default_secondary_llm_key == "CUSTOM_LLM_oat_secondary"
+    async with session_factory() as session:
+        stored = await session.get(OrganizationModel, "o_defaults")
+        assert stored is not None
+        assert stored.default_llm_key == "CUSTOM_LLM_oat_primary"
+        assert stored.default_secondary_llm_key == "CUSTOM_LLM_oat_secondary"
+
+    cleared = await repo.update_organization(
+        "o_defaults",
+        clear_default_llm_key=True,
+        clear_default_secondary_llm_key=True,
+    )
+
+    assert cleared.default_llm_key is None
+    assert cleared.default_secondary_llm_key is None
+    async with session_factory() as session:
+        stored = await session.get(OrganizationModel, "o_defaults")
+        assert stored is not None
+        assert stored.default_llm_key is None
+        assert stored.default_secondary_llm_key is None
+
+
 def test_schedules_repository_instantiation():
     from skyvern.forge.sdk.db.repositories.schedules import SchedulesRepository
 
@@ -382,3 +425,40 @@ def test_agent_db_defines_no_delegator_methods():
         "Add data-access methods to the domain repository and call it via the typed attribute "
         "(e.g. db.tasks.get_task) instead of adding delegators to AgentDB."
     )
+
+
+async def _create_task_with_status(monkeypatch: pytest.MonkeyPatch, status: str):
+    from skyvern.forge.sdk.db.repositories import tasks as tasks_module
+
+    session = make_mock_session(MagicMock())
+    monkeypatch.setattr(tasks_module, "convert_to_task", lambda model, *args, **kwargs: model)
+    repo = tasks_module.TasksRepository(
+        session_factory=lambda: MockAsyncSessionCtx(session),
+        debug_enabled=False,
+    )
+
+    return await repo.create_task(
+        url="https://example.test/",
+        title=None,
+        navigation_goal=None,
+        data_extraction_goal=None,
+        navigation_payload=None,
+        status=status,
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_task_running_is_not_created_after_it_started(monkeypatch: pytest.MonkeyPatch):
+    """queued_seconds is started_at - created_at, so a task created already-running must not
+    stamp started_at ahead of the flush-time created_at default."""
+    task = await _create_task_with_status(monkeypatch, TaskStatus.running.value)
+
+    assert task.started_at is not None
+    assert task.created_at == task.started_at
+
+
+@pytest.mark.asyncio
+async def test_create_task_leaves_started_at_unset_for_other_statuses(monkeypatch: pytest.MonkeyPatch):
+    task = await _create_task_with_status(monkeypatch, TaskStatus.created.value)
+
+    assert task.started_at is None

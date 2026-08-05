@@ -3,12 +3,11 @@ from __future__ import annotations
 import pytest
 
 from skyvern.forge.sdk.copilot.signature import compute_signature
-from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentMode
+from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 from skyvern.forge.sdk.copilot.turn_outcome import (
     build_minimal_turn_outcome,
     build_turn_outcome,
     derive_response_kind,
-    escalation_reply_for,
 )
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 
@@ -20,9 +19,9 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOut
         (TurnIntentMode.EDIT, ResponseKind.BUILD),
         (TurnIntentMode.DRAFT_ONLY, ResponseKind.BUILD),
         (TurnIntentMode.CLARIFY, ResponseKind.CLARIFY),
-        (TurnIntentMode.UNKNOWN, ResponseKind.CLARIFY),
+        (TurnIntentMode.UNKNOWN, ResponseKind.ANSWER),
         (TurnIntentMode.DIAGNOSE, ResponseKind.DIAGNOSE),
-        (TurnIntentMode.DOCS_ANSWER, ResponseKind.DIAGNOSE),
+        (TurnIntentMode.ANSWER, ResponseKind.ANSWER),
         (TurnIntentMode.REFUSE, ResponseKind.REFUSE),
     ],
 )
@@ -33,6 +32,15 @@ def test_derive_response_kind_covers_every_mode(mode: TurnIntentMode, expected: 
 
 def test_derive_response_kind_handles_none_intent() -> None:
     assert derive_response_kind(None) is ResponseKind.CLARIFY
+
+
+def test_unknown_that_requires_user_input_remains_clarification() -> None:
+    intent = TurnIntent(
+        mode=TurnIntentMode.UNKNOWN,
+        authority=TurnIntentAuthority(requires_user_input=True),
+    )
+
+    assert derive_response_kind(intent) is ResponseKind.CLARIFY
 
 
 def test_build_minimal_turn_outcome_sets_signature_and_inherited() -> None:
@@ -73,14 +81,3 @@ def test_turn_outcome_json_round_trip() -> None:
     payload = outcome.model_dump(mode="json")
     restored = TurnOutcome.model_validate(payload)
     assert restored == outcome
-
-
-def test_escalation_reply_for_covers_derivable_kinds() -> None:
-    for kind in (ResponseKind.BUILD, ResponseKind.CLARIFY, ResponseKind.DIAGNOSE, ResponseKind.REFUSE):
-        text = escalation_reply_for(kind)
-        assert isinstance(text, str)
-        assert text
-
-
-def test_escalation_reply_for_recover_falls_back_to_clarify_text() -> None:
-    assert escalation_reply_for(ResponseKind.RECOVER) == escalation_reply_for(ResponseKind.CLARIFY)

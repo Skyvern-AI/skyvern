@@ -44,6 +44,8 @@ except ImportError as fastmcp_import_error:
 else:
     _FASTMCP_IMPORT_ERROR = None
 
+from skyvern.cli.mcp_tools.browser import EITHER_STATE_OUTPUT_SCHEMA
+
 from .blocks import (
     skyvern_block_schema,
     skyvern_block_validate,
@@ -55,8 +57,10 @@ from .browser import (
     skyvern_clipboard_write,
     skyvern_drag,
     skyvern_evaluate,
+    skyvern_evaluate_and_screenshot,
     skyvern_execute,
     skyvern_extract,
+    skyvern_extract_and_screenshot,
     skyvern_file_upload,
     skyvern_find,
     skyvern_frame_list,
@@ -65,6 +69,8 @@ from .browser import (
     skyvern_hover,
     skyvern_login,
     skyvern_navigate,
+    skyvern_navigate_and_screenshot,
+    skyvern_navigate_extract_and_screenshot,
     skyvern_observe,
     skyvern_press_key,
     skyvern_run_task,
@@ -74,6 +80,7 @@ from .browser import (
     skyvern_type,
     skyvern_validate,
     skyvern_wait,
+    skyvern_wait_for_either_state,
 )
 from .browser_profiles import (
     skyvern_browser_profile_create,
@@ -82,11 +89,20 @@ from .browser_profiles import (
     skyvern_browser_profile_list,
     skyvern_browser_profile_update,
 )
+from .cdp_input import skyvern_write_grid
 from .code_block import skyvern_code_block_lint, skyvern_code_block_synthesize
 from .credential import (
+    skyvern_bitwarden_config_clear,
+    skyvern_bitwarden_config_get,
+    skyvern_bitwarden_config_set,
+    skyvern_bitwarden_items,
     skyvern_credential_delete,
     skyvern_credential_get,
     skyvern_credential_list,
+    skyvern_onepassword_config_clear,
+    skyvern_onepassword_config_get,
+    skyvern_onepassword_config_set,
+    skyvern_onepassword_items,
 )
 from .folder import (
     skyvern_folder_create,
@@ -147,6 +163,7 @@ from .storage import (
     skyvern_set_session_storage,
 )
 from .tabs import (
+    skyvern_open_tabs,
     skyvern_tab_close,
     skyvern_tab_list,
     skyvern_tab_new,
@@ -296,14 +313,20 @@ file_upload, find, navigate, screenshot, evaluate
 - **Workflows:** workflow_create/run/status/get/list/update/delete/cancel/update_folder
 - **Schedules:** schedule_list/list_for_workflow/get/create/update/enable/disable/delete
 - **Scripts:** script_list_for_workflow, script_get_code, script_versions, script_fallback_episodes, script_deploy
-- **Credentials:** credential_list/get/delete
+- **Credentials:** credential_list/get/delete, onepassword_items/config_get/config_set/config_clear, \
+bitwarden_items/config_get/config_set/config_clear
 - **Folders/Blocks:** folder_list/get/create/update/delete, block_schema, block_validate
+
+Provider config_set tools never accept secrets as arguments. Set OP_SERVICE_ACCOUNT_TOKEN or \
+BITWARDEN_MASTER_PASSWORD in the MCP server environment before starting it, then call the matching tool. \
+Never include provider secrets in chat or tool arguments.
 
 Precision tools support intent (AI), selector (deterministic), or hybrid (both) targeting.
 
 ### Dependencies
 - extract/validate read the CURRENT page — navigate first.
-- login requires a session AND a credential_id from credential_list.
+- login requires a session AND either a credential_id from credential_list or provider IDs from \
+onepassword_items/bitwarden_items.
 - file_upload requires a navigated page with an upload element.
 - console_messages and network_requests capture events from session start — call anytime.
 - Workflow, schedule, credential, script, folder, and block tools do NOT need a browser session.
@@ -399,6 +422,9 @@ mcp.tool(tags={"browser_profile"}, annotations=_dest("Delete Browser Profile"))(
 # non-destructive, but still open-world because the target site is unbounded.
 mcp.tool(tags={"ai_powered", "browser_primitive"}, annotations=_web_dest("Perform Browser Action (AI)"))(skyvern_act)
 mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Extract Data from Page (AI)"))(size_capped(skyvern_extract))
+mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Extract Data + Screenshot (AI)"))(
+    size_capped(skyvern_extract_and_screenshot)
+)
 mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Validate Page Condition (AI)"))(skyvern_validate)
 mcp.tool(
     description=_RUN_TASK_TOOL_DESCRIPTION,
@@ -407,8 +433,17 @@ mcp.tool(
 )(skyvern_run_task)
 mcp.tool(tags={"ai_powered", "browser_primitive"}, annotations=_web_mut("Log in to Website (AI)"))(skyvern_login)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_mut("Navigate to URL"))(skyvern_navigate)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_mut("Navigate to URL + Screenshot"))(
+    size_capped(skyvern_navigate_and_screenshot)
+)
+mcp.tool(tags={"ai_powered"}, annotations=_web_mut("Navigate + Extract Data + Screenshot (AI)"))(
+    size_capped(skyvern_navigate_extract_and_screenshot)
+)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_ro("Take Screenshot"))(skyvern_screenshot)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Evaluate JavaScript"))(skyvern_evaluate)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Evaluate JavaScript + Screenshot"))(
+    size_capped(skyvern_evaluate_and_screenshot)
+)
 
 # -- Clipboard --
 mcp.tool(tags={"browser_primitive"}, annotations=_ro("Read Clipboard"))(skyvern_clipboard_read)
@@ -417,6 +452,7 @@ mcp.tool(tags={"browser_primitive"}, annotations=_mut("Write Clipboard"))(skyver
 # -- Batch tools (observe + execute for multi-step optimization) --
 mcp.tool(tags={"browser_primitive", "batch"}, annotations=_web_ro("Observe Page Structure"))(skyvern_observe)
 mcp.tool(tags={"browser_primitive", "batch"}, annotations=_web_dest("Execute Batch Actions"))(skyvern_execute)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Write Grid"))(size_capped(skyvern_write_grid))
 
 # -- Precision tools (selector/intent-based browser primitives) --
 # Input/action primitives can submit, overwrite, or delete arbitrary website state.
@@ -430,11 +466,19 @@ mcp.tool(tags={"browser_primitive"}, annotations=_web_mut("Scroll Page"))(skyver
 mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Select Option"))(skyvern_select_option)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Press Key"))(skyvern_press_key)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_ro("Wait"))(skyvern_wait)
+mcp.tool(
+    tags={"browser_primitive"},
+    annotations=_web_ro("Wait For Either State"),
+    output_schema=EITHER_STATE_OUTPUT_SCHEMA,
+)(skyvern_wait_for_either_state)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_ro("Find Element"))(skyvern_find)
 
 # -- Tab management (multi-tab) --
 mcp.tool(tags={"tab_management"}, annotations=_web_ro("List Tabs"))(skyvern_tab_list)
 mcp.tool(tags={"tab_management"}, annotations=_web_mut("Open New Tab"))(skyvern_tab_new)
+mcp.tool(tags={"tab_management", "browser_primitive"}, annotations=_web_mut("Open Tabs"))(
+    size_capped(skyvern_open_tabs)
+)
 mcp.tool(tags={"tab_management"}, annotations=_mut("Switch Tab"))(skyvern_tab_switch)
 mcp.tool(tags={"tab_management"}, annotations=_dest("Close Tab"))(skyvern_tab_close)
 mcp.tool(tags={"tab_management"}, annotations=_web_ro("Wait for New Tab"))(skyvern_tab_wait_for_new)
@@ -485,6 +529,24 @@ mcp.tool(tags={"settings"}, annotations=_mut("Update Organization Settings"))(sk
 mcp.tool(tags={"credential"}, annotations=_ro("List Credentials"))(skyvern_credential_list)
 mcp.tool(tags={"credential"}, annotations=_ro("Get Credential"))(skyvern_credential_get)
 mcp.tool(tags={"credential"}, annotations=_dest("Delete Credential"))(skyvern_credential_delete)
+mcp.tool(tags={"credential", "onepassword"}, annotations=_ro("List 1Password Items"))(skyvern_onepassword_items)
+mcp.tool(tags={"credential", "onepassword"}, annotations=_ro("Get 1Password Configuration"))(
+    skyvern_onepassword_config_get
+)
+mcp.tool(tags={"credential", "onepassword"}, annotations=_mut("Set 1Password Configuration"))(
+    skyvern_onepassword_config_set
+)
+mcp.tool(tags={"credential", "onepassword"}, annotations=_dest("Clear 1Password Configuration"))(
+    skyvern_onepassword_config_clear
+)
+mcp.tool(tags={"credential", "bitwarden"}, annotations=_ro("List Bitwarden Items"))(skyvern_bitwarden_items)
+mcp.tool(tags={"credential", "bitwarden"}, annotations=_ro("Get Bitwarden Configuration"))(skyvern_bitwarden_config_get)
+mcp.tool(tags={"credential", "bitwarden"}, annotations=_mut("Set Bitwarden Configuration"))(
+    skyvern_bitwarden_config_set
+)
+mcp.tool(tags={"credential", "bitwarden"}, annotations=_dest("Clear Bitwarden Configuration"))(
+    skyvern_bitwarden_config_clear
+)
 
 # -- Folder management (no browser needed) --
 mcp.tool(tags={"folder"}, annotations=_ro("List Folders"))(skyvern_folder_list)
@@ -546,12 +608,16 @@ __all__ = [
     # Primary (AI-powered)
     "skyvern_act",
     "skyvern_extract",
+    "skyvern_extract_and_screenshot",
     "skyvern_validate",
     "skyvern_run_task",
     "skyvern_login",
     "skyvern_navigate",
+    "skyvern_navigate_and_screenshot",
+    "skyvern_navigate_extract_and_screenshot",
     "skyvern_screenshot",
     "skyvern_evaluate",
+    "skyvern_evaluate_and_screenshot",
     # Clipboard
     "skyvern_clipboard_read",
     "skyvern_clipboard_write",
@@ -568,6 +634,7 @@ __all__ = [
     "skyvern_select_option",
     "skyvern_press_key",
     "skyvern_wait",
+    "skyvern_wait_for_either_state",
     "skyvern_find",
     # Tab management
     "skyvern_tab_list",
@@ -610,6 +677,14 @@ __all__ = [
     "skyvern_credential_list",
     "skyvern_credential_get",
     "skyvern_credential_delete",
+    "skyvern_onepassword_items",
+    "skyvern_onepassword_config_get",
+    "skyvern_onepassword_config_set",
+    "skyvern_onepassword_config_clear",
+    "skyvern_bitwarden_items",
+    "skyvern_bitwarden_config_get",
+    "skyvern_bitwarden_config_set",
+    "skyvern_bitwarden_config_clear",
     # Folder management
     "skyvern_folder_list",
     "skyvern_folder_create",

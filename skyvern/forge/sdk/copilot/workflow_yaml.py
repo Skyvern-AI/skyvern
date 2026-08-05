@@ -405,6 +405,7 @@ async def _process_workflow_yaml(
     organization_id: str,
     workflow_yaml: str,
     settings_fallback_yaml: str | None = None,
+    settings_fallback_workflow: Workflow | None = None,
     credential_scrub_values: Collection[str] = (),
 ) -> Workflow:
     # Single seam every copilot YAML->Workflow conversion passes through, so code
@@ -431,12 +432,26 @@ async def _process_workflow_yaml(
         # failure propagates: failing the save is safer than writing an implicit disable.
         enable_self_healing = _yaml_enable_self_healing(settings_fallback_yaml)
 
+    mask_secrets = workflow_yaml_request.mask_secrets
+    if mask_secrets is None:
+        mask_secrets = _yaml_bool_setting(settings_fallback_yaml, "mask_secrets")
+
     pin_saved_session_ip = _yaml_pin_saved_session_ip(workflow_yaml)
     if pin_saved_session_ip is None:
         pin_saved_session_ip = _yaml_pin_saved_session_ip(settings_fallback_yaml)
 
-    current_workflow: Workflow | None = None
-    if enable_self_healing is None or pin_saved_session_ip is None:
+    if enable_self_healing is None:
+        fallback_value = getattr(settings_fallback_workflow, "enable_self_healing", None)
+        enable_self_healing = fallback_value if isinstance(fallback_value, bool) else None
+    if mask_secrets is None:
+        fallback_value = getattr(settings_fallback_workflow, "mask_secrets", None)
+        mask_secrets = fallback_value if isinstance(fallback_value, bool) else None
+    if pin_saved_session_ip is None:
+        fallback_value = getattr(settings_fallback_workflow, "pin_saved_session_ip", None)
+        pin_saved_session_ip = fallback_value if isinstance(fallback_value, bool) else None
+
+    current_workflow = settings_fallback_workflow
+    if enable_self_healing is None or mask_secrets is None or pin_saved_session_ip is None:
         try:
             current_workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
                 workflow_permanent_id=workflow_permanent_id,
@@ -446,6 +461,8 @@ async def _process_workflow_yaml(
             current_workflow = None
     if enable_self_healing is None:
         enable_self_healing = bool(current_workflow and getattr(current_workflow, "enable_self_healing", False))
+    if mask_secrets is None:
+        mask_secrets = bool(current_workflow and getattr(current_workflow, "mask_secrets", False))
     if pin_saved_session_ip is None:
         pin_saved_session_ip = bool(current_workflow and getattr(current_workflow, "pin_saved_session_ip", False))
 
@@ -464,6 +481,7 @@ async def _process_workflow_yaml(
         totp_verification_url=workflow_yaml_request.totp_verification_url,
         totp_identifier=workflow_yaml_request.totp_identifier,
         persist_browser_session=workflow_yaml_request.persist_browser_session or False,
+        mask_secrets=mask_secrets,
         pin_saved_session_ip=pin_saved_session_ip,
         browser_profile_id=workflow_yaml_request.browser_profile_id,
         browser_profile_key=workflow_yaml_request.browser_profile_key,
@@ -539,13 +557,14 @@ def apply_block_edit(
         occurrences = current.count(expected_code)
         if occurrences == 0:
             raise BlockEditError(
-                f"expected_code was not found in block {label!r}. It has changed since you read it — "
-                "re-read the block and rewrite the edit against its current code."
+                f"expected_code was not found in block {label!r}. It has changed since you read it. "
+                f"Its code is now:\n{current}\n"
+                "Rewrite the edit against exactly that text."
             )
         if occurrences > 1:
             raise BlockEditError(
                 f"expected_code appears {occurrences} times in block {label!r}; include enough "
-                "surrounding lines to identify one occurrence."
+                f"surrounding lines to identify one occurrence. Its code is now:\n{current}"
             )
         block["code"] = current.replace(expected_code, replacement_code, 1)
 

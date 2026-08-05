@@ -47,15 +47,6 @@ def parsed_ask_refs(value: object) -> list[str]:
     return [ref for ref in value if isinstance(ref, str) and ref]
 
 
-class DeliveredUnverifiedPublicOutputs(dict[str, Any]):
-    """Run-output values explicitly selected for terminal presentation.
-
-    The values remain dynamically shaped JSON until the presentation sanitizer
-    validates them.  The concrete marker prevents arbitrary result-factory
-    callers from minting the public structured-output surface.
-    """
-
-
 class NarrativeDraft(TypedDict):
     blockCount: int
     blockLabels: list[str]
@@ -104,7 +95,7 @@ class TurnNarrativePayload(TypedDict):
     responseType: NotRequired[ResponseType]
     cancelled: NotRequired[bool]
     proposalDisposition: NotRequired[ProposalDisposition]
-    # TurnOutcome.response_kind value: "build" | "clarify" | "diagnose" | "refuse" | "recover".
+    # TurnOutcome.response_kind value: "answer" | "build" | "clarify" | "diagnose" | "refuse" | "recover".
     responseKind: NotRequired[str]
     terminalEnvelope: NotRequired[dict[str, Any]]
     # The ADR-0005 terminal adjudication (enforcement.verified_goal_claim_authorized):
@@ -112,8 +103,6 @@ class TurnNarrativePayload(TypedDict):
     verifiedSuccess: NotRequired[bool]
     # Verdict-state summary from the turn's latest evaluated adjudication.
     outcomeAdjudication: NotRequired[NarrativeOutcomeAdjudication]
-    # Sanitized JSON boundary for reviewing outputs that were delivered but not independently verified.
-    deliveredUnverifiedObservedOutputs: NotRequired[dict[str, Any]]
     # {"reason": <credential_prompt_reason() token>}, set when this turn surfaces a credential need.
     credentialPrompt: NotRequired[dict[str, str]]
     # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ...}, set when a mid-build
@@ -629,7 +618,8 @@ _MAX_APPROVED_CREDENTIALS = 20
 def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_context: str | None) -> str | None:
     """Persist resolved credentials as durable cross-turn approval. Records only from
     resolved_credentials, never discovered_credentials, so ADR-0002's run/draft split
-    holds by construction.
+    holds by construction. A credential a live login page vouched for is left out: its
+    evidence is that page, which a later turn has not seen, so it must be re-earned there.
     """
     policy = ctx.request_policy
     if policy is None or not policy.resolved_credentials:
@@ -637,7 +627,13 @@ def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_c
     sc = StructuredContext.from_json_str(raw_context)
     existing_ids = {record.credential_id for record in sc.approved_credentials}
     for credential in policy.resolved_credentials:
-        if credential.credential_id in existing_ids:
+        # A credential the user picked from the card is durable approval even though the resume
+        # stamped an origin for it; only page-vouched ids have to be re-earned.
+        stamped_by_page = (
+            credential.credential_id in policy.live_page_admitted_urls
+            and credential.credential_id != ctx.credential_pause_connected_credential_id
+        )
+        if credential.credential_id in existing_ids or stamped_by_page:
             continue
         sc.approved_credentials.append(ApprovedCredential(credential_id=credential.credential_id))
         existing_ids.add(credential.credential_id)
@@ -738,6 +734,7 @@ class InFlightStreamToolCall:
     call_id: str
     tool_name: str
     iteration: int
+    display_label: str | None = None
 
 
 @dataclass
@@ -797,6 +794,7 @@ class CopilotContext(AgentContext):
     credential_pause_used: bool = False
     copilot_credential_pause_seconds: float = 0.0
     credential_pause_outcome: str | None = None
+    credential_pause_connected_credential_id: str | None = None
 
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)
@@ -857,17 +855,9 @@ class CopilotContext(AgentContext):
     # per-run pointer resets (``last_run_outcome = None``); cleared only by the
     # workflow-edit evidence reset, which invalidates pre-edit run evidence.
     terminal_envelope_run_outcomes: list[RecordedRunOutcome] = field(default_factory=list)
-    delivered_unverified_terminal: bool = False
-    delivered_unverified_workflow_run_id: str | None = None
-    delivered_unverified_observed_outputs: dict[str, Any] = field(default_factory=DeliveredUnverifiedPublicOutputs)
     # Consecutive failed runs where navigation completed but the scraper
     # could not read the page (generic "failed to load the website" template).
     # Resets on any non-matching run outcome. Streak crosses workflow-shape
-    # changes deliberately — the frontier fingerprint resets each time the
-    # copilot rewrites the workflow, but the underlying site-block pattern is
-    # shape-independent.
-    probable_site_block_streak_count: int = 0
-    probable_site_block_stop_nudge_count: int = 0
     per_tool_budget_nudge_count: int = 0
     effective_workflow_proxy_location: Any | None = None
     # Labels of navigation blocks that were canceled/failed inside a
@@ -937,6 +927,9 @@ class CopilotContext(AgentContext):
     # exception in run_with_enforcement. Cleared at the top of every call to
     # _record_run_blocks_result so stale state can't leak across runs.
     last_test_non_retriable_nav_error: str | None = None
+    # Secure-runner codes from the latest run that were faults of the sandbox itself, joined.
+    # Cleared per run in _record_run_blocks_result, so a later clean run releases the guard.
+    last_infrastructure_tool_error: str | None = None
     # Normalized signature of the non-retriable nav error last nudged on.
     # Lets the stop nudge re-fire if the user retries with a different bad URL
     # (different signature) in the same session. Cleared on meaningful success.
@@ -995,8 +988,6 @@ class CopilotContext(AgentContext):
     # construction site, overriding this default.
     turn_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     turn_index: int = 0
-    design_start_emitted: bool = False
-    design_end_emitted: bool = False
     narrative_summary: str | None = None
 
     staged_workflow_yaml: str | None = None

@@ -3,11 +3,32 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from skyvern.forge.sdk.copilot.context import ProposalDisposition, ResponseType, TurnNarrativePayload
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeVerdict
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
+
+
+class CopilotPendingTurn(BaseModel):
+    """Durable write-ahead marker for one in-flight copilot turn.
+
+    Written in the same transaction as the turn's user message so a hard kill
+    leaves enough state to reconcile the turn and roll canonical back.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    turn_id: str
+    started_at: datetime
+    pre_turn_workflow: dict[str, Any] | None = None
+    pre_turn_proposed_workflow: dict[str, Any] | None = None
+    keep_pending_proposal: bool = False
+    user_message_id: str | None = None
+    recovering_at: datetime | None = None
+    # Fingerprint of the canonical workflow as this turn last left it. None means the turn
+    # never wrote canonical, so it owns no write to roll back.
+    canonical_write_fingerprint: str | None = None
 
 
 class WorkflowCopilotChat(BaseModel):
@@ -18,6 +39,15 @@ class WorkflowCopilotChat(BaseModel):
     workflow_permanent_id: str = Field(..., description="Workflow permanent ID for the chat")
     proposed_workflow: dict | None = Field(None, description="Latest workflow proposed by the copilot")
     auto_accept: bool | None = Field(False, description="Whether copilot auto-accepts workflow updates")
+    pending_turns: dict[str, CopilotPendingTurn] = Field(
+        default_factory=dict, description="In-flight turns keyed by turn id"
+    )
+
+    @field_validator("pending_turns", mode="before")
+    @classmethod
+    def _default_pending_turns(cls, value: dict[str, Any] | None) -> dict[str, Any]:
+        return value or {}
+
     created_at: datetime = Field(..., description="When the chat was created")
     modified_at: datetime = Field(..., description="When the chat was last modified")
 
@@ -69,7 +99,8 @@ class WorkflowCopilotTurnMode(StrEnum):
     BUILD = "build"
     EDIT = "edit"
     DIAGNOSE = "diagnose"
-    DOCS_ANSWER = "docs_answer"
+    # Wire-compatible mirror of the generic answer-only TurnIntent mode.
+    ANSWER = "docs_answer"
     DRAFT_ONLY = "draft_only"
     CLARIFY = "clarify"
     REFUSE = "refuse"
@@ -320,6 +351,10 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
         WorkflowCopilotStreamMessageType.TOOL_RESULT, description="Message type"
     )
     tool_name: str = Field(..., description="Name of the tool that was called")
+    display_label: str | None = Field(
+        None,
+        description="Product-safe label for rendering the tool result in user-visible activity surfaces",
+    )
     success: bool = Field(..., description="Whether the tool call succeeded")
     summary: str = Field(..., description="Brief human-readable summary of the result")
     iteration: int = Field(..., description="Agent loop iteration number")

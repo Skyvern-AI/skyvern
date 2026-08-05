@@ -163,6 +163,23 @@ function ProfileDropdown({
     setQuery("");
   };
 
+  const searching = debouncedQuery.trim().length > 0;
+  // ＋New sits under the resting option in the default view; under an active
+  // search the resting option hides, so keep ＋New at the bottom to leave the
+  // first matching profile as cmdk's default-highlighted (Enter) target.
+  const newProfileGroup = (borderClass: string) => (
+    <CommandGroup className={borderClass}>
+      <CommandItem value="new-profile" onSelect={() => setCreating(true)}>
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-medium">＋ New profile…</div>
+          <div className="whitespace-normal break-words text-xs text-muted-foreground">
+            Created empty — the first run fills it, every run updates it
+          </div>
+        </div>
+      </CommandItem>
+    </CommandGroup>
+  );
+
   return (
     <div className="min-w-0 space-y-1.5">
       <Popover
@@ -252,25 +269,28 @@ function ProfileDropdown({
                 onValueChange={setQuery}
               />
               <CommandList>
-                {!debouncedQuery.trim() ? (
-                  <CommandGroup>
-                    <CommandItem
-                      value="auto-profile"
-                      onSelect={() => pick(null)}
-                    >
-                      <div className="min-w-0 flex-1">
-                        <div className="text-sm font-medium">
-                          {restingLabel}
+                {!searching ? (
+                  <>
+                    <CommandGroup>
+                      <CommandItem
+                        value="auto-profile"
+                        onSelect={() => pick(null)}
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="text-sm font-medium">
+                            {restingLabel}
+                          </div>
+                          <div className="whitespace-normal break-words text-xs text-muted-foreground">
+                            {restingCaption}
+                          </div>
                         </div>
-                        <div className="whitespace-normal break-words text-xs text-muted-foreground">
-                          {restingCaption}
-                        </div>
-                      </div>
-                      {profileId === null ? (
-                        <CheckIcon className="ml-2 size-4 shrink-0" />
-                      ) : null}
-                    </CommandItem>
-                  </CommandGroup>
+                        {profileId === null ? (
+                          <CheckIcon className="ml-2 size-4 shrink-0" />
+                        ) : null}
+                      </CommandItem>
+                    </CommandGroup>
+                    {newProfileGroup("border-b border-border")}
+                  </>
                 ) : null}
                 {profiles.length === 0 ? (
                   <CommandEmpty>
@@ -323,20 +343,7 @@ function ProfileDropdown({
                     })}
                   </CommandGroup>
                 )}
-                <CommandGroup className="border-t border-border">
-                  <CommandItem
-                    value="new-profile"
-                    onSelect={() => setCreating(true)}
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="text-sm font-medium">＋ New profile…</div>
-                      <div className="whitespace-normal break-words text-xs text-muted-foreground">
-                        Created empty — the first run fills it, every run
-                        updates it
-                      </div>
-                    </div>
-                  </CommandItem>
-                </CommandGroup>
+                {searching ? newProfileGroup("border-t border-border") : null}
               </CommandList>
             </Command>
           )}

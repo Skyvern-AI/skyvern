@@ -41,6 +41,9 @@ def _run_extract_information_and_capture_cache_calls(
     agent_function_stub = MagicMock()
     agent_function_stub.lookup_cross_run_extraction_cache = lookup_mock
     agent_function_stub.store_cross_run_extraction_cache = store_mock
+    # Grid collection is a separate AgentFunction seam; keep it a no-op so the
+    # handler's collection boundary neither runs a collector nor warns.
+    agent_function_stub.collect_virtualized_grid_rows = AsyncMock(return_value=None)
 
     monkeypatch.setattr(handler, "load_prompt_with_elements_tracked", fake_load_prompt_with_elements_tracked)
     monkeypatch.setattr(
@@ -86,7 +89,7 @@ def _run_extract_information_and_capture_cache_calls(
 
     asyncio.run(
         handler.extract_information_for_navigation_goal(
-            task=task, step=MagicMock(retry_index=0), scraped_page=scraped_page
+            task=task, step=MagicMock(retry_index=0), scraped_page=scraped_page, page=MagicMock()
         )
     )
 

@@ -12,6 +12,8 @@ import keyword
 import re
 import sys
 import textwrap
+from collections import Counter
+from collections.abc import Mapping
 from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -19,6 +21,7 @@ from typing import Any
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.copilot import code_block_synthesis as code_block_synthesis_module
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     _SELECTION_MATCH_BASES,
     AuthoringParameterBindingCandidate,
@@ -50,10 +53,8 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     SCOUTED_SPINE_TRUNCATED_REASON_CODE,
     TRUNCATED_FINDING,
     UNFORGIVEN_DROP_FINDING,
-    UNRECORDED_INDEX_FINDING,
     ProducedStaticReturnEnvelope,
     SynthesisDiagnostics,
-    _get_by_role_expr,
     _get_by_role_expr_strict,
     _is_submit_interaction,
     _strict_period_date_pattern,
@@ -552,6 +553,13 @@ class _RecipeLocator:
     def nth(self, index: int) -> _RecipeLocator:
         return _RecipeLocator(self.page, self.selector, (*self.indices, index))
 
+    @property
+    def first(self) -> _RecipeLocator:
+        return self.nth(0)
+
+    async def wait_for(self, *, state: str = "visible", timeout: float | None = None) -> None:
+        return None
+
     def locator(self, selector: str) -> _RecipeLocator:
         return _RecipeLocator(self.page, f"{self.selector}|{selector}", self.indices)
 
@@ -615,12 +623,12 @@ async def test_generated_recipe_executes_and_fails_closed_on_runtime_drift() -> 
     assert len(result["output"]["records"]) == 3
 
     page.counts[(".kv", ())] = 3
-    with pytest.raises(ValueError, match="scalar selector cardinality"):
+    with pytest.raises(Exception, match="scalar selector cardinality"):
         await _execute_recipe(page)
 
     page.counts[(".kv", ())] = 2
     page.visibility[("#records > tbody > tr|:scope > th, :scope > td", (1, 2))] = False
-    with pytest.raises(ValueError, match="cell is no longer visible"):
+    with pytest.raises(Exception, match="cell is no longer visible"):
         await _execute_recipe(page)
 
 
@@ -658,7 +666,7 @@ async def test_produced_envelope_executes_table_and_scalar_reads() -> None:
 async def test_produced_envelope_guard_raises_on_empty_cell() -> None:
     page = _RecipePage()
     page.text[("#records > tbody > tr|:scope > th, :scope > td", (0, 1))] = ""
-    with pytest.raises(ValueError, match="table cell value is empty"):
+    with pytest.raises(Exception, match="table cell value is empty"):
         await _execute_envelope(page, _produce_table_envelope())
 
 
@@ -1032,37 +1040,6 @@ class TestLocatorSynthesis:
         assert "\n" not in emitted
         assert f"await {emitted}.click()" in result.code
 
-    def test_strict_reanchor_emits_exact_name_match_for_repeated_affordance(self) -> None:
-        # AC1: a re-anchored named get_by_role on a page with a repeated accessible name must emit an
-        # exact (single (role, name) group) match, never the substring default that over-matches.
-        trajectory = [
-            _interaction("click", selector="#open", source_url="https://example.com/billing"),
-            _interaction(
-                "click",
-                selector="a",
-                source_url="https://example.com/billing",
-                role="link",
-                accessible_name="Download",
-            ),
-        ]
-        result = synthesize_code_block(trajectory, strict_selectors=True)
-        assert result is not None
-        assert 'await page.get_by_role("link", name="Download", exact=True).click()' in result.code
-        assert ".nth(" not in result.code
-        assert result.diagnostics.dropped_interactions == []
-        provenance = [p for p in result.diagnostics.locator_provenance if p.get("source") == "aria_role_name"]
-        assert provenance == [
-            {
-                "trajectory_index": 1,
-                "selector": "a",
-                "emitted_literal": _get_by_role_expr_strict("link", "Download"),
-                "source": "aria_role_name",
-                "role": "link",
-                "name": "Download",
-            }
-        ]
-        assert provenance[0]["emitted_literal"] != _get_by_role_expr("link", "Download")
-
 
 class TestActionSynthesis:
     def test_type_text_becomes_param_slot_fill(self) -> None:
@@ -1149,7 +1126,7 @@ class TestActionSynthesis:
         assert lines[2] == '        await _scout_entry_target.wait_for(state="visible", timeout=1000)'
         assert lines[3] == "    except Exception:"
         assert lines[4] == '        await page.goto("https://example.com/start", wait_until="domcontentloaded")'
-        assert lines[5] == '        await _scout_entry_target.wait_for(state="visible")'
+        assert lines[5] == '        await _scout_entry_target.wait_for(state="visible", timeout=120000)'
         assert "        del _scout_entry_target" in lines
 
     def test_optional_cookie_dismissal_is_conditional_and_uses_durable_entry_target(self) -> None:
@@ -1176,7 +1153,7 @@ class TestActionSynthesis:
         lines = result.code.splitlines()
         assert lines[0] == '    _scout_entry_target = page.locator("#locInput")'
         assert '        await page.goto("https://example.com/find", wait_until="domcontentloaded")' in lines
-        assert '        await _scout_entry_target.wait_for(state="visible")' in lines
+        assert '        await _scout_entry_target.wait_for(state="visible", timeout=120000)' in lines
         assert '    _scout_optional_dismissal = page.locator("#accept-consent")' in lines
         assert "    if await _scout_optional_dismissal.count() > 0:" in lines
         assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
@@ -1215,7 +1192,7 @@ class TestActionSynthesis:
         assert lines[0] == '    _scout_entry_target = page.locator("#locInput")'
         assert '    _scout_optional_dismissal = page.locator("button.decline")' in lines
         assert "    if await _scout_optional_dismissal.count() > 0:" in lines
-        assert 'await _scout_entry_target.wait_for(state="visible")' in result.code
+        assert 'await _scout_entry_target.wait_for(state="visible", timeout=120000)' in result.code
         assert 'await page.locator("button.decline").click()' not in result.code
 
     def test_close_named_action_is_not_optional_dismissal_by_name_only(self) -> None:
@@ -1408,7 +1385,7 @@ class TestActionSynthesis:
         assert lines[0] == '    await page.goto("https://example.com/find", wait_until="domcontentloaded")'
         assert dismissal_line in lines
         assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
-        assert 'await _scout_entry_target.wait_for(state="visible")' not in result.code
+        assert 'await _scout_entry_target.wait_for(state="visible", timeout=120000)' not in result.code
         assert forbidden_snippet not in result.code
         ast.parse("async def _block(page):\n" + result.code)
 
@@ -3851,6 +3828,107 @@ class TestEmittedInteractionPartition:
             {"tool_name": "press_key", "selector": "#name", "key": "Enter"},
         ]
 
+    def _login_otp_trajectory(self) -> list[dict[str, Any]]:
+        login_url = "https://example.com/login"
+        return [
+            _interaction(
+                CREDENTIAL_FILL_TOOL_NAME,
+                selector="#username",
+                source_url=login_url,
+                credential_id="cred_1",
+                credential_field="username",
+                typed_length=20,
+            ),
+            _interaction(
+                CREDENTIAL_FILL_TOOL_NAME,
+                selector="#password",
+                source_url=login_url,
+                credential_id="cred_1",
+                credential_field="password",
+                typed_length=14,
+            ),
+            _interaction("click", selector=".btn-login", role="button", accessible_name="Log in"),
+            _interaction("press_key", selector="button", key="Enter"),
+            _interaction(
+                "read_value",
+                read_expression='document.querySelector("#otp-hint").innerText',
+                read_output_path="output.otp_hint",
+            ),
+            _interaction(
+                CREDENTIAL_FILL_TOOL_NAME,
+                selector="#totp",
+                credential_id="cred_1",
+                credential_field="totp",
+                typed_length=6,
+            ),
+            _interaction("click", selector=".btn-primary-submit", role="button", accessible_name="Login"),
+        ]
+
+    def _lane_index_counts(self, diagnostics: SynthesisDiagnostics) -> Counter[int]:
+        return Counter(
+            record["trajectory_index"]
+            for group in (
+                diagnostics.emitted_interactions,
+                diagnostics.dropped_interactions,
+                diagnostics.forgiven_interactions,
+            )
+            for record in group
+        )
+
+    def test_login_otp_trajectory_puts_every_retained_index_in_exactly_one_lane(self) -> None:
+        trajectory = self._login_otp_trajectory()
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        diagnostics = result.diagnostics
+        assert diagnostics.truncated is False
+        emitted = {record["trajectory_index"] for record in diagnostics.emitted_interactions}
+        dropped = {record["trajectory_index"] for record in diagnostics.dropped_interactions}
+        forgiven = {record["trajectory_index"] for record in diagnostics.forgiven_interactions}
+        assert emitted | dropped | forgiven == set(range(len(trajectory)))
+        assert emitted & dropped == set()
+        assert emitted & forgiven == set()
+        assert dropped & forgiven == set()
+        assert set(self._lane_index_counts(diagnostics).values()) == {1}
+
+    def test_captured_read_and_wait_records_carry_a_lane(self) -> None:
+        trajectory = self._login_otp_trajectory()
+        trajectory.insert(5, _interaction("wait", duration_ms=2000))
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        by_index = {record["trajectory_index"]: record for record in result.diagnostics.emitted_interactions}
+        assert by_index[4]["method"] == "evaluate"
+        assert by_index[4]["lane"] == "page_read"
+        assert by_index[5]["method"] == "wait_for_timeout"
+        assert by_index[5]["lane"] == "page_wait"
+        assert set(self._lane_index_counts(result.diagnostics).values()) == {1}
+        uncovered = uncovered_required_emitted_interactions(result.diagnostics.emitted_interactions, [])
+        assert {record["trajectory_index"] for record in uncovered}.isdisjoint({4, 5})
+
+    def test_non_strict_hover_and_anchorless_interaction_stay_in_exactly_one_lane(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open", source_url="https://example.com/start"),
+            _interaction("hover", selector="#menu"),
+            _interaction("click"),
+        ]
+
+        result = synthesize_code_block(trajectory, strict_selectors=False)
+
+        assert result is not None
+        diagnostics = result.diagnostics
+        hover_record = next(record for record in diagnostics.emitted_interactions if record["trajectory_index"] == 1)
+        assert hover_record["method"] == "hover"
+        assert hover_record["lane"] == "recording_hover"
+        dropped_reasons = {
+            record["trajectory_index"]: record["reason_code"] for record in diagnostics.dropped_interactions
+        }
+        assert dropped_reasons[2] == "missing_selector_and_role_name"
+        assert set(self._lane_index_counts(diagnostics)) == set(diagnostics.retained_trajectory_indices)
+        assert set(self._lane_index_counts(diagnostics).values()) == {1}
+
     def test_every_retained_index_in_exactly_one_partition(self) -> None:
         trajectory = self._mixed_trajectory()
 
@@ -3932,6 +4010,58 @@ class TestEmittedInteractionPartition:
             {"trajectory_index": 1, "tool_name": "click", "lane": "entry_replay_prefix"}
         ]
 
+    def test_deferred_readonly_index_lands_in_exactly_one_lane(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
+            _readonly_type(control_readonly=True, control_value_satisfied=False),
+        ]
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        assert self._lane_index_counts(result.diagnostics) == Counter({0: 1, 1: 1})
+        by_index = {record["trajectory_index"]: record for record in result.diagnostics.emitted_interactions}
+        assert by_index[1]["lane"] == "readonly_skip"
+
+    def test_branch_yielding_no_locator_without_a_record_still_lands_in_one_lane(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
+            {"tool_name": "click", "selector": "#stage-b"},
+        ]
+
+        def forgetful_locator_expr(
+            interaction: Mapping[str, Any],
+            notes: list[str],
+            *,
+            diagnostics: SynthesisDiagnostics | None = None,
+            trajectory_index: int | None = None,
+            tool_name: str = "",
+            strict_selectors: bool = False,
+        ) -> str:
+            selector = str(interaction.get("selector") or "")
+            return "" if selector == "#stage-b" else f'page.locator("{selector}")'
+
+        monkeypatch.setattr(code_block_synthesis_module, "_locator_expr", forgetful_locator_expr)
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        diagnostics = result.diagnostics
+        assert self._lane_index_counts(diagnostics) == Counter({0: 1, 1: 1})
+        assert diagnostics.dropped_interactions == [
+            {
+                "trajectory_index": 1,
+                "tool_name": "click",
+                "selector": "#stage-b",
+                "reason_code": "unaccounted_branch",
+            }
+        ]
+        findings = spine_partition_findings(diagnostics, _covering_draft_calls(diagnostics), trajectory)
+        assert [finding.kind for finding in findings] == [UNFORGIVEN_DROP_FINDING]
+        assert obligation_finding_reason_code(findings[0]) == SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE
+
 
 def _covering_draft_calls(diagnostics: SynthesisDiagnostics) -> list[tuple[str, str]]:
     return [
@@ -3965,6 +4095,16 @@ class TestSpinePartitionFindings:
         assert result is not None
         draft_calls = _covering_draft_calls(result.diagnostics)
         assert spine_partition_findings(result.diagnostics, draft_calls, self._spine_trajectory()) == []
+
+    def test_deferred_readonly_trajectory_has_no_findings(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
+            _readonly_type(control_readonly=True, control_value_satisfied=False),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        draft_calls = _covering_draft_calls(result.diagnostics)
+        assert spine_partition_findings(result.diagnostics, draft_calls, trajectory) == []
 
     def test_omitted_demonstrated_totp_fill_is_an_uncovered_rung_finding(self) -> None:
         login_url = "https://example.com/login"
@@ -4024,7 +4164,7 @@ class TestSpinePartitionFindings:
         findings = spine_partition_findings(result.diagnostics, draft_calls, trajectory)
         assert all(finding.kind != UNFORGIVEN_DROP_FINDING for finding in findings)
 
-    def test_truncation_leaves_post_break_indices_in_manifest_only(self) -> None:
+    def test_truncation_reports_once_and_leaves_the_tail_unlaned(self) -> None:
         trajectory = [
             {"tool_name": "click", "selector": f"#stage-{index}", "source_url": "https://example.com/records"}
             for index in range(_MAX_STEPS + 3)
@@ -4035,14 +4175,11 @@ class TestSpinePartitionFindings:
         assert diagnostics.truncated is True
         assert diagnostics.retained_trajectory_indices == list(range(len(trajectory)))
         recorded = {record["trajectory_index"] for record in diagnostics.emitted_interactions}
-        post_break = set(diagnostics.retained_trajectory_indices) - recorded
-        assert post_break
+        assert set(diagnostics.retained_trajectory_indices) - recorded
+        assert diagnostics.dropped_interactions == []
         findings = spine_partition_findings(diagnostics, _covering_draft_calls(diagnostics), trajectory)
-        kinds = {finding.kind for finding in findings}
-        assert TRUNCATED_FINDING in kinds
-        assert UNRECORDED_INDEX_FINDING in kinds
-        truncated_finding = next(finding for finding in findings if finding.kind == TRUNCATED_FINDING)
-        assert obligation_finding_reason_code(truncated_finding) == SCOUTED_SPINE_TRUNCATED_REASON_CODE
+        assert [finding.kind for finding in findings] == [TRUNCATED_FINDING]
+        assert obligation_finding_reason_code(findings[0]) == SCOUTED_SPINE_TRUNCATED_REASON_CODE
 
 
 _STRUCTURAL_BUTTON_XPATH = 'xpath=/*[name()="body"][1]/*[name()="button"][3]'
@@ -5107,3 +5244,368 @@ def test_unstamped_click_emits_no_solve_captcha() -> None:
     result = synthesize_code_block([_captcha_click()], strict_selectors=True)
     assert result is not None
     assert "solve_captcha" not in result.code
+
+
+class TestScoutedReadSynthesis:
+    """A value the scout proved with `evaluate` is authored from that proven expression, the way a
+    login is authored from proven fills — instead of being rediscovered by a guessed selector."""
+
+    def test_proven_read_is_emitted_and_returned_at_the_requested_path(self) -> None:
+        block = synthesize_code_block(
+            [
+                {
+                    "tool_name": "click",
+                    "selector": "#submit",
+                    "source_url": "https://example.test/",
+                    "trajectory_index": 0,
+                },
+                {
+                    "tool_name": "read_value",
+                    "read_expression": 'document.querySelector("#total").innerText',
+                    "read_output_path": "output.error_count",
+                    "source_url": "https://example.test/logs",
+                    "trajectory_index": 1,
+                },
+            ]
+        )
+
+        assert block is not None
+        assert "await page.evaluate('document.querySelector(\"#total\").innerText')" in block.code
+        assert block.code.rstrip().endswith('return {"error_count": _read_value_0}')
+        ast.parse(textwrap.dedent(block.code))
+
+    def test_emitted_read_fails_loudly_when_the_value_never_appears(self) -> None:
+        # The scout only records a read that returned something. An empty replay contradicts that
+        # proof, so the block must end rather than register a field carrying nothing.
+        block = synthesize_code_block(
+            [
+                {
+                    "tool_name": "read_value",
+                    "read_expression": 'document.querySelector("#total").innerText',
+                    "read_output_path": "output.error_count",
+                    "read_result_shape": "str",
+                    "source_url": "https://example.test/logs",
+                    "trajectory_index": 0,
+                },
+            ]
+        )
+        assert block is not None
+        code = textwrap.dedent(block.code)
+        ast.parse(code)
+
+        settle = next(line.strip() for line in code.splitlines() if line.strip().startswith("if _read_value_0 not in"))
+        decide = eval(f"lambda _read_value_0: bool({settle.removeprefix('if ').rstrip(':')})")  # noqa: S307
+        for empty in (None, "", [], {}):
+            assert not decide(empty), f"emitted read settled for {empty!r}"
+        for value in ("8.3K", 0, 0.0, ["row"], {"a": 1}):
+            assert decide(value), f"emitted read discarded {value!r}"
+
+        # and the block raises rather than returning the empty value
+        raises = [line.strip() for line in code.splitlines() if line.strip().startswith("raise Exception")]
+        assert raises, "an unresolved read must end the block"
+        assert "output.error_count" in raises[0]
+
+    def test_an_empty_replay_contradicts_the_proof_whatever_shape_it_had(self) -> None:
+        # A read is only recorded once it returns something, so there are no empty proven reads: an
+        # empty replay is absence for a collection-proven read exactly as for a scalar-proven one.
+        for shape in ("str", "list", "dict"):
+            block = synthesize_code_block(
+                [
+                    {
+                        "tool_name": "read_value",
+                        "read_expression": 'document.querySelectorAll("tr")',
+                        "read_output_path": "output.rows",
+                        "read_result_shape": shape,
+                        "source_url": "https://example.test/rows",
+                        "trajectory_index": 0,
+                    }
+                ]
+            )
+            assert block is not None
+            code = textwrap.dedent(block.code)
+            ast.parse(code)
+            guard = next(line.strip() for line in code.splitlines() if line.strip().startswith("if _read_value_0 in"))
+            decide = eval(f"lambda _read_value_0: bool({guard.removeprefix('if ').rstrip(':')})")  # noqa: S307
+            for empty in (None, "", [], {}):
+                assert decide(empty), f"{shape}-proven read must treat {empty!r} as absent"
+            for value in ("8.3K", 0, ["row"], {"a": 1}):
+                assert not decide(value), f"{shape}-proven read must accept {value!r}"
+
+    def test_read_without_an_expression_is_dropped_rather_than_emitted_empty(self) -> None:
+        block = synthesize_code_block(
+            [
+                {
+                    "tool_name": "click",
+                    "selector": "#submit",
+                    "source_url": "https://example.test/",
+                    "trajectory_index": 0,
+                },
+                {"tool_name": "read_value", "read_output_path": "output.error_count", "trajectory_index": 1},
+            ]
+        )
+
+        assert block is not None
+        assert "page.evaluate" not in block.code
+        assert "return {" not in block.code
+
+
+class TestScoutedReadBindingSafety:
+    """A later probe of an unrelated value must not displace the read that answered the request."""
+
+    def test_a_second_read_of_another_path_does_not_discard_the_first(self) -> None:
+        block = synthesize_code_block(
+            [
+                {"tool_name": "click", "selector": "#go", "source_url": "https://example.test/", "trajectory_index": 0},
+                {
+                    "tool_name": "read_value",
+                    "read_expression": 'document.querySelector("#total").innerText',
+                    "read_output_path": "output.error_count",
+                    "trajectory_index": 1,
+                },
+                {
+                    "tool_name": "read_value",
+                    "read_expression": "document.title",
+                    "read_output_path": "output.page_title",
+                    "trajectory_index": 2,
+                },
+            ]
+        )
+
+        assert block is not None
+        assert "error_count" in block.code
+        assert "page_title" in block.code
+        assert "#total" in block.code
+
+    def test_a_repeat_read_of_the_same_path_keeps_only_the_last(self) -> None:
+        block = synthesize_code_block(
+            [
+                {"tool_name": "click", "selector": "#go", "source_url": "https://example.test/", "trajectory_index": 0},
+                {
+                    "tool_name": "read_value",
+                    "read_expression": 'document.querySelector("#stale").innerText',
+                    "read_output_path": "output.error_count",
+                    "trajectory_index": 1,
+                },
+                {
+                    "tool_name": "read_value",
+                    "read_expression": 'document.querySelector("#fresh").innerText',
+                    "read_output_path": "output.error_count",
+                    "trajectory_index": 2,
+                },
+            ]
+        )
+
+        assert block is not None
+        assert "#fresh" in block.code
+        assert "#stale" not in block.code
+
+    def test_an_unrelated_anonymous_probe_does_not_evict_the_anonymous_answer(self) -> None:
+        # An unnamed request pins every read to the shared anonymous path, so a later diagnostic
+        # probe is a different read, not a refinement — the answer's expression must survive.
+        block = synthesize_code_block(
+            [
+                {"tool_name": "click", "selector": "#go", "source_url": "https://example.test/", "trajectory_index": 0},
+                {
+                    "tool_name": "read_value",
+                    "read_expression": 'document.querySelector("#count").innerText',
+                    "read_output_path": "output.scouted_read",
+                    "trajectory_index": 1,
+                },
+                {
+                    "tool_name": "read_value",
+                    "read_expression": "document.title",
+                    "read_output_path": "output.scouted_read",
+                    "trajectory_index": 2,
+                },
+            ]
+        )
+
+        assert block is not None
+        assert "#count" in block.code
+        assert "document.title" in block.code
+        # The return keeps BOTH values under distinct keys: choosing one would silently discard
+        # the read that answered the request.
+        assert '"scouted_read": _read_value_0' in block.code
+        assert '"scouted_read_2": _read_value_1' in block.code
+
+    def test_composite_extraction_suffix_is_reachable_after_a_captured_read(self) -> None:
+        # Base synthesis must not emit its own terminal return when an extraction suffix follows,
+        # or the suffix is unreachable and the block returns the wrong shape.
+        plan = RequestedOutputExtractionPlan(
+            requested_output_paths=("output.error_count",),
+            observation_step=1,
+            observation_identity="observation-identity",
+            reveal=RevealAnchor(selector="#go"),
+            live_reads=(
+                LiveReadBinding(
+                    output_path="output.error_count",
+                    kind=LiveReadKind.KEY_VALUE,
+                    selector="#count",
+                    selector_count=1,
+                    selector_index=0,
+                    child_index=1,
+                    child_count=2,
+                    relation_label="Errors",
+                ),
+            ),
+            identity="plan-identity",
+        )
+        block = synthesize_code_block_with_extraction(
+            [
+                {"tool_name": "click", "selector": "#go", "source_url": "https://example.test/", "trajectory_index": 0},
+                {
+                    "tool_name": "read_value",
+                    "read_expression": 'document.querySelector("#count").innerText',
+                    "read_output_path": "output.error_count",
+                    "trajectory_index": 1,
+                },
+            ],
+            plan,
+        )
+
+        assert block is not None
+        # The imposition seam dedents the interaction half before appending the suffix; normalize
+        # the same way, then prove the suffix's return is the only and final return.
+        normalized = (
+            textwrap.dedent(block.interaction_code).rstrip() + "\n" + textwrap.dedent(block.extraction_code).rstrip()
+        )
+        tree = ast.parse(f"async def __wrapper__():\n{textwrap.indent(normalized, '    ')}\n")
+        returns = [n for n in ast.walk(tree) if isinstance(n, ast.Return)]
+        assert len(returns) == 1, "composite block must have exactly one terminal return"
+        normalized_lines = normalized.rstrip().splitlines()
+        trailing = [
+            line
+            for line in normalized_lines[returns[0].lineno - 2 :]
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        assert len(trailing) == 1, f"unreachable code after terminal return: {trailing[1:]}"
+        assert block.extraction_code.strip() in normalized
+
+
+def test_synthesized_extraction_guards_only_name_things_the_sandbox_provides() -> None:
+    # The generated block runs with builtins emptied, so an exception class the sandbox does not
+    # bind raises NameError instead of the guard's own message.
+    from skyvern.forge.sdk.copilot.code_block_preflight import sandbox_unresolved_name_repair_diagnostic
+    from skyvern.forge.sdk.copilot.code_block_synthesis import _key_value_scalar_read_statements
+    from skyvern.forge.sdk.copilot.output_extraction_plan import LiveReadBinding
+
+    binding = LiveReadBinding(
+        output_path="output.count",
+        kind="key_value_scalar",
+        selector="#summary",
+        selector_count=1,
+        selector_index=0,
+        child_index=1,
+        child_count=2,
+        relation_label="Errors",
+    )
+
+    emitted = _key_value_scalar_read_statements(binding, "_value", guard_empty=True)
+    diagnostic = sandbox_unresolved_name_repair_diagnostic("\n".join(emitted), parameter_keys=[])
+
+    assert diagnostic is None, diagnostic.unresolved_names if diagnostic else ()
+
+
+def test_a_value_witnessed_read_proves_no_heading_at_runtime() -> None:
+    # Live failure (SKY-13226): the value witness picks the element by the value it showed, then the
+    # generated read asserted the heading beside it and raised "Observed scalar label changed" —
+    # the tile's heading slot also carries a delta chip, and a page with no heading has none to read.
+    from skyvern.forge.sdk.copilot.code_block_synthesis import _key_value_scalar_read_statements
+    from skyvern.forge.sdk.copilot.output_extraction_plan import LiveReadBinding
+
+    fields = {
+        "output_path": "output.count",
+        "kind": "key_value_scalar",
+        "selector": "#summary",
+        "selector_count": 1,
+        "selector_index": 0,
+        "child_index": 1,
+        "child_count": 3,
+        "relation_label": "Visitors",
+    }
+
+    witnessed = "\n".join(
+        _key_value_scalar_read_statements(
+            LiveReadBinding(**fields, identified_by_label=False), "_value", guard_empty=True
+        )
+    )
+    by_label = "\n".join(_key_value_scalar_read_statements(LiveReadBinding(**fields), "_value", guard_empty=True))
+
+    assert "Observed scalar label" not in witnessed
+    # The element is still pinned by everything that chose it.
+    assert "Observed scalar selector cardinality changed" in witnessed
+    assert "Observed scalar direct-child shape changed" in witnessed
+    assert '_value = (await page.locator("#summary").nth(0).locator(":scope > *").nth(1).inner_text()).strip()' in (
+        witnessed
+    )
+    # A binding the label did choose keeps proving it.
+    assert "Observed scalar label changed" in by_label
+
+
+def test_entry_anchors_on_what_the_flow_fills_not_the_link_it_clicks_away_from() -> None:
+    # Live capture (SKY-13226): a scout opened a password-reset link before signing in, and the login
+    # block anchored on that link — so every execution began by leaving the login form.
+    trajectory = [
+        {
+            "tool_name": "click",
+            "selector": 'a[href="/account/forgot_password"]',
+            "accessible_name": "Forgot password?",
+            "source_url": "https://example.test/account/login",
+        },
+        {
+            "tool_name": "fill_credential_field",
+            "selector": "#username",
+            "credential_id": "cred_1",
+            "credential_field": "username",
+            "source_url": "https://example.test/account/login",
+        },
+        {
+            "tool_name": "fill_credential_field",
+            "selector": "#password",
+            "credential_id": "cred_1",
+            "credential_field": "password",
+            "source_url": "https://example.test/account/login",
+        },
+    ]
+
+    block = synthesize_code_block(trajectory, strict_selectors=True)
+
+    assert block is not None
+    assert '_scout_entry_target = page.locator("#username")' in block.code
+    # The click is still demonstrated, it just no longer decides where the flow starts.
+    assert 'a[href=\\"/account/forgot_password\\"]").click()' in block.code
+    assert [step["action_type"] for step in block.steps][:4] == ["goto_url", "click", "input_text", "input_text"]
+
+
+def test_a_designated_read_waits_for_a_figure_the_page_has_not_rendered_yet() -> None:
+    # Live failure (SKY-13226): the tile renders while its query is still resolving, so a read that
+    # fires once takes the empty frame — and on the log explorer it took the neighbouring control's
+    # text instead, costing a whole test run.
+    from skyvern.forge.sdk.copilot.code_block_synthesis import _key_value_scalar_read_statements
+    from skyvern.forge.sdk.copilot.output_extraction_plan import LiveReadBinding
+
+    designated = LiveReadBinding(
+        output_path="output.count",
+        kind="key_value_scalar",
+        selector="#total",
+        selector_count=1,
+        selector_index=0,
+    )
+    emitted = "\n".join(_key_value_scalar_read_statements(designated, "_value", guard_empty=True))
+
+    assert "wait_for_timeout" in emitted
+    assert emitted.count("inner_text()") == 2, "the value is re-read after each wait, not just once"
+    assert 'raise Exception("Designated value element is empty")' in emitted
+
+    # A relation-bound read proves its own shape and is left alone.
+    relation = LiveReadBinding(
+        output_path="output.count",
+        kind="key_value_scalar",
+        selector="#card",
+        selector_count=1,
+        selector_index=0,
+        child_index=1,
+        child_count=3,
+        relation_label="Visitors",
+    )
+    assert "wait_for_timeout" not in "\n".join(_key_value_scalar_read_statements(relation, "_value", guard_empty=True))

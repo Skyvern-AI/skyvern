@@ -209,6 +209,7 @@ async def create_browser_session(
         browser_type=browser_session_request.browser_type,
         browser_profile_id=browser_session_request.browser_profile_id,
         generate_browser_profile=browser_session_request.generate_browser_profile,
+        needs_live_view=browser_session_request.needs_live_view,
     )
     return await BrowserSessionResponse.from_browser_session(browser_session)
 
@@ -331,6 +332,27 @@ async def update_browser_session(
         200: {"description": "Successfully retrieved browser session details"},
         404: {"description": "Browser session not found"},
         403: {"description": "Unauthorized - Invalid or missing authentication"},
+        503: {
+            "description": "Downloaded files could not be returned",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["detail"],
+                        "properties": {
+                            "detail": {
+                                "type": "object",
+                                "required": ["code", "retryable"],
+                                "properties": {
+                                    "code": {"type": "string", "enum": ["downloaded_files_unavailable"]},
+                                    "retryable": {"type": "boolean"},
+                                },
+                            }
+                        },
+                    }
+                }
+            },
+        },
     },
 )
 @base_router.get(
@@ -351,7 +373,11 @@ async def get_browser_session(
     )
     if not browser_session:
         raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
-    return await BrowserSessionResponse.from_browser_session(browser_session, app.STORAGE)
+    return await BrowserSessionResponse.from_browser_session(
+        browser_session,
+        app.STORAGE,
+        fail_download_lookup=True,
+    )
 
 
 @base_router.get(

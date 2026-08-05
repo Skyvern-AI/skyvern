@@ -18,12 +18,20 @@ from typing import Any, Callable, Literal
 
 import structlog
 
+from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.utils.page import JS_FUNCTION_DEFS, SkyvernFrame
 
 from .guards import GuardError
 
 LOG = structlog.get_logger(__name__)
+
+LOCALHOST_RECOVERY_HINT = (
+    "Run `pip install skyvern && skyvern browser serve --tunnel` to bridge "
+    "your local dev server to a cloud browser via ngrok. "
+    "Or use `local=true` in skyvern_browser_session_create for a local browser."
+)
 
 
 @dataclass
@@ -67,8 +75,20 @@ async def do_navigate(
     url: str,
     timeout: int = 30000,
     wait_until: str | None = None,
+    *,
+    can_access_localhost: bool = False,
+    is_localhost_destination: bool = False,
 ) -> NavigateResult:
-    await page.goto(url, timeout=timeout, wait_until=wait_until)
+    try:
+        validated_url = await asyncio.to_thread(validate_fetch_url, url)
+    except BlockedHost as e:
+        if not (can_access_localhost and is_localhost_destination):
+            hint = LOCALHOST_RECOVERY_HINT if is_localhost_destination else "Use a public HTTP(S) URL"
+            raise GuardError(str(e), hint) from e
+        validated_url = url
+    except SkyvernHTTPException as e:
+        raise GuardError(str(e), "Use a valid public HTTP(S) URL") from e
+    await page.goto(validated_url, timeout=timeout, wait_until=wait_until)
     return NavigateResult(url=page.url, title=await page.title())
 
 
@@ -1177,6 +1197,7 @@ _ALLOWED_EXECUTE_TOOLS = frozenset(
         "hover",
         "scroll",
         "wait",
+        "wait_for_either_state",
         "observe",
         "screenshot",
         "evaluate",

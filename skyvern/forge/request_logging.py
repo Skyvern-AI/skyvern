@@ -11,6 +11,12 @@ from starlette.requests import ClientDisconnect
 from starlette.responses import Response
 
 from skyvern.config import settings
+from skyvern.forge.log_redaction import (
+    REDACTED,
+    SENSITIVE_HEADERS,
+    redact_sensitive_fields,
+    strip_artifact_url_query,
+)
 
 if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
     from typing import Awaitable, Callable
@@ -19,7 +25,6 @@ if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
 
 LOG = structlog.get_logger()
 
-_SENSITIVE_HEADERS = {"authorization", "cookie", "x-api-key"}
 _SENSITIVE_ENDPOINTS = {
     "POST /api/v1/credentials",
     "POST /v1/credentials",
@@ -33,50 +38,20 @@ _SENSITIVE_ENDPOINTS = {
     "POST /v1/google/oauth/callback",
     "POST /api/v1/google/oauth/callback",
 }
+_SENSITIVE_ENDPOINT_PATTERNS = (re.compile(r"^(?:POST|PUT) /(?:api/)?v1/credentials(?:/.*)?$"),)
 _MAX_BODY_LENGTH = 1000
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _MAX_RESPONSE_READ_BYTES = 1024 * 1024  # 1 MB — skip logging bodies larger than this
 _BINARY_PLACEHOLDER = "<binary>"
-_REDACTED = "****"
 _LOGGABLE_CONTENT_TYPES = {"text/", "application/json"}
 _STREAMING_CONTENT_TYPE = "text/event-stream"
-# Matches a signed artifact-content URL (absolute or path-relative) anywhere in a
-# string and captures everything up to — but excluding — its query, so re.sub can
-# drop the capability params (expiry/kid/sig) while leaving surrounding text and
-# non-artifact URLs untouched. Query runs to the next whitespace/quote/angle bracket.
-_ARTIFACT_CONTENT_URL_QUERY_RE = re.compile(
-    r"((?:[a-zA-Z][a-zA-Z0-9+.\-]*://[^/\s\"'<>]+)?/v1/artifacts/[^/\s\"'<>]+/content/?)\?[^\s\"'<>]*"
-)
 _ACTION_LOG_ENDPOINT_RE = re.compile(r"^/v1/browser_sessions/[^/]+/action_logs/?$")
-
-# Exact field names that are always redacted.  Use a set for O(1) lookup
-# instead of regex substring matching to avoid false positives like
-# credential_id, author, page_token, etc.
-_SENSITIVE_FIELDS: set[str] = {
-    "password",
-    "secret",
-    "token",
-    "api_key",
-    "apikey",
-    "api-key",
-    "credential",
-    "access_key",
-    "private_key",
-    "auth",
-    "authorization",
-    "secret_key",
-    "totp",
-    "otp",
-    "one_time_code",
-    "one_time_password",
-    "mfa_code",
-}
 
 
 def _sanitize_headers(headers: typing.Mapping[str, str]) -> dict[str, str]:
     sanitized: dict[str, str] = {}
     for key, value in headers.items():
-        if key.lower() in _SENSITIVE_HEADERS:
+        if key.lower() in SENSITIVE_HEADERS:
             continue
         sanitized[key] = value
     return sanitized
@@ -92,14 +67,17 @@ def _client_ip_from_headers(headers: typing.Mapping[str, str]) -> str | None:
 
 
 def _is_sensitive_endpoint(request: Request) -> bool:
-    return f"{request.method.upper()} {request.url.path.rstrip('/')}" in _SENSITIVE_ENDPOINTS or (
-        request.method.upper() == "POST" and _ACTION_LOG_ENDPOINT_RE.fullmatch(request.url.path) is not None
+    endpoint = f"{request.method.upper()} {request.url.path.rstrip('/')}"
+    return (
+        endpoint in _SENSITIVE_ENDPOINTS
+        or any(pattern.fullmatch(endpoint) for pattern in _SENSITIVE_ENDPOINT_PATTERNS)
+        or (request.method.upper() == "POST" and _ACTION_LOG_ENDPOINT_RE.fullmatch(request.url.path) is not None)
     )
 
 
 def _sanitize_body(request: Request, body: bytes, content_type: str | None) -> str:
     if _is_sensitive_endpoint(request):
-        return _REDACTED
+        return REDACTED
     if not body:
         return ""
     if content_type and not (content_type.startswith("text/") or content_type.startswith("application/json")):
@@ -114,42 +92,11 @@ def _sanitize_body(request: Request, body: bytes, content_type: str | None) -> s
     return text
 
 
-def _is_sensitive_key(key: str) -> bool:
-    return key.lower() in _SENSITIVE_FIELDS
-
-
-def _strip_artifact_url_query(value: str) -> str:
-    return _ARTIFACT_CONTENT_URL_QUERY_RE.sub(r"\1", value)
-
-
-def redact_sensitive_fields(obj: typing.Any, _depth: int = 0) -> typing.Any:
-    """Redact sensitive fields and strip capability queries from artifact URLs.
-
-    Field names use exact-match (case-insensitive) rather than substring/regex
-    to avoid false positives on fields like ``credential_id``, ``author``, or
-    ``page_token`` which contain sensitive substrings but are not secrets.
-    """
-    if isinstance(obj, str):
-        return _strip_artifact_url_query(obj)
-    if _depth > 20:
-        # Stop recursing but still redact sensitive keys at this level
-        if isinstance(obj, dict):
-            return {k: _REDACTED if _is_sensitive_key(k) else v for k, v in obj.items()}
-        return obj
-    if isinstance(obj, dict):
-        return {
-            k: _REDACTED if _is_sensitive_key(k) else redact_sensitive_fields(v, _depth + 1) for k, v in obj.items()
-        }
-    if isinstance(obj, list):
-        return [redact_sensitive_fields(item, _depth + 1) for item in obj]
-    return obj
-
-
 def _redact_loggable_body(text: str) -> str:
     try:
         parsed = json.loads(text)
     except (json.JSONDecodeError, TypeError):
-        return _strip_artifact_url_query(text)
+        return strip_artifact_url_query(text)
     redacted = redact_sensitive_fields(parsed)
     return json.dumps(redacted) if redacted != parsed else text
 
@@ -162,7 +109,7 @@ def _is_loggable_content_type(content_type: str | None) -> bool:
 
 def _sanitize_response_body(request: Request, body_str: str | None, content_type: str | None) -> str:
     if _is_sensitive_endpoint(request):
-        return _REDACTED
+        return REDACTED
     if body_str is None:
         return _BINARY_PLACEHOLDER
     if not body_str:
@@ -226,11 +173,9 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
     try:
         response = await call_next(request)
 
-        # Skip successful reads before buffering the response body: they are
-        # the bulk of request volume (health checks, status polling) and the
-        # 4xx/5xx and mutating paths below retain all audit/debugging value.
-        # Sensitive endpoints (credential/TOTP reads) always keep their
-        # redacted audit line.
+        # Skip successful reads before buffering the response body; 4xx/5xx and
+        # mutating paths keep logging, and sensitive endpoints always keep
+        # their redacted audit line.
         if (
             response.status_code < 400
             and http_method in _READ_METHODS

@@ -20,6 +20,7 @@ import { useGoogleSpreadsheet } from "@/hooks/useGoogleSpreadsheet";
 import { GoogleOAuthCredentialSelector } from "@/routes/workflows/components/GoogleOAuthCredentialSelector";
 import { SheetTabCombobox } from "@/routes/workflows/components/SheetTabCombobox";
 import { SpreadsheetCombobox } from "@/routes/workflows/components/SpreadsheetCombobox";
+import { TemplateModeToggle } from "@/routes/workflows/components/TemplateModeToggle";
 import {
   extractSpreadsheetIdFromUrl,
   isTemplateExpression,
@@ -31,6 +32,7 @@ import {
   type GoogleSheetsReadNode,
   type GoogleSheetsReadNodeData,
 } from "./types";
+import { useTemplateMode } from "../../hooks/useTemplateMode";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useUpdate } from "../../useUpdate";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
@@ -43,7 +45,15 @@ function GoogleSheetsReadEditor({ blockId }: { blockId: string }) {
   if (!nodeSlice || nodeSlice.type !== "googleSheetsRead") {
     return null;
   }
-  return <GoogleSheetsReadEditorBody blockId={blockId} data={nodeSlice.data} />;
+  // Key by blockId: the sidebar reuses one GoogleSheetsReadEditorBody instance
+  // across same-type blocks; remounting resets local template-mode state.
+  return (
+    <GoogleSheetsReadEditorBody
+      key={blockId}
+      blockId={blockId}
+      data={nodeSlice.data}
+    />
+  );
 }
 
 function GoogleSheetsReadEditorBody({
@@ -68,6 +78,27 @@ function GoogleSheetsReadEditorBody({
   const [spreadsheetDisplayName, setSpreadsheetDisplayName] = useState<
     string | null
   >(null);
+  const {
+    pressed: spreadsheetTemplateModePressed,
+    onChange: handleSpreadsheetTemplateModeChange,
+  } = useTemplateMode({
+    value: data.spreadsheetUrl,
+    event: "sheets.spreadsheet.picker.template_mode_toggled",
+    blockType: "google_sheets_read",
+    onClear: () => {
+      setSpreadsheetDisplayName(null);
+      update({ spreadsheetUrl: "" });
+    },
+  });
+  const {
+    pressed: sheetTemplateModePressed,
+    onChange: handleSheetTemplateModeChange,
+  } = useTemplateMode({
+    value: data.sheetName,
+    event: "sheets.tab.template_mode_toggled",
+    blockType: "google_sheets_read",
+    onClear: () => update({ sheetName: "" }),
+  });
 
   const { credentials } = useGoogleOAuthCredentials();
   const hasSelectedAccount =
@@ -112,15 +143,22 @@ function GoogleSheetsReadEditorBody({
         </div>
 
         <div className="space-y-2">
-          <div className="flex gap-2">
-            <Label className="text-xs text-tertiary-foreground">
-              Spreadsheet
-            </Label>
-            <HelpTooltip
-              content={
-                helpTooltips["google_sheets_read"]?.["spreadsheetUrl"] ??
-                "The spreadsheet to read. Type to search your Google Drive, or paste a spreadsheet URL."
-              }
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-xs text-tertiary-foreground">
+                Spreadsheet
+              </Label>
+              <HelpTooltip
+                content={
+                  helpTooltips["google_sheets_read"]?.["spreadsheetUrl"] ??
+                  "The spreadsheet to read. Type to search your Google Drive, or paste a spreadsheet URL."
+                }
+              />
+            </div>
+            <TemplateModeToggle
+              pressed={spreadsheetTemplateModePressed}
+              pickerTitle="Pick from your spreadsheets"
+              onToggle={handleSpreadsheetTemplateModeChange}
             />
           </div>
           <SpreadsheetCombobox
@@ -132,6 +170,8 @@ function GoogleSheetsReadEditorBody({
             placeholder="Search or paste a spreadsheet URL"
             allowCreate={false}
             blockType="google_sheets_read"
+            templateMode={spreadsheetTemplateModePressed}
+            onTemplateModeChange={handleSpreadsheetTemplateModeChange}
             onChange={(next) => {
               setSpreadsheetDisplayName(null);
               const oldId = extractSpreadsheetIdFromUrl(data.spreadsheetUrl);
@@ -162,15 +202,22 @@ function GoogleSheetsReadEditorBody({
           <AccordionContent className="pl-6 pr-1 pt-4">
             <div className="space-y-3">
               <div className="space-y-2">
-                <div className="flex gap-2">
-                  <Label className="text-xs text-tertiary-foreground">
-                    Sheet Name
-                  </Label>
-                  <HelpTooltip
-                    content={
-                      helpTooltips["google_sheets_read"]?.["sheetName"] ??
-                      "The sheet tab to read. Type to search tabs in the selected spreadsheet."
-                    }
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Label className="text-xs text-tertiary-foreground">
+                      Sheet Name
+                    </Label>
+                    <HelpTooltip
+                      content={
+                        helpTooltips["google_sheets_read"]?.["sheetName"] ??
+                        "The sheet tab to read. Type to search tabs in the selected spreadsheet."
+                      }
+                    />
+                  </div>
+                  <TemplateModeToggle
+                    pressed={sheetTemplateModePressed}
+                    pickerTitle="Pick from your sheet tabs"
+                    onToggle={handleSheetTemplateModeChange}
                   />
                 </div>
                 <SheetTabCombobox
@@ -182,6 +229,8 @@ function GoogleSheetsReadEditorBody({
                   placeholder="Sheet1"
                   allowCreate={false}
                   blockType="google_sheets_read"
+                  templateMode={sheetTemplateModePressed}
+                  onTemplateModeChange={handleSheetTemplateModeChange}
                   onChange={(next) => update({ sheetName: next })}
                   onSelect={(tabName) => update({ sheetName: tabName })}
                 />

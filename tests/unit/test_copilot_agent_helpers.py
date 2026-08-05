@@ -21,9 +21,9 @@ from skyvern.forge.sdk.copilot import request_policy as request_policy_module
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
     _VERIFIED_WORKFLOW_SUCCESS_REPLY,
-    _build_built_unverified_exit_result,
     _build_goal_satisfied_exit_result,
     _resolve_wrapped_exception_exit_result,
+    _rewrite_failed_test_response,
     _synthesized_block_offer_prompt,
     _verified_workflow_or_none,
 )
@@ -62,18 +62,13 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     VerificationResult,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
-    BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
-    CopilotBuiltUnverified,
-    CopilotGoalSatisfied,
     CopilotNonRetriableNavError,
     CopilotTotalTimeoutError,
     CopilotUnrecoverableToolError,
-    _check_enforcement,
     built_unverified_repair_inert_context,
     verified_goal_claim_authorized,
     verified_goal_satisfied_context,
 )
-from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.output_policy import (
     ACTUATION_OBLIGATION_BROWSER_ACTION_KEY,
@@ -90,9 +85,12 @@ from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     _classifier_fallback_policy,
     _classify_request,
+    _classify_request_trust_floor,
     build_classifier_fallback_floor,
     build_transcript_context,
+    is_defer_authoring_durable_fill_criterion,
     is_fallback_floor_criterion,
+    materialize_request_policy_authoring,
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOTS_PROMPT_NAME
@@ -116,6 +114,8 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     RequiredContextKey,
     TurnIntent,
     TurnIntentAuthority,
+    TurnIntentClassification,
+    TurnIntentClassifierResult,
     TurnIntentMode,
     TurnIntentReasonCode,
 )
@@ -481,21 +481,6 @@ workflow_definition:
         assert "I couldn't find the required credentials" in rewritten
         assert "add them via the Credentials UI" in rewritten
         assert "Keep the draft to iterate on, or discard." in rewritten
-
-    def test_rewrite_appends_keep_draft_affordance_when_draft_on_hand(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-
-        ctx = _ctx(
-            last_workflow=object(),
-            last_workflow_yaml="title: drafted",
-            last_update_block_count=2,
-            last_test_ok=False,
-            last_test_failure_reason="A verification challenge is preventing submission.",
-        )
-        rewritten = _rewrite_failed_test_response("done", ctx)
-
-        assert "test failed" in rewritten.lower()
-        assert "keep the draft" in rewritten.lower()
 
     def test_partial_verification_rewrite_uses_structured_evidence(self) -> None:
         from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
@@ -1257,45 +1242,6 @@ class TestVerifiedWorkflowOrNone:
 
 
 class TestVerifiedGoalSatisfiedStop:
-    @pytest.mark.asyncio
-    async def test_block_run_hook_stops_after_verified_goal_satisfied(self) -> None:
-        from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
-
-        ctx = _ctx(
-            last_test_ok=True,
-            last_full_workflow_test_ok=True,
-            latest_diagnosis_repair_contract=_verified_goal_contract(),
-        )
-        ctx.completion_verification_result = CompletionVerificationResult(
-            status="evaluated",
-            criterion_ids=["c0"],
-            verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
-        )
-        hook = CopilotRunHooks(ctx)
-        result = json.dumps(
-            {
-                "ok": True,
-                "data": {
-                    "workflow_run_id": "wr_1",
-                    "blocks": [{"label": "search", "output": {"status": "found"}}],
-                },
-            }
-        )
-
-        with pytest.raises(CopilotGoalSatisfied):
-            await hook.on_tool_end(
-                context=MagicMock(),
-                agent=MagicMock(),
-                tool=SimpleNamespace(name="update_and_run_blocks"),
-                result=result,
-            )
-
-        assert ctx.goal_satisfied_tool_name == "update_and_run_blocks"
-        assert ctx.goal_satisfied_tool_output is not None
-        assert ctx.goal_satisfied_tool_output["ok"] is True
-
-        assert ctx.tool_activity[-1]["tool"] == "update_and_run_blocks"
-
     def test_wrapped_goal_satisfied_error_context_is_recognized(self) -> None:
         from skyvern.forge.sdk.copilot.enforcement import verified_goal_satisfied_context
 
@@ -1394,32 +1340,6 @@ class TestVerifiedGoalSatisfiedStop:
 
         assert result.user_response == _VERIFIED_WORKFLOW_SUCCESS_REPLY
         assert result.proposal_disposition != "no_proposal"
-
-    def test_verified_turn_halt_suppresses_active_run_terminal_evidence_only(self) -> None:
-        ctx = _ctx()
-        signal = CopilotToolBlockerSignal(
-            blocker_kind="tool_error",
-            agent_steering_text="active run reached requested state",
-            user_facing_reason="active run reached requested state",
-            recovery_hint="report_blocker_to_user",
-            internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
-            blocked_tool="update_and_run_blocks",
-        )
-        ctx.blocker_signal = signal
-        ctx.latest_tool_blocker_signal = signal
-        ctx.tool_blocker_signals.append(signal)
-        ctx.turn_halt = TurnHalt(
-            kind=TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE,
-            blocker_signal=signal,
-            extra={"source": "run_execution"},
-        )
-
-        raise_if_turn_halt(ctx, verified=True)
-
-        assert not isinstance(ctx.turn_halt, TurnHalt)
-        assert ctx.blocker_signal is None
-        assert ctx.latest_tool_blocker_signal is None
-        assert ctx.tool_blocker_signals == []
 
     def test_verified_turn_halt_keeps_terminal_challenge_blocker(self) -> None:
         ctx = _ctx()
@@ -1564,30 +1484,6 @@ class TestVerifiedGoalSatisfiedStop:
 
         assert not verified_goal_satisfied_context(ctx)
 
-    def test_check_enforcement_stops_after_structural_built_unverified_terminal(self) -> None:
-        ctx = _ctx(
-            last_test_ok=True,
-            last_full_workflow_test_ok=True,
-            latest_diagnosis_repair_contract=_unverified_no_repair_contract(),
-            completion_verification_result=CompletionVerificationResult(
-                status="evaluated",
-                criterion_ids=["c0"],
-                verdicts=[
-                    CriterionVerdict(
-                        criterion_id="c0",
-                        state="unsatisfied",
-                        reason_code="structurally_abstained",
-                    )
-                ],
-            ),
-        )
-
-        assert verified_goal_satisfied_context(ctx) is False
-        assert built_unverified_repair_inert_context(ctx) is True
-        assert verified_goal_claim_authorized(ctx) is False
-        with pytest.raises(CopilotBuiltUnverified):
-            _check_enforcement(ctx)
-
     def test_verified_goal_satisfied_context_rejects_undercovered_workflow(self) -> None:
         from skyvern.forge.sdk.copilot.enforcement import verified_goal_satisfied_context
 
@@ -1622,9 +1518,9 @@ class TestVerifiedGoalSatisfiedStop:
         assert result.updated_workflow is workflow
         assert result.workflow_yaml == "workflow_definition:\n  blocks: []\n"
         assert result.proposal_disposition == "review_tested"
-        # No adjudicated outcome evidence: the turn ends but the claim renders
-        # built-but-unverified instead of a tested-success claim.
-        assert "not independently verified" in result.user_response.lower()
+        # A clean test is the evidence; the claim does not wait for adjudicated outcome evidence.
+        assert "not independently verified" not in result.user_response.lower()
+        assert "tested" in result.user_response.lower()
         assert result.narrative_payload is not None
         assert result.narrative_payload["terminal"] == "response"
         assert result.narrative_payload["verifiedSuccess"] is False
@@ -1644,82 +1540,6 @@ class TestVerifiedGoalSatisfiedStop:
         assert "tested" in verified.user_response.lower()
         assert verified.narrative_payload is not None
         assert verified.narrative_payload["verifiedSuccess"] is True
-
-    @pytest.mark.asyncio
-    async def test_goal_satisfied_exit_result_renders_structural_abstention_as_built_unverified(self) -> None:
-        workflow = object()
-        ctx = _ctx(
-            last_workflow=workflow,
-            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
-            last_test_ok=True,
-            last_full_workflow_test_ok=True,
-            latest_diagnosis_repair_contract=_unverified_no_repair_contract(),
-            completion_verification_result=CompletionVerificationResult(
-                status="evaluated",
-                criterion_ids=["c0"],
-                verdicts=[
-                    CriterionVerdict(
-                        criterion_id="c0",
-                        state="unsatisfied",
-                        reason_code="structurally_abstained",
-                    )
-                ],
-            ),
-            tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
-        )
-
-        assert verified_goal_satisfied_context(ctx) is False
-        assert built_unverified_repair_inert_context(ctx) is True
-        assert verified_goal_claim_authorized(ctx) is False
-
-        result = await _build_built_unverified_exit_result(ctx, global_llm_context=None)
-
-        assert result.updated_workflow is workflow
-        assert result.proposal_disposition == "review_tested"
-        assert "not independently verified" in result.user_response.lower()
-        assert result.turn_outcome is not None
-        assert result.turn_outcome.terminal_reason == BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON
-        assert result.narrative_payload is not None
-        assert result.narrative_payload["verifiedSuccess"] is False
-
-    @pytest.mark.asyncio
-    async def test_built_unverified_terminal_names_demonstrated_missing_steps(self) -> None:
-        workflow = object()
-        ctx = _ctx(
-            last_workflow=workflow,
-            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
-            last_test_ok=True,
-            last_full_workflow_test_ok=True,
-            latest_diagnosis_repair_contract=_unverified_no_repair_contract(),
-            completion_verification_result=CompletionVerificationResult(
-                status="evaluated",
-                criterion_ids=["c0"],
-                verdicts=[
-                    CriterionVerdict(
-                        criterion_id="c0",
-                        state="unsatisfied",
-                        reason_code="structurally_abstained",
-                    )
-                ],
-            ),
-            tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
-        )
-        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
-        ctx.impose_synthesized_code_block = True
-        ctx.has_staged_proposal = True
-        ctx.persisted_draft_browser_calls = []
-        ctx.scout_trajectory = [
-            {
-                "tool_name": "click",
-                "selector": "#search-submit",
-                "source_url": "https://example.com/search",
-                "trajectory_index": 0,
-            }
-        ]
-
-        result = await _build_built_unverified_exit_result(ctx, global_llm_context=None)
-
-        assert "#search-submit" in result.user_response
 
     def test_corroborated_structural_abstention_avoids_built_unverified_terminal(self) -> None:
         ctx = _ctx(
@@ -1844,6 +1664,395 @@ class TestSupersededAgentIntentGates:
 
 class TestRequestPolicyInputGuardrail:
     @pytest.mark.asyncio
+    async def test_answer_only_turn_skips_authoring_enrichment_and_stored_criteria(self, monkeypatch) -> None:
+        policy = RequestPolicy(_authoring_pending=True)
+        stored = StoredCriteriaSet(
+            set_id="wccs_1",
+            goal_epoch=1,
+            criteria=(CompletionCriterion(id="c0", outcome="A prior authoring criterion"),),
+        )
+        monkeypatch.setattr(
+            agent_module,
+            "build_request_policy_trust_floor",
+            AsyncMock(return_value=policy),
+        )
+        monkeypatch.setattr(
+            agent_module,
+            "classify_turn_intent",
+            AsyncMock(
+                return_value=TurnIntentClassifierResult.success(
+                    TurnIntentClassification(mode=TurnIntentMode.ANSWER, confidence=0.95)
+                )
+            ),
+        )
+        materialize = AsyncMock()
+        monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize)
+        ctx = _ctx()
+        policy_inputs = agent_module.RequestPolicyGuardrailInputs(
+            user_message="How do I make a workflow with a google sheet step?",
+            workflow_yaml="",
+            chat_history_text="",
+            chat_history_messages=[],
+            global_llm_context="",
+            organization_id="org-1",
+            request_policy_handler=object(),
+            turn_intent_handler=object(),
+            stored_completion_criteria=StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        )
+
+        guardrail = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=policy_inputs,
+        )[0]
+        await guardrail.run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        materialize.assert_not_awaited()
+        assert ctx.turn_intent is not None
+        assert ctx.turn_intent.mode is TurnIntentMode.ANSWER
+        assert policy.completion_criteria == []
+        assert ctx.completion_criteria_turn_state is None
+
+    @pytest.mark.asyncio
+    async def test_declared_read_only_diagnose_skips_authoring_enrichment(self, monkeypatch) -> None:
+        policy = RequestPolicy(testing_intent="unspecified", _authoring_pending=True)
+        monkeypatch.setattr(
+            agent_module,
+            "build_request_policy_trust_floor",
+            AsyncMock(return_value=policy),
+        )
+        monkeypatch.setattr(
+            agent_module,
+            "classify_turn_intent",
+            AsyncMock(
+                return_value=TurnIntentClassifierResult.success(
+                    TurnIntentClassification(mode=TurnIntentMode.DIAGNOSE, confidence=0.95)
+                )
+            ),
+        )
+        materialize = AsyncMock()
+        monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize)
+        ctx = _ctx()
+        policy_inputs = agent_module.RequestPolicyGuardrailInputs(
+            user_message="Why did the last run fail?",
+            workflow_yaml="workflow: yaml",
+            chat_history_text="",
+            chat_history_messages=[],
+            global_llm_context="",
+            organization_id="org-1",
+            request_policy_handler=object(),
+            turn_intent_handler=object(),
+            workflow_run_id="wr_1",
+            fix_origin=True,
+        )
+
+        guardrail = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=policy_inputs,
+        )[0]
+        await guardrail.run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        materialize.assert_not_awaited()
+        assert ctx.turn_intent is not None
+        assert ctx.turn_intent.mode is TurnIntentMode.DIAGNOSE
+        assert ctx.turn_intent.authority.may_run_blocks is False
+
+    @pytest.mark.asyncio
+    async def test_diagnose_retest_authority_materializes_completion_criteria(
+        self,
+        monkeypatch,
+    ) -> None:
+        stored = StoredCriteriaSet(
+            set_id="wccs_1",
+            goal_epoch=1,
+            criteria=(CompletionCriterion(id="c0", outcome="The requested value is returned"),),
+        )
+        policy = RequestPolicy(
+            testing_intent="require_test",
+            allow_run_blocks=True,
+            _authoring_pending=True,
+        )
+        monkeypatch.setattr(
+            agent_module,
+            "build_request_policy_trust_floor",
+            AsyncMock(return_value=policy),
+        )
+        monkeypatch.setattr(
+            agent_module,
+            "classify_turn_intent",
+            AsyncMock(
+                return_value=TurnIntentClassifierResult.success(
+                    TurnIntentClassification(mode=TurnIntentMode.DIAGNOSE, confidence=0.95)
+                )
+            ),
+        )
+
+        async def materialize(target: RequestPolicy, **_kwargs) -> RequestPolicy:
+            target.completion_criteria = list(stored.criteria)
+            target._authoring_pending = False
+            return target
+
+        materialize_mock = AsyncMock(side_effect=materialize)
+        monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize_mock)
+        ctx = _ctx()
+        policy_inputs = agent_module.RequestPolicyGuardrailInputs(
+            user_message="Run it again and verify the requested value",
+            workflow_yaml="workflow: yaml",
+            chat_history_text="",
+            chat_history_messages=[],
+            global_llm_context="",
+            organization_id="org-1",
+            request_policy_handler=object(),
+            turn_intent_handler=object(),
+            stored_completion_criteria=StoredCriteriaSnapshot(active=stored, next_epoch=2),
+            workflow_run_id="wr_1",
+        )
+
+        guardrail = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=policy_inputs,
+        )[0]
+        await guardrail.run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        materialize_mock.assert_awaited_once()
+        assert materialize_mock.await_args.kwargs["active_criteria"] == list(stored.criteria)
+        assert ctx.turn_intent is not None
+        assert ctx.turn_intent.mode is TurnIntentMode.DIAGNOSE
+        assert ctx.turn_intent.authority.may_update_workflow is True
+        assert ctx.turn_intent.authority.may_run_blocks is True
+        assert policy.completion_criteria == list(stored.criteria)
+        assert ctx.completion_criteria_turn_state is not None
+
+    @pytest.mark.asyncio
+    async def test_unknown_turn_skips_authoring_enrichment(self, monkeypatch) -> None:
+        policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True, _authoring_pending=True)
+        monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", AsyncMock(return_value=policy))
+        monkeypatch.setattr(
+            agent_module,
+            "classify_turn_intent",
+            AsyncMock(
+                return_value=TurnIntentClassifierResult.success(
+                    TurnIntentClassification(mode=TurnIntentMode.UNKNOWN, confidence=0.95)
+                )
+            ),
+        )
+        materialize = AsyncMock()
+        monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize)
+        ctx = _ctx()
+        policy_inputs = agent_module.RequestPolicyGuardrailInputs(
+            user_message="Insufficient signal for a requested effect",
+            workflow_yaml="",
+            chat_history_text="",
+            chat_history_messages=[],
+            global_llm_context="",
+            organization_id="org-1",
+            request_policy_handler=object(),
+            turn_intent_handler=object(),
+        )
+
+        guardrail = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=policy_inputs,
+        )[0]
+        await guardrail.run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        materialize.assert_not_awaited()
+        assert ctx.turn_intent is not None
+        assert ctx.turn_intent.mode is TurnIntentMode.UNKNOWN
+        assert ctx.turn_intent.authority.may_update_workflow is False
+        assert ctx.turn_intent.authority.may_run_blocks is False
+
+    @pytest.mark.asyncio
+    async def test_authoring_enriches_once_and_rebuilds_authority_from_same_classifier_result(
+        self, monkeypatch
+    ) -> None:
+        policy = RequestPolicy(_authoring_pending=True)
+        classifier_result = TurnIntentClassifierResult.success(
+            TurnIntentClassification(mode=TurnIntentMode.BUILD, confidence=0.95)
+        )
+        monkeypatch.setattr(
+            agent_module,
+            "build_request_policy_trust_floor",
+            AsyncMock(return_value=policy),
+        )
+        classify = AsyncMock(return_value=classifier_result)
+        monkeypatch.setattr(agent_module, "classify_turn_intent", classify)
+
+        async def materialize(target: RequestPolicy, **_kwargs) -> RequestPolicy:
+            target.allow_update_workflow = False
+            target.allow_run_blocks = False
+            target.completion_criteria = [CompletionCriterion(id="c0", outcome="Draft exists")]
+            target._authoring_pending = False
+            return target
+
+        materialize_mock = AsyncMock(side_effect=materialize)
+        monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize_mock)
+        ctx = _ctx()
+        policy_inputs = agent_module.RequestPolicyGuardrailInputs(
+            user_message="Add a Google Sheets write step to this workflow",
+            workflow_yaml="",
+            chat_history_text="",
+            chat_history_messages=[],
+            global_llm_context="",
+            organization_id="org-1",
+            request_policy_handler=object(),
+            turn_intent_handler=object(),
+        )
+
+        guardrail = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=policy_inputs,
+        )[0]
+        await guardrail.run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        classify.assert_awaited_once()
+        materialize_mock.assert_awaited_once()
+        assert ctx.turn_intent is not None
+        assert ctx.turn_intent.mode is TurnIntentMode.BUILD
+        assert ctx.turn_intent.authority.may_update_workflow is False
+        assert ctx.turn_intent.authority.may_run_blocks is False
+
+    @pytest.mark.asyncio
+    async def test_request_policy_trust_floor_defers_completion_producers(self, monkeypatch) -> None:
+        prompts: list[str] = []
+
+        async def handler(*, prompt: str, **_kwargs: object) -> dict[str, object]:
+            prompts.append(prompt)
+            return {
+                "testing_intent": "require_test",
+                "credential_input_kind": "none",
+                "credential_refs": [],
+                "login_page_urls": [],
+                "login_intent": False,
+                "email_signin_intent": False,
+                "signin_email_candidates": [],
+                "requires_user_clarification": False,
+                "raw_secret_handling": "none",
+                "clarification_reason": "none",
+            }
+
+        produce_request_slots = AsyncMock()
+        monkeypatch.setattr(request_policy_module, "produce_request_slots", produce_request_slots)
+
+        policy = await _classify_request_trust_floor(
+            "Build and test a workflow",
+            "",
+            [],
+            "",
+            handler,
+        )
+
+        produce_request_slots.assert_not_awaited()
+        assert policy.authoring_intent == "pending"
+        assert policy.completion_contract is None
+        assert policy.completion_criteria == []
+        assert policy._authoring_pending is True
+        assert len(prompts) == 1
+        assert "completion_contract" not in prompts[0]
+        assert "completion_criteria" not in prompts[0]
+        assert "REQUEST SLOT SOURCES" not in prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_request_policy_trust_floor_defers_fallback_criteria_until_authoring(self) -> None:
+        policy = await _classify_request_trust_floor(
+            "Build a workflow that extracts the page title",
+            "",
+            [],
+            "",
+            None,
+        )
+
+        assert policy.completion_criteria == []
+        assert policy._authoring_pending is True
+
+        await materialize_request_policy_authoring(
+            policy,
+            user_message="Build a workflow that extracts the page title",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=None,
+        )
+
+        assert policy.completion_criteria
+        assert policy.authoring_intent == "author_now"
+        assert policy._authoring_pending is False
+
+    @pytest.mark.asyncio
+    async def test_authoring_materialization_preserves_trust_floor_fields(self, monkeypatch) -> None:
+        policy = RequestPolicy(
+            testing_intent="require_test",
+            credential_input_kind="credential_name",
+            credential_refs=["saved-login"],
+            allow_update_workflow=False,
+            allow_run_blocks=False,
+            _authoring_pending=True,
+        )
+        enriched = RequestPolicy(
+            testing_intent="skip_test",
+            authoring_intent="author_now",
+            credential_input_kind="none",
+            allow_update_workflow=True,
+            allow_run_blocks=True,
+            completion_contract="The draft exists",
+            completion_criteria=[CompletionCriterion(id="c0", outcome="The draft exists")],
+            completion_contract_status="present",
+        )
+        classify = AsyncMock(return_value=enriched)
+        monkeypatch.setattr(request_policy_module, "_classify_request", classify)
+
+        await materialize_request_policy_authoring(
+            policy,
+            user_message="Build and test the workflow with saved-login",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=object(),
+        )
+
+        classify.assert_awaited_once()
+        assert policy.testing_intent == "require_test"
+        assert policy.credential_input_kind == "credential_name"
+        assert policy.credential_refs == ["saved-login"]
+        assert policy.allow_update_workflow is False
+        assert policy.allow_run_blocks is False
+        assert policy.completion_criteria == enriched.completion_criteria
+        assert policy._authoring_pending is False
+
+    @pytest.mark.asyncio
+    async def test_authoring_materialization_preserves_explicit_defer_authoring_authority(self, monkeypatch) -> None:
+        policy = RequestPolicy(
+            allow_update_workflow=True,
+            allow_run_blocks=True,
+            _authoring_pending=True,
+        )
+        enriched = RequestPolicy(
+            authoring_intent="defer_authoring",
+            allow_update_workflow=True,
+            allow_run_blocks=True,
+        )
+        monkeypatch.setattr(request_policy_module, "_classify_request", AsyncMock(return_value=enriched))
+
+        await materialize_request_policy_authoring(
+            policy,
+            user_message="Fill the live form, but do not create a workflow yet",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=object(),
+        )
+
+        assert policy.authoring_intent == "defer_authoring"
+        assert policy.allow_update_workflow is False
+        assert policy.allow_run_blocks is False
+        assert any(is_defer_authoring_durable_fill_criterion(item) for item in policy.completion_criteria)
+        assert policy._authoring_pending is False
+
+    @pytest.mark.asyncio
     async def test_sdk_input_guardrail_computes_and_stores_request_policy(self, monkeypatch) -> None:
         policy = RequestPolicy(
             testing_intent="skip_test",
@@ -1852,7 +2061,7 @@ class TestRequestPolicyInputGuardrail:
             allow_run_blocks=False,
         )
         build_request_policy = AsyncMock(return_value=policy)
-        monkeypatch.setattr(agent_module, "build_request_policy", build_request_policy)
+        monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", build_request_policy)
         ctx = _ctx()
         policy_inputs = agent_module.RequestPolicyGuardrailInputs(
             user_message="just draft without testing",
@@ -1888,7 +2097,6 @@ class TestRequestPolicyInputGuardrail:
             global_llm_context="",
             organization_id="org-1",
             handler=policy_inputs.request_policy_handler,
-            active_criteria=None,
             config=None,
         )
 
@@ -1901,7 +2109,7 @@ class TestRequestPolicyInputGuardrail:
         policy = RequestPolicy()
         build_request_policy = AsyncMock(return_value=policy)
         classify_turn_intent = AsyncMock(return_value=None)
-        monkeypatch.setattr(agent_module, "build_request_policy", build_request_policy)
+        monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", build_request_policy)
         monkeypatch.setattr(agent_module, "classify_turn_intent", classify_turn_intent)
         policy_inputs = agent_module.RequestPolicyGuardrailInputs(
             user_message="build and test it",
@@ -1927,14 +2135,25 @@ class TestRequestPolicyInputGuardrail:
         assert classify_turn_intent.await_args.kwargs["handler"] is turn_intent_handler
 
     @pytest.mark.asyncio
-    async def test_sdk_input_guardrail_forwards_stored_active_criteria(self, monkeypatch) -> None:
+    async def test_sdk_input_guardrail_defers_stored_active_criteria_until_authoring(self, monkeypatch) -> None:
         stored = StoredCriteriaSet(
             set_id="wccs_1",
             goal_epoch=1,
             criteria=(CompletionCriterion(id="c0", outcome="The main heading is extracted into the run output"),),
         )
-        build_request_policy = AsyncMock(return_value=RequestPolicy())
-        monkeypatch.setattr(agent_module, "build_request_policy", build_request_policy)
+        build_request_policy = AsyncMock(return_value=RequestPolicy(_authoring_pending=True))
+        materialize = AsyncMock()
+        monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", build_request_policy)
+        monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize)
+        monkeypatch.setattr(
+            agent_module,
+            "classify_turn_intent",
+            AsyncMock(
+                return_value=TurnIntentClassifierResult.success(
+                    TurnIntentClassification(mode=TurnIntentMode.BUILD, confidence=0.95)
+                )
+            ),
+        )
         policy_inputs = agent_module.RequestPolicyGuardrailInputs(
             user_message="run it again",
             workflow_yaml="",
@@ -1954,7 +2173,9 @@ class TestRequestPolicyInputGuardrail:
         await guardrails[0].run(SimpleNamespace(), "input", RunContextWrapper(context=_ctx()))
 
         assert build_request_policy.await_args is not None
-        assert build_request_policy.await_args.kwargs["active_criteria"] == list(stored.criteria)
+        assert "active_criteria" not in build_request_policy.await_args.kwargs
+        assert materialize.await_args is not None
+        assert materialize.await_args.kwargs["active_criteria"] == list(stored.criteria)
 
     @pytest.mark.asyncio
     async def test_sdk_input_guardrail_trips_after_computing_blocked_policy(self, monkeypatch) -> None:
@@ -1967,7 +2188,7 @@ class TestRequestPolicyInputGuardrail:
             clarification_reason="raw_secret",
             clarification_question="Do not paste raw credentials.",
         )
-        monkeypatch.setattr(agent_module, "build_request_policy", AsyncMock(return_value=policy))
+        monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", AsyncMock(return_value=policy))
         ctx = _ctx()
         guardrails = agent_module._build_copilot_input_guardrails(
             InputGuardrail,
@@ -1999,7 +2220,7 @@ class TestRequestPolicyInputGuardrail:
             testing_intent="unspecified",
             user_response_policy="proceed",
         )
-        monkeypatch.setattr(agent_module, "build_request_policy", AsyncMock(return_value=policy))
+        monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", AsyncMock(return_value=policy))
         ctx = _ctx()
         guardrails = agent_module._build_copilot_input_guardrails(
             InputGuardrail,
@@ -2038,7 +2259,7 @@ class TestRequestPolicyInputGuardrail:
             testing_intent="unspecified",
             user_response_policy="proceed",
         )
-        monkeypatch.setattr(agent_module, "build_request_policy", AsyncMock(return_value=policy))
+        monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", AsyncMock(return_value=policy))
         ctx = _ctx()
         guardrails = agent_module._build_copilot_input_guardrails(
             InputGuardrail,
@@ -2079,7 +2300,7 @@ class TestRequestPolicyInputGuardrail:
             allow_run_blocks=False,
             allow_missing_credentials_in_draft=True,
         )
-        monkeypatch.setattr(agent_module, "build_request_policy", AsyncMock(return_value=policy))
+        monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", AsyncMock(return_value=policy))
         ctx = _ctx()
         guardrails = agent_module._build_copilot_input_guardrails(
             InputGuardrail,
@@ -2475,34 +2696,6 @@ class TestTranslateToAgentResultGating:
         assert agent_result.response_type == "REPLY"
         assert agent_result.turn_outcome is not None
         assert agent_result.turn_outcome.reason_code != ACTUATION_OBLIGATION_STEER_REASON_CODE
-
-    def test_verified_terminal_state_surfaces_workflow_despite_weak_final_reply(self) -> None:
-        workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[]))
-        ctx = _ctx(
-            last_workflow=workflow,
-            last_workflow_yaml="title: Verified Draft",
-            last_test_ok=True,
-            last_full_workflow_test_ok=True,
-        )
-        ctx.verified_terminal_proposal_ready = True
-        ctx.completion_verification_result = CompletionVerificationResult(
-            status="evaluated",
-            criterion_ids=["c0"],
-            verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
-        )
-        result = _fake_run_result({"type": "ASK_QUESTION", "user_response": "Do you want me to keep repairing?"})
-
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert agent_result.response_type == "REPLY"
-        assert agent_result.updated_workflow is workflow
-        assert agent_result.workflow_yaml == "title: Verified Draft"
-        assert agent_result.clear_proposed_workflow is False
-        assert agent_result.proposal_disposition == "auto_applicable"
 
     def test_wip_exit_structural_abstention_stays_review_only(self) -> None:
         from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
@@ -2987,42 +3180,6 @@ workflow_definition:
         assert agent_result.narrative_payload is not None
         assert agent_result.narrative_payload["responseType"] == "ASK_QUESTION"
 
-    def test_probable_site_block_ask_question_is_concise_and_proxy_aware(self) -> None:
-        ctx = _ctx(
-            last_test_ok=False,
-            last_test_failure_reason="Skyvern failed to load the website. The page may have navigated unexpectedly.",
-            probable_site_block_stop_nudge_count=1,
-            effective_workflow_proxy_location="RESIDENTIAL",
-        )
-        verbose_response = (
-            "Diagnostic recap:\n"
-            "- I tried several workflow shapes with the same browser state.\n"
-            '- global_llm_context: {"workflow_state": "many internal details"}\n'
-            "- The final failure_reason was: Skyvern failed to load the website. "
-            "The page may have navigated unexpectedly.\n"
-            "- More implementation details that should not be user-facing.\n"
-            "Would you like me to configure a proxy?"
-        )
-        result = _fake_run_result({"type": "ASK_QUESTION", "user_response": verbose_response})
-
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert agent_result.response_type == "ASK_QUESTION"
-        assert len(agent_result.user_response.splitlines()) <= 8
-        assert "global_llm_context" not in agent_result.user_response
-        assert "configure a proxy" not in agent_result.user_response.lower()
-        assert "Would you like me to whether" not in agent_result.user_response
-        assert "different proxy location" in agent_result.user_response.lower()
-        assert "US-CA" in agent_result.user_response
-        assert "Skyvern failed to load the website. The page may have navigated unexpectedly." in (
-            agent_result.user_response
-        )
-        assert "same IP/workflow shape" in agent_result.user_response
-
     def test_unexpected_error_exit_names_failure_and_preserves_context(self) -> None:
         ctx = _ctx()
 
@@ -3165,73 +3322,6 @@ workflow_definition:
         assert "test failed" in agent_result.user_response.lower()
         assert "keep the draft" in agent_result.user_response.lower()
 
-    def test_reply_after_suspicious_success_surfaces_unvalidated_wip(self) -> None:
-        wf = SimpleNamespace(name="drafted")
-        ctx = _ctx(
-            last_workflow=wf,
-            last_workflow_yaml="title: drafted",
-            last_update_block_count=2,
-            last_test_ok=None,
-            last_test_suspicious_success=True,
-        )
-        result = _fake_run_result({"type": "REPLY", "user_response": "Done."})
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert agent_result.updated_workflow is wf
-        assert agent_result.proposal_disposition == "review_untested"
-        assert "review" in agent_result.user_response.lower()
-        assert "accept" in agent_result.user_response.lower()
-        assert "reject" in agent_result.user_response.lower()
-        assert "discard" in agent_result.user_response.lower()
-
-    def test_unvalidated_wip_reply_adds_proposal_affordance(self) -> None:
-        wf = SimpleNamespace(name="drafted")
-        ctx = _ctx(
-            last_workflow=wf,
-            last_workflow_yaml="title: drafted",
-            last_update_block_count=None,
-            last_test_ok=None,
-        )
-        result = _fake_run_result({"type": "REPLY", "user_response": "Please provide credentials before I continue."})
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert agent_result.updated_workflow is wf
-        assert agent_result.workflow_yaml == "title: drafted"
-        assert agent_result.proposal_disposition == "review_untested"
-        assert "Please provide credentials before I continue." in agent_result.user_response
-        assert "review" in agent_result.user_response.lower()
-        assert "accept" in agent_result.user_response.lower()
-        assert "reject" in agent_result.user_response.lower()
-        assert "discard" in agent_result.user_response.lower()
-
-    def test_unvalidated_wip_reply_keeps_existing_ui_affordance(self) -> None:
-        wf = SimpleNamespace(name="drafted")
-        ctx = _ctx(
-            last_workflow=wf,
-            last_workflow_yaml="title: drafted",
-            last_update_block_count=None,
-            last_test_ok=None,
-        )
-        response = "I have a draft proposal. Use Review to inspect it, Accept to save it, or Reject it."
-        result = _fake_run_result({"type": "REPLY", "user_response": response})
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert response in agent_result.user_response
-        assert "not been tested or verified" in agent_result.user_response
-        assert agent_result.updated_workflow is wf
-
     def test_goal_reached_false_flips_validated_proposal_to_unvalidated(self) -> None:
         # Agent-emitted goal_reached=False must override last_test_ok=True so
         # a draft the agent itself flagged as incomplete cannot auto-promote.
@@ -3259,136 +3349,6 @@ workflow_definition:
         assert agent_result.updated_workflow is wf
         assert agent_result.workflow_yaml == "title: drafted"
         assert agent_result.proposal_disposition == "review_untested"
-
-    def test_goal_reached_false_cannot_underclaim_verified_outcome(self) -> None:
-        from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
-
-        wf = SimpleNamespace(name="verified")
-        ctx = _ctx(
-            last_workflow=wf,
-            last_workflow_yaml="title: verified",
-            last_test_ok=True,
-            last_full_workflow_test_ok=False,
-            last_update_block_count=4,
-            last_run_outcome=RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_secret"),
-            completion_verification_result=CompletionVerificationResult(
-                status="evaluated",
-                criterion_ids=["c0"],
-                verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
-            ),
-        )
-        result = _fake_run_result(
-            {
-                "type": "REPLY",
-                "user_response": "I drafted the workflow, but it has not been tested end-to-end.",
-                "goal_reached": False,
-            }
-        )
-
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert agent_result.updated_workflow is wf
-        assert agent_result.workflow_yaml == "title: verified"
-        assert agent_result.proposal_disposition == "auto_applicable"
-        assert "draft" not in agent_result.user_response.lower()
-        assert "not been tested" not in agent_result.user_response.lower()
-        assert "tested end-to-end" not in agent_result.user_response.lower()
-        assert "created and tested" in agent_result.user_response.lower()
-        assert "demonstrated the requested outcome" in agent_result.user_response.lower()
-        assert "wr_secret" not in agent_result.user_response
-        assert agent_result.narrative_payload is not None
-        assert agent_result.narrative_payload["verifiedSuccess"] is True
-
-    def test_demonstrated_recorded_outcome_overrides_misleading_free_text(self) -> None:
-        from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
-
-        wf = SimpleNamespace(name="verified")
-        ctx = _ctx(
-            last_workflow=wf,
-            last_workflow_yaml="title: verified",
-            last_test_ok=True,
-            last_full_workflow_test_ok=True,
-            last_run_outcome=RecordedRunOutcome(verdict="demonstrated"),
-            completion_verification_result=CompletionVerificationResult(
-                status="evaluated",
-                criterion_ids=["c0"],
-                verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
-            ),
-        )
-        result = _fake_run_result(
-            {
-                "type": "REPLY",
-                "user_response": "The test could not verify the requested result.",
-                "goal_reached": True,
-            }
-        )
-
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert agent_result.updated_workflow is wf
-        assert agent_result.proposal_disposition == "auto_applicable"
-        assert "demonstrated the requested outcome" in agent_result.user_response.lower()
-        assert "could not verify" not in agent_result.user_response.lower()
-
-    def test_not_demonstrated_recorded_outcome_stays_conservative_and_sanitized(self) -> None:
-        wf = SimpleNamespace(name="drafted")
-        ctx = _ctx(
-            last_workflow=wf,
-            last_workflow_yaml="title: drafted",
-            last_test_ok=True,
-            last_full_workflow_test_ok=True,
-            last_run_outcome=RecordedRunOutcome(
-                verdict="not_demonstrated",
-                display_reason="Statement month was still April.",
-                workflow_run_id="wr_hidden",
-            ),
-        )
-        result = _fake_run_result({"type": "REPLY", "user_response": "All set.", "goal_reached": True})
-
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert agent_result.updated_workflow is wf
-        assert agent_result.proposal_disposition == "review_untested"
-        assert "did not demonstrate the requested outcome" in agent_result.user_response.lower()
-        assert "statement month was still april" in agent_result.user_response.lower()
-        assert "all set" not in agent_result.user_response.lower()
-        assert "wr_hidden" not in agent_result.user_response
-
-    def test_not_evaluated_recorded_outcome_reports_run_unverified_not_untested(self) -> None:
-        wf = SimpleNamespace(name="drafted")
-        ctx = _ctx(
-            last_workflow=wf,
-            last_workflow_yaml="title: drafted",
-            last_test_ok=True,
-            last_full_workflow_test_ok=True,
-            last_run_outcome=RecordedRunOutcome(verdict="not_evaluated", display_reason="Output judge unavailable."),
-        )
-        result = _fake_run_result({"type": "REPLY", "user_response": "All set.", "goal_reached": True})
-
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert agent_result.updated_workflow is wf
-        assert agent_result.proposal_disposition == "review_untested"
-        assert "could not verify the requested outcome" in agent_result.user_response.lower()
-        assert "did not demonstrate" not in agent_result.user_response.lower()
-        assert "output judge unavailable" in agent_result.user_response.lower()
-        assert "untested" not in agent_result.user_response.lower()
 
     @pytest.mark.parametrize(
         "payload_extras",
@@ -3601,7 +3561,9 @@ workflow_definition:
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
 
-    def test_clean_unverified_run_uses_deterministic_terminal_copy_when_proposal_exists(self) -> None:
+    def test_clean_test_keeps_the_models_reply_without_a_judge_cosign(self) -> None:
+        """A clean test is the evidence; a separate judge's reading of the same run does not
+        rewrite the model's reply into built-but-unverified copy."""
         wf = SimpleNamespace(name="drafted")
         ctx = _ctx(
             last_workflow=wf,
@@ -3616,10 +3578,7 @@ workflow_definition:
             )
         )
 
-        assert agent_result.user_response == (
-            "I built the workflow and the test run completed, but the goal outcome was not independently verified. "
-            "The workflow is available on the canvas for review."
-        )
+        assert "not independently verified" not in agent_result.user_response
         assert agent_result.updated_workflow is wf
 
     def test_goal_reached_false_on_failed_test_does_not_double_unvalidate(self) -> None:
@@ -3752,7 +3711,7 @@ workflow_definition:
         assert agent_result.response_type == "REPLY"
         assert agent_result.clear_proposed_workflow is False
 
-    def test_reply_with_unverified_clean_run_uses_deterministic_terminal_copy(self) -> None:
+    def test_reply_with_clean_run_keeps_model_reply_without_judge_cosign(self) -> None:
         workflow = SimpleNamespace(name="final")
         ctx = _ctx(
             last_workflow=workflow,
@@ -3768,8 +3727,8 @@ workflow_definition:
         )
 
         assert agent_result.updated_workflow is workflow
-        assert "the workflow is ready" not in agent_result.user_response.lower()
-        assert "not independently verified" in agent_result.user_response.lower()
+        assert "the workflow is ready" in agent_result.user_response.lower()
+        assert "not independently verified" not in agent_result.user_response.lower()
         assert agent_result.proposal_disposition == "auto_applicable"
         assert agent_result.narrative_payload is not None
         assert agent_result.narrative_payload["verifiedSuccess"] is False
@@ -3807,6 +3766,77 @@ class TestCredentialRefusalReachesAgent:
         assert "Use validate_block only for allowed non-browser helper blocks" in prompt
         assert "Do not call `validate_block`" not in prompt
         assert "native_allowed" not in prompt
+
+    def test_answer_only_prompt_is_content_neutral_and_has_no_tool_guidance(self) -> None:
+        prompt = agent_module._build_system_prompt(
+            tool_usage_guide="",
+            security_rules="",
+            answer_only=True,
+        )
+
+        assert "Respond to the user's current request inline" in prompt
+        assert "No tools are available in this answer-only turn" in prompt
+        assert "Explain the answer in prose" in prompt
+        assert "Do not return serialized workflow YAML/JSON or literal credential values" in prompt
+        assert "product or workflow-concept question" not in prompt
+        assert "documentation question" not in prompt
+        assert "greeting" not in prompt
+        for unavailable_name in (
+            "update_workflow",
+            "update_and_run_blocks",
+            "navigate_browser",
+            "list_credentials",
+        ):
+            assert unavailable_name not in prompt
+
+    def test_code_only_docs_answer_prompt_has_no_authoring_appendix(self) -> None:
+        prompt = agent_module._build_system_prompt(
+            tool_usage_guide="",
+            config=CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER),
+            answer_only=True,
+        )
+
+        assert "ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE" not in prompt
+        assert "SYNTHESIZED CODE BLOCK" not in prompt
+        assert "update_workflow" not in prompt
+
+    def test_docs_answer_prompt_keeps_custom_security_rules(self) -> None:
+        prompt = agent_module._build_system_prompt(
+            tool_usage_guide="",
+            config=CopilotConfig(security_rules="CUSTOM SECURITY RULE"),
+            answer_only=True,
+        )
+
+        assert "CUSTOM SECURITY RULE" in prompt
+
+    @pytest.mark.parametrize("mode", [TurnIntentMode.ANSWER, TurnIntentMode.UNKNOWN])
+    def test_inline_only_dynamic_prompt_keeps_projected_guide_empty(self, mode: TurnIntentMode) -> None:
+        config = CopilotConfig()
+        ctx = _ctx(
+            copilot_config=config,
+            request_policy=RequestPolicy(),
+            turn_intent=TurnIntent(mode=mode),
+        )
+        instructions = agent_module._build_dynamic_system_prompt(
+            tool_usage_guide="- **update_workflow** — Mutate a workflow.",
+            config=config,
+        )
+
+        prompt = instructions(SimpleNamespace(context=ctx), object())
+
+        assert "Respond to the user's current request inline" in prompt
+        assert "TURN INTENT: docs_answer" not in prompt
+        assert "Mutate a workflow" not in prompt
+        assert "authoring_intent" not in prompt
+        assert "completion_contract" not in prompt
+        for unavailable_name in (
+            "update_workflow",
+            "update_and_run_blocks",
+            "navigate_browser",
+            "list_credentials",
+        ):
+            assert f"`{unavailable_name}`" not in prompt
+            assert f"**{unavailable_name}**" not in prompt
 
     @pytest.mark.asyncio
     async def test_run_copilot_agent_logs_resolved_block_authoring_policy(
@@ -7245,3 +7275,229 @@ def test_transcript_anchor_blanked_when_retained_window_at_capacity() -> None:
     assert agent_module._transcript_anchor_for_turn(packet, CHAT_HISTORY_CONTEXT_MESSAGES) == ""
     assert agent_module._transcript_anchor_for_turn(packet, CHAT_HISTORY_CONTEXT_MESSAGES + 5) == ""
     assert agent_module._transcript_anchor_for_turn(None, 0) == ""
+
+
+class TestTheModelOwnsItsClaim:
+    """The harness renders the run record beside the model's reply; it never composes the reply,
+    never ends the loop on the model's behalf, and never promotes over the model's own admission."""
+
+    def test_model_reply_survives_a_clean_run(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            last_run_outcome=RecordedRunOutcome(verdict="demonstrated"),
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "Logged in; extraction is next."})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert "extraction is next" in agent_result.user_response.lower()
+        assert "created and tested the workflow successfully" not in agent_result.user_response.lower()
+
+    def test_goal_reached_false_is_not_overridden_by_a_demonstrated_record(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            last_run_outcome=RecordedRunOutcome(verdict="demonstrated"),
+        )
+        result = _fake_run_result(
+            {"type": "REPLY", "user_response": "Only the login is built so far.", "goal_reached": False}
+        )
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.proposal_disposition != "auto_applicable"
+        assert "only the login is built" in agent_result.user_response.lower()
+
+    def test_a_non_demonstrated_record_is_appended_and_caps_the_disposition(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            last_run_outcome=RecordedRunOutcome(
+                verdict="not_demonstrated", display_reason="Statement month was still April."
+            ),
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "All set.", "goal_reached": True})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert "all set" in agent_result.user_response.lower()
+        assert "did not demonstrate the requested outcome" in agent_result.user_response.lower()
+        assert "statement month was still april" in agent_result.user_response.lower()
+        assert agent_result.proposal_disposition != "auto_applicable"
+
+
+def test_an_element_state_timeout_does_not_send_the_user_to_check_the_url() -> None:
+    # The page loaded; an element never reached the state the block waited for. Copilot repairs that
+    # itself, so the reply carries no follow-up rather than a misdirecting one.
+    from skyvern.forge.sdk.copilot.agent import _FAILURE_FOLLOW_UP
+
+    assert _FAILURE_FOLLOW_UP.get("ELEMENT_STATE_TIMEOUT", "") == ""
+    assert "confirm the URL" in _FAILURE_FOLLOW_UP["PAGE_LOAD_TIMEOUT"]
+
+
+def test_offer_reopens_once_when_the_requested_read_becomes_provable_after_authoring() -> None:
+    # The page carrying the requested value is often reached after the draft exists (SKY-13226: the
+    # dashboard sits behind a login). Without reopening, the proven read is derived and never offered,
+    # and the draft's own guess is what the first test run executes.
+    criterion = CompletionCriterion(id="record_id", outcome="Record Identifier", output_path="output.record_id")
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.request_policy = RequestPolicy(completion_criteria=[criterion])
+    ctx.completion_criteria_turn_state = SimpleNamespace(decision=SimpleNamespace(criteria=(criterion,)))
+    ctx.copilot_config = CopilotConfig(requested_output_path_aliases={"record identifier": "output.record_id"})
+    ctx.scout_trajectory = [
+        {"tool_name": "click", "selector": "#show-details", "source_url": "https://example.com/provider"}
+    ]
+    ctx.flow_evidence = []
+    ctx.update_workflow_called = True
+
+    before_the_page_was_reached = _synthesized_block_offer_prompt(ctx)
+    ctx.flow_evidence = [
+        {
+            "step": 2,
+            "reached_via": "interaction",
+            "had_bounded_schema": True,
+            "evidence": {
+                "source_tool": "scout_interaction",
+                "interaction_tool": "click",
+                "interaction_selector": "#show-details",
+                "inspection_warnings": [],
+                "result_containers_truncated": False,
+                "key_value_relations_truncated": False,
+                "key_value_relations": [
+                    {
+                        "key_text": "Record Identifier",
+                        "container_selector": ".record-kv",
+                        "container_match_count": 1,
+                        "container_position": 0,
+                        "value_child_index": 1,
+                        "direct_child_count": 2,
+                        "visible": True,
+                        "value_visible": True,
+                    }
+                ],
+                "result_containers": [],
+            },
+        }
+    ]
+    once_provable = _synthesized_block_offer_prompt(ctx)
+    again = _synthesized_block_offer_prompt(ctx)
+
+    assert before_the_page_was_reached == ""
+    assert 'page.locator(".record-kv").nth(0)' in once_provable
+    assert again == ""
+
+
+def test_offer_reopens_for_candidates_when_the_pages_wording_binds_no_plan() -> None:
+    # Live shape (SKY-13226): a log query labelled its count "logs found" while the request said
+    # "azure", so no plan binds. The relations the page does offer are named only by the offer this
+    # gate guards, so requiring a bound plan to reopen asked the read that makes it bind to exist first.
+    criterion = CompletionCriterion(id="c0", outcome="azure", output_path="output.errors")
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.request_policy = RequestPolicy(completion_criteria=[criterion])
+    ctx.completion_criteria_turn_state = SimpleNamespace(decision=SimpleNamespace(criteria=(criterion,)))
+    ctx.scout_trajectory = [{"tool_name": "click", "selector": "#go", "source_url": "https://example.test/logs"}]
+    ctx.update_workflow_called = True
+    ctx.flow_evidence = [
+        {
+            "step": 1,
+            "reached_via": "current_page",
+            "had_bounded_schema": True,
+            "evidence": {
+                "source_tool": "inspect_page_for_composition",
+                "inspection_warnings": [],
+                "result_containers_truncated": False,
+                "key_value_relations_truncated": False,
+                "key_value_relations": [
+                    {
+                        "key_text": "logs found",
+                        "value_text": "1.22K",
+                        "container_selector": ".agg",
+                        "container_match_count": 1,
+                        "container_position": 0,
+                        "value_child_index": 0,
+                        "direct_child_count": 2,
+                        "visible": True,
+                        "value_visible": True,
+                    }
+                ],
+                "result_containers": [],
+            },
+        }
+    ]
+
+    offer = _synthesized_block_offer_prompt(ctx)
+
+    assert "logs found = 1.22K" in offer
+    assert "output.errors" in offer
+
+
+def test_a_turn_that_forms_no_requested_output_still_dumps_its_trajectory(tmp_path, monkeypatch) -> None:
+    # A login or navigation defect lives in a turn that never forms a requested output, and dumping
+    # only where a plan was attempted left exactly those turns unreproducible offline (SKY-13226).
+    from skyvern.forge.sdk.copilot import enforcement as enforcement_module
+
+    monkeypatch.setenv("COPILOT_DUMP_DERIVATION_INPUTS", str(tmp_path))
+    monkeypatch.setattr(enforcement_module.settings, "ENV", "local")
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.request_policy = RequestPolicy(completion_criteria=[])
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "fill_credential_field",
+            "selector": "#totp",
+            "credential_id": "cred_1",
+            "credential_field": "totp",
+            "source_url": "https://example.test/login/totp",
+        }
+    ]
+    ctx.flow_evidence = []
+
+    _synthesized_block_offer_prompt(ctx)
+
+    dumps = list(tmp_path.glob("derivation-no_requested_output-*.json"))
+    assert dumps, "a turn with no requested output wrote no dump"
+    import json
+
+    recorded = json.loads(dumps[0].read_text())["scout_trajectory"]
+    assert [step["credential_field"] for step in recorded] == ["totp"]
+
+
+def test_rewrite_names_the_sandbox_outage_when_the_runner_was_unreachable() -> None:
+    ctx = _ctx(
+        last_update_block_count=1,
+        last_test_ok=False,
+        last_test_failure_reason="Secure CodeBlock runner is unavailable. Please retry.",
+        last_failure_category_top="UNRECOVERABLE_TOOL_ERROR",
+        last_run_blocks_workflow_run_id="wr_runner",
+    )
+
+    rewritten = _rewrite_failed_test_response("All set — the workflow is ready.", ctx)
+
+    assert rewritten == (
+        "I created a draft workflow with 1 block and tested it, but the test failed. "
+        "Failure: Secure CodeBlock runner is unavailable. Please retry.."
+    )

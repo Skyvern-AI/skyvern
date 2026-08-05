@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from unittest.mock import AsyncMock, MagicMock
 
 from skyvern.forge import set_force_app_instance
@@ -14,6 +15,8 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module = ForgeApp()
     fake_app_module.DATABASE = _LazyNamespace()
     fake_app_module.WORKFLOW_CONTEXT_MANAGER = _LazyNamespace()
+    fake_app_module.WORKFLOW_CONTEXT_MANAGER.mask_secrets_enabled_for_run = MagicMock(return_value=False)
+    fake_app_module.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run = MagicMock(return_value=set())
     fake_app_module.WORKFLOW_SERVICE = _LazyNamespace()
     fake_app_module.BROWSER_MANAGER = _LazyNamespace()
     # get_for_task is a sync lookup returning None when no browser state is registered; _LazyNamespace
@@ -31,15 +34,28 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.execute_code_block_override = AsyncMock(return_value=None)
     # Copilot worker-dispatch gate — _LazyNamespace would auto-mock this as a truthy AsyncMock
     # and route copilot block runs down the worker-dispatch path. Match the real OSS base
-    # default (False) so unit tests exercise the inline run path.
+    # default (False) so unit tests exercise the unavailable-worker path.
     fake_app_module.AGENT_FUNCTION.should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=False)
     # Sync methods — _LazyNamespace would auto-mock these as AsyncMock and break callers that use
     # the return value directly. Match the real OSS defaults.
     fake_app_module.AGENT_FUNCTION.resolve_copilot_dispatch_trigger_type = MagicMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.allow_copilot_inline_code_execution = MagicMock(return_value=False)
     fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_org_lookups = MagicMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.get_mcp_request_organization_id = MagicMock(return_value=None)
     # Sync method returning a key or None — _LazyNamespace would auto-mock it as a truthy
     # AsyncMock and hijack the TextPromptBlock llm_key. Match the OSS no-op.
     fake_app_module.AGENT_FUNCTION.get_fallback_llm_key = MagicMock(return_value=None)
+    # Credential write-lock gating — _LazyNamespace would auto-mock these as truthy AsyncMocks,
+    # forcing the update/delete credential routes down the lock path and handing `async with` a
+    # coroutine instead of a context manager. Match the real OSS base no-ops (unlocked path).
+    fake_app_module.AGENT_FUNCTION.should_lock_credential_write = AsyncMock(return_value=False)
+    fake_app_module.AGENT_FUNCTION.credential_write_lock = MagicMock(return_value=nullcontext())
+    fake_app_module.AGENT_FUNCTION.validate_credential_write = AsyncMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.prepare_credential_update = AsyncMock(side_effect=lambda **kwargs: kwargs["data"])
+    # Grid-collection seam — _LazyNamespace would auto-mock this as a truthy AsyncMock whose
+    # awaited value is a non-None MagicMock, poisoning the extract-information prompt/cache key.
+    # Match the real OSS base no-op (None → no grid rows injected).
+    fake_app_module.AGENT_FUNCTION.collect_virtualized_grid_rows = AsyncMock(return_value=None)
     fake_app_module.agent = _LazyNamespace()
     fake_app_module.DATABASE.observer.update_workflow_run_block = AsyncMock()
     fake_app_module.DATABASE.observer.create_workflow_run_block = AsyncMock()

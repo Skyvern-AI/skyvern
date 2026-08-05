@@ -33,6 +33,7 @@ _BROWSER_SESSION_TOOL_NAMES = frozenset(
         "console_messages",
         "select_option",
         "press_key",
+        "wait_for_either_state",
     }
 )
 _UNRECOVERABLE_TOOL_ERROR_CATEGORY = "UNRECOVERABLE_TOOL_ERROR"

@@ -278,7 +278,7 @@ class TestScrapeAssemblyCarriesTheSidecar:
             [[element("e1", destination=ANCHOR_FACTS)], [element("e1", destination=ANCHOR_FACTS)]]
         )
 
-        async def fake_create_instance(_frame: object) -> SkyvernFrame:
+        async def fake_create_instance(_frame: object, engine_selection: object = None) -> SkyvernFrame:
             return main_frame
 
         monkeypatch.setattr(SkyvernFrame, "create_instance", fake_create_instance)
@@ -292,7 +292,6 @@ class TestScrapeAssemblyCarriesTheSidecar:
         assert all("destination" not in node for node in elements)
 
 
-@pytest.mark.skip(reason="SKY-12875 mitigation: buildDestinationFacts short-circuits; un-skip with PR #13991")
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 class TestDestinationFactsJs:
     def test_behavioral(self) -> None:

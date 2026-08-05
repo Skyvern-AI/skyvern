@@ -365,6 +365,43 @@ describe("RunView view toggles", () => {
     expect(scope.getByText("totp-identifier-1")).not.toBeNull();
   });
 
+  test("browser session/profile ids live in the Inputs view, not the Timeline strip", () => {
+    seedCompletedRun({
+      browser_session_id: "pbs_1",
+      browser_profile_id: "bp_1",
+    });
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    expect(scope.queryByText("pbs_1")).toBeNull();
+    expect(scope.queryByText("bp_1")).toBeNull();
+
+    fireEvent.click(scope.getByRole("button", { name: "Inputs" }));
+    expect(scope.getByText("Browser session")).not.toBeNull();
+    expect(
+      scope.getByRole("link", { name: "pbs_1" }).getAttribute("href"),
+    ).toBe("/browser-session/pbs_1/stream");
+    expect(scope.getByText("Browser profile")).not.toBeNull();
+    expect(scope.getByRole("link", { name: "bp_1" }).getAttribute("href")).toBe(
+      "/browser-profiles/bp_1",
+    );
+    expect(
+      scope.getAllByRole("button", { name: "Copy to clipboard" }),
+    ).toHaveLength(2);
+  });
+
+  test("a session-only run lists just the browser session in Inputs", () => {
+    seedCompletedRun({ browser_session_id: "pbs_only" });
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    fireEvent.click(scope.getByRole("button", { name: "Inputs" }));
+    expect(
+      scope.getByRole("link", { name: "pbs_only" }).getAttribute("href"),
+    ).toBe("/browser-session/pbs_only/stream");
+    expect(scope.queryByText("Browser profile")).toBeNull();
+  });
+
   test("Inputs view sources TOTP from task_v2 when the top-level run omits it", () => {
     seedCompletedRun({
       totp_verification_url: null,
@@ -736,6 +773,24 @@ describe("RunView live affordances", () => {
 
     expect(scope.queryByText(/Run queued/)).not.toBeNull();
     expect(scope.queryByRole("button", { name: "Live" })).toBeNull();
+  });
+
+  test("a queued run reports no elapsed time in the strip or the timeline", () => {
+    // created_at is always populated by the API, so only started_at can decide
+    // whether the run has actually accrued elapsed time.
+    seedCompletedRun({
+      status: Status.Queued,
+      created_at: "2026-06-30T23:59:00Z",
+      queued_at: "2026-06-30T23:59:30Z",
+      started_at: null,
+      finished_at: null,
+    });
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    expect(scope.queryByText(/^Ran for /)).toBeNull();
+    expect(scope.queryByText(/·\s*\d+[ms]/)).toBeNull();
+    expect(scope.queryByText(/·\s*—/)).toBeNull();
   });
 });
 

@@ -9,17 +9,21 @@ from fastapi.testclient import TestClient
 from starlette.requests import ClientDisconnect
 
 from skyvern.forge import request_logging
+from skyvern.forge.log_redaction import (
+    REDACTED,
+    SENSITIVE_FIELDS,
+    SENSITIVE_HEADERS,
+    is_sensitive_key,
+    redact_sensitive_fields,
+)
 from skyvern.forge.request_logging import (
     _BINARY_PLACEHOLDER,
     _MAX_BODY_LENGTH,
-    _REDACTED,
     _client_ip_from_headers,
     _is_loggable_content_type,
-    _is_sensitive_key,
     _sanitize_body,
     _sanitize_response_body,
     log_raw_request_middleware,
-    redact_sensitive_fields,
 )
 
 # ---------------------------------------------------------------------------
@@ -44,15 +48,15 @@ class TestClientIpFromHeaders:
 
 
 # ---------------------------------------------------------------------------
-# _is_sensitive_key — documents exactly which field names are redacted
+# is_sensitive_key — documents exactly which field names are redacted
 # ---------------------------------------------------------------------------
 
 
 class TestIsSensitiveKey:
     """These tests serve as living documentation of the redaction rules.
 
-    If you need to add or remove a field, update ``_SENSITIVE_FIELDS`` in
-    ``request_logging.py`` and add a corresponding test case here.
+    If you need to add or remove a field, update ``SENSITIVE_FIELDS`` in
+    ``log_redaction.py`` and add a corresponding test case here.
     """
 
     @pytest.mark.parametrize(
@@ -78,10 +82,30 @@ class TestIsSensitiveKey:
             "one_time_code",
             "one_time_password",
             "mfa_code",
+            # Credential headers — also classified by SENSITIVE_HEADERS, so they must
+            # be masked when the same dict arrives as a log kwarg instead.
+            "cookie",
+            "Cookie",
+            "x-api-key",
+            "X-Api-Key",
+            # Whole header dicts, masked wholesale because their inner key names are
+            # caller-chosen and therefore unmatchable.
+            "extra_http_headers",
+            "cdp_connect_headers",
+            # One-time codes
+            "cached_totp",
         ],
     )
     def test_sensitive_keys_are_redacted(self, key: str) -> None:
-        assert _is_sensitive_key(key) is True, f"Expected '{key}' to be sensitive"
+        assert is_sensitive_key(key) is True, f"Expected '{key}' to be sensitive"
+
+    @pytest.mark.parametrize("key", [200, None, 3.5, ("a",)])
+    def test_non_string_keys_are_not_sensitive(self, key: object) -> None:
+        # Reached with arbitrary structlog kwargs; raising here kills the log call.
+        assert is_sensitive_key(key) is False
+
+    def test_every_credential_header_is_also_a_sensitive_field(self) -> None:
+        assert SENSITIVE_HEADERS <= SENSITIVE_FIELDS
 
     @pytest.mark.parametrize(
         "key",
@@ -109,7 +133,7 @@ class TestIsSensitiveKey:
         ],
     )
     def test_non_sensitive_keys_are_preserved(self, key: str) -> None:
-        assert _is_sensitive_key(key) is False, f"Expected '{key}' to NOT be sensitive"
+        assert is_sensitive_key(key) is False, f"Expected '{key}' to NOT be sensitive"
 
 
 # ---------------------------------------------------------------------------
@@ -122,18 +146,18 @@ class TestRedactSensitiveFields:
         data = {"username": "alice", "password": "secret123"}
         result = redact_sensitive_fields(data)
         assert result["username"] == "alice"
-        assert result["password"] == _REDACTED
+        assert result["password"] == REDACTED
 
     def test_redacts_nested_keys(self) -> None:
         data = {"user": {"api_key": "key123", "name": "bob"}}
         result = redact_sensitive_fields(data)
-        assert result["user"]["api_key"] == _REDACTED
+        assert result["user"]["api_key"] == REDACTED
         assert result["user"]["name"] == "bob"
 
     def test_redacts_in_lists(self) -> None:
         data = [{"token": "abc"}, {"name": "ok"}]
         result = redact_sensitive_fields(data)
-        assert result[0]["token"] == _REDACTED
+        assert result[0]["token"] == REDACTED
         assert result[1]["name"] == "ok"
 
     def test_redacts_various_sensitive_keys(self) -> None:
@@ -149,7 +173,7 @@ class TestRedactSensitiveFields:
         }
         result = redact_sensitive_fields(data)
         for key in data:
-            assert result[key] == _REDACTED, f"Expected {key} to be redacted"
+            assert result[key] == REDACTED, f"Expected {key} to be redacted"
 
     def test_redacts_totp_and_otp_fields(self) -> None:
         data = {
@@ -161,7 +185,7 @@ class TestRedactSensitiveFields:
         }
         result = redact_sensitive_fields(data)
         for key in data:
-            assert result[key] == _REDACTED, f"Expected {key} to be redacted"
+            assert result[key] == REDACTED, f"Expected {key} to be redacted"
 
     def test_preserves_non_sensitive_suffixed_keys(self) -> None:
         """Fields like credential_id and page_token must NOT be redacted."""
@@ -201,13 +225,68 @@ class TestRedactSensitiveFields:
         node = result["level"]
         for _ in range(19):
             node = node["next"]
-        assert node["password"] == _REDACTED
+        assert node["password"] == REDACTED
         assert node["safe"] == "visible"
 
     def test_preserves_non_sensitive_values(self) -> None:
         data = {"status": "ok", "count": 42, "items": [1, 2, 3]}
         result = redact_sensitive_fields(data)
         assert result == data
+
+    def test_redacts_sensitive_fields_inside_serialized_json(self) -> None:
+        private_value = "serialized-private-value"
+        data = {
+            "payload": json.dumps(
+                {
+                    "private_key": private_value,
+                    "items": [{"status": "ok"}, {"api_key": "nested-key"}],
+                }
+            )
+        }
+
+        result = redact_sensitive_fields(data)
+        decoded = json.loads(result["payload"])
+
+        assert private_value not in result["payload"]
+        assert decoded == {
+            "private_key": REDACTED,
+            "items": [{"status": "ok"}, {"api_key": REDACTED}],
+        }
+
+    def test_metadata_preserved_by_default_and_redacted_only_when_requested(self) -> None:
+        payload = {"metadata": {"region": "north", "note": "opaque"}}
+
+        assert redact_sensitive_fields(payload) == payload
+        assert redact_sensitive_fields(payload, redact_metadata=True) == {"metadata": REDACTED}
+
+    def test_is_sensitive_key_gates_metadata_behind_flag(self) -> None:
+        assert is_sensitive_key("metadata") is False
+        assert is_sensitive_key("Metadata", redact_metadata=True) is True
+        assert is_sensitive_key("password") is True
+
+    def test_redact_metadata_flag_threads_into_nested_and_serialized_values(self) -> None:
+        nested = {"outer": {"metadata": {"k": "v"}, "keep": "me"}}
+        assert redact_sensitive_fields(nested, redact_metadata=True) == {
+            "outer": {"metadata": REDACTED, "keep": "me"},
+        }
+
+        serialized = {"payload": json.dumps({"metadata": {"k": "v"}, "ok": 1})}
+        result = redact_sensitive_fields(serialized, redact_metadata=True)
+        assert json.loads(result["payload"]) == {"metadata": REDACTED, "ok": 1}
+
+    def test_preserves_serialized_json_byte_for_byte_when_nothing_redacted(self) -> None:
+        # A non-secret JSON payload must round-trip unchanged: re-serializing would escape non-ASCII and
+        # re-space separators, corrupting downstream consumers that compare bytes.
+        original = '{"note":"Grüße","items":[1,2,3]}'
+        result = redact_sensitive_fields({"payload": original})
+        assert result["payload"] == original
+
+    @pytest.mark.parametrize("value", ["ordinary text", "123", "true", '"json string"'])
+    def test_preserves_non_object_strings(self, value: str) -> None:
+        assert redact_sensitive_fields({"message": value, "status": "ok"}) == {
+            "message": value,
+            "status": "ok",
+        }
 
     def test_handles_non_dict_non_list(self) -> None:
         assert redact_sensitive_fields("hello") == "hello"
@@ -296,7 +375,7 @@ class TestSanitizeResponseBody:
     def test_sensitive_endpoint_fully_redacted(self) -> None:
         request = _make_request("POST", "/api/v1/credentials")
         result = _sanitize_response_body(request, '{"token": "abc"}', "application/json")
-        assert result == _REDACTED
+        assert result == REDACTED
 
     def test_empty_body(self) -> None:
         request = _make_request()
@@ -317,8 +396,8 @@ class TestSanitizeResponseBody:
         result = _sanitize_response_body(request, body, "application/json")
         parsed = json.loads(result)
         assert parsed["user"] == "alice"
-        assert parsed["password"] == _REDACTED
-        assert parsed["api_key"] == _REDACTED
+        assert parsed["password"] == REDACTED
+        assert parsed["api_key"] == REDACTED
 
     def test_json_preserves_non_sensitive_suffixed_keys(self) -> None:
         """credential_id and page_token in responses must remain visible for debugging."""
@@ -355,7 +434,12 @@ class TestSanitizeResponseBody:
     def test_sensitive_endpoint_trailing_slash(self) -> None:
         request = _make_request("POST", "/api/v1/credentials/")
         result = _sanitize_response_body(request, '{"data": "value"}', "application/json")
-        assert result == _REDACTED
+        assert result == REDACTED
+
+    def test_malformed_json_credential_mutation_response_is_redacted(self) -> None:
+        request = _make_request("PUT", "/api/v1/credentials/cred_123/rotate")
+        result = _sanitize_response_body(request, '{"private_key":"secret"', "application/json")
+        assert result == REDACTED
 
     @pytest.mark.parametrize(
         ("method", "path"),
@@ -372,14 +456,14 @@ class TestSanitizeResponseBody:
         request = _make_request(method, path)
         body = json.dumps({"code": "123456", "content": "Your code is 123456"})
         result = _sanitize_response_body(request, body, "application/json")
-        assert result == _REDACTED
+        assert result == REDACTED
 
 
 class TestSanitizeBody:
     def test_sensitive_endpoint_request_fully_redacted(self) -> None:
         request = _make_request("POST", "/v1/credentials")
         result = _sanitize_body(request, b'{"password": "hunter2"}', "application/json")
-        assert result == _REDACTED
+        assert result == REDACTED
 
     @pytest.mark.parametrize(
         "path",
@@ -391,7 +475,7 @@ class TestSanitizeBody:
     def test_google_oauth_config_request_redacted(self, path: str) -> None:
         request = _make_request("PUT", path)
         result = _sanitize_body(request, b'{"client_id": "cid", "client_secret": "secret"}', "application/json")
-        assert result == _REDACTED
+        assert result == REDACTED
 
     @pytest.mark.parametrize(
         "path",
@@ -403,12 +487,34 @@ class TestSanitizeBody:
     def test_google_oauth_callback_request_redacted(self, path: str) -> None:
         request = _make_request("POST", path)
         result = _sanitize_body(request, b'{"code": "4/0Adeu...", "state": "nonce"}', "application/json")
-        assert result == _REDACTED
+        assert result == REDACTED
 
     def test_non_sensitive_endpoint_request_preserved(self) -> None:
         request = _make_request("GET", "/v1/tasks")
         result = _sanitize_body(request, b'{"user": "alice"}', "application/json")
         assert result == '{"user": "alice"}'
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("POST", "/v1/credentials/cred_123/rotate"),
+            ("PUT", "/api/v1/credentials/cred_123"),
+        ],
+    )
+    def test_malformed_json_credential_mutation_request_is_redacted(self, method: str, path: str) -> None:
+        request = _make_request(method, path)
+        result = _sanitize_body(request, b'{"private_key":"secret"', "application/json")
+        assert result == REDACTED
+
+    def test_malformed_json_unrelated_request_keeps_current_behavior(self) -> None:
+        request = _make_request("POST", "/v1/tasks")
+        result = _sanitize_body(request, b'{"private_key":"secret"', "application/json")
+        assert result == '{"private_key":"secret"'
+
+    def test_get_credential_path_is_logged_normally(self) -> None:
+        request = _make_request("GET", "/api/v1/credentials/cred_123")
+        result = _sanitize_body(request, b'{"status":"ok"}', "application/json")
+        assert result == '{"status":"ok"}'
 
     @pytest.mark.parametrize(
         ("method", "path"),
@@ -425,7 +531,7 @@ class TestSanitizeBody:
         request = _make_request(method, path)
         body = b'{"totp_identifier": "x@y.com", "content": "Your code is 123456"}'
         result = _sanitize_body(request, body, "application/json")
-        assert result == _REDACTED
+        assert result == REDACTED
 
 
 # ---------------------------------------------------------------------------
@@ -494,8 +600,8 @@ class TestMiddlewareLogVolume:
 
         assert response.status_code == 200
         log_mock.info.assert_called_once()
-        assert log_mock.info.call_args.kwargs["body"] == _REDACTED
-        assert log_mock.info.call_args.kwargs["response_body"] == _REDACTED
+        assert log_mock.info.call_args.kwargs["body"] == REDACTED
+        assert log_mock.info.call_args.kwargs["response_body"] == REDACTED
         assert secret not in str(log_mock.info.call_args)
 
     def test_successful_sensitive_get_keeps_redacted_audit_line(self, log_mock: MagicMock) -> None:
@@ -505,7 +611,7 @@ class TestMiddlewareLogVolume:
         assert response.status_code == 200
         log_mock.info.assert_called_once()
         assert log_mock.info.call_args.args[0] == "api.raw_request"
-        assert log_mock.info.call_args.kwargs["response_body"] == _REDACTED
+        assert log_mock.info.call_args.kwargs["response_body"] == REDACTED
 
     def test_successful_get_is_not_logged(self, log_mock: MagicMock) -> None:
         client = TestClient(_make_app())

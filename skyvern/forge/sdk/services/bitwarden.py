@@ -4,7 +4,7 @@ import os
 import random
 import re
 from enum import IntEnum, StrEnum
-from typing import Tuple
+from typing import Any, Tuple
 
 import structlog
 import tldextract
@@ -90,6 +90,32 @@ def _build_bitwarden_custom_fields(credential: CreditCardCredential) -> list[dic
     ]
 
 
+def _build_bitwarden_login_custom_fields(credential: PasswordCredential) -> list[dict[str, str | int | None]]:
+    return [
+        {
+            "name": f"metadata_{key}",
+            "value": value,
+            "type": BITWARDEN_CUSTOM_FIELD_TYPE_HIDDEN,
+            "linkedId": None,
+        }
+        for key, value in (credential.metadata or {}).items()
+        if key and value
+    ]
+
+
+def _password_metadata_from_bitwarden_item(item: dict) -> dict[str, str] | None:
+    metadata = {
+        name.removeprefix("metadata_"): value
+        for field in item.get("fields") or []
+        if isinstance((name := field.get("name")), str)
+        and name.startswith("metadata_")
+        and name != "metadata_"
+        and isinstance((value := field.get("value")), str)
+        and value
+    }
+    return metadata or None
+
+
 def _extract_credit_card_extra_custom_field_values(item: dict) -> dict[str, str]:
     values: dict[str, str] = {}
     for field in item.get("fields") or []:
@@ -150,6 +176,7 @@ def get_list_response_item_from_bitwarden_item(item: dict) -> CredentialItem:
                 username=login["username"] or "",
                 password=login["password"] or "",
                 totp=totp,
+                metadata=_password_metadata_from_bitwarden_item(item),
             ),
             name=item["name"],
             credential_type=CredentialType.PASSWORD,
@@ -232,6 +259,22 @@ def get_bitwarden_item_overview_from_bitwarden_item(
         credential_type=credential_type,
         url=url,
     )
+
+
+# Bitwarden's per-URI match mode, as the vault stores it. A user who narrowed a URI below its default
+# is saying the credential does not belong to the whole site, and `never` says not to offer it at all.
+_BITWARDEN_URI_MATCH_DOMAIN = 0
+
+
+def _whole_site_login_uris(login_item: dict[str, Any]) -> list[str]:
+    """URIs whose match mode lets the credential stand for its whole site."""
+    return [
+        uri["uri"]
+        for uri in login_item.get("uris") or []
+        if isinstance(uri, dict)
+        and uri.get("uri")
+        and (uri.get("match") is None or uri.get("match") == _BITWARDEN_URI_MATCH_DOMAIN)
+    ]
 
 
 def is_valid_email(email: str | None) -> bool:
@@ -1088,6 +1131,7 @@ class BitwardenService:
         item_template["login"] = login_template
         item_template["collectionIds"] = [collection_id]
         item_template["organizationId"] = bw_organization_id
+        item_template["fields"] = _build_bitwarden_login_custom_fields(credential)
 
         response = await aiohttp_post(f"{BITWARDEN_SERVER_BASE_URL}/object/item", data=item_template, timeout=120)
         if not response or response.get("success") is False:
@@ -1369,7 +1413,9 @@ class BitwardenService:
                     username=login_item["username"] or "",
                     password=login_item["password"] or "",
                     totp=login_item["totp"],
+                    metadata=_password_metadata_from_bitwarden_item(response["data"]),
                 ),
+                login_uris=_whole_site_login_uris(login_item),
             )
         elif response["data"]["type"] == BitwardenItemType.CREDIT_CARD:
             name = response["data"]["name"]

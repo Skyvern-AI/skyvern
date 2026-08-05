@@ -17,9 +17,15 @@ from skyvern.exceptions import NoTOTPSecretFound, SkyvernActionFailed, WorkflowR
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import validate_download_url
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
+from skyvern.forge.sdk.api.llm.api_handler_factory import (
+    get_org_aware_primary_llm_api_handler,
+    get_org_aware_secondary_llm_api_handler,
+)
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_prompt_type_handler
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import is_unresolved_totp_value
 from skyvern.schemas.workflows import BlockStatus
@@ -27,6 +33,7 @@ from skyvern.services import script_service
 from skyvern.services.otp_service import poll_otp_value
 from skyvern.services.script_reviewer_v3.cohort import is_v3_cohort
 from skyvern.services.script_reviewer_v3.midrun import v3_review_in_flight
+from skyvern.services.script_reviewer_v3.redaction import redact_sensitive_content, redact_sensitive_value
 from skyvern.services.script_reviewer_v3.types import FailureContext, InterceptedActionType
 from skyvern.utils.css_selector import compute_selector_options
 from skyvern.utils.prompt_engine import load_prompt_with_elements, load_prompt_with_elements_tracked
@@ -65,6 +72,16 @@ SELECT_OPTION_GOAL = """- The intention to select an option: {intention}.
 
 UPLOAD_GOAL = """- The intention to upload a file: {intention}.
 - The overall goal that the user wants to achieve: {prompt}."""
+
+
+async def _resolve_assist_llm_handler(prompt_type: str, default: LLMAPIHandler) -> LLMAPIHandler:
+    """LLM_CONFIG_BY_PROMPT_TYPE payload wins; else the org-aware secondary handler, matching prior behavior."""
+    org_aware_default = get_org_aware_secondary_llm_api_handler(default=default)
+    context = skyvern_context.current()
+    distinct_id = (context.workflow_run_id or context.task_id) if context else None
+    if not context or not distinct_id:
+        return org_aware_default
+    return await resolve_prompt_type_handler(prompt_type, distinct_id, context.organization_id, org_aware_default)
 
 
 async def _get_element_id_by_selector(selector: str, page: Page) -> str | None:
@@ -236,7 +253,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
                 user_context=context.prompt,
             )
-            json_response = await app.SINGLE_CLICK_AGENT_LLM_API_HANDLER(
+            llm_handler = await _resolve_assist_llm_handler(
+                "single-click-action", app.SINGLE_CLICK_AGENT_LLM_API_HANDLER
+            )
+            json_response = await llm_handler(
                 prompt=single_click_prompt,
                 prompt_name="single-click-action",
                 step=step,
@@ -311,9 +331,11 @@ class RealSkyvernPageAi(SkyvernPageAi):
         failed_selector: str | None = None,
         block_label: str | None = None,
         recoverable_marker_id: int | None = None,
+        value_is_sensitive: bool = False,
         v3_parent_episode_id: str | None = None,
     ) -> str:
         """Input text into an element using AI to determine the value."""
+        sensitive_value = value if value_is_sensitive else None
 
         # v3 mid-run hook — see ai_click for the contract.
         # Never expose an unresolved TOTP value to a reviewer that can write its prompt value directly to the page.
@@ -326,6 +348,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 totp_identifier=totp_identifier,
                 totp_url=totp_url,
                 block_label=block_label,
+                value_is_sensitive=value_is_sensitive,
             )
             if class_a:
                 # v3 mid-run committed the fill on the live page. The
@@ -394,7 +417,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         goal=prompt,
                         data=data,
                     )
-                    json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                    llm_handler = await _resolve_assist_llm_handler(
+                        "script-generation-input-text-generatiion", app.SINGLE_INPUT_AGENT_LLM_API_HANDLER
+                    )
+                    json_response = await llm_handler(
                         prompt=script_generation_input_text_prompt,
                         prompt_name="script-generation-input-text-generatiion",
                         step=step,
@@ -430,7 +456,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         elements=element_tree,
                         local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
                     )
-                    json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                    llm_handler = await _resolve_assist_llm_handler(
+                        "single-input-action", app.SINGLE_INPUT_AGENT_LLM_API_HANDLER
+                    )
+                    json_response = await llm_handler(
                         prompt=single_input_prompt,
                         prompt_name="single-input-action",
                         step=step,
@@ -458,6 +487,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 block_label=block_label,
                 recoverable_marker_id=recoverable_marker_id,
                 v3_parent_episode_id=v3_parent_episode_id,
+                sensitive_value=sensitive_value,
             )
         else:
             if is_unresolved_totp_value(transformed_value):
@@ -508,7 +538,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         data=data,
                         goal=prompt,
                     )
-                    json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                    llm_handler = await _resolve_assist_llm_handler(
+                        "script-generation-file-url-generation", app.SINGLE_INPUT_AGENT_LLM_API_HANDLER
+                    )
+                    json_response = await llm_handler(
                         prompt=script_generation_file_url_prompt,
                         prompt_name="script-generation-file-url-generation",
                         step=step,
@@ -542,7 +575,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         elements=element_tree,
                         local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
                     )
-                    json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                    llm_handler = await _resolve_assist_llm_handler(
+                        "single-upload-action", app.SINGLE_INPUT_AGENT_LLM_API_HANDLER
+                    )
+                    json_response = await llm_handler(
                         prompt=single_upload_prompt,
                         prompt_name="single-upload-action",
                         step=step,
@@ -613,7 +649,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         elements=element_tree,
                         local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
                     )
-                    json_response = await app.SELECT_AGENT_LLM_API_HANDLER(
+                    llm_handler = await _resolve_assist_llm_handler(
+                        "single-select-action", app.SELECT_AGENT_LLM_API_HANDLER
+                    )
+                    json_response = await llm_handler(
                         prompt=single_select_prompt,
                         prompt_name="single-select-action",
                         step=step,
@@ -744,7 +783,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             )
 
         try:
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
+            json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=classify_prompt,
                 prompt_name="page-classify",
                 step=step,
@@ -791,6 +830,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         totp_identifier: str | None,
         totp_url: str | None,
         block_label: str | None,
+        value_is_sensitive: bool = False,
     ) -> tuple[str | None, bool]:
         """v3 mid-run gate. Called at the top of ai_click / ai_input_text.
 
@@ -843,7 +883,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 block_label=block_label or self.current_label or "unknown",
                 fallback_type="element",
                 script_revision_id=context.script_revision_id,
-                page_url=self.page.url,
+                page_url=redact_sensitive_content(self.page.url, value if value_is_sensitive else None),
                 reviewer_version="v3",
             )
             episode_id_for_cleanup = episode.episode_id
@@ -859,6 +899,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 page=self.page,
                 context=context,
                 episode_id=episode.episode_id,
+                value_is_sensitive=value_is_sensitive,
             )
             result = await v3_review_in_flight(fc)
             return episode.episode_id, result.decision.is_midrun_class_a()
@@ -901,6 +942,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         block_label: str | None = None,
         recoverable_marker_id: int | None = None,
         v3_parent_episode_id: str | None = None,
+        sensitive_value: str | None = None,
     ) -> None:
         """Record an element-level fallback episode when ai_click/ai_input_text fires
         because a CSS selector failed or was missing. Gated on code_version >= 2.
@@ -968,19 +1010,24 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         action_data["css_suggestion"] = f"xpath={xpath}"
             if hasattr(action, "reasoning"):
                 action_data["reasoning"] = action.reasoning
+            action_data = json.loads(
+                redact_sensitive_content(json.dumps(action_data, ensure_ascii=False), sensitive_value)
+            )
+            safe_selector = redact_sensitive_content(failed_selector or "", sensitive_value)
+            safe_intention = redact_sensitive_content(intention, sensitive_value)
 
             if recoverable_marker_id is not None and failed_selector is None:
                 error_msg = (
                     f"Proactive recovery on page.{action_type}() (marker={recoverable_marker_id}): "
                     f"generator emitted ai='proactive' (no semantic selector at codegen); "
-                    f"AI picked the element. Intention: {intention}"
+                    f"AI picked the element. Intention: {safe_intention}"
                 )
             else:
                 error_msg = (
                     f"Selector {'failed' if failed_selector else 'missing'} on page.{action_type}(), "
                     f"AI fallback succeeded. "
-                    f"Original selector: {failed_selector or '(none)'}. "
-                    f"Intention: {intention}"
+                    f"Original selector: {safe_selector or '(none)'}. "
+                    f"Intention: {safe_intention}"
                 )
             if v3_parent_episode_id:
                 # v3 mid-run Class B fall-through: episode already exists; update
@@ -1007,14 +1054,14 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     fallback_type="element",
                     script_revision_id=context.script_revision_id,
                     error_message=error_msg,
-                    page_url=self.page.url,
+                    page_url=redact_sensitive_content(self.page.url, sensitive_value),
                     agent_actions=action_data,
                 )
                 LOG.info(
                     "Recorded element fallback episode for selector failure",
                     block_label=block_label or self.current_label,
                     action_type=action_type,
-                    failed_selector=failed_selector,
+                    failed_selector=redact_sensitive_value(safe_selector, sensitive_value),
                 )
         except Exception:
             LOG.warning("Failed to record element fallback episode for selector failure", exc_info=True)
@@ -1451,7 +1498,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 organization_id=context.organization_id,
             )
 
-        result = await app.EXTRACTION_LLM_API_HANDLER(
+        result = await get_org_aware_primary_llm_api_handler(default=app.EXTRACTION_LLM_API_HANDLER)(
             prompt=extract_information_prompt,
             step=step,
             screenshots=self.scraped_page.screenshots,
@@ -1528,7 +1575,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 organization_id=context.organization_id,
             )
 
-        result = await app.EXTRACTION_LLM_API_HANDLER(
+        result = await get_org_aware_primary_llm_api_handler(default=app.EXTRACTION_LLM_API_HANDLER)(
             prompt=locate_element_prompt,
             step=step,
             screenshots=scraped_page_refreshed.screenshots,
@@ -1614,7 +1661,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
             navigation_goal=prompt,
         )
 
-        json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+        infer_llm_handler = await _resolve_assist_llm_handler(
+            "infer-action-type", app.SINGLE_INPUT_AGENT_LLM_API_HANDLER
+        )
+        json_response = await infer_llm_handler(
             prompt=infer_action_type_prompt,
             prompt_name="infer-action-type",
             step=step,
@@ -1670,6 +1720,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         else:
             LOG.warning("ai_act: unknown action type", action_type=action_type, prompt=prompt)
             return
+        llm_handler = await _resolve_assist_llm_handler(template, llm_handler)
 
         local_datetime = datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat()
         single_action_prompt = prompt_engine.load_prompt(

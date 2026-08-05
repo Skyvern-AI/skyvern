@@ -734,7 +734,12 @@ class TestCopilotContext:
 
 def _policy_ctx(resolved: list[SimpleNamespace], credential_input_kind: str = "credential_name") -> SimpleNamespace:
     return SimpleNamespace(
-        request_policy=SimpleNamespace(resolved_credentials=resolved, credential_input_kind=credential_input_kind)
+        credential_pause_connected_credential_id=None,
+        request_policy=SimpleNamespace(
+            resolved_credentials=resolved,
+            credential_input_kind=credential_input_kind,
+            live_page_admitted_urls={},
+        ),
     )
 
 
@@ -779,6 +784,16 @@ def test_record_approved_credentials_survive_prompt_sanitization() -> None:
 
     ids = [record.credential_id for record in StructuredContext.from_json_str(sanitized).approved_credentials]
     assert ids == ["cred_portal"]
+
+
+def test_a_live_page_grant_does_not_carry_into_a_later_turn() -> None:
+    """The evidence is a page a later turn has not seen, whichever seam admitted it."""
+    ctx = _policy_ctx([SimpleNamespace(credential_id="cred_portal", name="mock-portal-login")])
+    ctx.request_policy.live_page_admitted_urls = {"cred_portal": "https://portal.example.com/login"}
+
+    raw = record_approved_credentials_in_global_llm_context(ctx, None)
+
+    assert StructuredContext.from_json_str(raw).approved_credentials == []
 
 
 def test_record_approved_credentials_no_ops_without_resolved() -> None:

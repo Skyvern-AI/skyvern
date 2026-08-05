@@ -662,11 +662,12 @@ Use Cases:
 - Parse a PDF invoice into structured fields
 - Extract rows from a CSV file
 - Read Excel sheets for downstream processing
-- Unzip a ZIP archive of PDFs and extract structured data across all of them
+- Unzip a ZIP archive (always outputs [{file_name, file_path, file_size}]; json_schema is ignored for ZIPs) and parse each extracted file in a loop
 
 ZIP behavior:
-- Without json_schema: outputs the list of extracted files as [{file_name, file_path, file_size}]. Loop over the output and pass each file_path as the file_url of another file_url_parser block to parse files individually.
-- With json_schema: parses every supported file inside the archive (CSV/Excel/PDF/image/DOCX) and extracts against the schema from the combined content.
+- A File Parser pointed at a ZIP always unzips it and outputs [{file_name, file_path, file_size}].
+- json_schema is ignored for ZIP archives.
+- To extract structured data from contained files, use File Parser (ZIP to file list) -> for-loop over the output -> File Parser for each run-local file_path, passed as file_url.
 
 Example:
 blocks:

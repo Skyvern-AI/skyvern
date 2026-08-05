@@ -6,7 +6,6 @@ import {
   DownloadIcon,
   Pencil2Icon,
   PlayIcon,
-  ReloadIcon,
   TokensIcon,
 } from "@radix-ui/react-icons";
 import { FolderIcon } from "@/components/icons/FolderIcon";
@@ -16,15 +15,7 @@ import {
   RowActionsKebab,
   type RowActionItem,
 } from "@/components/RowActions";
-import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { toast } from "@/components/ui/use-toast";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { useUpdateWorkflowFolderMutation } from "../hooks/useFolderMutations";
@@ -253,7 +244,7 @@ function WorkflowRowActions({
       icon: <GarbageIcon className="mr-2 h-4 w-4 text-destructive" />,
       destructive: true,
       disabled: isMultiSelect,
-      dialogTrigger: true,
+      onSelect: () => setDeleteOpen(true),
     },
   );
 
@@ -267,14 +258,7 @@ function WorkflowRowActions({
     );
 
   return (
-    <Dialog
-      open={deleteOpen}
-      onOpenChange={(open) => {
-        if (!isDeleting) {
-          setDeleteOpen(open);
-        }
-      }}
-    >
+    <>
       <RowActionsContextMenu
         items={items}
         onOpenChange={(open) => {
@@ -285,41 +269,28 @@ function WorkflowRowActions({
       >
         {children(kebab)}
       </RowActionsContextMenu>
-      <DialogContent onCloseAutoFocus={(e) => e.preventDefault()}>
-        <DialogHeader>
-          <DialogTitle>Are you sure?</DialogTitle>
-          <DialogDescription>
+      <ConfirmDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        title="Delete agent?"
+        description={
+          <p>
             The agent{" "}
             <span className="font-semibold text-primary">{workflow.title}</span>{" "}
-            will be deleted.
-          </DialogDescription>
-        </DialogHeader>
-        <DialogFooter>
-          <Button
-            variant="secondary"
-            onClick={() => setDeleteOpen(false)}
-            disabled={isDeleting}
-          >
-            Cancel
-          </Button>
-          <Button
-            variant="destructive"
-            onClick={() =>
-              deleteWorkflow({
-                onSuccess: () => {
-                  setDeleteOpen(false);
-                  onDeleted?.(workflow.workflow_permanent_id);
-                },
-              })
-            }
-            disabled={isDeleting}
-          >
-            {isDeleting && <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />}
-            Delete
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+            will be permanently deleted.
+          </p>
+        }
+        isPending={isDeleting}
+        onConfirm={() =>
+          deleteWorkflow({
+            onSuccess: () => {
+              setDeleteOpen(false);
+              onDeleted?.(workflow.workflow_permanent_id);
+            },
+          })
+        }
+      />
+    </>
   );
 }
 

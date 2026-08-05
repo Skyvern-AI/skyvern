@@ -54,9 +54,6 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     VerificationResult,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
-    CopilotBuiltUnverified,
-    _check_enforcement,
-    built_complete_without_evaluated_outcome,
     built_unverified_repair_inert_context,
     verified_goal_claim_authorized,
     verified_goal_satisfied_context,
@@ -329,6 +326,17 @@ def test_reconcile_no_criteria_anywhere_is_noop() -> None:
                 ),
             ),
             id="antecedent-family",
+        ),
+        pytest.param(
+            (
+                CompletionCriterion(
+                    id="__copilot_requested_output__output_visitors_last_7_days",
+                    outcome="the number of visitors in the last 7 days is output",
+                    output_path="output.visitors_last_7_days",
+                    requested_output_label="visitors",
+                ),
+            ),
+            id="requested-output-label",
         ),
     ],
 )
@@ -1646,18 +1654,6 @@ def _no_repair_unverified_contract() -> DiagnosisRepairContract:
             completion_contract_satisfied=False,
         ),
     )
-
-
-def test_claim_closure_turn_still_ends_but_claim_downgrades() -> None:
-    ctx = _legacy_verified_ctx()
-
-    assert ctx.completion_verification_result is None
-    assert verified_goal_satisfied_context(ctx) is False
-    assert verified_goal_claim_authorized(ctx) is False
-    assert built_complete_without_evaluated_outcome(ctx) is True
-
-    with pytest.raises(CopilotBuiltUnverified):
-        _check_enforcement(ctx)
 
 
 def test_structural_abstention_no_repair_terminalizes_without_authorizing_success_claim() -> None:

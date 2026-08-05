@@ -36,6 +36,7 @@ function WorkflowSettingsBlockFormBody({
       aiFallback: data.aiFallback,
       enableSelfHealing: data.enableSelfHealing,
       scriptCacheKey: data.scriptCacheKey,
+      maskSecrets: data.maskSecrets,
       runSequentially: data.runSequentially,
       sequentialKey: data.sequentialKey,
       persistBrowserSession: data.persistBrowserSession,

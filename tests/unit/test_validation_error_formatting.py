@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
+import pytest
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ValidationError, field_validator
+from starlette.requests import Request
 
-from skyvern.forge.api_app import format_validation_errors
+from skyvern.forge.api_app import create_api_app, format_validation_errors
 
 
 class _DummyModel(BaseModel):
@@ -126,3 +130,69 @@ class TestFormatValidationErrors:
         result = format_validation_errors(mock_exc)
         assert result == "email: field required"
         assert "body" not in result
+
+
+@pytest.mark.asyncio
+async def test_request_validation_handler_does_not_echo_input() -> None:
+    secret_input = "submitted-private-key-material"
+    secret_context = "submitted-context-material"
+    exc = RequestValidationError(
+        [
+            {
+                "type": "value_error",
+                "loc": ("body", "credential", "secret_value"),
+                "msg": "Value error, invalid secret value",
+                "input": secret_input,
+                "ctx": {"error": ValueError(secret_context), "submitted": secret_context},
+            }
+        ]
+    )
+    app = create_api_app()
+
+    handler = app.exception_handlers[RequestValidationError]
+    request = MagicMock(spec=Request)
+    request.url.path = "/v1/credentials/cred_x/passkey"
+    response = await handler(request, exc)
+    response_body = json.loads(response.body)
+
+    assert response.status_code == 422
+    assert secret_input not in response.body.decode()
+    assert secret_context not in response.body.decode()
+    assert isinstance(response_body["detail"], list)
+    assert response_body == {
+        "detail": [
+            {
+                "loc": ["body", "credential", "secret_value"],
+                "msg": "Value error, invalid secret value",
+                "type": "value_error",
+            }
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_request_validation_handler_preserves_input_for_non_credential_routes() -> None:
+    echoed_input = "workflow-parameter-value"
+    exc = RequestValidationError(
+        [
+            {
+                "type": "less_than",
+                "loc": ("body", "parameters", "count"),
+                "msg": "Input should be less than 3",
+                "input": echoed_input,
+                "ctx": {"lt": 3},
+            }
+        ]
+    )
+    app = create_api_app()
+
+    handler = app.exception_handlers[RequestValidationError]
+    request = MagicMock(spec=Request)
+    request.url.path = "/v1/workflows"
+    response = await handler(request, exc)
+    response_body = json.loads(response.body)
+
+    assert response.status_code == 422
+    detail = response_body["detail"][0]
+    assert detail["input"] == echoed_input
+    assert detail["ctx"] == {"lt": 3}

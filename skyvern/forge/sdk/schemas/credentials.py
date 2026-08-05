@@ -33,6 +33,7 @@ class TotpType(StrEnum):
     AUTHENTICATOR = "authenticator"
     EMAIL = "email"
     TEXT = "text"
+    PASSKEY = "passkey"
     NONE = "none"
 
 
@@ -125,6 +126,16 @@ class PasswordCredential(BaseModel):
         description="Identifier (email or phone number) used to fetch TOTP codes",
         examples=["user@example.com", "+14155550123"],
     )
+    metadata: dict[str, str] | None = Field(
+        default=None,
+        description="Optional additional password credential metadata fields",
+    )
+
+    @model_validator(mode="after")
+    def normalize_empty_optional_fields(self) -> Self:
+        if self.metadata == {}:
+            self.metadata = None
+        return self
 
 
 class NonEmptyPasswordCredential(PasswordCredential):
@@ -205,6 +216,10 @@ class CredentialItem(BaseModel):
     credential: PasswordCredential | CreditCardCredential | SecretCredential = Field(
         ..., description="The actual credential data"
     )
+    login_uris: list[str] = Field(
+        default_factory=list,
+        description="Sites the vault item itself names, as saved by the user who stored it",
+    )
 
 
 class CreateCredentialRequest(BaseModel):
@@ -284,6 +299,7 @@ class CredentialResponse(BaseModel):
         default=None,
         description="Whether the user intends to save a browser session, regardless of test outcome",
     )
+    run_sequentially: bool = False
     folder_id: str | None = Field(
         default=None,
         description="ID of the credential folder this credential belongs to, if any",
@@ -383,6 +399,7 @@ class Credential(BaseModel):
         default=False,
         description="Whether the user intends to save a browser session, regardless of test outcome",
     )
+    run_sequentially: bool = False
     folder_id: str | None = Field(
         default=None,
         description="ID of the credential folder this credential belongs to, if any",
@@ -433,6 +450,15 @@ class UpdateCredentialRequest(BaseModel):
     save_browser_session_intent: bool | None = Field(
         default=None,
         description="Whether the user intends to save a browser session, regardless of test outcome",
+    )
+    run_sequentially: bool | None = Field(
+        default=None,
+        description=(
+            "Whether runs using this credential are serialized so at most one runs at a time. "
+            "Serialization applies only to runs created after this flag is enabled: runs already "
+            "queued or running when it is turned on are not stamped and are not serialized against "
+            "later runs. Drain in-flight runs on this credential before enabling for full protection."
+        ),
     )
     proxy_location: ProxyLocationInput = Field(
         default=None,

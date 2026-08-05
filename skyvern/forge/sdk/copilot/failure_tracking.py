@@ -49,8 +49,6 @@ ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY = "ANTI_BOT_CHALLENGE"
 # Stable active-run terminal evidence identifiers. The category is stored in
 # tool result ``failure_categories``; the reason code is stored on blocker
 # signals that convert that tool result into product-safe final copy.
-ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY = "ACTIVE_RUN_TERMINAL_EVIDENCE"
-ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE = "tool_error_active_run_terminal_evidence"
 
 _ROOT_CAUSE_CATEGORY_ALIASES = {
     **{alias: ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY for alias in ANTI_BOT_CHALLENGE_ALIAS_CATEGORIES},
@@ -167,6 +165,28 @@ def _selector_from_text(text: str) -> tuple[str, str]:
         name = _normalize_signature_text(role_match.group("name") or "")
         return "role", f"{role}:{name}" if name else role
     return "", ""
+
+
+_CSS_SELECTOR_KIND = "locator"
+
+
+def selector_identity_from_failure(text: str) -> str:
+    kind, value = _selector_from_text(text or "")
+    # "selector" and "locator" are the same CSS string under two spellings; the code side only ever
+    # spells it "locator", so a failure that named it "selector" must normalize or never match.
+    return f"{_CSS_SELECTOR_KIND if kind == 'selector' else kind}:{value}" if kind else ""
+
+
+def selector_identities_in_text(text: str) -> set[str]:
+    """Every locator identity in ``text``, normalized to match ``selector_identity_from_failure``."""
+    identities: set[str] = set()
+    for match in _LOCATOR_RE.finditer(text or ""):
+        identities.add(f"{_CSS_SELECTOR_KIND}:{_normalize_signature_text(match.group('selector'))}")
+    for match in _ROLE_RE.finditer(text or ""):
+        role = _normalize_signature_text(match.group("role"))
+        name = _normalize_signature_text(match.group("name") or "")
+        identities.add(f"role:{role}:{name}" if name else f"role:{role}")
+    return identities
 
 
 def _error_class_from_text(text: str) -> str:

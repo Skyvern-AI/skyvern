@@ -28,7 +28,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _response_coverage_nudge,
 )
 from skyvern.forge.sdk.copilot.loop_detection import tool_step_identity
-from skyvern.forge.sdk.copilot.output_contracts import OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE
 from skyvern.forge.sdk.copilot.output_policy import (
     ACTUATION_OBLIGATION_BROWSER_ACTION_KEY,
     ACTUATION_OBLIGATION_STEER_REASON_CODE,
@@ -404,35 +403,37 @@ def test_does_not_infer_arbitrary_prose_secret_echoes(user_response: str) -> Non
     assert verdict.allowed
 
 
-def test_rejects_raw_secret_in_workflow_yaml() -> None:
+def test_rejects_raw_secret_in_the_reply() -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(),
-        workflow_yaml=_workflow_yaml(navigation_goal="Log in with password: hunter2."),
+        user_response="Log in with password: hunter2.",
     )
 
     assert not verdict.allowed
     assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
 
 
-def test_rejects_raw_secret_in_structured_tool_arguments() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        tool_arguments={"workflow_yaml": {"navigation_goal": "Type password: hunter2 into the field."}},
-    )
+def test_a_draft_carrying_the_same_value_is_not_a_disclosure_surface() -> None:
+    # Persistence scrubbing and credential rebinding own what reaches storage. Refusing the draft
+    # only refused the user their own workflow, and judged the YAML encoding rather than the value.
+    for draft_kwargs in (
+        {"workflow_yaml": _workflow_yaml(navigation_goal="Log in with password: hunter2.")},
+        {"tool_arguments": {"workflow_yaml": {"navigation_goal": "Type password: hunter2 into the field."}}},
+    ):
+        verdict = evaluate_output_policy(request_policy=_policy(), **draft_kwargs)
 
-    assert not verdict.allowed
-    assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+        assert verdict.allowed, draft_kwargs
 
 
 class TestSanctionedSecretReferenceIdiom:
     """`password = parameters[...]` / attribute-chain reads are references to bound
-    values, not leaks — the code-only authoring idiom must pass the syntactic
-    backstop while literal values keep blocking."""
+    values, not leaks — quoting the code-only authoring idiom back to the user must pass the
+    syntactic backstop while literal values keep blocking."""
 
     def test_allows_parameters_subscript_assignment_in_tool_arguments(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={"workflow_yaml": 'code: |\n  password = parameters["login_credential"]'},
+            user_response=('code: |\n  password = parameters["login_credential"]'),
         )
 
         assert verdict.allowed
@@ -440,7 +441,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_allows_credential_attribute_read_in_workflow_yaml(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            workflow_yaml=(
+            user_response=(
                 "code: |\n"
                 "  username = login_credential.username\n"
                 "  password = login_credential.password\n"
@@ -453,7 +454,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_allows_awaited_credential_otp_assignment_in_workflow_yaml(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            workflow_yaml=(
+            user_response=(
                 'code: |\n  passcode = await login_credentials.otp()\n  await page.locator("#code").fill(passcode)\n'
             ),
         )
@@ -463,7 +464,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_allows_keyword_secret_reference_to_awaited_credential_otp_in_tool_arguments(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={"workflow_yaml": "code: |\n  token = await login_credential.otp()"},
+            user_response=("code: |\n  token = await login_credential.otp()"),
         )
 
         assert verdict.allowed
@@ -471,9 +472,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_rejects_literal_secret_even_when_same_line_has_credential_reference(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={
-                "workflow_yaml": "code: |\n  password = 'hunter2'; password_ref = login_credential.password"
-            },
+            user_response="code: |\n  password = 'hunter2'; password_ref = login_credential.password",
         )
 
         assert not verdict.allowed
@@ -482,7 +481,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_allows_str_wrapped_parameter_reference(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={"workflow_yaml": 'code: |\n  token = str(parameters.get("api_token"))'},
+            user_response=('code: |\n  token = str(parameters.get("api_token"))'),
         )
 
         assert verdict.allowed
@@ -495,7 +494,7 @@ class TestSanctionedSecretReferenceIdiom:
         ):
             verdict = evaluate_output_policy(
                 request_policy=_policy(),
-                tool_arguments={"workflow_yaml": f"code: |\n  password = {rhs}"},
+                user_response=(f"code: |\n  password = {rhs}"),
             )
 
             assert not verdict.allowed, rhs
@@ -504,7 +503,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_still_rejects_awaited_non_credential_secret_source(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={"workflow_yaml": "code: |\n  passcode = await page.locator('#code').inner_text()"},
+            user_response=("code: |\n  passcode = await page.locator('#code').inner_text()"),
         )
 
         assert not verdict.allowed
@@ -513,7 +512,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_allows_keyword_argument_reference_with_closing_paren(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={"workflow_yaml": 'code: |\n  await do_login(password=parameters["cred"])'},
+            user_response=('code: |\n  await do_login(password=parameters["cred"])'),
         )
 
         assert verdict.allowed
@@ -522,7 +521,7 @@ class TestSanctionedSecretReferenceIdiom:
         # A dotted literal (JWT-shaped) must not pass as an "attribute chain".
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={"workflow_yaml": "code: |\n  token = eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig"},
+            user_response=("code: |\n  token = eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig"),
         )
 
         assert not verdict.allowed
@@ -531,7 +530,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_still_rejects_dotted_literal_not_ending_in_credential_field(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={"workflow_yaml": "code: |\n  password = admin.password123"},
+            user_response=("code: |\n  password = admin.password123"),
         )
 
         assert not verdict.allowed
@@ -540,7 +539,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_still_rejects_quoted_literal_assignment(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={"workflow_yaml": 'code: |\n  password = "hunter2"'},
+            user_response=('code: |\n  password = "hunter2"'),
         )
 
         assert not verdict.allowed
@@ -549,7 +548,94 @@ class TestSanctionedSecretReferenceIdiom:
     def test_still_rejects_bare_literal_assignment(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={"workflow_yaml": "password: hunter2"},
+            user_response=("password: hunter2"),
+        )
+
+        assert not verdict.allowed
+        assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+    def test_allows_lexical_token_parsed_out_of_page_text(self) -> None:
+        for rhs in (
+            "parts[0]",
+            "text.split(' logs found')[0]",
+            "m.group(1)",
+        ):
+            verdict = evaluate_output_policy(
+                request_policy=_policy(),
+                user_response=(f"code: |\n  first_token = {rhs}"),
+            )
+
+            assert verdict.allowed, rhs
+
+    def test_verdict_does_not_depend_on_how_the_yaml_escapes_the_code(self) -> None:
+        block_scalar = 'code: |\n  _entry = page.locator("#password")\n  count_token = evidence_text.split(" ")[0]\n'
+        escaped_scalar = (
+            'code: "_entry = page.locator(\\"#password\\")\\ncount_token = evidence_text.split(\\" \\")[0]"'
+        )
+
+        for workflow_yaml in (block_scalar, escaped_scalar):
+            verdict = evaluate_output_policy(
+                request_policy=_policy(),
+                user_response=(workflow_yaml),
+            )
+
+            assert verdict.allowed, workflow_yaml
+
+    def test_allows_a_newline_literal_the_block_scalar_keeps_as_code_data(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            user_response=('code: |\n  count_token = text.split("\\n")[0]\n'),
+        )
+
+        assert verdict.allowed
+
+    def test_a_value_shaped_secret_inside_a_call_argument_still_blocks(self) -> None:
+        # The lexical-token exemption clears only the keyword-assignment match; the value-shaped
+        # patterns scan the whole text independently, so hiding a real secret as a call argument
+        # does not ride out on the exemption.
+        for rhs in (
+            'cache.get("sk-abcdefghijklmnopqrstuvwx")',
+            'store.lookup("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27u")',
+        ):
+            verdict = evaluate_output_policy(
+                request_policy=_policy(),
+                user_response=f"code: |\n  token = {rhs}",
+            )
+
+            assert not verdict.allowed, rhs
+            assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+    def test_still_rejects_literal_secret_under_a_lexical_token_name(self) -> None:
+        # The literal deliberately contains no secret keyword, so only the token arm can reject it.
+        for lhs in ("first_token", "result_token", "token"):
+            verdict = evaluate_output_policy(
+                request_policy=_policy(),
+                user_response=(f"code: |\n  {lhs} = 'ghp_abcdefghijklmnopqrstuvwxyz'"),
+            )
+
+            assert not verdict.allowed, lhs
+            assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+    def test_still_rejects_a_literal_secret_wrapped_to_look_parsed(self) -> None:
+        for rhs in (
+            'identity("ghp_abcdefghijklmnopqrstuvwxyz")',
+            '("ghp_abcdefghijklmnopqrstuvwxyz", parts)[0]',
+            '["ghp_abcdefghijklmnopqrstuvwxyz"][0]',
+            '"ghp_abcdefghijklmnopqrstuvwxyz".strip()',
+            'str("ghp_abcdefghijklmnopqrstuvwxyz")',
+        ):
+            verdict = evaluate_output_policy(
+                request_policy=_policy(),
+                user_response=(f"code: |\n  first_token = {rhs}"),
+            )
+
+            assert not verdict.allowed, rhs
+            assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+    def test_still_rejects_page_read_into_an_unambiguous_secret_name(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            user_response=("code: |\n  password_token = await page.locator('#p').inner_text()"),
         )
 
         assert not verdict.allowed
@@ -558,9 +644,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_still_rejects_email_password_pair_next_to_reference_idiom(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={
-                "workflow_yaml": 'code: |\n  password = parameters["cred"]\nnotes: qa.user@example.test:FakePass123!'
-            },
+            user_response=('code: |\n  password = parameters["cred"]\nnotes: qa.user@example.test:FakePass123!'),
         )
 
         assert not verdict.allowed
@@ -575,12 +659,10 @@ class TestSanctionedSecretReferenceIdiom:
         assert _raw_secret_detected('password = parameters["cred"]')
 
 
-def test_rejects_bulk_colon_delimited_credentials_in_tool_arguments() -> None:
+def test_rejects_bulk_colon_delimited_credentials_in_the_reply() -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(),
-        tool_arguments={
-            "parameters": {"account_list": "alpha@example.test:FakePass123!\nbeta@example.test:AnotherFakePass456!"}
-        },
+        user_response="alpha@example.test:FakePass123!\nbeta@example.test:AnotherFakePass456!",
     )
 
     assert not verdict.allowed
@@ -609,10 +691,10 @@ def test_does_not_hard_block_on_prior_global_context_secret() -> None:
     assert verdict.allowed
 
 
-def test_rejects_raw_secret_even_when_workflow_contains_jinja_placeholder() -> None:
+def test_rejects_raw_secret_in_a_reply_that_also_contains_a_jinja_placeholder() -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(),
-        workflow_yaml="navigation_goal: Use {{ parameters.username }} and password: hunter2.",
+        user_response="Use {{ parameters.username }} and password: hunter2.",
     )
 
     assert not verdict.allowed
@@ -700,19 +782,6 @@ def test_url_clarification_does_not_trigger_output_field_confirmation_guard() ->
     assert OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION not in verdict.reason_codes
 
 
-def test_classifies_unbacked_workflow_delivery_claim() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        user_response="Here's the workflow.",
-        has_workflow_proposal=False,
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM in verdict.reason_codes
-    assert OutputPolicyReason.MISSING_PROPOSAL_STATE in verdict.reason_codes
-
-
 def test_flags_block_yaml_pasted_into_user_response() -> None:
     user_response = (
         "I've now updated the workflow to also accept the form's URL as a parameter, named `form_url`. "
@@ -765,47 +834,6 @@ def test_allows_workflow_delivery_language_after_failed_workflow_attempt() -> No
         user_response="I created a draft workflow and tested it, but the test failed.",
         has_workflow_proposal=False,
         workflow_attempted=True,
-    )
-
-    assert verdict.allowed
-
-
-def test_classifies_missing_unvalidated_proposal_affordance() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        user_response="I drafted the workflow but did not finish testing.",
-        has_workflow_proposal=True,
-        unvalidated=True,
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE in verdict.reason_codes
-
-
-def test_rejects_incidental_accept_discard_language_for_unvalidated_proposal() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        user_response="I accept that the test failed, but I can't discard the login block without more info.",
-        has_workflow_proposal=True,
-        unvalidated=True,
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE in verdict.reason_codes
-
-
-def test_allows_unvalidated_proposal_affordance_copy() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        user_response=(
-            "Use Review to inspect it, Accept to save it, or Reject to discard it. "
-            "It has not been tested or verified end-to-end."
-        ),
-        has_workflow_proposal=True,
-        unvalidated=True,
     )
 
     assert verdict.allowed
@@ -1493,7 +1521,7 @@ def test_actuation_obligation_unrelated_prior_steer_stays_recoverable() -> None:
     assert evaluation.reason_code == ACTUATION_OBLIGATION_STEER_REASON_CODE
 
 
-@pytest.mark.parametrize("mode", [TurnIntentMode.DOCS_ANSWER, TurnIntentMode.DIAGNOSE])
+@pytest.mark.parametrize("mode", [TurnIntentMode.ANSWER, TurnIntentMode.DIAGNOSE])
 def test_actuation_obligation_allows_non_actuation_intents(mode: TurnIntentMode) -> None:
     evaluation = evaluate_actuation_obligation(
         turn_intent=TurnIntent(mode=mode, authority=TurnIntentAuthority(may_update_workflow=False)),
@@ -1606,26 +1634,6 @@ def test_sdk_output_guardrail_allows_structural_blocker_reason() -> None:
     assert response_type == "REPLY"
     assert verdict.allowed
     assert diagnostics["cannot_act_reason"] == "missing_field_value"
-
-
-def test_sdk_output_guardrail_allows_explicit_structural_blocker_reason_code() -> None:
-    ctx = _ctx(turn_intent=_browser_actuation_intent())
-    ctx.blocker_signal = CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text="Report the unavailable output source.",
-        user_facing_reason="The values are not observable on this page.",
-        recovery_hint="report_blocker_to_user",
-        internal_reason_code=OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
-    )
-
-    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
-        ctx,
-        {"type": "REPLY", "user_response": "The values are not observable on this page."},
-    )
-
-    assert response_type == "REPLY"
-    assert verdict.allowed
-    assert diagnostics["cannot_act_reason"] == "structural_blocker"
 
 
 def test_sdk_output_guardrail_rejects_generic_report_blocker_reason() -> None:
@@ -1777,7 +1785,7 @@ def test_sdk_output_guardrail_allows_unknown_click_with_authority_denied_blocker
 @pytest.mark.parametrize(
     ("reason", "expected_terms"),
     [
-        (OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE, ("credential", "confirm")),
+        (OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE, ("credential", "credential id")),
         (OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED, ("credential", "url", "re-select")),
     ],
 )
@@ -1893,7 +1901,7 @@ workflow_definition:
 
     assert result.response_type == "ASK_QUESTION"
     assert "credential" in result.user_response.lower()
-    assert "confirm" in result.user_response.lower()
+    assert "credential id" in result.user_response.lower()
     assert "I could not safely return" not in result.user_response
 
 
@@ -2232,34 +2240,6 @@ workflow_definition:
     assert ctx.block_observation_refs == {}
 
 
-@pytest.mark.asyncio
-async def test_update_workflow_rejects_raw_secret_before_processing(monkeypatch) -> None:
-    from skyvern.forge.sdk.copilot.tools import _update_workflow
-
-    process_mock = MagicMock()
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml", process_mock)
-
-    result = await _update_workflow(
-        {
-            "workflow_yaml": """
-workflow_definition:
-  blocks:
-    - block_type: navigation
-      label: login
-      navigation_goal: Type password: hunter2 into the password field.
-"""
-        },
-        _ctx(),
-        allow_missing_credentials=True,
-    )
-
-    assert result["ok"] is False
-    assert "raw_secret_leak" in result["error"]
-    assert "<key>.password" in result["error"]
-    assert "do not split, concatenate, or obfuscate" in result["error"]
-    process_mock.assert_not_called()
-
-
 def test_inline_replace_workflow_rejects_raw_secret_before_processing(monkeypatch) -> None:
     process_mock = MagicMock()
     monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml", process_mock)
@@ -2355,27 +2335,6 @@ def test_translate_scrubs_late_block_running_leak_and_preserves_draft() -> None:
     assert agent_result.proposal_disposition == "review_untested"
     assert "Do NOT retry" not in agent_result.user_response
     assert "workflow draft is still saved" in agent_result.user_response
-
-
-def test_timeout_exit_scrubs_recorded_late_block_running_leak_and_preserves_draft() -> None:
-    ctx = _ctx()
-    saved_workflow = object()
-    ctx.last_workflow = saved_workflow
-    ctx.last_workflow_yaml = "workflow_definition:\n  blocks: []\n"
-    ctx.last_update_block_count = 5
-    ctx.last_test_ok = False
-    ctx.last_test_failure_reason = (
-        "Less than 90 seconds remain in this Copilot turn after the previous workflow run failed. "
-        "Do NOT retry block-running tools."
-    )
-
-    agent_result = agent_module._build_timeout_exit_result(ctx, global_llm_context=None)
-
-    assert agent_result.updated_workflow is saved_workflow
-    assert agent_result.clear_proposed_workflow is False
-    assert agent_result.proposal_disposition == "review_untested"
-    assert "Do NOT retry" not in agent_result.user_response
-    assert "draft workflow proposal" in agent_result.user_response
 
 
 def test_translate_to_agent_result_rewrites_unbacked_workflow_claim() -> None:
@@ -2761,25 +2720,6 @@ def test_translate_to_agent_result_rewrites_block_yaml_when_workflow_attached() 
     assert agent_result.updated_workflow is workflow
 
 
-def test_translate_to_agent_result_adds_unvalidated_affordance() -> None:
-    workflow = SimpleNamespace(name="draft")
-    result = _fake_run_result({"type": "REPLY", "user_response": "I drafted the workflow."})
-
-    agent_result = asyncio.run(
-        agent_module._translate_to_agent_result(
-            result,
-            _ctx(last_workflow=workflow, last_workflow_yaml="title: draft", last_test_ok=None),
-            global_llm_context=None,
-            chat_request=_chat_request(),
-            organization_id="org-1",
-        )
-    )
-
-    assert agent_result.updated_workflow is workflow
-    assert "Accept to save" in agent_result.user_response
-    assert "Reject to discard" in agent_result.user_response
-
-
 def _two_credential_workflow_yaml() -> str:
     return """
 workflow_definition:
@@ -2935,18 +2875,6 @@ def test_genuine_attempt_true_suppresses_avoidable_backstop() -> None:
     assert OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION not in verdict.reason_codes
 
 
-def test_genuine_attempt_true_suppresses_unbacked_delivery_claim() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        user_response="Here's the workflow.",
-        has_workflow_proposal=False,
-        workflow_attempted=True,
-    )
-
-    assert OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM not in verdict.reason_codes
-
-
 class _CaptureSentinel(Exception):
     pass
 
@@ -2983,23 +2911,6 @@ def test_build_exit_result_passes_genuine_predicate_as_workflow_attempted(monkey
     assert captured["derive"] is True
     assert captured["evaluate"] is True
     assert captured["evaluate"] == ctx.has_genuine_workflow_attempt()
-
-
-def test_watchdog_run_id_only_counts_as_genuine_and_suppresses_unbacked() -> None:
-    ctx = _run_id_only_ctx()
-    legacy_two_field_attempted = ctx.last_update_block_count is not None or ctx.last_test_ok is not None
-    assert legacy_two_field_attempted is False
-    assert ctx.has_genuine_workflow_attempt() is True
-
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        user_response="Here's the workflow.",
-        has_workflow_proposal=False,
-        workflow_attempted=ctx.has_genuine_workflow_attempt(),
-    )
-
-    assert OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM not in verdict.reason_codes
 
 
 def test_agent_no_longer_derives_workflow_attempted_from_two_marker_fields() -> None:
@@ -3177,7 +3088,6 @@ def test_avoidable_ask_with_co_firing_secret_leak_is_not_deferred() -> None:
 
 _AUTHOR_TIME_KEEP_HARD_REASONS = frozenset(
     {
-        OutputPolicyReason.RAW_SECRET_LEAK,
         OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE,
         OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
     }
@@ -3194,12 +3104,11 @@ _AUTHORING_SEAM_REFUSAL_SOURCES: dict[str, str] = {
     "code_safety": CODE_SAFETY_BLOCK_ID,
     "credential_scout": CREDENTIAL_SCOUT_BLOCK_ID,
     "banned_blocks": BANNED_BLOCKS_BLOCK_ID,
-    "raw_secret_leak": CREDENTIAL_SCOUT_BLOCK_ID,
+    "raw_secret_leak": _FINDING,
     "request_policy_clarification_bypass": _FINDING,
     "unapproved_credential_reference": CREDENTIAL_SCOUT_BLOCK_ID,
     "credential_scope_broadened": CREDENTIAL_SCOUT_BLOCK_ID,
     "unbacked_workflow_delivery_claim": _FINDING,
-    "missing_unvalidated_proposal_affordance": _FINDING,
     "missing_proposal_state": _FINDING,
     "persistence_state_mismatch": _FINDING,
     "internal_tool_instruction_leak": _FINDING,
@@ -3252,13 +3161,13 @@ def test_tool_input_disposition_matches_classification_table(reason: OutputPolic
 
 def test_hard_reason_still_blocks_when_co_firing_with_a_demoted_reason() -> None:
     verdict = OutputPolicyVerdict(
-        reason_codes=[OutputPolicyReason.WORKFLOW_YAML_IN_REPLY, OutputPolicyReason.RAW_SECRET_LEAK]
+        reason_codes=[OutputPolicyReason.WORKFLOW_YAML_IN_REPLY, OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED]
     )
 
     steered = demote_author_time_steer_reasons(verdict)
 
     assert verdict.allowed is False
-    assert verdict.reason_codes == [OutputPolicyReason.RAW_SECRET_LEAK]
+    assert verdict.reason_codes == [OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED]
     assert steered == [OutputPolicyReason.WORKFLOW_YAML_IN_REPLY]
 
 

@@ -773,3 +773,277 @@ async def test_mark_active_mismatched_client_as_error_with_no_new_client_flips_a
         "gcred_bound_2": STATE_ERROR,
         "gcred_unbound": STATE_ACTIVE,
     }
+
+
+@pytest.mark.asyncio
+async def test_update_email_address_only_if_null_does_not_overwrite_existing_address(
+    repo: GoogleOAuthRepository,
+    engine: AsyncEngine,
+) -> None:
+    modified_at = datetime.datetime(2026, 7, 30, 12, 0, 0)
+    async with engine.begin() as conn:
+        await conn.execute(
+            GoogleOAuthCredentialModel.__table__.insert().values(
+                id="gcred_email",
+                organization_id="o_test",
+                credential_name="Default",
+                state=STATE_ACTIVE,
+                email_address="fresh@example.test",
+                created_at=modified_at,
+                modified_at=modified_at,
+            )
+        )
+
+    updated = await repo.update_email_address(
+        organization_id="o_test",
+        credential_id="gcred_email",
+        email_address="stale@example.test",
+        only_if_null=True,
+    )
+
+    async with engine.connect() as conn:
+        stored = (
+            await conn.execute(
+                select(
+                    GoogleOAuthCredentialModel.email_address,
+                    GoogleOAuthCredentialModel.modified_at,
+                ).where(GoogleOAuthCredentialModel.id == "gcred_email")
+            )
+        ).one()
+
+    assert stored.email_address == "fresh@example.test"
+    assert stored.modified_at == modified_at
+    assert updated is False
+
+
+@pytest.mark.asyncio
+async def test_update_email_address_authoritative_write_preserves_cas_version(
+    repo: GoogleOAuthRepository,
+    engine: AsyncEngine,
+) -> None:
+    modified_at = datetime.datetime(2026, 7, 30, 12, 0, 0)
+    async with engine.begin() as conn:
+        await conn.execute(
+            GoogleOAuthCredentialModel.__table__.insert().values(
+                id="gcred_email",
+                organization_id="o_test",
+                credential_name="Default",
+                state=STATE_ACTIVE,
+                email_address="old@example.test",
+                created_at=modified_at,
+                modified_at=modified_at,
+            )
+        )
+
+    updated = await repo.update_email_address(
+        organization_id="o_test",
+        credential_id="gcred_email",
+        email_address="fresh@example.test",
+        only_if_null=False,
+        expected_version=modified_at,
+    )
+
+    async with engine.connect() as conn:
+        stored = (
+            await conn.execute(
+                select(
+                    GoogleOAuthCredentialModel.email_address,
+                    GoogleOAuthCredentialModel.modified_at,
+                ).where(GoogleOAuthCredentialModel.id == "gcred_email")
+            )
+        ).one()
+
+    assert stored.email_address == "fresh@example.test"
+    assert stored.modified_at == modified_at
+    assert updated is True
+
+
+@pytest.mark.asyncio
+async def test_update_email_address_backfill_stale_version_is_noop(
+    repo: GoogleOAuthRepository,
+    engine: AsyncEngine,
+) -> None:
+    current_version = datetime.datetime(2026, 7, 30, 12, 5, 0)
+    stale_version = datetime.datetime(2026, 7, 30, 12, 0, 0)
+    async with engine.begin() as conn:
+        await conn.execute(
+            GoogleOAuthCredentialModel.__table__.insert().values(
+                id="gcred_email",
+                organization_id="o_test",
+                credential_name="Default",
+                state=STATE_ACTIVE,
+                email_address=None,
+                created_at=stale_version,
+                modified_at=current_version,
+            )
+        )
+
+    updated = await repo.update_email_address(
+        organization_id="o_test",
+        credential_id="gcred_email",
+        email_address="stale@example.test",
+        only_if_null=True,
+        expected_version=stale_version,
+    )
+
+    async with engine.connect() as conn:
+        stored = (
+            await conn.execute(
+                select(
+                    GoogleOAuthCredentialModel.email_address,
+                    GoogleOAuthCredentialModel.modified_at,
+                ).where(GoogleOAuthCredentialModel.id == "gcred_email")
+            )
+        ).one()
+
+    assert stored.email_address is None
+    assert stored.modified_at == current_version
+    assert updated is False
+
+
+@pytest.mark.asyncio
+async def test_mark_revoked_and_scrub_clears_email_address(
+    repo: GoogleOAuthRepository,
+    engine: AsyncEngine,
+) -> None:
+    await _seed_active_credential(repo, "gcred_revoke_email", "nonce-revoke-email")
+    await repo.update_email_address(
+        organization_id="o_test",
+        credential_id="gcred_revoke_email",
+        email_address="account@example.test",
+        only_if_null=False,
+    )
+
+    await repo.mark_revoked_and_scrub(
+        organization_id="o_test",
+        credential_id="gcred_revoke_email",
+        now=datetime.datetime.utcnow(),
+    )
+
+    async with engine.connect() as conn:
+        stored = (
+            await conn.execute(
+                select(
+                    GoogleOAuthCredentialModel.state,
+                    GoogleOAuthCredentialModel.email_address,
+                ).where(GoogleOAuthCredentialModel.id == "gcred_revoke_email")
+            )
+        ).one()
+
+    assert stored.state == STATE_REVOKED
+    assert stored.email_address is None
+
+
+@pytest.mark.asyncio
+async def test_update_active_refresh_token_uses_token_identity_guard_across_rename(
+    repo: GoogleOAuthRepository,
+    engine: AsyncEngine,
+) -> None:
+    credential_version = datetime.datetime(2026, 7, 30, 12, 0, 0)
+    rotated_at = datetime.datetime(2026, 7, 30, 12, 5, 0)
+    async with engine.begin() as conn:
+        await conn.execute(
+            GoogleOAuthCredentialModel.__table__.insert().values(
+                id="gcred_rotation",
+                organization_id="o_test",
+                credential_name="Default",
+                state=STATE_ACTIVE,
+                encrypted_refresh_token="encrypted-old",
+                encrypted_method=EncryptMethod.AES.value,
+                created_at=credential_version,
+                modified_at=credential_version,
+            )
+        )
+
+    renamed = await repo.rename_active(
+        organization_id="o_test",
+        credential_id="gcred_rotation",
+        credential_name="Renamed",
+        now=datetime.datetime(2026, 7, 30, 12, 2, 0),
+    )
+    updated = await repo.update_active_refresh_token(
+        organization_id="o_test",
+        credential_id="gcred_rotation",
+        encrypted_refresh_token="encrypted-rotated",
+        encrypted_method=EncryptMethod.AES,
+        now=rotated_at,
+        expected_encrypted_refresh_token="encrypted-old",
+    )
+    stale_update = await repo.update_active_refresh_token(
+        organization_id="o_test",
+        credential_id="gcred_rotation",
+        encrypted_refresh_token="encrypted-stale",
+        encrypted_method=EncryptMethod.AES,
+        now=datetime.datetime(2026, 7, 30, 12, 10, 0),
+        expected_encrypted_refresh_token="encrypted-old",
+    )
+
+    async with engine.connect() as conn:
+        stored = (
+            await conn.execute(
+                select(
+                    GoogleOAuthCredentialModel.encrypted_refresh_token,
+                    GoogleOAuthCredentialModel.modified_at,
+                ).where(GoogleOAuthCredentialModel.id == "gcred_rotation")
+            )
+        ).one()
+
+    assert renamed is not None
+    assert renamed.credential_name == "Renamed"
+    assert updated is True
+    assert stale_update is False
+    assert stored.encrypted_refresh_token == "encrypted-rotated"
+    assert stored.modified_at == rotated_at
+
+
+@pytest.mark.asyncio
+async def test_post_rotation_version_allows_email_backfill(
+    repo: GoogleOAuthRepository,
+    engine: AsyncEngine,
+) -> None:
+    credential_version = datetime.datetime(2026, 7, 30, 12, 0, 0)
+    rotated_at = datetime.datetime(2026, 7, 30, 12, 5, 0)
+    async with engine.begin() as conn:
+        await conn.execute(
+            GoogleOAuthCredentialModel.__table__.insert().values(
+                id="gcred_rotation_email",
+                organization_id="o_test",
+                credential_name="Default",
+                state=STATE_ACTIVE,
+                encrypted_refresh_token="encrypted-old",
+                encrypted_method=EncryptMethod.AES.value,
+                created_at=credential_version,
+                modified_at=credential_version,
+            )
+        )
+
+    rotated = await repo.update_active_refresh_token(
+        organization_id="o_test",
+        credential_id="gcred_rotation_email",
+        encrypted_refresh_token="encrypted-rotated",
+        encrypted_method=EncryptMethod.AES,
+        now=rotated_at,
+        expected_encrypted_refresh_token="encrypted-old",
+    )
+    email_updated = await repo.update_email_address(
+        organization_id="o_test",
+        credential_id="gcred_rotation_email",
+        email_address="account@example.test",
+        only_if_null=True,
+        expected_version=rotated_at,
+    )
+
+    async with engine.connect() as conn:
+        stored = (
+            await conn.execute(
+                select(
+                    GoogleOAuthCredentialModel.email_address,
+                    GoogleOAuthCredentialModel.modified_at,
+                ).where(GoogleOAuthCredentialModel.id == "gcred_rotation_email")
+            )
+        ).one()
+
+    assert rotated is True
+    assert email_updated is True
+    assert stored.email_address == "account@example.test"
+    assert stored.modified_at == rotated_at

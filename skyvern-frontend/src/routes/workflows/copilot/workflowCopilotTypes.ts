@@ -207,6 +207,7 @@ export interface WorkflowCopilotToolCallUpdate {
 export interface WorkflowCopilotToolResultUpdate {
   type: "tool_result";
   tool_name: string;
+  display_label?: string | null;
   success: boolean;
   summary: string;
   iteration: number;

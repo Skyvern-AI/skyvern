@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Callable
+from itertools import count
+from pathlib import Path
 from typing import Any
 
 import structlog
 from agents.memory.sqlite_session import SQLiteSession
 from agents.run_config import CallModelData, ModelInputData
+from agents.run_context import RunContextWrapper
+from pydantic import BaseModel
 
+from skyvern.config import settings
 from skyvern.forge.sdk.agents.context import (
     compact_agent_messages_for_llm,
     get_agent_message_field,
@@ -108,6 +115,54 @@ def copilot_call_model_input_filter(data: CallModelData[Any]) -> ModelInputData:
 
 
 def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: int) -> ModelInputData:
+    model_data = _filter_to_budget(data, token_budget=token_budget)
+    _maybe_dump_model_input(data, model_data)
+    return model_data
+
+
+_MODEL_CALL_SEQ = count()
+
+
+def _jsonable(item: Any) -> Any:
+    if isinstance(item, BaseModel):
+        return item.model_dump(mode="json")
+    return item
+
+
+def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData) -> None:
+    """Record the exact model input so a prompt or tool-schema change can be replayed offline.
+
+    Written here rather than at the Runner call because this is the only point that sees what the
+    model actually receives — after session merge, compaction, and every budget layer above. That
+    includes page text and tool results, so writing takes both an explicit path and a local
+    environment rather than the path alone.
+    """
+    dump_dir = os.getenv("COPILOT_DUMP_MODEL_INPUTS")
+    if not dump_dir or settings.ENV != "local":
+        return
+    try:
+        from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
+
+        # CallModelData carries the run context itself; only some entry points hand over a wrapper.
+        ctx = data.context.context if isinstance(data.context, RunContextWrapper) else data.context
+        try:
+            requested_output_paths = sorted(requested_output_paths_for_derivation(ctx)) if ctx else []
+        except Exception:
+            requested_output_paths = []
+        target = Path(dump_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "instructions": model_data.instructions,
+            "input": [_jsonable(item) for item in model_data.input],
+            "requested_output_paths": requested_output_paths,
+        }
+        path = target / f"call-{next(_MODEL_CALL_SEQ):04d}.json"
+        path.write_text(json.dumps(payload, indent=2, default=str))
+    except Exception:
+        LOG.warning("Failed to dump copilot model input", exc_info=True)
+
+
+def _filter_to_budget(data: CallModelData[Any], *, token_budget: int) -> ModelInputData:
     """Token-budget enforcement applied just before each model call.
 
     Graduated pruning:

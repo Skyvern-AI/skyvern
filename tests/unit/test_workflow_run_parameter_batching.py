@@ -89,6 +89,7 @@ def _make_service_with_mocks(
     service.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)  # type: ignore[method-assign]
     service.create_workflow_run = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
     service.get_workflow_parameters = AsyncMock(return_value=workflow_parameters)  # type: ignore[method-assign]
+    service._resolve_sequential_credential_id = AsyncMock(return_value=None)  # type: ignore[method-assign]
     if batch_side_effect:
         service.create_workflow_run_parameters = AsyncMock(side_effect=batch_side_effect)  # type: ignore[method-assign]
     else:
@@ -103,7 +104,12 @@ def _make_service_with_mocks(
     # setup_workflow_run tests (param batching / tagging / trigger types) don't need seed fixtures.
     service._resolve_and_stamp_run_seed = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
 
-    organization = SimpleNamespace(organization_id="org_test", organization_name="Test Org")
+    organization = SimpleNamespace(
+        organization_id="org_test",
+        organization_name="Test Org",
+        default_llm_key="CUSTOM_LLM_oat_smart",
+        default_secondary_llm_key="CUSTOM_LLM_oat_fast",
+    )
     return service, organization, workflow_run
 
 
@@ -352,6 +358,72 @@ async def test_setup_workflow_run_raises_on_missing_required_parameters() -> Non
             )
 
     service.create_workflow_run_parameters.assert_not_awaited()
+    service.mark_workflow_run_as_failed.assert_awaited_once()
+
+
+def _setup_log_calls(mock_log: object, level: str) -> list:
+    return [c for c in getattr(mock_log, level).call_args_list if "Error while setting up workflow run" in c.args[0]]
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_logs_client_4xx_as_warning_without_traceback() -> None:
+    """A client 4xx (missing param) is expected input, so the setup-failure log drops to warning
+    without a traceback while keeping the error_type field for dashboards."""
+    required_param = _make_workflow_parameter("api_key")  # no default_value
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[required_param])
+
+    request = WorkflowRequestBody(data={})
+
+    with (
+        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.service.LOG") as mock_log,
+    ):
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
+        with pytest.raises(MissingValueForParameter):
+            await service.setup_workflow_run(
+                request_id="req_test",
+                workflow_request=request,
+                workflow_permanent_id="wpid_test",
+                organization=organization,
+            )
+
+    assert not _setup_log_calls(mock_log, "exception")
+    warning_calls = _setup_log_calls(mock_log, "warning")
+    assert len(warning_calls) == 1
+    warning_kwargs = warning_calls[0].kwargs
+    assert warning_kwargs["error_type"] == "skyvern.exceptions.MissingValueForParameter"
+    assert "exc_info" not in warning_kwargs
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_logs_unexpected_defect_as_error_with_traceback() -> None:
+    """A non-client (5xx-class) failure is a real defect, so it keeps error+traceback via LOG.exception."""
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[])
+    service._resolve_and_stamp_run_seed = AsyncMock(side_effect=RuntimeError("unexpected setup bug"))  # type: ignore[method-assign]
+
+    request = WorkflowRequestBody(data={})
+
+    with (
+        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.service.LOG") as mock_log,
+    ):
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
+        with pytest.raises(RuntimeError):
+            await service.setup_workflow_run(
+                request_id="req_test",
+                workflow_request=request,
+                workflow_permanent_id="wpid_test",
+                organization=organization,
+            )
+
+    assert len(_setup_log_calls(mock_log, "exception")) == 1
+    assert not _setup_log_calls(mock_log, "warning")
     service.mark_workflow_run_as_failed.assert_awaited_once()
 
 
@@ -747,6 +819,8 @@ async def test_setup_workflow_run_preserves_parent_loop_state_when_replacing_con
     parent_context = SkyvernContext(
         organization_id="org_test",
         organization_name="Test Org",
+        org_default_llm_key="CUSTOM_LLM_oat_parent_smart",
+        org_default_secondary_llm_key="CUSTOM_LLM_oat_parent_fast",
         workflow_run_id="wr_parent",
         root_workflow_run_id="wr_root",
         run_id="wr_parent",
@@ -772,6 +846,8 @@ async def test_setup_workflow_run_preserves_parent_loop_state_when_replacing_con
     assert current_context.workflow_run_id == "wr_test"
     assert current_context.run_id == "wr_parent"
     assert current_context.root_workflow_run_id == "wr_root"
+    assert current_context.org_default_llm_key == "CUSTOM_LLM_oat_smart"
+    assert current_context.org_default_secondary_llm_key == "CUSTOM_LLM_oat_fast"
     assert current_context.trigger_type == WorkflowRunTriggerType.api
     assert current_context.loop_internal_state == loop_state
     assert current_context.loop_internal_state is not loop_state

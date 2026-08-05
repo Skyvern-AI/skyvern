@@ -10,6 +10,7 @@ import { createPortal } from "react-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { Cross2Icon } from "@radix-ui/react-icons";
 
+import { CopyButton } from "@/components/CopyButton";
 import {
   Tooltip,
   TooltipContent,
@@ -86,6 +87,45 @@ type PaneReorder = {
   onDrop: () => void;
   onMove: (direction: -1 | 1) => void;
 };
+
+function RunPaneLabel({
+  label,
+  runId,
+  dragHint,
+}: {
+  label: string;
+  runId: string;
+  dragHint: string;
+}) {
+  return (
+    <span className="group/runlabel inline-flex min-w-0 items-center text-xs font-medium text-foreground">
+      <span
+        className="inline group-focus-within/runlabel:hidden group-hover/runlabel:hidden"
+        title={dragHint}
+      >
+        {label}
+      </span>
+      <span
+        className="hidden min-w-0 truncate group-focus-within/runlabel:inline-block group-hover/runlabel:inline-block"
+        title={`Run: ${runId}`}
+      >
+        Run: {runId}
+      </span>
+      <span
+        className={cn(
+          "inline-flex w-0 overflow-hidden opacity-0 transition-all",
+          "group-hover/runlabel:ml-1 group-hover/runlabel:w-5 group-hover/runlabel:opacity-100",
+          "group-focus-within/runlabel:ml-1 group-focus-within/runlabel:w-5 group-focus-within/runlabel:opacity-100",
+        )}
+      >
+        <CopyButton
+          value={runId}
+          className="h-5 w-5 shrink-0 p-0.5 text-muted-foreground hover:text-foreground"
+        />
+      </span>
+    </span>
+  );
+}
 
 export function StudioPane({
   id,
@@ -242,12 +282,20 @@ export function StudioPane({
           <Icon className="size-3.5 text-muted-foreground" aria-hidden />
           {iconBadge}
         </span>
-        <span
-          className="min-w-0 truncate text-xs font-medium text-foreground"
-          title={`Drag to reorder the ${accessibleLabel} pane (or Ctrl/Cmd+Shift+←/→)`}
-        >
-          {label}
-        </span>
+        {id === "overview" && runId ? (
+          <RunPaneLabel
+            label={label}
+            runId={runId}
+            dragHint={`Drag to reorder the ${accessibleLabel} pane (or Ctrl/Cmd+Shift+←/→)`}
+          />
+        ) : (
+          <span
+            className="min-w-0 truncate text-xs font-medium text-foreground"
+            title={`Drag to reorder the ${accessibleLabel} pane (or Ctrl/Cmd+Shift+←/→)`}
+          >
+            {label}
+          </span>
+        )}
         <StudioPaneCompactContext.Provider value={compact}>
           {headerExtras}
           <span className="min-w-0 flex-1" />

@@ -1,13 +1,27 @@
-import { useEffect, useState } from "react";
-import { Cross2Icon, LockClosedIcon } from "@radix-ui/react-icons";
-
+import { useEffect, useRef, useState } from "react";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+  ChevronDownIcon,
+  Cross2Icon,
+  LockClosedIcon,
+} from "@radix-ui/react-icons";
+
+import { getClient } from "@/api/AxiosClient";
+import { isPasswordCredential, type CredentialApiResponse } from "@/api/types";
+import { Button } from "@/components/ui/button";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 // Union of both a request-policy-time classifier's real reason tokens and a
 // mid-build run-failure reason that isn't emitted by any shipped backend
@@ -44,26 +58,34 @@ export type CredentialPauseOutcome = "connected" | "skipped" | "timeout";
 export interface CredentialPauseHistorical {
   outcome: CredentialPauseOutcome;
   credentialId?: string;
+  // Captured at connect time so the receipt names the credential without a lookup.
+  name?: string;
 }
 
-export interface MatchingCredential {
+// A picker row: id/name plus a secondary discriminator (the login username) so two credentials
+// saved under the same name stay distinguishable.
+interface PickerCredential {
   credentialId: string;
   name: string;
+  secondary?: string;
 }
 
 export interface CredentialCardProps {
   frame: CredentialRequiredFrame;
   mode: CredentialCardMode;
-  matchingCredentials?: MatchingCredential[];
   resolvedOutcome?: CredentialPauseHistorical;
   // undefined = primary CTA (wiring opens the add-credential modal); a string
-  // id = the user picked an already-stored credential (chip or dropdown).
-  onConnect: (credentialId?: string) => void;
+  // id = the user picked an already-stored credential. name rides along so the
+  // receipt shows it and the resume/continue references it without a lookup.
+  onConnect: (credentialId?: string, name?: string) => void;
   onSkip: () => void;
   // Terminal connect auto-sends a "continue" turn; the receipt says so instead
   // of the plain "added". Defaults false so inline-pause and every other caller
   // keep the existing copy.
   continued?: boolean;
+  // Bumped by the parent when a credential is created so the one-shot fetch re-runs and the new
+  // credential shows up in the picker (e.g. if the resume POST failed and the ask is still live).
+  reloadKey?: number;
 }
 
 const SIGN_IN_WHY_LINE =
@@ -171,14 +193,99 @@ function CredentialSystemRow({ text }: { text: string }) {
   );
 }
 
+// Searchable picker over the whole org credential list. Built on the cmdk primitives (same pattern as
+// the workflow-builder CredentialCombobox) rather than importing it, since that one pulls react-query
+// and the copilot chat's test harness has no QueryClientProvider.
+function CredentialPicker({
+  credentials,
+  suggestedIds,
+  disabled,
+  onPick,
+}: {
+  credentials: PickerCredential[];
+  // Copilot's suggested candidates for this sign-in (only inline-pause frames carry them; terminal
+  // asks deliberately don't stamp payload candidates, so they show a plain list).
+  suggestedIds?: string[];
+  disabled?: boolean;
+  onPick: (credentialId: string, name: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const suggestedSet = new Set(suggestedIds ?? []);
+  const suggested = credentials.filter((c) => suggestedSet.has(c.credentialId));
+  const rest = credentials.filter((c) => !suggestedSet.has(c.credentialId));
+  const renderItem = (credential: PickerCredential) => (
+    <CommandItem
+      key={credential.credentialId}
+      // cmdk filters on value; append username + id so identical names stay findable.
+      value={`${credential.name} ${credential.secondary ?? ""} ${credential.credentialId}`}
+      onSelect={() => {
+        // A pick after the pause expires would submit an already-rejected resume token; the popover
+        // closes on `disabled` above, this guards a click already in flight.
+        if (disabled) return;
+        setOpen(false);
+        onPick(credential.credentialId, credential.name);
+      }}
+    >
+      <div className="flex min-w-0 flex-col">
+        <span className="truncate">{credential.name}</span>
+        {credential.secondary ? (
+          <span className="truncate text-[11px] text-muted-foreground">
+            {credential.secondary}
+          </span>
+        ) : null}
+      </div>
+    </CommandItem>
+  );
+  return (
+    <Popover open={open && !disabled} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button
+          type="button"
+          role="combobox"
+          aria-expanded={open}
+          variant="outline"
+          disabled={disabled}
+          className="h-6 w-[200px] justify-between px-3 text-xs font-normal"
+        >
+          <span className="truncate">Use existing…</span>
+          <ChevronDownIcon className="ml-2 size-3 shrink-0 opacity-50" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent
+        className="w-[var(--radix-popover-trigger-width)] p-0"
+        align="start"
+      >
+        <Command>
+          <CommandInput placeholder="Search credentials..." />
+          <CommandList>
+            <CommandEmpty>No credentials found.</CommandEmpty>
+            {suggested.length > 0 ? (
+              // Copilot's suggestion(s) pinned first; cmdk highlights the first item, so one Enter
+              // accepts it. The full org list stays below to override.
+              <CommandGroup heading="Suggested">
+                {suggested.map(renderItem)}
+              </CommandGroup>
+            ) : null}
+            <CommandGroup
+              heading={suggested.length > 0 ? "All credentials" : undefined}
+            >
+              {rest.map(renderItem)}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 export function CredentialCard({
   frame,
   mode,
-  matchingCredentials = [],
   resolvedOutcome,
   onConnect,
   onSkip,
   continued = false,
+  reloadKey,
 }: Readonly<CredentialCardProps>) {
   // Terminal mode never expires by design: its signal carries no timeout/expiry
   // semantics at all, so there is nothing to compare "now" against. Only a
@@ -191,6 +298,52 @@ export function CredentialCard({
   );
   const disabled = countdownActive && expired;
 
+  const credentialGetter = useCredentialGetter();
+  const [orgCredentials, setOrgCredentials] = useState<
+    PickerCredential[] | null
+  >(null);
+  const fetchGeneration = useRef(0);
+  // Any credential ask (terminal or inline-pause) lists every org login credential so the user can
+  // pick or create. credential_type=password since the card only ever asks for a sign-in; the API
+  // returns them most-recent-first (created_at desc), used as-is. Direct getClient fetch, not
+  // useCredentialsQuery: the copilot chat's test harness has no QueryClientProvider. Re-fetches when
+  // the parent bumps reloadKey (a credential was just created) so the new one appears in the picker.
+  // page_size 100 with no pagination — a >100-credential org shows only the 100 most-recent; older
+  // ones are reachable only by creating a new credential. Add the route's `search` param if that bites.
+  const isAsk = !resolvedOutcome;
+  useEffect(() => {
+    if (!isAsk) return;
+    // Generation guard: a fetch superseded by a reloadKey change (or a slow one) must not set state
+    // after a newer fetch has started, so a stale response can't overwrite the current list.
+    const generation = ++fetchGeneration.current;
+    void (async () => {
+      try {
+        const client = await getClient(credentialGetter);
+        const res = await client.get<CredentialApiResponse[]>("/credentials", {
+          params: { page: 1, page_size: 100, credential_type: "password" },
+        });
+        if (fetchGeneration.current !== generation) return;
+        setOrgCredentials(
+          (Array.isArray(res.data) ? res.data : []).map((credential) => ({
+            credentialId: credential.credential_id,
+            name: credential.name,
+            secondary:
+              credential.credential &&
+              isPasswordCredential(credential.credential)
+                ? credential.credential.username
+                : undefined,
+          })),
+        );
+      } catch (error) {
+        // Leave the list null so the picker degrades to the Connect-credential CTA; null keeps
+        // not-loaded distinct from a genuinely empty org.
+        if (fetchGeneration.current === generation) {
+          console.error("Failed to load credentials:", error);
+        }
+      }
+    })();
+  }, [isAsk, reloadKey, credentialGetter]);
+
   if (resolvedOutcome) {
     switch (resolvedOutcome.outcome) {
       case "skipped":
@@ -198,10 +351,7 @@ export function CredentialCard({
       case "timeout":
         return <CredentialSystemRow text={TIMEOUT_COPY} />;
       case "connected": {
-        const name = matchingCredentials.find(
-          (credential) =>
-            credential.credentialId === resolvedOutcome.credentialId,
-        )?.name;
+        const name = resolvedOutcome.name;
         const heading = continued
           ? name
             ? `Continuing with '${name}'…`
@@ -235,9 +385,6 @@ export function CredentialCard({
   }
 
   const site = siteFromLoginPageUrls(frame.login_page_urls);
-  const singleMatch =
-    matchingCredentials.length === 1 ? matchingCredentials[0] : null;
-  const multipleMatches = matchingCredentials.length >= 2;
 
   return (
     <div>
@@ -302,35 +449,13 @@ export function CredentialCard({
           >
             Connect credential
           </button>
-          {singleMatch ? (
-            <button
-              type="button"
+          {orgCredentials && orgCredentials.length > 0 ? (
+            <CredentialPicker
+              credentials={orgCredentials}
+              suggestedIds={frame.credential_refs}
               disabled={disabled}
-              onClick={() => onConnect(singleMatch.credentialId)}
-              className="rounded-md border border-border px-3 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50"
-            >
-              Use &apos;{singleMatch.name}&apos;?
-            </button>
-          ) : null}
-          {multipleMatches ? (
-            <Select
-              disabled={disabled}
-              onValueChange={(credentialId) => onConnect(credentialId)}
-            >
-              <SelectTrigger className="h-7 w-[170px] text-xs">
-                <SelectValue placeholder="Use existing…" />
-              </SelectTrigger>
-              <SelectContent>
-                {matchingCredentials.map((credential) => (
-                  <SelectItem
-                    key={credential.credentialId}
-                    value={credential.credentialId}
-                  >
-                    {credential.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              onPick={(credentialId, name) => onConnect(credentialId, name)}
+            />
           ) : null}
         </div>
       </div>

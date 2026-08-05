@@ -22,12 +22,20 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     recorded_outcome_from_run_blocks_result,
     recorded_outcome_from_scout_act_observe_hollow,
     run_backed_repair_evidence_exists,
+    unresolved_runtime_block_failure,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
+from skyvern.forge.sdk.copilot.failure_tracking import selector_identity_from_failure
 from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence, LoadedResultCompositionTarget
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from tests.unit.copilot_test_helpers import (
+    failed_second_factor_run,
+    passing_run,
+    straight_line_login_yaml,
+    two_page_login_yaml,
+)
 
 
 def _metadata_reject_ladder_input(*, structural_key: str = "reject-key") -> MetadataRejectLadderInput:
@@ -1512,3 +1520,280 @@ def test_clearing_the_grounding_requirement_also_drops_the_binding_constraint() 
 
     assert ctx.recorded_outcome_grounding_requirement is None
     assert ctx.recorded_outcome_binding_constraint is None
+
+
+def _run_history_ctx(workflow_yaml: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        workflow_yaml=workflow_yaml,
+        latest_recorded_build_test_outcome=None,
+        recorded_build_test_outcome_history=[],
+        recorded_persisted_block_run_workflow_run_id=None,
+    )
+
+
+def test_failure_stays_open_when_a_later_run_passes_without_taking_the_failed_branch() -> None:
+    """The live shape: the block runs to completion while its internal branch skips the failing call."""
+    ctx = _run_history_ctx(two_page_login_yaml())
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
+
+    open_failure = unresolved_runtime_block_failure(ctx)
+
+    assert open_failure is not None
+    assert open_failure.workflow_run_id == "wr_1"
+    assert open_failure.block_label == "sign_in_and_read"
+
+
+def test_a_straight_line_block_a_later_run_executed_is_re_exercised() -> None:
+    """No branch can skip a call, so executing the block proves the failing call ran again."""
+    ctx = _run_history_ctx(straight_line_login_yaml())
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
+
+    assert unresolved_runtime_block_failure(ctx) is None
+
+
+def test_failure_retires_once_the_implicated_call_leaves_the_draft() -> None:
+    ctx = _run_history_ctx(two_page_login_yaml())
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
+    ctx.workflow_yaml = two_page_login_yaml(submit_selector="Continue")
+
+    assert unresolved_runtime_block_failure(ctx) is None
+
+
+def test_an_unrelated_edit_to_the_block_does_not_retire_the_failing_call() -> None:
+    """The call-level check earns its place here: the block changed, the failing call did not."""
+    ctx = _run_history_ctx(two_page_login_yaml())
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
+    ctx.workflow_yaml = two_page_login_yaml().replace(
+        'return {"visitors": "9.42K"}', 'return {"visitors": "9.42K", "extra": 1}'
+    )
+
+    open_failure = unresolved_runtime_block_failure(ctx)
+
+    assert open_failure is not None
+    assert open_failure.block_label == "sign_in_and_read"
+
+
+def test_a_failure_with_no_later_run_is_the_turns_own_headline_not_an_unresolved_note() -> None:
+    ctx = _run_history_ctx(two_page_login_yaml())
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+
+    assert unresolved_runtime_block_failure(ctx) is None
+
+
+def test_another_record_for_the_same_run_id_is_not_a_later_run() -> None:
+    ctx = _run_history_ctx(two_page_login_yaml())
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    record_build_test_outcome(ctx, passing_run("wr_1", ["sign_in_and_read"]))
+
+    assert unresolved_runtime_block_failure(ctx) is None
+
+
+def test_author_time_work_after_the_failure_is_not_a_later_run() -> None:
+    """Scout evaluations and author-time rejects share this history but execute nothing."""
+    ctx = _run_history_ctx(two_page_login_yaml())
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="author_time_reject",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="synthesized_parameter_binding_ambiguous",
+            structural_failure_identity="author-time-identity",
+        ),
+    )
+
+    assert unresolved_runtime_block_failure(ctx) is None
+
+
+def test_a_later_run_still_arms_the_note_when_author_time_work_follows_it() -> None:
+    ctx = _run_history_ctx(two_page_login_yaml())
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    record_build_test_outcome(ctx, passing_run("wr_2", ["read_metric"]))
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="scout_evaluate",
+            attempted_tool="evaluate",
+            verdict="progress_observed",
+            reason_code="run_completed_unevaluated",
+            structural_failure_identity="scout-identity",
+        ),
+    )
+
+    open_failure = unresolved_runtime_block_failure(ctx)
+
+    assert open_failure is not None
+    assert open_failure.workflow_run_id == "wr_1"
+
+
+def test_a_code_block_nested_in_a_loop_is_still_found() -> None:
+    """A failure inside a loop body must stay reportable, not vanish because the walk missed it."""
+    ctx = _run_history_ctx(
+        """
+    title: Loop over rows
+    workflow_definition:
+      blocks:
+      - block_type: for_loop
+        label: each_row
+        loop_blocks:
+        - block_type: code
+          label: sign_in_and_read
+          code: |
+            if await page.locator("#token").count():
+                await page.get_by_role("button", name="Login", exact=True).click()
+    """
+    )
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
+    record_build_test_outcome(ctx, passing_run("wr_2", ["each_row"]))
+
+    open_failure = unresolved_runtime_block_failure(ctx)
+
+    assert open_failure is not None
+    assert open_failure.block_label == "sign_in_and_read"
+
+
+def test_a_css_selector_failure_matches_the_locator_call_in_the_draft() -> None:
+    """A failure that spells it "selector:" must still match code that spells it locator()."""
+    ctx = _run_history_ctx(
+        """
+    title: Read the metric
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: sign_in_and_read
+        code: |
+          if await page.locator("#token").count():
+              await page.locator("#submit-btn").click()
+    """
+    )
+    # Derived, not hardcoded: the point of the test is that the two spellings normalize together.
+    call_ref = selector_identity_from_failure('TimeoutError: resolved selector: "#submit-btn" never appeared')
+    assert call_ref == "locator:#submit-btn"
+    outcome = failed_second_factor_run("wr_1").model_copy(update={"attempted_call_ref": call_ref})
+    record_build_test_outcome(ctx, outcome)
+    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
+
+    open_failure = unresolved_runtime_block_failure(ctx)
+
+    assert open_failure is not None
+    assert open_failure.block_label == "sign_in_and_read"
+
+
+def test_run_blocks_outcome_extracts_the_implicated_call_from_the_failure_text() -> None:
+    outcome = recorded_outcome_from_run_blocks_result(
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_failed",
+                "overall_status": "failed",
+                "failure_type": "runtime_error",
+                "blocks": [
+                    {
+                        "label": "get_visitors",
+                        "block_type": "code",
+                        "status": "failed",
+                        "failure_reason": (
+                            "code block failed. failure reason: Failed to execute code block. Reason: "
+                            "TimeoutError: Locator.click: Timeout 30000ms exceeded. Call log: - waiting for "
+                            'get_by_role("button", name="Continue", exact=True)'
+                        ),
+                    },
+                ],
+            },
+        },
+    )
+
+    assert outcome is not None
+    assert outcome.attempted_call_ref == "role:button:Continue"
+
+
+def _templated_selector_yaml(*, templated: bool = True) -> str:
+    call = 'f"#submit-{kind}"' if templated else '"#submit-btn"'
+    return f"""
+    title: Read the metric
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: sign_in_and_read
+        code: |
+          if await page.locator("#token").count():
+              await page.locator({call}).click()
+    """
+
+
+def test_a_templated_selector_does_not_read_as_the_call_being_removed() -> None:
+    """A runtime-built selector is invisible to the literal scan, so it cannot prove removal."""
+    ctx = _run_history_ctx(_templated_selector_yaml())
+    outcome = failed_second_factor_run("wr_1").model_copy(update={"attempted_call_ref": "locator:#submit-btn"})
+    record_build_test_outcome(ctx, outcome)
+    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
+
+    open_failure = unresolved_runtime_block_failure(ctx)
+
+    assert open_failure is not None
+    assert open_failure.block_label == "sign_in_and_read"
+
+
+def test_an_all_literal_block_still_retires_when_the_call_is_gone() -> None:
+    """The pass path: with every selector a literal, absence really is proof of removal."""
+    ctx = _run_history_ctx(_templated_selector_yaml(templated=False))
+    outcome = failed_second_factor_run("wr_1").model_copy(update={"attempted_call_ref": "locator:#gone-btn"})
+    record_build_test_outcome(ctx, outcome)
+    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
+
+    assert unresolved_runtime_block_failure(ctx) is None
+
+
+def _secure_runner_failure_result(error_code: str, category: str | None) -> dict[str, object]:
+    data: dict[str, object] = {
+        "workflow_run_id": "wr_runner",
+        "overall_status": "failed",
+        "blocks": [
+            {
+                "label": "run_code",
+                "block_type": "CODE",
+                "status": "failed",
+                "failure_reason": "Secure CodeBlock runner is unavailable. Please retry.",
+                "error_codes": [error_code],
+            }
+        ],
+    }
+    if category is not None:
+        data["failure_categories"] = [{"category": category, "confidence_float": 1.0, "reasoning": "sandbox"}]
+    return {"ok": False, "data": data}
+
+
+def test_unrecoverable_tool_error_run_is_not_repairable_and_not_authoritative() -> None:
+    outcome = recorded_outcome_from_run_blocks_result(
+        _secure_runner_failure_result("runner_unavailable", "UNRECOVERABLE_TOOL_ERROR")
+    )
+
+    assert outcome is not None
+    assert outcome.verdict != "repairable_failure"
+    assert outcome.verdict == "not_authoritative"
+    assert outcome.reason_code == "unrecoverable_tool_error"
+    assert outcome.is_authoritative is False
+    assert outcome.structural_failure_identity == ""
+
+
+def test_user_code_error_run_stays_repairable() -> None:
+    outcome = recorded_outcome_from_run_blocks_result(
+        _secure_runner_failure_result("user_code_error", "CODE_BLOCK_FAILURE")
+    )
+
+    assert outcome is not None
+    assert outcome.verdict == "repairable_failure"
+    assert outcome.reason_code == "runtime_block_failure"
+
+
+def test_runner_timeout_run_stays_repairable() -> None:
+    outcome = recorded_outcome_from_run_blocks_result(_secure_runner_failure_result("timeout", "CODE_BLOCK_FAILURE"))
+
+    assert outcome is not None
+    assert outcome.verdict == "repairable_failure"
+    assert outcome.reason_code == "runtime_block_failure"

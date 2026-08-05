@@ -267,25 +267,6 @@ PRE_DISCOVERY_URL_QUESTION_NUDGE = (
     "runs and cannot resolve a site."
 )
 
-PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX = (
-    "STOP — the target site has failed to scrape on every attempt across "
-    "multiple workflow shapes. Every run navigated successfully but the "
-    'scraper could not read the page ("failed to load the website" / '
-    '"page may have navigated unexpectedly"). This pattern indicates the '
-    "site is either blocking automated access, genuinely unresponsive in "
-    "this environment, or rendering content Skyvern cannot read reliably.\n"
-    "Do NOT retry with another workflow variation. Do NOT call "
-    "update_and_run_blocks or run_blocks_and_collect_debug again.\n"
-    "Reply to the user now: state that the site could not be loaded after "
-    "multiple attempts, quote the last failure_reason verbatim, keep the "
-    "message concise, and ask "
-)
-
-POST_PROBABLE_SITE_BLOCK_STOP_NUDGE = (
-    PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX
-    + "whether to try a different URL, configure a proxy, or provide an alternate entry point."
-)
-
 POST_ANTI_BOT_FAILED_TEST_NUDGE = (
     "STOP — your last test run failed due to an anti-bot/WAF block "
     "(Access Denied, CAPTCHA, human-verification, or similar challenge evidence).\n"
@@ -342,8 +323,6 @@ DEFAULT_ENFORCEMENT_NUDGES: dict[str, str] = {
     "post_no_workflow_delivery": POST_NO_WORKFLOW_DELIVERY_NUDGE,
     "post_discovery_entrypoint_url_question": POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE,
     "pre_discovery_url_question": PRE_DISCOVERY_URL_QUESTION_NUDGE,
-    "post_probable_site_block_stop_prefix": PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX,
-    "post_probable_site_block_stop": POST_PROBABLE_SITE_BLOCK_STOP_NUDGE,
     "post_anti_bot_failed_test": POST_ANTI_BOT_FAILED_TEST_NUDGE,
     "post_format": POST_FORMAT_NUDGE,
 }

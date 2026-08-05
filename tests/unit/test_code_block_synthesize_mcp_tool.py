@@ -5,7 +5,9 @@ OSS-synced: only example.* / RFC-2606 placeholder targets.
 
 from __future__ import annotations
 
+import ast
 import json
+import textwrap
 from collections.abc import Iterator
 from typing import Any
 
@@ -16,7 +18,7 @@ from skyvern.cli.core.trajectory_store import append_trajectory_entry
 from skyvern.cli.mcp_tools import code_block as code_block_tools
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools import trajectory as mcp_trajectory
-from skyvern.cli.mcp_tools.code_block import skyvern_code_block_synthesize
+from skyvern.cli.mcp_tools.code_block import skyvern_code_block_lint, skyvern_code_block_synthesize
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 
 _HASH_A = "principal-a"
@@ -77,7 +79,7 @@ def _expected_synthesis_data(*, strict_selectors: bool) -> dict[str, Any]:
     synthesized = synthesize_code_block(_fixture_trajectory(), strict_selectors=strict_selectors)
     assert synthesized is not None
     return {
-        "code": synthesized.code,
+        "code": textwrap.dedent(synthesized.code),
         "parameters": synthesized.parameters,
         "steps": synthesized.steps,
         "notes": synthesized.notes,
@@ -293,6 +295,20 @@ async def test_fixture_trajectory_synthesizes_non_empty_code_block() -> None:
     assert ".fill(" in code
     assert ".click()" in code
     assert result["data"]["emitted_interaction_count"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict_selectors", [False, True])
+async def test_synthesized_code_is_standalone_and_passes_lint(strict_selectors: bool) -> None:
+    result = await skyvern_code_block_synthesize(json.dumps(_fixture_trajectory()), strict_selectors=strict_selectors)
+
+    code = result["data"]["code"]
+    ast.parse(code)
+    lint = await skyvern_code_block_lint(
+        code,
+        parameter_keys=[parameter["key"] for parameter in result["data"]["parameters"]],
+    )
+    assert lint["data"]["lint_ok"] is True, lint["data"]
 
 
 @pytest.mark.asyncio

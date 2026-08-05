@@ -42,7 +42,7 @@ from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_pers
 from skyvern.schemas.proxy_pinning import apply_proxy_pin_update as _apply_proxy_pin_update
 from skyvern.schemas.proxy_pinning import should_generate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
-from skyvern.webeye.browser_profile_utils import DEFAULT_PROFILE_COPY_IGNORE, valid_operator_profile_generation
+from skyvern.webeye.browser_profile_utils import FRESH_PROFILE_COPY_IGNORE, valid_operator_profile_generation
 
 LOG = structlog.get_logger()
 
@@ -582,7 +582,7 @@ def _clear_directory(directory: FilePath) -> None:
 
 def _copy_browser_profile_template(source_dir: FilePath, destination_dir: FilePath) -> None:
     for source_child in source_dir.iterdir():
-        if source_child.name in DEFAULT_PROFILE_COPY_IGNORE:
+        if source_child.name in FRESH_PROFILE_COPY_IGNORE:
             continue
 
         destination_child = destination_dir / source_child.name

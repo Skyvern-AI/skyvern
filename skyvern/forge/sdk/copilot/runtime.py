@@ -38,6 +38,7 @@ from skyvern.forge.sdk.copilot.turn_origin import (
 )
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.webeye.browser_state import BrowserState
 
@@ -57,7 +58,10 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
     from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
-    from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
+    from skyvern.forge.sdk.copilot.output_extraction_plan import (
+        FrozenRequestedOutputExtractionCandidate,
+        RequestedOutputExtractionPlan,
+    )
     from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence, ScoutObservationContract
@@ -216,6 +220,18 @@ class ScoutedInteraction(TypedDict):
     control_value_satisfied: NotRequired[bool]
     trajectory_index: NotRequired[int]
     carried: NotRequired[bool]
+    # A read the scout proved on the live page: the expression it ran and the output path the
+    # value answers. Recorded so authoring quotes a proven read instead of guessing a selector.
+    read_expression: NotRequired[str]
+    read_output_path: NotRequired[str]
+    # Whether the reader named this path or it was the only one left. A witness binds a value to a
+    # path, so a read that merely inherited the path by elimination is not evidence of that path.
+    read_output_path_source: NotRequired[str]
+    read_result_shape: NotRequired[str]
+    # The scalar the read actually returned, so a later binding can locate the element that still
+    # carries it rather than re-deriving one from labels. Bounded and scalar-only; turn-ephemeral,
+    # like raw_typed_value, and excluded from every persistence path.
+    read_result_value: NotRequired[str]
     # Set when a live scout-time count()==1 probe found the captured selector matching >1 element on its
     # source page; synthesis re-anchors or drops it rather than emitting a selector that strict-mode-fails.
     ambiguous: NotRequired[bool]
@@ -239,16 +255,6 @@ class ScoutedInteraction(TypedDict):
     challenge_state: NotRequired[dict[str, Any]]
 
 
-@dataclass(frozen=True)
-class PostRunPagePathInteractionWindow:
-    structural_key: str
-    workflow_run_id: str
-    trajectory_anchor: int
-    admitted_attempts: int = 0
-    observation_generation: int = 0
-    observed_successful_interactions: int = 0
-
-
 @dataclass
 class AgentContext:
     organization_id: str
@@ -262,6 +268,10 @@ class AgentContext:
     injected_browser_state: BrowserState | None = None
     heal_workflow_run_id: str | None = None
     turn_intent: TurnIntent | None = None
+    # The streaming adapter narrates any context it is handed, so the design-phase latches live here
+    # rather than on the copilot subclass it is annotated for.
+    design_start_emitted: bool = False
+    design_end_emitted: bool = False
     # Ephemeral carrier for SDK-action run reuse, bounded by browser sessions touched in one Copilot run.
     sdk_action_workflow_run_ids_by_browser_session: dict[SdkActionWorkflowRunCacheKey, str] = field(
         default_factory=dict
@@ -335,6 +345,7 @@ class AgentContext:
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     challenge_gated_proxy_retry_count: int = 0
     last_test_non_retriable_nav_error: str | None = None
+    last_infrastructure_tool_error: str | None = None
     non_retriable_nav_error_last_emitted_signature: str | None = None
     workflow_persisted: bool = False
     last_workflow: Any | None = None
@@ -412,7 +423,6 @@ class AgentContext:
     post_run_page_observation_workflow_run_id: str | None = None
     post_run_page_observation_after_failed_test: bool = False
     post_run_page_observation_generation: int = 0
-    post_run_page_path_interaction_window: PostRunPagePathInteractionWindow | None = None
     post_run_current_page_inspection_workflow_run_id: str | None = None
     last_evaluate_actionable_signature: str | None = None
     last_evaluate_actionable_url: str | None = None
@@ -436,7 +446,6 @@ class AgentContext:
     # Ordered (method, receiver) browser mutations of the last successfully persisted draft's code
     # blocks; None until a persist succeeds this turn. Gates the scouted-spine under-build reject and turn-end nudge.
     persisted_draft_browser_calls: list[tuple[str, str]] | None = None
-    scouted_spine_checkpoint_fired: bool = False
     scouted_spine_previous_omission_digest: str | None = None
     scouted_spine_repeated_identical_missing_steps: bool = False
     # Author-time output-contract cross-turn state, keyed by the contract signature; set lazily by workflow_update.
@@ -485,10 +494,16 @@ class AgentContext:
     synthesized_block_offered: bool = False
     synthesized_block_offered_trajectory_len: int = 0
     synthesized_block_offered_goal_complete: bool = False
+    # Probe-validated value elements the model designated, each pinned to the page it was resolved on.
+    requested_output_designations: list[dict[str, Any]] = field(default_factory=list)
     requested_output_extraction_candidate: FrozenRequestedOutputExtractionCandidate | None = None
     # Candidate frozen by an imposition that has not been persisted yet; promoted to the committed
     # candidate only once the update it rode in on succeeds.
     pending_requested_output_extraction_candidate: FrozenRequestedOutputExtractionCandidate | None = None
+    # The last plan that bound every requested path. Derivation reads the freshest packet, which is
+    # usually truncated or unbindable, so a plan that did bind is kept rather than re-derived away
+    # before the imposition that needs it.
+    last_bound_requested_output_extraction_plan: RequestedOutputExtractionPlan | None = None
     # Set by the imposition seam when a goal-complete spine is on its way into a draft; the successful update
     # promotes it to the landed latch only when the persisted draft covers the freshly scouted spine.
     pending_goal_complete_landing: bool = False
@@ -516,6 +531,9 @@ class AgentContext:
     # Which requires-live-scout fields (username/password, non-empty) each scouted credential
     # carries; recorded at credential resolve time and rehydrated from FillCarry across turns.
     scouted_credential_field_inventory_by_credential_id: dict[str, frozenset[str]] = field(default_factory=dict)
+    # Read once per turn: repeated fill attempts must not re-scan the org's credentials.
+    org_credentials_for_turn: list[Credential] | None = None
+    vault_login_uris_by_credential_id: dict[str, list[str]] = field(default_factory=dict)
     # Highest trajectory_index visible at the latest parsed evaluate observation and whether that page
     # showed a password-type control; orders page evidence against post-fill submits across evictions.
     last_scout_observation_trajectory_index: int | None = None
@@ -532,6 +550,10 @@ class AgentContext:
     # Selector of an in-flight click, captured pre-dispatch so a failed/timed-out click can gate a
     # settle re-perception on whether that selector still resolves to a live element.
     pending_scout_click_selector: str | None = None
+    # Browser-session download filenames snapshotted before a scout click, so the post-hook can tell
+    # a download this click produced from one an earlier click left behind.
+    pending_scout_download_snapshot: frozenset[str] | None = None
+    repair_obligation_nudge_count: int = 0
     # (selector, ambiguous) verdict from a pre-dispatch live count probe, applied to the recorded
     # interaction only when the post-action resolved selector matches the probed one.
     pending_scout_ambiguous: tuple[str, bool] | None = None
@@ -542,6 +564,12 @@ class AgentContext:
     # Source-bound row identity captured before a positional click dispatches. The post-hook consumes it
     # only for the exact selector/source pair, so navigation cannot transfer the witness to another click.
     pending_scout_dynamic_row: ScoutedDynamicRowEvidence | None = None
+    # Expression of an in-flight evaluate, stashed pre-dispatch: the MCP response carries only the
+    # result, so a post-hook that wants the expression must receive it from the invocation side.
+    pending_scout_read_expression: str | None = None
+    # Requested output the in-flight evaluate says it fills. Without it a read can only be attributed
+    # when the turn requests exactly one output, so a multi-field request binds nothing.
+    pending_scout_read_output_path: str | None = None
     # Connected overlay used by bounded pre-click evidence probes; declared so capture code accesses it
     # directly instead of silently accepting a dynamically attached dependency.
     discovery_mcp_server: SkyvernOverlayMCPServer | None = None
@@ -568,6 +596,23 @@ class AgentContext:
     # Claimant whose owned claim stashed the current blocker_signal; the stash choke-point clears
     # it whenever the held signal changes identity, so a plain stash can never alias a stale owner.
     blocker_signal_claimant: TurnClaimant | None = None
+
+
+def diagnosis_repair_obligation_open(ctx: AgentContext) -> bool:
+    """True while the latest diagnosis contract says the failed run is repairable and no later run has
+    discharged it. The build-test oracle already reported the failure; this keeps the loop on the hook for
+    consuming it, so a turn cannot observe the reached page once and then finalize a draft the run disproved.
+
+    Keyed on the typed decision, never on a nudge count: the contract's own ASK/STOP/NO_CHANGE transitions
+    discharge it, and the operational total-turn timeout bounds it."""
+    # Deferred: diagnosis_repair_contract reaches this module through context, so a module-level
+    # import cycles.
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+
+    contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
+    if contract is None:
+        return False
+    return contract.repair_decision.next_action is RepairNextAction.REPAIR
 
 
 def output_contract_ladder_unresolved(ctx: AgentContext) -> bool:
@@ -734,13 +779,14 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             browser=skyvern_browser,
             context=mcp_ctx,
             api_key_hash=hash_api_key_for_cache(active_key) if active_key else None,
+            organization_id=ctx.organization_id,
         )
         if working_page is not None:
             # Seed the tab pin from the already-probed page (mirrors what skyvern_tab_switch
             # sets interactively) so self-heal tools land on the adopted tab instead of the
             # new SkyvernBrowser's pages[-1] fallback.
             state._active_page = working_page
-        register_copilot_session(browser_session_id, state)
+        register_copilot_session(browser_session_id, state, organization_id=ctx.organization_id)
         if is_self_heal_session_id(browser_session_id):
             LOG.info(
                 "registered self-heal browser session",
@@ -757,7 +803,7 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
                 )
             else:
                 ctx.sdk_action_workflow_run_ids_by_browser_session.pop(sdk_action_workflow_run_cache_key, None)
-            unregister_copilot_session(browser_session_id)
+            unregister_copilot_session(browser_session_id, organization_id=ctx.organization_id)
             if is_self_heal_session_id(browser_session_id):
                 LOG.info("unregistered self-heal browser session", session_id=browser_session_id)
     finally:

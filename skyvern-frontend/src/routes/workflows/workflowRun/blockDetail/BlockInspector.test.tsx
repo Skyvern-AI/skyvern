@@ -1,14 +1,19 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ActionTypes, Status, type ActionsApiResponse } from "@/api/types";
 import type { WorkflowRunBlock } from "../../types/workflowRunTypes";
 import { BlockInspector, JsonExplorer } from "./BlockInspector";
 
+const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn() }));
+
+vi.mock("@/util/copyText", () => ({ copyText: copyTextMock }));
+
 afterEach(() => {
   cleanup();
+  vi.clearAllMocks();
 });
 
 function buildBlock(
@@ -115,6 +120,32 @@ describe("JsonExplorer", () => {
 
     expect(row.textContent).not.toContain('loop_value: "/runs"');
     expect(screen.getByText("loop_value")).toBeDefined();
+  });
+
+  it("offers a copy button per node: raw text for leaves, the full subtree for nested nodes", () => {
+    render(
+      <JsonExplorer
+        rootLabel="output"
+        value={{ task: { id: "tsk_1" }, status: "completed" }}
+      />,
+    );
+
+    expect(screen.getAllByRole("button", { name: /^Copy / })).toHaveLength(3);
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy status" }));
+    expect(copyTextMock).toHaveBeenLastCalledWith("completed");
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy task" }));
+    expect(copyTextMock).toHaveBeenLastCalledWith(
+      JSON.stringify({ id: "tsk_1" }, null, 2),
+    );
+    // Copying a collapsed node must not expand it.
+    expect(screen.queryByText("id")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy output" }));
+    expect(copyTextMock).toHaveBeenLastCalledWith(
+      JSON.stringify({ task: { id: "tsk_1" }, status: "completed" }, null, 2),
+    );
   });
 });
 

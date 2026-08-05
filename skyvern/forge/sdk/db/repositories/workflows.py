@@ -43,6 +43,7 @@ from skyvern.forge.sdk.workflow.browser_action_policy_enrollment import (
 from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock, WhileLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
+from skyvern.forge.sdk.workflow.runtime_completion import carried_contract, with_contract
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.schemas.workflows import WorkflowStatus
 
@@ -130,6 +131,7 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
+        mask_secrets: bool = False,
         pin_saved_session_ip: bool = False,
         browser_profile_id: str | None = None,
         browser_profile_key: str | None = None,
@@ -173,6 +175,7 @@ class WorkflowsRepository(BaseRepository):
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 persist_browser_session=persist_browser_session,
+                mask_secrets=mask_secrets,
                 pin_saved_session_ip=pin_saved_session_ip,
                 browser_profile_id=browser_profile_id,
                 browser_profile_key=browser_profile_key,
@@ -780,6 +783,7 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None | object = _UNSET,
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        mask_secrets: bool | None = None,
         pin_saved_session_ip: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
         browser_profile_key: str | None | object = _UNSET,
@@ -833,6 +837,8 @@ class WorkflowsRepository(BaseRepository):
                     workflow.totp_identifier = cast(str | None, totp_identifier)
                 if persist_browser_session is not None:
                     workflow.persist_browser_session = persist_browser_session
+                if mask_secrets is not None:
+                    workflow.mask_secrets = mask_secrets
                 if pin_saved_session_ip is not None:
                     workflow.pin_saved_session_ip = pin_saved_session_ip
                 if browser_profile_id is not _UNSET:
@@ -1101,6 +1107,7 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None | object = _UNSET,
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        mask_secrets: bool | None = None,
         pin_saved_session_ip: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
         browser_profile_key: str | None | object = _UNSET,
@@ -1165,8 +1172,11 @@ class WorkflowsRepository(BaseRepository):
                 # not depend on caller-side object identity between the
                 # top-level parameters list and each block's field.
                 _align_block_output_parameters(workflow_definition)
+                definition_json = with_contract(
+                    workflow_definition.model_dump(mode="json"), carried_contract(workflow.workflow_definition)
+                )
                 workflow.workflow_definition = with_policy(
-                    workflow_definition.model_dump(mode="json"), carried_policy(workflow.workflow_definition)
+                    definition_json, carried_policy(workflow.workflow_definition)
                 )
             if version is not None:
                 workflow.version = version
@@ -1190,6 +1200,8 @@ class WorkflowsRepository(BaseRepository):
                 workflow.totp_identifier = cast(str | None, totp_identifier)
             if persist_browser_session is not None:
                 workflow.persist_browser_session = persist_browser_session
+            if mask_secrets is not None:
+                workflow.mask_secrets = mask_secrets
             if pin_saved_session_ip is not None:
                 workflow.pin_saved_session_ip = pin_saved_session_ip
             if browser_profile_id is not _UNSET:

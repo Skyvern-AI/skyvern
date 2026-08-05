@@ -67,7 +67,7 @@ def _capture_handler_kwargs(monkeypatch, previous_extracted_information):
 
     asyncio.run(
         handler.extract_information_for_navigation_goal(
-            task=task, step=MagicMock(retry_index=0), scraped_page=scraped_page
+            task=task, step=MagicMock(retry_index=0), scraped_page=scraped_page, page=MagicMock()
         )
     )
 
@@ -147,7 +147,7 @@ def _capture_handler_schema(monkeypatch, extracted_information_schema):
 
     asyncio.run(
         handler.extract_information_for_navigation_goal(
-            task=task, step=MagicMock(retry_index=0), scraped_page=scraped_page
+            task=task, step=MagicMock(retry_index=0), scraped_page=scraped_page, page=MagicMock()
         )
     )
 

@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
-from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
 from skyvern.forge.sdk.copilot.output_contracts import (
     OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
     OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
@@ -78,7 +77,6 @@ _RUN_ID_LEAK_RE = re.compile(r"\b(?:wr|pbs)_[a-z0-9_]+", re.IGNORECASE)
 _INTERNAL_GUARD_TOKENS: tuple[str, ...] = (
     "per_tool_budget",
     "per-tool-call budget",
-    "active_run_terminal_evidence",
     "block-running tool",
     "block running tool",
 )
@@ -92,6 +90,7 @@ _INTERNAL_TOOL_NAME_TOKENS: tuple[str, ...] = (
     "discover_workflow_entrypoint",
     "get_browser_screenshot",
     "list_credentials",
+    "list_integrations",
 )
 
 
@@ -264,9 +263,6 @@ class _TerminalEvidenceResetCtx(Protocol):
     last_outcome_gate_reason: str | None
     last_outcome_gate_workflow_run_id: str | None
     last_test_anti_bot: str | None
-    delivered_unverified_terminal: bool
-    delivered_unverified_workflow_run_id: str | None
-    delivered_unverified_observed_outputs: dict[str, Any]
     completion_verification_result: Any | None
     outcome_verification_trace_snapshot: dict[str, Any]
 
@@ -301,9 +297,6 @@ def clear_terminal_evidence_on_workflow_edit(ctx: _TerminalEvidenceResetCtx) -> 
     ctx.last_outcome_gate_reason = None
     ctx.last_outcome_gate_workflow_run_id = None
     ctx.last_test_anti_bot = None
-    ctx.delivered_unverified_terminal = False
-    ctx.delivered_unverified_workflow_run_id = None
-    ctx.delivered_unverified_observed_outputs = {}
     ctx.completion_verification_result = None
     ctx.outcome_verification_trace_snapshot = {}
 
@@ -328,7 +321,6 @@ def loop_blocker_evidence_from_ctx(ctx: _LoopEvidenceCtx) -> LoopBlockerEvidence
 _LOOP_PROGRESS_TOOL_SUCCESS_REASON_CODES = frozenset(
     {
         "loop_detected_credential_or_parameter_misconfig",
-        "loop_detected_repeated_failed_step",
         "loop_detected_generic",
     }
 )
@@ -361,12 +353,10 @@ _OUTPUT_CONTRACT_TERMINAL_REASON_CODES = frozenset(
 # halt kind over a later non-terminal trip (e.g. the code-authoring churn backstop).
 GENUINELY_TERMINAL_BLOCKER_REASON_CODES: frozenset[str] = frozenset(
     {
-        ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
         TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
         "tool_error_run_output_terminal_blocker",
         "tool_error_post_budget_challenge_blocker",
         "tool_error_challenge_gated_submit_disabled",
-        "probable_site_block_stop",
         OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
         OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
         "advisory_dispatch_stalled",
@@ -388,11 +378,6 @@ def _should_stash_over_existing(
     if (
         incoming.internal_reason_code in _OUTPUT_CONTRACT_TERMINAL_REASON_CODES
         and existing.blocker_kind == "loop_detected"
-    ):
-        return True
-    if (
-        incoming.internal_reason_code == ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
-        and existing.internal_reason_code in _ACTIVE_TERMINAL_REPLACEABLE_REASON_CODES
     ):
         return True
     if (
@@ -485,19 +470,7 @@ _LOOP_CREDENTIAL_TEMPLATE = (
 CREDENTIAL_SCOUT_VERIFY_REPLY = (
     "I need to verify the saved-credential login in the browser before I can save or run this code."
 )
-# Mirrors OutputPolicyReason.RAW_SECRET_LEAK.value; kept local because output_policy imports this
-# module, so importing back would be circular.
-RAW_SECRET_LEAK_REASON_CODE = "raw_secret_leak"
-RAW_SECRET_EMBED_REFUSAL_REPLY = (
-    "I couldn't save this because the login code kept embedding the credential's secret value directly "
-    "instead of referencing your saved credential. Your draft is preserved — tell me to reference the "
-    "saved credential and I'll try again."
-)
 _LOOP_BRANCH_COPY: dict[str, tuple[str, str]] = {
-    "loop_detected_repeated_failed_step": (
-        "I retried without making progress.",
-        "Tell me what to change and I'll try a different approach.",
-    ),
     "loop_detected_consecutive_same_tool": (
         "I'm stuck retrying the same step.",
         "Tell me what to change and I'll try a different approach.",
@@ -644,9 +617,6 @@ def compose_loop_blocker_user_facing_reason(
     if internal_reason_code == "loop_detected_credential_or_parameter_misconfig":
         return _LOOP_CREDENTIAL_TEMPLATE, draft_tier
     if internal_reason_code == "credential_priority_authoring_churn":
-        reject_reason_codes = evidence.output_policy_reject_reason_codes if evidence is not None else None
-        if reject_reason_codes == frozenset({RAW_SECRET_LEAK_REASON_CODE}):
-            return RAW_SECRET_EMBED_REFUSAL_REPLY, draft_tier
         return CREDENTIAL_SCOUT_VERIFY_REPLY, draft_tier
     framing, ask = _LOOP_BRANCH_COPY.get(internal_reason_code or "", _LOOP_BRANCH_COPY["loop_detected_generic"])
     result_steer = evidence.latest_evaluate_result_composition_steer if evidence is not None else None
@@ -676,9 +646,6 @@ def build_loop_blocker_signal(
     if "with CREDENTIAL_ERROR" in loop_message or "with PARAMETER_BINDING_ERROR" in loop_message:
         internal = "loop_detected_credential_or_parameter_misconfig"
         recovery_hint: RecoveryHint = "ask_user_clarifying"
-    elif "has already failed" in loop_message:
-        internal = "loop_detected_repeated_failed_step"
-        recovery_hint = "report_blocker_to_user"
     elif "has been called" in loop_message:
         internal = "loop_detected_consecutive_same_tool"
         recovery_hint = "report_blocker_to_user"

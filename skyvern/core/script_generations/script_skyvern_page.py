@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -15,7 +16,13 @@ from playwright.async_api import Page
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, NAVIGATION_MAX_RETRY_TIME
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi, render_template
-from skyvern.core.script_generations.skyvern_page import ActionCall, ActionMetadata, RunContext, SkyvernPage
+from skyvern.core.script_generations.skyvern_page import (
+    ActionCall,
+    ActionMetadata,
+    ResolvedSensitiveValue,
+    RunContext,
+    SkyvernPage,
+)
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import (
@@ -31,14 +38,16 @@ from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
     list_files_in_directory,
 )
+from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.utils import ACTION_TYPE_TO_CLASS
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import generate_totp_code
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services.otp_service import poll_otp_value
-from skyvern.utils.url_validators import prepend_scheme_and_validate_url
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -178,7 +187,9 @@ class ScriptSkyvernPage(SkyvernPage):
         browser_state = await cls._get_or_create_browser_state(browser_session_id=browser_session_id, url=url)
         return await browser_state.scrape_website(
             url="",
-            cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
+            cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(
+                engine_selection=browser_state.engine_selection
+            ),
             scrape_exclude=app.scrape_exclude,
             max_screenshot_number=settings.MAX_NUM_SCREENSHOTS,
             # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
@@ -266,6 +277,10 @@ class ScriptSkyvernPage(SkyvernPage):
             except Exception:
                 pass  # Don't block action execution if file listing fails
 
+        # Stamped after the download-detection baseline (a listdir plus an awaited storage
+        # lookup): the window starts at the action itself, matching finished_at's cut before
+        # the post-action scan.
+        started_at = naive_utc_now()
         try:
             # Wait for page to be ready before executing action
             # This helps prevent issues where cached actions execute before the page is fully loaded
@@ -313,6 +328,7 @@ class ScriptSkyvernPage(SkyvernPage):
 
             raise
         finally:
+            finished_at = naive_utc_now()
             # Add a small buffer between cached actions to give slow pages time to settle
             if settings.CACHED_ACTION_DELAY_SECONDS > 0:
                 await asyncio.sleep(settings.CACHED_ACTION_DELAY_SECONDS)
@@ -376,6 +392,8 @@ class ScriptSkyvernPage(SkyvernPage):
                 call_error=call.error,
                 download_triggered=download_triggered,
                 downloaded_files=downloaded_files,
+                started_at=started_at,
+                finished_at=finished_at,
             )
 
             # Auto-create screenshot artifact after execution
@@ -417,7 +435,7 @@ class ScriptSkyvernPage(SkyvernPage):
             )
 
             # Call secondary LLM to generate reasoning
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
+            json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=reasoning_prompt,
                 prompt_name="generate-action-reasoning",
                 organization_id=context.organization_id,
@@ -444,6 +462,8 @@ class ScriptSkyvernPage(SkyvernPage):
         call_error: Exception | None = None,
         download_triggered: bool | None = None,
         downloaded_files: list[str] | None = None,
+        started_at: datetime | None = None,
+        finished_at: datetime | None = None,
     ) -> tuple[Action | None, list[ActionResult]]:
         """Create an action record and result in the database after execution if task_id and step_id are available.
 
@@ -506,6 +526,8 @@ class ScriptSkyvernPage(SkyvernPage):
                 download=download_triggered,
                 download_triggered=download_triggered,
                 downloaded_files=downloaded_files,
+                started_at=started_at,
+                finished_at=finished_at,
                 created_by="script",
             )
             data_extraction_goal: str | None = None
@@ -695,7 +717,10 @@ class ScriptSkyvernPage(SkyvernPage):
             if not working_page:
                 return
 
-            skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
+            skyvern_frame = await SkyvernFrame.create_instance(
+                frame=working_page,
+                engine_selection=browser_state.engine_selection,
+            )
             html = await skyvern_frame.get_content()
 
             if html:
@@ -790,7 +815,10 @@ class ScriptSkyvernPage(SkyvernPage):
             if not self.page:
                 return
 
-            skyvern_frame = await SkyvernFrame.create_instance(frame=self.page)
+            skyvern_frame = await SkyvernFrame.create_instance(
+                frame=self.page,
+                engine_selection=self.engine_selection,
+            )
             await skyvern_frame.wait_for_page_ready(
                 network_idle_timeout_ms=settings.PAGE_READY_NETWORK_IDLE_TIMEOUT_MS,
                 loading_indicator_timeout_ms=settings.PAGE_READY_LOADING_INDICATOR_TIMEOUT_MS,
@@ -821,7 +849,10 @@ class ScriptSkyvernPage(SkyvernPage):
 
             # Inject domUtils.js and build the element tree to set unique_id attrs.
             # Use a short timeout since this is best-effort; we don't want to hang for 60s.
-            skyvern_frame = await SkyvernFrame.create_instance(frame=self.page)
+            skyvern_frame = await SkyvernFrame.create_instance(
+                frame=self.page,
+                engine_selection=self.engine_selection,
+            )
             await skyvern_frame.build_tree_from_body(
                 frame_name="main.frame",
                 frame_index=0,
@@ -872,6 +903,13 @@ class ScriptSkyvernPage(SkyvernPage):
                     value = totp_value.value
 
         return value
+
+    def _is_secret_reference(self, value: str) -> bool:
+        context = skyvern_context.current()
+        if context is None or not context.workflow_run_id:
+            return False
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
+        return bool(workflow_run_context and workflow_run_context.get_original_secret_value_or_none(value) is not None)
 
     # Class-level cache for TOTP codes to ensure all digits in a sequence use the same code
     # Key: (workflow_run_id, credential_key), Value: totp_code
@@ -961,6 +999,15 @@ class ScriptSkyvernPage(SkyvernPage):
                                     totp_code = generate_totp_code(totp_secret)
                                     # Cache the code for subsequent digit requests in this sequence
                                     self._totp_sequence_cache[cache_key] = totp_code
+                                    try:
+                                        workflow_run_context.register_runtime_otp_value(totp_code)
+                                    except Exception:
+                                        LOG.debug(
+                                            "Failed to register runtime TOTP for redaction",
+                                            workflow_run_id=workflow_run_id,
+                                            credential_key=key,
+                                            exc_info=True,
+                                        )
                                     LOG.info(
                                         "Generated fresh TOTP and cached for sequence",
                                         field_name=field_name,
@@ -982,7 +1029,7 @@ class ScriptSkyvernPage(SkyvernPage):
 
         # Return the specific digit
         if digit_index < len(totp_code):
-            return totp_code[digit_index]
+            return ResolvedSensitiveValue(totp_code[digit_index])
         LOG.warning(
             "TOTP digit index out of range",
             field_name=field_name,
@@ -993,7 +1040,7 @@ class ScriptSkyvernPage(SkyvernPage):
 
     async def goto(self, url: str, **kwargs: Any) -> None:
         url = render_template(url)
-        url = prepend_scheme_and_validate_url(url)
+        url = await asyncio.to_thread(validate_fetch_url, url)
 
         # Print navigation in script mode
         context = skyvern_context.current()

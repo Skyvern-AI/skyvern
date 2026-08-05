@@ -273,6 +273,7 @@ class GoogleOAuthRepository(BaseRepository):
                     encrypted_refresh_token=encrypted_refresh_token,
                     encrypted_method=encrypted_method.value,
                     scopes_granted=scopes_granted,
+                    email_address=None,
                     consent_nonce=None,
                     consent_redirect_uri=None,
                     consent_expires_at=None,
@@ -423,6 +424,69 @@ class GoogleOAuthRepository(BaseRepository):
             await session.commit()
             return result
 
+    @db_operation("update_active_refresh_token")
+    async def update_active_refresh_token(
+        self,
+        *,
+        organization_id: str,
+        credential_id: str,
+        encrypted_refresh_token: str,
+        encrypted_method: EncryptMethod,
+        now: datetime.datetime,
+        expected_encrypted_refresh_token: str,
+    ) -> bool:
+        async with self.Session() as session:
+            stmt = (
+                update(GoogleOAuthCredentialModel)
+                .where(
+                    GoogleOAuthCredentialModel.id == credential_id,
+                    GoogleOAuthCredentialModel.organization_id == organization_id,
+                    GoogleOAuthCredentialModel.state == STATE_ACTIVE,
+                    GoogleOAuthCredentialModel.encrypted_refresh_token == expected_encrypted_refresh_token,
+                )
+                .values(
+                    encrypted_refresh_token=encrypted_refresh_token,
+                    encrypted_method=encrypted_method.value,
+                    modified_at=now,
+                )
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            return result.rowcount > 0
+
+    @db_operation("update_email_address")
+    async def update_email_address(
+        self,
+        *,
+        organization_id: str,
+        credential_id: str,
+        email_address: str,
+        only_if_null: bool,
+        expected_version: datetime.datetime | None = None,
+    ) -> bool:
+        async with self.Session() as session:
+            filters = [
+                GoogleOAuthCredentialModel.id == credential_id,
+                GoogleOAuthCredentialModel.organization_id == organization_id,
+                GoogleOAuthCredentialModel.state == STATE_ACTIVE,
+            ]
+            if only_if_null:
+                filters.append(GoogleOAuthCredentialModel.email_address.is_(None))
+            if expected_version is not None:
+                filters.append(GoogleOAuthCredentialModel.modified_at == expected_version)
+            # modified_at is the refresh-token optimistic-lock version and email enrichment must not advance it.
+            stmt = (
+                update(GoogleOAuthCredentialModel)
+                .where(*filters)
+                .values(
+                    email_address=email_address,
+                    modified_at=GoogleOAuthCredentialModel.modified_at,
+                )
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            return result.rowcount > 0
+
     @db_operation("mark_revoked_and_scrub")
     async def mark_revoked_and_scrub(
         self,
@@ -442,6 +506,7 @@ class GoogleOAuthRepository(BaseRepository):
                     state=STATE_REVOKED,
                     encrypted_refresh_token=None,
                     encrypted_method=None,
+                    email_address=None,
                     consent_nonce=None,
                     consent_redirect_uri=None,
                     consent_expires_at=None,

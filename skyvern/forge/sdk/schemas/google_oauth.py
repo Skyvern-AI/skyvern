@@ -1,7 +1,9 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, computed_field, field_validator
+
+STATE_ACTIVE = "active"
 
 
 class GoogleOAuthClientConfig(BaseModel):
@@ -73,12 +75,18 @@ class GoogleOAuthCredentialBase(BaseModel):
     id: str
     organization_id: str
     credential_name: str
+    email_address: str | None = None
     provider: str = "google"
     state: str
     scopes_requested: list[str] = Field(default_factory=list)
     scopes_granted: list[str] = Field(default_factory=list)
     created_at: datetime
     modified_at: datetime
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def valid(self) -> bool:
+        return self.state == STATE_ACTIVE
 
 
 class GoogleOAuthCredentialResponse(BaseModel):

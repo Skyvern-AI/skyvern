@@ -12,12 +12,10 @@ from unittest.mock import AsyncMock, MagicMock, call
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.forge.sdk.copilot import hooks as hooks_module
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.code_block_synthesis import dynamic_row_evidence_fingerprint, synthesize_code_block
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.enforcement import CopilotGoalSatisfied
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.tools import (
     _capture_scout_ambiguity,
@@ -68,10 +66,10 @@ def _mcp_text_output(payload: dict[str, Any]) -> list[dict[str, str]]:
 def _terminal_loop_signal() -> CopilotToolBlockerSignal:
     return CopilotToolBlockerSignal(
         blocker_kind="loop_detected",
-        agent_steering_text="LOOP DETECTED: 'update_workflow' has already failed 3 times.",
+        agent_steering_text="LOOP DETECTED: 'update_workflow' has been called 3 times.",
         user_facing_reason="I retried without making progress. Tell me what to change and I'll try again.",
         recovery_hint="report_blocker_to_user",
-        internal_reason_code="loop_detected_repeated_failed_step",
+        internal_reason_code="loop_detected_consecutive_same_tool",
         blocked_tool="update_workflow",
     )
 
@@ -248,25 +246,6 @@ async def test_on_tool_end_swallows_unserializable_output() -> None:
     assert warning["workflow_permanent_id"] == "wpid_example"
     assert warning["turn_id"] == "turn_example"
     assert warning["workflow_copilot_chat_id"] == "chat_example"
-
-
-@pytest.mark.asyncio
-async def test_on_tool_end_goal_satisfied_log_includes_copilot_turn_identifiers(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = _FakeContext()
-    hooks = CopilotRunHooks(ctx)
-    monkeypatch.setattr(hooks_module, "_tool_completion_satisfies_turn", lambda *_args: True)
-
-    output = _mcp_text_output({"ok": True, "data": {"workflow_run_id": "wrid_example"}})
-    with capture_logs() as logs:
-        with pytest.raises(CopilotGoalSatisfied):
-            await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("update_and_run_blocks"), output)
-
-    satisfied = next(log for log in logs if log["event"] == "copilot tool satisfied goal; stopping agent loop")
-    assert satisfied["workflow_permanent_id"] == "wpid_example"
-    assert satisfied["turn_id"] == "turn_example"
-    assert satisfied["workflow_copilot_chat_id"] == "chat_example"
 
 
 class TestCopilotToCallToolResult:
@@ -718,63 +697,6 @@ class TestMCPFailedStepLoopDetection:
             organization_id="org-1",
         )
 
-    @pytest.mark.asyncio
-    async def test_interleaved_same_step_failures_short_circuit_third_dispatch(self) -> None:
-        from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
-
-        class FakeRawResult:
-            def __init__(self, payload: dict[str, Any], is_error: bool = False) -> None:
-                self.structured_content = payload
-                self.is_error = is_error
-                self.content: list[Any] = []
-
-        class FakeClient:
-            def __init__(self) -> None:
-                self.calls: list[tuple[str, dict[str, Any]]] = []
-
-            async def call_tool(
-                self,
-                name: str,
-                args: dict[str, Any],
-                raise_on_error: bool = False,
-            ) -> FakeRawResult:
-                self.calls.append((name, args))
-                if name == "get_browser_screenshot":
-                    return FakeRawResult({"ok": False, "error": "screenshot failed"}, is_error=True)
-                return FakeRawResult({"ok": True, "data": {"status": "failed"}})
-
-        ctx = MagicMock()
-        ctx.consecutive_tool_tracker = []
-        ctx.failed_tool_step_tracker = {}
-        ctx.turn_ownership = None
-        ctx.blocker_signal_claimant = None
-        ctx.gate_precedence_conflict_events = []
-        client = FakeClient()
-        server = SkyvernOverlayMCPServer(
-            transport=MagicMock(),
-            overlays={},
-            alias_map={},
-            allowlist=frozenset(),
-            context_provider=lambda: ctx,
-        )
-        server._client = client
-
-        await server.call_tool("get_browser_screenshot", {})
-        await server.call_tool("get_run_results", {})
-        await server.call_tool("get_browser_screenshot", {})
-        await server.call_tool("get_run_results", {})
-        blocked = await server.call_tool("get_browser_screenshot", {})
-
-        parsed = json.loads(blocked.content[0].text)
-        assert blocked.isError is True
-        assert "LOOP DETECTED" in parsed["error"]
-        assert client.calls == [
-            ("get_browser_screenshot", {}),
-            ("get_run_results", {}),
-            ("get_browser_screenshot", {}),
-            ("get_run_results", {}),
-        ]
-
 
 class TestMCPToolOverlayCompleteness:
     """Verify alias map and overlay configs are in sync and complete."""
@@ -795,6 +717,7 @@ class TestMCPToolOverlayCompleteness:
             "console_messages",
             "select_option",
             "press_key",
+            "wait_for_either_state",
         }
         assert set(alias_map.keys()) == expected_aliases
         assert all(v.startswith("skyvern_") for v in alias_map.values())
@@ -824,9 +747,21 @@ class TestMCPToolOverlayCompleteness:
             "console_messages",
             "select_option",
             "press_key",
+            "wait_for_either_state",
         }
         for name in browser_tools:
             assert overlays[name].requires_browser, f"{name} should have requires_browser=True"
+
+    def test_wait_for_either_state_exposes_the_two_selector_branch(self) -> None:
+        """Without selector_or the copilot must guess one state and pay the timeout when it is wrong."""
+        from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
+
+        assert get_skyvern_mcp_alias_map()["wait_for_either_state"] == "skyvern_wait_for_either_state"
+        overlay = _build_skyvern_mcp_overlays()["wait_for_either_state"]
+
+        # Both states are required by the tool itself, so a single-selector call — the shape that
+        # spends the whole ceiling on a wrong guess — is not expressible here at all.
+        assert not overlay.hide_params & {"selector_a", "selector_b"}
 
     def test_intent_hidden_on_element_action_tools(self) -> None:
         """An `intent` runs a second LLM agent to pick the element, duplicating reasoning the
@@ -1068,10 +1003,14 @@ class TestBrowserInteractionObservationHooks:
             pending_scout_ambiguous=None,
             pending_scout_reanchor=None,
             pending_scout_dynamic_row=None,
+            pending_scout_download_snapshot=None,
             discovery_mcp_server=None,
             scouted_interactions=[],
             scout_trajectory=[],
             pending_scout_source_url=None,
+            request_policy=None,
+            org_credentials_for_turn=None,
+            organization_id="o_1",
         )
         result = await _click_post_hook(
             {"ok": True, "data": {"selector": "#add-to-cart"}},
@@ -1105,6 +1044,7 @@ class TestBrowserInteractionObservationHooks:
             pending_scout_ambiguous=None,
             pending_scout_reanchor=None,
             pending_scout_dynamic_row=None,
+            pending_scout_download_snapshot=None,
             discovery_mcp_server=None,
             scouted_interactions=[],
             scout_trajectory=[],
@@ -1163,6 +1103,7 @@ class TestScoutedInteractionCapture:
             pending_scout_ambiguous=None,
             pending_scout_reanchor=None,
             pending_scout_dynamic_row=None,
+            pending_scout_download_snapshot=None,
             discovery_mcp_server=None,
             browser_session_id=None,
             scouted_interactions=[],
@@ -1173,6 +1114,9 @@ class TestScoutedInteractionCapture:
             pending_scout_source_url=source_url,
             prior_fill_carry=[],
             fill_carry_rebound_done=False,
+            request_policy=None,
+            org_credentials_for_turn=None,
+            organization_id="o_1",
         )
         if policy is not None:
             ns.block_authoring_policy = policy
@@ -1989,21 +1933,6 @@ class TestClickPostHookReachedDownloadTarget:
     }
 
     @pytest.mark.asyncio
-    async def test_click_on_download_affordance_populates_reached_download_target(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from skyvern.forge.sdk.copilot.tools.mcp_hooks import _click_post_hook
-
-        self._patch_scouting(monkeypatch, page_evidence=self._SINGLE_DOWNLOAD_EVIDENCE)
-
-        ctx = self._ctx()
-        result = {"ok": True, "data": {"selector": 'a[href="/x/statement.pdf"]'}}
-        await _click_post_hook(result, {}, ctx)
-
-        assert ctx.reached_download_target is not None
-        assert ctx.reached_download_target.download_kind == "extension"
-
-    @pytest.mark.asyncio
     async def test_click_post_hook_is_noop_in_standard_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.forge.sdk.copilot.tools.mcp_hooks import _click_post_hook
 
@@ -2015,20 +1944,22 @@ class TestClickPostHookReachedDownloadTarget:
 
         assert ctx.reached_download_target is None
 
-    @pytest.mark.asyncio
-    async def test_click_on_two_affordances_leaves_target_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.forge.sdk.copilot.tools.mcp_hooks import _click_post_hook
 
-        two = {
-            "navigation_targets": [
-                {"selector": 'a[href="/x/a.pdf"]', "text": "A", "download_kind": "extension"},
-                {"selector": 'a[href="/x/b.pdf"]', "text": "B", "download_kind": "extension"},
-            ]
-        }
-        self._patch_scouting(monkeypatch, page_evidence=two)
+def test_browser_overlays_are_gated_by_phase_and_session_classification() -> None:
+    """A requires_browser overlay provisions a session, so leaving one out of these sets lets it run
+    before composition and stops a dead-session failure from being classified unrecoverable."""
+    from skyvern.forge.sdk.copilot.build_phase import _BROWSER_PRIMITIVE_TOOLS
+    from skyvern.forge.sdk.copilot.streaming_adapter import _OBSERVATION_TOOLS
+    from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
+    from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _BROWSER_SESSION_TOOL_NAMES
 
-        ctx = self._ctx()
-        result = {"ok": True, "data": {"selector": 'a[href="/x/a.pdf"]'}}
-        await _click_post_hook(result, {}, ctx)
+    browser_overlays = {name for name, o in _build_skyvern_mcp_overlays().items() if o.requires_browser}
 
-        assert ctx.reached_download_target is None
+    assert browser_overlays <= _BROWSER_PRIMITIVE_TOOLS, browser_overlays - _BROWSER_PRIMITIVE_TOOLS
+    assert browser_overlays <= _BROWSER_SESSION_TOOL_NAMES, browser_overlays - _BROWSER_SESSION_TOOL_NAMES
+
+    # navigate_browser is the call that creates the need for an observation, so it cannot satisfy it.
+    # Every other browser tool touches the page it arrived on, which is what the post-navigate nudge
+    # is asking the model to do — leaving one out re-asks for work it already did.
+    observers = browser_overlays - {"navigate_browser"}
+    assert observers <= _OBSERVATION_TOOLS, observers - _OBSERVATION_TOOLS

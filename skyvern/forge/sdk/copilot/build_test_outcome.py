@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
@@ -24,6 +25,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, workflow_target_url
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
+from skyvern.forge.sdk.copilot.failure_tracking import selector_identities_in_text, selector_identity_from_failure
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.result_evidence import (
     LoadedResultCompositionEvidence,
@@ -31,6 +33,7 @@ from skyvern.forge.sdk.copilot.result_evidence import (
     scout_observation_contract_valid,
 )
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, RunOutcomeReasonCode
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import UnresolvedRuntimeFailure
 
 LOG = structlog.get_logger()
 
@@ -58,6 +61,7 @@ BuildTestOutcomeReasonCode = Literal[
     "blocker_reported",
     "failed_run",
     "run_completed_unevaluated",
+    "unrecoverable_tool_error",
     "suspicious_success",
     "missing_structural_evidence",
     "unchanged_after_recorded_outcome",
@@ -87,6 +91,7 @@ _REF_TEXT_MAX = 96
 _VALUE_EXCERPT_MAX = 700
 _HISTORY_LIMIT = 8
 _INSPECT_PAGE_SOURCE_TOOL = "inspect_page_for_composition"
+_UNRECOVERABLE_TOOL_ERROR_CATEGORY = "UNRECOVERABLE_TOOL_ERROR"
 _PLAYWRIGHT_LOCATOR_WAIT_RE = re.compile(
     r"waiting for locator\((?P<quote>['\"])(?P<selector>.*?)(?P=quote)\)"
     r"(?P<locator_chain>(?:\.[A-Za-z_][A-Za-z0-9_]*(?:\([^)]*\))?)*)\s+to be (?P<state>[a-z_]+)",
@@ -123,6 +128,7 @@ class RecordedBuildTestOutcome(BaseModel):
     attempted_tool: str = ""
     attempted_target: str = ""
     attempted_block_label: str = ""
+    attempted_call_ref: str = ""
     verdict: BuildTestOutcomeVerdict
     reason_code: BuildTestOutcomeReasonCode
     observed_evidence_summary: str = ""
@@ -363,6 +369,10 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
             "is_authoritative": outcome.is_authoritative,
             "workflow_run_id": outcome.workflow_run_id,
             "authored_structure_signature": outcome.authored_structure_signature,
+            "block_labels": list(outcome.block_labels),
+            "attempted_block_label": outcome.attempted_block_label,
+            "attempted_block_signature": _attempted_block_signature(ctx, outcome),
+            "attempted_call_ref": outcome.attempted_call_ref,
         }
     )
     del history[:-_HISTORY_LIMIT]
@@ -379,6 +389,135 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
         workflow_run_id=outcome.workflow_run_id,
         authored_structure_signature=outcome.authored_structure_signature,
     )
+
+
+def _attempted_block_signature(ctx: _RecordedBuildTestOutcomeContext, outcome: RecordedBuildTestOutcome) -> str:
+    """YAML-derived so it stays comparable later; ``block_shape_hashes`` is built from block models
+    and never hashes equal to a YAML-derived signature."""
+    if outcome.reason_code != "runtime_block_failure" or not outcome.attempted_block_label:
+        return ""
+    return authored_block_signatures_from_workflow(ctx.workflow_yaml).get(outcome.attempted_block_label, "")
+
+
+def _code_blocks_by_label(workflow_yaml: str | None) -> dict[str, str]:
+    """Code text for every code block in the draft, including blocks nested in containers or loops."""
+    code_by_label: dict[str, str] = {}
+    if not isinstance(workflow_yaml, str) or not workflow_yaml.strip():
+        return code_by_label
+    parsed = _parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, Mapping):
+        return code_by_label
+
+    def walk(value: object) -> None:
+        for block in _mapping_list(value):
+            label = _safe_str(block.get("label"))
+            code = block.get("code")
+            if _safe_str(block.get("block_type")).lower() == "code" and label and isinstance(code, str):
+                code_by_label[label] = code
+            walk(block.get("blocks"))
+            walk(block.get("loop_blocks"))
+
+    walk(_dict(parsed.get("workflow_definition")).get("blocks"))
+    return code_by_label
+
+
+# Every construct that can reach the end of a block without running something inside it, including
+# expression-level ones: a zero-length comprehension skips its body exactly as an unentered loop does.
+# Over-detection only costs a redundant note; a miss silently drops a real failure.
+_SELECTOR_CALL_ATTRS = frozenset({"locator", "get_by_role", "get_by_text", "get_by_label", "get_by_placeholder"})
+
+_CALL_SKIPPING_NODES = (
+    ast.If,
+    ast.IfExp,
+    ast.BoolOp,
+    ast.Try,
+    ast.TryStar,
+    ast.While,
+    ast.For,
+    ast.AsyncFor,
+    ast.comprehension,
+    ast.Match,
+    ast.Lambda,
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+)
+
+
+def _parse_block_code(code: str) -> ast.AsyncFunctionDef | None:
+    """Block code is an async body, so it only parses inside a wrapper; None means unparseable."""
+    try:
+        wrapper = ast.parse("async def _block():\n" + textwrap.indent(code, "    ")).body[0]
+    except Exception:
+        # Deeply nested generated code raises MemoryError from the parser rather than SyntaxError,
+        # and no caller may propagate a parse failure out of turn assembly.
+        return None
+    return wrapper if isinstance(wrapper, ast.AsyncFunctionDef) else None
+
+
+def _code_can_skip_a_call(code: str) -> bool:
+    """Unparseable code counts as branching so an unrecognized shape never credits re-exercise."""
+    wrapper = _parse_block_code(code)
+    if wrapper is None:
+        return True
+    return any(isinstance(node, _CALL_SKIPPING_NODES) for stmt in wrapper.body for node in ast.walk(stmt))
+
+
+def _selector_removal_is_provable(code: str) -> bool:
+    """Whether every selector in the block is a literal, so a scan that misses one proves removal.
+
+    A selector built at runtime (an f-string, a variable, a concatenation) is invisible to the
+    literal scan, so its absence would otherwise read as the failing call having been edited away.
+    """
+    wrapper = _parse_block_code(code)
+    if wrapper is None:
+        return False
+    for node in ast.walk(wrapper):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        if node.func.attr not in _SELECTOR_CALL_ATTRS:
+            continue
+        selector_args = [*node.args, *(kw.value for kw in node.keywords if kw.arg == "name")]
+        if any(not isinstance(arg, ast.Constant) or not isinstance(arg.value, str) for arg in selector_args):
+            return False
+    return True
+
+
+def unresolved_runtime_block_failure(ctx: _RecordedBuildTestOutcomeContext) -> UnresolvedRuntimeFailure | None:
+    """The newest runtime block failure that no later run verifiably re-exercised or edited away."""
+    history = ctx.recorded_build_test_outcome_history
+    for index in range(len(history) - 1, -1, -1):
+        entry = history[index]
+        if entry.get("reason_code") != "runtime_block_failure":
+            continue
+        label = _safe_str(entry.get("attempted_block_label"))
+        signature = _safe_str(entry.get("attempted_block_signature"))
+        run_id = _safe_str(entry.get("workflow_run_id"))
+        call_ref = _safe_str(entry.get("attempted_call_ref"))
+        # Scout evaluations and author-time rejects share this history, so a later *run* has to be
+        # identified by phase and a different run id -- otherwise author-time work after the failure
+        # would read as a later run that skipped the block.
+        later_runs = [
+            entry_after
+            for entry_after in history[index + 1 :]
+            if entry_after.get("phase") == "persisted_block_run"
+            and _safe_str(entry_after.get("workflow_run_id")) not in ("", run_id)
+        ]
+        code = _code_blocks_by_label(ctx.workflow_yaml).get(label)
+        if not (label and run_id and later_runs and code):
+            return None
+        # Executing the block re-exercises the failing call only when the block runs straight
+        # through; a branch inside it can reach the end without reaching the call.
+        if not _code_can_skip_a_call(code):
+            for later_run in later_runs:
+                if label in _string_list(later_run.get("block_labels")):
+                    return None
+        if call_ref:
+            if call_ref not in selector_identities_in_text(code) and _selector_removal_is_provable(code):
+                return None
+        elif signature and authored_block_signatures_from_workflow(ctx.workflow_yaml).get(label) != signature:
+            return None
+        return UnresolvedRuntimeFailure(workflow_run_id=run_id, block_label=label)
+    return None
 
 
 def bind_post_run_page_path_failure(
@@ -1248,6 +1387,13 @@ def recorded_outcome_from_run_blocks_result(
         if failed_block is not None or not bool(result.get("ok"))
         else "run_completed_unevaluated"
     )
+    if any(ref.split(":", 1)[0] == _UNRECOVERABLE_TOOL_ERROR_CATEGORY for ref in failure_categories):
+        # The run failed on the tool plane, not on what was authored, so it is not test
+        # signal: dropping the identity keys it out of outcome dedup and grounding too.
+        verdict = "not_authoritative"
+        reason_code = "unrecoverable_tool_error"
+        structural_identity = ""
+        page_refs = []
     has_runtime_failure_evidence = bool(failure_categories or failure_type or runtime_failure_identity or failed_block)
     if (
         verdict == "repairable_failure"
@@ -1261,6 +1407,9 @@ def recorded_outcome_from_run_blocks_result(
         phase="persisted_block_run",
         attempted_tool="update_and_run_blocks",
         attempted_block_label=_safe_str(failed_block.get("label")) if failed_block is not None else "",
+        attempted_call_ref=selector_identity_from_failure(
+            _safe_str(failed_block.get("failure_reason")) if failed_block is not None else ""
+        ),
         verdict=verdict,
         reason_code=reason_code,
         workflow_run_id=workflow_run_id or None,

@@ -1,5 +1,8 @@
+import asyncio
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Awaitable, Callable
+
+import structlog
 
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.credentials import (
@@ -10,7 +13,10 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialVaultType,
     CreditCardBillingAddress,
     CreditCardCredential,
+    PasswordCredential,
 )
+
+LOG = structlog.get_logger()
 
 
 class CredentialVaultService(ABC):
@@ -32,15 +38,115 @@ class CredentialVaultService(ABC):
     async def delete_credential(self, credential: Credential) -> None:
         """Delete a credential from the vault and database."""
 
-    async def post_delete_credential_item(self, item_id: str, organization_id: str | None = None) -> None:
+    async def post_delete_credential_item(self, item_id: str, organization_id: str | None = None) -> bool:
         """
         Optional hook for scheduling background cleanup tasks after credential deletion.
         Default implementation does nothing. Override in subclasses as needed.
         """
+        return True
 
     @abstractmethod
     async def get_credential_item(self, db_credential: Credential) -> CredentialItem:
         """Retrieve the full credential data from the vault."""
+
+    async def _enqueue_orphaned_vault_item_cleanup(
+        self,
+        *,
+        organization_id: str,
+        item_id: str,
+        vault_type: CredentialVaultType,
+    ) -> bool:
+        try:
+            return bool(
+                await app.AGENT_FUNCTION.on_credential_item_orphaned(
+                    organization_id=organization_id,
+                    item_id=item_id,
+                    vault_type=vault_type,
+                )
+            )
+        except Exception:
+            LOG.error(
+                "Durable vault-item cleanup enqueue failed; item requires manual reconciliation",
+                organization_id=organization_id,
+                item_id=item_id,
+                vault_type=vault_type,
+                exc_info=True,
+            )
+            raise
+
+    async def _run_task_to_completion(
+        self,
+        awaitable: Awaitable[None],
+        *,
+        suppress_cancellation: bool = False,
+        cancellation_failure_message: str | None = None,
+        log_context: dict[str, object] | None = None,
+    ) -> None:
+        task = asyncio.ensure_future(awaitable)
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                cancellation = cancellation or exc
+            except Exception:
+                if cancellation is None:
+                    raise
+                break
+
+        if cancellation is None:
+            task.result()
+            return
+
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            if cancellation_failure_message:
+                LOG.error(cancellation_failure_message, **(log_context or {}), exc_info=True)
+
+        if not suppress_cancellation:
+            raise cancellation
+
+    async def _reclaim_orphaned_vault_item(
+        self,
+        *,
+        delete: Callable[[], Awaitable[None]],
+        organization_id: str,
+        item_id: str,
+        vault_type: CredentialVaultType,
+    ) -> None:
+        """Reclaim a just-created vault item after the DB repoint failed or was cancelled.
+
+        Runs under shield so a CancelledError (write-lease renewal cancelling the owner task)
+        cannot orphan a secret-bearing item between create and repoint. Falls back to durable
+        cleanup so the reaper reclaims the item if the inline delete also fails.
+        """
+
+        async def _run() -> None:
+            try:
+                await delete()
+                return
+            except Exception:
+                LOG.error(
+                    "Inline vault-item cleanup failed after DB repoint failure; enqueuing durable cleanup",
+                    organization_id=organization_id,
+                    item_id=item_id,
+                    vault_type=vault_type,
+                    exc_info=True,
+                )
+            try:
+                await self._enqueue_orphaned_vault_item_cleanup(
+                    organization_id=organization_id,
+                    item_id=item_id,
+                    vault_type=vault_type,
+                )
+            except Exception:
+                # The original failure or cancellation must win over a failed fallback enqueue.
+                pass
+
+        await self._run_task_to_completion(_run(), suppress_cancellation=True)
 
     async def _preserve_omitted_credit_card_fields(
         self,
@@ -75,6 +181,20 @@ class CredentialVaultService(ABC):
                 preserved_fields[field_name] = getattr(existing_credential, field_name)
 
         return updated_credential.model_copy(update=preserved_fields)
+
+    async def _preserve_omitted_password_metadata(
+        self,
+        credential: Credential,
+        updated_credential: PasswordCredential,
+    ) -> PasswordCredential:
+        if "metadata" in updated_credential.model_fields_set:
+            return updated_credential
+
+        existing_item = await self.get_credential_item(credential)
+        if not isinstance(existing_item.credential, PasswordCredential):
+            return updated_credential
+
+        return updated_credential.model_copy(update={"metadata": existing_item.credential.metadata})
 
     @staticmethod
     def _preserve_omitted_billing_address_fields(

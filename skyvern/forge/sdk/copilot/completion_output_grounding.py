@@ -269,7 +269,9 @@ def grade_requested_output_criteria(
             requires_independent_evidence = (
                 effective_evidence_source == "independent_run_evidence" or _is_judgment_boolean_criterion(criterion)
             )
-            if requires_independent_evidence and satisfied_source not in _INDEPENDENT_EVIDENCE_SOURCES:
+            if self_witnessed_numeric_substring(criterion, snapshot, satisfied_source) or (
+                requires_independent_evidence and satisfied_source not in _INDEPENDENT_EVIDENCE_SOURCES
+            ):
                 verdicts.append(
                     CriterionVerdict(
                         criterion_id=criterion.id,
@@ -430,7 +432,7 @@ def _carrier_confirmation(
     artifact_text = _carrier_surface_text(
         snapshot, _REGISTERED_ARTIFACT_OBSERVATION_LABEL, "registered_artifact_content"
     )
-    if artifact_text is not None and _boundary_delimited_present(value_text, artifact_text):
+    if artifact_text is not None and _value_present_in_text(value_text, artifact_text):
         return CriterionVerdict(
             criterion_id=criterion.id,
             state="satisfied",
@@ -440,11 +442,11 @@ def _carrier_confirmation(
             **trace_fields,
         )
     page_text = _carrier_surface_text(snapshot, _POST_RUN_PAGE_OBSERVATION_LABEL, "independent_page_evidence")
-    if page_text is not None and _boundary_delimited_present(value_text, page_text):
+    if page_text is not None and _value_present_in_text(value_text, page_text):
         pre_run_text = snapshot.pre_run_page_reference_text
         if pre_run_text is None:
             return None
-        if not _boundary_delimited_present(value_text, _normalized_expected_text(pre_run_text)):
+        if not _value_present_in_text(value_text, _normalized_expected_text(pre_run_text)):
             return CriterionVerdict(
                 criterion_id=criterion.id,
                 state="satisfied",
@@ -1303,6 +1305,51 @@ def _normalized_expected_text(value: Any) -> str:
 
 def _compact_expected_text(value: str) -> str:
     return "".join(char for char in value if char.isalnum())
+
+
+def self_witnessed_numeric_substring(
+    criterion: CompletionCriterion,
+    snapshot: RunEvidenceSnapshot,
+    satisfied_source: EvidenceSourceKind | None,
+) -> bool:
+    """A registered number whose own evidence text carries it only inside a different quantity.
+
+    "8" reads as present in a tile's "-8.0%" delta while the visitor count it claims to be is 8.45K,
+    so the block's assertion becomes the only proof of itself (SKY-13332). A registered value that
+    stands on its own in the evidence, or that the evidence never mentions, is not this shape.
+    """
+    if satisfied_source != "registered_output_parameter":
+        return False
+    value_text = _carrier_scalar_text(criterion.expected_output_value)
+    if value_text is None or not value_text.replace(",", "").isdigit():
+        return False
+    for payload in snapshot.block_outputs.values():
+        if not isinstance(payload, Mapping):
+            continue
+        evidence_text = payload.get("evidence_text")
+        if not isinstance(evidence_text, str) or not evidence_text.strip():
+            continue
+        normalized = _normalized_expected_text(evidence_text)
+        if _value_present_in_text(value_text, normalized) and not _standalone_number_present(value_text, normalized):
+            return True
+    return False
+
+
+def _standalone_number_present(value_text: str, text: str) -> bool:
+    """Whether the value appears as a number in its own right, not inside a larger figure."""
+    needle = value_text.replace(",", "")
+    for match in re.finditer(r"\d[\d,]*(?:\.\d+)?", text):
+        token = match.group(0)
+        trailing = text[match.end() : match.end() + 1]
+        if trailing == "%" and token.replace(",", "") == needle:
+            continue
+        if token.replace(",", "") == needle:
+            return True
+    return False
+
+
+def _value_present_in_text(value_text: str, text: str) -> bool:
+    return _boundary_delimited_present(value_text, text)
 
 
 def _normalize_output_path(path: str | None) -> str:

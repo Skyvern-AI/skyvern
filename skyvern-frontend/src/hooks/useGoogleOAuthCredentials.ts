@@ -121,7 +121,8 @@ function extractApiErrorMessage(error: unknown, fallback: string): string {
 
 export function useGoogleOAuthCredentials({
   enabled = true,
-}: { enabled?: boolean } = {}) {
+  includeEmail = false,
+}: { enabled?: boolean; includeEmail?: boolean } = {}) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -143,11 +144,17 @@ export function useGoogleOAuthCredentials({
     isFetching,
     error,
   } = useQuery<GoogleOAuthCredential[]>({
-    queryKey: ["googleOAuthCredentials"],
+    queryKey: includeEmail
+      ? ["googleOAuthCredentials", "includeEmail"]
+      : ["googleOAuthCredentials"],
     enabled,
     queryFn: async () => {
       const client = await getClient(credentialGetter);
-      const response = await client.get("/google/oauth/credentials");
+      const response = await client.get(
+        includeEmail
+          ? "/google/oauth/credentials?include_email=true"
+          : "/google/oauth/credentials",
+      );
       return (response.data as GoogleOAuthCredentialListResponse).credentials;
     },
     // Moderate staleness so multiple GoogleOAuthCredentialSelector instances

@@ -17,6 +17,8 @@ from skyvern.exceptions import require_server_extra_modules
 require_server_extra_modules("skyvern.forge.api_app", ("fastapi", "starlette", "starlette_context"))
 
 from fastapi import FastAPI, Response, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
@@ -39,7 +41,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import Base
-from skyvern.forge.sdk.routes import internal_auth
+from skyvern.forge.sdk.routes import internal_auth, internal_llms
 from skyvern.forge.sdk.routes.google_oauth import google_oauth_router
 from skyvern.forge.sdk.routes.google_sheets import google_sheets_router
 from skyvern.forge.sdk.routes.microsoft_oauth import microsoft_oauth_router
@@ -123,6 +125,17 @@ def format_validation_errors(exc: ValidationError) -> str:
         if error_messages
         else "A validation error occurred. Please check your input and try again."
     )
+
+
+def sanitize_request_validation_errors(exc: RequestValidationError) -> list[dict[str, Any]]:
+    return [
+        {
+            "loc": error["loc"],
+            "msg": error["msg"],
+            "type": error["type"],
+        }
+        for error in exc.errors()
+    ]
 
 
 class ExecutionDatePlugin(Plugin):
@@ -418,6 +431,9 @@ def create_api_app() -> FastAPI:
         fastapi_app.include_router(internal_auth.router, prefix="/v1")
         fastapi_app.include_router(internal_auth.router, prefix="/api/v1")
         fastapi_app.include_router(internal_auth.router, prefix="/api/v2")
+        fastapi_app.include_router(internal_llms.router, prefix="/v1")
+        fastapi_app.include_router(internal_llms.router, prefix="/api/v1")
+        fastapi_app.include_router(internal_llms.router, prefix="/api/v2")
 
     # Mirror the public /workflows surface to /agents (and hide the /workflows form from the schema).
     register_agent_route_aliases(fastapi_app)
@@ -448,6 +464,20 @@ def create_api_app() -> FastAPI:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"detail": detail},
+        )
+
+    @fastapi_app.exception_handler(RequestValidationError)
+    async def handle_request_validation_error(request: Request, exc: RequestValidationError) -> Response:
+        # Only credential routes carry passkey/secret material worth stripping from 422 detail; every
+        # other route keeps FastAPI's default input/ctx to preserve debuggable validation errors.
+        path = request.url.path.rstrip("/")
+        credential_prefixes = ("/v1/credentials", "/api/v1/credentials")
+        if not any(path == prefix or path.startswith(f"{prefix}/") for prefix in credential_prefixes):
+            return await request_validation_exception_handler(request, exc)
+
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": sanitize_request_validation_errors(exc)},
         )
 
     @fastapi_app.exception_handler(ClientDisconnect)

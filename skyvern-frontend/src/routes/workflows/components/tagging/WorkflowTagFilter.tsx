@@ -1,14 +1,5 @@
 import * as React from "react";
-import { ReloadIcon } from "@radix-ui/react-icons";
-import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { type TagFilterTerm, type TagKey } from "../../types/tagTypes";
 import { type TagColorMap } from "../../types/tagColors";
 import { useDeleteTagKeyMutation } from "../../hooks/useWorkflowTagMutations";
@@ -41,58 +32,38 @@ function WorkflowTagFilter({ value, onChange, ...controlProps }: Props) {
         onChange={onChange}
         onDeleteKey={setKeyToDelete}
       />
-      <Dialog
+      <ConfirmDialog
         open={keyToDelete !== null}
         onOpenChange={(next) => {
-          if (!next && !deleteKeyMutation.isPending) {
+          if (!next) {
             setKeyToDelete(null);
           }
         }}
-      >
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>Delete group “{keyToDelete?.key}”?</DialogTitle>
-            <DialogDescription>
-              This removes it from {keyToDelete?.workflow_count ?? 0} workflow
-              {keyToDelete?.workflow_count === 1 ? "" : "s"} and from the group
-              list. This can’t be undone.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setKeyToDelete(null)}
-              disabled={deleteKeyMutation.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              className="gap-2"
-              disabled={deleteKeyMutation.isPending}
-              onClick={() => {
-                if (!keyToDelete) {
-                  return;
-                }
-                const deletedKey = keyToDelete.key;
-                deleteKeyMutation.mutate(deletedKey, {
-                  onSuccess: () => {
-                    // Drop any active filter term on the now-deleted group, else
-                    // the list refetches with a stale ?tags= and shows empty.
-                    onChange(value.filter((term) => term.key !== deletedKey));
-                    setKeyToDelete(null);
-                  },
-                });
-              }}
-            >
-              {deleteKeyMutation.isPending ? (
-                <ReloadIcon className="h-4 w-4 animate-spin" />
-              ) : null}
-              Delete
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        title={`Delete group "${keyToDelete?.key ?? ""}"?`}
+        description={
+          <p>
+            This removes it from {keyToDelete?.workflow_count ?? 0} workflow
+            {keyToDelete?.workflow_count === 1 ? "" : "s"} and from the group
+            list.
+          </p>
+        }
+        contentClassName="sm:max-w-md"
+        isPending={deleteKeyMutation.isPending}
+        onConfirm={() => {
+          if (!keyToDelete) {
+            return;
+          }
+          const deletedKey = keyToDelete.key;
+          deleteKeyMutation.mutate(deletedKey, {
+            onSuccess: () => {
+              // Drop any active filter term on the now-deleted group, else
+              // the list refetches with a stale ?tags= and shows empty.
+              onChange(value.filter((term) => term.key !== deletedKey));
+              setKeyToDelete(null);
+            },
+          });
+        }}
+      />
     </>
   );
 }
