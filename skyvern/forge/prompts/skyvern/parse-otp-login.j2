@@ -1,4 +1,4 @@
-You receive either an email or a text message containing an OTP(like TOTP, Magic Link) to verify the login. Your job is to parse the content, identify the OTP type and value. The value must be from the content.
+You receive either an email or a text message containing an OTP(like TOTP, Magic Link) to verify the login. Your job is to parse the content, identify the OTP type and value. The value must be from the content. Copy the value EXACTLY as it appears in the content, character for character — do NOT retype, reformat, correct, or shorten it. Magic-link URLs are long and a single changed character makes them invalid.
 {% if enforced_otp_type %}
 IMPORTANT: The user has specified they expect a "{{ enforced_otp_type }}" type OTP. You MUST extract the {{ enforced_otp_type }} value from the content, even if other OTP types are present. Ignore any other OTP types in the content. If no {{ enforced_otp_type }} is found, set otp_value_found to false.
 {% else %}

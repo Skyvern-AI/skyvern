@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import json
 import re
 from dataclasses import dataclass, field
@@ -41,6 +42,23 @@ _MFA_PARAMETER_KEY_HINTS = ("mfa", "otp", "verification")
 # "totpidentifier" matches "otp" but carries a lookup key, not a 6-digit code.
 _MFA_METADATA_KEY_HINTS = ("identifier", "url", "secret", "seed", "key")
 _NON_ALNUM_PATTERN = re.compile(r"[^a-z0-9]")
+# OTP/magic-link values are copied verbatim from the source, never re-typed by the LLM: a high-entropy
+# JWT loses one character to the classic rn->m confusion and its signature breaks. URL boundaries stop at
+# whitespace and HTML/quote delimiters so an href="...">Sign body doesn't swallow the trailing markup.
+_BARE_URL_PATTERN = re.compile(r"""^https?://[^\s"'<>)\]}]+$""", re.IGNORECASE)
+_URL_IN_TEXT_PATTERN = re.compile(r"""https?://[^\s"'<>)\]}]+""", re.IGNORECASE)
+# Every HTML spelling of a query-separating "&": named, decimal and hex. The semicolon is required so a
+# plain-text parameter named after a legacy entity (?copy=1, ?amp=1) is left byte-exact.
+_AMPERSAND_ENTITY_PATTERN = re.compile(r"&(?:amp|#0*38|#x0*26);", re.IGNORECASE)
+_OTP_CODE_PATTERN = re.compile(r"\b\d{4,8}\b")
+_CODE_SEPARATOR_PATTERN = re.compile(r"[\s\-]")
+# A code as the source displays it, so a prefix of one is never mistaken for a whole one. A hyphen binds
+# into the token ("AB-12" is one code, not "AB"). A space joins only equal-sized groups of 3-4 digits, the
+# shape used to make a code readable ("123 456"); anything else keeps its own token, so a code followed by
+# an unrelated number ("123456 10 minutes") is never welded into a value that appears nowhere in the source.
+_CODE_CANDIDATE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])\d{3,4}(?:[ \t]\d{3,4})+(?![A-Za-z0-9])|[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*"
+)
 _EXPECTED_TOTP_WEBHOOK_RESPONSE_SHAPE = '{"verification_code":"123456"}'
 # Recovers the verification_code value when the surrounding JSON is malformed
 # (e.g. unescaped quotes inside a relayed email). Assumes verification_code is
@@ -87,6 +105,71 @@ class OTPResultParsedByLLM(BaseModel):
     otp_value: str | None = Field(None, description="The OTP value.")
 
 
+def _clean_url(url: str) -> str:
+    """Normalize a URL pulled from message text to what a browser would actually navigate to: strip
+    trailing sentence punctuation a prose body attaches ("...verify.") and decode the ampersands an HTML
+    href carries, so a query separator is the real & rather than the encoded source bytes. A full
+    html.unescape would corrupt a plain-text link whose query parameter is a legacy entity (&copy=1)."""
+    return _AMPERSAND_ENTITY_PATTERN.sub("&", url).rstrip(".,;:!?")
+
+
+def _verbatim_otp_value(content: str, otp_type: OTPType | None, llm_value: str | None) -> str | None:
+    """Return an OTP/magic-link value copied byte-for-byte from ``content``. The LLM is trusted to LOCATE
+    the value, never to transcribe it: the stored value is always a COMPLETE candidate extracted from the
+    source (a whole URL for magic links, a whole digit run for codes), selected as the one closest to what
+    the LLM returned. This defeats one-character corruption AND truncation of a long token, and — when a
+    message carries several URLs (logo, unsubscribe) or number runs (order #, year) — recovers the one the
+    LLM actually located rather than the first in the text."""
+    if not llm_value:
+        return None
+
+    if otp_type == OTPType.MAGIC_LINK or (
+        otp_type is None and llm_value.strip().lower().startswith(("http://", "https://"))
+    ):
+        urls = [_clean_url(url) for url in _URL_IN_TEXT_PATTERN.findall(content)]
+        cleaned_value = _clean_url(llm_value)
+        if cleaned_value in urls:
+            return cleaned_value
+        closest = difflib.get_close_matches(cleaned_value, urls, n=1, cutoff=0.5)
+        return closest[0] if closest else None
+
+    # Codes: accept only a value equal to a WHOLE candidate from the source, compared with display
+    # separators removed ("123 456", "123-456") so a correctly-read code is kept as the digits the site
+    # expects. A truncation equals no whole candidate, so it reaches digit-run recovery instead of storage.
+    stripped_value = _CODE_SEPARATOR_PATTERN.sub("", llm_value)
+    if not stripped_value:
+        return None
+    # The same code quoted twice (subject and body) is one candidate, not two competing ones.
+    candidates = list(
+        dict.fromkeys(
+            _CODE_SEPARATOR_PATTERN.sub("", candidate) for candidate in _CODE_CANDIDATE_PATTERN.findall(content)
+        )
+    )
+    if stripped_value in candidates:
+        return stripped_value
+    numeric_candidates = [candidate for candidate in candidates if _OTP_CODE_PATTERN.fullmatch(candidate)]
+    # A truncation is a prefix of the code it came from, so resolve prefixes before similarity: scoring
+    # alone ranks a shorter unrelated number ("1234" from an order line) above the code it truncated.
+    # Several prefix matches means the source cannot say which code was located; return nothing.
+    prefixed = [candidate for candidate in numeric_candidates if candidate.startswith(stripped_value)]
+    if prefixed:
+        return prefixed[0] if len(prefixed) == 1 else None
+    # Approximate recovery never guesses: an equally-similar runner-up ("123456" and "123457" against a
+    # misread "123458") means the source cannot say which code was located, so let polling retry instead.
+    scored = sorted(
+        (
+            (difflib.SequenceMatcher(None, candidate, stripped_value).ratio(), candidate)
+            for candidate in numeric_candidates
+        ),
+        reverse=True,
+    )
+    if not scored or scored[0][0] < 0.6:
+        return None
+    if len(scored) > 1 and scored[1][0] == scored[0][0]:
+        return None
+    return scored[0][1]
+
+
 async def parse_otp_login(
     content: str,
     organization_id: str,
@@ -97,6 +180,13 @@ async def parse_otp_login(
     if not await app.AGENT_FUNCTION.has_sufficient_credit_for_otp_parse(organization_id):
         LOG.info("Skipping OTP parse; organization has insufficient credits", organization_id=organization_id)
         raise InsufficientCreditsForOTPParse
+    # A bare magic-link URL is the entire message: store it verbatim and skip the LLM entirely, so a
+    # high-entropy token is never re-transcribed (the rn->m corruption that breaks its signature). Still
+    # a billable parse — charge as usual so the customer's per-parse bill is unchanged by the fast path.
+    stripped_content = content.strip()
+    if enforced_otp_type in (None, OTPType.MAGIC_LINK) and _BARE_URL_PATTERN.match(stripped_content):
+        await app.AGENT_FUNCTION.charge_for_otp_parse(organization_id)
+        return OTPValue(value=_clean_url(stripped_content), type=OTPType.MAGIC_LINK)
     prompt = prompt_engine.load_prompt(
         "parse-otp-login",
         content=content,
@@ -128,7 +218,9 @@ async def parse_otp_login(
         otp_length=len(otp_result.otp_value) if otp_result.otp_value else 0,
     )
     if otp_result.otp_value_found and otp_result.otp_value:
-        return OTPValue(value=otp_result.otp_value, type=otp_result.otp_type)
+        verbatim_value = _verbatim_otp_value(content, otp_result.otp_type, otp_result.otp_value)
+        if verbatim_value:
+            return OTPValue(value=verbatim_value, type=otp_result.otp_type)
     return None
 
 
