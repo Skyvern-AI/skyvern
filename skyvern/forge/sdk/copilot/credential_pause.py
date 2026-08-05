@@ -285,7 +285,7 @@ def credential_pause_reason(ctx: Any) -> str | None:
 def credential_pause_would_fire(ctx: Any, copilot_config: CopilotConfig | None) -> bool:
     """Synchronous subset of maybe_credential_pause's guards.
 
-    Called from both here and enforcement.py's _check_enforcement so the two
+    Called from both here and enforcement.py's enforcement_decision so the two
     can't drift: enforcement pre-empts hygiene nudges based on this same
     prediction, and a client/kill-switch/latch mismatch between the two would
     either suppress nudges for a pause that will never fire, or let a nudge
