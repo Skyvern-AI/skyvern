@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Literal, overload
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
@@ -323,6 +324,24 @@ class OrganizationsRepository(BaseRepository):
                 )
             ).all()
             return [await convert_to_organization_auth_token(token, token_type) for token in tokens]
+
+    @db_operation("delete_org_auth_tokens")
+    async def delete_org_auth_tokens(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+        token_ids: Sequence[str],
+    ) -> None:
+        if not token_ids:
+            return
+        async with self.Session() as session:
+            await session.execute(
+                delete(OrganizationAuthTokenModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(token_type=token_type)
+                .where(OrganizationAuthTokenModel.id.in_(token_ids))
+            )
+            await session.commit()
 
     @db_operation("get_valid_org_auth_tokens_by_type")
     async def get_valid_org_auth_tokens_by_type(

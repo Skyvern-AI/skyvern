@@ -270,6 +270,7 @@ class Settings(BaseSettings):
     # Algorithm used to sign the JWT
     SIGNATURE_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # one week
+    UI_SESSION_TOKEN_TTL_MINUTES: int = Field(default=60, gt=0)
 
     # Artifact storage settings
     ARTIFACT_STORAGE_PATH: str = f"{SKYVERN_DIR}/artifacts"

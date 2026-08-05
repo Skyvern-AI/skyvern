@@ -868,6 +868,9 @@ class AgentFunction:
     workflow_schedules_use_local_scheduler: bool = settings.ENABLE_WORKFLOW_SCHEDULES
     """Whether the API process should run the built-in local scheduler loop."""
 
+    def credential_routes_accept_ui_session(self) -> bool:
+        return True
+
     def supports_sequential_credentials(self) -> bool:
         """Whether this deployment can execute credentials marked run_sequentially."""
         return False

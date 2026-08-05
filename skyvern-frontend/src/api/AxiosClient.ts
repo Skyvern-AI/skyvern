@@ -2,11 +2,12 @@ import {
   apiBaseUrl,
   artifactApiBaseUrl,
   getRuntimeApiKey,
+  getRuntimeApiKeyExpiresAt,
   persistRuntimeApiKey,
   clearRuntimeApiKey,
 } from "@/util/env";
 import { useAuthIssueStore } from "@/store/AuthIssueStore";
-import axios from "axios";
+import axios, { type InternalAxiosRequestConfig } from "axios";
 
 type ApiVersion = "sans-api-v1" | "v1" | "v2";
 
@@ -52,6 +53,155 @@ const artifactApiClient = axios.create({
 
 const clients = [client, v2Client, clientSansApiV1] as const;
 
+type UISessionResponse = {
+  token: string;
+  expires_at: number;
+};
+
+type UISessionRetryConfig = InternalAxiosRequestConfig & {
+  uiSessionRetry?: boolean;
+};
+
+const UI_SESSION_REQUEST_TIMEOUT_MS = 10_000;
+
+let uiSessionEnabled = false;
+let uiSessionEndpointConfirmed = false;
+// "endpoint absent" is inferred from a 404 or a non-JSON 200, and an SPA catch-all or a proxy
+// mid-rollout produces exactly that for an endpoint which does exist. Require a run of them before
+// concluding the deployment has no mint endpoint, so one blip cannot disable refresh for the tab.
+let uiSessionEndpointAbsentStreak = 0;
+let uiSessionLatchReprobed = false;
+const UI_SESSION_ENDPOINT_ABSENT_LIMIT = 3;
+let uiSessionInitialization: Promise<void> | null = null;
+let uiSessionRefresh: Promise<boolean> | null = null;
+let uiSessionRefreshBypassesCache = false;
+let uiSessionRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+function isUiSessionResponse(value: unknown): value is UISessionResponse {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as Partial<UISessionResponse>;
+  return (
+    typeof candidate.token === "string" &&
+    candidate.token.length > 0 &&
+    typeof candidate.expires_at === "number" &&
+    Number.isFinite(candidate.expires_at) &&
+    candidate.expires_at * 1000 > Date.now()
+  );
+}
+
+function scheduleUiSessionRefresh(expiresAt: number) {
+  if (uiSessionRefreshTimer) {
+    clearTimeout(uiSessionRefreshTimer);
+  }
+  const remainingLifetime = expiresAt * 1000 - Date.now();
+  uiSessionRefreshTimer = setTimeout(
+    () => {
+      void refreshUiSession();
+    },
+    Math.max(0, remainingLifetime / 2),
+  );
+}
+
+async function requestUiSession(bypassCache = false): Promise<boolean> {
+  const abortController = new AbortController();
+  const timeoutId = setTimeout(
+    () => abortController.abort(),
+    UI_SESSION_REQUEST_TIMEOUT_MS,
+  );
+  try {
+    const response = await fetch("/ui-session", {
+      cache: "no-store",
+      headers: {
+        accept: "application/json",
+        ...(bypassCache
+          ? { "x-skyvern-ui-session-refresh": "auth-failure" }
+          : {}),
+      },
+      signal: abortController.signal,
+    });
+    const contentType = response.headers.get("content-type") ?? "";
+    const hasJsonContentType = contentType.includes("application/json");
+    const endpointAbsent =
+      response.status === 404 || (response.ok && !hasJsonContentType);
+    if (!response.ok || !hasJsonContentType) {
+      if (!uiSessionEndpointConfirmed && endpointAbsent) {
+        uiSessionEndpointAbsentStreak += 1;
+        if (uiSessionEndpointAbsentStreak >= UI_SESSION_ENDPOINT_ABSENT_LIMIT) {
+          uiSessionEnabled = false;
+        }
+      }
+      return false;
+    }
+    const payload: unknown = await response.json();
+    if (!isUiSessionResponse(payload)) {
+      return false;
+    }
+    uiSessionEndpointConfirmed = true;
+    uiSessionEndpointAbsentStreak = 0;
+    setApiKeyHeader(payload.token, payload.expires_at);
+    scheduleUiSessionRefresh(payload.expires_at);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function refreshUiSession(bypassCache = false): Promise<boolean> {
+  if (!uiSessionEnabled) {
+    // A 401/403 is evidence the deployment does want a credential, so a latch set by ambiguous
+    // absent-endpoint responses may have been wrong. Probe exactly once per page load, and only
+    // lift the latch if that probe actually mints — re-enabling first would let a genuinely absent
+    // endpoint be polled again on every later failure.
+    if (!bypassCache || uiSessionLatchReprobed) {
+      return false;
+    }
+    uiSessionLatchReprobed = true;
+    const recovered = await requestUiSession(true);
+    if (recovered) {
+      uiSessionEnabled = true;
+      uiSessionEndpointAbsentStreak = 0;
+    }
+    return recovered;
+  }
+  if (uiSessionRefresh) {
+    if (bypassCache && !uiSessionRefreshBypassesCache) {
+      await uiSessionRefresh;
+      return await refreshUiSession(true);
+    }
+    return await uiSessionRefresh;
+  }
+  uiSessionRefreshBypassesCache = bypassCache;
+  uiSessionRefresh = requestUiSession(bypassCache).finally(() => {
+    uiSessionRefresh = null;
+    uiSessionRefreshBypassesCache = false;
+  });
+  return await uiSessionRefresh;
+}
+
+export function initializeUiSession(): Promise<void> {
+  if (!uiSessionInitialization) {
+    uiSessionEnabled = true;
+    uiSessionInitialization = (async () => {
+      const apiKey = getRuntimeApiKey();
+      const expiresAt = getRuntimeApiKeyExpiresAt();
+      if (apiKey && expiresAt && expiresAt * 1000 > Date.now()) {
+        uiSessionEndpointConfirmed = true;
+        scheduleUiSessionRefresh(expiresAt);
+      } else {
+        const initialized = await refreshUiSession();
+        if (!initialized && uiSessionEnabled) {
+          uiSessionInitialization = null;
+        }
+      }
+    })();
+  }
+  return uiSessionInitialization;
+}
+
 function getResponseDetail(data: unknown): string | undefined {
   if (data && typeof data === "object" && "detail" in data) {
     const detail = (data as { detail?: unknown }).detail;
@@ -63,10 +213,25 @@ function getResponseDetail(data: unknown): string | undefined {
 clients.forEach((instance) => {
   instance.interceptors.response.use(
     (response) => response,
-    (error) => {
+    async (error) => {
       if (axios.isAxiosError(error)) {
         const statusCode = error.response?.status;
         const detail = getResponseDetail(error.response?.data);
+        const retryConfig = error.config as UISessionRetryConfig | undefined;
+        if (
+          (statusCode === 401 || statusCode === 403) &&
+          retryConfig &&
+          !retryConfig.uiSessionRetry
+        ) {
+          retryConfig.uiSessionRetry = true;
+          if (await refreshUiSession(true)) {
+            const apiKey = getRuntimeApiKey();
+            if (apiKey) {
+              retryConfig.headers.set("X-API-Key", apiKey);
+              return await instance.request(retryConfig);
+            }
+          }
+        }
         const isAuthFailure =
           statusCode === 401 ||
           statusCode === 403 ||
@@ -109,8 +274,8 @@ export function removeAuthorizationHeader() {
   removeHeaderForAllClients("Authorization");
 }
 
-export function setApiKeyHeader(apiKey: string) {
-  persistRuntimeApiKey(apiKey);
+export function setApiKeyHeader(apiKey: string, expiresAt?: number) {
+  persistRuntimeApiKey(apiKey, expiresAt);
   setHeaderForAllClients("X-API-Key", apiKey);
 }
 
