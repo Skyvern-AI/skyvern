@@ -533,6 +533,7 @@ class AgentContext:
     scouted_credential_field_inventory_by_credential_id: dict[str, frozenset[str]] = field(default_factory=dict)
     # Read once per turn: repeated fill attempts must not re-scan the org's credentials.
     org_credentials_for_turn: list[Credential] | None = None
+    vault_login_uris_by_credential_id: dict[str, list[str]] = field(default_factory=dict)
     # Highest trajectory_index visible at the latest parsed evaluate observation and whether that page
     # showed a password-type control; orders page evidence against post-fill submits across evictions.
     last_scout_observation_trajectory_index: int | None = None

@@ -216,6 +216,10 @@ class CredentialItem(BaseModel):
     credential: PasswordCredential | CreditCardCredential | SecretCredential = Field(
         ..., description="The actual credential data"
     )
+    login_uris: list[str] = Field(
+        default_factory=list,
+        description="Sites the vault item itself names, as saved by the user who stored it",
+    )
 
 
 class CreateCredentialRequest(BaseModel):
