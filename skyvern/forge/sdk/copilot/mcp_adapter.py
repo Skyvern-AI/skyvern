@@ -25,6 +25,7 @@ from mcp.types import (
 )
 from playwright.async_api import Browser, BrowserContext
 
+from skyvern.cli.core.session_manager import request_session_scope
 from skyvern.forge import app
 from skyvern.forge.agent_functions import CopilotCandidateNetworkHop
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -36,6 +37,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
 from skyvern.forge.sdk.copilot.enforcement import (
     register_no_progress_interaction_click,
+    requested_output_paths_for_derivation,
     synthesized_block_persistence_signal,
     terminal_challenge_blocker_signal_from_current_page_evidence,
 )
@@ -67,6 +69,7 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "pending_browser_interaction_observation",
     "scouted_interactions",
     "scout_trajectory",
+    "requested_output_designations",
     "pending_scout_source_url",
     "pending_scout_typed_value",
     "pending_scout_role_name",
@@ -128,6 +131,9 @@ class SchemaOverlay:
     required_overrides: list[str] | None = None
     arg_transforms: dict[str, str] = field(default_factory=dict)
     forced_args: dict[str, Any] = field(default_factory=dict)
+    # Params the copilot offers on top of the MCP tool's own schema. A hook consumes them; they are
+    # stripped before the call, so the underlying tool never sees an argument it cannot accept.
+    copilot_params: dict[str, Any] = field(default_factory=dict)
     requires_browser: bool = False
     timeout: int | None = None
     pre_hook: PreHook | None = None
@@ -170,6 +176,37 @@ def _stash_and_emit_current_page_terminal_challenge_blocker(ctx: Any, tool_name:
     return payload
 
 
+def _requested_output_path_choices(schema: dict[str, Any], paths: list[str]) -> dict[str, Any]:
+    """Present the outputs this turn owes as the choices for the path a read claims.
+
+    A free-form string left the model naming its own purpose, so the read that observed the requested
+    quantity was filed as exploration and the value it saw never witnessed the path the binder owes
+    (SKY-13226). The field stays optional: a read that is genuinely exploration omits it, and every
+    requested path stays available so a later read can refine one already claimed.
+    """
+    properties = schema.get("properties")
+    if not paths or not isinstance(properties, dict):
+        return schema
+    output_path = properties.get("output_path")
+    if not isinstance(output_path, dict):
+        return schema
+    listed = ", ".join(paths)
+    return {
+        **schema,
+        "properties": {
+            **properties,
+            "output_path": {
+                **output_path,
+                "enum": paths,
+                "description": (
+                    f"{output_path.get('description', '')} This turn owes: {listed}. Set it to the one "
+                    "this read fills; omit it when the read is exploration."
+                ).strip(),
+            },
+        },
+    }
+
+
 def _apply_schema_overlay(
     input_schema: dict[str, Any],
     overlay: SchemaOverlay,
@@ -189,6 +226,8 @@ def _apply_schema_overlay(
             required.remove(mcp_param)
             required.append(copilot_param)
 
+    props.update(overlay.copilot_params)
+
     if overlay.required_overrides is not None:
         required = overlay.required_overrides
 
@@ -203,7 +242,8 @@ def _transform_args(
     arguments: dict[str, Any],
     overlay: SchemaOverlay,
 ) -> dict[str, Any]:
-    mcp_args = {k: v for k, v in arguments.items() if k not in overlay.hide_params | _INTERNAL_TOOL_ARG_KEYS}
+    dropped = overlay.hide_params | _INTERNAL_TOOL_ARG_KEYS | frozenset(overlay.copilot_params)
+    mcp_args = {k: v for k, v in arguments.items() if k not in dropped}
 
     for copilot_param, mcp_param in overlay.arg_transforms.items():
         if copilot_param in mcp_args:
@@ -308,7 +348,8 @@ class SkyvernOverlayMCPServer(MCPServer):
         stack = AsyncExitStack()
         await stack.__aenter__()
         client = Client(self._transport)
-        await stack.enter_async_context(client)
+        with request_session_scope(self._context_provider().organization_id):
+            await stack.enter_async_context(client)
         self._client = client
         self._exit_stack = stack
 
@@ -405,6 +446,10 @@ class SkyvernOverlayMCPServer(MCPServer):
             self._cached_raw_tools = await self._client.list_tools()
         raw_tools = self._cached_raw_tools
         result: list[MCPTool] = []
+        try:
+            requested_output_path_choices = sorted(requested_output_paths_for_derivation(self._context_provider()))
+        except Exception:
+            requested_output_path_choices = []
 
         for tool in raw_tools:
             if tool.name not in self._allowlist:
@@ -415,6 +460,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             overlay = self._overlays.get(copilot_name, SchemaOverlay())
 
             schema = _apply_schema_overlay(tool.inputSchema, overlay)
+            schema = _requested_output_path_choices(schema, requested_output_path_choices)
             description = overlay.description or tool.description or ""
 
             result.append(
@@ -507,11 +553,33 @@ class SkyvernOverlayMCPServer(MCPServer):
             mcp_args["session_id"] = copilot_ctx.browser_session_id
 
         try:
+            # wait_for(timeout=None) is a plain await, so only overlays that declare a ceiling get
+            # one. The ceiling bounds every await under the call — a page evaluate, but also a stale
+            # session handle whose CDP request never answers, which held a turn for 307s (SKY-13226).
             if overlay.requires_browser:
                 async with mcp_browser_context(copilot_ctx):
-                    raw_result = await self._client.call_tool(mcp_name, mcp_args, raise_on_error=False)
+                    raw_result = await asyncio.wait_for(
+                        self._client.call_tool(mcp_name, mcp_args, raise_on_error=False),
+                        timeout=overlay.timeout,
+                    )
             else:
-                raw_result = await self._client.call_tool(mcp_name, mcp_args, raise_on_error=False)
+                raw_result = await asyncio.wait_for(
+                    self._client.call_tool(mcp_name, mcp_args, raise_on_error=False),
+                    timeout=overlay.timeout,
+                )
+        except TimeoutError:
+            LOG.warning("MCP tool call timed out", tool=tool_name, ceiling_seconds=overlay.timeout)
+            # The call is cancelled where it stands, so a tool that changes the page may already have
+            # changed it. Reporting a plain failure invites a retry that acts on the page twice.
+            err = {
+                "ok": False,
+                "error": (
+                    f"{tool_name} did not answer within {overlay.timeout}s and was cancelled. "
+                    "Whether it took effect is unknown; read the page before trying it again."
+                ),
+            }
+            record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
+            return _copilot_to_call_tool_result(err)
         except Exception as e:
             LOG.warning(
                 "MCP tool call failed",

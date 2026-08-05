@@ -226,6 +226,18 @@ def test_is_connected_false_when_driver_connection_closed() -> None:
     assert _state_with_context(context).is_connected() is False
 
 
+def test_is_connected_true_when_context_browser_is_none() -> None:
+    # A CDP-connected context can expose ``browser is None``; is_connected() then reports True from
+    # cached impl flags alone, with no transport round-trip. This passive True is exactly why the
+    # page-less inheritance seam actively probes the transport before same-context recovery
+    # (RealBrowserManager._inherited_browser_transport_alive) rather than trusting is_connected()
+    # (SKY-13389).
+    context = MagicMock()
+    context.browser = None
+    context._impl_obj = MagicMock(_close_was_called=False, _closed=False, _connection=MagicMock(_closed_error=None))
+    assert _state_with_context(context).is_connected() is True
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))

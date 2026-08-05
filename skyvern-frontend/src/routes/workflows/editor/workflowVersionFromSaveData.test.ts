@@ -35,6 +35,7 @@ function makeSaveData(
     codeVersion: null,
     scriptCacheKey: "cache_1",
     aiFallback: true,
+    maskSecrets: true,
     runSequentially: false,
     sequentialKey: null,
     finallyBlockLabel: null,
@@ -94,6 +95,7 @@ describe("workflowVersionFromSaveData", () => {
     expect(version.persist_browser_session).toBe(true);
     expect(version.browser_profile_id).toBe("bp_1");
     expect(version.cache_key).toBe("cache_1");
+    expect(version.mask_secrets).toBe(true);
     expect(version.extra_http_headers).toEqual({ a: "b" });
     expect(version.adaptive_caching).toBe(true);
   });

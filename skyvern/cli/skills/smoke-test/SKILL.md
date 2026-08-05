@@ -387,9 +387,11 @@ cat >> "$COMMENT_FILE" <<'REPORT_EOF'
 <the full report markdown from Step 7>
 REPORT_EOF
 
-# Find an existing smoke test comment on the PR
-EXISTING_COMMENT_ID=$(gh api "repos/{owner}/{repo}/issues/${PR_NUMBER}/comments" \
-  --jq '.[] | select(.body | test("skyvern-smoke-test-report")) | .id' \
+# Find this user's own sticky comment across all pages. Matching the marker as a bare
+# substring, or without the author, would PATCH someone else's comment out of existence.
+GH_LOGIN=$(gh api user --jq .login 2>/dev/null)
+EXISTING_COMMENT_ID=$(GH_LOGIN="$GH_LOGIN" gh api --paginate "repos/{owner}/{repo}/issues/${PR_NUMBER}/comments" \
+  --jq '.[] | select(.user.login == $ENV.GH_LOGIN) | select(.body | startswith("<!-- skyvern-smoke-test-report -->")) | .id' \
   2>/dev/null | head -1)
 
 if [ -n "$EXISTING_COMMENT_ID" ]; then

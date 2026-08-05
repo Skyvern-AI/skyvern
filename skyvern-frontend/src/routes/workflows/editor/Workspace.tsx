@@ -44,8 +44,10 @@ import { DebugSessionApiResponse, ProxyLocation } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useBrowserSessionRateLimit } from "../hooks/useBrowserSessionRateLimit";
+import { useActiveRunSessionQuery } from "../hooks/useActiveRunSessionQuery";
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
+import { resolveWorkspaceBrowserSessionBindings } from "./browserSessionBindings";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
 import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
@@ -91,7 +93,8 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
-import { DeleteConfirmationDialog } from "@/components/DeleteConfirmationDialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { AffectedBlocksNotice } from "./AffectedBlocksNotice";
 import { BrowserStream } from "@/components/BrowserStream";
 import { RecordingPanel } from "@/routes/workflows/editor/recording/RecordingPanel";
 import { useApplyRecordedBlocks } from "@/routes/workflows/editor/recording/useApplyRecordedBlocks";
@@ -572,6 +575,7 @@ function Workspace({
   // restores the pre-YAML dirty state instead of leaving it stuck true.
   const yamlEntryHadChangesRef = useRef(false);
   const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
+  const [isCopilotTurnActive, setIsCopilotTurnActive] = useState(false);
   const blockScriptStore = useBlockScriptStore();
   const recordingStore = useRecordingStore();
   const isCdpStreamingMode =
@@ -762,6 +766,12 @@ function Workspace({
     isRateLimited,
     keepAliveBrowserSession: true,
   });
+  const { data: viewerState } = useActiveRunSessionQuery({
+    workflowPermanentId,
+    enabled:
+      shouldFetchDebugSession && Boolean(workflowPermanentId) && !isRateLimited,
+    isTurnActive: isCopilotTurnActive,
+  });
 
   const activeDebugSession = debugSession ?? null;
 
@@ -769,7 +779,13 @@ function Workspace({
 
   const showBreakoutButton =
     activeDebugSession && activeDebugSession.browser_session_id;
-  const liveBrowserSessionId = activeDebugSession?.browser_session_id ?? null;
+  const { debugBrowserSessionId, displayBrowserSessionId } =
+    resolveWorkspaceBrowserSessionBindings(
+      activeDebugSession?.browser_session_id ?? null,
+      viewerState?.active_run_session_id ?? null,
+    );
+  const activeRunSessionIdRef = useRef<string | null>(null);
+  activeRunSessionIdRef.current = viewerState?.active_run_session_id ?? null;
   const showVncBrowserPanel =
     preferVncStream &&
     shouldFetchDebugSession &&
@@ -783,11 +799,11 @@ function Workspace({
   // guard keeps the null -> first-id transition from clearing a recording that
   // started before the session resolved.
   useEffect(() => {
-    if (embedded || !liveBrowserSessionId) {
+    if (embedded || !debugBrowserSessionId) {
       return;
     }
     return () => useRecordingStore.getState().reset();
-  }, [embedded, liveBrowserSessionId]);
+  }, [embedded, debugBrowserSessionId]);
   // Embedded: the shell owns the stream, so bind the copilot once the backend
   // session exists — else it gets a null id and the backend spins a separate browser.
   const copilotRequiresLiveBrowser =
@@ -797,28 +813,28 @@ function Workspace({
   // from the previous session cannot leak into the next render.
   const copilotLiveBrowserReady = resolveCopilotLiveBrowserReady({
     displayReady: Boolean(
-      readyBrowserSessionId && readyBrowserSessionId === liveBrowserSessionId,
+      readyBrowserSessionId && readyBrowserSessionId === debugBrowserSessionId,
     ),
-    hasBackendSession: Boolean(liveBrowserSessionId),
+    hasBackendSession: Boolean(debugBrowserSessionId),
     headlessTurnDrainEnabled: headlessTurnDrainEnabled || embedded,
   });
   const debugSessionExpiryWarningKeyRef = useRef<string | null>(null);
 
   const { data: liveBrowserSession, dataUpdatedAt: liveBrowserSessionNowMs } =
     useQuery<BrowserSessionData>({
-      queryKey: ["browserSession", liveBrowserSessionId],
+      queryKey: ["browserSession", debugBrowserSessionId],
       queryFn: async () => {
-        if (!liveBrowserSessionId) {
+        if (!debugBrowserSessionId) {
           throw new Error("Cannot fetch browser session without an ID");
         }
         const client = await getClient(credentialGetter, "sans-api-v1");
         const response = await client.get<BrowserSessionData>(
-          `/browser_sessions/${liveBrowserSessionId}`,
+          `/browser_sessions/${debugBrowserSessionId}`,
         );
         return response.data;
       },
       enabled:
-        Boolean(liveBrowserSessionId) &&
+        Boolean(debugBrowserSessionId) &&
         shouldFetchDebugSession &&
         !isRateLimited,
       refetchInterval: DEBUG_SESSION_EXPIRY_STATUS_REFETCH_MS,
@@ -827,6 +843,9 @@ function Workspace({
 
   const handleLiveBrowserReadyChange = useCallback(
     (ready: boolean, sessionId: string | null) => {
+      if (activeRunSessionIdRef.current !== null) {
+        return;
+      }
       setReadyBrowserSessionId(ready ? sessionId : null);
     },
     [],
@@ -1356,7 +1375,7 @@ function Workspace({
     });
     setIsRecording(true, {
       workflowPermanentId: workflowPermanentId ?? null,
-      browserSessionId: liveBrowserSessionId,
+      browserSessionId: debugBrowserSessionId,
     });
   }, [
     getNodes,
@@ -1364,7 +1383,7 @@ function Workspace({
     setWorkflowPanelState,
     setIsRecording,
     workflowPermanentId,
-    liveBrowserSessionId,
+    debugBrowserSessionId,
   ]);
   useEffect(() => {
     if (!embedded) {
@@ -1603,6 +1622,7 @@ function Workspace({
       scriptCacheKey: workflowData.cache_key ?? null,
       aiFallback: workflowData.ai_fallback ?? true,
       enableSelfHealing: workflowData.enable_self_healing ?? false,
+      maskSecrets: workflowData.mask_secrets ?? false,
       runSequentially: workflowData.run_sequentially ?? false,
       sequentialKey: workflowData.sequential_key ?? null,
       finallyBlockLabel:
@@ -1915,6 +1935,7 @@ function Workspace({
       scriptCacheKey: selectedVersion.cache_key,
       aiFallback: selectedVersion.ai_fallback ?? true,
       enableSelfHealing: selectedVersion.enable_self_healing ?? false,
+      maskSecrets: selectedVersion.mask_secrets ?? false,
       runSequentially: selectedVersion.run_sequentially ?? false,
       sequentialKey: selectedVersion.sequential_key ?? null,
       finallyBlockLabel:
@@ -2475,7 +2496,7 @@ function Workspace({
                   panels that each fire their own commit. */}
               {!embedded && recordingStore.isRecording && (
                 <div className="absolute inset-0 z-20 h-full px-6 pb-4 pt-[8.5rem]">
-                  <RecordingPanel browserSessionId={liveBrowserSessionId} />
+                  <RecordingPanel browserSessionId={debugBrowserSessionId} />
                 </div>
               )}
             </div>
@@ -2516,7 +2537,7 @@ function Workspace({
                 {showVncBrowserPanel && (
                   <div className="skyvern-vnc-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
                     <div key={reloadKey} className="w-full flex-1">
-                      {!liveBrowserSessionId ? (
+                      {!displayBrowserSessionId ? (
                         isDebugSessionError ? (
                           <StreamStatusPanel
                             diagnostic={{
@@ -2546,13 +2567,13 @@ function Workspace({
                         )
                       ) : isFlowCanvasReady || recordingStore.isRecording ? (
                         <BrowserStream
-                          key={liveBrowserSessionId}
+                          key={displayBrowserSessionId}
                           exfiltrate={
                             recordingStore.isRecording &&
                             !recordingStore.finishRequested
                           }
                           interactive={true}
-                          browserSessionId={liveBrowserSessionId}
+                          browserSessionId={displayBrowserSessionId}
                           showControlButtons={true}
                           // The recording panel overlays the canvas whenever a
                           // recording is live here, so the REC pill is redundant.
@@ -2614,7 +2635,7 @@ function Workspace({
                       key={reloadKey}
                       className="flex w-full flex-1 items-center justify-center"
                     >
-                      {!liveBrowserSessionId ? (
+                      {!displayBrowserSessionId ? (
                         isDebugSessionError ? (
                           <StreamStatusPanel
                             diagnostic={{
@@ -2644,7 +2665,7 @@ function Workspace({
                         )
                       ) : isFlowCanvasReady || recordingStore.isRecording ? (
                         <BrowserSessionStream
-                          browserSessionId={liveBrowserSessionId}
+                          browserSessionId={displayBrowserSessionId}
                           interactive={true}
                           showControlButtons={true}
                           onReadyChange={handleLiveBrowserReadyChange}
@@ -2816,8 +2837,9 @@ function Workspace({
         onMessageCountChange={setCopilotMessageCount}
         buttonRef={copilotButtonRef}
         liveBrowserSessionId={
-          copilotLiveBrowserReady ? liveBrowserSessionId : null
+          copilotLiveBrowserReady ? debugBrowserSessionId : null
         }
+        onTurnActivityChange={setIsCopilotTurnActive}
         workflowRunId={copilotRunId({ embedded, studioRunId })}
         requiresLiveBrowser={copilotRequiresLiveBrowser}
         isLiveBrowserReady={copilotLiveBrowserReady}
@@ -2941,6 +2963,7 @@ function Workspace({
               ai_fallback: saveData.settings.aiFallback,
               enable_self_healing: saveData.settings.enableSelfHealing ?? false,
               adaptive_caching: false,
+              mask_secrets: saveData.settings.maskSecrets,
               code_version:
                 saveData.settings.runWith === "code"
                   ? (saveData.settings.codeVersion ?? 2)
@@ -3054,7 +3077,7 @@ function Workspace({
           }
         }}
       />
-      <DeleteConfirmationDialog
+      <ConfirmDialog
         open={deleteBlockDialogState.open}
         onOpenChange={(open) => {
           if (!open) {
@@ -3066,9 +3089,9 @@ function Workspace({
             });
           }
         }}
-        title="Delete Block"
-        description={`Are you sure you want to delete "${deleteBlockDialogState.nodeLabel}"?`}
-        affectedBlocks={affectedBlocksForDelete}
+        title={`Delete block "${deleteBlockDialogState.nodeLabel}"?`}
+        description="This block will be deleted from the agent."
+        reversible
         onConfirm={() => {
           if (deleteConfirmCallbackRef.current) {
             deleteConfirmCallbackRef.current();
@@ -3080,7 +3103,9 @@ function Workspace({
             nodeLabel: null,
           });
         }}
-      />
+      >
+        <AffectedBlocksNotice affectedBlocks={affectedBlocksForDelete} />
+      </ConfirmDialog>
 
       {/* Studio: the cache key/value panel escapes the Editor pane via the
           shell-level portal, so the Overview pane's Code view can open it (and

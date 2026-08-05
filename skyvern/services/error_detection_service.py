@@ -16,6 +16,7 @@ from playwright.async_api import Page
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_primary_llm_api_handler
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
@@ -220,7 +221,7 @@ async def _detect_errors_from_context(
             error_code_mapping=task.error_code_mapping,
             failure_reason=failure_reason,
         )
-        json_response = await app.EXTRACTION_LLM_API_HANDLER(
+        json_response = await get_org_aware_primary_llm_api_handler(default=app.EXTRACTION_LLM_API_HANDLER)(
             prompt=prompt,
             screenshots=[],  # No screenshots available
             step=step,

@@ -20,6 +20,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _MAX_RESULT_SAMPLE_ROWS,
     _MAX_REVEAL_KEY_VALUE_RELATIONS,
     _MAX_SELECT_OPTIONS,
+    _MAX_SELECTOR_CHARS,
     _MAX_TABLE_HEADERS,
     _MAX_VISIBLE_TEXT_EXCERPT_CHARS,
     _MODAL_IDENTITY_PATTERNS,
@@ -368,6 +369,7 @@ _STRUCTURED_CONST_HEADER = (
     f"const MAX_NAVIGATION_TARGETS={int(_MAX_NAVIGATION_TARGETS)};"
     f"const MAX_RESULT_CONTAINERS={int(_MAX_RESULT_CONTAINERS)};"
     f"const MAX_KEY_VALUE_RELATIONS={int(_MAX_KEY_VALUE_RELATIONS)};"
+    f"const MAX_SELECTOR_CHARS={int(_MAX_SELECTOR_CHARS)};"
     f"const MAX_REVEAL_KEY_VALUE_RELATIONS={int(_MAX_REVEAL_KEY_VALUE_RELATIONS)};"
     f"const MAX_TABLE_HEADERS={int(_MAX_TABLE_HEADERS)};"
     f"const MAX_RESULT_SAMPLE_ROWS={int(_MAX_RESULT_SAMPLE_ROWS)};"
@@ -389,6 +391,19 @@ const FIELD_CAP = 2048;
 const cap = (s) => (s.length > FIELD_CAP ? s.slice(0, FIELD_CAP) : s);
 const attr = (el, k) => { const v = el && el.getAttribute ? el.getAttribute(k) : null; return typeof v === 'string' ? cap(v.trim()) : ''; };
 const nodeText = (el) => { if (!el) return ''; return cap(String(el.textContent || '').replace(/\s+/g, ' ').trim()); };
+  const readsAsOneLeaf = (el) => {
+    if (!el || !el.children || !el.children.length) return true;
+    let bearing = 0;
+    const stack = Array.from(el.children);
+    while (stack.length) {
+      const cur = stack.pop();
+      const kids = Array.from(cur.children || []);
+      if (!kids.length) { if (nodeText(cur)) bearing += 1; }
+      else { for (let i = 0; i < kids.length; i++) stack.push(kids[i]); }
+      if (bearing > 1) return false;
+    }
+    return bearing <= 1;
+  };
 const classesFor = (el) => Array.from((el && el.classList) || []).map((c) => String(c).trim()).filter(Boolean);
 const cssAttr = (v) => String(v).split('\\').join('\\\\').split('"').join('\\"');
 const simpleIdent = (v) => { if (!v) return false; if (!/[A-Za-z_-]/.test(v[0])) return false; for (let i = 1; i < v.length; i++) { if (!/[A-Za-z0-9_-]/.test(v[i])) return false; } return true; };
@@ -416,7 +431,13 @@ const structuralPath = (el) => {
     if (pid && simpleIdent(pid)) { parts.unshift('#' + pid); break; }
     node = parent;
   }
-  return parts.join(' > ');
+  const full = parts.join(' > ');
+  if (full.length <= MAX_SELECTOR_CHARS) return full;
+  for (let start = 1; start < parts.length; start++) {
+    const tail = parts.slice(start).join(' > ');
+    if (tail.length <= MAX_SELECTOR_CHARS && resolvesUniquely(tail, el)) return tail;
+  }
+  return full;
 };
 // The selector is a contract: the model clicks it and authors it into generated blocks, so an
 // ambiguous or unresolvable guess costs a failed run rather than a retry. Every candidate is
@@ -683,11 +704,14 @@ const resultEntry = (node, tag) => {
 	  }
 	  return entry;
 	};
+	// Whole tokens, matching the parser twin: "arrow" contains "row", so a substring test hands every
+	// slot of the bounded budget to an icon sprite sheet before the document reaches a real result.
+	const matchesResultHint = (identity) => identity.split(/[^a-z0-9]+/).some((token) => !!token && RESULT_CONTAINER_HINTS.includes(token));
 	for (const node of all) {
 	  const tag = (node.tagName || '').toLowerCase();
 	  if (SKIP_TAGS.has(tag)) continue;
 	  const identity = (attr(node, 'id') + ' ' + classesFor(node).join(' ')).toLowerCase();
-	  if (tag === 'table' || RESULT_CONTAINER_HINTS.some((h) => identity.includes(h))) {
+	  if (tag === 'table' || matchesResultHint(identity)) {
 	    if (resultContainers.length >= MAX_RESULT_CONTAINERS) { resultContainersTruncated = true; break; }
 	    resultContainers.push(resultEntry(node, tag));
 	  }
@@ -695,17 +719,137 @@ const resultEntry = (node, tag) => {
 
 const keyValueRelations = [];
 let keyValueRelationsTruncated = false;
+// Counting continues past the cap even though recording stops: whether a captured label is unique
+// on the page is what decides a bind, and stopping both turned "there is more" into "trust none".
+const foldedKeyCounts = new Map();
+const countFoldedKey = (text) => { const k = String(text || '').toLowerCase(); if (k) foldedKeyCounts.set(k, (foldedKeyCounts.get(k) || 0) + 1); };
+const walkedValueCounts = new Map();
+const countWalkedValue = (text) => { const v = String(text || ''); if (v) walkedValueCounts.set(v, (walkedValueCounts.get(v) || 0) + 1); };
 const keyValueSkipTags = new Set(['body', 'form', 'html', 'table', 'tbody', 'thead', 'tr']);
+const nonContentChildTags = new Set(['style', 'script', 'noscript', 'svg', 'template']);
+const bareMagnitude = /^-?\$?\d{1,3}(?:[,\s]?\d{3})*(?:\.\d+)?[KMB]?$/i;
+const insidePageChrome = (node) => !!(node.closest && node.closest('nav,aside,header,footer,[role=navigation],[role=menu],[role=menubar],[role=banner],[role=complementary]'));
+const labelLike = (text) => text.length >= 2 && text.indexOf('{') < 0;
+const metricCardNodes = new Set();
+const insideMetricCard = (node) => { let ancestor = node; while (ancestor) { if (metricCardNodes.has(ancestor)) return true; ancestor = ancestor.parentElement; } return false; };
+// Mirror of _append_requested_target_relations: the labels the turn asked for are resolved before
+// any shape pass, so a tile that nests its figure deeper is still read by its own label rather than
+// skipped and replaced by whatever generic pair the page happens to offer.
+const isLeafEl = (el) => !el.children || el.children.length === 0;
+const withinEl = (el, ancestor) => { let c = el; while (c) { if (c === ancestor) return true; c = c.parentElement; } return false; };
+const valueBesideLabel = (labelEl) => {
+  let branch = labelEl;
+  let ancestor = labelEl.parentElement;
+  while (ancestor && ancestor.tagName !== 'BODY' && ancestor.tagName !== 'HTML') {
+    const candidates = [];
+    for (const leaf of Array.from(ancestor.querySelectorAll('*'))) {
+      if (!isLeafEl(leaf) || withinEl(leaf, branch)) continue;
+      if (bareMagnitude.test(nodeText(leaf))) candidates.push(leaf);
+    }
+    if (candidates.length > 1) return null;
+    if (candidates.length === 1) {
+      const valueLeaf = candidates[0];
+      const carrier = valueLeaf.parentElement;
+      if (!carrier) return null;
+      const kids = Array.from(carrier.children || []);
+      const childIndex = kids.indexOf(valueLeaf);
+      if (childIndex < 0) return null;
+      const labelText = nodeText(labelEl);
+      let labelSelector = '';
+      if (!kids.length || nodeText(kids[0]) !== labelText) {
+        labelSelector = selectorFor(labelEl);
+        if (!labelSelector || labelSelector.length > MAX_SELECTOR_CHARS || !resolvesUniquely(labelSelector, labelEl)) return null;
+      }
+      const sel = selectorFor(carrier);
+      if (!sel || sel.length > MAX_SELECTOR_CHARS) return null;
+      const matches = selectorMatchCount(sel);
+      if (!matches) return null;
+      let pos = -1;
+      try { pos = Array.from(document.querySelectorAll(sel)).indexOf(carrier); } catch (e) { pos = -1; }
+      if (pos < 0) return null;
+      return { owner: ancestor, relation: { key_text: labelText, label_selector: labelSelector, value_text: nodeText(valueLeaf), container_selector: sel, container_match_count: matches, container_position: pos, value_child_index: childIndex, direct_child_count: kids.length, visible: true, value_visible: true } };
+    }
+    branch = ancestor;
+    ancestor = ancestor.parentElement;
+  }
+  return null;
+};
+for (const target of REQUESTED_TARGETS) {
+  const wanted = String(target || '').trim().toLowerCase();
+  if (!wanted) continue;
+  for (const node of all) {
+    if (!isLeafEl(node) || !elementVisible(node) || insidePageChrome(node)) continue;
+    if (nodeText(node).trim().toLowerCase() !== wanted) continue;
+    const found = valueBesideLabel(node);
+    if (!found) continue;
+    countFoldedKey(found.relation.key_text);
+    countWalkedValue(found.relation.value_text);
+    keyValueRelations.push(found.relation);
+    metricCardNodes.add(found.owner);
+    break;
+  }
+}
 for (const node of all) {
   const tag = (node.tagName || '').toLowerCase();
-  if (keyValueSkipTags.has(tag) || !elementVisible(node)) continue;
+  if (keyValueSkipTags.has(tag) || !elementVisible(node) || insidePageChrome(node) || insideMetricCard(node)) continue;
+  const children = Array.from(node.children || []);
+  if (children.length < 2 || children.length > 6) continue;
+  if (children.some((child) => nonContentChildTags.has((child.tagName || '').toLowerCase()))) continue;
+  const leaves = [];
+  let nestedOk = true;
+  for (let index = 0; index < children.length; index++) {
+    const child = children[index];
+    const grand = Array.from(child.children || []);
+    if (!grand.length) { const text = nodeText(child); if (text) leaves.push({ index: index, text: text, carrier: null, carrierIndex: 0, carrierCount: 0 }); continue; }
+    if (grand.some((g) => !readsAsOneLeaf(g))) { nestedOk = false; break; }
+    for (let gi = 0; gi < grand.length; gi++) { const text = nodeText(grand[gi]); if (text) leaves.push({ index: index, text: text, carrier: child, carrierIndex: gi, carrierCount: grand.length }); }
+  }
+  if (!nestedOk || !leaves.length || leaves.length > 8) continue;
+  const magnitudeLeaves2 = leaves.filter((leaf) => bareMagnitude.test(leaf.text));
+  if (magnitudeLeaves2.length !== 1) continue;
+  const cardValueIndex = magnitudeLeaves2[0].index;
+  const cardValueText = magnitudeLeaves2[0].text;
+  // The compiled read takes a direct child's whole text, so the relation is anchored wherever the
+  // figure is that child: the tile when the figure is a direct child, the row holding it when the
+  // figure sits beside a comparison.
+  let cardCarrier = node;
+  let cardChildIndex = cardValueIndex;
+  let cardChildCount = children.length;
+  if (nodeText(children[cardValueIndex]) !== cardValueText) {
+    const anchor = magnitudeLeaves2[0];
+    if (!anchor.carrier) continue;
+    cardCarrier = anchor.carrier;
+    cardChildIndex = anchor.carrierIndex;
+    cardChildCount = anchor.carrierCount;
+  }
+  const headingLeaves = leaves.filter((leaf) => leaf.index !== cardValueIndex && leaf.text.length <= 60 && labelLike(leaf.text) && !bareMagnitude.test(leaf.text));
+  const headingChildIndex = headingLeaves.length ? headingLeaves[0].index : 0;
+  if (!headingLeaves.length) continue;
+  const cardSelector = selectorFor(cardCarrier);
+  const cardMatches = selectorMatchCount(cardSelector);
+  if (!cardMatches) continue;
+  let cardPosition = -1;
+  try { cardPosition = Array.from(document.querySelectorAll(cardSelector)).indexOf(cardCarrier); } catch (e) { cardPosition = -1; }
+  if (cardPosition < 0) continue;
+  countFoldedKey(headingLeaves[0].text);
+  countWalkedValue(cardValueText);
+  if (keyValueRelations.length >= MAX_KEY_VALUE_RELATIONS) { keyValueRelationsTruncated = true; continue; }
+  keyValueRelations.push({ key_text: headingLeaves[0].text, value_text: cardValueText, container_selector: cardSelector, container_match_count: cardMatches, container_position: cardPosition, value_child_index: cardChildIndex, label_child_index: (cardCarrier === node ? headingChildIndex : -1), direct_child_count: cardChildCount, visible: true, value_visible: true });
+  metricCardNodes.add(node);
+}
+for (const node of all) {
+  const tag = (node.tagName || '').toLowerCase();
+  if (keyValueSkipTags.has(tag) || !elementVisible(node) || insidePageChrome(node) || insideMetricCard(node)) continue;
   const children = Array.from(node.children || []);
   if (children.length !== 2) continue;
   if (children[0].children && children[0].children.length > 0) continue;
+  if (children.some((child) => nonContentChildTags.has((child.tagName || '').toLowerCase()))) continue;
   const keyText = nodeText(children[0]);
   const valueText = nodeText(children[1]);
-  if (!keyText || keyText.length > 120 || !valueText || keyText === valueText) continue;
-  if (keyValueRelations.length >= MAX_KEY_VALUE_RELATIONS) { keyValueRelationsTruncated = true; break; }
+  if (!keyText || keyText.length > 120 || !valueText || keyText === valueText || !labelLike(keyText)) continue;
+  countFoldedKey(keyText);
+  countWalkedValue(valueText);
+  if (keyValueRelations.length >= MAX_KEY_VALUE_RELATIONS) { keyValueRelationsTruncated = true; continue; }
   const selector = selectorFor(node);
   const matches = selectorMatchCount(selector);
   if (!matches) continue;
@@ -722,7 +866,7 @@ let revealRelationCount = 0;
 let revealRelationsTruncated = false;
 for (const node of all) {
   const tag = (node.tagName || '').toLowerCase();
-  if (keyValueSkipTags.has(tag) || !elementVisible(node)) continue;
+  if (keyValueSkipTags.has(tag) || !elementVisible(node) || insidePageChrome(node) || insideMetricCard(node)) continue;
   if (!matchesResultHintToken(node)) continue;
   const children = Array.from(node.children || []);
   if (children.length < 3 || children.length > 6) continue;
@@ -745,11 +889,12 @@ for (const node of all) {
     if (!valueText || keyText === valueText) continue;
     valueLeaves.push({ index: i, valueText: valueText });
   }
-  const revealKeyText = valueLeaves.length === 1 ? keyText : '';
+  const magnitudeLeaves = valueLeaves.filter((leaf) => bareMagnitude.test(leaf.valueText));
+  const designatedIndex = valueLeaves.length === 1 ? valueLeaves[0].index : (magnitudeLeaves.length === 1 ? magnitudeLeaves[0].index : null);
   let capped = false;
   for (const leaf of valueLeaves) {
     if (keyValueRelations.length >= MAX_KEY_VALUE_RELATIONS || revealRelationCount >= MAX_REVEAL_KEY_VALUE_RELATIONS) { revealRelationsTruncated = true; capped = true; break; }
-    keyValueRelations.push({ key_text: revealKeyText, value_text: leaf.valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: leaf.index, direct_child_count: children.length, visible: true, value_visible: true });
+    keyValueRelations.push({ key_text: leaf.index === designatedIndex ? keyText : '', value_text: leaf.valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: leaf.index, direct_child_count: children.length, visible: true, value_visible: true });
     revealRelationCount++;
   }
   if (capped) break;
@@ -848,7 +993,9 @@ return JSON.stringify({
   navigation_targets: navTargets,
   result_containers: resultContainers,
   result_containers_truncated: resultContainersTruncated,
-  key_value_relations: keyValueRelations,
+  key_value_relations: keyValueRelations.map((r) => Object.assign({}, r,
+    String(r.key_text || '') ? { key_text_walked_count: foldedKeyCounts.get(String(r.key_text).toLowerCase()) || 1 } : {},
+    String(r.value_text || '') ? { value_text_walked_count: walkedValueCounts.get(String(r.value_text)) || 1 } : {})),
   key_value_relations_truncated: keyValueRelationsTruncated,
   reveal_relations_truncated: revealRelationsTruncated,
   clickable_controls: clickableControls,
@@ -861,4 +1008,16 @@ return JSON.stringify({
 });
 """
 
-COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION = "(() => {" + _STRUCTURED_CONST_HEADER + _STRUCTURED_EVIDENCE_BODY + "})()"
+
+def composition_structured_evidence_expression(requested_targets: tuple[str, ...] = ()) -> str:
+    """The capture expression, told which labels the turn asked for.
+
+    Capture that does not know the request can only guess which of a page's relations matters, and a
+    tile whose shape it fails to recognise is replaced by whatever generic pair sits nearby.
+    """
+    targets = [target.strip() for target in requested_targets if isinstance(target, str) and target.strip()]
+    header = f"const REQUESTED_TARGETS={json.dumps(targets[:_MAX_KEY_VALUE_RELATIONS])};"
+    return "(() => {" + header + _STRUCTURED_CONST_HEADER + _STRUCTURED_EVIDENCE_BODY + "})()"
+
+
+COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION = composition_structured_evidence_expression()

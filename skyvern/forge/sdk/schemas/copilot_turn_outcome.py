@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ResponseKind(StrEnum):
+    ANSWER = "answer"
     BUILD = "build"
     CLARIFY = "clarify"
     DIAGNOSE = "diagnose"

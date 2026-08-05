@@ -9,14 +9,7 @@ import { GarbageIcon } from "@/components/icons/GarbageIcon";
 import { SelectionBar } from "@/components/SelectionBar";
 import { SelectionHeaderCheckboxCell } from "@/components/SelectionCheckbox";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useRowSelection } from "@/hooks/useRowSelection";
 import { bulkResultToast } from "@/util/bulkResultToast";
@@ -376,50 +369,33 @@ function BrowserProfilesList({ searchKey, managed }: Props = {}) {
           </Button>
         </SelectionBar>
       )}
-      <Dialog
+      <ConfirmDialog
         open={deleteDialog.open}
         onOpenChange={(open) => {
-          if (!open && !isBulkOperating) {
+          if (!open) {
             setDeleteDialog({ open: false, targets: [] });
           }
         }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>
-              Delete {deleteDialog.targets.length} Browser Profile
-              {deleteDialog.targets.length === 1 ? "" : "s"}
-            </DialogTitle>
-            <DialogDescription>
-              Are you sure you want to delete {deleteDialog.targets.length}{" "}
-              {deleteDialog.targets.length === 1
-                ? "browser profile"
-                : "browser profiles"}
-              ? Linked credentials are unlinked automatically; any workflows
-              pinned to these profiles will need repointing. This action cannot
-              be undone.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="secondary"
-              disabled={isBulkOperating}
-              onClick={() => setDeleteDialog({ open: false, targets: [] })}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              disabled={isBulkOperating}
-              onClick={() => {
-                void handleBulkDeleteConfirm();
-              }}
-            >
-              {isBulkOperating ? "Deleting..." : "Delete"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        title={`Delete ${deleteDialog.targets.length} browser profile${
+          deleteDialog.targets.length === 1 ? "" : "s"
+        }?`}
+        description={
+          <p>
+            {deleteDialog.targets.length}{" "}
+            {deleteDialog.targets.length === 1
+              ? "browser profile"
+              : "browser profiles"}{" "}
+            will be permanently deleted. Linked credentials are unlinked
+            automatically; any agents pinned to these profiles will need
+            repointing.
+          </p>
+        }
+        itemCount={deleteDialog.targets.length}
+        isPending={isBulkOperating}
+        onConfirm={() => {
+          void handleBulkDeleteConfirm();
+        }}
+      />
     </div>
   );
 }

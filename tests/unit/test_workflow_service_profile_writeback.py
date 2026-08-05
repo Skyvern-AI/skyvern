@@ -15,6 +15,8 @@ import pytest
 from skyvern.forge import app
 from skyvern.forge.sdk.workflow.browser_profile_key import build_workflow_browser_session_storage_key
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.webeye.browser_manager import BrowserCleanupResult
 
 
 def _make_workflow(persist: bool = True) -> MagicMock:
@@ -61,7 +63,16 @@ def _patch_clean_up_deps(monkeypatch: pytest.MonkeyPatch, browser_state: MagicMo
     monkeypatch.setattr(app.STORAGE, "store_browser_session", store_mock)
     monkeypatch.setattr(app.STORAGE, "store_browser_profile", AsyncMock())
     monkeypatch.setattr(app.STORAGE, "save_downloaded_files", AsyncMock())
-    monkeypatch.setattr(app.BROWSER_MANAGER, "cleanup_for_workflow_run", AsyncMock(return_value=browser_state))
+    monkeypatch.setattr(
+        app.BROWSER_MANAGER,
+        "cleanup_for_workflow_run",
+        AsyncMock(
+            side_effect=lambda *args, **kwargs: BrowserCleanupResult(
+                browser_state=browser_state,
+                recording_finalized=kwargs["close_browser_on_completion"],
+            )
+        ),
+    )
     monkeypatch.setattr(app.ARTIFACT_MANAGER, "wait_for_upload_aiotasks", AsyncMock())
     # Non-debug default: the legacy write-back proceeds (debug-skip tests override this to True).
     monkeypatch.setattr(app.AGENT_FUNCTION, "should_skip_debug_profile_writeback", AsyncMock(return_value=False))
@@ -74,6 +85,27 @@ def _patch_clean_up_deps(monkeypatch: pytest.MonkeyPatch, browser_state: MagicMo
         AsyncMock(return_value=[]),
     )
     return store_mock
+
+
+@pytest.mark.asyncio
+async def test_cleanup_reports_actual_recording_finalization(monkeypatch: pytest.MonkeyPatch) -> None:
+    workflow_run = _make_workflow_run(WorkflowRunStatus.completed)
+    browser_state = _make_browser_state()
+    cleanup_mock = AsyncMock(return_value=BrowserCleanupResult(browser_state=browser_state, recording_finalized=False))
+    monkeypatch.setattr(app.BROWSER_MANAGER, "cleanup_for_workflow_run", cleanup_mock)
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "get_workflow_runs_by_parent_workflow_run_id",
+        AsyncMock(return_value=[]),
+    )
+
+    service = WorkflowService()
+    monkeypatch.setattr(service, "get_tasks_by_workflow_run_id", AsyncMock(return_value=[]))
+
+    result = await service._clean_up_workflow_browser(workflow_run)
+
+    assert cleanup_mock.await_args.kwargs["close_browser_on_completion"] is True
+    assert result.close_browser_on_completion is False
 
 
 @pytest.mark.asyncio
@@ -377,11 +409,18 @@ async def test_session_cookies_persisted_before_store_when_browser_stays_alive(
     monkeypatch.setattr(service_module, "persist_session_cookies", persist_mock)
 
     svc = WorkflowService()
-    monkeypatch.setattr(svc, "persist_video_data", AsyncMock())
+    persist_video_mock = AsyncMock()
+    monkeypatch.setattr(svc, "persist_video_data", persist_video_mock)
     monkeypatch.setattr(svc, "get_tasks_by_workflow_run_id", AsyncMock(return_value=[]))
 
     await svc.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, need_call_webhook=False)
 
+    persist_video_mock.assert_awaited_once_with(
+        browser_state,
+        workflow,
+        workflow_run,
+        close_browser_on_completion=False,
+    )
     persist_mock.assert_awaited_once_with(browser_state.browser_context, "/tmp/fake_profile")
     assert order == ["persist", "store"]
 

@@ -751,6 +751,7 @@ def _sdk_equivalent_page(monkeypatch: pytest.MonkeyPatch) -> None:
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setenv("SKYVERN_DISABLE_CUSTOM_SELECT", "1")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    monkeypatch.setattr(mcp_browser, "validate_fetch_url", lambda url: url)
     monkeypatch.setattr(mcp_browser, "get_current_session", lambda: SimpleNamespace(_working_frame=None))
     monkeypatch.setattr(mcp_browser, "clear_session_ref_map", Mock())
     monkeypatch.setattr(
@@ -1375,6 +1376,8 @@ async def test_do_select_option_scan_observed_control_uses_widened_shape(
         {"text": "Select", "value": "", "dataValues": [""], "expanded": "true", "optionSelected": False},
         {"text": "Music", "value": "", "dataValues": ["music"], "expanded": "false", "optionSelected": False},
     ]
+    # SKY-12634: freeze the wall clock so a loaded CI runner cannot blow the 100ms budget.
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(return_value=0)))
 
     result = await do_select_option(page, "#category", "music", timeout=100)
 
@@ -1575,6 +1578,8 @@ async def test_do_select_option_scan_observed_bare_input_uses_typeahead(
         {"text": "", "value": "Fairview", "dataValues": [], "expanded": None, "optionSelected": False},
         {"text": "", "value": "Fairview", "dataValues": [], "expanded": None, "optionSelected": True},
     ]
+    # SKY-12634: freeze the wall clock so a loaded CI runner cannot blow the 100ms budget.
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(return_value=0)))
 
     assert await do_select_option(page, "#town", "Fairview", timeout=100) == "Fairview"
     control.fill.assert_awaited_once_with("Fairview", timeout=100)
@@ -2748,3 +2753,98 @@ async def test_inline_screenshot_is_also_persisted(monkeypatch: pytest.MonkeyPat
 
     assert result["data"]["path"] == artifact.path
     assert result["artifacts"] == [artifact.to_dict()]
+
+
+def _either_wait_page(
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: dict[str, float | Exception],
+) -> list[asyncio.Task]:
+    """Fake a page whose per-selector waits resolve after a delay, raise, or time out: an outcome of
+    None means the selector never appears, so that waiter times out the way Playwright's does. Returns
+    the waiter tasks so a caller can assert the tool drained them.
+    """
+    waiters: list[asyncio.Task] = []
+
+    async def wait_for_selector(selector: str, timeout: float = 30000, **_: object) -> SimpleNamespace:
+        task = asyncio.current_task()
+        if task is not None:
+            waiters.append(task)
+        outcome = outcomes.get(selector)
+        if isinstance(outcome, Exception):
+            raise outcome
+        if outcome is None:
+            await asyncio.sleep(timeout / 1000)
+            raise mcp_browser.PlaywrightTimeoutError(f"Timeout {timeout}ms exceeded waiting for {selector}")
+        await asyncio.sleep(outcome)
+        return SimpleNamespace(selector=selector)
+
+    _action_page(monkeypatch, wait_for_selector=AsyncMock(side_effect=wait_for_selector))
+    return waiters
+
+
+@pytest.mark.asyncio
+async def test_wait_timeout_on_one_selector_points_at_the_two_state_form(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The timeout is the moment the caller learns its guess was wrong — the error is where MCP puts
+    feedback a model can act on, so it names the form that would not have cost the ceiling."""
+    _either_wait_page(monkeypatch, {"#login": None})
+
+    result = await mcp_browser.skyvern_wait(selector="#login", timeout=1000)
+
+    assert result["ok"] is False
+    assert "skyvern_wait_for_either_state" in result["error"]["hint"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("appears", "expected"), [("#login", "selector_a"), ("#home", "selector_b")])
+async def test_wait_for_either_state_names_the_side_that_matched(
+    monkeypatch: pytest.MonkeyPatch,
+    appears: str,
+    expected: str,
+) -> None:
+    """One tool, one operation: both states are required, so the answer is always which one it is."""
+    absent = "#home" if appears == "#login" else "#login"
+    _either_wait_page(monkeypatch, {appears: 0.01, absent: None})
+
+    result = await mcp_browser.skyvern_wait_for_either_state(selector_a="#login", selector_b="#home", timeout=120000)
+
+    assert result["ok"] is True
+    assert result["data"]["matched_selector"] == appears
+    assert result["data"]["matched"] == expected
+
+
+@pytest.mark.asyncio
+async def test_wait_for_either_state_rejects_states_where_absence_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    _either_wait_page(monkeypatch, {"#login": 0.01, "#home": 0.01})
+
+    result = await mcp_browser.skyvern_wait_for_either_state(selector_a="#a", selector_b="#b", state="hidden")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
+
+
+@pytest.mark.parametrize("concise", [True, False])
+def test_either_state_output_schema_accepts_both_envelope_modes(concise: bool) -> None:
+    """Declared schemas are enforced at runtime, and the two envelope modes disagree on absent fields."""
+    import jsonschema
+
+    from skyvern.cli.core.result import set_concise_responses
+
+    set_concise_responses(concise)
+    try:
+        for envelope in (
+            mcp_browser.make_result(
+                "skyvern_wait_for_either_state",
+                browser_context=BrowserContext(mode="local"),
+                data={"matched_selector": "#home", "matched": "selector_b"},
+                timing_ms={"total": 5},
+            ),
+            mcp_browser.make_result(
+                "skyvern_wait_for_either_state",
+                ok=False,
+                browser_context=BrowserContext(mode="local"),
+                error=mcp_browser.make_error(mcp_browser.ErrorCode.TIMEOUT, "nope", "hint"),
+            ),
+        ):
+            jsonschema.validate(envelope, mcp_browser.EITHER_STATE_OUTPUT_SCHEMA)
+    finally:
+        set_concise_responses(False)

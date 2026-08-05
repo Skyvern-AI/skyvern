@@ -12,6 +12,11 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_state import BrowserState
 
+# Not a RunType member, so the reaper cannot resolve it by matching that enum. Both the writer of
+# a standalone-task lease and the reaper's liveness check must agree on this exact string, or the
+# reaper protects the row forever.
+PBS_TASK_RUNNABLE_TYPE = "task"
+
 
 class PersistentSessionsManager(Protocol):
     """Protocol defining the interface for persistent browser session management."""
@@ -46,7 +51,7 @@ class PersistentSessionsManager(Protocol):
         runnable_type: str,
         runnable_id: str,
         organization_id: str,
-    ) -> None:
+    ) -> str | None:
         """Begin a browser session for a specific runnable."""
         ...
 
@@ -75,7 +80,15 @@ class PersistentSessionsManager(Protocol):
         """Get all active sessions for an organization."""
         ...
 
-    async def get_browser_state(self, session_id: str, organization_id: str | None = None) -> BrowserState | None:
+    async def get_browser_state(
+        self,
+        session_id: str,
+        organization_id: str | None = None,
+        *,
+        expected_runnable_id: str | None = None,
+        expected_runnable_generation_id: str | None = None,
+        download_run_id: str | None = None,
+    ) -> BrowserState | None:
         """Get the browser state for a session."""
         ...
 
@@ -105,6 +118,7 @@ class PersistentSessionsManager(Protocol):
         generate_browser_profile: bool = False,
         inherit_profile_proxy: bool = False,
         wait_for_startup: bool = True,
+        needs_live_view: bool = False,
     ) -> PersistentBrowserSession:
         """Create a new browser session."""
         ...
@@ -115,6 +129,8 @@ class PersistentSessionsManager(Protocol):
         runnable_type: str,
         runnable_id: str,
         organization_id: str,
+        *,
+        runnable_generation_id: str | None = None,
     ) -> None:
         """Occupy a browser session for use."""
         ...
@@ -129,7 +145,15 @@ class PersistentSessionsManager(Protocol):
         """Update the status of a browser session."""
         ...
 
-    async def release_browser_session(self, session_id: str, organization_id: str) -> None:
+    async def release_browser_session(
+        self,
+        session_id: str,
+        organization_id: str,
+        *,
+        expected_runnable_id: str | None = None,
+        expected_runnable_generation_id: str | None = None,
+        expected_browser_state: BrowserState | None = None,
+    ) -> bool:
         """Release a browser session."""
         ...
 

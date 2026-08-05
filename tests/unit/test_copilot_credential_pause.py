@@ -34,11 +34,16 @@ from fastapi import HTTPException, status
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import NoopLock
+from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import credential_pause as credential_pause_module
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import RequestPolicyGuardrailInputs, _derive_turn_intent_on_context
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import (
+    CopilotContext,
+    StructuredContext,
+    record_approved_credentials_in_global_llm_context,
+)
 from skyvern.forge.sdk.copilot.credential_pause import (
     CredentialPauseRejection,
     CredentialPauseResolution,
@@ -68,16 +73,27 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.request_policy import (
     CREDENTIAL_PROMPT_CLARIFICATION_REASONS,
+    ClarificationReason,
     RequestPolicy,
     credential_prompt_reason,
 )
-from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
+from skyvern.forge.sdk.copilot.tools._shared import TOTAL_TIMEOUT_SECONDS, _copilot_seconds_remaining
+from skyvern.forge.sdk.copilot.turn_intent import (
+    TurnIntent,
+    TurnIntentAuthority,
+    TurnIntentClassification,
+    TurnIntentClassifierResult,
+    TurnIntentMode,
+)
 from skyvern.forge.sdk.routes.workflow_copilot import (
     WorkflowCopilotCredentialResponseRequest,
     workflow_copilot_credential_response,
 )
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotCredentialRequiredUpdate,
+    WorkflowCopilotStreamMessageType,
+)
 from tests.unit.conftest import make_copilot_context
 
 
@@ -1593,15 +1609,13 @@ async def test_last_run_skipped_flag_stays_false_when_update_workflow_fails_befo
 
 
 def test_copilot_seconds_remaining_credits_pause_time() -> None:
-    from skyvern.forge.sdk.copilot.tools._shared import _copilot_seconds_remaining
-
     ctx = SimpleNamespace(copilot_run_start_monotonic=time.monotonic() - 1000.0, copilot_credential_pause_seconds=300.0)
 
     remaining = _copilot_seconds_remaining(ctx)
 
-    # Uncredited: 900 - 1000 = -100s (would forbid). Credited: 900 - 700 = 200s.
+    # Uncredited, the budget would be spent against 1000s rather than the 700s of counted work.
     assert remaining is not None
-    assert remaining > 150.0
+    assert remaining == pytest.approx(TOTAL_TIMEOUT_SECONDS - 700.0, abs=1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1848,6 +1862,109 @@ def test_reason_does_not_fire_for_a_login_ask_that_resolved_to_a_credential() ->
     assert credential_pause_module.credential_pause_reason(ctx) is None
 
 
+def _card_answerable_policy(
+    *,
+    clarification_reason: ClarificationReason = "credential_name_unresolved",
+    clarification_question: str = "Which one should I use?",
+    card_answerable: bool = True,
+    ask_login_page_urls: list[str] | None = None,
+) -> RequestPolicy:
+    """A disambiguation ask the credential card can answer: a different reason to the login ask."""
+    return RequestPolicy(
+        login_intent=True,
+        clarification_reason=clarification_reason,
+        clarification_question=clarification_question,
+        requires_user_clarification=True,
+        user_response_policy="ask_clarification",
+        allow_update_workflow=False,
+        allow_run_blocks=False,
+        credential_ask_card_answerable=card_answerable,
+        credential_ask_candidate_ids=["cred_1", "cred_2"] if card_answerable else [],
+        credential_ask_login_page_urls=["https://portal.example.com/login"]
+        if ask_login_page_urls is None
+        else ask_login_page_urls,
+    )
+
+
+def test_reason_fires_on_a_card_answerable_ask_under_a_different_reason() -> None:
+    ctx = make_copilot_context()
+    ctx.request_policy = _card_answerable_policy()
+
+    assert credential_pause_module.credential_pause_reason(ctx) == "login_credentials_unresolved"
+
+
+def test_reason_ignores_a_clarification_the_card_cannot_answer() -> None:
+    ctx = make_copilot_context()
+    ctx.request_policy = _card_answerable_policy(clarification_reason="raw_secret", card_answerable=False)
+
+    assert credential_pause_module.credential_pause_reason(ctx) is None
+
+
+def test_widened_reason_still_builds_a_valid_credential_required_frame() -> None:
+    ctx = make_copilot_context()
+    ctx.request_policy = _card_answerable_policy()
+    reason = credential_pause_module.credential_pause_reason(ctx)
+
+    frame = WorkflowCopilotCredentialRequiredUpdate(
+        type=WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED,
+        turn_id="turn-1",
+        workflow_copilot_chat_id="chat-1",
+        resume_token="rt",
+        reason=reason or "",
+        message="Which one should I use?",
+        login_page_urls=[],
+        credential_refs=[],
+        timeout_seconds=5,
+        expires_at=datetime.now(timezone.utc),
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    assert frame.reason == "login_credentials_unresolved"
+
+
+def test_connected_resume_stamps_the_single_ask_origin() -> None:
+    policy = _card_answerable_policy()
+    credential = _make_credential()
+
+    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, credential)
+
+    assert policy.live_page_admitted_urls == {"cred_1": "https://portal.example.com/login"}
+
+
+def test_connected_resume_stamps_nothing_when_the_ask_spans_several_origins() -> None:
+    policy = _card_answerable_policy(
+        ask_login_page_urls=["https://portal.example.com/login", "https://other.example.com/login"]
+    )
+
+    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
+
+    assert policy.live_page_admitted_urls == {}
+
+
+def test_connected_resume_never_binds_an_origin_from_prose() -> None:
+    policy = _card_answerable_policy(
+        ask_login_page_urls=[],
+        clarification_question="Sign in at https://prose.example.com/login first. Which one should I use?",
+    )
+
+    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
+
+    assert policy.live_page_admitted_urls == {}
+
+
+def test_a_card_connected_credential_keeps_its_durable_cross_turn_approval() -> None:
+    ctx = make_copilot_context()
+    policy = _card_answerable_policy()
+    ctx.request_policy = policy
+
+    credential_pause_module._apply_connected_credential_to_policy(ctx, policy, _make_credential())
+    carried = record_approved_credentials_in_global_llm_context(ctx, None)
+
+    assert [record.credential_id for record in StructuredContext.from_json_str(carried).approved_credentials] == [
+        "cred_1"
+    ]
+
+
 @pytest.mark.asyncio
 async def test_preflight_connect_binds_the_credential_and_clears_the_clarification_block(
     monkeypatch: pytest.MonkeyPatch,
@@ -1881,36 +1998,6 @@ async def test_preflight_connect_binds_the_credential_and_clears_the_clarificati
     assert policy.requires_user_clarification is False
     sent_types = [call.args[0].type for call in stream.send.await_args_list]
     assert sent_types == [WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED]
-
-
-@pytest.mark.asyncio
-async def test_preflight_connect_preserves_an_explicit_defer_authoring_hold(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = _preflight_ctx()
-    ctx.request_policy.authoring_intent = "defer_authoring"
-    cache = _FakeCache()
-    cache.store[credential_response_cache_key("org-1", "chat-1", "turn-1")] = encode_credential_response(
-        "connected", "cred_1"
-    )
-    monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
-    credential = _make_credential()
-    monkeypatch.setattr(
-        credential_pause_module.app,
-        "DATABASE",
-        SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[credential]))),
-    )
-    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
-    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
-
-    resolution = await preflight_credential_pause(ctx, _make_stream(), config)
-
-    assert resolution is not None and resolution.action == "connected"
-    policy = ctx.request_policy
-    assert policy.user_response_policy == "proceed"
-    assert policy.resolved_credentials == [credential]
-    assert policy.allow_update_workflow is False
-    assert policy.allow_run_blocks is False
 
 
 def _preflight_policy_inputs() -> RequestPolicyGuardrailInputs:
@@ -1949,16 +2036,56 @@ async def test_preflight_connect_re_derives_run_authority_onto_the_turn_intent(
         ),
     )
     monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
+    classify = AsyncMock(
+        return_value=TurnIntentClassifierResult.success(
+            TurnIntentClassification(mode=TurnIntentMode.BUILD, confidence=0.95)
+        )
+    )
+    materialize = AsyncMock()
+    monkeypatch.setattr(agent_module, "classify_turn_intent", classify)
+    monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize)
     config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
 
     resolution = await preflight_credential_pause(ctx, _make_stream(), config)
     assert resolution is not None and resolution.action == "connected"
-    _derive_turn_intent_on_context(ctx, ctx.request_policy, policy_inputs)
+    await agent_module._resume_turn_intent_after_preflight_credential(ctx, ctx.request_policy, policy_inputs)
 
     assert ctx.request_policy.clarification_reason == "none"
-    assert ctx.turn_intent.mode is not TurnIntentMode.CLARIFY
+    assert ctx.turn_intent.mode is TurnIntentMode.BUILD
     assert ctx.turn_intent.authority.may_update_workflow is True
     assert ctx.turn_intent.authority.may_run_blocks is True
+    classify.assert_awaited_once()
+    materialize.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_preflight_resume_unknown_does_not_inherit_connected_policy_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _preflight_ctx()
+    policy = ctx.request_policy
+    policy.user_response_policy = "proceed"
+    policy.clarification_reason = "none"
+    policy.allow_update_workflow = True
+    policy.allow_run_blocks = True
+    monkeypatch.setattr(
+        agent_module,
+        "classify_turn_intent",
+        AsyncMock(
+            return_value=TurnIntentClassifierResult.success(
+                TurnIntentClassification(mode=TurnIntentMode.UNKNOWN, confidence=0.95)
+            )
+        ),
+    )
+    materialize = AsyncMock()
+    monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize)
+
+    await agent_module._resume_turn_intent_after_preflight_credential(ctx, policy, _preflight_policy_inputs())
+
+    assert ctx.turn_intent.mode is TurnIntentMode.UNKNOWN
+    assert ctx.turn_intent.authority.may_update_workflow is False
+    assert ctx.turn_intent.authority.may_run_blocks is False
+    materialize.assert_not_awaited()
 
 
 @pytest.mark.asyncio

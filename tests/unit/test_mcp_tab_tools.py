@@ -135,7 +135,7 @@ async def test_tab_new_with_url(monkeypatch: pytest.MonkeyPatch) -> None:
     browser._browser_context.new_page = AsyncMock(return_value=new_page)
     browser._browser_context.pages = [existing_page, new_page]
 
-    ctx = BrowserContext(mode="local")
+    ctx = BrowserContext(mode="cloud_session", session_id="pbs_test", can_access_localhost=False)
     monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(SimpleNamespace(page=existing_page), ctx)))
 
     state = _make_session_state(browser)
@@ -144,7 +144,62 @@ async def test_tab_new_with_url(monkeypatch: pytest.MonkeyPatch) -> None:
     result = await mcp_tabs.skyvern_tab_new(url="https://target.com")
 
     assert result["ok"] is True
-    new_page.goto.assert_awaited_once_with("https://target.com", wait_until="domcontentloaded", timeout=30000)
+    new_page.goto.assert_awaited_once_with("https://target.com/", wait_until="domcontentloaded", timeout=30000)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("url", "can_access_localhost"),
+    [
+        pytest.param("file:///etc/passwd", False, id="file"),
+        pytest.param("http://169.254.169.254/", False, id="metadata"),
+        pytest.param("http://10.20.30.40/", False, id="private"),
+        pytest.param("http://127.0.0.1:8000/", False, id="loopback"),
+        pytest.param("http://127.0.0.2/", False, id="alternate-loopback"),
+        pytest.param("http://2130706433/", False, id="integer-loopback"),
+        pytest.param("http://169.254.169.254/", True, id="metadata-local-context"),
+        pytest.param("http://10.20.30.40/", True, id="private-local-context"),
+    ],
+)
+async def test_tab_new_rejects_unsafe_url_before_opening(
+    monkeypatch: pytest.MonkeyPatch, url: str, can_access_localhost: bool
+) -> None:
+    existing_page = _make_mock_page()
+    new_page = _make_mock_page()
+    browser = _make_mock_browser(existing_page)
+    browser._browser_context.new_page = AsyncMock(return_value=new_page)
+    ctx = BrowserContext(
+        mode="local" if can_access_localhost else "cloud_session",
+        session_id=None if can_access_localhost else "pbs_test",
+        can_access_localhost=can_access_localhost,
+    )
+    _patch_get_page(monkeypatch, existing_page, ctx)
+    _patch_session(monkeypatch, _make_session_state(browser))
+
+    result = await mcp_tabs.skyvern_tab_new(url=url)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "INVALID_INPUT"
+    browser._browser_context.new_page.assert_not_awaited()
+    new_page.goto.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", ["http://localhost:3000/", "http://127.0.0.1:8000/"])
+async def test_tab_new_allows_local_url_when_context_permits(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    existing_page = _make_mock_page()
+    new_page = _make_mock_page(url, "Local")
+    browser = _make_mock_browser(existing_page)
+    browser._browser_context.new_page = AsyncMock(return_value=new_page)
+    browser._browser_context.pages = [existing_page, new_page]
+    ctx = BrowserContext(mode="local", can_access_localhost=True)
+    _patch_get_page(monkeypatch, existing_page, ctx)
+    _patch_session(monkeypatch, _make_session_state(browser))
+
+    result = await mcp_tabs.skyvern_tab_new(url=url)
+
+    assert result["ok"] is True
+    new_page.goto.assert_awaited_once_with(url, wait_until="domcontentloaded", timeout=30000)
 
 
 @pytest.mark.asyncio
@@ -166,7 +221,7 @@ async def test_tab_new_navigation_failure_restores_previous_active(monkeypatch: 
     state._active_page = existing_page
     _patch_session(monkeypatch, state)
 
-    result = await mcp_tabs.skyvern_tab_new(url="https://bad-url.com")
+    result = await mcp_tabs.skyvern_tab_new(url="https://example.com")
 
     assert result["ok"] is False
     # Previous active page should be restored, not reset to None

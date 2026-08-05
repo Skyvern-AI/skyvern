@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 from dataclasses import dataclass
 
@@ -20,17 +19,15 @@ from skyvern.schemas.scripts import (
     DeployCachedScriptBlockPlan,
     DeployCachedScriptRequest,
     DeployCachedScriptResponse,
-    FileEncoding,
     ScriptFileCreate,
     ScriptStatus,
     WorkflowScript,
 )
+from skyvern.services import script_service
 from skyvern.services.workflow_script_service import CacheKeyResolutionError, resolve_cache_key_value
-from skyvern.utils.script_file_paths import SCRIPT_FILE_PATH_ERROR, normalize_script_file_path
 
 _CODE_VERSION_STATIC = 1
 _CODE_VERSION_ADAPTIVE = 2
-_MAX_SCRIPT_FILE_BYTES = 10 * 1024 * 1024
 
 LOG = structlog.get_logger(__name__)
 
@@ -78,41 +75,9 @@ class _CachedScriptDeployUndoState:
         )
 
 
-def _decode_script_file_bytes(file: ScriptFileCreate) -> bytes:
-    if file.encoding == FileEncoding.BASE64:
-        try:
-            return base64.b64decode(file.content, validate=True)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"File {file.path!r} is not valid base64") from exc
-    return file.content.encode("utf-8")
-
-
-def _validate_script_file_path(file_path: str) -> None:
-    try:
-        normalize_script_file_path(file_path)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"File path {file_path!r} is invalid: {SCRIPT_FILE_PATH_ERROR}",
-        ) from exc
-
-
 def _validate_script_files(files: list[ScriptFileCreate]) -> list[_ValidatedScriptFile]:
-    seen_paths: set[str] = set()
-    validated_files: list[_ValidatedScriptFile] = []
-    for file in files:
-        _validate_script_file_path(file.path)
-        if file.path in seen_paths:
-            raise HTTPException(status_code=400, detail=f"Duplicate script file path {file.path!r}")
-        seen_paths.add(file.path)
-        content_bytes = _decode_script_file_bytes(file)
-        if len(content_bytes) > _MAX_SCRIPT_FILE_BYTES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"File {file.path!r} exceeds maximum size of {_MAX_SCRIPT_FILE_BYTES} bytes",
-            )
-        validated_files.append(_ValidatedScriptFile(file=file, content_bytes=content_bytes))
-    return validated_files
+    file_bytes_by_path = script_service.validate_uploaded_script_files(files)
+    return [_ValidatedScriptFile(file=file, content_bytes=file_bytes_by_path[file.path]) for file in files]
 
 
 def _main_py(files: list[_ValidatedScriptFile]) -> str:

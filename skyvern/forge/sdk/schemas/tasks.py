@@ -20,7 +20,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.models.run_limits import MaxScreenshotScrolls
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
-from skyvern.schemas.runs import ProxyLocationInput
+from skyvern.schemas.runs import ProxyLocationInput, _validate_browser_address
 from skyvern.utils.prompt_truncation import EXTRACTION_GOAL_MAX_TOKENS
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.token_counter import count_tokens
@@ -190,6 +190,11 @@ class TaskRequest(TaskBase):
             )
         return goal
 
+    @field_validator("browser_address")
+    @classmethod
+    def validate_browser_address(cls, browser_address: str | None) -> str | None:
+        return _validate_browser_address(browser_address)
+
     @field_validator("webhook_callback_url", "totp_verification_url")
     @classmethod
     def validate_optional_urls(cls, url: str | None) -> str | None:
@@ -336,11 +341,7 @@ class Task(TaskBase):
 
     @property
     def llm_key(self) -> str | None:
-        """
-        If the `Task` has a `model` defined, then return the mapped llm_key for it.
-
-        Otherwise return `None`.
-        """
+        """Resolve the task's explicit model mapping, if any."""
         if self.model:
             model_name = self.model.get("model_name")
             if model_name:

@@ -30,13 +30,16 @@ LLM_HANDLER_NAME_FRAGMENTS = ("LLM_API_HANDLER", "llm_api_handler")
 
 
 def _is_llm_handler_call(call: ast.Call) -> bool:
-    """True if the call looks like `await (whatever).LLM_API_HANDLER(...)` or
-    `await llm_api_handler(...)`."""
+    """True if the call looks like `await (whatever).LLM_API_HANDLER(...)`,
+    `await llm_api_handler(...)`, or `await get_org_aware_secondary_llm_api_handler(...)(...)`
+    where the awaited call's callee is a resolver call returning the handler."""
     func = call.func
     if isinstance(func, ast.Attribute):
         return any(frag in func.attr for frag in LLM_HANDLER_NAME_FRAGMENTS)
     if isinstance(func, ast.Name):
         return any(frag in func.id for frag in LLM_HANDLER_NAME_FRAGMENTS)
+    if isinstance(func, ast.Call):
+        return _is_llm_handler_call(func)
     return False
 
 

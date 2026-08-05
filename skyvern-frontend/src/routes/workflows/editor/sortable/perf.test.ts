@@ -62,6 +62,7 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   scriptCacheKey: null,
   aiFallback: true,
   enableSelfHealing: false,
+  maskSecrets: false,
   runSequentially: false,
   sequentialKey: null,
   finallyBlockLabel: null,

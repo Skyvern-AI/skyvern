@@ -28,6 +28,8 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import (
     Page,
     Playwright,
+    Request,
+    Route,
     Video,
 )
 
@@ -52,6 +54,7 @@ from skyvern.webeye.cdp_connection import connect_over_cdp_with_diagnostics as _
 from skyvern.webeye.cdp_connection import (
     merge_cdp_connect_headers,
     parse_default_cdp_connect_headers,
+    redact_cdp_url,
 )
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, bind_download_interceptor_to_context
 from skyvern.webeye.dialog_handler import set_dialog_handler
@@ -129,6 +132,103 @@ def sanitize_browser_headers(headers: dict[str, str] | None) -> dict[str, str] |
             continue
         sanitized[name] = value
     return sanitized or None
+
+
+def _browser_origin(url: str | None) -> tuple[str, str, int] | None:
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or hostname is None:
+        return None
+    if port is None:
+        port = 80 if scheme == "http" else 443
+    return scheme, hostname.lower(), port
+
+
+def _partition_browser_headers(
+    extra_http_headers: dict[str, str] | None,
+) -> tuple[dict[str, str] | None, dict[str, str] | None]:
+    if not extra_http_headers:
+        return None, None
+
+    parsed_headers = parse_extra_headers(extra_http_headers).headers
+    caller_headers = app.AGENT_FUNCTION.strip_proxy_session_extra_http_headers(parsed_headers) or {}
+    browser_internal_headers = {name: value for name, value in extra_http_headers.items() if name not in caller_headers}
+    return sanitize_browser_headers(browser_internal_headers), sanitize_browser_headers(caller_headers)
+
+
+async def _apply_origin_scoped_headers(
+    browser_context: BrowserContext,
+    *,
+    target_url: str | None,
+    headers: dict[str, str] | None,
+    route_handlers_allowed: bool | None,
+) -> None:
+    scoped_headers = sanitize_browser_headers(headers)
+    if not scoped_headers:
+        return
+
+    if route_handlers_allowed is not True:
+        LOG.warning("Omitting caller HTTP headers because browser context route handlers are not permitted")
+        return
+
+    target_origin = _browser_origin(target_url)
+    if target_origin is None:
+        LOG.warning("Omitting caller HTTP headers because the browser target URL has no valid HTTP origin")
+        return
+
+    normalized_headers = {name.lower(): (name, value) for name, value in scoped_headers.items()}
+    baseline_headers: dict[str, tuple[str, str] | None] = {}
+
+    async def apply_headers(route: Route, request: Request) -> None:
+        request_origin = _browser_origin(request.url)
+        request_headers = await request.all_headers()
+        request_header_names = {name.lower(): name for name in request_headers}
+
+        if request_origin == target_origin:
+            for normalized_name, (name, value) in normalized_headers.items():
+                existing_name = request_header_names.get(normalized_name)
+                if normalized_name not in baseline_headers:
+                    if existing_name is not None and request_headers[existing_name] != value:
+                        baseline_headers[normalized_name] = (existing_name, request_headers[existing_name])
+                    else:
+                        baseline_headers[normalized_name] = None
+                if existing_name is not None:
+                    request_headers.pop(existing_name)
+                request_headers[name] = value
+            await route.fallback(headers=request_headers)
+            return
+
+        changed = False
+        for normalized_name, (_, scoped_value) in normalized_headers.items():
+            existing_name = request_header_names.get(normalized_name)
+            if existing_name is None:
+                continue
+
+            baseline = baseline_headers.get(normalized_name)
+            if normalized_name in baseline_headers:
+                request_headers.pop(existing_name)
+                if baseline is not None:
+                    baseline_name, baseline_value = baseline
+                    request_headers[baseline_name] = baseline_value
+                changed = True
+            elif request_headers[existing_name] == scoped_value:
+                request_headers.pop(existing_name)
+                changed = True
+
+        if changed:
+            await route.fallback(headers=request_headers)
+        else:
+            await route.fallback()
+
+    await browser_context.route("**/*", apply_headers)
 
 
 async def _capture_seed_profile_state(
@@ -572,11 +672,13 @@ class BrowserContextFactory:
         browser_type = settings.BROWSER_TYPE
         browser_context: BrowserContext | None = None
         cleanup_func: BrowserCleanupFunc = None
+        browser_internal_headers, scoped_headers = _partition_browser_headers(kwargs.get("extra_http_headers"))
+        creator_kwargs = {**kwargs, "extra_http_headers": browser_internal_headers}
         try:
             creator = cls._creators.get(browser_type)
             if not creator:
                 raise UnknownBrowserType(browser_type)
-            browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
+            browser_context, browser_artifacts, cleanup_func = await creator(playwright, **creator_kwargs)
             await restore_session_cookies(browser_context, browser_artifacts.browser_session_dir)
             # After session cookies so a verified-login heal (banked by the credential living-profile
             # engine) wins over the profile's own older session cookies on a key clash. Gated on the
@@ -589,7 +691,23 @@ class BrowserContextFactory:
             set_popup_video_listener(browser_context=browser_context, browser_artifacts=browser_artifacts)
             set_download_file_listener(browser_context=browser_context, **kwargs)
             set_dialog_handler(browser_context=browser_context)
-            await app.AGENT_FUNCTION.setup_browser_context_extensions(browser_context=browser_context, **kwargs)
+            route_handlers_allowed = None
+            if scoped_headers:
+                route_handlers_allowed = await app.AGENT_FUNCTION.browser_context_route_handlers_allowed(**kwargs)
+            extension_kwargs = {
+                **kwargs,
+                "_browser_context_route_handlers_allowed": route_handlers_allowed,
+            }
+            await app.AGENT_FUNCTION.setup_browser_context_extensions(
+                browser_context=browser_context,
+                **extension_kwargs,
+            )
+            await _apply_origin_scoped_headers(
+                browser_context,
+                target_url=cast(str | None, kwargs.get("url")),
+                headers=scoped_headers,
+                route_handlers_allowed=route_handlers_allowed,
+            )
 
             proxy_location: ProxyLocationInput = kwargs.get("proxy_location")
             if isinstance(proxy_location, ProxyLocation):
@@ -707,6 +825,7 @@ async def _create_headless_chromium(
             extra_http_headers=extra_http_headers,
             cdp_connect_headers=cdp_connect_headers,
             apply_download_behaviour=True,
+            validate_browser_address=True,
         )
 
     # Check for browser_profile_id and load from storage if available
@@ -799,6 +918,7 @@ async def _create_headful_chromium(
             extra_http_headers=extra_http_headers,
             cdp_connect_headers=cdp_connect_headers,
             apply_download_behaviour=True,
+            validate_browser_address=True,
         )
 
     # Check for browser_profile_id and load from storage if available
@@ -919,6 +1039,7 @@ async def _create_cdp_connection_browser(
             extra_http_headers=extra_http_headers,
             cdp_connect_headers=cdp_connect_headers,
             apply_download_behaviour=True,
+            validate_browser_address=True,
         )
 
     browser_type = settings.BROWSER_TYPE
@@ -973,6 +1094,7 @@ async def _create_cdp_connection_browser(
         settings.BROWSER_REMOTE_DEBUGGING_URL,
         extra_http_headers=extra_http_headers,
         cdp_connect_headers=cdp_connect_headers,
+        validate_browser_address=False,
     )
 
 
@@ -982,6 +1104,7 @@ async def _connect_to_cdp_browser(
     extra_http_headers: dict[str, str] | None = None,
     cdp_connect_headers: dict[str, str] | None = None,
     apply_download_behaviour: bool = False,
+    validate_browser_address: bool = True,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     parsed_headers = parse_extra_headers(extra_http_headers)
 
@@ -996,7 +1119,7 @@ async def _connect_to_cdp_browser(
     # RealBrowserManager attaches the CDP frame publisher.
     browser_artifacts.needs_cdp_frame_publisher = True
 
-    LOG.info("Connecting browser CDP connection", remote_browser_url=remote_browser_url)
+    LOG.info("Connecting browser CDP connection", remote_browser_url=redact_cdp_url(remote_browser_url))
     cdp_headers = merge_cdp_connect_headers(
         default_headers=parse_default_cdp_connect_headers(settings.BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS),
         per_row_headers=cdp_connect_headers,
@@ -1007,6 +1130,7 @@ async def _connect_to_cdp_browser(
         remote_browser_url,
         headers=cdp_headers or None,
         timeout_ms=settings.BROWSER_CDP_CONNECT_TIMEOUT_MS,
+        validate_browser_address=validate_browser_address,
     )
 
     if apply_download_behaviour:
@@ -1059,7 +1183,7 @@ async def _connect_to_cdp_browser(
 
     LOG.info(
         "Launched browser CDP connection",
-        remote_browser_url=remote_browser_url,
+        remote_browser_url=redact_cdp_url(remote_browser_url),
     )
     return browser_context, browser_artifacts, None
 

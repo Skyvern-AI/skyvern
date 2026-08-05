@@ -1,9 +1,11 @@
+from datetime import datetime
 from unittest.mock import MagicMock
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from skyvern.config import settings
+from skyvern.forge.sdk.db.models import ActionModel
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.schemas import sdk_actions
@@ -21,6 +23,7 @@ from skyvern.utils.action_redaction import (
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
+    ActionStatus,
     ClickAction,
     ClosePageAction,
     ExtractAction,
@@ -283,6 +286,8 @@ def test_action_log_payload_keeps_non_otp_input_debuggable() -> None:
 @pytest.mark.asyncio
 async def test_create_action_redacts_response_but_preserves_action_json_for_hydration() -> None:
     secret_value = "OTP_SECRET_VALUE_SHOULD_NOT_APPEAR"
+    started_at = datetime(2026, 7, 30, 12, 0, 0)
+    finished_at = datetime(2026, 7, 30, 12, 0, 1)
     captured_models = []
 
     class FakeSession:
@@ -315,6 +320,8 @@ async def test_create_action_redacts_response_but_preserves_action_json_for_hydr
         intention="Enter verification code",
         response=secret_value,
         totp_code_required=True,
+        started_at=started_at,
+        finished_at=finished_at,
     )
 
     await repo.create_action(action)
@@ -323,11 +330,85 @@ async def test_create_action_redacts_response_but_preserves_action_json_for_hydr
     assert persisted_model.response == REDACTED_OTP_VALUE
     assert persisted_model.action_json["text"] == secret_value
     assert persisted_model.action_json["response"] == secret_value
+    assert persisted_model.started_at == started_at
+    assert persisted_model.finished_at == finished_at
 
     hydrated_action = hydrate_action(persisted_model)
     assert isinstance(hydrated_action, InputTextAction)
     assert hydrated_action.text == secret_value
     assert hydrated_action.response == secret_value
+    assert hydrated_action.model_dump(mode="json")["started_at"] == "2026-07-30T12:00:00"
+    assert hydrated_action.model_dump(mode="json")["finished_at"] == "2026-07-30T12:00:01"
+
+
+def test_hydration_prefers_model_timestamps_over_action_json_snapshot() -> None:
+    """action_json carries a serialized snapshot whose timestamps can lag the model columns
+    (e.g. after the batch upsert refreshed them); the model columns must win."""
+    model = ActionModel(
+        action_id="a_ts_fence",
+        action_type=ActionType.CLICK,
+        status=ActionStatus.completed,
+        organization_id="o_1",
+        task_id="tsk_1",
+        step_id="stp_1",
+        step_order=0,
+        action_order=0,
+        started_at=datetime(2026, 7, 30, 12, 0, 0),
+        finished_at=datetime(2026, 7, 30, 12, 0, 5),
+        created_at=datetime(2026, 7, 30, 11, 59, 0),
+        modified_at=datetime(2026, 7, 30, 12, 0, 5),
+        action_json={
+            "action_type": "click",
+            "started_at": "2026-07-30T00:00:00",
+            "finished_at": "2026-07-30T00:00:01",
+            "created_at": "2026-07-29T00:00:00",
+            "modified_at": "2026-07-30T00:00:01",
+        },
+    )
+
+    hydrated = hydrate_action(model)
+
+    assert hydrated.started_at == datetime(2026, 7, 30, 12, 0, 0)
+    assert hydrated.finished_at == datetime(2026, 7, 30, 12, 0, 5)
+    assert hydrated.created_at == datetime(2026, 7, 30, 11, 59, 0)
+
+
+def test_malformed_action_fallback_keeps_execution_timestamps() -> None:
+    """A row whose action_json fails base-Action validation hydrates through the minimal
+    fallback; the execution timestamps must survive that path too."""
+    model = ActionModel(
+        action_id="a_fallback",
+        action_type=ActionType.CLICK,
+        status=ActionStatus.completed,
+        organization_id="o_1",
+        task_id="tsk_1",
+        step_id="stp_1",
+        step_order=0,
+        action_order=0,
+        started_at=datetime(2026, 7, 30, 12, 0, 0),
+        finished_at=datetime(2026, 7, 30, 12, 0, 5),
+        created_at=datetime(2026, 7, 30, 11, 59, 0),
+        modified_at=datetime(2026, 7, 30, 12, 0, 5),
+        action_json={"action_type": "click", "confidence_float": "not-a-float"},
+    )
+
+    hydrated = hydrate_action(model)
+
+    assert hydrated.started_at == datetime(2026, 7, 30, 12, 0, 0)
+    assert hydrated.finished_at == datetime(2026, 7, 30, 12, 0, 5)
+
+
+def test_action_api_response_serializes_execution_timestamps() -> None:
+    action = Action(
+        action_type=ActionType.CLICK,
+        started_at=datetime(2026, 7, 30, 12, 0, 0),
+        finished_at=datetime(2026, 7, 30, 12, 0, 1),
+    )
+
+    payload = TypeAdapter(list[Action]).dump_python([action], mode="json")
+
+    assert payload[0]["started_at"] == "2026-07-30T12:00:00"
+    assert payload[0]["finished_at"] == "2026-07-30T12:00:01"
 
 
 def test_web_action_parse__no_element_id() -> None:

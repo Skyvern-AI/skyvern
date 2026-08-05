@@ -357,3 +357,70 @@ describe("NarrativeView collapse default", () => {
     expect(head.textContent).not.toContain("Outcome not confirmed:");
   });
 });
+
+const pureAskTurn = (): TurnNarrativeState => ({
+  ...EMPTY_NARRATIVE,
+  turnId: "turn-ask",
+  turnIndex: 0,
+  mode: "clarify",
+  responseType: "ASK_QUESTION",
+  terminal: "response",
+  narrativeSummary: "Which login should I use?",
+});
+
+const SCOUT_NARRATION = "Checked the login page for SSO options.";
+
+const askAfterScoutingTurn = (): TurnNarrativeState => ({
+  ...pureAskTurn(),
+  turnId: "turn-ask-scouted",
+  designStarted: true,
+  designActivity: [
+    { kind: "narration", text: SCOUT_NARRATION, iteration: 0, id: "n-1" },
+  ],
+});
+
+describe("NarrativeView rollup expand affordance", () => {
+  it("renders a pure needs-input ask as a plain, non-expandable card", () => {
+    render(<NarrativeView turn={pureAskTurn()} uxV1 />);
+
+    expect(screen.getByText("Which login should I use?")).toBeTruthy();
+    expect(screen.queryByRole("button")).toBeNull();
+    expect(document.querySelector("[aria-expanded]")).toBeNull();
+  });
+
+  it("keeps the chevron for an ask that follows scouting and reveals the thought stream on expand", () => {
+    render(<NarrativeView turn={askAfterScoutingTurn()} uxV1 />);
+
+    const head = screen.getByRole("button");
+    expect(head.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText(SCOUT_NARRATION)).toBeNull();
+
+    fireEvent.click(head);
+    expect(screen.getByRole("button", { name: "Collapse turn" })).toBeTruthy();
+    expect(screen.getByText(SCOUT_NARRATION)).toBeTruthy();
+  });
+
+  it("still shows the expand chevron for a build turn with blocks", () => {
+    render(<NarrativeView turn={terminalBuildTurn()} />);
+
+    const head = screen.getByRole("button", { name: new RegExp(HEADLINE) });
+    expect(head.getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.click(head);
+    expect(screen.getByRole("button", { name: "Collapse turn" })).toBeTruthy();
+  });
+
+  it("gains the expand affordance when activity arrives after a content-free render", () => {
+    const { rerender } = render(<NarrativeView turn={pureAskTurn()} uxV1 />);
+    expect(screen.queryByRole("button")).toBeNull();
+
+    rerender(
+      <NarrativeView
+        turn={{ ...pureAskTurn(), blocks: [completedBlock("block_1")] }}
+        uxV1
+      />,
+    );
+    const head = screen.getByRole("button");
+    expect(head.getAttribute("aria-expanded")).toBe("false");
+  });
+});

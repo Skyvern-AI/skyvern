@@ -235,6 +235,7 @@ class TestModelResolver:
             "thinking_level": "high",
             "service_tier": "flex",
             "extra_headers": {"X-Skyvern-Route": "copilot"},
+            "extra_body": {"reasoning_effort": "high"},
             "timeout": 900.0,
         }
         config = LLMConfig(
@@ -252,6 +253,7 @@ class TestModelResolver:
         assert ms is not None
 
         assert ms.extra_headers == {"X-Skyvern-Route": "copilot"}
+        assert ms.extra_body == {"reasoning_effort": "high"}
 
         assert ms.extra_args is not None
         assert ms.extra_args["thinking"] == lp["thinking"]

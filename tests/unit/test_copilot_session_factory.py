@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 
-def _mk_input_data(items: list[Any]) -> Any:
-    """Build a fake CallModelData payload with a model_data.input list."""
-    return SimpleNamespace(model_data=SimpleNamespace(input=list(items), instructions=None))
+
+def _mk_input_data(items: list[Any], *, instructions: str | None = None, context: Any = None) -> Any:
+    """Build a fake CallModelData payload with a model_data.input list.
+
+    ``CallModelData.context`` is the run context itself (``TContext | None``), not a wrapper around
+    one; a fake that nests it hides an attribute error behind a passing test.
+    """
+    return SimpleNamespace(
+        model_data=SimpleNamespace(input=list(items), instructions=instructions),
+        context=context,
+    )
 
 
 class TestFirstTurnCompaction:
@@ -137,3 +147,56 @@ class TestSessionInputCallback:
         assert len(combined) == 5
         assert combined[0] == goal
         assert combined[-1] == new[0]
+
+
+class TestModelInputCapture:
+    """COPILOT_DUMP_MODEL_INPUTS records what the model actually receives, so a prompt or
+    tool-schema change can be replayed offline instead of re-run live.
+    """
+
+    def test_capture_is_inert_and_lossless_when_unset(self, tmp_path: Any, monkeypatch: Any) -> None:
+        from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+
+        monkeypatch.delenv("COPILOT_DUMP_MODEL_INPUTS", raising=False)
+        items = [{"role": "user", "content": "build me a workflow"}]
+
+        result = copilot_call_model_input_filter(_mk_input_data(items))
+
+        assert result.input == items
+        assert list(tmp_path.iterdir()) == []
+
+    def test_capture_records_instructions_and_input(self, tmp_path: Any, monkeypatch: Any) -> None:
+        from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+
+        monkeypatch.setenv("COPILOT_DUMP_MODEL_INPUTS", str(tmp_path))
+        items = [
+            {"role": "user", "content": "output the number of azure errors"},
+            {"type": "function_call_output", "call_id": "c1", "output": '{"ok": true}'},
+        ]
+
+        copilot_call_model_input_filter(_mk_input_data(items, instructions="SYSTEM PROMPT"))
+
+        dumps = sorted(tmp_path.glob("call-*.json"))
+        assert len(dumps) == 1
+        payload = json.loads(dumps[0].read_text())
+        assert payload["instructions"] == "SYSTEM PROMPT"
+        assert payload["input"] == items
+        # A context the derivation helper cannot read must not cost the run its model call.
+        assert payload["requested_output_paths"] == []
+
+    def test_capture_records_a_call_whichever_shape_carries_the_context(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A live turn dumped 2 of 34 calls: the copilot's own hand over the context directly, and
+        # reading it as a wrapper lost every one of them to an AttributeError (SKY-13226).
+        from agents.run_context import RunContextWrapper
+
+        from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+
+        monkeypatch.setenv("COPILOT_DUMP_MODEL_INPUTS", str(tmp_path))
+        items = [{"role": "user", "content": "read the visitor count"}]
+
+        copilot_call_model_input_filter(_mk_input_data(items, context=SimpleNamespace()))
+        copilot_call_model_input_filter(_mk_input_data(items, context=RunContextWrapper(context=SimpleNamespace())))
+
+        assert len(sorted(tmp_path.glob("call-*.json"))) == 2

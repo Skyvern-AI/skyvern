@@ -34,6 +34,7 @@ def _make_context(
     context.workflow_permanent_id = "wpid-1"
     context.workflow_run_id = "wr-1"
     context.browser_session_id = None
+    context.mask_secrets = False
     return context
 
 

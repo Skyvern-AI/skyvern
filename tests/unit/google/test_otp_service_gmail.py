@@ -89,10 +89,11 @@ async def test_get_otp_value_from_email_uses_gmail_scoped_credentials(monkeypatc
 
     result = await agent.get_otp_value_from_email(
         organization_id="org_1",
-        totp_identifier="user@example.com",
-        workflow_id="wpid_1",
+        totp_identifier="user@example.test",
+        workflow_id="w_1",
         workflow_run_id="wr_1",
         created_after=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        expected_otp_type=OTPType.TOTP,
     )
 
     assert result == otp_service.OTPValue(value="123456", type=OTPType.TOTP)
@@ -105,17 +106,128 @@ async def test_get_otp_value_from_email_uses_gmail_scoped_credentials(monkeypatc
     assert search_messages_args is not None
     assert search_messages_args.kwargs["max_results"] == agent_functions.EMAIL_OTP_MAX_RESULTS
     assert search_messages_args.kwargs["client"] is not None
-    parse.assert_awaited_once_with("Your verification code is 123456", "org_1")
+    parse.assert_awaited_once_with(
+        "Your verification code is 123456",
+        "org_1",
+        enforced_otp_type=OTPType.TOTP,
+    )
     create_otp_code.assert_awaited_once_with(
         "org_1",
-        "user@example.com",
+        "user@example.test",
         "123456",
         "123456",
         OTPType.TOTP,
-        workflow_id="wpid_1",
+        workflow_id="w_1",
         workflow_run_id="wr_1",
         source="gmail",
     )
+
+
+@pytest.mark.asyncio
+async def test_get_otp_value_from_email_skips_mismatched_expected_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent = AgentFunction()
+    credential = SimpleNamespace(
+        id="goac_1",
+        scopes_granted=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+    )
+    monkeypatch.setattr(
+        otp_email.google_oauth_service,
+        "get_credentials_for_org",
+        AsyncMock(return_value=[credential]),
+    )
+    monkeypatch.setattr(agent, "get_google_workspace_credentials", AsyncMock(return_value=SimpleNamespace(token="AT")))
+    create_otp_code = AsyncMock()
+    monkeypatch.setattr(
+        agent_functions.app, "DATABASE", SimpleNamespace(otp=SimpleNamespace(create_otp_code=create_otp_code))
+    )
+    candidate = google_gmail_service.GmailMessageCandidate(
+        message_id="msg_code",
+        content="Your sign-in code is 123456",
+        internal_date=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr(
+        otp_email.google_gmail_service,
+        "search_recent_otp_messages",
+        AsyncMock(return_value=[candidate]),
+    )
+    parse = AsyncMock(return_value=otp_service.OTPValue(value="123456", type=OTPType.TOTP))
+    monkeypatch.setattr(otp_service, "parse_otp_login", parse)
+    context = EmailOTPVerificationContext()
+
+    result = await agent.get_otp_value_from_email(
+        organization_id="org_1",
+        totp_identifier="user@example.test",
+        expected_otp_type=OTPType.MAGIC_LINK,
+        context=context,
+    )
+
+    assert result is None
+    parse.assert_awaited_once_with(
+        "Your sign-in code is 123456",
+        "org_1",
+        enforced_otp_type=OTPType.MAGIC_LINK,
+    )
+    create_otp_code.assert_not_awaited()
+    assert context.for_source("gmail").has_seen_message("goac_1", "msg_code")
+
+
+@pytest.mark.asyncio
+async def test_get_otp_value_from_email_keeps_scanning_after_mismatched_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = AgentFunction()
+    credential = SimpleNamespace(
+        id="goac_1",
+        scopes_granted=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+    )
+    monkeypatch.setattr(
+        otp_email.google_oauth_service,
+        "get_credentials_for_org",
+        AsyncMock(return_value=[credential]),
+    )
+    monkeypatch.setattr(agent, "get_google_workspace_credentials", AsyncMock(return_value=SimpleNamespace(token="AT")))
+    create_otp_code = AsyncMock()
+    monkeypatch.setattr(
+        agent_functions.app, "DATABASE", SimpleNamespace(otp=SimpleNamespace(create_otp_code=create_otp_code))
+    )
+    now = datetime.now(timezone.utc)
+    candidates = [
+        google_gmail_service.GmailMessageCandidate(
+            message_id="msg_code",
+            content="Your sign-in code is 123456",
+            internal_date=now,
+        ),
+        google_gmail_service.GmailMessageCandidate(
+            message_id="msg_link",
+            content="Use this link to sign in: https://auth.example.test/magic",
+            internal_date=now,
+        ),
+    ]
+    monkeypatch.setattr(
+        otp_email.google_gmail_service,
+        "search_recent_otp_messages",
+        AsyncMock(return_value=candidates),
+    )
+    magic_link = otp_service.OTPValue(value="https://auth.example.test/magic", type=OTPType.MAGIC_LINK)
+    parse = AsyncMock(side_effect=[otp_service.OTPValue(value="123456", type=OTPType.TOTP), magic_link])
+    monkeypatch.setattr(otp_service, "parse_otp_login", parse)
+    context = EmailOTPVerificationContext()
+
+    result = await agent.get_otp_value_from_email(
+        organization_id="org_1",
+        totp_identifier="user@example.test",
+        expected_otp_type=OTPType.MAGIC_LINK,
+        context=context,
+    )
+
+    assert result == magic_link
+    assert parse.await_count == 2
+    assert parse.await_args_list[0].args == ("Your sign-in code is 123456", "org_1")
+    assert parse.await_args_list[0].kwargs == {"enforced_otp_type": OTPType.MAGIC_LINK}
+    create_otp_code.assert_awaited_once()
+    assert create_otp_code.await_args is not None
+    assert create_otp_code.await_args.args[2] == magic_link.value
+    assert context.for_source("gmail").has_seen_message("goac_1", "msg_code")
 
 
 @pytest.mark.asyncio
@@ -161,7 +273,7 @@ async def test_get_otp_value_from_email_uses_first_parseable_gmail_candidate(
     result = await agent.get_otp_value_from_email(
         organization_id="org_1",
         totp_identifier="user@example.com",
-        workflow_id="wpid_1",
+        workflow_id="w_1",
         workflow_run_id="wr_1",
     )
 
@@ -176,7 +288,7 @@ async def test_get_otp_value_from_email_uses_first_parseable_gmail_candidate(
         "654321",
         "654321",
         OTPType.TOTP,
-        workflow_id="wpid_1",
+        workflow_id="w_1",
         workflow_run_id="wr_1",
         source="gmail",
     )
@@ -219,7 +331,7 @@ async def test_get_otp_value_from_email_retries_gmail_candidate_after_parser_err
         first_result = await agent.get_otp_value_from_email(
             organization_id="org_1",
             totp_identifier="user@example.com",
-            workflow_id="wpid_1",
+            workflow_id="w_1",
             workflow_run_id="wr_1",
             context=context,
         )
@@ -227,7 +339,7 @@ async def test_get_otp_value_from_email_retries_gmail_candidate_after_parser_err
         second_result = await agent.get_otp_value_from_email(
             organization_id="org_1",
             totp_identifier="user@example.com",
-            workflow_id="wpid_1",
+            workflow_id="w_1",
             workflow_run_id="wr_1",
             context=context,
         )

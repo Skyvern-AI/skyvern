@@ -343,6 +343,7 @@ def convert_workflow_definition(
         finally_block_label=workflow_definition_yaml.finally_block_label,
         error_code_mapping=workflow_definition_yaml.error_code_mapping,
         workflow_system_prompt=workflow_definition_yaml.workflow_system_prompt,
+        completion_contract=workflow_definition_yaml.completion_contract,
     )
 
     LOG.info(

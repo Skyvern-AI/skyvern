@@ -13,7 +13,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT
 from skyvern.errors.errors import UserDefinedError
 from skyvern.forge.sdk.models import StepStatus
-from skyvern.webeye.actions.actions import ClickAction, DownloadFileAction
+from skyvern.webeye.actions.actions import ActionStatus, ClickAction, DownloadFileAction
 from skyvern.webeye.actions.handler import (
     _BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS,
     _INLINE_IFRAME_SRC_JS,
@@ -25,6 +25,7 @@ from skyvern.webeye.actions.handler import (
     _EagerAdoptedBlobCapture,
     _looks_like_pdf,
     _persist_captured_download,
+    _recover_adopted_session_blob_pdf_iframe,
     _recover_blocked_inline_pdf_download,
     _remove_download_listener,
     handle_download_file_action,
@@ -32,6 +33,7 @@ from skyvern.webeye.actions.handler import (
 from skyvern.webeye.actions.responses import ActionFailure, ActionSuccess
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
+from skyvern.webeye.utils.page import BlobActionFreshness
 from tests.unit.helpers import make_organization, make_step, make_task
 
 # Five seconds is only a test-side runaway guard. The behavior under test is
@@ -158,6 +160,62 @@ async def _run_false_click_observation(
             file_download_false_click_eligible=True,
         )
     return results, action, context, page, storage
+
+
+@pytest.mark.asyncio
+async def test_reused_action_with_stale_finished_at_gets_fresh_stamp_on_exception(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    """A hydrated/cached action arrives with a prior finished_at; if this execution's inner
+    action raises, the fallback must stamp THIS execution, never preserve the stale value
+    (which would yield finished_at < started_at)."""
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/download",
+    )
+    stale = datetime(2020, 1, 1, 0, 0, 0)
+    action.finished_at = stale
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=RuntimeError("boom")),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            with pytest.raises(RuntimeError):
+                await ActionHandler.handle_action(
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                    page=page,
+                    action=action,
+                )
+
+    assert action.started_at is not None
+    assert action.finished_at is not None
+    assert action.finished_at != stale
+    assert action.started_at <= action.finished_at
+
+
+@pytest.mark.asyncio
+async def test_agent_action_persists_execution_window(tmp_path: Path) -> None:
+    rig = _make_false_click_observation_context()
+    rig[-1].status = ActionStatus.completed
+
+    _, action, _, _, _ = await _run_false_click_observation(tmp_path, rig=rig)
+
+    assert action.started_at is not None
+    assert action.finished_at is not None
+    assert action.started_at <= action.finished_at
 
 
 @pytest.mark.asyncio
@@ -713,6 +771,7 @@ def _make_download_click_context(
     step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
     page = MagicMock()
     page.url = page_url
+    page.is_closed.return_value = False
     page.context.browser = None
     browser_state = MagicMock()
     browser_state.list_valid_pages = AsyncMock(return_value=[page])
@@ -732,6 +791,239 @@ def _make_download_click_context(
         step_id=step.step_id,
     )
     return task, step, page, browser_state, scraped_page, action
+
+
+@pytest.mark.asyncio
+async def test_handle_action_recovers_working_page_closed_by_download_click() -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/downloads",
+        task_overrides={
+            "error_code_mapping": {
+                "download_failed": "The requested download could not be prepared",
+            },
+        },
+    )
+    task = task.model_copy(update={"download_timeout": 0.01})
+    transient_callbacks: dict[str, Callable] = {}
+    unrelated_page = MagicMock()
+    unrelated_page.url = "https://example.com/unrelated"
+    recovered_page = MagicMock()
+    recovered_page.url = page.url
+    recovered_page.is_closed.return_value = False
+    recovered_page.context = page.context
+    page.context._skyvern_cdp_download_active = False
+
+    async def expose_original_binding(_name: str, callback: Callable) -> None:
+        transient_callbacks["original"] = callback
+
+    page.expose_binding = AsyncMock(side_effect=expose_original_binding)
+    page.evaluate = AsyncMock(return_value=[])
+    recovered_page.expose_binding = AsyncMock()
+    recovered_page.evaluate = AsyncMock(return_value=[])
+    browser_state.list_valid_pages = AsyncMock(return_value=[page, unrelated_page])
+    browser_state.new_page = AsyncMock(return_value=recovered_page)
+    browser_state.navigate_to_url = AsyncMock()
+    browser_state.set_active_page = AsyncMock()
+
+    async def close_page_during_click(*args: object, **kwargs: object) -> list[ActionSuccess]:
+        transient_callbacks["original"](
+            {},
+            {"text": "The requested download could not be prepared", "timestamp_ms": 1},
+        )
+        page.is_closed.return_value = True
+        return [ActionSuccess()]
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=close_page_during_click),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            results = await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+    browser_state.new_page.assert_awaited_once_with()
+    browser_state.navigate_to_url.assert_awaited_once_with(
+        page=recovered_page,
+        url="https://example.com/downloads",
+    )
+    browser_state.set_active_page.assert_awaited_once_with(recovered_page)
+    assert unrelated_page is not recovered_page
+    assert results[-1].download_triggered is False
+    assert results[-1].skip_remaining_actions is True
+    assert isinstance(results[-1], ActionFailure)
+    assert [error.error_code for error in action.errors or []] == ["download_failed"]
+
+
+@pytest.mark.asyncio
+async def test_handle_action_does_not_close_recovered_page_when_download_finishes() -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/downloads",
+    )
+    download_popup = MagicMock()
+    download_popup.url = "https://example.com/download-popup"
+    download_popup.close = AsyncMock()
+    recovered_page = MagicMock()
+    recovered_page.url = page.url
+    recovered_page.is_closed.return_value = False
+    recovered_page.context = page.context
+    recovered_page.close = AsyncMock()
+    page.context._skyvern_cdp_download_active = False
+    page.expose_binding = AsyncMock()
+    page.evaluate = AsyncMock(return_value=[])
+    recovered_page.expose_binding = AsyncMock()
+    recovered_page.evaluate = AsyncMock(return_value=[])
+    browser_state.list_valid_pages = AsyncMock(side_effect=[[page], [download_popup, recovered_page]])
+    browser_state.new_page = AsyncMock(return_value=recovered_page)
+    browser_state.navigate_to_url = AsyncMock()
+    browser_state.set_active_page = AsyncMock()
+    observer_lifecycle: list[str] = []
+    original_observer = MagicMock()
+    original_observer.events = [{"text": "The report download is ready", "timestamp_ms": 1}]
+    original_observer.start = AsyncMock(side_effect=lambda **_: observer_lifecycle.append("original:start"))
+
+    async def stop_original_observer() -> None:
+        observer_lifecycle.append("original:stop")
+        original_observer.events.clear()
+
+    original_observer.stop = AsyncMock(side_effect=stop_original_observer)
+    recovered_observer = MagicMock()
+    recovered_observer.events = []
+    recovered_observer.start = AsyncMock(side_effect=lambda **_: observer_lifecycle.append("recovered:start"))
+    recovered_observer.stop = AsyncMock(side_effect=lambda: observer_lifecycle.append("recovered:stop"))
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        downloaded_file = Path(temp_dir) / "report.pdf"
+
+        async def close_page_during_click(*args: object, **kwargs: object) -> list[ActionSuccess]:
+            page.is_closed.return_value = True
+            downloaded_file.write_bytes(b"downloaded")
+            return [ActionSuccess()]
+
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=close_page_during_click),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch(
+                "skyvern.webeye.actions.handler.list_files_in_directory",
+                side_effect=lambda _path: [str(downloaded_file)] if downloaded_file.exists() else [],
+            ),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=AsyncMock(),
+            ),
+            patch(
+                "skyvern.webeye.actions.handler.TransientPageTextObserver",
+                side_effect=[original_observer, recovered_observer],
+            ),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            results = await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+    assert results[-1].download_triggered is True
+    assert results[-1].skip_remaining_actions is True
+    assert recovered_observer.events == [{"text": "The report download is ready", "timestamp_ms": 1}]
+    assert observer_lifecycle == ["original:start", "original:stop", "recovered:start", "recovered:stop"]
+    recovered_page.close.assert_not_awaited()
+    download_popup.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_handle_action_closes_failed_recovery_page_and_bounds_navigation() -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/downloads",
+    )
+    task.download_timeout = 0.01
+    failed_recovery_page = MagicMock()
+    failed_recovery_page.url = "about:blank"
+    failed_recovery_page.context = page.context
+    failed_recovery_page.close = AsyncMock()
+    page.context._skyvern_cdp_download_active = False
+    page.expose_binding = AsyncMock()
+    page.evaluate = AsyncMock(return_value=[])
+    browser_state.new_page = AsyncMock(return_value=failed_recovery_page)
+    navigation_started = asyncio.Event()
+
+    async def hang_during_recovery(*args: object, **kwargs: object) -> None:
+        navigation_started.set()
+        await asyncio.Event().wait()
+
+    browser_state.navigate_to_url = AsyncMock(side_effect=hang_during_recovery)
+    browser_state.set_active_page = AsyncMock()
+
+    async def close_page_during_click(*args: object, **kwargs: object) -> list[ActionSuccess]:
+        page.is_closed.return_value = True
+        return [ActionSuccess()]
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=close_page_during_click),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch("skyvern.webeye.actions.handler.LOG.warning"),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            results = await asyncio.wait_for(
+                ActionHandler.handle_action(
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                    page=page,
+                    action=action,
+                ),
+                timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
+            )
+
+    assert navigation_started.is_set()
+    browser_state.navigate_to_url.assert_awaited_once_with(
+        page=failed_recovery_page,
+        url="https://example.com/downloads",
+    )
+    browser_state.set_active_page.assert_not_awaited()
+    failed_recovery_page.close.assert_awaited_once_with()
+    assert results[-1].download_triggered is False
+    assert results[-1].skip_remaining_actions is not True
 
 
 @pytest.mark.asyncio
@@ -827,8 +1119,11 @@ async def test_handle_action_download_completion_may_exceed_signal_budget(
                 file.write(b"ready")
             return [ActionSuccess()]
 
+        during_completion_wait: list[datetime] = []
+
         async def slow_download_completion(**kwargs: object) -> None:
             assert kwargs["timeout"] == 0.2
+            during_completion_wait.append(datetime.now(UTC).replace(tzinfo=None))
             await asyncio.sleep(0.05)
 
         mock_app = MagicMock()
@@ -857,7 +1152,7 @@ async def test_handle_action_download_completion_may_exceed_signal_budget(
                     page=page,
                     action=action,
                 ),
-                timeout=0.5,
+                timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
             )
 
         elapsed = time.monotonic() - started_at
@@ -866,6 +1161,14 @@ async def test_handle_action_download_completion_may_exceed_signal_budget(
     assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert results[-1].download_triggered is True
     assert results[-1].downloaded_files == ["report.pdf"]
+    # The download-triggered persist path stamps the execution window too, and the
+    # window excludes the download-completion wait: finished_at was taken when the
+    # inner action returned, strictly before the completion mock ran.
+    assert action.started_at is not None
+    assert action.finished_at is not None
+    assert action.started_at <= action.finished_at
+    assert during_completion_wait
+    assert action.finished_at <= during_completion_wait[0]
 
 
 @pytest.mark.asyncio
@@ -915,7 +1218,7 @@ async def test_handle_action_crdownload_signal_enters_completion_before_reportin
                     page=page,
                     action=action,
                 ),
-                timeout=0.5,
+                timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
             )
 
     settle.assert_awaited_once()
@@ -980,7 +1283,7 @@ async def test_handle_action_remote_crdownload_signal_enters_completion_before_r
                     page=page,
                     action=action,
                 ),
-                timeout=0.5,
+                timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
             )
 
     settle.assert_awaited_once()
@@ -1040,7 +1343,7 @@ async def test_handle_action_preexisting_remote_crdownload_does_not_signal_new_d
                     page=page,
                     action=action,
                 ),
-                timeout=0.5,
+                timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
             )
 
     settle.assert_not_awaited()
@@ -1102,7 +1405,7 @@ async def test_handle_action_remote_snapshot_captures_partial_transition_before_
                     page=page,
                     action=action,
                 ),
-                timeout=0.5,
+                timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
             )
 
     settle.assert_not_awaited()
@@ -2541,6 +2844,7 @@ async def test_handle_action_prefers_observed_file_over_download_event_copy(
 
     page = MagicMock()
     page.url = "https://example.com/download"
+    page.is_closed.return_value = False
     page.context.browser = None
     settle_active = False
     settle_count = 0
@@ -2869,6 +3173,7 @@ async def test_handle_action_stops_after_download_event_fallback_failure(
 
     page = MagicMock()
     page.url = "https://example.com/download"
+    page.is_closed.return_value = False
     page.context.browser = None
     download_callbacks: dict[str, Callable[[object], None]] = {}
     page.on.side_effect = lambda event, callback: download_callbacks.__setitem__(event, callback)
@@ -3638,7 +3943,7 @@ async def test_handle_action_adopted_session_refetches_when_save_as_target_close
     assert landed_bytes == refetched_bytes
     assert results[-1].downloaded_files == landed
     download.save_as.assert_awaited_once()
-    page.context.request.get.assert_awaited_once_with(download.url)
+    page.context.request.get.assert_awaited_once_with(download.url, max_redirects=0)
     span_attrs = _download_wait_span_attrs(span_exporter)
     assert span_attrs["download_event_fallback_used"] is True
 
@@ -3753,7 +4058,7 @@ async def test_handle_action_adopted_session_falls_through_to_session_folder_whe
     assert action.download_triggered is True
     # helper attempted and failed; recovery came from the browser-session folder poll
     download.save_as.assert_awaited_once()
-    page.context.request.get.assert_awaited_once_with(download.url)
+    page.context.request.get.assert_awaited_once_with(download.url, max_redirects=0)
     # storage was polled at least twice: once before the action, again on a later loop iteration
     assert mock_app.STORAGE.list_downloaded_files_in_browser_session.await_count >= 2
     span_attrs = _download_wait_span_attrs(span_exporter)
@@ -3773,12 +4078,16 @@ async def test_handle_action_adopted_session_helper_failure_does_not_short_circu
     """
     now = datetime.now(UTC)
     organization = make_organization(now)
+    # Small, non-flaky budget: enough for a baseline poll plus at least one post-helper poll, while
+    # keeping the test fast. The stated contract (keep polling after the helper returns None) is what
+    # this test isolates, so the real _save_adopted_session_download is replaced with an instant None
+    # below rather than being driven to failure by the outer timeout.
     task = make_task(
         now,
         organization,
         workflow_run_id="wr-1",
         browser_session_id="bs-1",
-        download_timeout=0.01,
+        download_timeout=0.3,
     )
     step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
 
@@ -3789,7 +4098,6 @@ async def test_handle_action_adopted_session_helper_failure_does_not_short_circu
     page.expose_binding = AsyncMock()
     download_callbacks: dict[str, Callable[[object], None]] = {}
     page.on.side_effect = lambda event, callback: download_callbacks.__setitem__(event, callback)
-    page.context.request.get = AsyncMock(side_effect=Exception("connection gone"))
 
     browser_state = MagicMock()
     browser_state.list_valid_pages = AsyncMock(return_value=[page])
@@ -3814,7 +4122,11 @@ async def test_handle_action_adopted_session_helper_failure_does_not_short_circu
     download = MagicMock()
     download.suggested_filename = "report.pdf"
     download.url = "https://example.com/presigned/report.pdf"
-    download.save_as = AsyncMock(side_effect=Exception("Target page, context or browser has been closed"))
+
+    # Isolate the stated contract: the adopted-session save helper returns None (could not save), and
+    # the poll loop must keep polling the browser-session folder afterwards. Replacing the real helper
+    # keeps this fast and deterministic instead of driving it to failure via the outer timeout.
+    save_helper = AsyncMock(return_value=None)
 
     async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
         download_callbacks["download"](download)
@@ -3834,6 +4146,7 @@ async def test_handle_action_adopted_session_helper_failure_does_not_short_circu
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
+            patch("skyvern.webeye.actions.handler._save_adopted_session_download", save_helper),
             patch(
                 "skyvern.webeye.actions.handler.skyvern_context.current",
                 return_value=MagicMock(run_id="bs-1", download_suffix=None),
@@ -3854,8 +4167,9 @@ async def test_handle_action_adopted_session_helper_failure_does_not_short_circu
 
     assert results[-1].download_triggered is False
     assert action.download_triggered is False
-    download.save_as.assert_awaited_once()
-    # the loop kept polling the browser-session folder after the helper failure,
+    # The adopted-session save helper was attempted and returned None (could not save).
+    save_helper.assert_awaited()
+    # the loop kept polling the browser-session folder after the helper returned None,
     # rather than breaking out on the first failed attempt.
     assert mock_app.STORAGE.list_downloaded_files_in_browser_session.await_count >= 2
     span_attrs = _download_wait_span_attrs(span_exporter)
@@ -3975,7 +4289,7 @@ async def test_handle_action_adopted_session_xhr_staging_recovered_when_helper_f
             timeout_seconds=download_timeout if download_timeout is not None else BROWSER_DOWNLOAD_TIMEOUT,
         )
         download.save_as.assert_awaited_once()
-        page.context.request.get.assert_awaited_once_with(download.url)
+        page.context.request.get.assert_awaited_once_with(download.url, max_redirects=0)
         # file moved from staging to download dir
         landed_files = sorted(os.listdir(primary_dir))
         assert landed_files == ["xhr-captured.pdf"]
@@ -4590,7 +4904,7 @@ async def test_handle_action_threads_preclick_iframe_baseline_into_recovery(tmp_
     ):
         results = await asyncio.wait_for(
             ActionHandler.handle_action(scraped_page=scraped_page, task=task, step=step, page=page, action=action),
-            timeout=0.5,
+            timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
         )
 
     assert seen["baseline"] == baseline
@@ -4630,7 +4944,7 @@ async def test_handle_action_skips_recovery_when_native_download_fires(tmp_path:
     ):
         results = await asyncio.wait_for(
             ActionHandler.handle_action(scraped_page=scraped_page, task=task, step=step, page=page, action=action),
-            timeout=0.5,
+            timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
         )
 
     recover.assert_not_called()
@@ -5024,3 +5338,527 @@ async def test_handle_action_managed_session_disables_eager_and_popup_wiring() -
     assert captured_kwargs.get("enabled") is False
     assert "popup" not in page_listeners
     assert not any(c.args and c.args[0] == "popup" for c in page.on.call_args_list)
+
+
+def _blob_download(url: str, suggested_filename: str) -> MagicMock:
+    download = MagicMock()
+    download.url = url
+    download.suggested_filename = suggested_filename
+    return download
+
+
+def _patch_fresh_probe(*, state_observed: bool = True, retained: bool = True):
+    """Patch the retention-freshness gate to a fixed verdict so selection-logic tests can reach the
+    read path without standing up a real retention Map."""
+    return patch(
+        "skyvern.webeye.actions.handler.probe_blob_action_freshness",
+        new=AsyncMock(return_value=BlobActionFreshness(state_observed=state_observed, retained=retained)),
+    )
+
+
+class TestRecoverAdoptedSessionBlobPdfIframe:
+    """Fast guardrail coverage for the live blob: PDF iframe recovery selection logic."""
+
+    @pytest.mark.asyncio
+    async def test_non_blob_download_url_returns_none_without_reading(self) -> None:
+        page = MagicMock()
+        with (
+            patch("skyvern.webeye.actions.handler._blob_iframe_src_titles", new=AsyncMock()) as titles,
+            patch("skyvern.webeye.actions.handler.SkyvernFrame.read_blob_url_bytes", new=AsyncMock()) as read,
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("https://x.example/file.pdf", "file.pdf"), "wr"
+            )
+        assert result is None
+        titles.assert_not_awaited()
+        read.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_named_match_pdf_iframe_is_recovered(self) -> None:
+        page = MagicMock()
+        src = "blob:https://portal.example/live-uuid"
+        with (
+            patch(
+                "skyvern.webeye.actions.handler._blob_iframe_src_titles",
+                new=AsyncMock(return_value={src: "Statement.pdf"}),
+            ),
+            _patch_fresh_probe(),
+            patch(
+                "skyvern.webeye.actions.handler.SkyvernFrame.read_blob_url_bytes",
+                new=AsyncMock(return_value=b"%PDF-1.4 real"),
+            ),
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("blob:https://portal.example/dl-uuid", "statement.pdf"), "wr"
+            )
+        assert result == b"%PDF-1.4 real"
+
+    @pytest.mark.asyncio
+    async def test_empty_suggested_filename_fails_closed_without_reading(self) -> None:
+        page = MagicMock()
+        with (
+            patch("skyvern.webeye.actions.handler._blob_iframe_src_titles", new=AsyncMock()) as titles,
+            patch("skyvern.webeye.actions.handler.SkyvernFrame.read_blob_url_bytes", new=AsyncMock()) as read,
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("blob:https://portal.example/dl-uuid", ""), "wr"
+            )
+        assert result is None
+        titles.assert_not_awaited()
+        read.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_single_iframe_name_mismatch_fails_closed(self) -> None:
+        page = MagicMock()
+        src = "blob:https://portal.example/live-uuid"
+        with (
+            patch(
+                "skyvern.webeye.actions.handler._blob_iframe_src_titles",
+                new=AsyncMock(return_value={src: "Statement.pdf"}),
+            ),
+            patch(
+                "skyvern.webeye.actions.handler.SkyvernFrame.read_blob_url_bytes",
+                new=AsyncMock(return_value=b"%PDF-1.4 real"),
+            ) as read,
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("blob:https://portal.example/dl-uuid", "different-name.pdf"), "wr"
+            )
+        assert result is None
+        read.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_matching_titles_fail_closed(self) -> None:
+        page = MagicMock()
+        srcs = {
+            "blob:https://portal.example/a-uuid": "Statement.pdf",
+            "blob:https://portal.example/b-uuid": "Statement.pdf",
+        }
+        with (
+            patch(
+                "skyvern.webeye.actions.handler._blob_iframe_src_titles",
+                new=AsyncMock(return_value=srcs),
+            ),
+            patch(
+                "skyvern.webeye.actions.handler.SkyvernFrame.read_blob_url_bytes",
+                new=AsyncMock(return_value=b"%PDF-1.4 x"),
+            ) as read,
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("blob:https://portal.example/dl-uuid", "Statement.pdf"), "wr"
+            )
+        assert result is None
+        read.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_pdf_blob_iframe_is_not_recovered(self) -> None:
+        page = MagicMock()
+        src = "blob:https://portal.example/live-uuid"
+        with (
+            patch(
+                "skyvern.webeye.actions.handler._blob_iframe_src_titles",
+                new=AsyncMock(return_value={src: "Statement.pdf"}),
+            ),
+            _patch_fresh_probe(),
+            patch(
+                "skyvern.webeye.actions.handler.SkyvernFrame.read_blob_url_bytes",
+                new=AsyncMock(return_value=b"<html>login</html>"),
+            ),
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("blob:https://portal.example/dl-uuid", "statement.pdf"), "wr"
+            )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_other_origin_blob_iframe_is_ignored(self) -> None:
+        page = MagicMock()
+        other = "blob:https://ads.example/other-uuid"
+        with (
+            patch(
+                "skyvern.webeye.actions.handler._blob_iframe_src_titles",
+                new=AsyncMock(return_value={other: "Ad.pdf"}),
+            ),
+            patch(
+                "skyvern.webeye.actions.handler.SkyvernFrame.read_blob_url_bytes",
+                new=AsyncMock(return_value=b"%PDF-1.4 ad"),
+            ) as read,
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("blob:https://portal.example/dl-uuid", "statement.pdf"), "wr"
+            )
+        assert result is None
+        read.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_filename_match_selects_named_iframe_not_first(self) -> None:
+        page = MagicMock()
+        decoy = "blob:https://portal.example/decoy-uuid"
+        wanted = "blob:https://portal.example/wanted-uuid"
+
+        async def _read(*, page, blob_url, workflow_run_id, max_size_bytes, probe):  # noqa: ANN001
+            return b"%PDF-1.4 " + blob_url.encode()
+
+        with (
+            patch(
+                "skyvern.webeye.actions.handler._blob_iframe_src_titles",
+                new=AsyncMock(return_value={decoy: "DecoyDoc.pdf", wanted: "AnnualStatement2026.pdf"}),
+            ),
+            _patch_fresh_probe(),
+            patch("skyvern.webeye.actions.handler.SkyvernFrame.read_blob_url_bytes", new=_read),
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page,
+                _blob_download("blob:https://portal.example/dl-uuid", "AnnualStatement2026.pdf"),
+                "wr",
+            )
+        assert result == b"%PDF-1.4 " + wanted.encode()
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_pdfs_without_filename_match_fail_closed(self) -> None:
+        page = MagicMock()
+        srcs = {
+            "blob:https://portal.example/a-uuid": "DocA.pdf",
+            "blob:https://portal.example/b-uuid": "DocB.pdf",
+        }
+        with (
+            patch(
+                "skyvern.webeye.actions.handler._blob_iframe_src_titles",
+                new=AsyncMock(return_value=srcs),
+            ),
+            patch(
+                "skyvern.webeye.actions.handler.SkyvernFrame.read_blob_url_bytes",
+                new=AsyncMock(return_value=b"%PDF-1.4 x"),
+            ),
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("blob:https://portal.example/dl-uuid", "unrelated.pdf"), "wr"
+            )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_filename_match_that_is_not_pdf_fails_closed(self) -> None:
+        page = MagicMock()
+        srcs = {
+            "blob:https://portal.example/named-uuid": "Statement.pdf",
+            "blob:https://portal.example/other-uuid": "Other.pdf",
+        }
+
+        async def _read(*, page, blob_url, workflow_run_id, max_size_bytes, probe):  # noqa: ANN001
+            return b"<html>not a pdf</html>" if "named-uuid" in blob_url else b"%PDF-1.4 other"
+
+        with (
+            patch(
+                "skyvern.webeye.actions.handler._blob_iframe_src_titles",
+                new=AsyncMock(return_value=srcs),
+            ),
+            _patch_fresh_probe(),
+            patch("skyvern.webeye.actions.handler.SkyvernFrame.read_blob_url_bytes", new=_read),
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("blob:https://portal.example/dl-uuid", "Statement.pdf"), "wr"
+            )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_no_filename_match_logs_reason_and_candidate_count(self) -> None:
+        page = MagicMock()
+        srcs = {
+            "blob:https://portal.example/a-uuid": "DocA.pdf",
+            "blob:https://portal.example/b-uuid": "DocB.pdf",
+        }
+        with (
+            patch(
+                "skyvern.webeye.actions.handler._blob_iframe_src_titles",
+                new=AsyncMock(return_value=srcs),
+            ),
+            patch(
+                "skyvern.webeye.actions.handler.SkyvernFrame.read_blob_url_bytes",
+                new=AsyncMock(return_value=b"%PDF-1.4 x"),
+            ),
+            patch("skyvern.webeye.actions.handler.LOG") as log,
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("blob:https://portal.example/dl-uuid", "unrelated.pdf"), "wr"
+            )
+        assert result is None
+        reason_calls = [c for c in log.info.call_args_list if c.kwargs.get("reason") == "no_filename_title_match"]
+        assert len(reason_calls) == 1
+        assert reason_calls[0].kwargs["candidate_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_missing_suggested_filename_logs_reason(self) -> None:
+        page = MagicMock()
+        with (
+            patch("skyvern.webeye.actions.handler._blob_iframe_src_titles", new=AsyncMock()) as titles,
+            patch("skyvern.webeye.actions.handler.LOG") as log,
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("blob:https://portal.example/dl-uuid", ""), "wr"
+            )
+        assert result is None
+        titles.assert_not_awaited()
+        assert any(c.kwargs.get("reason") == "missing_suggested_filename" for c in log.info.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_no_same_origin_candidate_logs_reason(self) -> None:
+        page = MagicMock()
+        with (
+            patch(
+                "skyvern.webeye.actions.handler._blob_iframe_src_titles",
+                new=AsyncMock(return_value={"blob:https://ads.example/x": "Ad.pdf"}),
+            ),
+            patch("skyvern.webeye.actions.handler.LOG") as log,
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("blob:https://portal.example/dl-uuid", "statement.pdf"), "wr"
+            )
+        assert result is None
+        no_origin = [c for c in log.info.call_args_list if c.kwargs.get("reason") == "no_same_origin_blob_iframe"]
+        assert len(no_origin) == 1
+        assert no_origin[0].kwargs["candidate_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_duplicate_match_logs_reason_and_counts(self) -> None:
+        page = MagicMock()
+        srcs = {
+            "blob:https://portal.example/a-uuid": "Statement.pdf",
+            "blob:https://portal.example/b-uuid": "Statement.pdf",
+        }
+        with (
+            patch(
+                "skyvern.webeye.actions.handler._blob_iframe_src_titles",
+                new=AsyncMock(return_value=srcs),
+            ),
+            patch("skyvern.webeye.actions.handler.LOG") as log,
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("blob:https://portal.example/dl-uuid", "Statement.pdf"), "wr"
+            )
+        assert result is None
+        dup = [c for c in log.warning.call_args_list if c.kwargs.get("reason") == "duplicate_filename_match"]
+        assert len(dup) == 1
+        assert dup[0].kwargs["match_count"] == 2
+        assert dup[0].kwargs["candidate_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_page_access_error_during_discovery_fails_closed(self) -> None:
+        # Simulate the page/frame being torn down (e.g. remote session closing) mid-discovery.
+        page = MagicMock()
+        with (
+            patch(
+                "skyvern.webeye.actions.handler._blob_iframe_src_titles",
+                new=AsyncMock(side_effect=RuntimeError("Target page, context or browser has been closed")),
+            ),
+            patch("skyvern.webeye.actions.handler.SkyvernFrame.read_blob_url_bytes", new=AsyncMock()) as read,
+            patch("skyvern.webeye.actions.handler.LOG") as log,
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("blob:https://portal.example/dl-uuid", "Statement.pdf"), "wr"
+            )
+        assert result is None
+        read.assert_not_awaited()
+        errors = [c for c in log.warning.call_args_list if c.kwargs.get("reason") == "recovery_error"]
+        assert len(errors) == 1
+        assert errors[0].kwargs["error_type"] == "RuntimeError"
+
+    @pytest.mark.asyncio
+    async def test_read_error_during_recovery_fails_closed(self) -> None:
+        # A matched candidate whose read raises must fail closed, not propagate.
+        page = MagicMock()
+        src = "blob:https://portal.example/live-uuid"
+        with (
+            patch(
+                "skyvern.webeye.actions.handler._blob_iframe_src_titles",
+                new=AsyncMock(return_value={src: "Statement.pdf"}),
+            ),
+            _patch_fresh_probe(),
+            patch(
+                "skyvern.webeye.actions.handler.SkyvernFrame.read_blob_url_bytes",
+                new=AsyncMock(side_effect=RuntimeError("frame detached")),
+            ),
+            patch("skyvern.webeye.actions.handler.LOG") as log,
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("blob:https://portal.example/dl-uuid", "Statement.pdf"), "wr"
+            )
+        assert result is None
+        assert any(c.kwargs.get("reason") == "recovery_error" for c in log.warning.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_recovery_does_not_swallow_cancellation(self) -> None:
+        # CancelledError (BaseException) must propagate so the enclosing timeout/cancel scope observes it.
+        page = MagicMock()
+        with (
+            patch(
+                "skyvern.webeye.actions.handler._blob_iframe_src_titles",
+                new=AsyncMock(side_effect=asyncio.CancelledError()),
+            ),
+            patch("skyvern.webeye.actions.handler.LOG"),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await _recover_adopted_session_blob_pdf_iframe(
+                    page, _blob_download("blob:https://portal.example/dl-uuid", "Statement.pdf"), "wr"
+                )
+
+    @pytest.mark.asyncio
+    async def test_stale_named_iframe_not_action_fresh_fails_closed(self) -> None:
+        # Title matches but the candidate blob is absent from the live retention Map: a lingering
+        # same-named iframe from an earlier action must never be saved.
+        page = MagicMock()
+        src = "blob:https://portal.example/stale-uuid"
+        with (
+            patch(
+                "skyvern.webeye.actions.handler._blob_iframe_src_titles",
+                new=AsyncMock(return_value={src: "Statement.pdf"}),
+            ),
+            patch(
+                "skyvern.webeye.actions.handler.probe_blob_action_freshness",
+                new=AsyncMock(return_value=BlobActionFreshness(state_observed=True, retained=False)),
+            ),
+            patch("skyvern.webeye.actions.handler.SkyvernFrame.read_blob_url_bytes", new=AsyncMock()) as read,
+            patch("skyvern.webeye.actions.handler.LOG") as log,
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("blob:https://portal.example/dl-uuid", "Statement.pdf"), "wr"
+            )
+        assert result is None
+        read.assert_not_awaited()
+        assert any(c.kwargs.get("reason") == "not_action_fresh" for c in log.info.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_retention_state_unobservable_fails_closed(self) -> None:
+        # No probe realm exposes retention state at all: fail closed, distinctly from not_action_fresh.
+        page = MagicMock()
+        src = "blob:https://portal.example/live-uuid"
+        with (
+            patch(
+                "skyvern.webeye.actions.handler._blob_iframe_src_titles",
+                new=AsyncMock(return_value={src: "Statement.pdf"}),
+            ),
+            patch(
+                "skyvern.webeye.actions.handler.probe_blob_action_freshness",
+                new=AsyncMock(return_value=BlobActionFreshness(state_observed=False, retained=False)),
+            ),
+            patch("skyvern.webeye.actions.handler.SkyvernFrame.read_blob_url_bytes", new=AsyncMock()) as read,
+            patch("skyvern.webeye.actions.handler.LOG") as log,
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("blob:https://portal.example/dl-uuid", "Statement.pdf"), "wr"
+            )
+        assert result is None
+        read.assert_not_awaited()
+        assert any(c.kwargs.get("reason") == "retention_state_unobservable" for c in log.info.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_action_fresh_named_iframe_is_recovered(self) -> None:
+        # The candidate blob is a live key in the retention Map: proceed to the PDF read and save.
+        page = MagicMock()
+        src = "blob:https://portal.example/live-uuid"
+        with (
+            patch(
+                "skyvern.webeye.actions.handler._blob_iframe_src_titles",
+                new=AsyncMock(return_value={src: "Statement.pdf"}),
+            ),
+            _patch_fresh_probe(),
+            patch(
+                "skyvern.webeye.actions.handler.SkyvernFrame.read_blob_url_bytes",
+                new=AsyncMock(return_value=b"%PDF-1.4 fresh"),
+            ),
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("blob:https://portal.example/dl-uuid", "Statement.pdf"), "wr"
+            )
+        assert result == b"%PDF-1.4 fresh"
+
+    @pytest.mark.asyncio
+    async def test_freshness_gate_skip_logs_no_sensitive_values(self) -> None:
+        # The gate's skip log must carry only a reason + workflow id: never the blob URL, title,
+        # suggested filename, or origin/domain.
+        page = MagicMock()
+        src = "blob:https://portal.example/secret-uuid"
+        suggested = "AnnualStatement.pdf"
+        with (
+            patch(
+                "skyvern.webeye.actions.handler._blob_iframe_src_titles",
+                new=AsyncMock(return_value={src: suggested}),
+            ),
+            patch(
+                "skyvern.webeye.actions.handler.probe_blob_action_freshness",
+                new=AsyncMock(return_value=BlobActionFreshness(state_observed=True, retained=False)),
+            ),
+            patch("skyvern.webeye.actions.handler.LOG") as log,
+        ):
+            result = await _recover_adopted_session_blob_pdf_iframe(
+                page, _blob_download("blob:https://portal.example/dl-uuid", suggested), "wr"
+            )
+        assert result is None
+        for log_call in log.mock_calls:
+            rendered = repr(log_call)
+            assert src not in rendered
+            assert suggested not in rendered
+            assert "portal.example" not in rendered
+
+
+async def _run_download_action_for_wiring(*, browser_session_id: str | None) -> tuple:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/download",
+    )
+    task = task.model_copy(update={"download_timeout": 0.01, "browser_session_id": browser_session_id})
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        storage = MagicMock()
+        storage.list_downloading_files_in_browser_session = AsyncMock(return_value=[])
+        storage.list_downloaded_files_in_browser_session = AsyncMock(return_value=[])
+        mock_app.STORAGE = storage
+
+        install = AsyncMock()
+        teardown = AsyncMock()
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=AsyncMock(return_value=[ActionSuccess()])),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch("skyvern.webeye.utils.page.install_blob_url_retention", install),
+            patch("skyvern.webeye.actions.handler.teardown_blob_url_retention", teardown),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+    return install, teardown, page
+
+
+@pytest.mark.asyncio
+async def test_adopted_session_download_no_longer_installs_retention_but_still_tears_down() -> None:
+    # Activation moved to the targeted cloud click setup; the generic handler keeps only the teardown.
+    install, teardown, page = await _run_download_action_for_wiring(browser_session_id="pbs-1")
+
+    install.assert_not_awaited()
+    teardown.assert_awaited_once()
+    assert teardown.await_args.args[0] is page
+
+
+@pytest.mark.asyncio
+async def test_managed_session_download_does_not_touch_blob_retention() -> None:
+    install, teardown, _ = await _run_download_action_for_wiring(browser_session_id=None)
+
+    install.assert_not_awaited()
+    teardown.assert_not_awaited()
+
+
+def test_handler_module_no_longer_imports_blob_retention_install() -> None:
+    import skyvern.webeye.actions.handler as handler_module
+
+    assert not hasattr(handler_module, "install_blob_url_retention")

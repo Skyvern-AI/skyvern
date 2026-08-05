@@ -22,6 +22,7 @@ from skyvern.forge.sdk.artifact.signing import (
     parse_keyring,
     sign_artifact_url,
 )
+from skyvern.forge.sdk.artifact.utils import replace_file_extension
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.db.models import ArtifactModel
@@ -29,6 +30,7 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.utils.secret_redaction import redact_har_bytes, redact_secrets_from_bytes
 
 if TYPE_CHECKING:
     from skyvern.schemas.action_log import ActionLogEvent
@@ -42,11 +44,73 @@ def _ensure_aware_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
+def _log_artifact_store_task_failure(task: asyncio.Future[None], artifact: Artifact) -> None:
+    if task.cancelled():
+        LOG.warning(
+            "Artifact store task cancelled",
+            artifact_id=artifact.artifact_id,
+            artifact_type=artifact.artifact_type,
+            uri=artifact.uri,
+        )
+        return
+
+    exception = task.exception()
+    if not exception:
+        return
+
+    LOG.warning(
+        "Artifact store task failed",
+        artifact_id=artifact.artifact_id,
+        artifact_type=artifact.artifact_type,
+        uri=artifact.uri,
+        exc_info=(type(exception), exception, exception.__traceback__),
+    )
+
+
 _SCREENSHOT_PREFIX_MAP: dict[ArtifactType, str] = {
     ArtifactType.SCREENSHOT_LLM: "screenshot_llm",
     ArtifactType.SCREENSHOT_ACTION: "screenshot_action",
     ArtifactType.SCREENSHOT_FINAL: "screenshot_final",
 }
+
+_REDACTABLE_TEXT_ARTIFACT_TYPES: frozenset[ArtifactType] = frozenset(
+    {
+        ArtifactType.HTML,
+        ArtifactType.HTML_SCRAPE,
+        ArtifactType.HTML_ACTION,
+        ArtifactType.VISIBLE_ELEMENTS_TREE,
+        ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
+        ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
+        ArtifactType.LLM_PROMPT,
+        ArtifactType.LLM_REQUEST,
+        ArtifactType.LLM_RESPONSE,
+        ArtifactType.LLM_RESPONSE_PARSED,
+        ArtifactType.LLM_RESPONSE_RENDERED,
+        ArtifactType.BROWSER_CONSOLE_LOG,
+        ArtifactType.SKYVERN_LOG,
+        ArtifactType.SKYVERN_LOG_RAW,
+        ArtifactType.HASHED_HREF_MAP,
+    }
+)
+
+
+def _maybe_redact_artifact_data(artifact_type: ArtifactType, data: bytes, workflow_run_id: str | None = None) -> bytes:
+    if artifact_type not in _REDACTABLE_TEXT_ARTIFACT_TYPES and artifact_type != ArtifactType.HAR:
+        return data
+    if not settings.ENABLE_SECRET_ARTIFACT_REDACTION:
+        return data
+
+    try:
+        context = skyvern_context.current()
+        resolved_workflow_run_id = workflow_run_id or (context.workflow_run_id if context else None)
+        secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(resolved_workflow_run_id)
+    except Exception:
+        return data
+    if artifact_type == ArtifactType.HAR:
+        return redact_har_bytes(data, secret_values)
+    if not secret_values:
+        return data
+    return redact_secrets_from_bytes(data, secret_values)
 
 
 def _safe_file_size_from_path(path: str | None) -> int | None:
@@ -141,7 +205,12 @@ class ArtifactManager:
         # step_id -> accumulator for step archive artifacts
         self._step_archives: dict[str, StepArchiveAccumulator] = {}
 
-    def _track_upload_aiotask(self, primary_key: str, aio_task: asyncio.Task[None]) -> None:
+    def _track_upload_aiotask(
+        self,
+        primary_key: str,
+        aio_task: asyncio.Task[None],
+        artifact: Artifact | None = None,
+    ) -> None:
         """Track a fire-and-forget upload so wait_for_upload_aiotasks can barrier on it.
 
         Tasks self-discard on completion: writers key this map by ids no lifecycle ever
@@ -152,7 +221,9 @@ class ArtifactManager:
         self.upload_aiotasks_map[primary_key].append(aio_task)
 
         def _discard(task: asyncio.Task[None]) -> None:
-            if not task.cancelled() and (exc := task.exception()) is not None:
+            if artifact is not None:
+                _log_artifact_store_task_failure(task, artifact)
+            elif not task.cancelled() and (exc := task.exception()) is not None:
                 LOG.warning(
                     "Artifact upload task failed",
                     primary_key=primary_key,
@@ -261,6 +332,10 @@ class ArtifactManager:
         if not workflow_run_block_id and context:
             workflow_run_block_id = context.parent_workflow_run_block_id
 
+        if data is not None:
+            data = _maybe_redact_artifact_data(artifact_type, data, workflow_run_id=workflow_run_id)
+            file_size = len(data)
+
         if file_size is None:
             file_size = _safe_file_size_from_path(path)
 
@@ -296,11 +371,18 @@ class ArtifactManager:
         artifact_type: ArtifactType,
         data: bytes | None = None,
         path: str | None = None,
+        file_extension: str | None = None,
     ) -> str:
         artifact_id = generate_artifact_id()
         uri = app.STORAGE.build_uri(
             organization_id=step.organization_id, artifact_id=artifact_id, step=step, artifact_type=artifact_type
         )
+        if artifact_type == ArtifactType.RECORDING:
+            recording_extension = file_extension
+            if not recording_extension and path:
+                recording_extension = os.path.splitext(path)[1].lstrip(".").lower()
+            if recording_extension:
+                uri = replace_file_extension(uri, recording_extension)
         file_size = len(data) if data is not None else _safe_file_size_from_path(path)
         return await self._create_artifact(
             aio_task_primary_key=step.task_id,
@@ -857,6 +939,16 @@ class ArtifactManager:
         if not request.artifacts:
             return []
 
+        for artifact_data in request.artifacts:
+            if artifact_data.data is not None:
+                artifact_type = ArtifactType(artifact_data.artifact_model.artifact_type)
+                artifact_data.data = _maybe_redact_artifact_data(
+                    artifact_type,
+                    artifact_data.data,
+                    workflow_run_id=artifact_data.artifact_model.workflow_run_id,
+                )
+                artifact_data.artifact_model.file_size = len(artifact_data.data)
+
         # Extract models for bulk insert
         artifact_models = [artifact_data.artifact_model for artifact_data in request.artifacts]
 
@@ -1160,12 +1252,36 @@ class ArtifactManager:
         organization_id: str | None,
         data: bytes,
         primary_key: str = "task_id",
+        file_extension: str | None = None,
     ) -> str | None:
         if not artifact_id or not organization_id:
             return None
         artifact = await app.DATABASE.artifacts.get_artifact_by_id(artifact_id, organization_id)
         if not artifact:
             return None
+        data = _maybe_redact_artifact_data(
+            ArtifactType(artifact.artifact_type),
+            data,
+            workflow_run_id=artifact.workflow_run_id,
+        )
+        if file_extension and artifact.artifact_type == ArtifactType.RECORDING:
+            next_uri = replace_file_extension(artifact.uri, file_extension)
+            file_size = len(data)
+            if next_uri != artifact.uri or artifact.file_size != file_size:
+                updated_artifact = await app.DATABASE.artifacts.update_artifact_uri(
+                    artifact_id=artifact.artifact_id,
+                    organization_id=organization_id,
+                    uri=next_uri,
+                    file_size=file_size,
+                )
+                if not updated_artifact:
+                    # Avoid writing prepared bytes under stale metadata, which can create
+                    # content/extension mismatches for recording artifacts.
+                    raise RuntimeError(
+                        f"Failed to update recording artifact metadata before upload: {artifact.artifact_id}"
+                    )
+                artifact = updated_artifact
+
         # Fire and forget
         aio_task = asyncio.create_task(app.STORAGE.store_artifact(artifact, data))
 
@@ -1174,7 +1290,7 @@ class ArtifactManager:
         aio_task_key = artifact[primary_key] or artifact["workflow_run_block_id"] or artifact["run_id"]
         if not aio_task_key:
             raise ValueError("artifact must have a task_id, workflow_run_block_id, or run_id to track its upload.")
-        self._track_upload_aiotask(aio_task_key, aio_task)
+        self._track_upload_aiotask(aio_task_key, aio_task, artifact=artifact)
         return aio_task_key
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
@@ -1431,7 +1547,7 @@ class ArtifactManager:
         Returns the artifact_id (pre-generated or provided) so callers can link it
         in DB foreign keys (e.g. action.screenshot_artifact_id) before flush.
         """
-        acc.entries[filename] = data
+        acc.entries[filename] = _maybe_redact_artifact_data(artifact_type, data, workflow_run_id=acc.workflow_run_id)
         # Deduplicate by filename — update in place if it already exists
         for i, (_, fn, existing_id) in enumerate(acc.member_types):
             if fn == filename:
@@ -1770,7 +1886,10 @@ class ArtifactManager:
             modified_at=now,
         )
 
-        zip_entries = {filename: data for filename, (_, data) in entries.items()}
+        zip_entries = {
+            filename: _maybe_redact_artifact_data(artifact_type, data, workflow_run_id=archive_artifact.workflow_run_id)
+            for filename, (artifact_type, data) in entries.items()
+        }
         zip_bytes = self._build_zip(zip_entries)
         await app.STORAGE.store_artifact(archive_artifact, zip_bytes)
 

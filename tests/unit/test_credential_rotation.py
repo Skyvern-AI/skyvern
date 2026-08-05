@@ -747,7 +747,12 @@ async def _attempt_setup_rotation_profile_run(
     updated_run_values = dict(workflow_run.__dict__)
     updated_run_values["browser_profile_id"] = profile_id
     updated_run = SimpleNamespace(**updated_run_values)
-    organization = SimpleNamespace(organization_id="org_test", organization_name="Test Org")
+    organization = SimpleNamespace(
+        organization_id="org_test",
+        organization_name="Test Org",
+        default_llm_key=None,
+        default_secondary_llm_key=None,
+    )
 
     service.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)  # type: ignore[method-assign]
     service.create_workflow_run = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
@@ -810,7 +815,12 @@ async def _setup_bound_credentials(
     workflow.workflow_definition.parameters = credential_parameters
     workflow_run = _setup_workflow_run()
     workflow_run.sequential_credential_id = None
-    organization = SimpleNamespace(organization_id="org_test", organization_name="Test Org")
+    organization = SimpleNamespace(
+        organization_id="org_test",
+        organization_name="Test Org",
+        default_llm_key=None,
+        default_secondary_llm_key=None,
+    )
     repo = selection_repo or _SelectionRepo()
 
     service.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)  # type: ignore[method-assign]

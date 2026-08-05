@@ -4,14 +4,7 @@ import { FolderIcon } from "@/components/icons/FolderIcon";
 import { TrashSolidIcon } from "@/components/icons/TrashSolidIcon";
 import { SelectionBar, SelectionBarDivider } from "@/components/SelectionBar";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { bulkResultToast } from "@/util/bulkResultToast";
 import {
@@ -171,46 +164,29 @@ function CredentialsBulkBar({
           Delete
         </Button>
       </SelectionBar>
-      <Dialog
+      <ConfirmDialog
         open={deleteDialog.open}
         onOpenChange={(open) => {
-          if (!open && !isOperating) {
+          if (!open) {
             setDeleteDialog({ open: false, targets: [] });
           }
         }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>
-              Delete {deleteDialog.targets.length} Credential
-              {deleteDialog.targets.length === 1 ? "" : "s"}
-            </DialogTitle>
-            <DialogDescription>
-              Are you sure you want to delete {deleteDialog.targets.length}{" "}
-              {deleteDialog.targets.length === 1 ? "credential" : "credentials"}
-              ? This action cannot be undone.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="secondary"
-              disabled={isOperating}
-              onClick={() => setDeleteDialog({ open: false, targets: [] })}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              disabled={isOperating}
-              onClick={() => {
-                void handleBulkDeleteConfirm();
-              }}
-            >
-              {isOperating ? "Deleting..." : "Delete"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        title={`Delete ${deleteDialog.targets.length} credential${
+          deleteDialog.targets.length === 1 ? "" : "s"
+        }?`}
+        description={
+          <p>
+            {deleteDialog.targets.length}{" "}
+            {deleteDialog.targets.length === 1 ? "credential" : "credentials"}{" "}
+            will be permanently deleted.
+          </p>
+        }
+        itemCount={deleteDialog.targets.length}
+        isPending={isOperating}
+        onConfirm={() => {
+          void handleBulkDeleteConfirm();
+        }}
+      />
     </>
   );
 }

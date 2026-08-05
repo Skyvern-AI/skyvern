@@ -324,7 +324,12 @@ def _make_setup_service(workflow: SimpleNamespace) -> tuple[WorkflowService, Sim
     # These tests assert the request-level browser_profile_id copy, not seed resolution.
     service._resolve_and_stamp_run_seed = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
 
-    organization = SimpleNamespace(organization_id="org_test", organization_name="Test Org")
+    organization = SimpleNamespace(
+        organization_id="org_test",
+        organization_name="Test Org",
+        default_llm_key=None,
+        default_secondary_llm_key=None,
+    )
     return service, organization, workflow_run
 
 

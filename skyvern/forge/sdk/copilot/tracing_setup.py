@@ -19,7 +19,7 @@ from skyvern.config import settings
 
 # Reuse the HTTP-logging redactor so trace-side and SSE-side redaction share
 # one exact-match sensitive-key policy.
-from skyvern.forge.request_logging import redact_sensitive_fields
+from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.sdk.core import skyvern_context
 
 if TYPE_CHECKING:

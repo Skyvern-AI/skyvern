@@ -47,6 +47,8 @@ def update_or_add_env_var(
             "ENV": "local",
             "ENABLE_OPENAI": "false",
             "OPENAI_API_KEY": "",
+            "ENABLE_XAI": "false",
+            "XAI_API_KEY": "",
             "ENABLE_ANTHROPIC": "false",
             "ANTHROPIC_API_KEY": "",
             "ENABLE_AZURE": "false",
@@ -116,6 +118,21 @@ def setup_llm_providers(env_path: Path | str | None = None) -> None:
             )
     else:
         set_env_var("ENABLE_OPENAI", "false")
+
+    console.print("\n[bold blue]--- xAI Configuration ---[/bold blue]")
+    console.print("To enable xAI Grok, you must have an xAI API key.")
+    enable_xai = Confirm.ask("Do you want to enable xAI Grok?")
+    if enable_xai:
+        xai_api_key = ask_secret("Enter your xAI API key")
+        if not xai_api_key:
+            console.print("[red]Error: xAI API key is required. xAI will not be enabled.[/red]")
+        else:
+            set_env_var("XAI_API_KEY", xai_api_key)
+            set_env_var("ENABLE_XAI", "true")
+            enabled_providers.append("xai")
+            model_options.append("XAI_GROK_4_5")
+    else:
+        set_env_var("ENABLE_XAI", "false")
 
     console.print("\n[bold blue]--- Anthropic Configuration ---[/bold blue]")
     console.print("To enable Anthropic, you must have an Anthropic API key.")

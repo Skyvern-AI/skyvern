@@ -42,6 +42,16 @@ function TaskRecording() {
     return <div>Error loading recording</div>;
   }
 
+  if (recordingData?.archived) {
+    return (
+      <div className="text-muted-foreground">
+        This recording has been archived. To request restoration, please contact
+        support@skyvern.com
+        {/* TODO: add a "Request Restore" button */}
+      </div>
+    );
+  }
+
   if (recordingData?.url) {
     return (
       <ArtifactVideo
@@ -50,16 +60,6 @@ function TaskRecording() {
         src={recordingData.url}
         controls
       />
-    );
-  }
-
-  if (recordingData?.archived) {
-    return (
-      <div className="text-muted-foreground">
-        This recording has been archived. To request restoration, please contact
-        support@skyvern.com
-        {/* TODO: add a "Request Restore" button */}
-      </div>
     );
   }
 

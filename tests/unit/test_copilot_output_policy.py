@@ -1521,7 +1521,7 @@ def test_actuation_obligation_unrelated_prior_steer_stays_recoverable() -> None:
     assert evaluation.reason_code == ACTUATION_OBLIGATION_STEER_REASON_CODE
 
 
-@pytest.mark.parametrize("mode", [TurnIntentMode.DOCS_ANSWER, TurnIntentMode.DIAGNOSE])
+@pytest.mark.parametrize("mode", [TurnIntentMode.ANSWER, TurnIntentMode.DIAGNOSE])
 def test_actuation_obligation_allows_non_actuation_intents(mode: TurnIntentMode) -> None:
     evaluation = evaluate_actuation_obligation(
         turn_intent=TurnIntent(mode=mode, authority=TurnIntentAuthority(may_update_workflow=False)),
@@ -1785,7 +1785,7 @@ def test_sdk_output_guardrail_allows_unknown_click_with_authority_denied_blocker
 @pytest.mark.parametrize(
     ("reason", "expected_terms"),
     [
-        (OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE, ("credential", "confirm")),
+        (OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE, ("credential", "credential id")),
         (OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED, ("credential", "url", "re-select")),
     ],
 )
@@ -1901,7 +1901,7 @@ workflow_definition:
 
     assert result.response_type == "ASK_QUESTION"
     assert "credential" in result.user_response.lower()
-    assert "confirm" in result.user_response.lower()
+    assert "credential id" in result.user_response.lower()
     assert "I could not safely return" not in result.user_response
 
 

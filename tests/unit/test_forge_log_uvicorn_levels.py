@@ -30,6 +30,7 @@ from skyvern.forge.sdk.forge_log import setup_logger
 _OTLP_EXPORTER_LOGGER = "opentelemetry.exporter.otlp.proto.grpc.exporter"
 
 _TOUCHED_LOGGERS = (
+    "codeblock",
     "uvicorn.error",
     "uvicorn.access",
     "uvicorn.asgi",
@@ -59,6 +60,14 @@ def test_setup_logger_silences_uvicorn_and_websockets(_restore_logger_levels: No
     assert logging.getLogger("websockets.client").level == logging.WARNING
     assert logging.getLogger("websockets.legacy").level == logging.WARNING
     assert logging.getLogger("websockets.legacy.server").level == logging.WARNING
+
+
+def test_setup_logger_elevates_codeblock_namespace(_restore_logger_levels: None) -> None:
+    # Root sits at WARNING, so any first-party namespace missing from the elevated list has
+    # its INFO logs silently dropped — that is how runner success telemetry vanished (SKY-13335).
+    setup_logger()
+    assert logging.getLogger("codeblock").level == logging.getLogger("cloud").level
+    assert logging.getLogger("codeblock.workflow").isEnabledFor(logging.INFO)
 
 
 def test_setup_logger_defaults_otlp_exporter_logger_to_warning(_restore_logger_levels: None) -> None:

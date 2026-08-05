@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import errno
+import socket
+import ssl
 from typing import Any, cast
 
 import pytest
@@ -136,3 +139,50 @@ class TestSelectionAwareDetection:
         selection = _rich_fake_selection()
         for exc in (ConnectionRefusedError("ECONNREFUSED"), ConnectionResetError("ECONNRESET"), TimeoutError("late")):
             assert is_cdp_connection_error(exc, selection), f"Expected transport floor for {exc!r}"
+
+
+class TestTransportFloorExcludesBlanketOSError:
+    """The floor is the three narrow ``OSError`` subclasses, never ``OSError`` itself.
+
+    ``is_cdp_connection_error`` gates the runner retry loop *and* cloud quarantine, so a ``True``
+    both spends the retry budget and pulls the address out of the schedulable pool. Widening to
+    ``OSError`` would capture ~24 other classes, including permanent local-launch failures — a
+    missing or unexecutable browser binary, EACCES, EMFILE — where retrying cannot succeed and
+    quarantining is wrong. ECONNREFUSED / ECONNRESET / ETIMEDOUT, the socket conditions the retry
+    loop exists for, are already covered by their own subclasses below.
+    """
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            OSError(errno.EHOSTUNREACH, "No route to host"),
+            socket.gaierror(socket.EAI_NONAME, "Name or service not known"),
+            ssl.SSLCertVerificationError("certificate verify failed"),
+            BrokenPipeError(errno.EPIPE, "Broken pipe"),
+            ConnectionAbortedError(errno.ECONNABORTED, "Software caused connection abort"),
+            FileNotFoundError(errno.ENOENT, "No such file or directory"),
+            PermissionError(errno.EACCES, "Permission denied"),
+            OSError(errno.EMFILE, "Too many open files"),
+            OSError(errno.ENOSPC, "No space left on device"),
+            IsADirectoryError(errno.EISDIR, "Is a directory"),
+        ],
+        ids=lambda e: type(e).__name__ + ":" + str(getattr(e, "errno", "")),
+    )
+    def test_non_transport_oserrors_are_not_retryable(self, exc: Exception) -> None:
+        assert not is_cdp_connection_error(exc)
+        assert not is_cdp_connection_error(exc, _stock_selection())
+        assert not is_cdp_connection_error(exc, _rich_fake_selection())
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused"),
+            ConnectionResetError(errno.ECONNRESET, "Connection reset by peer"),
+            TimeoutError(errno.ETIMEDOUT, "Connection timed out"),
+        ],
+        ids=lambda e: type(e).__name__,
+    )
+    def test_socket_transport_subclasses_stay_retryable(self, exc: Exception) -> None:
+        assert is_cdp_connection_error(exc)
+        assert is_cdp_connection_error(exc, _stock_selection())
+        assert is_cdp_connection_error(exc, _rich_fake_selection())

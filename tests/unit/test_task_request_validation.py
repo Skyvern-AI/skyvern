@@ -3,12 +3,54 @@
 from __future__ import annotations
 
 import socket
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.exceptions import BlockedHost
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2
+from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.settings_manager import SettingsManager
+
+
+def _task_with_model(model: dict[str, str] | None = None) -> Task:
+    now = datetime.now(timezone.utc)
+    return Task(
+        task_id="tsk_llm_default",
+        organization_id="o_test",
+        status=TaskStatus.running,
+        created_at=now,
+        modified_at=now,
+        url="https://example.com",
+        model=model,
+    )
+
+
+def test_task_llm_key_ignores_ambient_org_default() -> None:
+    with skyvern_context.scoped(SkyvernContext(org_default_llm_key="CUSTOM_LLM_oat_smart")):
+        assert _task_with_model().llm_key is None
+
+
+def test_task_explicit_model_wins_over_org_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = MagicMock()
+    settings.get_model_name_to_llm_key.return_value = {"selected-model": {"llm_key": "EXPLICIT_LLM_KEY"}}
+    monkeypatch.setattr(SettingsManager, "get_settings", MagicMock(return_value=settings))
+    with skyvern_context.scoped(SkyvernContext(org_default_llm_key="CUSTOM_LLM_oat_smart")):
+        assert _task_with_model({"model_name": "selected-model"}).llm_key == "EXPLICIT_LLM_KEY"
+
+
+def test_task_llm_key_is_safe_without_context() -> None:
+    skyvern_context.reset()
+    assert _task_with_model().llm_key is None
+
+
+def test_task_v2_llm_key_ignores_ambient_org_default() -> None:
+    with skyvern_context.scoped(SkyvernContext(org_default_llm_key="CUSTOM_LLM_oat_smart")):
+        assert TaskV2.model_construct(organization_id="o_test", model=None).llm_key is None
 
 
 def test_task_models_do_not_resolve_dns_during_validation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -21,7 +63,138 @@ def test_task_models_do_not_resolve_dns_during_validation(monkeypatch: pytest.Mo
     )
 
     TaskRunRequest(prompt="stored task", url="https://task.example.test")
+    TaskRunRequest(prompt="remote browser", browser_address="wss://browser.example.test/devtools/browser/id")
     TaskRequest(url="https://task.example.test")
+
+
+def test_legacy_task_request_validates_browser_address_at_parse_time() -> None:
+    import pydantic
+
+    from skyvern.forge.sdk.schemas.tasks import TaskRequest
+
+    with pytest.raises(pydantic.ValidationError, match="browser_address"):
+        TaskRequest(url="https://task.example.test", browser_address="not-a-url")
+
+    request = TaskRequest(
+        url="https://task.example.test",
+        browser_address="wss://browser.example.test/devtools/browser/id",
+    )
+    assert request.browser_address == "wss://browser.example.test/devtools/browser/id"
+
+
+def test_legacy_workflow_request_validates_browser_address_at_parse_time() -> None:
+    import pydantic
+
+    from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
+
+    with pytest.raises(pydantic.ValidationError, match="browser_address"):
+        WorkflowRequestBody(browser_address="not-a-url")
+
+    request = WorkflowRequestBody(browser_address="wss://browser.example.test/devtools/browser/id")
+    assert request.browser_address == "wss://browser.example.test/devtools/browser/id"
+
+
+def test_run_requests_allow_loopback_browser_address_locally(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.config import settings
+    from skyvern.schemas.runs import TaskRunRequest, WorkflowRunRequest
+
+    monkeypatch.setattr(settings, "ENV", "local")
+
+    task_request = TaskRunRequest(prompt="run", browser_address="ws://127.0.0.1:9222")
+    workflow_request = WorkflowRunRequest(agent_id="wpid_1", browser_address="ws://127.0.0.1:9222")
+
+    assert task_request.browser_address == "ws://127.0.0.1:9222"
+    assert workflow_request.browser_address == "ws://127.0.0.1:9222"
+
+
+def test_run_requests_allow_docker_host_alias_but_reject_private_address_locally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.config import settings
+    from skyvern.schemas.runs import WorkflowRunRequest
+
+    monkeypatch.setattr(settings, "ENV", "local")
+    browser_address = "ws://host.docker.internal:9222"
+
+    assert WorkflowRunRequest(agent_id="wpid_1", browser_address=browser_address).browser_address == browser_address
+    with pytest.raises(BlockedHost):
+        WorkflowRunRequest(agent_id="wpid_1", browser_address="ws://10.0.0.5:9222")
+
+
+@pytest.mark.parametrize("browser_address", ["ws://localhost:9222", "ws://LOCALHOST:9222", "ws://[::1]:9222"])
+def test_run_requests_allow_named_loopback_browser_address_locally(
+    monkeypatch: pytest.MonkeyPatch,
+    browser_address: str,
+) -> None:
+    from skyvern.config import settings
+    from skyvern.schemas.runs import TaskRunRequest, WorkflowRunRequest
+
+    monkeypatch.setattr(settings, "ENV", "local")
+
+    assert TaskRunRequest(prompt="run", browser_address=browser_address).browser_address == browser_address
+    assert WorkflowRunRequest(agent_id="wpid_1", browser_address=browser_address).browser_address == browser_address
+
+
+@pytest.mark.parametrize("browser_address", ["ws://127.0.0.1:9222", "ws://localhost:9222", "ws://[::1]:9222"])
+def test_run_requests_reject_loopback_browser_address_outside_local(
+    monkeypatch: pytest.MonkeyPatch,
+    browser_address: str,
+) -> None:
+    from skyvern.config import settings
+    from skyvern.schemas.runs import TaskRunRequest, WorkflowRunRequest
+
+    monkeypatch.setattr(settings, "ENV", "prod")
+
+    with pytest.raises(BlockedHost):
+        TaskRunRequest(prompt="run", browser_address=browser_address)
+
+    with pytest.raises(BlockedHost):
+        WorkflowRunRequest(agent_id="wpid_1", browser_address=browser_address)
+
+
+@pytest.mark.parametrize("env", ["local", "prod"])
+@pytest.mark.parametrize(
+    "browser_address",
+    [
+        "ws://10.0.0.42:9222",
+        "ws://169.254.1.1:9222",
+        "ws://169.254.169.254:9222",
+    ],
+)
+def test_run_requests_reject_non_loopback_internal_browser_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+    env: str,
+    browser_address: str,
+) -> None:
+    from skyvern.config import settings
+    from skyvern.schemas.runs import TaskRunRequest, WorkflowRunRequest
+
+    monkeypatch.setattr(settings, "ENV", env)
+    getaddrinfo = MagicMock(side_effect=AssertionError("literal browser address validation must not resolve DNS"))
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", getaddrinfo)
+    connect = MagicMock()
+
+    with pytest.raises(BlockedHost):
+        request = TaskRunRequest(prompt="run", browser_address=browser_address)
+        connect(request.browser_address)
+
+    with pytest.raises(BlockedHost):
+        request = WorkflowRunRequest(agent_id="wpid_1", browser_address=browser_address)
+        connect(request.browser_address)
+
+    connect.assert_not_called()
+    getaddrinfo.assert_not_called()
+
+
+def test_run_request_allows_configured_browser_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.config import settings
+    from skyvern.schemas.runs import WorkflowRunRequest
+
+    monkeypatch.setattr(settings, "ALLOWED_HOSTS", ["127.0.0.1"])
+
+    request = WorkflowRunRequest(agent_id="wpid_1", browser_address="ws://127.0.0.1:9222")
+
+    assert request.browser_address == "ws://127.0.0.1:9222"
 
 
 @pytest.mark.parametrize("task_version", ["v1", "v2"])

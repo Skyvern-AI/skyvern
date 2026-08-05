@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import os
 import re
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -16,6 +18,7 @@ import structlog
 from agents import ModelSettings, RunConfig
 from agents.run import Runner
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot import config as copilot_config_defaults
 from skyvern.forge.sdk.copilot import streaming_adapter
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -24,7 +27,11 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     clear_tool_blocker_signals_for_reason_codes,
     stash_blocker_signal,
 )
-from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD, DISCOVERY_PERMITTED_PHASES
+from skyvern.forge.sdk.copilot.build_phase import (
+    DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD,
+    DISCOVERY_PERMITTED_PHASES,
+    BuildPhase,
+)
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     latest_recorded_build_test_outcome_repeated,
 )
@@ -34,11 +41,22 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     LIVE_SCOUT_CREDENTIAL_FIELDS,
     ObligationFinding,
     credential_scout_gap,
+    credential_submit_boundary_index,
     first_matched_post_fill_submit_index,
+)
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    first_stable_login_submit_index as _first_stable_login_submit_index,
+)
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
     freeze_requested_output_extraction_candidate,
     is_durable_fallback_entry_target,
     is_generic_entry_opener_click,
     is_optional_dismissal_only_trajectory,
+)
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    last_scout_credential_fill_index as _last_scout_credential_fill_index,
+)
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
     missing_rung_text,
     render_obligation_findings,
     render_synthesized_offer_text,
@@ -92,8 +110,13 @@ from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     RequestedOutputExtractionPlan,
+    bindable_candidate_headings,
+    derivation_bail_reason,
     derive_requested_output_extraction_plan,
+    plan_from_designations,
     resolve_shape_expectations_by_path,
+    unbound_candidate_relations,
+    value_shown_in_selectable_evidence,
 )
 from skyvern.forge.sdk.copilot.output_policy import (
     completion_criterion_requires_browser_fill_delivery,
@@ -130,6 +153,7 @@ from skyvern.forge.sdk.copilot.run_outcome import (
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
+    diagnosis_repair_obligation_open,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.terminal_predicates import (
@@ -172,6 +196,9 @@ POST_INTERMEDIATE_SUCCESS_NUDGE = copilot_config_defaults.POST_INTERMEDIATE_SUCC
 MAX_POST_UPDATE_NUDGES = 2
 MAX_INTERMEDIATE_NUDGES = 8
 MAX_FAILED_TEST_NUDGES = 2
+# Repair rounds the typed obligation may force past the ordinary nudge budget before a turn is
+# allowed to report an unrepairable failure.
+MAX_REPAIR_OBLIGATION_NUDGES = 6
 MAX_FORMAT_NUDGES = 2
 MAX_NO_WORKFLOW_NUDGES = 2
 MAX_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGES = 2
@@ -193,7 +220,7 @@ REPEATED_FRONTIER_STREAK_STOP_AT = 3
 MAX_PER_TOOL_BUDGET_NUDGES = 2
 _NO_PROGRESS_INTERACTION_REASON_CODES = frozenset({"loop_detected_no_forward_progress_interaction"})
 MIN_BLOCKS_FOR_AUTO_COMPLETE = 10
-TOTAL_TIMEOUT_SECONDS = 900
+TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
 # Floor for the per-iteration ``wait_for`` deadline so an already-spent budget
 # never yields ``wait_for(timeout=0)`` (which raises immediately). Kept as a
 # constant so tests can shrink it instead of paying a full second per deadline.
@@ -215,15 +242,6 @@ _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS = frozenset(
 _SYNTHESIZED_BLOCK_REAUTHORING_TOOLS = frozenset({SYNTHESIZED_BLOCK_PERSISTENCE_TOOL, "update_workflow"})
 _SYNTHESIZED_BLOCK_COMMIT_TOOLS = frozenset({"click", "press_key"})
 _POST_RUN_PAGE_PATH_INTERACTION_BUDGET = 4
-_LOGIN_SUBMIT_NAME_PATTERN = re.compile(
-    r"^(?:log in|login|sign in|authenticate)(?: now| securely| to continue)?$",
-    re.I,
-)
-_LOGIN_SUBMIT_SELECTOR_PATTERN = re.compile(
-    r"^(?:(?:log in|login|sign in|authenticate)(?: submit| button| btn)?|"
-    r"(?:submit|button|btn) (?:log in|login|sign in|authenticate))$",
-    re.I,
-)
 # Evidence sources confirmable only after a run — excluded from the pre-run scout-coverage gate.
 _PRE_RUN_UNGATED_EVIDENCE_SOURCES = frozenset(
     {"independent_run_evidence", "registered_output_parameter", "registered_artifact_content"}
@@ -682,8 +700,20 @@ def _verified_goal_likely_needs_more_work(ctx: CopilotContext) -> bool:
     return _goal_likely_needs_more_blocks(user_message, block_count, completion_contract)
 
 
-def _mark_copilot_total_timeout(ctx: Any) -> None:
+def _mark_copilot_total_timeout(ctx: Any, *, elapsed_seconds: float, iteration: int) -> None:
+    already_marked = ctx.copilot_total_timeout_exceeded is True
     ctx.copilot_total_timeout_exceeded = True
+    if already_marked:
+        return
+    # Only CopilotContext carries build_phase; the self-heal path passes a bare AgentContext,
+    # and an AttributeError here would replace the timeout with a crash.
+    build_phase = getattr(ctx, "build_phase", None)
+    LOG.warning(
+        "copilot_turn_deadline_expired",
+        elapsed_seconds=round(elapsed_seconds, 3),
+        iteration=iteration,
+        build_phase=build_phase.value if isinstance(build_phase, BuildPhase) else None,
+    )
 
 
 def _elapsed_run_seconds(ctx: Any, start_time: float) -> float:
@@ -702,9 +732,10 @@ def _elapsed_run_seconds(ctx: Any, start_time: float) -> float:
     return time.monotonic() - start_time - pause_seconds
 
 
-def _mark_copilot_total_timeout_if_elapsed(ctx: Any, start_time: float) -> None:
-    if _elapsed_run_seconds(ctx, start_time) >= TOTAL_TIMEOUT_SECONDS:
-        _mark_copilot_total_timeout(ctx)
+def _mark_copilot_total_timeout_if_elapsed(ctx: Any, start_time: float, iteration: int) -> None:
+    elapsed = _elapsed_run_seconds(ctx, start_time)
+    if elapsed >= TOTAL_TIMEOUT_SECONDS:
+        _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
 
 
 class CopilotNonRetriableNavError(Exception):
@@ -1155,6 +1186,29 @@ def _needs_explore_without_workflow_nudge(ctx: Any) -> bool:
     return nudge_count < MAX_EXPLORE_WITHOUT_WORKFLOW_NUDGES
 
 
+def _repair_obligation_live(ctx: AgentContext) -> bool:
+    """The typed obligation, bounded. It is discharged by evidence, but must not outlive the
+    evidence that produced it: a failure that looks repairable and is not would otherwise be
+    re-nudged until the turn budget dies, burying the blocker the model is trying to report."""
+    if not diagnosis_repair_obligation_open(ctx):
+        return False
+    return _get_int(ctx, "repair_obligation_nudge_count") < MAX_REPAIR_OBLIGATION_NUDGES
+
+
+def _repair_obligation_blocks_finalize(ctx: AgentContext, result: RunResultStreaming | None) -> bool:
+    """True when the turn is about to end while the typed contract still says the failure is repairable.
+
+    The nudge counters bound *repetition of a nudge*; they were never evidence that the failure had been
+    addressed, so once they ran out a turn could finalize a draft its own build test disproved. Ending is
+    still bounded — by the total-turn timeout and max-turns, both of which exit as WIP rather than as an
+    accept-ready proposal."""
+    if not _repair_obligation_live(ctx):
+        return False
+    parsed = _parse_normalized_final_response(result)
+    # ASK_QUESTION is a legitimate exit: it needs the user, not another repair round.
+    return parsed is not None and parsed.get("type") == "REPLY"
+
+
 def _needs_failed_test_nudge(ctx: Any) -> bool:
     """Return True when the last test failed and the agent hasn't iterated yet."""
     # A permanent nav error cannot be 'fix the workflow and retry' material —
@@ -1345,7 +1399,9 @@ def _check_enforcement(
     ):
         return _nudge(config, "post_update")
 
-    if _post_run_observed_reply_can_finalize(ctx, result):
+    # Observing the reached page is the first repair move, not the last: while the typed contract
+    # still says REPAIR, a reply that reports the failure instead of acting on it re-enters the loop.
+    if not _repair_obligation_live(ctx) and _post_run_observed_reply_can_finalize(ctx, result):
         return None
 
     _maybe_stash_terminal_challenge_halt(ctx)
@@ -1395,6 +1451,12 @@ def _check_enforcement(
         ctx.failed_test_nudge_count += 1
         if _needs_inspect_before_repair_nudge(ctx):
             return _nudge(config, "post_failed_test_inspect_first")
+        return _nudge(config, "post_failed_test")
+
+    # Counters exhausted but the contract still says REPAIR: keep steering rather than finalize a
+    # draft the build test disproved.
+    if _repair_obligation_blocks_finalize(ctx, result):
+        ctx.repair_obligation_nudge_count = _get_int(ctx, "repair_obligation_nudge_count") + 1
         return _nudge(config, "post_failed_test")
 
     # Response-time gate: peek at the model's final output to tell ASK_QUESTION
@@ -1904,12 +1966,7 @@ async def _run_streamed_with_deadline(
         finally:
             _accumulate_usage(result, ctx)
     except asyncio.TimeoutError:
-        _mark_copilot_total_timeout(ctx)
-        LOG.warning(
-            "Copilot total timeout exceeded mid-iteration",
-            elapsed_seconds=round(time.monotonic() - start_time, 3),
-            iteration=iteration,
-        )
+        _mark_copilot_total_timeout(ctx, elapsed_seconds=_elapsed_run_seconds(ctx, start_time), iteration=iteration)
         raise CopilotTotalTimeoutError() from None
     return result
 
@@ -2039,6 +2096,32 @@ def synthesized_persistence_reopened_after_failed_run(ctx: Any) -> bool:
     if len(trajectory) <= previous_offer_len:
         return False
     return _last_scout_interaction_commits(trajectory)
+
+
+def synthesized_offer_reopened_for_extraction_plan(
+    ctx: AgentContext, plan: RequestedOutputExtractionPlan | None
+) -> bool:
+    """Whether a newly provable read is worth reopening a closed offer for.
+
+    The offer is made once per authoring, but the value a turn was asked for often only becomes
+    provable after the draft exists — the page carrying it is reached later. Without this the proven
+    read is derived and never offered, and the draft's own guess is what the first run executes.
+    Reopening stops as soon as the authored block already carries this plan, so it cannot loop.
+
+    A page whose wording never matches the request binds no plan at all, and the relations it does
+    offer are named only by the offer this gate guards; requiring a bound plan to reopen therefore
+    asked the read that makes the plan bind to already exist. Unbound candidates reopen it too, and
+    stop doing so once one has been read into a requested path.
+    """
+    if plan is None:
+        requested = _requested_output_paths_for_ctx(ctx)
+        if not requested or not unbound_candidate_relations(ctx.flow_evidence):
+            return False
+        # The offer names relations no read has claimed, so it stops once one of them has been read
+        # into a requested path. Without this the prompt re-carries the whole offer on every build.
+        return not (requested & set(_witness_values_for_derivation(ctx)))
+    carried = (ctx.requested_output_extraction_candidate, ctx.pending_requested_output_extraction_candidate)
+    return all(candidate is None or candidate.plan_identity != plan.identity for candidate in carried)
 
 
 def synthesized_persistence_reopened(ctx: AgentContext) -> bool:
@@ -2236,29 +2319,208 @@ def _effective_requested_output_path(criterion: CompletionCriterion) -> str | No
     return None
 
 
+def requested_output_paths_for_derivation(ctx: AgentContext) -> set[str]:
+    """The paths derivation will try to bind, including floor-rekeyed and repair-context ones.
+
+    The offer and the binder have to read one set. Gating the offer on the policy's criteria alone
+    withheld it for a path that reached derivation by rekey, so the page's own candidates were never
+    named and the read that would have witnessed the value was never invited (SKY-13226).
+    """
+    return _requested_output_paths_for_ctx(ctx)
+
+
 def _requested_output_labels_by_path(ctx: AgentContext) -> dict[str, tuple[str, ...]]:
     requested_paths = _requested_output_paths_for_ctx(ctx)
     labels_by_path: dict[str, tuple[str, ...]] = {}
     for criterion in _pre_run_gated_completion_criteria(ctx):
-        outcome = criterion.outcome.strip()
+        label = (criterion.requested_output_label or criterion.outcome).strip()
         path = _effective_requested_output_path(criterion)
-        if path in requested_paths and outcome:
+        if path in requested_paths and label:
             labels_by_path.setdefault(path, ())
-            labels_by_path[path] += (outcome,)
+            labels_by_path[path] += (label,)
     return labels_by_path
+
+
+def _witnessed_values_by_path(ctx: AgentContext) -> dict[str, str]:
+    """The scalar each requested output was read as, keyed by the path the read claimed.
+
+    Capture retains every read of a path and defers the choice to synthesis, so this is where that
+    choice lives: differing reads resolve to the one value a selectable observation still shows,
+    because the page corroborates what was read from it and cannot corroborate a probe's echo. A
+    conflict the page corroborates for none, or for more than one, still carries no witness.
+    """
+    reads: dict[str, list[str]] = {}
+    for interaction in ctx.scout_trajectory:
+        if interaction.get("tool_name") != "read_value":
+            continue
+        # A read that inherited its path by elimination says nothing about that path: an early probe
+        # of a login form was promoted that way and its JSON became the witness for a metric the page
+        # had not shown yet. Only a read that named the path witnesses it (SKY-13226).
+        if interaction.get("read_output_path_source") != "declared":
+            continue
+        path = str(interaction.get("read_output_path") or "")
+        value = str(interaction.get("read_result_value") or "")
+        if path and value:
+            reads.setdefault(path, []).append(value)
+    resolved: dict[str, str] = {}
+    for path, values in reads.items():
+        distinct = list(dict.fromkeys(values))
+        if len(distinct) == 1:
+            resolved[path] = distinct[0]
+            continue
+        shown = [
+            value
+            for value in distinct
+            if value_shown_in_selectable_evidence(getattr(ctx, "flow_evidence", None) or [], value)
+        ]
+        if len(shown) == 1:
+            resolved[path] = shown[0]
+    return resolved
+
+
+def dump_derivation_inputs(ctx: AgentContext, *, outcome: str) -> None:
+    """Write the inputs a derivation was given, when a local run asks for them.
+
+    Derivation and the synthesis it feeds are both pure, so a live outcome is reproducible offline
+    from these values alone; without them every attempt at either costs a full turn. Successes are
+    written as well as failures because the code a bound plan generates is only reachable from a
+    packet that bound. The evidence carries whatever text the page held, so writing takes both an
+    explicit path and a local environment rather than the path alone: a deployed run cannot be
+    talked into dumping page contents by its environment.
+    """
+    directory = os.environ.get("COPILOT_DUMP_DERIVATION_INPUTS")
+    if not directory or settings.ENV != "local":
+        return
+    try:
+        os.makedirs(directory, exist_ok=True)
+        payload = {
+            "outcome": outcome,
+            "labels_by_path": {path: list(labels) for path, labels in _requested_output_labels_by_path(ctx).items()},
+            "witnessed_by_path": _witnessed_values_by_path(ctx),
+            # Scope is authoritative, so a replay that rebuilds it from the labels is not the same
+            # derivation the run performed.
+            "requested_paths": sorted(_requested_output_paths_for_ctx(ctx)),
+            "designations": list(ctx.requested_output_designations),
+            "flow_evidence": ctx.flow_evidence,
+            "scout_trajectory": list(ctx.scout_trajectory),
+        }
+        target = os.path.join(directory, f"derivation-{outcome}-{len(ctx.flow_evidence)}-{uuid.uuid4().hex[:8]}.json")
+        with open(target, "w") as handle:
+            json.dump(payload, handle, default=str)
+    except Exception:
+        LOG.info("copilot_derivation_input_dump_failed", exc_info=True)
+
+
+def _current_page_designations(ctx: AgentContext) -> list[dict[str, Any]]:
+    """Designations pin coordinates on one page; once the browser moves they describe a page the
+    block will not be looking at, so they are dropped rather than compiled into a stale read."""
+    designations = ctx.requested_output_designations
+    if not designations:
+        return []
+    page_evidence = ctx.composition_page_evidence or {}
+    current_url = str(page_evidence.get("current_url") or "")
+    # An unknown current URL is the ordinary state right after designating — the probe stamps the
+    # page, but only a composition inspection records one — so it cannot stand in for staleness.
+    if not current_url:
+        return list(designations)
+    return [
+        designation
+        for designation in designations
+        if not str(designation.get("url") or "") or str(designation.get("url")) == current_url
+    ]
+
+
+def _designated_values_by_path(ctx: AgentContext) -> dict[str, str]:
+    """The value the model designated and the page confirmed, keyed by the path it fills.
+
+    A designation is a witness the page validated against the live DOM, so it arms the value binder
+    without the model having to author an expression that returns exactly one scalar (SKY-13226).
+    """
+    values: dict[str, str] = {}
+    for designation in _current_page_designations(ctx):
+        path = designation.get("output_path")
+        text = designation.get("text")
+        if isinstance(path, str) and isinstance(text, str) and text:
+            values[path] = text
+    return values
+
+
+def _witness_values_for_derivation(ctx: AgentContext) -> dict[str, str]:
+    """Read-witnessed values, overridden for any path the page confirmed a designation for."""
+    return {**_witnessed_values_by_path(ctx), **_designated_values_by_path(ctx)}
+
+
+def _labels_outranked_by_designation(
+    ctx: AgentContext, labels_by_path: dict[str, tuple[str, ...]]
+) -> dict[str, tuple[str, ...]]:
+    """Drop the lexical channel for a path the model designated on the live page.
+
+    Both channels can bind the same path to different relations, and the designation is the one an
+    element was actually resolved from.
+    """
+    designated = _designated_values_by_path(ctx)
+    return {path: labels for path, labels in labels_by_path.items() if path not in designated}
+
+
+def requested_output_extraction_plan_diagnostic(ctx: AgentContext) -> dict[str, Any]:
+    """Why a derivation returned nothing: gate mismatch, or no bindable packet.
+
+    Without both sides plus the trajectory's stamps, an unavailable-plan log cannot separate the two
+    and each guess costs a live run.
+    """
+    requested_paths = _requested_output_paths_for_ctx(ctx)
+    labels_by_path = _requested_output_labels_by_path(ctx)
+    return {
+        "requested_paths": sorted(requested_paths),
+        "label_paths": sorted(labels_by_path),
+        # The values, not just the keys: a fallen-back outcome sentence and a minted page noun have
+        # identical paths, and only the value says which one the binder was actually given.
+        "labels_by_path": {path: list(labels) for path, labels in sorted(labels_by_path.items())},
+        "paths_match": set(labels_by_path) == requested_paths,
+        "designations": len(_current_page_designations(ctx)),
+        "bail_reason": derivation_bail_reason(
+            flow_evidence=ctx.flow_evidence,
+            labels_by_path=labels_by_path,
+            witnessed_by_path=_witness_values_for_derivation(ctx),
+            requested_paths=requested_paths,
+        ),
+        "candidate_headings": bindable_candidate_headings(ctx.flow_evidence),
+        "flow_evidence_reached_via": [
+            str(entry.get("reached_via") or "") for entry in ctx.flow_evidence if isinstance(entry, dict)
+        ],
+    }
 
 
 def requested_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtractionPlan | None:
     requested_paths = _requested_output_paths_for_ctx(ctx)
     if not requested_paths:
         return None
-    labels_by_path = _requested_output_labels_by_path(ctx)
-    if set(labels_by_path) != requested_paths:
-        return None
-    return derive_requested_output_extraction_plan(
+    # Labels are one channel for meeting the request, not the definition of it: withholding the plan
+    # unless every requested path carried a label meant a page whose wording the request never uses
+    # was refused before the value witness that exists for it could be tried (SKY-13226).
+    labels_by_path = _labels_outranked_by_designation(ctx, _requested_output_labels_by_path(ctx))
+    plan = derive_requested_output_extraction_plan(
         flow_evidence=ctx.flow_evidence,
         labels_by_path=labels_by_path,
+        witnessed_by_path=_witness_values_for_derivation(ctx),
+        requested_paths=requested_paths,
     )
+    if plan is not None:
+        ctx.last_bound_requested_output_extraction_plan = plan
+        return plan
+    # The structured packet could not carry the designated element — it is truncated, or the value
+    # is not a relation the capture models. The probe already pinned it, so read it where it sits.
+    designated = plan_from_designations(_current_page_designations(ctx), requested_paths)
+    if designated is not None:
+        ctx.last_bound_requested_output_extraction_plan = designated
+        return designated
+    # Derivation reads the freshest packet, and most are truncated or unbindable, so a plan that did
+    # bind every requested path is answered with rather than re-derived away before the imposition
+    # that needs it. A changed request abandons it: it bound paths the turn no longer asks for.
+    retained = ctx.last_bound_requested_output_extraction_plan
+    if retained is not None and set(retained.requested_output_paths) == requested_paths:
+        return retained
+    return None
 
 
 def requested_scalar_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtractionPlan | None:
@@ -2275,13 +2537,15 @@ def requested_scalar_output_extraction_plan(ctx: AgentContext) -> RequestedOutpu
         if path in requested_paths and outcome:
             labels_by_path.setdefault(path, ())
             labels_by_path[path] += (outcome,)
-    # A path with no label is an underivable field; withholding the plan keeps a clarification legitimate.
-    if set(labels_by_path) != requested_paths:
-        return None
-    return derive_requested_output_extraction_plan(
+    plan = derive_requested_output_extraction_plan(
         flow_evidence=ctx.flow_evidence,
-        labels_by_path=labels_by_path,
+        labels_by_path=_labels_outranked_by_designation(ctx, labels_by_path),
+        witnessed_by_path=_witness_values_for_derivation(ctx),
+        requested_paths=requested_paths,
     )
+    if plan is not None:
+        return plan
+    return plan_from_designations(_current_page_designations(ctx), requested_paths)
 
 
 def requested_output_extraction_plan_changed(ctx: AgentContext, current: RequestedOutputExtractionPlan | None) -> bool:
@@ -2289,7 +2553,9 @@ def requested_output_extraction_plan_changed(ctx: AgentContext, current: Request
         return False
     previous = derive_requested_output_extraction_plan(
         flow_evidence=ctx.flow_evidence[:-1],
-        labels_by_path=_requested_output_labels_by_path(ctx),
+        labels_by_path=_labels_outranked_by_designation(ctx, _requested_output_labels_by_path(ctx)),
+        witnessed_by_path=_witness_values_for_derivation(ctx),
+        requested_paths=_requested_output_paths_for_ctx(ctx),
     )
     return previous is not None and previous.identity != current.identity
 
@@ -2401,20 +2667,6 @@ def _credential_password_demand_holds(ctx: Any, interactions: list[dict[str, Any
     ):
         return True
     return bool(getattr(ctx, "last_scout_observation_has_password_control", False))
-
-
-def _first_stable_login_submit_index(interactions: Sequence[Mapping[str, Any]], credential_index: int) -> int | None:
-    for index, interaction in enumerate(interactions[credential_index + 1 :], start=credential_index + 1):
-        tool_name = str(interaction.get("tool_name") or "").strip()
-        if tool_name == "press_key" and str(interaction.get("key") or "").strip() == "Enter":
-            return index
-        if tool_name != "click":
-            continue
-        accessible_name = re.sub(r"[^a-z0-9]+", " ", str(interaction.get("accessible_name") or "").lower()).strip()
-        selector = re.sub(r"[^a-z0-9]+", " ", str(interaction.get("selector") or "").lower()).strip()
-        if _LOGIN_SUBMIT_NAME_PATTERN.fullmatch(accessible_name) or _LOGIN_SUBMIT_SELECTOR_PATTERN.fullmatch(selector):
-            return index
-    return None
 
 
 def _credential_flow_scout_gap_incomplete(ctx: Any, trajectory: list[Any]) -> bool:
@@ -2579,17 +2831,6 @@ def _request_expects_unreached_download(ctx: AgentContext) -> bool:
     return any(criterion.deliverable_kind == "registered_download" for criterion in _active_completion_criteria(ctx))
 
 
-def _last_scout_credential_fill_index(trajectory: list[Any]) -> int | None:
-    # Boundary past the ENTIRE credential flow, including a runtime-only OTP/MFA fill. Keying only on
-    # username/password let an MFA step (fill totp -> verify-click) form a durable entry->commit past
-    # the boundary and falsely release the terminal-action gate on a login-only trajectory.
-    last_index: int | None = None
-    for index, item in enumerate(trajectory):
-        if isinstance(item, dict) and str(item.get("tool_name") or "").strip() == CREDENTIAL_FILL_TOOL_NAME:
-            last_index = index
-    return last_index
-
-
 def _trajectory_reaches_post_credential_commit(ctx: AgentContext) -> bool:
     """Apply the ordinary reach shapes only to the business spine after the credential submit."""
     trajectory = ctx.scout_trajectory
@@ -2604,14 +2845,7 @@ def _trajectory_reaches_post_credential_commit(ctx: AgentContext) -> bool:
             include_download=False,
             allow_intermediate_interactions=True,
         )
-    credential_submit_index = _first_stable_login_submit_index(interactions, credential_index)
-    latest_fill_source_url = str(interactions[credential_index].get("source_url") or "").strip()
-    if credential_submit_index is None and latest_fill_source_url:
-        credential_submit_index = first_matched_post_fill_submit_index(
-            interactions,
-            credential_index,
-            {latest_fill_source_url},
-        )
+    credential_submit_index = credential_submit_boundary_index(interactions, credential_index)
     if credential_submit_index is None:
         return False
     return _trajectory_reaches_generic_goal(
@@ -2967,7 +3201,7 @@ async def run_with_enforcement(
         # chat history on the server side (see SKY-8986).
         elapsed = _elapsed_run_seconds(ctx, start_time)
         if elapsed > TOTAL_TIMEOUT_SECONDS:
-            _mark_copilot_total_timeout(ctx)
+            _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
             raise CopilotTotalTimeoutError()
 
         # When the current turn contains image payloads, the session-backed
@@ -3041,7 +3275,7 @@ async def run_with_enforcement(
                     iteration,
                 )
             except asyncio.CancelledError:
-                _mark_copilot_total_timeout_if_elapsed(ctx, start_time)
+                _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
                 raise
             except Exception as e:
                 if not _is_context_window_error(e):
@@ -3065,7 +3299,7 @@ async def run_with_enforcement(
                 try:
                     current_input, images_stripped = await _recover_from_context_overflow(session, current_input)
                 except asyncio.CancelledError:
-                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time)
+                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
                     raise
                 if images_stripped:
                     # The agent could otherwise reason about the page from
@@ -3084,7 +3318,7 @@ async def run_with_enforcement(
                         iteration,
                     )
                 except asyncio.CancelledError:
-                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time)
+                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
                     raise
                 except Exception as retry_err:
                     # Never retry twice; even a second overflow surfaces as a

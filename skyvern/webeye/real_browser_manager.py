@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import os
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import structlog
 
@@ -18,7 +18,12 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.routes.streaming.registries import set_deferred_close_params, stream_ref_active
+from skyvern.forge.sdk.routes.streaming.registries import (
+    complete_stream_teardown,
+    mark_stream_closing,
+    set_deferred_close_params,
+    stream_ref_active,
+)
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
@@ -29,16 +34,17 @@ from skyvern.webeye.browser_engine import (
     resolve_browser_engine,
 )
 from skyvern.webeye.browser_factory import BrowserContextFactory, rebind_download_dir
-from skyvern.webeye.browser_manager import BrowserManager
+from skyvern.webeye.browser_manager import BrowserCleanupResult, BrowserManager
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_frame_publisher import (
     CDPFramePublisher,
     stream_key_for_task,
     stream_key_for_workflow_run,
 )
+from skyvern.webeye.persistent_sessions_manager import PBS_TASK_RUNNABLE_TYPE
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.session_cookies import persist_session_cookies
-from skyvern.webeye.video_utils import finalize_webm
+from skyvern.webeye.video_utils import prepare_recording_for_upload
 
 LOG = structlog.get_logger()
 
@@ -54,23 +60,92 @@ def _is_cached_cdp_drop_error(exc: FailedToNavigateToUrl) -> bool:
     return any(needle in message for needle in _CACHED_CDP_DROP_ERROR_SUBSTRINGS)
 
 
+# A bounded, read-only probe confirms an inherited browser's transport is really alive before
+# the same-context (#14311) recovery runs new_page() on it. Kept small so the rare page-less
+# inheritance path never stalls; a live cookies() round-trip returns well under this.
+_INHERITED_BROWSER_LIVENESS_PROBE_TIMEOUT_SECONDS = 5.0
+
+# Closed-transport signatures matched by message substring and by type NAME, never by imported
+# class identity: scripts/patch_browser.sh rewrites playwright -> patchright for the agent image
+# but not for cloud/persistent_browsers, so the two packages expose distinct TargetClosedError
+# classes (see skyvern/webeye/cdp_frame_publisher.py for the same name-based matching).
+_CLOSED_TRANSPORT_ERROR_SUBSTRINGS = (
+    "Connection closed while reading from the driver",
+    "Target page, context or browser has been closed",
+    "Target closed",
+    "Browser closed",
+)
+_CLOSED_TRANSPORT_ERROR_TYPE_NAMES = ("TargetClosedError",)
+
+
+def _is_closed_transport_error(exc: BaseException) -> bool:
+    if type(exc).__name__ in _CLOSED_TRANSPORT_ERROR_TYPE_NAMES:
+        return True
+    message = str(exc)
+    return any(needle in message for needle in _CLOSED_TRANSPORT_ERROR_SUBSTRINGS)
+
+
+async def _inherited_browser_transport_alive(browser_state: BrowserState) -> bool:
+    """Truthfully classify an inherited, page-less browser as connected before same-context recovery.
+
+    ``is_connected()`` only inspects cached client-side flags, so a driver/CDP transport that died
+    with no I/O since (a long sequential-gate wait, a reaped remote browser, a NAT/LB idle timeout,
+    a TCP half-close) still reports connected. Confirm with one bounded, read-only round-trip:
+    a genuinely live tab-less context answers and is reused (preserving cookies/session), while a
+    dead transport is classified disconnected here and routed to the existing fresh-browser path,
+    instead of crashing the #14311 ``new_page()`` recovery with
+    "Connection closed while reading from the driver" (SKY-13389).
+    """
+    if not browser_state.is_connected():
+        return False
+    context = browser_state.browser_context
+    if context is None:
+        return False
+    try:
+        async with asyncio.timeout(_INHERITED_BROWSER_LIVENESS_PROBE_TIMEOUT_SECONDS):
+            await context.cookies()
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        # Process-control signals are never a browser-liveness verdict — propagate untouched.
+        raise
+    except (asyncio.TimeoutError, TimeoutError):
+        LOG.info("Inherited browser liveness probe timed out; treating browser as disconnected")
+        return False
+    except Exception as exc:
+        # Only a genuinely closed transport counts as disconnected; anything else is an unexpected
+        # programming error that must not be silently swallowed into a fresh-browser fallback.
+        if _is_closed_transport_error(exc):
+            LOG.info(
+                "Inherited browser liveness probe hit a closed transport; treating browser as disconnected",
+                error=str(exc),
+            )
+            return False
+        raise
+    return True
+
+
 async def _rebind_pbs_download_dir(
     browser_state: BrowserState,
-    workflow_run: WorkflowRun,
+    download_run_id: str,
     browser_session_id: str,
 ) -> None:
     browser_context = browser_state.browser_context
-    adopted_browser = browser_context.browser if browser_context else None
+    if browser_context is None:
+        return
+    adopted_browser = browser_context.browser
     if adopted_browser is None:
         return
     try:
-        rebind_run_id = resolve_run_download_id(skyvern_context.current(), fallback_run_id=workflow_run.workflow_run_id)
-        await rebind_download_dir(adopted_browser, run_id=rebind_run_id)
+        if getattr(browser_context, "_skyvern_download_run_id", None) == download_run_id:
+            return
+        # Not gated on the interceptor: a Skyvern-hosted context has none, and rebind_download_dir
+        # is what repoints its Browser.setDownloadBehavior off the session-scoped connect-time path.
+        await rebind_download_dir(adopted_browser, run_id=download_run_id)
+        browser_context._skyvern_download_run_id = download_run_id  # type: ignore[attr-defined]
     except Exception:
         LOG.warning(
             "Failed to rebind download dir on adopted browser session",
             browser_session_id=browser_session_id,
-            workflow_run_id=workflow_run.workflow_run_id,
+            download_run_id=download_run_id,
             exc_info=True,
         )
 
@@ -143,6 +218,15 @@ class _EngineSelectionOwner:
         self.terminal = False
 
 
+@dataclass(frozen=True)
+class _PersistentSessionLease:
+    session_id: str
+    organization_id: str
+    runnable_id: str
+    browser_state: BrowserState
+    runnable_generation_id: str | None = None
+
+
 class RealBrowserManager(BrowserManager):
     def __init__(self) -> None:
         self.pages: dict[str, BrowserState] = {}
@@ -152,12 +236,62 @@ class RealBrowserManager(BrowserManager):
         # re-resolve to a different engine (e.g. after a flag change). Dropped — with its in-flight
         # resolution cancelled — when the run's browser state is cleaned up.
         self._engine_owners: dict[str, _EngineSelectionOwner] = {}
+        # The runnable identity accepted by begin_session, carried unchanged into teardown. Cleanup
+        # reads this lease instead of reconstructing identity from Task/Workflow fields.
+        self._persistent_session_leases: dict[str, _PersistentSessionLease] = {}
+        # Runnables between begin_session and their lease. Occupancy is published first and occupy
+        # does not extend the session's timeout, so without this a reused-but-expired session is
+        # unprotected for the whole attach.
+        self._acquiring_session_runnables: set[str] = set()
         # CDP frame publishers keyed by stream key (``{wr}.png`` / ``{task}.png``).
         self._frame_publishers: dict[str, CDPFramePublisher] = {}
         # Serializes the check/create/start/store/register sequence in
         # ``_start_frame_publisher`` so concurrent attaches for one stream key
         # cannot orphan a publisher loop.
         self._publisher_lock = asyncio.Lock()
+
+    @staticmethod
+    def _matching_session_lease(
+        lease: _PersistentSessionLease | None,
+        session_id: str,
+        organization_id: str,
+    ) -> _PersistentSessionLease | None:
+        if lease is None or lease.session_id != session_id or lease.organization_id != organization_id:
+            return None
+        return lease
+
+    async def _release_persistent_session(
+        self,
+        session_id: str,
+        organization_id: str,
+        lease: _PersistentSessionLease | None,
+    ) -> bool:
+        owner = self._matching_session_lease(lease, session_id, organization_id)
+        context = skyvern_context.current()
+        expected_runnable_id: str | None = context.browser_session_runnable_id if context else None
+        expected_runnable_generation_id: str | None = None
+        expected_browser_state: BrowserState | None = owner.browser_state if owner else None
+
+        if owner is not None:
+            expected_runnable_id = owner.runnable_id
+            expected_runnable_generation_id = owner.runnable_generation_id
+        elif context and context.browser_session_runnable_generation_id is not None:
+            expected_runnable_generation_id = context.browser_session_runnable_generation_id
+
+        return await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
+            session_id=session_id,
+            organization_id=organization_id,
+            expected_runnable_id=expected_runnable_id,
+            expected_runnable_generation_id=expected_runnable_generation_id,
+            expected_browser_state=expected_browser_state,
+        )
+
+    def _discard_session_lease(self, run_id: str, lease: _PersistentSessionLease | None) -> None:
+        if lease is not None and self._persistent_session_leases.get(run_id) is lease:
+            self._persistent_session_leases.pop(run_id, None)
+
+    def live_session_runnable_ids(self) -> set[str]:
+        return set(self._persistent_session_leases) | self._acquiring_session_runnables
 
     async def _start_frame_publisher(
         self,
@@ -379,6 +513,7 @@ class RealBrowserManager(BrowserManager):
             **engine_selection.attribution(),
         )
         pw = await engine_selection.start_driver()
+        context = skyvern_context.current()
         try:
             (
                 browser_context,
@@ -396,6 +531,7 @@ class RealBrowserManager(BrowserManager):
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
+                browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
                 browser_profile_id=browser_profile_id,
                 engine_selection=engine_selection,
             )
@@ -455,12 +591,47 @@ class RealBrowserManager(BrowserManager):
             return await _on_browser_state_acquired(browser_state, task.workflow_run_id)
 
         if browser_session_id:
+            if not task.organization_id:
+                raise MissingOrganizationForBrowserSession(browser_session_id)
+            if task.workflow_run_id is None:
+                raw_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+                    browser_session_id=browser_session_id,
+                    runnable_type=PBS_TASK_RUNNABLE_TYPE,
+                    runnable_id=task.task_id,
+                    organization_id=task.organization_id,
+                )
+                expected_runnable_generation_id = raw_generation_id if isinstance(raw_generation_id, str) else None
+                expected_runnable_id = task.task_id
+                context = skyvern_context.current()
+                if context is not None:
+                    context.browser_session_runnable_id = expected_runnable_id
+                    context.browser_session_runnable_generation_id = expected_runnable_generation_id
+            else:
+                # The workflow service already acquired this lease. A task inside that workflow
+                # inherits the immutable workflow identity and never creates a competing task lease.
+                context = skyvern_context.current()
+                expected_runnable_id = (
+                    context.browser_session_runnable_id if context else None
+                ) or task.workflow_run_id
+                expected_runnable_generation_id = context.browser_session_runnable_generation_id if context else None
+            download_run_id = (
+                resolve_run_download_id(skyvern_context.current(), fallback_run_id=expected_runnable_id)
+                or expected_runnable_id
+            )
             LOG.info(
                 "Getting browser state for task from persistent sessions manager",
                 browser_session_id=browser_session_id,
             )
+            get_state_kwargs = {
+                "organization_id": task.organization_id,
+                "expected_runnable_id": expected_runnable_id,
+                "download_run_id": download_run_id,
+            }
+            if expected_runnable_generation_id is not None:
+                get_state_kwargs["expected_runnable_generation_id"] = expected_runnable_generation_id
             browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-                browser_session_id, organization_id=task.organization_id
+                browser_session_id,
+                **get_state_kwargs,
             )
             if browser_state is None:
                 LOG.warning(
@@ -472,6 +643,14 @@ class RealBrowserManager(BrowserManager):
                     LOG.info("User to occupy browser session here", browser_session_id=browser_session_id)
                 else:
                     LOG.warning("Organization ID is not set for task", task_id=task.task_id)
+                await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
+                self._persistent_session_leases[expected_runnable_id] = _PersistentSessionLease(
+                    session_id=browser_session_id,
+                    organization_id=task.organization_id,
+                    runnable_id=expected_runnable_id,
+                    runnable_generation_id=expected_runnable_generation_id,
+                    browser_state=browser_state,
+                )
                 page = await browser_state.get_working_page()
                 if page:
                     await browser_state.navigate_to_url(page=page, url=task.url)
@@ -543,6 +722,8 @@ class RealBrowserManager(BrowserManager):
         browser_session_id: str | None = None,
         browser_profile_id: str | None = None,
         navigate: bool = True,
+        browser_session_runnable_id: str | None = None,
+        browser_session_runnable_generation_id: str | None = None,
     ) -> BrowserState:
         parent_workflow_run_id = workflow_run.parent_workflow_run_id
         workflow_run_id = workflow_run.workflow_run_id
@@ -572,9 +753,31 @@ class RealBrowserManager(BrowserManager):
                 # fan-out) can therefore find an earlier, already-completed sibling's torn-down
                 # browser here. This early-return path skips get_or_create_page, so returning a
                 # page-less state would fail the run's first browser block with a missing page.
-                # Only adopt the inherited browser when it still has a working page; otherwise
-                # drop the stale entry and fall through to create a fresh browser for this run.
-                if await browser_state.get_working_page() is not None:
+                working_page = await browser_state.get_working_page()
+                if working_page is None and await _inherited_browser_transport_alive(browser_state):
+                    # The inherited browser is still live but its last valid tab was closed
+                    # (e.g. a use_parent_browser_session child whose prior run closed the last
+                    # page). Recreate a page in the SAME context so the child keeps the parent's
+                    # cookies/session, instead of orphaning the live browser and starting fresh.
+                    # Liveness is actively probed (not just is_connected()'s cached flags) so a
+                    # transport that died while idle falls through to a fresh browser (SKY-13389).
+                    LOG.info(
+                        "Inherited parent browser is live but has no working page; recreating a page in the same context",
+                        workflow_run_id=workflow_run_id,
+                        parent_workflow_run_id=parent_workflow_run_id,
+                    )
+                    await browser_state.get_or_create_page(
+                        proxy_location=workflow_run.proxy_location,
+                        workflow_run_id=workflow_run_id,
+                        workflow_permanent_id=workflow_run.workflow_permanent_id,
+                        organization_id=workflow_run.organization_id,
+                        extra_http_headers=workflow_run.extra_http_headers,
+                        cdp_connect_headers=workflow_run.cdp_connect_headers,
+                        browser_address=workflow_run.browser_address,
+                        browser_profile_id=browser_profile_id,
+                    )
+                    working_page = await browser_state.get_working_page()
+                if working_page is not None:
                     # always keep the browser state for the workflow run and the parent workflow run synced
                     self.pages[workflow_run_id] = browser_state
                     if parent_workflow_run_id:
@@ -588,8 +791,10 @@ class RealBrowserManager(BrowserManager):
                         organization_id=workflow_run.organization_id,
                     )
                     return await _on_browser_state_acquired(browser_state, workflow_run_id)
+                # The inherited state is genuinely torn down (disconnected and page-less).
+                # Drop the stale entry and fall through to create a fresh browser for this run.
                 LOG.warning(
-                    "Inherited parent browser state has no working page; creating a fresh browser",
+                    "Inherited parent browser state is torn down; creating a fresh browser",
                     workflow_run_id=workflow_run_id,
                     parent_workflow_run_id=parent_workflow_run_id,
                 )
@@ -599,12 +804,35 @@ class RealBrowserManager(BrowserManager):
                 browser_state = None
 
         if browser_session_id:
+            context = skyvern_context.current()
+            expected_runnable_id = (
+                browser_session_runnable_id
+                or (context.browser_session_runnable_id if context else None)
+                or workflow_run.workflow_run_id
+            )
+            expected_runnable_generation_id = browser_session_runnable_generation_id or (
+                context.browser_session_runnable_generation_id if context else None
+            )
+            download_run_id = (
+                resolve_run_download_id(skyvern_context.current(), fallback_run_id=workflow_run.workflow_run_id)
+                or workflow_run.workflow_run_id
+            )
             LOG.info(
                 "Getting browser state for workflow run from persistent sessions manager",
                 browser_session_id=browser_session_id,
             )
             browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-                browser_session_id, organization_id=workflow_run.organization_id
+                browser_session_id,
+                **{
+                    "organization_id": workflow_run.organization_id,
+                    "expected_runnable_id": expected_runnable_id,
+                    "download_run_id": download_run_id,
+                    **(
+                        {"expected_runnable_generation_id": expected_runnable_generation_id}
+                        if expected_runnable_generation_id is not None
+                        else {}
+                    ),
+                },
             )
             if browser_state is None:
                 LOG.warning(
@@ -612,7 +840,14 @@ class RealBrowserManager(BrowserManager):
                 )
             else:
                 LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
-                await _rebind_pbs_download_dir(browser_state, workflow_run, browser_session_id)
+                await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
+                self._persistent_session_leases[workflow_run.workflow_run_id] = _PersistentSessionLease(
+                    session_id=browser_session_id,
+                    organization_id=workflow_run.organization_id,
+                    runnable_id=expected_runnable_id,
+                    runnable_generation_id=expected_runnable_generation_id,
+                    browser_state=browser_state,
+                )
                 page = await browser_state.get_working_page()
                 if page:
                     if url and navigate:
@@ -641,11 +876,29 @@ class RealBrowserManager(BrowserManager):
                             )
                             browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
                                 browser_session_id,
-                                organization_id=workflow_run.organization_id,
+                                **{
+                                    "organization_id": workflow_run.organization_id,
+                                    "expected_runnable_id": expected_runnable_id,
+                                    "download_run_id": download_run_id,
+                                    **(
+                                        {
+                                            "expected_runnable_generation_id": expected_runnable_generation_id,
+                                        }
+                                        if expected_runnable_generation_id is not None
+                                        else {}
+                                    ),
+                                },
                             )
                             if browser_state is None:
                                 raise
-                            await _rebind_pbs_download_dir(browser_state, workflow_run, browser_session_id)
+                            self._persistent_session_leases[workflow_run.workflow_run_id] = _PersistentSessionLease(
+                                session_id=browser_session_id,
+                                organization_id=workflow_run.organization_id,
+                                runnable_id=expected_runnable_id,
+                                runnable_generation_id=expected_runnable_generation_id,
+                                browser_state=browser_state,
+                            )
+                            await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
                             page = await browser_state.get_working_page()
                             if page is not None:
                                 await browser_state.navigate_to_url(page=page, url=url)
@@ -774,20 +1027,21 @@ class RealBrowserManager(BrowserManager):
         for i, video_artifact in enumerate(browser_state.browser_artifacts.video_artifacts):
             path = video_artifact.video_path
             if path and os.path.exists(path=path):
-                # Only the local Playwright-launched recording path produces WebM
-                # that needs the remux fix-up. Other producers (e.g. fully formed
-                # MP4 downloaded from a remote source) are already container-valid
-                # and would be corrupted by ``finalize_webm`` — read those raw.
                 is_webm = path.lower().endswith(".webm")
                 if finalize and is_webm:
-                    # Remux via ffmpeg so the WebM container has a valid Duration + Cues,
-                    # even when browser_context.close() was killed mid-finalization.
-                    browser_state.browser_artifacts.video_artifacts[i].video_data = await finalize_webm(path)
+                    async with prepare_recording_for_upload(path) as prepared:
+                        with open(prepared.path, "rb") as f:
+                            browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
+                        browser_state.browser_artifacts.video_artifacts[
+                            i
+                        ].video_file_extension = prepared.file_extension
                 else:
-                    # Per-step snapshot while recording is still open — skip ffmpeg: the file is
-                    # partial, so remux would either fail or be thrown away by the final pass.
+                    # Non-WebM sources are already container-valid; per-step WebM snapshots are still incomplete.
                     with open(path, "rb") as f:
                         browser_state.browser_artifacts.video_artifacts[i].video_data = f.read()
+                    browser_state.browser_artifacts.video_artifacts[i].video_file_extension = (
+                        os.path.splitext(path)[1].lstrip(".").lower() or "webm"
+                    )
             else:
                 LOG.debug(
                     "Video path not found",
@@ -873,6 +1127,7 @@ class RealBrowserManager(BrowserManager):
         If error occurs, log it and address the cleanup error.
         """
         LOG.info("Cleaning up for task")
+        session_lease = self._persistent_session_leases.get(task_id)
         await self._drop_engine_owner(task_id)
         browser_state_to_close = self.pages.pop(task_id, None)
         if browser_state_to_close:
@@ -897,9 +1152,13 @@ class RealBrowserManager(BrowserManager):
 
         if browser_session_id:
             if organization_id:
-                await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
-                    browser_session_id, organization_id=organization_id
+                released = await self._release_persistent_session(
+                    browser_session_id,
+                    organization_id,
+                    session_lease,
                 )
+                if released:
+                    self._discard_session_lease(task_id, session_lease)
                 LOG.info("Released browser session", browser_session_id=browser_session_id)
             else:
                 LOG.warning("Organization ID not specified, cannot release browser session", task_id=task_id)
@@ -914,9 +1173,16 @@ class RealBrowserManager(BrowserManager):
         browser_session_id: str | None = None,
         organization_id: str | None = None,
         child_workflow_run_ids: list[str] | None = None,
-    ) -> BrowserState | None:
+    ) -> BrowserCleanupResult:
         LOG.info("Cleaning up for workflow run", sampling=True)
+        # No await before the tombstone: a concurrent stream attach either increments first and is
+        # observed below, or sees CLOSING and is rejected at the public websocket entry point.
+        mark_stream_closing(workflow_run_id)
         browser_state_to_close = self.pages.get(workflow_run_id)
+        session_lease = self._persistent_session_leases.get(workflow_run_id)
+        recording_finalized = False
+        finalization_attempted = False
+        cleanup_page_ids = {workflow_run_id, *task_ids, *(child_workflow_run_ids or [])}
 
         # Drop the run's pinned engine — the run is ending, so no further browser resource will be
         # created for it. Covers the run, its inherited children, and its tasks.
@@ -944,7 +1210,10 @@ class RealBrowserManager(BrowserManager):
             # If another workflow run still references this browser state (e.g. a
             # parent whose in-memory browser was shared via use_parent_browser_session),
             # skip closing the browser so the parent can continue using it.
-            shared = any(bs is browser_state_to_close for bs in self.pages.values())
+            shared = any(
+                page_id != workflow_run_id and browser_state is browser_state_to_close
+                for page_id, browser_state in self.pages.items()
+            )
             effective_close = close_browser_on_completion and not shared
             if shared:
                 LOG.info(
@@ -972,11 +1241,45 @@ class RealBrowserManager(BrowserManager):
                     browser_state_to_close.browser_context,
                     browser_state_to_close.browser_artifacts.browser_session_dir,
                 )
+                shared_after_cleanup = any(
+                    page_id not in cleanup_page_ids and browser_state is browser_state_to_close
+                    for page_id, browser_state in self.pages.items()
+                )
+                deferred_close = close_browser_on_completion and not shared_after_cleanup
+                release_driver = False if (shared_after_cleanup or browser_session_id) else None
+                owner = (
+                    self._matching_session_lease(session_lease, browser_session_id, organization_id)
+                    if browser_session_id is not None and organization_id is not None
+                    else None
+                )
+                if owner is None:
+                    streams_active = set_deferred_close_params(
+                        workflow_run_id,
+                        deferred_close,
+                        release_driver=release_driver,
+                    )
+                else:
+                    streams_active = set_deferred_close_params(
+                        workflow_run_id,
+                        deferred_close,
+                        release_driver=release_driver,
+                        browser_session_id=owner.session_id,
+                        organization_id=owner.organization_id,
+                        expected_runnable_id=owner.runnable_id,
+                        expected_runnable_generation_id=owner.runnable_generation_id,
+                        expected_browser_state=owner.browser_state,
+                    )
+                if not streams_active:
+                    effective_close = deferred_close
+                    shared = shared_after_cleanup
+                elif owner is not None:
+                    # The tombstone now owns the immutable lease until its finalizer succeeds.
+                    self._discard_session_lease(workflow_run_id, session_lease)
+            if streams_active:
                 LOG.info(
                     "Deferring browser close — active CDP streams",
                     workflow_run_id=workflow_run_id,
                 )
-                set_deferred_close_params(workflow_run_id, close_browser_on_completion)
                 # Keep the publisher running while streams are attached. The
                 # eventual ``close(True)`` fires the on-close callback that
                 # stops it; ``close(False)`` is covered by the publisher's
@@ -985,16 +1288,20 @@ class RealBrowserManager(BrowserManager):
                 # Detach the publisher's CDP session before the Playwright context
                 # closes; otherwise the stale session can race the teardown.
                 await self._stop_frame_publisher(workflow_run_id=workflow_run_id)
-                await browser_state_to_close.close(
+                close_succeeded = await browser_state_to_close.close(
                     close_browser_on_completion=effective_close,
                     release_driver=False if (shared or browser_session_id) else None,
                 )
+                finalization_attempted = effective_close
+                recording_finalized = effective_close and bool(close_succeeded)
 
         if not streams_active:
             self.pages.pop(workflow_run_id, None)
         for task_id in task_ids:
             task_browser_state = self.pages.pop(task_id, None)
             if task_browser_state is None or streams_active:
+                continue
+            if task_browser_state is browser_state_to_close and finalization_attempted:
                 continue
             # Same shared-state check for task-level entries
             shared = any(bs is task_browser_state for bs in self.pages.values())
@@ -1007,10 +1314,14 @@ class RealBrowserManager(BrowserManager):
                     workflow_run_id=workflow_run_id,
                 )
             try:
-                await task_browser_state.close(
+                if task_browser_state is browser_state_to_close:
+                    finalization_attempted = effective_close
+                close_succeeded = await task_browser_state.close(
                     close_browser_on_completion=effective_close,
                     release_driver=False if (shared or browser_session_id) else None,
                 )
+                if task_browser_state is browser_state_to_close and effective_close:
+                    recording_finalized = bool(close_succeeded)
             except Exception:
                 LOG.info(
                     "Failed to close the browser state from the task block, might because it's already closed.",
@@ -1020,18 +1331,29 @@ class RealBrowserManager(BrowserManager):
                 )
         LOG.info("Workflow run is cleaned up", sampling=True)
 
-        if browser_session_id:
+        release_complete = True
+        if browser_session_id and not streams_active:
             if organization_id:
-                await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
-                    browser_session_id, organization_id=organization_id
+                release_complete = await self._release_persistent_session(
+                    browser_session_id,
+                    organization_id,
+                    session_lease,
                 )
+                if release_complete:
+                    self._discard_session_lease(workflow_run_id, session_lease)
                 LOG.info("Released browser session", browser_session_id=browser_session_id)
             else:
                 LOG.warning(
                     "Organization ID not specified, cannot release browser session", workflow_run_id=workflow_run_id
                 )
 
-        return browser_state_to_close
+        if not streams_active and release_complete:
+            complete_stream_teardown(workflow_run_id)
+
+        return BrowserCleanupResult(
+            browser_state=browser_state_to_close,
+            recording_finalized=recording_finalized,
+        )
 
     async def get_or_create_for_script(
         self,
@@ -1049,18 +1371,54 @@ class RealBrowserManager(BrowserManager):
             # Fail closed: look the session up under its real organization_id (release's symmetric key).
             if not organization_id:
                 raise MissingOrganizationForBrowserSession(browser_session_id)
-            LOG.info(
-                "Getting browser state for script",
-                browser_session_id=browser_session_id,
-            )
-            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-                browser_session_id, organization_id=organization_id
-            )
-            if browser_state is None:
-                # Fail closed: a cold/evicted session has no reusable state. Silently creating a local
-                # browser below would produce an unregistered state that terminal cleanup misclassifies as
-                # a reusable persistent session (keyed off browser_session_id) and leaks instead of closes.
+            if not script_id:
                 raise MissingBrowserStateForBrowserSession(browser_session_id)
+            self._acquiring_session_runnables.add(script_id)
+            try:
+                raw_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+                    browser_session_id=browser_session_id,
+                    runnable_type="script",
+                    runnable_id=script_id,
+                    organization_id=organization_id,
+                )
+                expected_runnable_generation_id = raw_generation_id if isinstance(raw_generation_id, str) else None
+                if context is not None:
+                    context.browser_session_runnable_id = script_id
+                    context.browser_session_runnable_generation_id = expected_runnable_generation_id
+                download_run_id = (
+                    resolve_run_download_id(skyvern_context.current(), fallback_run_id=script_id) or script_id
+                )
+                LOG.info(
+                    "Getting browser state for script",
+                    browser_session_id=browser_session_id,
+                )
+                browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                    browser_session_id,
+                    **{
+                        "organization_id": organization_id,
+                        "expected_runnable_id": script_id,
+                        "download_run_id": download_run_id,
+                        **(
+                            {"expected_runnable_generation_id": expected_runnable_generation_id}
+                            if expected_runnable_generation_id is not None
+                            else {}
+                        ),
+                    },
+                )
+                if browser_state is None:
+                    # Fail closed: a cold/evicted session has no reusable state. Silently creating a local
+                    # browser below would produce an unregistered state that terminal cleanup misclassifies as
+                    # a reusable persistent session (keyed off browser_session_id) and leaks instead of closes.
+                    raise MissingBrowserStateForBrowserSession(browser_session_id)
+                self._persistent_session_leases[script_id] = _PersistentSessionLease(
+                    session_id=browser_session_id,
+                    organization_id=organization_id,
+                    runnable_id=script_id,
+                    runnable_generation_id=expected_runnable_generation_id,
+                    browser_state=browser_state,
+                )
+            finally:
+                self._acquiring_session_runnables.discard(script_id)
             page = await browser_state.get_working_page()
             if not page:
                 LOG.warning("Browser state has no page to run the script", script_id=script_id)
@@ -1097,6 +1455,7 @@ class RealBrowserManager(BrowserManager):
         closes with the session. Errors are logged, not raised.
         """
         LOG.info("Cleaning up for script", script_id=script_id)
+        session_lease = self._persistent_session_leases.get(script_id)
         pending_cancel: asyncio.CancelledError | None = None
         try:
             await self._drop_engine_owner(script_id)
@@ -1134,8 +1493,10 @@ class RealBrowserManager(BrowserManager):
                 # Best-effort per the "errors are logged, not raised" contract: a release failure must not
                 # escape cleanup and mask the script's own exception (this runs in run_script's finally).
                 try:
-                    await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
-                        browser_session_id, organization_id=organization_id
+                    await self._release_persistent_session(
+                        browser_session_id,
+                        organization_id,
+                        session_lease,
                     )
                     LOG.info("Released browser session", browser_session_id=browser_session_id)
                 except Exception:
@@ -1145,6 +1506,11 @@ class RealBrowserManager(BrowserManager):
                         browser_session_id=browser_session_id,
                         exc_info=True,
                     )
+                finally:
+                    # This is the script's only cleanup call, so a retained lease is never retried —
+                    # it just reads as "still running" to the reaper's lease gate and pins the
+                    # session. Drop it either way and leave the occupied row to the reaper.
+                    self._discard_session_lease(script_id, session_lease)
             elif browser_session_id:
                 LOG.warning("Organization ID not specified, cannot release browser session", script_id=script_id)
             return browser_state_to_close
