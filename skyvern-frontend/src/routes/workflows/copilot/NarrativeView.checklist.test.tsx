@@ -155,6 +155,7 @@ describe("NarrativeView — phase checklist (SKY-11970)", () => {
       ],
       lastRunOutcome: {
         verdict: "not_demonstrated",
+        role: "interim_build_test",
         displayReason: "outcome not confirmed",
         activitySeqAtVerdict: 2,
       },
