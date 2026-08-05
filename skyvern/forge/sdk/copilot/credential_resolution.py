@@ -75,6 +75,42 @@ def loggable_origin(url: str) -> str:
     return f"{parsed.scheme.lower()}://{parsed.hostname}{port}"
 
 
+def is_resolved_page_url(url: str) -> bool:
+    """Whether this is an absolute page URL a URL match may be computed against.
+
+    Scheme-less input is not a page. The `https://` normalization these matchers apply would turn
+    any bare token — a prompt sentinel, a tool-argument echo, a placeholder — into a hostname that
+    matches nothing, and the resulting "no match" reads as a fact about the org's saved credentials.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        # A malformed authority (`http://[`) raises here, and callers run this ahead of their own
+        # resolver guard, so raising would abort the observing tool rather than decline its input.
+        return False
+    # Keyed on `hostname` where `url_parts` keys the whole netloc, so `https://a.example@b.example`
+    # passes here and still matches no saved credential there; netloc would not harden this.
+    return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+
+
+def unresolved_page_url_for_log(url: str) -> str:
+    """What a value that is not a page URL points at: its host, else its scheme, else the bare token.
+
+    Userinfo, query, fragment, params and path are the parts a URL carries content in, and content
+    is where a secret rides, so the identity a log may name is only ever the components above them.
+    A value too malformed to parse has no identity to name, and the outcome field carries that.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return ""
+    if parsed.hostname:
+        return f"{parsed.scheme.lower()}://{parsed.hostname}"[:64] if parsed.scheme else f"//{parsed.hostname}"[:64]
+    if parsed.scheme:
+        return f"{parsed.scheme.lower()}:"[:64]
+    return parsed.path[:64]
+
+
 def deduplicate_credentials(credentials: list[Credential]) -> list[Credential]:
     by_id: dict[str, Credential] = {}
     for credential in credentials:

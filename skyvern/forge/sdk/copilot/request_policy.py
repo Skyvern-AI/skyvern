@@ -28,10 +28,14 @@ from skyvern.forge.sdk.copilot.credential_resolution import (
     CredentialResolutionTier,
 )
 from skyvern.forge.sdk.copilot.credential_resolution import deduplicate_credentials as _deduplicate_credentials
+from skyvern.forge.sdk.copilot.credential_resolution import (
+    is_resolved_page_url,
+)
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials as _load_credentials
 from skyvern.forge.sdk.copilot.credential_resolution import (
     loggable_origin,
     resolve_by_url,
+    unresolved_page_url_for_log,
 )
 from skyvern.forge.sdk.copilot.credential_resolution import url_parts as _url_parts
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
@@ -565,7 +569,7 @@ class RequestSlotAnchorCorrectionDecisionV1:
 
 
 LiveCredentialSeam = Literal["fill", "page_observation"]
-LivePageResolutionVerdict = Literal["resolved", "ambiguous", "no_match", "declined"]
+LivePageResolutionVerdict = Literal["resolved", "ambiguous", "no_match", "declined", "abstain"]
 
 
 @dataclass(frozen=True)
@@ -5195,6 +5199,44 @@ def _live_page_log_allowed(policy: RequestPolicy, page_url: str, seam: LiveCrede
     return True
 
 
+def live_page_credentials_admissible(policy: RequestPolicy) -> bool:
+    """Whether this turn may bind a saved credential from a live page at all.
+
+    Callers that must pay for evidence — a browser read, a credential load — check this first so a
+    turn that could never admit does not buy the evidence to decide it.
+    """
+    return not policy.raw_secret_detected and policy.allow_run_blocks
+
+
+def _live_page_url_abstains(
+    policy: RequestPolicy,
+    *,
+    organization_id: str,
+    page_url: str,
+    seam: LiveCredentialSeam,
+    credential_id: str | None = None,
+) -> bool:
+    """Whether the seam was handed something that is not a page, and must make no claim about it.
+
+    `no_match` is a factual statement about the org's saved credentials. From an unresolvable input
+    the seam has looked at no page at all, so it is not entitled to make one.
+    """
+    if not page_url or is_resolved_page_url(page_url):
+        return False
+    if _live_page_log_allowed(policy, page_url, seam, "abstain"):
+        LOG.info(
+            "copilot credential live-page admission",
+            outcome="abstain",
+            seam=seam,
+            organization_id=organization_id,
+            credential_id=credential_id,
+            page_url=unresolved_page_url_for_log(page_url),
+            tier=None,
+            candidate_credential_ids=[],
+        )
+    return True
+
+
 async def _resolve_live_page_credentials(
     policy: RequestPolicy,
     *,
@@ -5205,7 +5247,7 @@ async def _resolve_live_page_credentials(
     credential_id: str | None = None,
 ) -> CredentialResolution | None:
     """Ask the live page which saved credentials it vouches for, or None when a precondition declines."""
-    if policy.raw_secret_detected or not policy.allow_run_blocks or not page_url:
+    if not live_page_credentials_admissible(policy) or not page_url:
         return None
     if _is_passwordless_email_signin(policy):
         # Turn-start resolution excludes this shape from every URL tier because a site that signs in
@@ -5255,6 +5297,8 @@ async def resolve_credential_for_live_page(
     Same discriminator and same records as the fill seam; the difference is only that no
     credential was requested, so a sole match is the answer rather than something to check against.
     """
+    if _live_page_url_abstains(policy, organization_id=organization_id, page_url=page_url, seam="page_observation"):
+        return LivePageResolutionRecord(verdict="abstain", page_url=page_url)
     resolution = await _resolve_live_page_credentials(
         policy,
         organization_id=organization_id,
@@ -5318,6 +5362,14 @@ async def admit_credential_for_live_page(
     no page at all.
     """
     if not credential_id:
+        return LiveCredentialAdmission(False)
+    if _live_page_url_abstains(
+        policy,
+        organization_id=organization_id,
+        page_url=page_url,
+        seam="fill",
+        credential_id=credential_id,
+    ):
         return LiveCredentialAdmission(False)
     resolution = await _resolve_live_page_credentials(
         policy,

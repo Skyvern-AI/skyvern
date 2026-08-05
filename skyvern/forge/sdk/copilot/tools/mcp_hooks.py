@@ -22,7 +22,7 @@ from skyvern.forge.sdk.copilot.config import (
     download_scout_act_required_for_policy,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.credential_resolution import load_credentials
+from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url, load_credentials
 from skyvern.forge.sdk.copilot.enforcement import (
     _requested_output_labels_by_path,
     requested_output_extraction_plan,
@@ -38,7 +38,11 @@ from skyvern.forge.sdk.copilot.output_designation_resolution import (
     render_candidates,
     render_requested_paths,
 )
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, resolve_credential_for_live_page
+from skyvern.forge.sdk.copilot.request_policy import (
+    RequestPolicy,
+    live_page_credentials_admissible,
+    resolve_credential_for_live_page,
+)
 from skyvern.forge.sdk.copilot.request_slots import is_canonical_request_slot_path
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
@@ -46,7 +50,11 @@ from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values
 from skyvern.forge.sdk.copilot.typed_value_policy import safe_typed_default_value, should_reject_type_text_value
 from skyvern.forge.sdk.schemas.credentials import Credential
 
-from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS, _composition_get_structured_evidence
+from ._shared import (
+    _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+    _composition_get_structured_evidence,
+    _fallback_page_info,
+)
 from .banned_blocks import (
     _CODE_ONLY_SELECTOR_ACTION_TOOLS,
     _CODE_ONLY_TARGET_EVIDENCE_KEYS,
@@ -467,9 +475,15 @@ async def _bind_login_credential_for_observed_url(ctx: AgentContext, url: str, r
         return
 
     policy = ctx.request_policy
-    if not isinstance(policy, RequestPolicy):
+    if not isinstance(policy, RequestPolicy) or not live_page_credentials_admissible(policy):
         return
     organization_id = ctx.organization_id
+
+    if not is_resolved_page_url(url):
+        # A `current_page` inspection stamps its placeholder when the URL read raced the capture.
+        # The match is against the page the browser actually reached, so read it again rather than
+        # hand over a token no page vouches for.
+        url, _ = await _fallback_page_info(ctx)
 
     async def load_once() -> list[Credential]:
         if ctx.org_credentials_for_turn is None:
@@ -496,6 +510,9 @@ async def _bind_login_credential_for_observed_url(ctx: AgentContext, url: str, r
         credential = record.candidates[0]
         result["resolved_login_credential_id"] = credential.credential_id
         result["resolved_login_credential_name"] = credential.name
+        # The observation may name a placeholder while the match ran against the page read after it,
+        # so the page the credential was matched on is reported rather than left to be inferred.
+        result["resolved_login_page_url"] = url
     elif record.verdict == "ambiguous":
         result["candidate_login_credentials"] = [
             {"credential_id": candidate.credential_id, "name": candidate.name} for candidate in record.candidates
