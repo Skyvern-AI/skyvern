@@ -3,7 +3,7 @@ import socket
 import pytest
 
 from skyvern.config import settings
-from skyvern.exceptions import BlockedHost, UnresolvableHost
+from skyvern.exceptions import BlockedHost, SkyvernHTTPException, UnresolvableHost
 from skyvern.utils.url_validators import (
     encode_url,
     is_blocked_host,
@@ -227,6 +227,17 @@ def test_validate_fetch_url_checks_blocked_host_when_url_is_too_long(
         validate_fetch_url(url)
 
     assert type(exc_info.value) is BlockedHost
+
+
+@pytest.mark.parametrize("url", ["ftp://public.example.test/file", "chrome://settings", "gopher://host/x"])
+def test_validate_fetch_url_refuses_nonhttp_scheme_without_dns(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    def unexpected_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        raise AssertionError("non-http(s) schemes must be refused before DNS is consulted")
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", unexpected_dns)
+
+    with pytest.raises(SkyvernHTTPException):
+        validate_fetch_url(url)
 
 
 @pytest.mark.parametrize("blocked_host", ["169.254.169.254", "127.0.0.1", "10.0.0.5"])
