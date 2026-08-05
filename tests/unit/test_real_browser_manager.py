@@ -146,6 +146,72 @@ async def test_pbs_workflow_run_returns_own_cache_not_parent() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pbs_workflow_run_with_synthetic_run_does_not_assert_session_ownership() -> None:
+    """SKY-13518: a synthetic bookkeeping run (minted per-action by run_sdk_action) never begins the
+    session, so presenting it as the expected owner can only ever fail the DB ownership guard."""
+    manager = RealBrowserManager()
+    workflow_run = make_workflow_run("wfr_synthetic")
+
+    pbs_state = MagicMock()
+    pbs_state.get_working_page = AsyncMock(return_value=None)
+    pbs_state.get_or_create_page = AsyncMock()
+
+    skyvern_context.set(SkyvernContext(workflow_run_id="wfr_synthetic", workflow_run_is_synthetic=True))
+    try:
+        with (
+            patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+            patch(
+                "skyvern.webeye.real_browser_manager._rebind_pbs_download_dir",
+                new_callable=AsyncMock,
+            ) as mock_rebind,
+        ):
+            configure_browser_context_acquired_hook(mock_app)
+            mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
+            mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+            await manager.get_or_create_for_workflow_run(
+                workflow_run=workflow_run,
+                url="https://example.com",
+                browser_session_id="bs_123",
+            )
+    finally:
+        skyvern_context.reset()
+
+    call_kwargs = mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.await_args.kwargs
+    assert call_kwargs["expected_runnable_id"] is None
+    # A synthetic run only reads a session owned by another runnable. It must not change that
+    # runnable's download destination or acquire a lease that could later release the session.
+    mock_rebind.assert_not_awaited()
+    assert "wfr_synthetic" not in manager._persistent_session_leases
+
+
+@pytest.mark.asyncio
+async def test_pbs_workflow_run_without_lease_still_asserts_run_as_expected_owner() -> None:
+    """Without the synthetic marker the run-id fallback stays: cross-process reads must keep being
+    governed by the DB ownership guard (SKY-13473)."""
+    manager = RealBrowserManager()
+    workflow_run = make_workflow_run("wfr_child")
+
+    pbs_state = MagicMock()
+    pbs_state.get_working_page = AsyncMock(return_value=None)
+    pbs_state.get_or_create_page = AsyncMock()
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url="https://example.com",
+            browser_session_id="bs_123",
+        )
+
+    call_kwargs = mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.await_args.kwargs
+    assert call_kwargs["expected_runnable_id"] == "wfr_child"
+
+
+@pytest.mark.asyncio
 async def test_non_pbs_workflow_run_cache_hit_on_second_call() -> None:
     """Non-PBS runs must also hit the early cache check on subsequent calls."""
     manager = RealBrowserManager()
