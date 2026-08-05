@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
-from aiohttp import ClientSession, ClientWebSocketResponse, WSMsgType
+from aiohttp import ClientSession, ClientWebSocketResponse
 
 from skyvern.browser_extension.cdp_adapter import ExtensionCdpAdapter
 from skyvern.browser_extension.errors import ExtensionRequestError
@@ -23,6 +23,14 @@ class StubRelay:
         self.block_attach_tab_id: int | None = None
         self.attach_started = asyncio.Event()
         self.release_attach = asyncio.Event()
+        self.block_detach_tab_id: int | None = None
+        self.detach_started = asyncio.Event()
+        self.release_detach = asyncio.Event()
+        self.main_frame_ids: dict[int, str] = {}
+        self.block_send_keys: set[tuple[str | None, str]] = set()
+        self.fail_send_keys: dict[tuple[str | None, str], ExtensionRequestError] = {}
+        self.send_started: dict[tuple[str | None, str], asyncio.Event] = {}
+        self.release_send: dict[tuple[str | None, str], asyncio.Event] = {}
 
     async def request(self, op: str, args: dict, timeout: float = 30.0) -> dict:
         self.calls.append((op, args))
@@ -37,11 +45,23 @@ class StubRelay:
             if tab_id == self.block_attach_tab_id:
                 self.attach_started.set()
                 await self.release_attach.wait()
+        if op == "debugger.detach" and args["tabId"] == self.block_detach_tab_id:
+            self.detach_started.set()
+            await self.release_detach.wait()
         if op == "tabs.create":
             tab_id = self.next_tab_id
             self.next_tab_id += 1
             return {"tabId": tab_id}
         if op == "debugger.send":
+            key = (args.get("sessionId"), args["method"])
+            if key in self.block_send_keys:
+                self.send_started.setdefault(key, asyncio.Event()).set()
+                await self.release_send.setdefault(key, asyncio.Event()).wait()
+            if key in self.fail_send_keys:
+                raise self.fail_send_keys.pop(key)
+            if args["method"] == "Page.getFrameTree" and args["tabId"] in self.main_frame_ids:
+                frame_id = self.main_frame_ids[args["tabId"]]
+                return {"result": {"frameTree": {"frame": {"id": frame_id}}}}
             return {"result": {"forwardedMethod": args["method"]}}
         return {}
 
@@ -200,6 +220,53 @@ async def test_auto_attach_existing_and_later_scoped_tabs() -> None:
     assert [event["params"]["targetInfo"]["targetId"] for event in events] == ["tab-7", "tab-8"]
     assert later["params"]["targetInfo"]["targetId"] == "tab-9"
     assert popup["params"]["targetInfo"]["openerId"] == "tab-7"
+
+
+@pytest.mark.asyncio
+async def test_root_target_discovery_waits_for_auto_attach_while_session_commands_continue() -> None:
+    scoped_tabs = [
+        {"tabId": 41, "url": "https://one.example", "title": "One"},
+        {"tabId": 42, "url": "https://two.example", "title": "Two"},
+    ]
+    relay = StubRelay(scoped_tabs)
+    relay.main_frame_ids = {41: "frame-41", 42: "frame-42"}
+    relay.block_attach_tab_id = 42
+    registry = VirtualTargetRegistry()
+    adapter = ExtensionCdpAdapter(registry, relay)
+    await adapter.handle_extension_event("extension.hello", {"scopedTabs": scoped_tabs})
+    await adapter.start()
+    try:
+        async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+            await ws.send_json({"id": 1, "method": "Target.setAutoAttach", "params": {"autoAttach": True}})
+            assert await receive_response(ws, 1) == {"id": 1, "result": {}}
+            await asyncio.wait_for(relay.attach_started.wait(), 1)
+
+            attached_session_id = registry.root_session_id(41)
+            await ws.send_json({"id": 2, "method": "Target.getTargets", "params": {}})
+            await ws.send_json({"id": 3, "sessionId": attached_session_id, "method": "Runtime.enable", "params": {}})
+
+            early_get_targets = None
+            session_response = None
+            while session_response is None:
+                message = await ws.receive_json(timeout=1)
+                if message.get("id") == 2:
+                    early_get_targets = message
+                elif message.get("id") == 3:
+                    session_response = message
+            assert early_get_targets is None
+            assert session_response == {
+                "id": 3,
+                "sessionId": attached_session_id,
+                "result": {"forwardedMethod": "Runtime.enable"},
+            }
+
+            relay.release_attach.set()
+            targets = await receive_response(ws, 2)
+    finally:
+        relay.release_attach.set()
+        await adapter.stop()
+
+    assert {info["targetId"] for info in targets["result"]["targetInfos"]} == {"frame-41", "frame-42"}
 
 
 @pytest.mark.asyncio
@@ -446,13 +513,576 @@ async def test_child_attach_recurses_and_detach_unregisters(
             "tabId": 12,
             "sessionId": "child-12",
             "method": "Target.setAutoAttach",
-            "params": {"flatten": True, "autoAttach": True, "waitForDebuggerOnStart": False},
+            "params": {
+                "flatten": True,
+                "autoAttach": True,
+                "waitForDebuggerOnStart": False,
+                "filter": [{"type": "iframe", "exclude": False}],
+            },
         },
     )
     assert relay.calls[1][1]["sessionId"] == "child-12"
     assert detached["params"] == {"sessionId": "child-12"}
     with pytest.raises(KeyError):
         registry.resolve_session("child-12")
+
+
+@pytest.mark.asyncio
+async def test_child_detach_during_post_registration_window_emits_and_unregisters(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, _, registry = adapter_server
+    registry.register_tab(17, "https://example.com", "Example")
+    child_session_id = "child-17"
+    replay_started = asyncio.Event()
+    release_replay = asyncio.Event()
+
+    async def block_replay(session_id: str) -> None:
+        assert session_id == child_session_id
+        replay_started.set()
+        await release_replay.wait()
+
+    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+        await ws.send_json({"id": 1, "method": "Target.setAutoAttach", "params": {"autoAttach": True}})
+        await receive_response(ws, 1)
+        await receive_event(ws, "Target.attachedToTarget")
+
+        with patch.object(adapter, "_replay_buffered_child_events", side_effect=block_replay):
+            await adapter.handle_extension_event(
+                "debugger.event",
+                {
+                    "tabId": 17,
+                    "method": "Target.attachedToTarget",
+                    "params": {
+                        "sessionId": child_session_id,
+                        "targetInfo": {
+                            "targetId": "frame-17",
+                            "type": "iframe",
+                            "title": "",
+                            "url": "https://example.com/frame",
+                            "attached": True,
+                            "canAccessOpener": False,
+                            "browserContextId": "skyvern-default",
+                        },
+                        "waitingForDebugger": False,
+                    },
+                },
+            )
+            await receive_event(ws, "Target.attachedToTarget")
+            await asyncio.wait_for(replay_started.wait(), 1)
+            assert child_session_id in adapter._pending_child_sessions
+            assert registry.resolve_session(child_session_id) == (17, child_session_id)
+
+            await adapter.handle_extension_event(
+                "debugger.event",
+                {
+                    "tabId": 17,
+                    "method": "Target.detachedFromTarget",
+                    "params": {"sessionId": child_session_id},
+                },
+            )
+            detached = await receive_event(ws, "Target.detachedFromTarget")
+
+            await ws.send_json({"id": 2, "sessionId": child_session_id, "method": "Runtime.enable", "params": {}})
+            missing = await receive_response(ws, 2)
+            release_replay.set()
+
+    assert detached["params"] == {"sessionId": child_session_id}
+    assert missing == {
+        "id": 2,
+        "sessionId": child_session_id,
+        "error": {"code": -32001, "message": "session not found"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_child_detach_before_probe_completes_is_swallowed_and_tombstones_initialization(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(18, "https://example.com", "Example")
+    child_session_id = "child-18"
+    probe_key = (child_session_id, "Target.setAutoAttach")
+    relay.block_send_keys.add(probe_key)
+
+    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+        await ws.send_json({"id": 1, "method": "Target.setAutoAttach", "params": {"autoAttach": True}})
+        await receive_response(ws, 1)
+        await receive_event(ws, "Target.attachedToTarget")
+
+        await adapter.handle_extension_event(
+            "debugger.event",
+            {
+                "tabId": 18,
+                "method": "Target.attachedToTarget",
+                "params": {
+                    "sessionId": child_session_id,
+                    "targetInfo": {
+                        "targetId": "frame-18",
+                        "type": "iframe",
+                        "title": "",
+                        "url": "https://example.com/frame",
+                        "attached": True,
+                        "canAccessOpener": False,
+                        "browserContextId": "skyvern-default",
+                    },
+                    "waitingForDebugger": False,
+                },
+            },
+        )
+        await asyncio.wait_for(relay.send_started.setdefault(probe_key, asyncio.Event()).wait(), 1)
+        initialization_task = next(task for task in adapter._background_tasks if not task.done())
+
+        await adapter.handle_extension_event(
+            "debugger.event",
+            {
+                "tabId": 18,
+                "method": "Target.detachedFromTarget",
+                "params": {"sessionId": child_session_id},
+            },
+        )
+        with pytest.raises(TimeoutError):
+            await ws.receive_json(timeout=0.05)
+
+        relay.release_send[probe_key].set()
+        await asyncio.wait_for(initialization_task, 1)
+
+    with pytest.raises(KeyError):
+        registry.resolve_session(child_session_id)
+
+
+@pytest.mark.asyncio
+async def test_nested_child_attach_during_parent_probe_is_replayed_in_parent_first_order(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(13, "https://parent.example", "Parent")
+    root_session_id = registry.root_session_id(13)
+    parent_session_id = "parent-child-13"
+    grandchild_session_id = "grandchild-13"
+    parent_probe_key = (parent_session_id, "Target.setAutoAttach")
+    relay.block_send_keys.add(parent_probe_key)
+
+    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+        await ws.send_json({"id": 1, "method": "Target.setAutoAttach", "params": {"autoAttach": True}})
+        await receive_response(ws, 1)
+        await receive_event(ws, "Target.attachedToTarget")
+        relay.calls.clear()
+
+        parent_params = {
+            "sessionId": parent_session_id,
+            "targetInfo": {
+                "targetId": "parent-frame-13",
+                "type": "iframe",
+                "title": "",
+                "url": "https://parent.example/frame",
+                "attached": True,
+                "canAccessOpener": False,
+                "browserContextId": "skyvern-default",
+            },
+            "waitingForDebugger": False,
+        }
+        await adapter.handle_extension_event(
+            "debugger.event",
+            {"tabId": 13, "method": "Target.attachedToTarget", "params": parent_params},
+        )
+        await asyncio.wait_for(relay.send_started.setdefault(parent_probe_key, asyncio.Event()).wait(), 1)
+
+        grandchild_params = {
+            "sessionId": grandchild_session_id,
+            "targetInfo": {
+                "targetId": "grandchild-frame-13",
+                "type": "iframe",
+                "title": "",
+                "url": "https://grandchild.example/frame",
+                "attached": True,
+                "canAccessOpener": False,
+                "browserContextId": "skyvern-default",
+            },
+            "waitingForDebugger": False,
+        }
+        await adapter.handle_extension_event(
+            "debugger.event",
+            {
+                "tabId": 13,
+                "sessionId": parent_session_id,
+                "method": "Target.attachedToTarget",
+                "params": grandchild_params,
+            },
+        )
+
+        relay.release_send[parent_probe_key].set()
+        parent_attached = await receive_event(ws, "Target.attachedToTarget")
+        grandchild_attached = await receive_event(ws, "Target.attachedToTarget")
+        assert registry.resolve_session(grandchild_session_id) == (13, grandchild_session_id)
+
+    assert parent_attached["sessionId"] == root_session_id
+    assert parent_attached["params"] == parent_params
+    assert grandchild_attached["sessionId"] == parent_session_id
+    assert grandchild_attached["params"] == grandchild_params
+
+
+@pytest.mark.asyncio
+async def test_nested_child_attach_is_detached_when_parent_probe_fails(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(15, "https://parent.example", "Parent")
+    parent_session_id = "parent-child-15"
+    grandchild_session_id = "grandchild-15"
+    parent_probe_key = (parent_session_id, "Target.setAutoAttach")
+    relay.block_send_keys.add(parent_probe_key)
+    relay.fail_send_keys[parent_probe_key] = ExtensionRequestError("INTERNAL", "parent probe failed")
+
+    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+        await ws.send_json({"id": 1, "method": "Target.setAutoAttach", "params": {"autoAttach": True}})
+        await receive_response(ws, 1)
+        await receive_event(ws, "Target.attachedToTarget")
+        relay.calls.clear()
+
+        await adapter.handle_extension_event(
+            "debugger.event",
+            {
+                "tabId": 15,
+                "method": "Target.attachedToTarget",
+                "params": {
+                    "sessionId": parent_session_id,
+                    "targetInfo": {
+                        "targetId": "parent-frame-15",
+                        "type": "iframe",
+                        "title": "",
+                        "url": "https://parent.example/frame",
+                        "attached": True,
+                        "canAccessOpener": False,
+                        "browserContextId": "skyvern-default",
+                    },
+                    "waitingForDebugger": False,
+                },
+            },
+        )
+        await asyncio.wait_for(relay.send_started.setdefault(parent_probe_key, asyncio.Event()).wait(), 1)
+
+        await adapter.handle_extension_event(
+            "debugger.event",
+            {
+                "tabId": 15,
+                "sessionId": parent_session_id,
+                "method": "Target.attachedToTarget",
+                "params": {
+                    "sessionId": grandchild_session_id,
+                    "targetInfo": {
+                        "targetId": "grandchild-frame-15",
+                        "type": "iframe",
+                        "title": "",
+                        "url": "https://grandchild.example/frame",
+                        "attached": True,
+                        "canAccessOpener": False,
+                        "browserContextId": "skyvern-default",
+                    },
+                    "waitingForDebugger": False,
+                },
+            },
+        )
+
+        relay.release_send[parent_probe_key].set()
+        with pytest.raises(TimeoutError):
+            await ws.receive_json(timeout=0.05)
+        with pytest.raises(KeyError):
+            registry.resolve_session(parent_session_id)
+        with pytest.raises(KeyError):
+            registry.resolve_session(grandchild_session_id)
+
+    assert (
+        "debugger.send",
+        {
+            "tabId": 15,
+            "sessionId": grandchild_session_id,
+            "method": "Runtime.runIfWaitingForDebugger",
+            "params": {},
+        },
+    ) in relay.calls
+    assert (
+        "debugger.send",
+        {
+            "tabId": 15,
+            "method": "Target.detachFromTarget",
+            "params": {"sessionId": grandchild_session_id},
+        },
+    ) in relay.calls
+
+
+@pytest.mark.asyncio
+async def test_pending_child_detach_does_not_wait_for_buffered_grandchild_cleanup(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(19, "https://parent.example", "Parent")
+    parent_session_id = "parent-child-19"
+    grandchild_session_id = "grandchild-19"
+    resume_key = (grandchild_session_id, "Runtime.runIfWaitingForDebugger")
+    relay.block_send_keys.add(resume_key)
+    adapter._pending_child_sessions.add(parent_session_id)
+    adapter._pending_child_events[parent_session_id] = [
+        {
+            "tabId": 19,
+            "sessionId": parent_session_id,
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": grandchild_session_id,
+                "targetInfo": {
+                    "targetId": "grandchild-frame-19",
+                    "type": "iframe",
+                    "title": "",
+                    "url": "https://grandchild.example/frame",
+                    "attached": True,
+                    "canAccessOpener": False,
+                    "browserContextId": "skyvern-default",
+                },
+                "waitingForDebugger": False,
+            },
+        }
+    ]
+
+    await asyncio.wait_for(
+        adapter.handle_extension_event(
+            "debugger.event",
+            {
+                "tabId": 19,
+                "method": "Target.detachedFromTarget",
+                "params": {"sessionId": parent_session_id},
+            },
+        ),
+        0.5,
+    )
+    await asyncio.wait_for(relay.send_started.setdefault(resume_key, asyncio.Event()).wait(), 0.5)
+    relay.release_send.setdefault(resume_key, asyncio.Event()).set()
+
+    async def grandchild_detached() -> None:
+        expected = (
+            "debugger.send",
+            {
+                "tabId": 19,
+                "method": "Target.detachFromTarget",
+                "params": {"sessionId": grandchild_session_id},
+            },
+        )
+        while expected not in relay.calls:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(grandchild_detached(), 0.5)
+    assert parent_session_id not in adapter._pending_child_sessions
+    assert parent_session_id not in adapter._pending_child_events
+
+
+@pytest.mark.asyncio
+async def test_child_initialization_keeps_live_outer_alias_when_another_alias_is_dead(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, _, registry = adapter_server
+    registry.register_tab(20, "https://parent.example", "Parent")
+    adapter._auto_attach = True
+    dead_alias = registry.create_root_session_alias(20)
+    live_alias = registry.create_root_session_alias(20)
+    assert registry.remove_root_session_alias(dead_alias)
+    child_session_id = "child-20"
+    target_info = {
+        "targetId": "frame-20",
+        "type": "iframe",
+        "title": "",
+        "url": "https://child.example/frame",
+        "attached": True,
+        "canAccessOpener": False,
+        "browserContextId": "skyvern-default",
+    }
+    event_params = {
+        "sessionId": child_session_id,
+        "targetInfo": target_info,
+        "waitingForDebugger": False,
+    }
+    adapter._pending_child_sessions.add(child_session_id)
+
+    with patch.object(adapter, "_emit_to_sessions", wraps=adapter._emit_to_sessions) as emit_to_sessions:
+        await adapter._initialize_child_target(
+            20,
+            child_session_id,
+            target_info,
+            event_params,
+            [dead_alias, live_alias],
+        )
+
+    assert registry.resolve_session(child_session_id) == (20, child_session_id)
+    emit_to_sessions.assert_awaited_once_with("Target.attachedToTarget", event_params, [live_alias])
+
+
+@pytest.mark.asyncio
+async def test_child_initialization_resumes_and_detaches_when_all_outer_aliases_are_dead(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    registry.register_tab(21, "https://parent.example", "Parent")
+    adapter._auto_attach = True
+    outer_session_ids = registry.root_session_ids(21)
+    registry.remove_tab(21)
+    child_session_id = "child-21"
+    target_info = {
+        "targetId": "frame-21",
+        "type": "iframe",
+        "title": "",
+        "url": "https://child.example/frame",
+        "attached": True,
+        "canAccessOpener": False,
+        "browserContextId": "skyvern-default",
+    }
+    adapter._pending_child_sessions.add(child_session_id)
+
+    await adapter._initialize_child_target(
+        21,
+        child_session_id,
+        target_info,
+        {"sessionId": child_session_id, "targetInfo": target_info, "waitingForDebugger": False},
+        outer_session_ids,
+    )
+
+    assert (
+        "debugger.send",
+        {
+            "tabId": 21,
+            "sessionId": child_session_id,
+            "method": "Runtime.runIfWaitingForDebugger",
+            "params": {},
+        },
+    ) in relay.calls
+    assert (
+        "debugger.send",
+        {
+            "tabId": 21,
+            "method": "Target.detachFromTarget",
+            "params": {"sessionId": child_session_id},
+        },
+    ) in relay.calls
+    assert child_session_id not in adapter._pending_child_sessions
+    with pytest.raises(KeyError):
+        registry.resolve_session(child_session_id)
+
+
+@pytest.mark.asyncio
+async def test_child_auto_attach_failure_skips_session_and_navigation_lifecycle_continues() -> None:
+    relay = StubRelay([{"tabId": 14, "url": "https://page.example", "title": "Page"}])
+    registry = VirtualTargetRegistry()
+    adapter = ExtensionCdpAdapter(registry, relay)
+    await adapter.start()
+    try:
+        async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+            await ws.send_json({"id": 1, "method": "Target.setAutoAttach", "params": {"autoAttach": True}})
+            await receive_response(ws, 1)
+            await receive_event(ws, "Target.attachedToTarget")
+            relay.calls.clear()
+            relay.fail_send_keys[("unsupported-child", "Target.setAutoAttach")] = ExtensionRequestError(
+                "INTERNAL", "child target does not support auto-attach"
+            )
+
+            await adapter.handle_extension_event(
+                "debugger.event",
+                {
+                    "tabId": 14,
+                    "method": "Target.attachedToTarget",
+                    "params": {
+                        "sessionId": "unsupported-child",
+                        "targetInfo": {
+                            "targetId": "unsupported-target",
+                            "type": "iframe",
+                            "title": "",
+                            "url": "https://frame.example",
+                            "attached": True,
+                            "canAccessOpener": False,
+                            "browserContextId": "skyvern-default",
+                        },
+                        "waitingForDebugger": False,
+                    },
+                },
+            )
+            await asyncio.sleep(0)
+
+            with pytest.raises(KeyError):
+                registry.resolve_session("unsupported-child")
+            with pytest.raises(TimeoutError):
+                await ws.receive_json(timeout=0.05)
+
+            root_session_id = registry.root_session_id(14)
+            await ws.send_json(
+                {
+                    "id": 2,
+                    "sessionId": root_session_id,
+                    "method": "Page.navigate",
+                    "params": {"url": "https://destination.example"},
+                }
+            )
+            assert (await receive_response(ws, 2))["result"] == {"forwardedMethod": "Page.navigate"}
+
+            lifecycle_params = {"name": "DOMContentLoaded", "frameId": "main"}
+            await adapter.handle_extension_event(
+                "debugger.event",
+                {
+                    "tabId": 14,
+                    "method": "Page.lifecycleEvent",
+                    "params": lifecycle_params,
+                },
+            )
+            lifecycle = await receive_event(ws, "Page.lifecycleEvent")
+            assert lifecycle["sessionId"] == root_session_id
+            assert lifecycle["params"] == lifecycle_params
+    finally:
+        await adapter.stop()
+
+    assert (
+        "debugger.send",
+        {
+            "tabId": 14,
+            "method": "Target.detachFromTarget",
+            "params": {"sessionId": "unsupported-child"},
+        },
+    ) in relay.calls
+
+
+@pytest.mark.asyncio
+async def test_slow_session_command_does_not_block_independent_session_command() -> None:
+    relay = StubRelay()
+    registry = VirtualTargetRegistry()
+    registry.register_tab(16, "https://page.example", "Page")
+    session_id = registry.root_session_id(16)
+    navigate_key = (None, "Page.navigate")
+    relay.block_send_keys.add(navigate_key)
+    adapter = ExtensionCdpAdapter(registry, relay)
+    await adapter.start()
+    try:
+        async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+            await ws.send_json(
+                {
+                    "id": 1,
+                    "sessionId": session_id,
+                    "method": "Page.navigate",
+                    "params": {"url": "https://destination.example"},
+                }
+            )
+            await asyncio.wait_for(relay.send_started.setdefault(navigate_key, asyncio.Event()).wait(), 1)
+
+            await ws.send_json(
+                {
+                    "id": 2,
+                    "sessionId": session_id,
+                    "method": "Runtime.runIfWaitingForDebugger",
+                    "params": {},
+                }
+            )
+            fast_response = await receive_response(ws, 2)
+            assert fast_response["result"] == {"forwardedMethod": "Runtime.runIfWaitingForDebugger"}
+
+            relay.release_send.setdefault(navigate_key, asyncio.Event()).set()
+            navigate_response = await receive_response(ws, 1)
+            assert navigate_response["result"] == {"forwardedMethod": "Page.navigate"}
+    finally:
+        relay.release_send.setdefault(navigate_key, asyncio.Event()).set()
+        await adapter.stop()
 
 
 @pytest.mark.asyncio
@@ -626,17 +1256,67 @@ async def test_second_client_rejected_and_disconnect_allows_future_client(
 
 
 @pytest.mark.asyncio
-async def test_browser_close_replies_then_closes_without_removing_tabs(
+async def test_old_client_disconnect_does_not_cancel_new_client_command(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, registry = adapter_server
+    old_cancel_started = asyncio.Event()
+    release_old_cancel = asyncio.Event()
+    original_cancel_client_tasks = adapter._cancel_client_tasks
+
+    async def block_old_cancel(*args: object) -> None:
+        old_cancel_started.set()
+        await release_old_cancel.wait()
+        await original_cancel_client_tasks(*args)
+
+    async with ClientSession() as client:
+        await client.ws_connect(adapter.cdp_ws_url)
+        with patch.object(adapter, "_cancel_client_tasks", side_effect=block_old_cancel):
+            disconnect_task = asyncio.create_task(adapter.on_extension_disconnect())
+            await asyncio.wait_for(old_cancel_started.wait(), 1)
+
+            new = await client.ws_connect(adapter.cdp_ws_url)
+            registry.register_tab(24, "https://example.com", "Example")
+            session_id = registry.root_session_id(24)
+            send_key = (None, "Runtime.evaluate")
+            relay.block_send_keys.add(send_key)
+            await new.send_json(
+                {"id": 1, "sessionId": session_id, "method": "Runtime.evaluate", "params": {"expression": "1+1"}}
+            )
+            await asyncio.wait_for(relay.send_started.setdefault(send_key, asyncio.Event()).wait(), 1)
+
+            release_old_cancel.set()
+            await asyncio.wait_for(disconnect_task, 2)
+            relay.release_send[send_key].set()
+
+            assert await receive_response(new, 1) == {
+                "id": 1,
+                "sessionId": session_id,
+                "result": {"forwardedMethod": "Runtime.evaluate"},
+            }
+            await asyncio.sleep(0)
+            assert adapter._client_tasks == {}
+            await new.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_close_detaches_all_tabs_when_client_closes_after_reply(
     adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
 ) -> None:
     adapter, relay, registry = adapter_server
     registry.register_tab(22, "https://example.com", "Example")
+    registry.register_tab(23, "https://other.example", "Other")
+    relay.block_detach_tab_id = 22
 
-    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+    async with ClientSession() as client:
+        ws = await client.ws_connect(adapter.cdp_ws_url)
         await ws.send_json({"id": 9, "method": "Browser.close", "params": {}})
         assert await receive_response(ws, 9) == {"id": 9, "result": {}}
-        close_message = await ws.receive(timeout=2)
-        assert close_message.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
+        close_task = asyncio.create_task(ws.close())
+        await asyncio.wait_for(relay.detach_started.wait(), 1)
+        await asyncio.sleep(0.05)
+        relay.release_detach.set()
+        await asyncio.wait_for(close_task, 2)
 
-    assert ("debugger.detach", {"tabId": 22}) in relay.calls
+    assert {args["tabId"] for op, args in relay.calls if op == "debugger.detach"} == {22, 23}
     assert all(op != "tabs.remove" for op, _ in relay.calls)
