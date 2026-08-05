@@ -147,6 +147,7 @@ async def run_sdk_action(
             max_screenshot_scrolls=task.max_screenshot_scrolls,
             workflow_id=workflow.workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
+            workflow_run_is_synthetic=created_workflow_run,
         )
     )
     result: Any | None = None
