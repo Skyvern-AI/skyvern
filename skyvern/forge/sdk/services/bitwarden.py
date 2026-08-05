@@ -4,7 +4,7 @@ import os
 import random
 import re
 from enum import IntEnum, StrEnum
-from typing import Tuple
+from typing import Any, Tuple
 
 import structlog
 import tldextract
@@ -259,6 +259,22 @@ def get_bitwarden_item_overview_from_bitwarden_item(
         credential_type=credential_type,
         url=url,
     )
+
+
+# Bitwarden's per-URI match mode, as the vault stores it. A user who narrowed a URI below its default
+# is saying the credential does not belong to the whole site, and `never` says not to offer it at all.
+_BITWARDEN_URI_MATCH_DOMAIN = 0
+
+
+def _whole_site_login_uris(login_item: dict[str, Any]) -> list[str]:
+    """URIs whose match mode lets the credential stand for its whole site."""
+    return [
+        uri["uri"]
+        for uri in login_item.get("uris") or []
+        if isinstance(uri, dict)
+        and uri.get("uri")
+        and (uri.get("match") is None or uri.get("match") == _BITWARDEN_URI_MATCH_DOMAIN)
+    ]
 
 
 def is_valid_email(email: str | None) -> bool:
@@ -1399,6 +1415,7 @@ class BitwardenService:
                     totp=login_item["totp"],
                     metadata=_password_metadata_from_bitwarden_item(response["data"]),
                 ),
+                login_uris=_whole_site_login_uris(login_item),
             )
         elif response["data"]["type"] == BitwardenItemType.CREDIT_CARD:
             name = response["data"]["name"]
