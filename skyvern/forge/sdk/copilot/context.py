@@ -20,6 +20,7 @@ from skyvern.forge.sdk.copilot.result_evidence import (
     LoadedResultCompositionEvidence,
     loaded_result_target_structure_signature,
 )
+from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeRole
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -75,6 +76,7 @@ class NarrativeBlock(TypedDict):
     endedAt: str | None
     outcome: NotRequired[str]
     outcomeReason: NotRequired[str]
+    outcomeRole: NotRequired[RunOutcomeRole]
 
 
 class NarrativeOutcomeAdjudication(TypedDict):

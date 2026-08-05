@@ -19,6 +19,7 @@ import {
   effectiveMode,
   formatElapsed,
   isBlockOk,
+  isInterimOutcome,
   latestBlocksByLabel,
   notConfirmedOutcome,
   parseUtcIsoMs,
@@ -353,11 +354,18 @@ function FBlockRun({
   const isRunning = block.state === "running";
   const isCompleted = block.state === "completed";
   const isEvaluating = isCompleted && block.outcome === "evaluating";
+  const isInterimNotDemonstrated =
+    isCompleted &&
+    block.outcome === "not_demonstrated" &&
+    isInterimOutcome(block.outcomeRole);
   // A row stuck in `evaluating` at turn end (dropped stream) renders the
   // neutral "ran" treatment — never the live verifying beat, never green.
   const isVerifying = isEvaluating && !turnEnded;
-  const isRanNeutral = isEvaluating && turnEnded;
-  const isOutcomeNotShown = isCompleted && block.outcome === "not_demonstrated";
+  const isRanNeutral = (isEvaluating && turnEnded) || isInterimNotDemonstrated;
+  const isOutcomeNotShown =
+    isCompleted &&
+    block.outcome === "not_demonstrated" &&
+    !isInterimNotDemonstrated;
   const isOk = isBlockOk(block);
   const isFail = block.state === "failed";
   const isDraft = block.state === "drafted";

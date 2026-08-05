@@ -7,6 +7,7 @@ import { buildRevealOffsets } from "./actionReveal";
 import {
   CopilotResponseType,
   ProposalDisposition,
+  RunOutcomeRole,
   WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotDesignEndUpdate,
   WorkflowCopilotDesignStartUpdate,
@@ -88,6 +89,10 @@ export type BlockOutcome =
   | "not_demonstrated"
   | "not_evaluated";
 
+export function isInterimOutcome(role: RunOutcomeRole | undefined): boolean {
+  return role === "interim_build_test";
+}
+
 export interface TerminalEnvelopeFacts {
   runVerdict: BlockOutcome | null;
   runDisplayReason: string | null;
@@ -122,6 +127,7 @@ export interface BlockState {
   // Undefined when no verdict was recorded (older backend or unadjudicated run).
   outcome?: BlockOutcome;
   outcomeReason?: string;
+  outcomeRole?: RunOutcomeRole;
   lastSeenIteration: number;
   // Tool calls and results emitted while this block was running are
   // appended here so the expanded card shows what the agent did.
@@ -232,6 +238,7 @@ export interface TurnNarrativeState {
   // stopped rather than Draft (accepted).
   lastRunOutcome: {
     verdict: BlockOutcome;
+    role?: RunOutcomeRole;
     displayReason: string | null;
     activitySeqAtVerdict: number;
   } | null;
@@ -797,6 +804,7 @@ export function applyNarrativeEvent(
         // either, so always keep the prior values.
         outcome: previousBlock?.outcome,
         outcomeReason: previousBlock?.outcomeReason,
+        outcomeRole: previousBlock?.outcomeRole,
         recordedActions: previousBlock?.recordedActions,
         recordedActionsAt: previousBlock?.recordedActionsAt,
         lastSeenIteration: event.iteration,
@@ -822,6 +830,7 @@ export function applyNarrativeEvent(
               ...b,
               outcome: event.verdict,
               outcomeReason: event.display_reason ?? undefined,
+              outcomeRole: event.role ?? "adjudicated",
             }
           : b,
       );
@@ -832,6 +841,7 @@ export function applyNarrativeEvent(
         // verdict from a prior run cycle within the same turn.
         lastRunOutcome: {
           verdict: event.verdict,
+          role: event.role ?? "adjudicated",
           displayReason: event.display_reason ?? null,
           activitySeqAtVerdict: prev.activitySeq,
         },
@@ -1179,6 +1189,12 @@ export function hydrateNarrativeFromPayload(
         return o;
       return undefined;
     })();
+    const outcomeRole: RunOutcomeRole | undefined =
+      outcome === undefined
+        ? undefined
+        : obj.outcomeRole === "interim_build_test"
+          ? "interim_build_test"
+          : "adjudicated";
     return {
       workflowRunBlockId:
         typeof obj.workflowRunBlockId === "string"
@@ -1187,6 +1203,7 @@ export function hydrateNarrativeFromPayload(
       label: typeof obj.label === "string" ? obj.label : "",
       blockType: typeof obj.blockType === "string" ? obj.blockType : "task",
       outcome,
+      outcomeRole,
       outcomeReason:
         typeof obj.outcomeReason === "string" ? obj.outcomeReason : undefined,
       state: ((): BlockState["state"] => {
@@ -1402,7 +1419,8 @@ export function notConfirmedOutcome(
       : null;
   }
   if (turn.lastRunOutcome !== null) {
-    return turn.lastRunOutcome.verdict === "not_demonstrated"
+    return turn.lastRunOutcome.verdict === "not_demonstrated" &&
+      !isInterimOutcome(turn.lastRunOutcome.role)
       ? {
           verdict: "not_demonstrated",
           displayReason: turn.lastRunOutcome.displayReason,
@@ -1411,7 +1429,10 @@ export function notConfirmedOutcome(
   }
   for (let i = turn.blocks.length - 1; i >= 0; i -= 1) {
     const block = turn.blocks[i]!;
-    if (block.outcome === "not_demonstrated") {
+    if (
+      block.outcome === "not_demonstrated" &&
+      !isInterimOutcome(block.outcomeRole)
+    ) {
       return {
         verdict: "not_demonstrated",
         displayReason: block.outcomeReason ?? null,

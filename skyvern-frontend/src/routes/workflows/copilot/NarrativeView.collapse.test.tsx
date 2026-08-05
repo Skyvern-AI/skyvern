@@ -63,6 +63,24 @@ const LONG_OUTCOME_REASON =
   "The verification challenge kept reappearing after submit, and each retry landed back on the same gate instead of the requested destination page.";
 const SHORT_OUTCOME_REASON = "A verification challenge prevented confirmation";
 
+const interimRunTurn = (): TurnNarrativeState => ({
+  ...inFlightTurn(),
+  blocks: [
+    {
+      ...completedBlock("block_1"),
+      outcome: "not_demonstrated",
+      outcomeRole: "interim_build_test",
+      outcomeReason: SHORT_OUTCOME_REASON,
+    },
+  ],
+  lastRunOutcome: {
+    verdict: "not_demonstrated",
+    role: "interim_build_test",
+    displayReason: SHORT_OUTCOME_REASON,
+    activitySeqAtVerdict: 0,
+  },
+});
+
 afterEach(() => {
   cleanup();
 });
@@ -123,6 +141,64 @@ describe("NarrativeView collapse default", () => {
     expect(
       screen.getByText("Waiting for the first block to start…"),
     ).toBeTruthy();
+  });
+
+  it.each([false, true])(
+    "renders an interim completed row as neutral in uxV1=%s",
+    (uxV1) => {
+      render(<NarrativeView turn={interimRunTurn()} uxV1={uxV1} />);
+
+      const row = screen.getByTitle("Highlight block_1 on canvas");
+      expect(row.textContent).toContain("ran");
+      expect(row.textContent).not.toContain("!");
+      expect(row.textContent).not.toContain("✓");
+      expect(screen.queryByText(/Outcome not confirmed/)).toBeNull();
+      expect(screen.queryByText(SHORT_OUTCOME_REASON)).toBeNull();
+    },
+  );
+
+  it.each([undefined, "adjudicated" as const])(
+    "keeps role=%s not-demonstrated rows amber",
+    (outcomeRole) => {
+      const block: BlockState = {
+        ...completedBlock("block_1"),
+        outcome: "not_demonstrated",
+        outcomeReason: SHORT_OUTCOME_REASON,
+        ...(outcomeRole ? { outcomeRole } : {}),
+      };
+      render(<NarrativeView turn={{ ...inFlightTurn(), blocks: [block] }} />);
+
+      const row = screen.getByTitle("Highlight block_1 on canvas");
+      expect(row.textContent).toContain("!");
+      expect(row.textContent).not.toContain("✓");
+      expect(screen.getByText(/Outcome not confirmed/)).toBeTruthy();
+      expect(screen.getByText(new RegExp(SHORT_OUTCOME_REASON))).toBeTruthy();
+    },
+  );
+
+  it("hydrates an interim outcome into the same neutral row treatment", () => {
+    const hydrated = hydrateNarrativeFromPayload({
+      turnId: "turn-hydrated-interim",
+      turnIndex: 0,
+      mode: "build",
+      blocks: [
+        {
+          ...completedBlock("block_1"),
+          outcome: "not_demonstrated",
+          outcomeRole: "interim_build_test",
+          outcomeReason: SHORT_OUTCOME_REASON,
+        },
+      ],
+      terminal: null,
+    })!;
+    render(<NarrativeView turn={hydrated} />);
+
+    const row = screen.getByTitle("Highlight block_1 on canvas");
+    expect(row.textContent).toContain("ran");
+    expect(row.textContent).not.toContain("!");
+    expect(row.textContent).not.toContain("✓");
+    expect(screen.queryByText(/Outcome not confirmed/)).toBeNull();
+    expect(screen.queryByText(SHORT_OUTCOME_REASON)).toBeNull();
   });
 
   it("expands via the summary card and re-collapses via the labeled control", () => {
