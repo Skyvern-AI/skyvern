@@ -219,6 +219,7 @@ from skyvern.utils.css_selector import build_action_summaries_with_timing  # sha
 from skyvern.utils.secret_headers import merge_masked_headers
 from skyvern.utils.secret_redaction import redact_console_log_bytes, redact_har_bytes
 from skyvern.utils.strings import is_uuid
+from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.browser_state import BrowserState
@@ -5534,6 +5535,36 @@ class WorkflowService:
                 exc_info=True,
             )
 
+    def _rendered_login_block_url(self, block: BlockTypeVar, workflow_run_id: str) -> str | None:
+        # The profile boot resolves the url before the block does, so mirror the block's own order: a
+        # direct parameter key, then jinja. The blocked-host check still runs downstream at navigation.
+        if not block.url:
+            return block.url
+
+        try:
+            workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+            raw_url = block.url
+            if workflow_run_context.has_parameter(raw_url) and workflow_run_context.has_value(raw_url):
+                raw_url = workflow_run_context.get_value(raw_url) or raw_url
+            rendered_url = block.format_block_parameter_template_from_workflow_run_context(
+                raw_url, workflow_run_context
+            )
+            if not rendered_url:
+                return block.url
+            # A no-op resolution stays byte-identical, except for a scheme-less value: those never boot
+            # today, so prepending the scheme the block would have added cannot change working behavior.
+            if rendered_url == block.url and rendered_url.lower().startswith(("http://", "https://")):
+                return block.url
+            return prepend_scheme_and_validate_url(rendered_url)
+        except Exception:
+            LOG.warning(
+                "Login block URL did not render for the profile boot; using the raw block URL",
+                workflow_run_id=workflow_run_id,
+                block_label=block.label,
+                exc_info=True,
+            )
+            return block.url
+
     async def _prepare_login_block_browser_profile(
         self,
         *,
@@ -5588,6 +5619,7 @@ class WorkflowService:
         # retries don't stack the browser-session prefix repeatedly.
         original_navigation_goal = block.navigation_goal
         if resolved_browser_profile_id:
+            login_url = self._rendered_login_block_url(block, workflow_run_id)
             decision = await self._evaluate_debug_session_profile_decision(
                 workflow_run=workflow_run,
                 browser_session_id=browser_session_id,
@@ -5612,11 +5644,11 @@ class WorkflowService:
                     browser_session_id=browser_session_id,
                     credential_browser_profile_id=resolved_browser_profile_id,
                 )
-                if decision.attach_browser_session_id and block.url:
+                if decision.attach_browser_session_id and login_url:
                     try:
                         await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                             workflow_run=workflow_run,
-                            url=block.url,
+                            url=login_url,
                             browser_session_id=decision.attach_browser_session_id,
                         )
                     except Exception:
@@ -5633,7 +5665,7 @@ class WorkflowService:
                     workflow_run_id=workflow_run_id,
                     block_label=block.label,
                     browser_profile_id=resolved_browser_profile_id,
-                    url=block.url,
+                    url=login_url,
                 )
                 # A prior block may already have opened this run's browser; get_or_create_for_workflow_run
                 # then returns that cached context and ignores browser_profile_id, so the credential
@@ -5685,18 +5717,18 @@ class WorkflowService:
 
                 # Create the browser with the saved profile and navigate to the login block's URL. The
                 # user enters the post-login target URL; the saved cookies authenticate once it loads.
-                profile_loaded = bool(block.url) and not browser_already_open
-                if block.url and not browser_already_open:
+                profile_loaded = bool(login_url) and not browser_already_open
+                if login_url and not browser_already_open:
                     try:
                         browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                             workflow_run=workflow_run,
-                            url=block.url,
+                            url=login_url,
                             browser_profile_id=resolved_browser_profile_id,
                             browser_session_id=decision.attach_browser_session_id,
                         )
                         working_page = await browser_state.get_working_page()
                         if working_page and working_page.url == "about:blank":
-                            await browser_state.navigate_to_url(page=working_page, url=block.url)
+                            await browser_state.navigate_to_url(page=working_page, url=login_url)
                         # Wait for the page to settle so cookies/redirects complete
                         if working_page:
                             try:
