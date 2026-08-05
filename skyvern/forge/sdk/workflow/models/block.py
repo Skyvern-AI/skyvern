@@ -5551,10 +5551,11 @@ async def wrapper({default_args}):
 
         page = await browser_state.get_working_page()
         if page is None:
-            # A session can arrive holding a context with no tab, leaving nothing to adopt. Opening
-            # one can raise even on a live context: when another Playwright client enabled autoAttach
-            # first, it owns target announcements and this connection stays blind to pages
-            # (SKY-13338) — no reconnect or retry from here can fix that.
+            # A session can arrive holding a context with no tab, leaving nothing to adopt.
+            # Opening one can still raise when the CDP path does not deliver this client the
+            # target announcement for the tab it creates (SKY-13338); the cloud CDP proxy
+            # fans announcements out to late autoAttach clients, so a failure here now
+            # points at a direct (non-proxied) multi-client connection.
             try:
                 page = await browser_state.get_or_create_page()
             except Exception as e:

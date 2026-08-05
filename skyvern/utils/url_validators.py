@@ -297,6 +297,11 @@ def _raise_if_best_effort_fetch_host_is_blocked(url: str) -> None:
     if not host:
         return
 
+    # A non-http(s) scheme is refused on scheme alone, so resolving its host decides nothing and
+    # would emit a DNS query for an attacker-supplied name on every rejected URL.
+    if parsed.scheme not in ("http", "https"):
+        return
+
     try:
         resolve_fetch_host_ips(host)
     except UnresolvableHost:
