@@ -905,7 +905,6 @@ async def test_validate_mcp_oauth_token_passes_clock_skew_leeway_to_pyjwt(
             "resource": "https://api.skyvern.com/mcp/",
             "sub": "user_123",
             "org_id": "clerk_org_jwt",
-            "org_role": "org:admin",
         }
 
     fake_db = SimpleNamespace(
@@ -1082,7 +1081,7 @@ async def test_resolve_oauth_subject_to_org_uses_explicit_org_id() -> None:
     )
 
     resolution = await mcp_http_auth._resolve_oauth_subject_to_org(
-        {"sub": "user_123", "org_id": "clerk_org_123", "org_role": "org:admin"},
+        {"sub": "user_123", "org_id": "clerk_org_123"},
         fake_db,
     )
 
@@ -1121,7 +1120,7 @@ async def test_resolve_oauth_subject_to_org_uses_organizations_repository_shape(
     )
 
     resolution = await mcp_http_auth._resolve_oauth_subject_to_org(
-        {"sub": "user_123", "org_id": "clerk_org_cloud", "org_role": "org:admin"},
+        {"sub": "user_123", "org_id": "clerk_org_cloud"},
         fake_db,
     )
 
@@ -1141,7 +1140,7 @@ async def test_resolve_oauth_subject_to_org_uses_compact_clerk_org_claim() -> No
     )
 
     resolution = await mcp_http_auth._resolve_oauth_subject_to_org(
-        {"sub": "user_123", "o": {"id": "clerk_org_compact", "rol": "admin"}},
+        {"sub": "user_123", "o": {"id": "clerk_org_compact"}},
         fake_db,
     )
 

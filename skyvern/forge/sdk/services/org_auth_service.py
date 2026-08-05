@@ -1,7 +1,7 @@
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Annotated, Any, Mapping, Sequence
+from typing import Annotated, Sequence
 
 import jwt
 import structlog
@@ -17,12 +17,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import TokenPayload
-from skyvern.forge.sdk.schemas.organizations import (
-    Organization,
-    OrganizationAuthToken,
-    OrganizationAuthTokenType,
-    OrganizationRole,
-)
+from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken, OrganizationAuthTokenType
 from skyvern.forge.sdk.workflow.models.tags import CallerType
 
 LOG = structlog.get_logger()
@@ -39,7 +34,6 @@ _SAFE_JWT_ERROR_REASONS = {
     "Signature verification failed",
     "Invalid header string: must be a json object",
 }
-ADMIN_ROLE_REQUIRED_DETAIL = "Organization administrator role required"
 
 
 @dataclass
@@ -174,78 +168,6 @@ async def get_current_org(
         organization = await authenticate_helper(authorization)
 
     if organization:
-        apply_request_org_context(organization)
-        return organization
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="Invalid credentials",
-    )
-
-
-def extract_clerk_org_id(payload: Mapping[str, Any]) -> str | None:
-    """Return the Clerk org id from either supported org-scoped JWT claim shape.
-
-    Our Clerk template uses `org_id`; Clerk's org-scoped session JWTs can also
-    expose the active organization as compact claim `o.id`. Callers that miss the
-    compact shape treat an org session as a personal account and skip role checks.
-    """
-    org_id_claim = payload.get("org_id")
-    if isinstance(org_id_claim, str) and org_id_claim:
-        return org_id_claim
-
-    compact_org_claim = payload.get("o")
-    if isinstance(compact_org_claim, dict):
-        compact_org_id = compact_org_claim.get("id")
-        if isinstance(compact_org_id, str) and compact_org_id:
-            return compact_org_id
-
-    return None
-
-
-def extract_clerk_org_role(payload: Mapping[str, Any]) -> str | None:
-    """Return the org role claim, normalizing the compact `o.rol` form to `org:<role>`."""
-    role = payload.get("org_role")
-    if isinstance(role, str):
-        return role
-
-    compact_org_claim = payload.get("o")
-    if isinstance(compact_org_claim, dict):
-        compact_role = compact_org_claim.get("rol")
-        if isinstance(compact_role, str):
-            return f"org:{compact_role.removeprefix('org:')}"
-
-    return None
-
-
-def require_org_admin_role(role: OrganizationRole | str | None) -> None:
-    if role != OrganizationRole.admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=ADMIN_ROLE_REQUIRED_DETAIL,
-        )
-
-
-def require_org_admin(organization: Organization) -> Organization:
-    require_org_admin_role(organization.role)
-    return organization
-
-
-async def get_current_admin_org(
-    x_api_key: Annotated[
-        str | None,
-        Header(
-            description="Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-        ),
-    ] = None,
-    authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
-) -> Organization:
-    """Authorize an administrator, preferring a member session while retaining API-key service authority."""
-    if authorization:
-        organization = require_org_admin(await authenticate_helper(authorization))
-        apply_request_org_context(organization)
-        return organization
-    if x_api_key:
-        organization = await get_current_org_cached(x_api_key, app.DATABASE)
         apply_request_org_context(organization)
         return organization
     raise HTTPException(
