@@ -159,6 +159,159 @@ async def test_transient_text_observer_can_observe_mutations_without_scanning_vi
 
 
 @pytest.mark.asyncio
+async def test_transient_text_observer_captures_overlay_that_animates_in_after_insertion(
+    chromium_browser: Browser,
+) -> None:
+    # Production-shaped miss: an error toast is inserted invisible and animates in (opacity 0 -> 1) with
+    # no further observed mutation, so a point-in-time visibility check at the insertion mutation drops
+    # it and it never becomes step evidence.
+    page = await chromium_browser.new_page()
+    await page.set_content(
+        """
+        <style>
+          @keyframes skyReveal { from { opacity: 0; } to { opacity: 1; } }
+          .sky-toast {
+            position: fixed; top: 10px; right: 10px; width: 240px; height: 64px;
+            animation: skyReveal 200ms linear 80ms both;
+          }
+        </style>
+        <div id="host"></div>
+        """
+    )
+    observer = TransientPageTextObserver(page)
+
+    await observer.start(scan_initial_visible_state=True)
+    await page.evaluate(
+        """
+        () => document.getElementById("host").insertAdjacentHTML(
+          "beforeend",
+          '<div class="sky-toast" role="alert">Fehlermeldung Beim Herunterladen der Datei ist ein Fehler aufgetreten. Bitte versuchen Sie es spater noch einmal.</div>'
+        )
+        """
+    )
+    await page.wait_for_timeout(700)
+    await observer.stop()
+
+    assert any(
+        "Beim Herunterladen der Datei ist ein Fehler aufgetreten" in event["text"] for event in observer.events
+    ), observer.events
+
+
+@pytest.mark.asyncio
+async def test_transient_text_observer_ignores_element_that_never_becomes_visible(
+    chromium_browser: Browser,
+) -> None:
+    # Negative coverage: a stale/hidden overlay that never becomes visible must not be captured, so a
+    # successful download (no error surfaced) or an unrelated invisible node cannot cause a false match.
+    page = await chromium_browser.new_page()
+    await page.set_content('<div id="host"></div>')
+    observer = TransientPageTextObserver(page)
+
+    await observer.start(scan_initial_visible_state=True)
+    await page.evaluate(
+        """
+        () => document.getElementById("host").insertAdjacentHTML(
+          "beforeend",
+          '<div style="position:fixed;top:10px;right:10px;width:240px;height:64px;opacity:0" role="alert">Hidden overlay text that never becomes visible</div>'
+        )
+        """
+    )
+    await page.wait_for_timeout(700)
+    await observer.stop()
+
+    assert observer.events == []
+
+
+@pytest.mark.asyncio
+async def test_transient_text_observer_captures_alert_inserted_near_an_earlier_node_deadline(
+    chromium_browser: Browser,
+) -> None:
+    # A first invisible node is admitted early; a real alert then appears ~850ms later (near the first
+    # node's recheck budget) and animates in. Each admitted node must carry its own recheck deadline, so
+    # the late alert still gets its full window instead of being dropped by a schedule shared with the
+    # earlier node.
+    page = await chromium_browser.new_page()
+    await page.set_content(
+        """
+        <style>
+          @keyframes skyLateReveal { from { opacity: 0; } to { opacity: 1; } }
+          .sky-late-toast {
+            position: fixed; top: 90px; right: 10px; width: 240px; height: 64px;
+            animation: skyLateReveal 200ms linear 250ms both;
+          }
+        </style>
+        <div id="host"></div>
+        """
+    )
+    observer = TransientPageTextObserver(page)
+
+    await observer.start(scan_initial_visible_state=True)
+    await page.evaluate(
+        """
+        () => document.getElementById("host").insertAdjacentHTML(
+          "beforeend",
+          '<div style="position:fixed;top:10px;right:10px;width:240px;height:64px;opacity:0" role="status">Earlier node that stays invisible the whole time</div>'
+        )
+        """
+    )
+    await page.wait_for_timeout(850)
+    await page.evaluate(
+        """
+        () => document.getElementById("host").insertAdjacentHTML(
+          "beforeend",
+          '<div class="sky-late-toast" role="alert">Late arriving download error alert text</div>'
+        )
+        """
+    )
+    await page.wait_for_timeout(800)
+    await observer.stop()
+
+    texts = [event["text"] for event in observer.events]
+    assert any("Late arriving download error alert text" in text for text in texts), texts
+    assert all("Earlier node that stays invisible" not in text for text in texts), texts
+
+
+@pytest.mark.asyncio
+async def test_transient_text_observer_captures_overlay_straddling_post_action_reinstall(
+    chromium_browser: Browser,
+) -> None:
+    # Mirrors the download handler lifecycle: the observer is installed before the action
+    # (scan_initial_visible_state=False), then reinstalled after the action
+    # (scan_initial_visible_state=True) before the download wait. An error overlay inserted
+    # invisible during the action, still mid animation-delay when the reinstall lands, must
+    # survive the reinstall and be captured once it animates into visibility.
+    page = await chromium_browser.new_page()
+    await page.set_content(
+        """
+        <style>
+          @keyframes skyStraddleReveal { from { opacity: 0; } to { opacity: 1; } }
+          .sky-straddle-toast {
+            position: fixed; top: 10px; right: 10px; width: 240px; height: 64px;
+            animation: skyStraddleReveal 200ms linear 250ms both;
+          }
+        </style>
+        <div id="host"></div>
+        """
+    )
+    observer = TransientPageTextObserver(page)
+
+    await observer.start(scan_initial_visible_state=False)
+    await page.evaluate(
+        """
+        () => document.getElementById("host").insertAdjacentHTML(
+          "beforeend",
+          '<div class="sky-straddle-toast" role="alert">Straddle download error alert text</div>'
+        )
+        """
+    )
+    await observer.start(scan_initial_visible_state=True)
+    await page.wait_for_timeout(700)
+    await observer.stop()
+
+    assert any("Straddle download error alert text" in event["text"] for event in observer.events), observer.events
+
+
+@pytest.mark.asyncio
 async def test_transient_text_observer_failed_reinstall_preserves_routing_and_cleanup_ownership() -> None:
     page = _FakePage()
     captured: dict[str, Any] = {}
