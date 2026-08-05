@@ -51,7 +51,7 @@ export interface CredentialRequiredFrame {
   timestamp?: string;
 }
 
-export type CredentialCardMode = "terminal" | "inline-pause";
+export type CredentialCardMode = "terminal" | "inline-pause" | "auto-bound";
 
 export type CredentialPauseOutcome = "connected" | "skipped" | "timeout";
 
@@ -86,6 +86,11 @@ export interface CredentialCardProps {
   // Bumped by the parent when a credential is created so the one-shot fetch re-runs and the new
   // credential shows up in the picker (e.g. if the resume POST failed and the ask is still live).
   reloadKey?: number;
+  // "auto-bound" mode only: the credential the turn silently bound, named in the receipt.
+  autoBound?: { credentialId: string; name: string };
+  // "auto-bound" mode only: whether the Change affordance is live (the tail turn). A scrollback
+  // receipt stays read-only so a pick can't optimistically resolve without an actual continuation.
+  canChange?: boolean;
 }
 
 const SIGN_IN_WHY_LINE =
@@ -201,6 +206,11 @@ function CredentialPicker({
   suggestedIds,
   disabled,
   onPick,
+  triggerLabel = "Use existing…",
+  triggerClassName = "h-6 w-[200px] justify-between px-3 text-xs font-normal",
+  // Popover content matches the trigger width by default; a content-width trigger (e.g. "Change")
+  // needs an explicit width here or the dropdown collapses to the label and hides its search/rows.
+  contentClassName = "w-[var(--radix-popover-trigger-width)]",
 }: {
   credentials: PickerCredential[];
   // Copilot's suggested candidates for this sign-in (only inline-pause frames carry them; terminal
@@ -208,6 +218,9 @@ function CredentialPicker({
   suggestedIds?: string[];
   disabled?: boolean;
   onPick: (credentialId: string, name: string) => void;
+  triggerLabel?: string;
+  triggerClassName?: string;
+  contentClassName?: string;
 }) {
   const [open, setOpen] = useState(false);
   const suggestedSet = new Set(suggestedIds ?? []);
@@ -245,16 +258,13 @@ function CredentialPicker({
           aria-expanded={open}
           variant="outline"
           disabled={disabled}
-          className="h-6 w-[200px] justify-between px-3 text-xs font-normal"
+          className={triggerClassName}
         >
-          <span className="truncate">Use existing…</span>
+          <span className="truncate">{triggerLabel}</span>
           <ChevronDownIcon className="ml-2 size-3 shrink-0 opacity-50" />
         </Button>
       </PopoverTrigger>
-      <PopoverContent
-        className="w-[var(--radix-popover-trigger-width)] p-0"
-        align="start"
-      >
+      <PopoverContent className={`${contentClassName} p-0`} align="start">
         <Command>
           <CommandInput placeholder="Search credentials..." />
           <CommandList>
@@ -286,6 +296,8 @@ export function CredentialCard({
   onSkip,
   continued = false,
   reloadKey,
+  autoBound,
+  canChange = false,
 }: Readonly<CredentialCardProps>) {
   // Terminal mode never expires by design: its signal carries no timeout/expiry
   // semantics at all, so there is nothing to compare "now" against. Only a
@@ -311,8 +323,11 @@ export function CredentialCard({
   // page_size 100 with no pagination — a >100-credential org shows only the 100 most-recent; older
   // ones are reachable only by creating a new credential. Add the route's `search` param if that bites.
   const isAsk = !resolvedOutcome;
+  // An auto-bound receipt only needs the org list when its Change affordance is live; a read-only
+  // scrollback receipt must not each fire its own 100-credential fetch.
+  const needsCredentialList = isAsk && (mode !== "auto-bound" || canChange);
   useEffect(() => {
-    if (!isAsk) return;
+    if (!needsCredentialList) return;
     // Generation guard: a fetch superseded by a reloadKey change (or a slow one) must not set state
     // after a newer fetch has started, so a stale response can't overwrite the current list.
     const generation = ++fetchGeneration.current;
@@ -342,7 +357,7 @@ export function CredentialCard({
         }
       }
     })();
-  }, [isAsk, reloadKey, credentialGetter]);
+  }, [needsCredentialList, reloadKey, credentialGetter]);
 
   if (resolvedOutcome) {
     switch (resolvedOutcome.outcome) {
@@ -382,6 +397,52 @@ export function CredentialCard({
         return <CredentialSystemRow text="Credential status unavailable" />;
       }
     }
+  }
+
+  if (mode === "auto-bound" && autoBound) {
+    // Change re-picks only OTHER credentials (re-picking the bound one fires a redundant continuation).
+    // When none are pickable yet — list still loading, fetch failed, or the bound one is the org's only
+    // credential — fall back to adding a new credential so a correction is always reachable.
+    const others = (orgCredentials ?? []).filter(
+      (credential) => credential.credentialId !== autoBound.credentialId,
+    );
+    return (
+      <div className="rounded-lg border border-border bg-slate-elevation2 p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-2 text-xs font-semibold text-foreground">
+            <span aria-hidden="true">🔑</span>
+            <span className="truncate" title={autoBound.name}>
+              Using credential &apos;{autoBound.name}&apos;
+            </span>
+          </div>
+          {canChange ? (
+            others.length > 0 ? (
+              <CredentialPicker
+                credentials={others}
+                onPick={(credentialId, name) => onConnect(credentialId, name)}
+                triggerLabel="Change"
+                triggerClassName="h-6 gap-1 px-2 text-xs font-medium"
+                contentClassName="w-[240px]"
+              />
+            ) : (
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => onConnect(undefined)}
+                className="h-6 flex-none px-2 text-xs font-medium"
+              >
+                Change
+              </Button>
+            )
+          ) : null}
+        </div>
+        <p className="mt-1 text-xs text-muted-foreground">
+          {canChange
+            ? "Auto-selected to sign in on your behalf — Change it if this isn't right."
+            : "Auto-selected to sign in on your behalf."}
+        </p>
+      </div>
+    );
   }
 
   const site = siteFromLoginPageUrls(frame.login_page_urls);

@@ -342,6 +342,29 @@ const terminalPromptResponse = (turnId = "turn-9") => ({
   },
 });
 
+// A turn that silently auto-bound a credential (no ask): carries credentialAutoBound, no prompt/pause.
+const terminalAutoBoundResponse = (turnId = "turn-9") => ({
+  type: "response",
+  workflow_copilot_chat_id: "chat-1",
+  message: "Signing in with your saved credential.",
+  updated_workflow: null,
+  response_time: "2026-07-13T00:00:05Z",
+  proposal_disposition: "no_proposal",
+  turn_id: turnId,
+  narrative_payload: {
+    turnId,
+    turnIndex: 0,
+    mode: "build",
+    responseType: "REPLY",
+    terminal: "response",
+    terminalMessage: "Signing in with your saved credential.",
+    narrativeSummary: "Signing in with your saved credential.",
+    startedAt: "2026-07-13T00:00:00Z",
+    endedAt: "2026-07-13T00:00:05Z",
+    credentialAutoBound: { credentialId: "cred_work", name: "Work login" },
+  },
+});
+
 // A pause that engaged but never sent a frame — no card should render.
 const terminalDeclinedResponse = (turnId = "turn-7") => ({
   type: "response",
@@ -931,6 +954,87 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
     await screen.findByTestId("mock-create-credential");
     expect(modalDefaultTestUrl.current).toBeUndefined();
   });
+
+  it("renders the auto-bind receipt from the credentialAutoBound signal", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    await renderChat();
+    await submit("sign in and grab my dashboard");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalAutoBoundResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    expect(
+      await screen.findByText("Using credential 'Work login'"),
+    ).toBeTruthy();
+  });
+
+  it("Change re-picks through the existing terminal-continue path (no third path)", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    credentialsData.current = [
+      { credential_id: "cred_work", name: "Work login", tested_url: null },
+      {
+        credential_id: "cred_personal",
+        name: "Personal login",
+        tested_url: null,
+      },
+    ];
+    await renderChat();
+    await submit("sign in and grab my dashboard");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalAutoBoundResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    expect(
+      await screen.findByText("Using credential 'Work login'"),
+    ).toBeTruthy();
+    // Open the Change picker and pick a different credential.
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Personal login" }),
+      );
+    });
+    // A fresh turn fires referencing the picked credential by id (the deterministic continue path),
+    // and NOT a typed credential-response POST — the same path a terminal ask pick uses.
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]!.body.message).toContain("cred_personal");
+    expect(streamCalls[1]!.body.message).toContain("continue");
+    expect(credentialResponsePosts()).toHaveLength(0);
+    expect(
+      await screen.findByText("Continuing with 'Personal login'…"),
+    ).toBeTruthy();
+  });
+
+  it("defers the auto-bind receipt to a co-occurring credential ask", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    await renderChat();
+    await submit("sign in to both sites");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    const base = terminalAutoBoundResponse("turn-9");
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage({
+        ...base,
+        narrative_payload: {
+          ...base.narrative_payload,
+          credentialPrompt: { reason: "credential_name_unresolved" },
+        },
+      });
+      streamCalls[0]!.resolve();
+    });
+    // The credential ask owns this turn's credential UI and its credentialResolutions entry; the
+    // auto-bind receipt defers so it can't adopt the ask's resolution.
+    expect(screen.queryByText(/Using credential/)).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Connect credential" }),
+    ).toBeTruthy();
+  });
 });
 
 describe("WorkflowCopilotChat — credential card (flag off parity)", () => {
@@ -946,5 +1050,17 @@ describe("WorkflowCopilotChat — credential card (flag off parity)", () => {
     expect(
       screen.queryByRole("button", { name: "Connect credential" }),
     ).toBeNull();
+  });
+
+  it("renders no auto-bind receipt with the flag off", async () => {
+    await renderChat();
+    await submit("sign in and grab my dashboard");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalAutoBoundResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    expect(screen.queryByText(/Using credential/)).toBeNull();
   });
 });

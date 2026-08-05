@@ -244,6 +244,9 @@ export interface TurnNarrativeState {
     outcome: "connected" | "skipped" | "timeout" | "declined";
     credentialId: string | null;
   } | null;
+  // Silently auto-bound credential, from the credentialAutoBound narrative signal — rendered as a
+  // receipt with a Change affordance so a confident-but-wrong pick can be corrected after the fact.
+  credentialAutoBound: { credentialId: string; name: string } | null;
 }
 
 export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
@@ -274,6 +277,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   lastRunOutcome: null,
   credentialPrompt: null,
   credentialPause: null,
+  credentialAutoBound: null,
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -330,6 +334,21 @@ export function parseCredentialPause(
     outcome,
     credentialId: typeof o.credentialId === "string" ? o.credentialId : null,
   };
+}
+
+export function parseCredentialAutoBound(
+  value: unknown,
+): TurnNarrativeState["credentialAutoBound"] {
+  if (!value || typeof value !== "object") return null;
+  const o = value as Record<string, unknown>;
+  const credentialId = o.credentialId;
+  const name = o.name;
+  return typeof credentialId === "string" &&
+    credentialId.length > 0 &&
+    typeof name === "string" &&
+    name.length > 0
+    ? { credentialId, name }
+    : null;
 }
 
 // Tool calls that write the workflow definition. update_workflow only
@@ -1257,6 +1276,7 @@ export function hydrateNarrativeFromPayload(
       typeof payload.endedAt === "string" ? (payload.endedAt as string) : null,
     credentialPrompt: parseCredentialPrompt(payload.credentialPrompt),
     credentialPause: parseCredentialPause(payload.credentialPause),
+    credentialAutoBound: parseCredentialAutoBound(payload.credentialAutoBound),
   };
 }
 
