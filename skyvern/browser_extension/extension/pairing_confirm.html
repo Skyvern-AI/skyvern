@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pair Skyvern Agent</title>
+    <link rel="stylesheet" href="pairing_confirm.css" />
+  </head>
+  <body data-state="loading">
+    <div class="page-shell">
+      <main class="pairing-card" aria-labelledby="pairing-title">
+        <header class="card-header">
+          <span class="brand-mark" aria-hidden="true">
+            <img src="icons/icon128.png" alt="" />
+          </span>
+          <span class="brand-copy">
+            <span class="brand-name">Skyvern Agent</span>
+          </span>
+        </header>
+
+        <div class="card-body">
+          <section class="intro">
+            <h1 id="pairing-title">Pair Skyvern Agent</h1>
+            <p id="pairing-question" class="question">
+              Loading the local pairing offer…
+            </p>
+          </section>
+
+          <div class="pairing-details" aria-label="Pairing details">
+            <div class="detail-chip">
+              <span class="detail-copy">
+                <span class="detail-label">Local server</span>
+                <code id="pairing-port">127.0.0.1:-----</code>
+              </span>
+            </div>
+
+            <div class="detail-chip">
+              <span class="detail-copy">
+                <span class="detail-label">Token fingerprint</span>
+                <code id="pairing-fingerprint">--------</code>
+              </span>
+            </div>
+          </div>
+
+          <div class="security-note">
+            <p>Confirm the fingerprint matches the local server you started.</p>
+          </div>
+
+          <div class="actions">
+            <button
+              id="cancel-button"
+              class="secondary-button"
+              type="button"
+              disabled
+            >
+              Cancel
+            </button>
+            <button
+              id="approve-button"
+              class="primary-button"
+              type="button"
+              disabled
+            >
+              <span class="spinner" aria-hidden="true"></span>
+              <span id="approve-label">Approve pairing</span>
+            </button>
+          </div>
+
+          <section
+            id="pairing-result"
+            class="result-panel"
+            role="status"
+            aria-live="polite"
+            hidden
+          >
+            <div class="result-heading">
+              <span class="result-icon" aria-hidden="true">
+                <svg
+                  class="success-icon"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2.4"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <path d="m7 12.5 3.2 3.2L17.5 8.5" />
+                </svg>
+                <svg
+                  class="error-icon"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                >
+                  <path d="M12 8v5M12 17h.01" />
+                  <circle cx="12" cy="12" r="9" />
+                </svg>
+                <svg
+                  class="neutral-icon"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                >
+                  <path d="M7 12h10" />
+                  <circle cx="12" cy="12" r="9" />
+                </svg>
+              </span>
+              <h2 id="result-title" class="result-title"></h2>
+            </div>
+            <p id="result-message" class="result-message"></p>
+            <div id="recovery" class="recovery" hidden>
+              <span class="recovery-label">Start a new pairing link</span>
+              <button
+                id="copy-command"
+                class="copy-chip"
+                type="button"
+                aria-label="Copy skyvern browser extension-pair"
+              >
+                <code id="recovery-command"
+                  >skyvern browser extension-pair</code
+                >
+                <span id="copy-label" class="copy-label">Copy</span>
+              </button>
+            </div>
+          </section>
+
+          <p class="fine-print">
+            This offer is local to your computer and can be approved once.
+          </p>
+        </div>
+      </main>
+    </div>
+    <script type="module" src="pairing_confirm.js"></script>
+  </body>
+</html>
