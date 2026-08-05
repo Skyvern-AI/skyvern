@@ -25,6 +25,7 @@ from skyvern.exceptions import (
     MissingBrowserStatePage,
 )
 from skyvern.forge import app
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.trace import traced
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
@@ -97,6 +98,8 @@ class RealBrowserState(BrowserState):
         # weakly, so a still-pending detached drain would be eligible for GC ("Task was destroyed
         # but it is pending!"); we own it strongly here until its done-callback discards it.
         self._detached_teardown_tasks: set[asyncio.Task[None]] = set()
+        # A release retry after a transient DB failure must not repeat local CDP teardown.
+        self._remote_driver_detached = False
 
     def add_on_close(self, callback: Callable[[], Awaitable[None]]) -> None:
         self._on_close_callbacks.append(callback)
@@ -199,6 +202,7 @@ class RealBrowserState(BrowserState):
     ) -> None:
         if self.browser_context is None:
             LOG.info("creating browser context")
+            context = skyvern_context.current()
             (
                 browser_context,
                 browser_artifacts,
@@ -215,6 +219,7 @@ class RealBrowserState(BrowserState):
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
+                browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
                 browser_profile_id=browser_profile_id,
                 engine_selection=self.engine_selection,
             )
@@ -640,7 +645,7 @@ class RealBrowserState(BrowserState):
             allow_transient_ui_suppression=allow_transient_ui_suppression,
         )
 
-    async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> None:
+    async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> bool:
         # ``release_driver`` decouples the local Playwright driver's lifetime
         # from the remote browser's: callers that retain this state for reuse
         # (persistent sessions, parent/child sharing) must pass False; None
@@ -657,14 +662,16 @@ class RealBrowserState(BrowserState):
         # even when interceptor disable, cookie persistence, or context close hangs or fails.
         # Worst-case wall time is the sum of the per-phase budgets:
         # BROWSER_INTERCEPTOR_DISABLE_TIMEOUT + 3 * BROWSER_CLOSE_TIMEOUT.
-        if close_browser_on_completion:
+        recording_finalized = False
+        if close_browser_on_completion or release_driver:
             if self.browser_context is not None:
                 await self._run_bounded_detachable(
                     disable_download_interceptor_for_context(self.browser_context),
                     BROWSER_INTERCEPTOR_DISABLE_TIMEOUT,
                     "download interceptor disable",
                 )
-            await self._run_bounded_detachable(
+        if close_browser_on_completion:
+            recording_finalized = await self._run_bounded_detachable(
                 self._teardown_context(),
                 BROWSER_CLOSE_TIMEOUT,
                 "browser context teardown",
@@ -672,8 +679,30 @@ class RealBrowserState(BrowserState):
             await self._run_browser_cleanup_bounded()
 
         await self._stop_driver_bounded(release_driver)
+        return recording_finalized
 
-    async def _run_bounded_detachable(self, coro: Awaitable[None], timeout: float, description: str) -> None:
+    async def detach_remote_driver(self) -> None:
+        """Release this process's adopted-remote resources without closing the remote browser.
+
+        Unlike ``close(..., release_driver=True)``, failures propagate so the persistent-session
+        owner can leave database occupancy intact. The operation is idempotent: a successful
+        interceptor disable removes its context binding, while a successful Playwright stop is
+        recorded locally for a release retry that only needs to finish the database CAS.
+        """
+        if self._remote_driver_detached:
+            return
+        if self.browser_context is not None:
+            interceptor = getattr(self.browser_context, "_skyvern_cdp_download_interceptor", None)
+            if interceptor is not None:
+                await interceptor.disable()
+                if getattr(self.browser_context, "_skyvern_cdp_download_interceptor", None) is interceptor:
+                    self.browser_context._skyvern_cdp_download_interceptor = None  # type: ignore[attr-defined]
+        if self.pw is not None:
+            async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+                await self.pw.stop()
+        self._remote_driver_detached = True
+
+    async def _run_bounded_detachable(self, coro: Awaitable[None], timeout: float, description: str) -> bool:
         # Bound a teardown phase WITHOUT relying on cancellation: a stuck download drain or a real
         # Playwright ``context.close`` blocked by an unresolved paused request can ignore the cancel a
         # plain ``asyncio.timeout`` delivers. We race the phase against ``timeout`` and, if it does not
@@ -695,12 +724,14 @@ class RealBrowserState(BrowserState):
             )
             task.cancel()
             self._own_detached_task(task, description)
-            return
+            return False
         if task.cancelled():
-            return
+            return False
         error = task.exception()
         if error is not None:
             LOG.warning("Teardown phase failed", phase=description, error_type=type(error).__name__)
+            return False
+        return True
 
     def _own_detached_task(self, task: asyncio.Task[None], description: str) -> None:
         # A cancellation-resistant phase can outlive close(). We hold a strong reference until it
@@ -738,10 +769,7 @@ class RealBrowserState(BrowserState):
             await persist_session_cookies(self.browser_context, session_dir)
         except Exception:
             LOG.warning("Failed to persist session cookies during teardown", exc_info=True)
-        try:
-            await self.browser_context.close()
-        except Exception:
-            LOG.warning("Failed to close browser context", exc_info=True)
+        await self.browser_context.close()
         LOG.info("Main browser context and all its pages are closed")
 
     async def _run_browser_cleanup_bounded(self) -> None:

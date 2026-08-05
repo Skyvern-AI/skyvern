@@ -18,6 +18,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_primary_llm_api_handler
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
@@ -941,7 +942,7 @@ async def generate_cua_fallback_actions(
         assistant_reasoning=reasoning,
     )
 
-    action_response = await app.LLM_API_HANDLER(
+    action_response = await get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)(
         prompt=fallback_action_prompt,
         prompt_name="cua-fallback-action",
         step=step,

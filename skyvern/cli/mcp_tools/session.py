@@ -215,6 +215,10 @@ async def skyvern_browser_session_create(
                 generate_browser_profile=generate_browser_profile,
                 local=local,
                 headless=headless,
+                # Keep the MCP process from claiming the session's initial page.
+                # Code blocks connect through the backend's persistent-session manager,
+                # so an MCP-side CDP connection here can leave that manager with zero pages.
+                connect_browser=local,
             )
             timer.mark("sdk")
 
@@ -228,7 +232,7 @@ async def skyvern_browser_session_create(
                 )
             set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=_session_api_key_hash()))
 
-            app_url = browser.app_url
+            app_url = result.app_url if browser is None else browser.app_url
 
         except ValueError as e:
             return make_result(
@@ -312,6 +316,7 @@ async def skyvern_browser_session_close(
     """
     current = get_current_session()
     await drain_action_log_events()
+    closed_id: str | None = None
 
     with Timer() as timer:
         try:
@@ -332,10 +337,9 @@ async def skyvern_browser_session_close(
                 except Exception as e:
                     close_error = e
 
-                if matching_cloud_session:
-                    if current.browser is None:
-                        set_current_session(SessionState())
-                        raise RuntimeError("Expected active browser for matching cloud session")
+                # A cloud session connects its browser lazily, so the matching session may
+                # have no local browser to tear down.
+                if matching_cloud_session and current.browser is not None:
                     try:
                         await current.browser.close()
                     except Exception as browser_err:
@@ -354,6 +358,23 @@ async def skyvern_browser_session_close(
 
                 timer.mark("sdk")
                 recording_data = await _fetch_session_recording_data(skyvern, session_id)
+                return make_result(
+                    "skyvern_browser_session_close",
+                    data=_session_close_data(result.session_id, result.closed, recording_data),
+                    timing_ms=timer.timing_ms,
+                )
+
+            if current.browser is None and current.context and current.context.session_id:
+                skyvern = get_skyvern()
+                closed_id = current.context.session_id
+                try:
+                    result = await do_session_close(skyvern, closed_id)
+                finally:
+                    clear_session_ref_map(session_id=closed_id)
+                    delete_session_trajectories(closed_id)
+                    set_current_session(SessionState())
+                timer.mark("sdk")
+                recording_data = await _fetch_session_recording_data(skyvern, closed_id)
                 return make_result(
                     "skyvern_browser_session_close",
                     data=_session_close_data(result.session_id, result.closed, recording_data),

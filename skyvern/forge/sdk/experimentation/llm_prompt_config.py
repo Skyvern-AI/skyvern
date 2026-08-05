@@ -7,12 +7,20 @@ import structlog
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.core import skyvern_context
 
 LOG = structlog.get_logger()
 
 
+def _org_defaults_suppress_experiments() -> bool:
+    context = skyvern_context.current()
+    return context is not None and bool(context.org_default_llm_key or context.org_default_secondary_llm_key)
+
+
 async def get_llm_config_by_prompt_type(distinct_id: str, organization_id: str | None = None) -> dict[str, str] | None:
     """Return PostHog-configured LLM mapping for each prompt type."""
+    if _org_defaults_suppress_experiments():
+        return None
     llm_config_experiment = await app.EXPERIMENTATION_PROVIDER.get_value_cached(
         "LLM_CONFIG_BY_PROMPT_TYPE", distinct_id, properties={"organization_id": organization_id}
     )
@@ -100,6 +108,9 @@ async def get_check_user_goal_llm_override(
     distinct_id: str, organization_id: str | None = None
 ) -> LLMAPIHandler | None:
     """Resolve the CHECK_USER_GOAL_LLM_NAME multivariate flag to an LLM handler."""
+    if _org_defaults_suppress_experiments():
+        return None
+
     try:
         variant = await app.EXPERIMENTATION_PROVIDER.get_value_cached(
             "CHECK_USER_GOAL_LLM_NAME",

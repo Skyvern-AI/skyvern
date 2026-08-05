@@ -436,6 +436,24 @@ async def resolve_browser(
             raise RuntimeError("Expected active browser and context for matching session")
         return current.browser, current.context
 
+    # Cloud sessions created by the MCP session tool intentionally do not open a
+    # second CDP connection. Connect lazily when a browser tool is used; this
+    # leaves the initial page available to the backend persistent-session manager
+    # for code-only workflow runs.
+    if (
+        current.browser is None
+        and current.context is not None
+        and current.context.mode == "cloud_session"
+        and current.context.session_id
+        and session_id is None
+        and cdp_url is None
+        and not local
+        and _hashes_equal(current.api_key_hash, _api_key_hash(get_active_api_key()))
+    ):
+        connected_browser = await skyvern.connect_to_cloud_browser_session(current.context.session_id)
+        current.browser = connected_browser
+        return connected_browser, current.context
+
     active_api_key_hash = _api_key_hash(get_active_api_key())
 
     # Check copilot session registry (cross-task fallback when ContextVar

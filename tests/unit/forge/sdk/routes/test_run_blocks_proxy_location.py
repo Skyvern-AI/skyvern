@@ -26,6 +26,7 @@ def _app_mock() -> MagicMock:
     app_mock.WORKFLOW_SERVICE.create_empty_workflow = AsyncMock(return_value=_workflow_stub())
     app_mock.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(return_value=_workflow_stub())
     app_mock.DATABASE.credentials.get_credential = AsyncMock(return_value=SimpleNamespace(totp_identifier=None))
+    app_mock.RATE_LIMITER.rate_limit_submit_run = AsyncMock()
     return app_mock
 
 

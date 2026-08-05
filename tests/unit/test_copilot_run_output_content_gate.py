@@ -28,6 +28,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _is_unfinished_run_verification_candidate,
     _record_run_blocks_result,
     _run_blocks_structured_blocker_message,
+    _tool_loop_error,
     run_execution,
 )
 from skyvern.forge.sdk.copilot.tools._shared import _registered_output_parameter_payloads
@@ -973,6 +974,64 @@ async def test_inline_registered_output_identity_uses_runtime_override_when_pers
     assert [item["output_parameter_id"] for item in data["registered_output_parameter_values"]] == ["op_runtime"]
 
 
+@pytest.mark.asyncio
+async def test_inline_prior_draft_registered_output_identity_uses_snapshot_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_get_workflow_run_output_parameters(*, workflow_run_id: str) -> list[SimpleNamespace]:
+        assert workflow_run_id == "wr_inline_snapshot"
+        return [
+            SimpleNamespace(
+                workflow_run_id="wr_inline_snapshot",
+                output_parameter_id="op_snapshot",
+                value={"record_number": "1234567890"},
+            )
+        ]
+
+    monkeypatch.setattr(
+        run_execution.app.DATABASE,
+        "workflow_runs",
+        SimpleNamespace(get_workflow_run_output_parameters=fake_get_workflow_run_output_parameters),
+    )
+
+    def workflow(output_parameter_id: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            organization_id="o",
+            workflow_definition=SimpleNamespace(
+                blocks=[
+                    SimpleNamespace(
+                        label="extract_record",
+                        block_type="CODE",
+                        output_parameter=SimpleNamespace(
+                            output_parameter_id=output_parameter_id,
+                            key="extract_record_output",
+                        ),
+                    )
+                ]
+            ),
+        )
+
+    runtime_workflow = workflow("op_runtime")
+    snapshot_workflow = workflow("op_snapshot")
+    output_identity_workflow = run_execution._registered_output_identity_workflow(
+        dispatch_to_worker=False,
+        dispatch_workflow=snapshot_workflow,  # type: ignore[arg-type]
+        runtime_workflow=runtime_workflow,  # type: ignore[arg-type]
+    )
+    data: dict[str, Any] = {"workflow_run_id": "wr_inline_snapshot", "blocks": []}
+
+    by_label = await _attach_registered_output_parameter_values(
+        workflow_run_id="wr_inline_snapshot",
+        workflow=runtime_workflow,  # type: ignore[arg-type]
+        output_identity_workflow=output_identity_workflow,
+        data=data,
+    )
+
+    assert output_identity_workflow is snapshot_workflow
+    assert by_label == {"extract_record": {"extract_record_output": {"record_number": "1234567890"}}}
+    assert [item["output_parameter_id"] for item in data["registered_output_parameter_values"]] == ["op_snapshot"]
+
+
 def test_satisfied_completion_prevents_empty_output_suspicious_success() -> None:
     result = _empty_extraction_run_result()
     ctx = _ctx(result["data"]["blocks"])
@@ -1401,3 +1460,60 @@ def test_present_value_upgrade_flips_lone_judge_unknown_to_demonstrated_on_ok_ru
     assert outcome_fully_verified(ctx) is True
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_full_workflow_test_ok is True
+
+
+def _failed_code_block_run_result(error_code: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_test",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "run_code",
+                    "block_type": "CODE",
+                    "status": "failed",
+                    "failure_reason": "Secure CodeBlock runner is unavailable. Please retry.",
+                    "error_codes": [error_code],
+                }
+            ],
+        },
+    }
+
+
+@pytest.mark.parametrize("error_code", sorted(run_execution.INFRASTRUCTURE_RUNNER_ERROR_CODES))
+def test_infrastructure_runner_code_prepends_unrecoverable_tool_error(error_code: str) -> None:
+    result = _failed_code_block_run_result(error_code)
+    ctx = _ctx(result["data"]["blocks"])
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    categories = result["data"]["failure_categories"]
+    assert categories[0]["category"] == "UNRECOVERABLE_TOOL_ERROR"
+    assert ctx.last_failure_category_top == "UNRECOVERABLE_TOOL_ERROR"
+    assert ctx.last_infrastructure_tool_error == error_code
+
+
+@pytest.mark.parametrize("error_code", ["timeout", "user_code_error", "insecure_code_detected"])
+def test_repairable_runner_code_injects_no_unrecoverable_category(error_code: str) -> None:
+    result = _failed_code_block_run_result(error_code)
+    ctx = _ctx(result["data"]["blocks"])
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    categories = result["data"].get("failure_categories") or []
+    assert all(entry.get("category") != "UNRECOVERABLE_TOOL_ERROR" for entry in categories)
+    assert ctx.last_failure_category_top != "UNRECOVERABLE_TOOL_ERROR"
+    assert ctx.last_infrastructure_tool_error is None
+
+
+def test_pre_run_sandbox_refusal_leaves_the_within_turn_guard_disarmed() -> None:
+    result = run_execution._copilot_sandbox_unavailable_result()
+    ctx = _ctx()
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    assert result["data"]["workflow_run_id"] is None
+    assert ctx.last_failure_category_top == "UNRECOVERABLE_TOOL_ERROR"
+    assert ctx.last_infrastructure_tool_error is None
+    assert _tool_loop_error(ctx, "edit_block") is None

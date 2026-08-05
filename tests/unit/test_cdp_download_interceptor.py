@@ -1847,23 +1847,11 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
     .zip while reporting the download as successful.
     """
 
-    _URLOPEN = "urllib.request.urlopen"
+    _URLOPEN = "skyvern.webeye.cdp_download_interceptor._urlopen_single_hop"
 
     @staticmethod
     def _fake_urlopen(body: bytes, content_type: str) -> MagicMock:
-        class _Resp:
-            headers = {"content-type": content_type}
-
-            def read(self) -> bytes:
-                return body
-
-            def __enter__(self) -> "_Resp":
-                return self
-
-            def __exit__(self, *exc: object) -> bool:
-                return False
-
-        return MagicMock(return_value=_Resp())
+        return MagicMock(return_value=(200, {"content-type": content_type}, body))
 
     @staticmethod
     def _context_forcing_urllib(cookies: list[dict]) -> MagicMock:
@@ -1876,6 +1864,20 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
         ctx.request.get = AsyncMock(return_value=non_ok)
         ctx.cookies = AsyncMock(return_value=cookies)
         return ctx
+
+    @pytest.fixture(autouse=True)
+    def _resolvable_site_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Keep this class's ``site.example`` fixtures off real DNS now destinations are checked."""
+        import socket
+
+        real_getaddrinfo = socket.getaddrinfo
+
+        def fake_getaddrinfo(host: str, port: object = None, *args: object, **kwargs: object) -> list:
+            if host == "site.example":
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 0))]
+            return real_getaddrinfo(host, port, *args, **kwargs)
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
 
     _LOGIN_HTML = (
         b'\n<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN">\n'
@@ -1897,10 +1899,6 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
 
         sent_request = urlopen.call_args.args[0]
         assert sent_request.get_header("Cookie") == "ASP.NET_SessionId=sess123; auth=tok"
-        # The cookie must be an unredirected header so urllib does not replay it across a cross-host
-        # redirect (session-cookie leak): urllib copies req.headers on redirect, not unredirected_hdrs.
-        assert "Cookie" not in sent_request.headers
-        assert sent_request.unredirected_hdrs.get("Cookie") == "ASP.NET_SessionId=sess123; auth=tok"
         saved = list(tmp_path.iterdir())
         assert [p.name for p in saved] == ["statement.zip"]
         assert saved[0].read_bytes() == zip_bytes
@@ -2765,3 +2763,136 @@ class TestTwoPathDownloadStreaming:
 
         assert _only_file(tmp_path).read_bytes() == b"P" * 2000  # file saved despite the benign fulfill race
         assert not [log for log in logs if log.get("log_level") == "error"]
+
+
+class TestDownloadDestinationValidation:
+    """A download URL is chosen by the page, so it must be checked against the destination rules
+    before the worker fetches it — on the initial URL and on every redirect hop, and on both the
+    Playwright and urllib transports."""
+
+    @staticmethod
+    def _context(request_context: object | None = None, cookies: list[dict] | None = None) -> MagicMock:
+        ctx = MagicMock()
+        if request_context is None:
+            # Non-OK forces _download_url_directly onto its urllib transport.
+            non_ok = MagicMock()
+            non_ok.ok = False
+            non_ok.status = 407
+            ctx.request.get = AsyncMock(return_value=non_ok)
+        else:
+            ctx.request = request_context
+        ctx.cookies = AsyncMock(return_value=cookies or [])
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_playwright_transport_refuses_internal_destination(
+        self, tmp_path: Path, download_destinations: Any, fake_api_request_context: Any
+    ) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context(fake_api_request_context())
+
+        await interceptor._download_url_directly(f"{download_destinations.internal_base}/internal", "statement.pdf")
+
+        assert download_destinations.reached_internal() is False
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_playwright_transport_refuses_redirect_hop_to_internal_destination(
+        self, tmp_path: Path, download_destinations: Any, fake_api_request_context: Any
+    ) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context(fake_api_request_context())
+
+        await interceptor._download_url_directly(
+            f"{download_destinations.public_base}/redirect-to-internal", "statement.pdf"
+        )
+
+        assert download_destinations.reached_internal() is False
+        saved = list(tmp_path.iterdir())
+        assert [path.read_bytes() for path in saved] == []
+
+    @pytest.mark.asyncio
+    async def test_urllib_transport_refuses_internal_destination(
+        self, tmp_path: Path, download_destinations: Any
+    ) -> None:
+        # No browser context, so the urllib transport is entered directly and owns the initial
+        # destination check itself rather than inheriting one from the Playwright transport.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = None
+
+        await interceptor._download_url_directly(f"{download_destinations.internal_base}/internal", "statement.pdf")
+
+        assert download_destinations.reached_internal() is False
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_urllib_transport_refuses_redirect_hop_to_internal_destination(
+        self, tmp_path: Path, download_destinations: Any
+    ) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context(cookies=[{"name": "sess", "value": "tok"}])
+
+        await interceptor._download_url_directly(
+            f"{download_destinations.public_base}/redirect-to-internal", "statement.pdf"
+        )
+
+        assert download_destinations.reached_internal() is False
+        saved = list(tmp_path.iterdir())
+        assert [path.read_bytes() for path in saved] == []
+
+    @pytest.mark.asyncio
+    async def test_allowed_destination_still_downloads(
+        self, tmp_path: Path, download_destinations: Any, fake_api_request_context: Any
+    ) -> None:
+        # Non-vacuity: the harness must be able to complete a download that is not refused,
+        # otherwise the refusal assertions above would pass for the wrong reason.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context(fake_api_request_context())
+
+        await interceptor._download_url_directly(f"{download_destinations.public_base}/attachment", "statement.pdf")
+
+        saved = list(tmp_path.iterdir())
+        assert [path.name for path in saved] == ["statement.pdf"]
+        assert saved[0].read_bytes() == download_destinations.PUBLIC_BODY
+
+    @pytest.mark.asyncio
+    async def test_urllib_transport_drops_session_cookie_on_cross_origin_hop(
+        self, tmp_path: Path, download_destinations: Any
+    ) -> None:
+        # The session cookie belongs to the host the download started on. A hop to a different
+        # origin — permitted or not — must not replay it.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context(cookies=[{"name": "sess", "value": "tok"}])
+
+        await interceptor._download_url_directly(
+            f"{download_destinations.public_base}/redirect-to-other", "statement.pdf"
+        )
+
+        assert download_destinations.cookies_by_path["public-host.test"] == "sess=tok"
+        assert download_destinations.cookies_by_path["other-host.test"] == ""
+        saved = list(tmp_path.iterdir())
+        assert [path.name for path in saved] == ["statement.pdf"]
+
+    @pytest.mark.asyncio
+    async def test_urllib_transport_reads_content_type_case_insensitively(
+        self, tmp_path: Path, download_destinations: Any
+    ) -> None:
+        # Servers send "Content-Type"; the extension for a suffix-less download comes from it.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = None
+
+        await interceptor._download_url_directly(f"{download_destinations.public_base}/attachment", "statement")
+
+        assert [path.name for path in tmp_path.iterdir()] == ["statement.pdf"]
+
+    @pytest.mark.asyncio
+    async def test_urllib_transport_does_not_save_an_error_response_body(
+        self, tmp_path: Path, download_destinations: Any
+    ) -> None:
+        # An error page is not the file. Saving its body would report a corrupt download as success.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = None
+
+        await interceptor._download_url_directly(f"{download_destinations.public_base}/notfound", "statement.pdf")
+
+        assert list(tmp_path.iterdir()) == []

@@ -99,6 +99,7 @@ function bucketActivity(designActivity: ActivityEntry[]): {
   explore: ActivityEntry[];
   draft: ActivityEntry[];
   test: ActivityEntry[];
+  authoringSeen: boolean;
 } {
   const explore: ActivityEntry[] = [];
   const draft: ActivityEntry[] = [];
@@ -118,7 +119,7 @@ function bucketActivity(designActivity: ActivityEntry[]): {
     }
     (authoringSeen ? draft : explore).push(entry);
   }
-  return { explore, draft, test };
+  return { explore, draft, test, authoringSeen };
 }
 
 function lastAuthoringToolName(
@@ -193,6 +194,7 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
     explore,
     draft: draftEntries,
     test,
+    authoringSeen,
   } = bucketActivity(turn.designActivity);
   const lastAuthoring = lastAuthoringToolName(turn.designActivity);
   const latestBlocks = latestBlocksByLabel(turn.blocks).filter(
@@ -201,12 +203,18 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
   const testReached =
     latestBlocks.length > 0 ||
     (turn.designEnded && lastAuthoring === "update_and_run_blocks");
+  // Explore completes only on recorded authoring (authoringCount live /
+  // authoringSeen after hydration resets the client-only count) or a run.
+  // draftingSignaledAt can fire on a mid-scout pause and designEnded is forced
+  // true at every terminal, so neither completes Explore mid-turn; turn.draft
+  // resolves the phases only at a healthy, non-cancelled response terminal.
   const draftReached =
     turn.authoringCount > 0 ||
-    turn.draft !== null ||
-    turn.designEnded ||
-    turn.draftingSignaledAt !== null ||
-    testReached;
+    authoringSeen ||
+    testReached ||
+    (turn.terminal === "response" &&
+      turn.cancelled !== true &&
+      turn.draft !== null);
 
   const running = turn.blocks.some(
     (b) => b.state === "running" || b.state === "queued",

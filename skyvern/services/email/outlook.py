@@ -37,7 +37,8 @@ _OTP_EXCLUDED_FOLDER_IDS_STATE_KEY = "otp_excluded_folder_ids"
 _OTP_MAILBOX_IDENTITIES_STATE_KEY = "otp_mailbox_identities"
 _SAFE_EMAIL_IDENTIFIER = SAFE_EMAIL_ADDRESS_PATTERN
 _OTP_KEYWORD_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9])(?:verification|verify|code|passcode|otp|2fa|one(?:[\s-]+)time|password)(?![A-Za-z0-9])",
+    r"(?<![A-Za-z0-9])(?:verification|verify|code|passcode|otp|2fa|one(?:[\s-]+)time|password|"
+    r"sign(?:[\s-]+)in|signin|log(?:[\s-]+)in|login|(?:magic|access)(?:[\s-]+)link)(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 # Only EOP-stripped headers are trusted for recipient matching.

@@ -42,6 +42,7 @@ from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOT_
 from skyvern.forge.sdk.copilot.request_slots import (
     CanonicalRequestSlotV1,
     RequestSlotAntecedentFamily,
+    RequestSlotCandidateRefutationV1,
     RequestSlotDatumBindingDeclarationV1,
     RequestSlotDatumDeclineDeclarationV1,
     RequestSlotDatumTargetV1,
@@ -51,6 +52,7 @@ from skyvern.forge.sdk.copilot.request_slots import (
     RequestSlotPlane,
     RequestSlotProducerInputV1,
     canonicalize_request_slots,
+    request_slot_contracts_agree,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -328,6 +330,11 @@ def _anchor_only_envelope(
             )
             for source_quote in ("confirmation number", "account number", "selected start date", "deposit amount")
         ),
+        # The recorded anchor-only shape predates the candidate obligation; the omitted requested
+        # field must now be answered, and a refutation is that answer for this fixture.
+        candidate_refutations=(
+            RequestSlotCandidateRefutationV1(candidate="next owner", reason="anchor-only recorded shape omitted it"),
+        ),
     )
 
 
@@ -361,6 +368,7 @@ async def test_independent_request_slot_producer_recovers_primary_classifier_omi
                 antecedent_family=RequestSlotAntecedentFamily.BLOCKER,
             ),
         ),
+        candidate_refutations=_water_refutations(),
     )
     calls: list[str] = []
 
@@ -445,6 +453,23 @@ def _semantically_identical_anchor_correction() -> dict[str, Any]:
             }
         )
     return corrected
+
+
+_WATER_SERVICE_CANDIDATES = (
+    "confirmation number",
+    "account number",
+    "selected start date",
+    "deposit amount",
+    "next owner",
+)
+
+
+def _water_refutations(*covered: str) -> tuple[RequestSlotCandidateRefutationV1, ...]:
+    return tuple(
+        RequestSlotCandidateRefutationV1(candidate=candidate, reason="recorded shape omitted it")
+        for candidate in _WATER_SERVICE_CANDIDATES
+        if candidate not in covered
+    )
 
 
 def _example_water_service_envelope() -> RequestSlotEnvelopeV1:
@@ -1418,7 +1443,11 @@ async def test_invalid_anchor_only_claim_gets_one_correction() -> None:
     ]
     corrected = _synthetic_anchor_only_payload()
     corrected["completion_criteria"] = [corrected["completion_criteria"][0]]
-    envelope = RequestSlotEnvelopeV1(version="1", slots=(_anchor_only_envelope().slots[0],))
+    envelope = RequestSlotEnvelopeV1(
+        version="1",
+        slots=(_anchor_only_envelope().slots[0],),
+        candidate_refutations=_water_refutations("confirmation number"),
+    )
 
     async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
         calls.append(prompt_name)
@@ -1695,6 +1724,7 @@ async def test_p8_admitted_source_fixture_mints_ordered_decidable_canonical_slot
         latest_assistant_turn="",
         retained_history=(),
         global_context="",
+        detected_output_candidates=request_policy_module._detected_output_candidates(P8_QUICKCONNECT_REQUEST),
         datum_targets=tuple(
             RequestSlotDatumTargetV1(
                 criterion_index=index,
@@ -2296,6 +2326,12 @@ async def test_primary_self_asserted_binding_is_replaced_by_two_pass_producer_co
                 pinability=RequestSlotPinability.SHAPELESS_VALID,
                 antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
             ),
+        ),
+        candidate_refutations=(
+            RequestSlotCandidateRefutationV1(candidate="request id", reason="recorded shape omitted it"),
+            RequestSlotCandidateRefutationV1(candidate="provider-captured address", reason="recorded shape omitted it"),
+            RequestSlotCandidateRefutationV1(candidate="requested date", reason="recorded shape omitted it"),
+            RequestSlotCandidateRefutationV1(candidate="status", reason="recorded shape omitted it"),
         ),
     )
 
@@ -2924,7 +2960,11 @@ async def test_recorded_confirmation_runs_reach_same_run_plane_terminal() -> Non
         corrected = _semantically_identical_anchor_correction()
         corrected["completion_criteria"] = corrected["completion_criteria"][2:5]
         envelope = _example_water_service_envelope()
-        recorded_envelope = RequestSlotEnvelopeV1(version="1", slots=envelope.slots[:3])
+        recorded_envelope = RequestSlotEnvelopeV1(
+            version="1",
+            slots=envelope.slots[:3],
+            candidate_refutations=_water_refutations("confirmation number", "account number", "selected start date"),
+        )
         request_policy_calls = 0
 
         async def classify_handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
@@ -3565,3 +3605,96 @@ def test_requested_output_mint_state_treats_value_present_as_decidable() -> None
     # A shapeless criterion with no typed shape still degrades.
     assert _requested_output_mint_state(None, None, None) == ("decidable", None)
     assert _requested_output_mint_state(None, "status_label", None) == ("degraded", "undecidable_judgment")
+
+
+_CANDIDATE_MESSAGE = "Go to the dashboard and output the number of visitors in the last 7 days."
+
+
+def _candidate_input() -> RequestSlotProducerInputV1:
+    return RequestSlotProducerInputV1(
+        version="1",
+        latest_request=_CANDIDATE_MESSAGE,
+        workflow_context="",
+        earliest_user_turn="",
+        latest_prior_user_turn="",
+        latest_assistant_turn="",
+        retained_history=(),
+        global_context="",
+        detected_output_candidates=("visitors",),
+    )
+
+
+def test_an_unaddressed_detected_candidate_is_reported_and_still_yields_a_contract() -> None:
+    # A producer that stays silent on a detected candidate is worth knowing about, but refusing the
+    # envelope costs the whole slot contract and every criterion in it — a live directory request
+    # lost all of its paths that way, and the only thing proven was the silence.
+    contract = canonicalize_request_slots(
+        request=_candidate_input(),
+        envelope=RequestSlotEnvelopeV1(version="1", slots=()),
+    )
+
+    assert contract.count == 0
+
+
+def test_refuted_candidate_is_a_valid_empty_contract_and_rides_the_contract() -> None:
+    contract = canonicalize_request_slots(
+        request=_candidate_input(),
+        envelope=RequestSlotEnvelopeV1(
+            version="1",
+            slots=(),
+            candidate_refutations=(
+                RequestSlotCandidateRefutationV1(
+                    candidate="visitors", reason="describes a page section, not a requested value"
+                ),
+            ),
+        ),
+    )
+    assert contract.count == 0
+    assert [refutation.candidate for refutation in contract.candidate_refutations] == ["visitors"]
+
+
+def test_slot_anchored_on_the_candidate_satisfies_completeness() -> None:
+    contract = canonicalize_request_slots(
+        request=_candidate_input(),
+        envelope=RequestSlotEnvelopeV1(
+            version="1",
+            slots=(
+                RequestSlotDeclarationV1(
+                    source_id="u0",
+                    source_quote="output the number of visitors in the last 7 days",
+                    plane=RequestSlotPlane.RUN,
+                    pinability=RequestSlotPinability.SHAPELESS_VALID,
+                    antecedent_family=RequestSlotAntecedentFamily.UNDECIDABLE,
+                ),
+            ),
+        ),
+    )
+    assert contract.count == 1
+    assert contract.candidate_refutations == ()
+
+
+def test_refutation_of_an_undetected_candidate_is_invalid() -> None:
+    with pytest.raises(ValueError):
+        canonicalize_request_slots(
+            request=_request_slot_input(_CANDIDATE_MESSAGE),
+            envelope=RequestSlotEnvelopeV1(
+                version="1",
+                slots=(),
+                candidate_refutations=(RequestSlotCandidateRefutationV1(candidate="visitors", reason="not requested"),),
+            ),
+        )
+
+
+def test_contracts_that_differ_only_in_refutations_do_not_agree() -> None:
+    def _contract(reason: str) -> Any:
+        return canonicalize_request_slots(
+            request=_candidate_input(),
+            envelope=RequestSlotEnvelopeV1(
+                version="1",
+                slots=(),
+                candidate_refutations=(RequestSlotCandidateRefutationV1(candidate="visitors", reason=reason),),
+            ),
+        )
+
+    assert request_slot_contracts_agree(_contract("reason one"), _contract("reason one"))
+    assert not request_slot_contracts_agree(_contract("reason one"), _contract("reason two"))

@@ -69,7 +69,21 @@ function renderAt(entry: string) {
   );
 }
 
-describe("RunRouter workflow-run branch", () => {
+function expectCenteredLoadingIndicator() {
+  const logo = screen.getByAltText("Minimized Logo");
+  const pulse = logo.parentElement;
+  const wrapper = pulse?.parentElement;
+
+  expect(screen.getByRole("status").textContent).toContain("Loading");
+  expect(pulse?.classList.contains("animate-pulse")).toBe(true);
+  expect(wrapper?.classList.contains("flex")).toBe(true);
+  expect(wrapper?.classList.contains("h-screen")).toBe(true);
+  expect(wrapper?.classList.contains("w-full")).toBe(true);
+  expect(wrapper?.classList.contains("items-center")).toBe(true);
+  expect(wrapper?.classList.contains("justify-center")).toBe(true);
+}
+
+describe("RunRouter", () => {
   beforeEach(() => {
     mocks.studioEnabled.mockReturnValue(true);
     mocks.taskV2.mockReturnValue({ data: undefined, isLoading: false });
@@ -86,7 +100,14 @@ describe("RunRouter workflow-run branch", () => {
   test("studio on: shows the fetching treatment while the run resolves", () => {
     mocks.runQuery.mockReturnValue({ data: undefined, isLoading: true });
     renderAt("/runs/wr_1");
-    expect(screen.getByText("Fetching run details...")).toBeTruthy();
+    expectCenteredLoadingIndicator();
+    expect(screen.queryByTestId("studio")).toBeNull();
+  });
+
+  test("task v2: shows the centered loading indicator while the task resolves", () => {
+    mocks.taskV2.mockReturnValue({ data: undefined, isLoading: true });
+    renderAt("/runs/tsk_v2_1");
+    expectCenteredLoadingIndicator();
     expect(screen.queryByTestId("studio")).toBeNull();
   });
 
@@ -101,7 +122,7 @@ describe("RunRouter workflow-run branch", () => {
       isLoading: false,
     });
     renderAt("/runs/wr_1");
-    expect(screen.getByText("Fetching run details...")).toBeTruthy();
+    expectCenteredLoadingIndicator();
     expect(screen.queryByTestId("studio")).toBeNull();
   });
 
@@ -141,7 +162,7 @@ describe("RunRouter workflow-run branch", () => {
     });
     renderAt("/runs/wr_1");
     expect(screen.queryByTestId("studio")).toBeNull();
-    expect(screen.queryByText("Fetching run details...")).toBeNull();
+    expect(screen.queryByAltText("Minimized Logo")).toBeNull();
     expect(screen.queryByTestId("legacy")).toBeNull();
   });
 
@@ -156,6 +177,6 @@ describe("RunRouter workflow-run branch", () => {
     });
     renderAt("/runs/wr_1");
     expect(screen.getByTestId("studio").textContent).toBe("studio:wpid_123");
-    expect(screen.queryByText("Fetching run details...")).toBeNull();
+    expect(screen.queryByAltText("Minimized Logo")).toBeNull();
   });
 });

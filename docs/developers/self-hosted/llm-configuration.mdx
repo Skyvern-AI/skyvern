@@ -1,10 +1,12 @@
 ---
 title: LLM Configuration
 subtitle: Connect your preferred language model provider
-description: Configure LLM providers for self-hosted Skyvern including OpenAI, Anthropic, Azure OpenAI, Google Gemini, AWS Bedrock, Ollama, and OpenAI-compatible endpoints via LiteLLM.
+description: Configure LLM providers for self-hosted Skyvern including OpenAI, xAI Grok, Anthropic, Azure OpenAI, Google Gemini, AWS Bedrock, Ollama, and OpenAI-compatible endpoints via LiteLLM.
 slug: developers/self-hosted/llm-configuration
 keywords:
   - OpenAI
+  - xAI
+  - Grok
   - Anthropic
   - Azure OpenAI
   - Google Gemini
@@ -38,6 +40,7 @@ For most deployments, configure a single provider using `LLM_KEY`. Skyvern also 
 |----------|--------------|-----------------|-------|
 | **Anthropic** | `ANTHROPIC_CLAUDE4.7_OPUS` | `ANTHROPIC_CLAUDE4.6_SONNET` | Most capable |
 | **OpenAI** | `OPENAI_GPT5_5` | `OPENAI_GPT5_4` | Latest |
+| **xAI** | `XAI_GROK_4_5` | `XAI_GROK_4_5` | Grok 4.5 |
 | **Google** | `GEMINI_3_PRO` | `GEMINI_3.0_FLASH` | Latest |
 | **AWS Bedrock** | `BEDROCK_ANTHROPIC_CLAUDE4.7_OPUS_INFERENCE_PROFILE` | `BEDROCK_ANTHROPIC_CLAUDE4.6_SONNET_INFERENCE_PROFILE` | Latest Claude |
 
@@ -89,6 +92,34 @@ OPENAI_API_BASE=https://your-proxy.com/v1
 
 # Specify organization ID
 OPENAI_ORGANIZATION=org-...
+```
+
+---
+
+## xAI Grok
+
+Grok models from [x.ai](https://x.ai/api). Requires an xAI API key.
+
+```bash .env
+ENABLE_XAI=true
+XAI_API_KEY=xai-...
+LLM_KEY=XAI_GROK_4_5
+```
+
+### Available models
+
+| LLM_KEY | Notes |
+|---------|-------|
+| `XAI_GROK_4_5` | Grok 4.5 for coding, agentic tasks, and general chat |
+
+### Optional settings
+
+```bash .env
+# Override the default API endpoint
+XAI_API_BASE=https://api.x.ai/v1
+
+# Supported values: low, medium, high. Unset to use xAI's default.
+XAI_REASONING_EFFORT=medium
 ```
 
 ---

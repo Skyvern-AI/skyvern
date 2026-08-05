@@ -141,6 +141,12 @@ class TestPrependSchemeAndValidateUrl:
         with pytest.raises(InvalidUrl):
             prepend_scheme_and_validate_url("not a valid url at all!!!")
 
+    @pytest.mark.parametrize("url", ["http://[", "http://[::1", "https://]"])
+    def test_malformed_ipv6_raises_invalid_url_not_value_error(self, url):
+        """Unterminated IPv6 literals make stdlib urlparse raise ValueError; it must surface as InvalidUrl."""
+        with pytest.raises(InvalidUrl):
+            prepend_scheme_and_validate_url(url)
+
 
 class TestEncodeUrlEdgeCases:
     """Edge case tests for encode_url."""

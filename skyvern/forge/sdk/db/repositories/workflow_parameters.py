@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import defer
 
@@ -1143,6 +1143,8 @@ class WorkflowParametersRepository(BaseRepository):
                 screenshot_artifact_id=action.screenshot_artifact_id,
                 action_json=raw_action_payload,
                 confidence_float=action.confidence_float,
+                started_at=action.started_at,
+                finished_at=action.finished_at,
                 created_by=action.created_by,
             )
             session.add(new_action)
@@ -1178,12 +1180,10 @@ class WorkflowParametersRepository(BaseRepository):
             "screenshot_artifact_id": action.screenshot_artifact_id,
             "action_json": action.model_dump(),
             "confidence_float": action.confidence_float,
+            "started_at": action.started_at,
+            "finished_at": action.finished_at,
             "created_by": action.created_by,
         }
-        if action.created_at is not None:
-            values["created_at"] = action.created_at
-        if action.modified_at is not None:
-            values["modified_at"] = action.modified_at
         async with self.Session() as session:
             stmt = pg_insert(ActionModel).values(**values)
             stmt = stmt.on_conflict_do_update(
@@ -1191,6 +1191,10 @@ class WorkflowParametersRepository(BaseRepository):
                 set_={
                     "screenshot_artifact_id": stmt.excluded.screenshot_artifact_id,
                     "action_json": stmt.excluded.action_json,
+                    # coalesce: an upsert writer that carries no execution timestamps must
+                    # never overwrite real stamps with NULL.
+                    "started_at": func.coalesce(stmt.excluded.started_at, ActionModel.started_at),
+                    "finished_at": func.coalesce(stmt.excluded.finished_at, ActionModel.finished_at),
                     "modified_at": stmt.excluded.modified_at,
                 },
             )

@@ -50,6 +50,7 @@ const baseWorkflow = {
   enable_self_healing: false,
   adaptive_caching: null,
   code_version: null,
+  mask_secrets: false,
   run_sequentially: false,
   sequential_key: null,
   folder_id: null,

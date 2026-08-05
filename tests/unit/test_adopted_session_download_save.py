@@ -88,7 +88,7 @@ async def test_save_as_raises_target_closed_falls_back_to_refetch(tmp_path) -> N
 
     assert saved is not None and saved.exists()
     assert saved.read_bytes() == PDF_BODY
-    page.context.request.get.assert_awaited_once_with(download.url)
+    page.context.request.get.assert_awaited_once_with(download.url, max_redirects=0)
 
 
 @pytest.mark.asyncio
@@ -105,7 +105,7 @@ async def test_zero_byte_save_as_falls_back_to_refetch(tmp_path) -> None:
 
     assert saved is not None and saved.exists()
     assert saved.read_bytes() == PDF_BODY
-    page.context.request.get.assert_awaited_once_with(download.url)
+    page.context.request.get.assert_awaited_once_with(download.url, max_redirects=0)
     # the empty placeholder must not survive alongside the recovered file
     assert sorted(p.name for p in tmp_path.iterdir()) == [saved.name]
 
@@ -249,11 +249,18 @@ async def test_blob_url_in_page_fetch_returns_not_ok(tmp_path) -> None:
     failing_frame = _frame(BLOB_ORIGIN_FRAME_URL, evaluate_return={"ok": False, "status": 0})
     page = _blob_capable_page(failing_frame)
 
-    saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+    # The live-blob-iframe recovery seam runs after the download-url read fails and would issue its
+    # own DOM probe; stub it out so this test isolates the download-url in-page fetch behavior.
+    with patch(
+        "skyvern.webeye.actions.handler._recover_adopted_session_blob_pdf_iframe",
+        new=AsyncMock(return_value=None),
+    ) as recover:
+        saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
 
     assert saved is None
     page.context.request.get.assert_not_awaited()
     failing_frame.evaluate.assert_awaited_once()
+    recover.assert_awaited_once_with(page, download, "wr")
     assert list(tmp_path.iterdir()) == []
 
 
@@ -264,11 +271,18 @@ async def test_blob_url_evaluate_raises_returns_none(tmp_path) -> None:
     raising_frame = _frame(BLOB_ORIGIN_FRAME_URL, evaluate_return=Exception("frame detached"))
     page = _blob_capable_page(raising_frame)
 
-    saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+    # The live-blob-iframe recovery seam runs after the download-url read fails and would issue its
+    # own DOM probe; stub it out so this test isolates the download-url in-page fetch behavior.
+    with patch(
+        "skyvern.webeye.actions.handler._recover_adopted_session_blob_pdf_iframe",
+        new=AsyncMock(return_value=None),
+    ) as recover:
+        saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
 
     assert saved is None
     page.context.request.get.assert_not_awaited()
     raising_frame.evaluate.assert_awaited_once()
+    recover.assert_awaited_once_with(page, download, "wr")
     assert list(tmp_path.iterdir()) == []
 
 
@@ -669,6 +683,63 @@ async def test_eager_capture_aclose_reraises_outer_cancellation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_retention_teardown_runs_even_when_aclose_is_cancelled() -> None:
+    """If closing the eager capture raises CancelledError, the page-realm retention wrapper must still
+    be torn down for an adopted session, and the original cancellation must propagate afterwards."""
+    from skyvern.webeye.actions.handler import _close_eager_capture_then_teardown_retention
+
+    capture = MagicMock()
+    capture.aclose = AsyncMock(side_effect=asyncio.CancelledError())
+    page = MagicMock()
+
+    with patch("skyvern.webeye.actions.handler.teardown_blob_url_retention", AsyncMock()) as teardown:
+        with pytest.raises(asyncio.CancelledError):
+            await _close_eager_capture_then_teardown_retention(
+                capture, page, browser_session_id="pbs-1", workflow_run_id="wr"
+            )
+
+    teardown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_retention_teardown_failure_does_not_replace_cancellation() -> None:
+    """A teardown failure stays fail-open/debug-only and must not swallow or replace the original
+    cancellation raised by aclose."""
+    from skyvern.webeye.actions.handler import _close_eager_capture_then_teardown_retention
+
+    capture = MagicMock()
+    capture.aclose = AsyncMock(side_effect=asyncio.CancelledError())
+    page = MagicMock()
+
+    with patch(
+        "skyvern.webeye.actions.handler.teardown_blob_url_retention",
+        AsyncMock(side_effect=RuntimeError("teardown boom")),
+    ) as teardown:
+        with pytest.raises(asyncio.CancelledError):
+            await _close_eager_capture_then_teardown_retention(
+                capture, page, browser_session_id="pbs-1", workflow_run_id="wr"
+            )
+
+    teardown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_retention_teardown_skipped_without_browser_session() -> None:
+    """Non-adopted sessions never installed the retention wrapper, so teardown must not run."""
+    from skyvern.webeye.actions.handler import _close_eager_capture_then_teardown_retention
+
+    capture = MagicMock()
+    capture.aclose = AsyncMock()
+    page = MagicMock()
+
+    with patch("skyvern.webeye.actions.handler.teardown_blob_url_retention", AsyncMock()) as teardown:
+        await _close_eager_capture_then_teardown_retention(capture, page, browser_session_id=None, workflow_run_id="wr")
+
+    capture.aclose.assert_awaited_once()
+    teardown.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_read_adopted_session_blob_bytes_prefers_owner_then_fans_out() -> None:
     """The extracted reader returns the first page that owns the blob, owner (download.page) first."""
     download = _download(url=BLOB_URL)
@@ -714,3 +785,62 @@ async def test_read_adopted_session_blob_bytes_oversized_returns_none() -> None:
         AsyncMock(return_value=None),
     ):
         assert await _read_adopted_session_blob_bytes(download, click_page, workflow_run_id="wr") is None
+
+
+@pytest.fixture(autouse=True)
+def _resolvable_example_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the module's ``example.com`` fixtures off real DNS once destinations are checked."""
+    import socket
+
+    real_getaddrinfo = socket.getaddrinfo
+
+    def fake_getaddrinfo(host: str, port: object = None, *args: object, **kwargs: object) -> list:
+        if host == "example.com":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 0))]
+        return real_getaddrinfo(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+
+@pytest.mark.asyncio
+async def test_refetch_refuses_internal_destination(tmp_path, download_destinations, fake_api_request_context) -> None:
+    download = _download(url=f"{download_destinations.internal_base}/internal")
+    download.save_as.side_effect = Exception("Target page, context or browser has been closed")
+    page = _page_with_refetch()
+    page.context.request = fake_api_request_context()
+
+    saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+
+    assert saved is None
+    assert download_destinations.reached_internal() is False
+    assert all(path.read_bytes() != download_destinations.INTERNAL_BODY for path in tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_refetch_refuses_redirect_hop_to_internal_destination(
+    tmp_path, download_destinations, fake_api_request_context
+) -> None:
+    download = _download(url=f"{download_destinations.public_base}/redirect-to-internal")
+    download.save_as.side_effect = Exception("Target page, context or browser has been closed")
+    page = _page_with_refetch()
+    page.context.request = fake_api_request_context()
+
+    saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+
+    assert saved is None
+    assert download_destinations.reached_internal() is False
+    assert all(path.read_bytes() != download_destinations.INTERNAL_BODY for path in tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_refetch_allows_permitted_destination(tmp_path, download_destinations, fake_api_request_context) -> None:
+    # Non-vacuity: a permitted destination must still round-trip through the re-fetch path.
+    download = _download(url=f"{download_destinations.public_base}/attachment")
+    download.save_as.side_effect = Exception("Target page, context or browser has been closed")
+    page = _page_with_refetch()
+    page.context.request = fake_api_request_context()
+
+    saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+
+    assert saved is not None and saved.exists()
+    assert saved.read_bytes() == download_destinations.PUBLIC_BODY

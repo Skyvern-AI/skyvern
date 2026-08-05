@@ -423,9 +423,10 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlo
 
     blocks_update = tool_name in WORKFLOW_MUTATION_TOOLS and not authority.may_update_workflow
     blocks_run = tool_name in BLOCK_RUNNING_TOOLS and not authority.may_run_blocks
-    blocks_page_inspection = tool_name in PAGE_SCHEMA_CONTEXT_TOOLS and (
-        intent.mode in NO_MUTATION_TURN_INTENT_MODES or not authority.may_update_workflow
-    )
+    # Authority, not mode membership: every other NO_MUTATION mode already resolves to
+    # may_update_workflow False, so keying on the mode too only ever blocked a diagnose turn that
+    # had earned write authority — the one case where inspecting the page is the point.
+    blocks_page_inspection = tool_name in PAGE_SCHEMA_CONTEXT_TOOLS and not authority.may_update_workflow
     blocks_credential_metadata = tool_name in CREDENTIAL_METADATA_TOOLS and not (
         authority.may_update_workflow or authority.may_run_blocks
     )

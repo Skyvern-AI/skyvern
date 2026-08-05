@@ -108,6 +108,8 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
+_MODEL_TIMESTAMP_FIELDS = frozenset({"started_at", "finished_at", "created_at", "modified_at"})
+
 
 def summarize_copilot_chat_title(content: str, max_length: int = 120) -> str:
     # Collapse the opening message to one line so multi-line prompts read cleanly in the history dropdown.
@@ -456,6 +458,8 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
         bw_organization_id=org_model.bw_organization_id,
         bw_collection_ids=org_model.bw_collection_ids,
         artifact_url_expiry_seconds=org_model.artifact_url_expiry_seconds,
+        default_llm_key=org_model.default_llm_key,
+        default_secondary_llm_key=org_model.default_secondary_llm_key,
         created_at=org_model.created_at,
         modified_at=org_model.modified_at,
     )
@@ -561,6 +565,7 @@ def convert_to_workflow(
         totp_verification_url=workflow_model.totp_verification_url,
         totp_identifier=workflow_model.totp_identifier,
         persist_browser_session=workflow_model.persist_browser_session,
+        mask_secrets=workflow_model.mask_secrets,
         pin_saved_session_ip=workflow_model.pin_saved_session_ip,
         browser_profile_id=workflow_model.browser_profile_id,
         browser_profile_key=workflow_model.browser_profile_key,
@@ -840,6 +845,7 @@ def convert_to_workflow_run_block(
         output=workflow_run_block_model.output,
         continue_on_failure=workflow_run_block_model.continue_on_failure,
         failure_reason=workflow_run_block_model.failure_reason,
+        final_url=workflow_run_block_model.final_url,
         error_codes=workflow_run_block_model.error_codes or [],
         engine=workflow_run_block_model.engine,
         task_id=workflow_run_block_model.task_id,
@@ -961,14 +967,16 @@ def hydrate_action(action_model: ActionModel, empty_element_id: bool = False) ->
         "skyvern_element_hash": action_model.skyvern_element_hash,
         "skyvern_element_data": action_model.skyvern_element_data,
         "screenshot_artifact_id": action_model.screenshot_artifact_id,
+        "started_at": action_model.started_at,
+        "finished_at": action_model.finished_at,
         "created_at": action_model.created_at,
         "modified_at": action_model.modified_at,
     }
 
-    # Merge with action_json data, skipping None values
+    model_timestamp_fields = _MODEL_TIMESTAMP_FIELDS
     if action_model.action_json:
         for key, value in action_model.action_json.items():
-            if value is not None:
+            if value is not None and key not in model_timestamp_fields:
                 action_data[key] = value
 
     # Get the appropriate action class and instantiate it. Fall back to base Action on
@@ -1013,6 +1021,8 @@ def _hydrate_as_base_action(action_data: dict[str, typing.Any], action_model: Ac
             "workflow_run_id": action_model.workflow_run_id,
             "task_id": action_model.task_id,
             "step_id": action_model.step_id,
+            "started_at": action_model.started_at,
+            "finished_at": action_model.finished_at,
             "created_at": action_model.created_at,
             "modified_at": action_model.modified_at,
         }

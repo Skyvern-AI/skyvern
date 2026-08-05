@@ -756,20 +756,27 @@ class TestPollOtpValueRetry:
     ) -> None:
         mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
         mock_email.return_value = None
-        otp = OTPValue(value="123456", type=OTPType.TOTP)
+        otp = OTPValue(value="https://auth.example.test/magic", type=OTPType.MAGIC_LINK)
         mock_db.return_value = otp
 
         result = await poll_otp_value(
             organization_id="o_test",
             task_id="tsk_test",
+            workflow_id="w_test",
             workflow_run_id="wr_test",
             workflow_permanent_id="wpid_test",
-            totp_identifier="otp@example.com",
+            totp_identifier="otp@example.test",
+            expected_otp_type=OTPType.MAGIC_LINK,
         )
 
         assert result == otp
         mock_email.assert_awaited_once()
         mock_db.assert_awaited_once()
+        assert mock_email.await_args is not None
+        assert mock_db.await_args is not None
+        assert mock_email.await_args.kwargs["workflow_id"] == "w_test"
+        assert mock_email.await_args.kwargs["expected_otp_type"] == OTPType.MAGIC_LINK
+        assert mock_db.await_args.kwargs["workflow_id"] == "w_test"
 
     @pytest.mark.asyncio
     @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)

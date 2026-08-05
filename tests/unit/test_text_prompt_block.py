@@ -11,6 +11,7 @@ import skyvern.forge.sdk.workflow.models.block as _block_mod
 from skyvern.config import settings as base_settings
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import TextPromptBlock
@@ -57,6 +58,28 @@ def _make_text_prompt_block(
         ),
         model=None,
     )
+
+
+def test_block_llm_key_ignores_ambient_org_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        block_module.skyvern_context,
+        "current",
+        lambda: SkyvernContext(org_default_llm_key="CUSTOM_LLM_oat_smart"),
+    )
+
+    assert _make_text_prompt_block().override_llm_key_for_organization("o_test") is None
+
+
+def test_block_explicit_llm_key_wins_over_org_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        block_module.skyvern_context,
+        "current",
+        lambda: SkyvernContext(org_default_llm_key="CUSTOM_LLM_oat_smart"),
+    )
+    block = _make_text_prompt_block()
+    block.llm_key = "EXPLICIT_BLOCK_LLM_KEY"
+
+    assert block.override_llm_key_for_organization("o_test") == "EXPLICIT_BLOCK_LLM_KEY"
 
 
 @pytest.mark.asyncio
@@ -1039,6 +1062,17 @@ def test_workflow_request_deserialization_strips_invalid_text_prompt_llm_key() -
     workflow_request = WorkflowRequest.model_validate(raw_request)
 
     block = workflow_request.json_definition.workflow_definition.blocks[0]
+    assert block.llm_key is None
+    assert block.model is None
+
+
+def test_text_prompt_yaml_rejects_raw_custom_llm_key() -> None:
+    block = TextPromptBlockYAML(
+        label="summarize",
+        prompt="Summarize the result",
+        llm_key="CUSTOM_LLM_oat_unverified",
+    )
+
     assert block.llm_key is None
     assert block.model is None
 

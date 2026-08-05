@@ -304,8 +304,8 @@ class _Recorder:
             raise
         finally:
             duration_ms = int((time.monotonic() - started) * 1000)
-            action.created_at = started_wall
-            action.modified_at = naive_utc_now()
+            action.started_at = started_wall
+            action.finished_at = naive_utc_now()
             if isinstance(action.output, dict):
                 action.output["duration_ms"] = duration_ms
             self.actions.append(action)

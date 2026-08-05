@@ -27,6 +27,7 @@ const startNodeData: WorkflowStartNodeData = {
   scriptCacheKey: null,
   aiFallback: true,
   enableSelfHealing: false,
+  maskSecrets: false,
   runSequentially: false,
   sequentialKey: null,
   finallyBlockLabel: null,
@@ -98,6 +99,10 @@ vi.mock("@/components/KeyValueInput", () => ({
 
 vi.mock("@/components/TestWebhookDialog", () => ({
   TestWebhookDialog: () => <div data-testid="test-webhook-dialog" />,
+}));
+
+vi.mock("@/components/HelpTooltip", () => ({
+  HelpTooltip: ({ content }: { content: string }) => <span>{content}</span>,
 }));
 
 vi.mock("@/routes/workflows/hooks/useResetProfileMutation", () => ({
@@ -230,5 +235,26 @@ describe("WorkflowSettingsEditor browser profile key field", () => {
         ) as HTMLTextAreaElement
       ).value,
     ).toBe("{{ credential_id }}");
+  });
+});
+
+describe("WorkflowSettingsEditor mask secrets setting", () => {
+  test("renders the pinned tooltip and updates maskSecrets", () => {
+    renderSettings();
+
+    const label = screen.getByText("Mask Secrets");
+    expect(
+      screen.getByText(
+        "Visually mask secrets while they are typed, so they do not appear in screenshots, recordings, or the live browser view. Turning this on can make login debugging harder because typed values are hidden.",
+      ),
+    ).toBeDefined();
+
+    const toggle = label.parentElement?.querySelector('button[role="switch"]');
+    expect(toggle).not.toBeNull();
+    fireEvent.click(toggle!);
+
+    expect(mockUpdateNodeData).toHaveBeenCalledWith("start", {
+      maskSecrets: true,
+    });
   });
 });

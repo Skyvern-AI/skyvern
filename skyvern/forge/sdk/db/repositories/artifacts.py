@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import datetime
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
 from sqlalchemy import and_, delete, func, or_, select, update
@@ -76,6 +76,37 @@ class ArtifactsRepository(BaseRepository):
             await session.commit()
             await session.refresh(new_artifact)
             return convert_to_artifact(new_artifact, self.debug_enabled)
+
+    @db_operation("update_artifact_uri")
+    async def update_artifact_uri(
+        self,
+        artifact_id: str,
+        organization_id: str,
+        uri: str,
+        file_size: int | None = None,
+    ) -> Artifact | None:
+        update_values: dict[str, Any] = {"uri": uri}
+        if file_size is not None:
+            update_values["file_size"] = file_size
+
+        async with self.Session() as session:
+            query = (
+                update(ArtifactModel)
+                .where(
+                    ArtifactModel.artifact_id == artifact_id,
+                    ArtifactModel.organization_id == organization_id,
+                )
+                .values(**update_values)
+                .returning(ArtifactModel)
+            )
+            artifact = await session.scalar(query)
+            if artifact is None:
+                return None
+            # Read the row before committing: commit expires the instance, and the
+            # refetch it would trigger runs outside the async greenlet context.
+            converted = convert_to_artifact(artifact, self.debug_enabled)
+            await session.commit()
+            return converted
 
     @traced(name="skyvern.db.bulk_create_artifacts")
     @db_operation("bulk_create_artifacts")

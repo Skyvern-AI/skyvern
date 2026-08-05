@@ -201,6 +201,8 @@ class OrganizationModel(Base):
         Boolean, default=False, nullable=False, server_default=sqlalchemy.false()
     )
     selfheal_artifact_retention_days = Column(Integer, nullable=True)
+    default_llm_key = Column(String, nullable=True)
+    default_secondary_llm_key = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -594,6 +596,7 @@ class WorkflowModel(SoftDeleteMixin, Base):
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
     persist_browser_session = Column(Boolean, default=False, nullable=False)
+    mask_secrets = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     pin_saved_session_ip = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     browser_profile_id = Column(String, nullable=True)
     browser_profile_key = Column(String, nullable=True)
@@ -1136,6 +1139,8 @@ class ActionModel(Base):
     confidence_float = Column(Numeric, nullable=True)
     screenshot_artifact_id = Column(String, nullable=True)
 
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     created_by = Column(String, nullable=True)
@@ -1162,6 +1167,9 @@ class WorkflowRunBlockModel(Base):
     output = Column(JSON, nullable=True)
     continue_on_failure = Column(Boolean, nullable=False, default=False)
     failure_reason = Column(String, nullable=True)
+    # Page URL at the moment the block failed. Distinct from the task's target url, which is
+    # where the block was aimed rather than where it ended up.
+    final_url = Column(String, nullable=True)
     error_codes = Column(JSON, nullable=True)
     engine = Column(String, nullable=True)
 
@@ -1316,8 +1324,11 @@ class PersistentBrowserSessionModel(Base):
         ),
         # The orphan sweep (SKY-13158) is deliberately cross-organization, so it matches neither
         # index above. The partial predicate is what does the work: it restricts the index to live
-        # vendor-held rows, a small subset, which is why plain column keys are enough even though
-        # the sweep orders by COALESCE(last_activity_at, started_at).
+        # rows of the shape the sweep can identify from this table alone, a small subset, which is
+        # why plain column keys are enough even though the sweep orders by
+        # COALESCE(last_activity_at, started_at). Rows whose provider is recorded elsewhere are not
+        # identifiable by shape and are swept off that table's own index instead — a partial
+        # predicate cannot reference another table's columns.
         # Do NOT "fix" the keys to that COALESCE expression: alembic cannot reliably compare
         # expression-based indexes, so an expression key here reads as drift and fails `alembic
         # check`. Its postgresql_where is never compared, so the partial predicate is safe.
@@ -1336,6 +1347,7 @@ class PersistentBrowserSessionModel(Base):
     organization_id = Column(String, nullable=False, index=True)
     runnable_type = Column(String, nullable=True)
     runnable_id = Column(String, nullable=True, index=True)
+    runnable_generation_id = Column(String, nullable=True)
     browser_id = Column(String, nullable=True)
     browser_address = Column(String, nullable=True, unique=True)
     status = Column(String, nullable=True, default="created")

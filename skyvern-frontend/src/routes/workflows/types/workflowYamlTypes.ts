@@ -31,6 +31,7 @@ export type WorkflowCreateYAMLRequest = {
   enable_self_healing?: boolean;
   adaptive_caching?: boolean;
   code_version?: number | null;
+  mask_secrets?: boolean | null;
   run_sequentially?: boolean;
   sequential_key?: string | null;
   folder_id?: string | null;

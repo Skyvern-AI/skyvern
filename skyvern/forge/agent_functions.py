@@ -33,6 +33,8 @@ from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AzureClientFactory
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
+from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.cache.base import CACHE_EXPIRE_TIME
 from skyvern.forge.sdk.copilot.config import CopilotConfig, block_authoring_policy_from_code_only_mode
@@ -49,6 +51,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     NonEmptyPasswordCredential,
     SecretCredential,
 )
+from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.services import (
@@ -76,6 +79,7 @@ if TYPE_CHECKING:
     from playwright.async_api import BrowserContext
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+    from skyvern.forge.sdk.schemas.totp_codes import OTPType
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
@@ -114,6 +118,25 @@ def running_in_packaged_deployment() -> bool:
 USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
 SVG_SHAPE_CONVERTION_ATTEMPTS = 3
 CSS_SHAPE_CONVERTION_ATTEMPTS = 1
+
+
+def _get_org_aware_svg_css_converter_llm_api_handler() -> LLMAPIHandler | None:
+    default_handler = app.SVG_CSS_CONVERTER_LLM_API_HANDLER
+    if default_handler is not None:
+        return get_org_aware_secondary_llm_api_handler(default=default_handler)
+    context = skyvern_context.current()
+    if context is not None and context.org_default_secondary_llm_key:
+        return get_org_aware_secondary_llm_api_handler()
+    return None
+
+
+def _svg_css_converter_llm_api_handler_available() -> bool:
+    if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is not None:
+        return True
+    context = skyvern_context.current()
+    return context is not None and bool(context.org_default_secondary_llm_key)
+
+
 INVALID_SHAPE = "N/A"
 DISABLE_SVG_CONVERT_CACHE_RESILIENCE_FLAG = "DISABLE_SVG_CONVERT_CACHE_RESILIENCE"
 SVG_LOCAL_CACHE_MAX_ITEMS = 4096
@@ -158,6 +181,14 @@ class CopilotSiteOriginAssociation:
     source: str
     provider_relation_type: str
     provider_relation_text: str
+
+
+@dataclass(frozen=True)
+class ScriptExecutionPolicyDecision:
+    allowed: bool
+    selection_reason: str
+    flag_value: bool | None = None
+    env_force_on: bool = False
 
 
 class CopilotCandidateNetworkHop(TypedDict):
@@ -551,6 +582,7 @@ async def _convert_svg_to_string(
     *,
     svg_html: str | None = None,
     svg_key: str | None = None,
+    llm_api_handler: LLMAPIHandler | None = None,
 ) -> None:
     """Convert an SVG element to a string description. Assumes element has already passed eligibility checks."""
     element_id = element.get("id", "")
@@ -586,13 +618,15 @@ async def _convert_svg_to_string(
 
             LOG.debug("call LLM to convert SVG to string shape", element_id=element_id)
             svg_convert_prompt = prompt_engine.load_prompt("svg-convert", svg_element=svg_html)
+            if llm_api_handler is None:
+                llm_api_handler = _get_org_aware_svg_css_converter_llm_api_handler()
 
             for retry in range(SVG_SHAPE_CONVERTION_ATTEMPTS):
                 try:
                     async with asyncio.timeout(_LLM_CALL_TIMEOUT_SECONDS):
-                        if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None:
+                        if llm_api_handler is None:
                             raise Exception("To enable svg shape conversion, please set the Secondary LLM key")
-                        json_response = await app.SVG_CSS_CONVERTER_LLM_API_HANDLER(
+                        json_response = await llm_api_handler(
                             prompt=svg_convert_prompt, step=step, prompt_name="svg-convert"
                         )
                     svg_shape = json_response.get("shape", "")
@@ -671,6 +705,8 @@ async def _convert_css_shape_to_string(
     element: dict,
     task: Task | None = None,
     step: Step | None = None,
+    *,
+    llm_api_handler: LLMAPIHandler | None = None,
 ) -> None:
     element_id: str = element.get("id", "")
 
@@ -744,14 +780,16 @@ async def _convert_css_shape_to_string(
                 engine_selection=skyvern_frame.engine_selection,
             )
             prompt = prompt_engine.load_prompt("css-shape-convert")
+            if llm_api_handler is None:
+                llm_api_handler = _get_org_aware_svg_css_converter_llm_api_handler()
 
             # TODO: we don't retry the css shape conversion today
             for retry in range(CSS_SHAPE_CONVERTION_ATTEMPTS):
                 try:
                     async with asyncio.timeout(_LLM_CALL_TIMEOUT_SECONDS):
-                        if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None:
+                        if llm_api_handler is None:
                             raise Exception("To enable css shape conversion, please set the Secondary LLM key")
-                        json_response = await app.SVG_CSS_CONVERTER_LLM_API_HANDLER(
+                        json_response = await llm_api_handler(
                             prompt=prompt, screenshots=[screenshot], step=step, prompt_name="css-shape-convert"
                         )
                     css_shape = json_response.get("shape", "")
@@ -873,6 +911,23 @@ class AgentFunction:
     ) -> str | None:
         return browser_address
 
+    async def supports_live_view(self, browser_session_id: str, *, ip_address: str | None) -> bool:
+        """Whether this session's browser runs somewhere that can serve a live view stream.
+
+        Always yes here: a self-hosted deployment runs every browser itself.
+        """
+        return True
+
+    async def select_browser_session_recordings(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        recordings: list[FileInfo],
+        browser_vendor: str | None = None,
+    ) -> list[FileInfo]:
+        return recordings
+
     def get_flex_llm_key(self, llm_key: str | None) -> str | None:
         """Return a flex-tier router key for the given LLM key, or None if no flex twin exists.
 
@@ -992,6 +1047,17 @@ class AgentFunction:
         only routes runs that have a browser session for the runner to broker against.
         """
         return False
+
+    async def resolve_in_process_script_execution_policy(
+        self,
+        *,
+        organization_id: str | None,
+        workflow_run_id: str | None,
+        workflow_permanent_id: str | None = None,
+        workflow_id: str | None = None,
+        script_id: str | None = None,
+    ) -> ScriptExecutionPolicyDecision:
+        return ScriptExecutionPolicyDecision(allowed=True, selection_reason="oss_default")
 
     async def should_auto_create_browser_session_for_code_block(
         self,
@@ -1167,6 +1233,9 @@ class AgentFunction:
         """
         return None
 
+    def get_mcp_request_organization_id(self) -> str | None:
+        return None
+
     async def get_mcp_oauth_jwt_key(self) -> Any | None:
         """Return the current signing key/JWK for MCP OAuth token validation.
 
@@ -1207,6 +1276,9 @@ class AgentFunction:
         del organization_id
         api_key = settings.SKYVERN_API_KEY
         return api_key if api_key and api_key != "PLACEHOLDER" else None
+
+    async def browser_context_route_handlers_allowed(self, **_: Any) -> bool:
+        return True
 
     async def setup_browser_context_extensions(self, browser_context: Any, **kwargs: Any) -> None:
         """Attach cloud-only listeners/route handlers to a fresh BrowserContext. OSS no-op."""
@@ -1314,8 +1386,8 @@ class AgentFunction:
         organization_id: str,
         item_id: str,
         vault_type: CredentialVaultType,
-    ) -> None:
-        return
+    ) -> bool:
+        return False
 
     async def process_registered_credential_item(
         self,
@@ -1667,6 +1739,7 @@ class AgentFunction:
         workflow_id: str | None = None,
         workflow_run_id: str | None = None,
         created_after: datetime | None = None,
+        expected_otp_type: OTPType | None = None,
         context: EmailOTPVerificationContext | None = None,
     ) -> OTPValue | None:
         """Find an OTP in connected email inboxes (all configured sources) for a single polling window."""
@@ -1738,7 +1811,11 @@ class AgentFunction:
                         if source_context.has_seen_message(credential_id, candidate.message_id):
                             continue
                         try:
-                            otp_value = await parse_otp_login(candidate.content, organization_id)
+                            otp_value = await parse_otp_login(
+                                candidate.content,
+                                organization_id,
+                                enforced_otp_type=expected_otp_type,
+                            )
                         except InsufficientCreditsForOTPParse:
                             source_context.remember_message(credential_id, candidate.message_id)
                             return None
@@ -1752,6 +1829,12 @@ class AgentFunction:
                             )
                             continue
                         source_context.remember_message(credential_id, candidate.message_id)
+                        if (
+                            otp_value
+                            and expected_otp_type is not None
+                            and otp_value.get_otp_type() != expected_otp_type
+                        ):
+                            continue
                         if otp_value:
                             try:
                                 # Persist only the resolved OTP value to avoid retaining raw email bodies.
@@ -1922,6 +2005,9 @@ class AgentFunction:
             :return: List of elements without xpaths.
             """
             context = skyvern_context.ensure_context()
+            svg_css_converter_llm_api_handler = None
+            if settings.ENABLE_CSS_SVG_PARSING and _svg_css_converter_llm_api_handler_available():
+                svg_css_converter_llm_api_handler = _get_org_aware_svg_css_converter_llm_api_handler()
             # page won't be in the context.frame_index_map, so the index is going to be 0
             skyvern_frame = await SkyvernFrame.create_instance(frame=frame, engine_selection=engine_selection)
             current_frame_index = context.frame_index_map.get(frame, 0)
@@ -1941,7 +2027,7 @@ class AgentFunction:
                 if element_cnt == MAX_ELEMENT_CNT:
                     LOG.debug(f"Element reached max count {MAX_ELEMENT_CNT}, will stop converting svg and css element.")
                 disable_conversion = element_cnt > MAX_ELEMENT_CNT
-                if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None or not settings.ENABLE_CSS_SVG_PARSING:
+                if svg_css_converter_llm_api_handler is None:
                     disable_conversion = True
 
                 if queue_ele.get("frame_index") != current_frame_index:
@@ -1972,7 +2058,13 @@ class AgentFunction:
             if eligible_css_shapes and task and step:
                 await asyncio.gather(
                     *[
-                        _convert_css_shape_to_string(skyvern_frame=sf, element=elem, task=task, step=step)
+                        _convert_css_shape_to_string(
+                            skyvern_frame=sf,
+                            element=elem,
+                            task=task,
+                            step=step,
+                            llm_api_handler=svg_css_converter_llm_api_handler,
+                        )
                         for elem, sf in eligible_css_shapes
                     ]
                 )
@@ -1987,7 +2079,14 @@ class AgentFunction:
 
                 async def convert_svg(element: dict) -> None:
                     svg_html, svg_key = svg_cache_inputs.get(id(element), (None, None))
-                    await _convert_svg_to_string(element, task, step, svg_html=svg_html, svg_key=svg_key)
+                    await _convert_svg_to_string(
+                        element,
+                        task,
+                        step,
+                        svg_html=svg_html,
+                        svg_key=svg_key,
+                        llm_api_handler=svg_css_converter_llm_api_handler,
+                    )
 
                 svg_representatives, svg_duplicates = _partition_svgs_by_cache_key(
                     [element for element, _frame in eligible_svgs],
@@ -2236,10 +2335,12 @@ class AgentFunction:
         return None
 
     def try_import_static_script(self, script_path: str) -> Any | None:
-        """Try to import a static script module as a fallback when spec_from_file_location fails.
+        """Import the live platform module for a static (marker) pin.
 
-        Override in subclass for platform-specific import logic.
-        Returns the loaded module or None.
+        The loader calls this BEFORE exec-ing the stored script body, so marker
+        pins always run the deployed module. Override in subclass for
+        platform-specific import logic. Returns the loaded module, or None for
+        a markerless (generated) script or a failed import.
         """
         return None
 

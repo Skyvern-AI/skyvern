@@ -8,7 +8,7 @@ import aiohttp
 import pytest
 
 from skyvern.exceptions import BlockedHost, HttpException
-from skyvern.forge.sdk.core.aiohttp_helper import SSRFGuardedResolver, aiohttp_request
+from skyvern.forge.sdk.core.aiohttp_helper import SSRFGuardedResolver, aiohttp_delete, aiohttp_request
 from skyvern.utils.url_validators import MAX_SAFE_REDIRECTS, validate_fetch_url
 
 
@@ -18,6 +18,30 @@ def public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
         return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
 
     monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_public)
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_delete_propagates_http_exception_after_retries() -> None:
+    url = "https://example.com/object/item/item_test"
+    mock_response = AsyncMock()
+    mock_response.status = 404
+    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+    mock_response.__aexit__ = AsyncMock(return_value=None)
+
+    mock_session = MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_session.delete = MagicMock(return_value=mock_response)
+
+    with (
+        patch("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", return_value=mock_session),
+        pytest.raises(HttpException) as exc_info,
+    ):
+        await aiohttp_delete(url, retry=1)
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.url == url
+    assert mock_session.delete.call_count == 2
 
 
 @pytest.mark.asyncio

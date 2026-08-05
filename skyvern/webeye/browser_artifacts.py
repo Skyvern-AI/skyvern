@@ -14,6 +14,7 @@ LOG = structlog.get_logger()
 class VideoArtifact(BaseModel):
     video_path: str | None = None
     video_artifact_id: str | None = None
+    video_file_extension: str | None = None
     video_data: bytes = b""
 
 

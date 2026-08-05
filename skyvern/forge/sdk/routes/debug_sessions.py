@@ -9,17 +9,20 @@ from fastapi import Depends, HTTPException, Query
 from skyvern.config import settings
 from skyvern.exceptions import BrowserSessionNotRenewable
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.active_run_session import get_active_run_session
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.debug_sessions import (
     DebugLoginBlockCompatibility,
     DebugSession,
     DebugSessionRuns,
+    DebugSessionViewerState,
 )
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.block import LoginBlock
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import (
     DEBUG_SESSION_PROFILE_REASON_DIFFERENT,
     DEBUG_SESSION_PROFILE_REASON_NO_PROFILE,
@@ -57,6 +60,66 @@ async def _hydrate_pbs_browser_profile_id(
     if pbs is not None and debug_session.pbs_browser_profile_id is None:
         debug_session.pbs_browser_profile_id = pbs.browser_profile_id
     return debug_session
+
+
+@base_router.get(
+    "/debug-session/{workflow_permanent_id}/viewer-state",
+    include_in_schema=False,
+)
+async def get_debug_session_viewer_state(
+    workflow_permanent_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_user_id: str = Depends(org_auth_service.get_current_user_id),
+) -> DebugSessionViewerState:
+    """Return the active run viewer target without creating or renewing a debug session."""
+    debug_session = await app.DATABASE.debug.get_debug_session(
+        organization_id=current_org.organization_id,
+        user_id=current_user_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+    if debug_session is None:
+        return DebugSessionViewerState()
+
+    try:
+        association = await get_active_run_session(
+            organization_id=current_org.organization_id,
+            debug_browser_session_id=debug_session.browser_session_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to read active Copilot run session",
+            organization_id=current_org.organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            debug_browser_session_id=debug_session.browser_session_id,
+            exc_info=True,
+        )
+        return DebugSessionViewerState()
+
+    if (
+        association is None
+        or association.organization_id != current_org.organization_id
+        or association.workflow_permanent_id != workflow_permanent_id
+        or association.debug_browser_session_id != debug_session.browser_session_id
+    ):
+        return DebugSessionViewerState()
+
+    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+        workflow_run_id=association.workflow_run_id,
+        organization_id=current_org.organization_id,
+    )
+    try:
+        run_is_final = workflow_run is not None and WorkflowRunStatus(workflow_run.status).is_final()
+    except ValueError:
+        return DebugSessionViewerState()
+    if (
+        workflow_run is None
+        or workflow_run.workflow_permanent_id != workflow_permanent_id
+        or workflow_run.browser_session_id != association.run_browser_session_id
+        or run_is_final
+    ):
+        return DebugSessionViewerState()
+
+    return DebugSessionViewerState(active_run_session_id=association.run_browser_session_id)
 
 
 @base_router.get(
@@ -292,6 +355,7 @@ async def new_debug_session(
         timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
         proxy_location=proxy_location,
         wait_for_startup=settings.ENV != "local",
+        needs_live_view=True,
     )
 
     debug_session = await app.DATABASE.debug.create_debug_session(
@@ -301,6 +365,10 @@ async def new_debug_session(
         workflow_permanent_id=workflow_permanent_id,
         vnc_streaming_supported=(
             settings.ENV == "local" or bool(new_browser_session.ip_address or new_browser_session.browser_address)
+        )
+        and await app.AGENT_FUNCTION.supports_live_view(
+            new_browser_session.persistent_browser_session_id,
+            ip_address=new_browser_session.ip_address,
         ),
     )
 

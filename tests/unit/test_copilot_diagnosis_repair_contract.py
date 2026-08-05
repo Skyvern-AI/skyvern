@@ -2377,3 +2377,67 @@ async def test_failed_seam_capture_preserves_clean_matching_evidence(
         ctx, run_session_id="run_session", run_id="wr_failed", current_url="https://example.test/app"
     )
     assert ctx.composition_page_evidence is clean
+
+
+def _secure_runner_unavailable_result() -> dict[str, object]:
+    return {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_runner_unavailable",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "run_code",
+                    "block_type": "CODE",
+                    "status": "failed",
+                    "failure_reason": "Secure CodeBlock runner is unavailable. Please retry.",
+                    "error_codes": ["runner_unavailable"],
+                }
+            ],
+        },
+    }
+
+
+def test_runner_unavailable_stops_even_with_a_code_authoring_repair_context() -> None:
+    ctx = _ctx()
+    result = _secure_runner_unavailable_result()
+    run_execution_module._record_run_blocks_result(ctx, result, completion_verification=None)
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["authoring_repair_context"] = CodeAuthoringRepairContext(
+        block_label="run_code",
+        reason_code="ambiguous_bare_selector",
+        selector="button",
+        refiner_selector="xpath=//button[normalize-space()='Download']",
+    ).model_dump(mode="json")
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=result,
+        ctx=ctx,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.UNRECOVERABLE_TOOL_ERROR
+    assert contract.repair_decision.next_action == RepairNextAction.STOP
+
+
+def test_user_code_error_still_repairs_through_the_contract() -> None:
+    ctx = _ctx()
+    result = _secure_runner_unavailable_result()
+    data = result["data"]
+    assert isinstance(data, dict)
+    blocks = data["blocks"]
+    assert isinstance(blocks, list)
+    blocks[0]["error_codes"] = ["user_code_error"]
+    blocks[0]["failure_reason"] = "NameError: name 'undefined_helper' is not defined"
+    run_execution_module._record_run_blocks_result(ctx, result, completion_verification=None)
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=result,
+        ctx=ctx,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type != DiagnosisFailureType.UNRECOVERABLE_TOOL_ERROR
+    assert contract.repair_decision.next_action != RepairNextAction.STOP

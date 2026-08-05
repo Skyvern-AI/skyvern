@@ -29,6 +29,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     _apply_classifier_typed_requested_output_corroborators,
     _apply_requested_output_completion_criteria,
+    _apply_requested_output_labels,
     _apply_validation_classification_completion_criteria,
     _classifier_fallback_policy,
     _criterion_grounding_mode,
@@ -2834,3 +2835,104 @@ def test_to_trace_data_reports_mint_degraded_criteria_without_output_path() -> N
     assert data["mint_degraded_criterion_count"] == 1
     assert data["mint_degraded_criterion_0_id"] == "c0"
     assert data["mint_degraded_criterion_0_mint_degrade"] == "contingent_missing_antecedent"
+
+
+def test_classifier_authored_requested_output_criterion_carries_short_typed_label() -> None:
+    message = "Go to the analytics dashboard and output the number of visitors in the last 7 days"
+    policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c0",
+                outcome="the number of visitors in the last 7 days is output",
+                level="run",
+                output_path="output.visitors_last_7_days",
+            )
+        ]
+    )
+
+    _apply_requested_output_labels(policy, message)
+
+    assert [criterion.requested_output_label for criterion in policy.completion_criteria] == ["visitors"]
+
+
+def test_canonical_requested_output_mint_carries_the_label_it_renders_into_prose() -> None:
+    message = "Go to the analytics dashboard and output the number of visitors in the last 7 days"
+    policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c0",
+                outcome="the number of visitors in the last 7 days is output",
+                level="run",
+                output_path="output.visitors_last_7_days",
+            )
+        ]
+    )
+
+    _apply_requested_output_completion_criteria(policy, message)
+
+    minted = [criterion for criterion in policy.completion_criteria if criterion.output_path]
+    assert [criterion.requested_output_label for criterion in minted] == ["visitors"]
+
+
+_LIVE_ANALYTICS_MESSAGE = (
+    "Go to https://analytics.example.test/project/1234/web and output the number of visitors in the last 7 days"
+)
+
+
+def test_label_lands_on_a_classifier_criterion_whose_path_names_the_field_differently() -> None:
+    # Live gap: the detector derives output.visitors while the classifier minted
+    # output.visitors_last_7_days for the same field, so an exact-path join drops the label and the
+    # extraction binder is handed the outcome sentence, which never matches a tile heading.
+    policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_visitors",
+                outcome="The returned record includes the number of visitors in the last 7 days.",
+                level="run",
+                output_path="output.visitors_last_7_days",
+            )
+        ]
+    )
+
+    _apply_requested_output_labels(policy, _LIVE_ANALYTICS_MESSAGE)
+
+    (criterion,) = policy.completion_criteria
+    assert criterion.requested_output_label == "visitors"
+
+
+def test_label_lands_via_text_coverage_when_the_alias_join_misses() -> None:
+    # Live W11: the classifier named the path output.visitor_count while the detector derived
+    # output.visitors; the alias join missed and the binder was handed the outcome sentence, which
+    # can never match a page heading.
+    policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_visitors",
+                outcome="The number of visitors in the last 7 days is output.",
+                level="run",
+                output_path="output.visitor_count",
+            )
+        ]
+    )
+
+    _apply_requested_output_labels(policy, _LIVE_ANALYTICS_MESSAGE)
+
+    (criterion,) = policy.completion_criteria
+    assert criterion.requested_output_label == "visitors"
+
+
+def test_text_coverage_fallback_stays_silent_when_two_criteria_cover_the_field() -> None:
+    duplicated = [
+        CompletionCriterion(
+            id=f"c_{index}",
+            outcome="The number of visitors in the last 7 days is output.",
+            level="run",
+            output_path=f"output.visitor_count_{index}",
+        )
+        for index in (1, 2)
+    ]
+    policy = RequestPolicy(completion_criteria=duplicated)
+
+    _apply_requested_output_labels(policy, _LIVE_ANALYTICS_MESSAGE)
+
+    assert [criterion.requested_output_label for criterion in policy.completion_criteria] == [None, None]

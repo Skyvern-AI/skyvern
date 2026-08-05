@@ -562,3 +562,92 @@ def test_content_endpoint_download_filename_strips_header_injection():
     assert "\r" not in disposition
     assert "\n" not in disposition
     assert disposition.count('"') == 2  # only the pair around filename
+
+
+def _run_with_created_at(created_at):
+    run = MagicMock()
+    run.created_at = created_at
+    return run
+
+
+@pytest.mark.asyncio
+async def test_get_downloaded_files_skips_listing_for_empty_post_cutover_run(keyring_configured):
+    """A post-cutover run with zero DOWNLOAD rows returns [] without the legacy S3 LIST:
+    every download registers a row at save time, so the LIST could only confirm emptiness."""
+    from datetime import datetime
+
+    from skyvern.config import settings
+
+    storage = S3Storage()
+    storage.async_client = MagicMock()
+    storage.async_client.list_files = AsyncMock()  # must NOT be called
+
+    mock_list = AsyncMock(return_value=[])
+    mock_get_run = AsyncMock(return_value=_run_with_created_at(datetime(2026, 8, 2, 12, 0, 0)))
+
+    with (
+        patch.object(settings, "DOWNLOADS_EMPTY_S3_LISTING_CUTOVER", "2026-08-01T00:00:00"),
+        patch("skyvern.forge.sdk.artifact.storage.s3.app") as s3_app,
+    ):
+        s3_app.DATABASE.artifacts.list_artifacts_for_run_by_type = mock_list
+        s3_app.DATABASE.tasks.get_run = mock_get_run
+        result = await storage.get_downloaded_files(organization_id="o_1", run_id="wr_new")
+
+    assert result == []
+    storage.async_client.list_files.assert_not_awaited()
+    mock_get_run.assert_awaited_once_with(run_id="wr_new", organization_id="o_1")
+
+
+@pytest.mark.asyncio
+async def test_get_downloaded_files_lists_for_empty_pre_cutover_run(keyring_configured):
+    """A run created before the cutover keeps the legacy S3 LIST — its downloads may
+    predate row registration."""
+    from datetime import datetime
+
+    from skyvern.config import settings
+
+    storage = S3Storage()
+    storage.async_client = MagicMock()
+    storage.async_client.list_files = AsyncMock(return_value=[])
+
+    mock_list = AsyncMock(return_value=[])
+    mock_get_run = AsyncMock(return_value=_run_with_created_at(datetime(2026, 7, 1, 0, 0, 0)))
+
+    with (
+        patch.object(settings, "DOWNLOADS_EMPTY_S3_LISTING_CUTOVER", "2026-08-01T00:00:00"),
+        patch("skyvern.forge.sdk.artifact.storage.s3.app") as s3_app,
+    ):
+        s3_app.DATABASE.artifacts.list_artifacts_for_run_by_type = mock_list
+        s3_app.DATABASE.tasks.get_run = mock_get_run
+        result = await storage.get_downloaded_files(organization_id="o_1", run_id="wr_old")
+
+    assert result == []
+    storage.async_client.list_files.assert_awaited_once()
+
+
+@pytest.mark.parametrize("get_run_behavior", ["raises", "returns_none"])
+@pytest.mark.asyncio
+async def test_get_downloaded_files_lists_when_run_unresolvable(keyring_configured, get_run_behavior):
+    """DB errors or a missing run row fail open to the legacy S3 LIST."""
+    from skyvern.config import settings
+
+    storage = S3Storage()
+    storage.async_client = MagicMock()
+    storage.async_client.list_files = AsyncMock(return_value=[])
+
+    mock_list = AsyncMock(return_value=[])
+    if get_run_behavior == "raises":
+        mock_get_run = AsyncMock(side_effect=RuntimeError("db down"))
+    else:
+        mock_get_run = AsyncMock(return_value=None)
+
+    with (
+        patch.object(settings, "DOWNLOADS_EMPTY_S3_LISTING_CUTOVER", "2026-08-01T00:00:00"),
+        patch("skyvern.forge.sdk.artifact.storage.s3.app") as s3_app,
+    ):
+        s3_app.DATABASE.artifacts.list_artifacts_for_run_by_type = mock_list
+        s3_app.DATABASE.tasks.get_run = mock_get_run
+        result = await storage.get_downloaded_files(organization_id="o_1", run_id="wr_x")
+
+    assert result == []
+    storage.async_client.list_files.assert_awaited_once()

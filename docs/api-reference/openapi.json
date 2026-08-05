@@ -3819,7 +3819,8 @@
                 "$ref": "#/components/schemas/CreateBrowserSessionRequest",
                 "default": {
                   "timeout": 60,
-                  "generate_browser_profile": false
+                  "generate_browser_profile": false,
+                  "needs_live_view": false
                 }
               }
             }
@@ -4169,6 +4170,39 @@
           },
           "403": {
             "description": "Unauthorized - Invalid or missing authentication"
+          },
+          "503": {
+            "description": "Downloaded files could not be returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "detail"
+                  ],
+                  "properties": {
+                    "detail": {
+                      "type": "object",
+                      "required": [
+                        "code",
+                        "retryable"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "downloaded_files_unavailable"
+                          ]
+                        },
+                        "retryable": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           },
           "422": {
             "description": "Validation Error",
@@ -8006,6 +8040,30 @@
             "title": "Skip Auto Complete Tab",
             "default": false
           },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
           "created_at": {
             "anyOf": [
               {
@@ -11102,6 +11160,18 @@
       },
       "CreateBrowserSessionRequest": {
         "properties": {
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url",
+            "description": "Optional URL to open when the standalone browser session starts."
+          },
           "timeout": {
             "anyOf": [
               {
@@ -11190,6 +11260,12 @@
             "type": "boolean",
             "title": "Generate Browser Profile",
             "description": "When true, the session's browser profile (cookies, localStorage, etc.) is saved to storage when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid storing profiles for sessions that never need them. Sessions started with a browser_profile_id always persist their profile regardless of this flag.",
+            "default": false
+          },
+          "needs_live_view": {
+            "type": "boolean",
+            "title": "Needs Live View",
+            "description": "Whether a person will watch this session's browser live. Defaults to false, which suits unattended automation; the Skyvern app sets it because a session opened in the UI is watched. It requests a capability, not a particular browser, and cannot be used to select where the session runs.",
             "default": false
           }
         },
@@ -12124,6 +12200,11 @@
               }
             ],
             "title": "Reasoning Effort"
+          },
+          "extra_parameters": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Extra Parameters"
           }
         },
         "type": "object",
@@ -12167,7 +12248,8 @@
         "enum": [
           "openai_compatible",
           "ollama",
-          "openrouter"
+          "openrouter",
+          "gemini"
         ],
         "title": "CustomLLMProvider"
       },
@@ -26733,6 +26815,11 @@
             "title": "Persist Browser Session",
             "default": false
           },
+          "mask_secrets": {
+            "type": "boolean",
+            "title": "Mask Secrets",
+            "default": false
+          },
           "pin_saved_session_ip": {
             "type": "boolean",
             "title": "Pin Saved Session Ip",
@@ -27060,6 +27147,18 @@
             "type": "boolean",
             "title": "Persist Browser Session",
             "default": false
+          },
+          "mask_secrets": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mask Secrets",
+            "description": "Visually mask secrets as they are typed in the browser, hiding them from screenshots, recordings, and the live view."
           },
           "pin_saved_session_ip": {
             "type": "boolean",
@@ -28583,6 +28682,17 @@
               }
             ],
             "title": "Url"
+          },
+          "final_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Final Url"
           },
           "navigation_goal": {
             "anyOf": [
