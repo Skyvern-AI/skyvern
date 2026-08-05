@@ -1249,6 +1249,29 @@ async def test_browser_profile_exists_propagates_non_not_found_errors() -> None:
 
 
 @pytest.mark.asyncio
+async def test_retrieve_browser_profile_extracts_sub_buffer_size_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: the archive used to be closed only AFTER unzipping, so anything smaller than the io
+    # buffer (~8KB) — a cookie-only first bank — was still unflushed and ZipFile hit an empty file.
+    zip_bytes = _build_zip({".skyvern_banked_cookies.json": b'[{"name":"session"}]'})
+    assert len(zip_bytes) < 1024
+
+    storage = S3Storage()
+    storage.async_client = MagicMock()
+    storage.async_client.download_file = AsyncMock(return_value=zip_bytes)
+
+    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path))
+    profile_dir = await storage.retrieve_browser_profile("o", "bp")
+
+    assert profile_dir is not None
+    assert (Path(profile_dir) / ".skyvern_banked_cookies.json").read_bytes() == b'[{"name":"session"}]'
+    # The extraction directory must be the ONLY thing left in TEMP_PATH — the downloaded archive is
+    # written there under a suffixless temp name, so a leak would show up as a second entry.
+    assert [entry.name for entry in tmp_path.iterdir()] == [Path(profile_dir).name]
+
+
+@pytest.mark.asyncio
 async def test_delete_browser_profile_hard_raises_soft_swallows() -> None:
     # hard_delete must PROPAGATE an S3 failure (raise_on_error=True) so the reap can't falsely report a
     # cookie-bearing archive erased and silently orphan it; a soft delete stays best-effort.
