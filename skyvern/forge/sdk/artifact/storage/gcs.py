@@ -15,8 +15,7 @@ from skyvern.forge.sdk.api.files import (
     create_named_temporary_file,
     get_download_dir,
     get_skyvern_temp_dir,
-    make_temp_directory,
-    unzip_files,
+    unzip_bytes_to_temp_directory,
     wait_for_pending_extension_rename,
 )
 from skyvern.forge.sdk.api.gcp import STORAGE_CLASS_STANDARD, GcsUri
@@ -233,14 +232,7 @@ class GcsStorage(BaseStorage):
         downloaded_zip_bytes = await self.async_client.download_file(browser_session_uri, log_exception=True)
         if not downloaded_zip_bytes:
             return None
-        temp_zip_file = create_named_temporary_file(delete=False)
-        temp_zip_file.write(downloaded_zip_bytes)
-        temp_zip_file_path = temp_zip_file.name
-
-        temp_dir = make_temp_directory(prefix="skyvern_browser_session_")
-        unzip_files(temp_zip_file_path, temp_dir)
-        temp_zip_file.close()
-        return temp_dir
+        return unzip_bytes_to_temp_directory(downloaded_zip_bytes, prefix="skyvern_browser_session_")
 
     async def delete_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
         browser_session_uri = (
@@ -290,19 +282,7 @@ class GcsStorage(BaseStorage):
         downloaded_zip_bytes = await self.async_client.download_file(profile_uri, log_exception=True)
         if not downloaded_zip_bytes:
             return None
-        temp_zip_file = create_named_temporary_file(delete=False)
-        temp_zip_file.write(downloaded_zip_bytes)
-        temp_zip_file_path = temp_zip_file.name
-
-        temp_dir = make_temp_directory(prefix="skyvern_browser_profile_")
-        try:
-            unzip_files(temp_zip_file_path, temp_dir)
-        finally:
-            # The downloaded archive is a delete=False temp file; remove it so cookie-bearing zips
-            # don't accumulate in TEMP_PATH on every profile retrieve (e.g. each cookie-only bank).
-            temp_zip_file.close()
-            os.unlink(temp_zip_file_path)
-        return temp_dir
+        return unzip_bytes_to_temp_directory(downloaded_zip_bytes, prefix="skyvern_browser_profile_")
 
     async def browser_profile_exists(self, organization_id: str, profile_id: str) -> bool:
         """Non-destructive existence check via object metadata — avoids downloading the whole archive."""
