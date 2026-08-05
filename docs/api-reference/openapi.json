@@ -4238,7 +4238,7 @@
           "Credentials"
         ],
         "summary": "Send TOTP code",
-        "description": "Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern. This endpoint stores the code in database so that Skyvern can use it while running tasks/workflows.",
+        "description": "Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern. This endpoint stores the code in database so that Skyvern can use it while running tasks/workflows. Requires an administrator-scoped API key; non-administrator members receive a 403 response.",
         "operationId": "send_totp_code_v1_credentials_totp_post",
         "parameters": [
           {
@@ -4281,8 +4281,8 @@
               }
             }
           },
-          "402": {
-            "description": "Insufficient credits to parse OTP content"
+          "403": {
+            "description": "The caller does not have administrator role on the organization."
           },
           "422": {
             "description": "Validation Error",
@@ -4293,6 +4293,9 @@
                 }
               }
             }
+          },
+          "402": {
+            "description": "Insufficient credits to parse OTP content"
           }
         },
         "x-fern-sdk-method-name": "send_totp_code",
@@ -4318,7 +4321,7 @@
           "Credentials"
         ],
         "summary": "Create credential",
-        "description": "Creates a new credential for the current organization",
+        "description": "Creates a new credential for the current organization. Requires an administrator-scoped API key; non-administrator members receive a 403 response.",
         "operationId": "create_credential_v1_credentials_post",
         "parameters": [
           {
@@ -4366,15 +4369,8 @@
           }
         },
         "responses": {
-          "201": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CredentialResponse"
-                }
-              }
-            }
+          "403": {
+            "description": "The caller does not have administrator role on the organization."
           },
           "422": {
             "description": "Validation Error",
@@ -4382,6 +4378,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CredentialResponse"
                 }
               }
             }
@@ -4416,7 +4422,7 @@
           "Credentials"
         ],
         "summary": "Get all credentials",
-        "description": "Retrieves a paginated list of credentials for the current organization",
+        "description": "Retrieves a paginated list of credentials for the current organization. Requires an administrator-scoped API key; non-administrator members receive a 403 response.",
         "operationId": "get_credentials_v1_credentials_get",
         "parameters": [
           {
@@ -4546,6 +4552,9 @@
               }
             }
           },
+          "403": {
+            "description": "The caller does not have administrator role on the organization."
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -4580,7 +4589,7 @@
           "Credentials"
         ],
         "summary": "Update credential",
-        "description": "Overwrites the stored credential data (e.g. username/password) while keeping the same credential_id.",
+        "description": "Overwrites the stored credential data (e.g. username/password) while keeping the same credential_id. Requires an administrator-scoped API key; non-administrator members receive a 403 response.",
         "operationId": "update_credential_v1_credentials__credential_id__update_post",
         "parameters": [
           {
@@ -4654,6 +4663,9 @@
               }
             }
           },
+          "403": {
+            "description": "The caller does not have administrator role on the organization."
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -4688,7 +4700,7 @@
           "Credentials"
         ],
         "summary": "Delete credential",
-        "description": "Deletes a specific credential by its ID",
+        "description": "Deletes a specific credential by its ID. Requires an administrator-scoped API key; non-administrator members receive a 403 response.",
         "operationId": "delete_credential_v1_credentials__credential_id__delete_post",
         "parameters": [
           {
@@ -4728,8 +4740,8 @@
           }
         ],
         "responses": {
-          "204": {
-            "description": "Successful Response"
+          "403": {
+            "description": "The caller does not have administrator role on the organization."
           },
           "422": {
             "description": "Validation Error",
@@ -4740,6 +4752,9 @@
                 }
               }
             }
+          },
+          "204": {
+            "description": "Successful Response"
           }
         },
         "x-fern-sdk-method-name": "delete_credential",
@@ -4765,7 +4780,7 @@
           "Credentials"
         ],
         "summary": "Get credential by ID",
-        "description": "Retrieves a specific credential by its ID",
+        "description": "Retrieves a specific credential by its ID. Requires an administrator-scoped API key; non-administrator members receive a 403 response.",
         "operationId": "get_credential_v1_credentials__credential_id__get",
         "parameters": [
           {
@@ -4814,6 +4829,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "The caller does not have administrator role on the organization."
           },
           "422": {
             "description": "Validation Error",
@@ -5529,7 +5547,7 @@
           "Scripts"
         ],
         "summary": "Deploy script",
-        "description": "Deploy a script with updated files, creating a new version",
+        "description": "Deploy a script with updated files, creating a new version. Uploaded files are validated before persistence. Deploy fails with 400 if a file exceeds 10 MB, has a blocked extension (compiled artifacts and archives such as .pyc, .so, .whl, .zip), contains invalid base64, or if a `.py` file is not valid UTF-8, does not parse, or uses disallowed constructs.",
         "operationId": "deploy_script_v1_scripts__script_id__deploy_post",
         "parameters": [
           {
@@ -5585,6 +5603,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "The uploaded script files failed validation."
           },
           "422": {
             "description": "Validation Error",
@@ -6386,7 +6407,7 @@
           "Runs"
         ],
         "summary": "Get all runs",
-        "description": "List workflow runs across all workflows for the current organization.\n\nResults are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.\n\n### search_key\n\nA case-insensitive substring search that matches against **any** of the following fields:\n\n| Searched field | Description |\n|---|---|\n| `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |\n| Parameter **key** | The `key` of any workflow parameter definition associated with the run |\n| Parameter **description** | The `description` of any workflow parameter definition |\n| Run parameter **value** | The actual value supplied for any parameter when the run was created |\n| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n\nSoft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.\n\n### error_code\n\nAn **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).\n\n### Combining filters\n\nAll query parameters use AND logic:\n- `?status=failed` — only failed runs\n- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error\n- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match",
+        "description": "List workflow runs across all workflows for the current organization.\n\nResults are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic \u2014 a run must match every supplied filter to be returned.\n\n### search_key\n\nA case-insensitive substring search that matches against **any** of the following fields:\n\n| Searched field | Description |\n|---|---|\n| `workflow_run_id` | The unique run identifier (e.g. `wr_123\u2026`) |\n| Parameter **key** | The `key` of any workflow parameter definition associated with the run |\n| Parameter **description** | The `description` of any workflow parameter definition |\n| Run parameter **value** | The actual value supplied for any parameter when the run was created |\n| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n\nSoft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.\n\n### error_code\n\nAn **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).\n\n### Combining filters\n\nAll query parameters use AND logic:\n- `?status=failed` \u2014 only failed runs\n- `?status=failed&error_code=LOGIN_FAILED` \u2014 failed runs **and** have a LOGIN_FAILED error\n- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` \u2014 all three conditions must match",
         "operationId": "get_workflow_runs_v1_workflows_runs_get",
         "parameters": [
           {
@@ -7477,7 +7498,7 @@
           "proactive"
         ],
         "title": "AIFallbackMode",
-        "description": "Controls how an action block uses a CSS/XPath selector relative to AI.\n\n- `fallback`: attempt the selector first; fall back to AI on failure.\n- `proactive`: always use AI; the selector (if any) is a hint only.\n\nWhen `selector` is None, both modes degrade to AI-only — the difference\nis purely semantic (whether the author expected to have a selector here)."
+        "description": "Controls how an action block uses a CSS/XPath selector relative to AI.\n\n- `fallback`: attempt the selector first; fall back to AI on failure.\n- `proactive`: always use AI; the selector (if any) is a hint only.\n\nWhen `selector` is None, both modes degrade to AI-only \u2014 the difference\nis purely semantic (whether the author expected to have a selector here)."
       },
       "AWSSecretParameter": {
         "properties": {
@@ -10020,7 +10041,7 @@
           "degraded_fresh"
         ],
         "title": "BrowserSeedSource",
-        "description": "Which layer of the seed-precedence chain seeded a run's browser (provenance).\n\nResolved once at run setup, before any browser creation, for all run types (C-semantics).\n- override: explicit request browser_profile_id (one-run-only pick via API)\n- picked: the workflow's explicit profile pick (workflows.browser_profile_id) — \"always start here\"\n- own_memory: the workflow's own auto-profile (no pick + persist_browser_session)\n- credential: the run's selected credential's profile (rotation-aware; also the empty-own boot)\n- fresh: no seed profile\n- degraded_fresh: a resolved profile failed to load; ran fresh"
+        "description": "Which layer of the seed-precedence chain seeded a run's browser (provenance).\n\nResolved once at run setup, before any browser creation, for all run types (C-semantics).\n- override: explicit request browser_profile_id (one-run-only pick via API)\n- picked: the workflow's explicit profile pick (workflows.browser_profile_id) \u2014 \"always start here\"\n- own_memory: the workflow's own auto-profile (no pick + persist_browser_session)\n- credential: the run's selected credential's profile (rotation-aware; also the empty-own boot)\n- fresh: no seed profile\n- degraded_fresh: a resolved profile failed to load; ran fresh"
       },
       "BrowserSessionResponse": {
         "properties": {
@@ -12061,7 +12082,7 @@
           "brand"
         ],
         "title": "CreditCardCredentialResponse",
-        "description": "Response model for credit card credentials — non-sensitive fields only.\n\nSECURITY: Must NEVER include full card number, CVV, expiration date, card holder name,\nbilling fields, or metadata."
+        "description": "Response model for credit card credentials \u2014 non-sensitive fields only.\n\nSECURITY: Must NEVER include full card number, CVV, expiration date, card holder name,\nbilling fields, or metadata."
       },
       "CustomLLM": {
         "properties": {
@@ -12407,7 +12428,7 @@
           "start_fresh_browser": {
             "type": "boolean",
             "title": "Start Fresh Browser",
-            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory — no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
+            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory \u2014 no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
             "default": false
           },
           "browser_address": {
@@ -12420,7 +12441,7 @@
               }
             ],
             "title": "Browser Address",
-            "description": "The CDP address for the task.",
+            "description": "The CDP address for the task. Must be an http, https, ws, or wss URL with a resolvable host that passes network policy. Invalid or blocked addresses are rejected with a 422 validation error.",
             "examples": [
               "http://127.0.0.1:9222",
               "ws://127.0.0.1:9222/devtools/browser/1234567890"
@@ -18417,7 +18438,7 @@
           "start_fresh_browser": {
             "type": "boolean",
             "title": "Start Fresh Browser",
-            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory — no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
+            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory \u2014 no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
             "default": false
           },
           "browser_address": {
@@ -18430,7 +18451,7 @@
               }
             ],
             "title": "Browser Address",
-            "description": "The CDP address for the task.",
+            "description": "The CDP address for the task. Must be an http, https, ws, or wss URL with a resolvable host that passes network policy. Invalid or blocked addresses are rejected with a 422 validation error.",
             "examples": [
               "http://127.0.0.1:9222",
               "ws://127.0.0.1:9222/devtools/browser/1234567890"
@@ -19551,7 +19572,7 @@
           "modified_at"
         ],
         "title": "OrganizationScheduleItem",
-        "description": "Compact schedule projection for the org-wide list endpoint.\n\nIntentionally omits `backend_schedule_id` — the list view is for browsing\nschedules in the dashboard, not for managing the underlying execution-backend\nbinding. Callers that need the backend id should fetch the individual\nschedule via the per-workflow get endpoint."
+        "description": "Compact schedule projection for the org-wide list endpoint.\n\nIntentionally omits `backend_schedule_id` \u2014 the list view is for browsing\nschedules in the dashboard, not for managing the underlying execution-backend\nbinding. Callers that need the backend id should fetch the individual\nschedule via the per-workflow get endpoint."
       },
       "OrganizationScheduleListResponse": {
         "properties": {
@@ -19890,7 +19911,7 @@
           "username"
         ],
         "title": "PasswordCredentialResponse",
-        "description": "Response model for password credentials — non-sensitive fields only.\n\nSECURITY: Must NEVER include password or TOTP secret."
+        "description": "Response model for password credentials \u2014 non-sensitive fields only.\n\nSECURITY: Must NEVER include password or TOTP secret."
       },
       "PdfFillBlock": {
         "properties": {
@@ -20611,7 +20632,7 @@
               }
             ],
             "title": "Browser Address",
-            "description": "The browser address"
+            "description": "The browser address. Must be an http, https, ws, or wss URL with a resolvable host that passes network policy. Invalid or blocked addresses are rejected with a 422 validation error."
           },
           "workflow_run_id": {
             "anyOf": [
@@ -21146,7 +21167,7 @@
         },
         "type": "object",
         "title": "SecretCredentialResponse",
-        "description": "Response model for secret credentials — non-sensitive fields only.\n\nSECURITY: Must NEVER include the secret_value."
+        "description": "Response model for secret credentials \u2014 non-sensitive fields only.\n\nSECURITY: Must NEVER include the secret_value."
       },
       "SelectOption": {
         "properties": {
@@ -22199,7 +22220,7 @@
           "value"
         ],
         "title": "TagInput",
-        "description": "One tag to set. ``value`` is the required label; ``key`` is the optional\ngroup — null for a standalone label, set for a grouped label (e.g. env:prod)."
+        "description": "One tag to set. ``value`` is the required label; ``key`` is the optional\ngroup \u2014 null for a standalone label, set for a grouped label (e.g. env:prod)."
       },
       "TagItem": {
         "properties": {
@@ -23406,7 +23427,7 @@
           "start_fresh_browser": {
             "type": "boolean",
             "title": "Start Fresh Browser",
-            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory — no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
+            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory \u2014 no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
             "default": false
           },
           "model": {
@@ -23494,7 +23515,7 @@
               }
             ],
             "title": "Browser Address",
-            "description": "The CDP address for the task.",
+            "description": "The CDP address for the task. Must be an http, https, ws, or wss URL with a resolvable host that passes network policy. Invalid or blocked addresses are rejected with a 422 validation error.",
             "examples": [
               "http://127.0.0.1:9222",
               "ws://127.0.0.1:9222/devtools/browser/1234567890"
@@ -23726,7 +23747,7 @@
           "start_fresh_browser": {
             "type": "boolean",
             "title": "Start Fresh Browser",
-            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory — no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
+            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory \u2014 no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
             "default": false
           },
           "model": {
@@ -23814,7 +23835,7 @@
               }
             ],
             "title": "Browser Address",
-            "description": "The CDP address for the task.",
+            "description": "The CDP address for the task. Must be an http, https, ws, or wss URL with a resolvable host that passes network policy. Invalid or blocked addresses are rejected with a 422 validation error.",
             "examples": [
               "http://127.0.0.1:9222",
               "ws://127.0.0.1:9222/devtools/browser/1234567890"
@@ -27056,7 +27077,7 @@
           "agent_id": {
             "type": "string",
             "title": "Agent Id",
-            "description": "Alias of `workflow_permanent_id` — the stable agent identifier (starts with `wpid_`).",
+            "description": "Alias of `workflow_permanent_id` \u2014 the stable agent identifier (starts with `wpid_`).",
             "readOnly": true
           }
         },
@@ -29153,7 +29174,7 @@
           "start_fresh_browser": {
             "type": "boolean",
             "title": "Start Fresh Browser",
-            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory — no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
+            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory \u2014 no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
             "default": false
           },
           "max_screenshot_scrolls": {
@@ -29222,7 +29243,7 @@
               }
             ],
             "title": "Browser Address",
-            "description": "The CDP address for the workflow run.",
+            "description": "The CDP address for the workflow run. Must be an http, https, ws, or wss URL with a resolvable host that passes network policy. Invalid or blocked addresses are rejected with a 422 validation error.",
             "examples": [
               "http://127.0.0.1:9222",
               "ws://127.0.0.1:9222/devtools/browser/1234567890"
@@ -29404,7 +29425,7 @@
           "start_fresh_browser": {
             "type": "boolean",
             "title": "Start Fresh Browser",
-            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory — no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
+            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory \u2014 no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
             "default": false
           },
           "max_screenshot_scrolls": {
@@ -29473,7 +29494,7 @@
               }
             ],
             "title": "Browser Address",
-            "description": "The CDP address for the workflow run.",
+            "description": "The CDP address for the workflow run. Must be an http, https, ws, or wss URL with a resolvable host that passes network policy. Invalid or blocked addresses are rejected with a 422 validation error.",
             "examples": [
               "http://127.0.0.1:9222",
               "ws://127.0.0.1:9222/devtools/browser/1234567890"
