@@ -284,6 +284,10 @@ def _raise_if_best_effort_fetch_host_is_blocked(url: str) -> None:
     candidate = url.replace("\\", "/")
     try:
         parsed = urlsplit(candidate)
+        # Non-http(s) schemes are already refused by the caller's parse error; resolving their
+        # hosts would block the caller's event loop on DNS for a URL that gets refused anyway.
+        if parsed.scheme and parsed.scheme not in ("http", "https"):
+            return
         if not parsed.scheme:
             parsed = urlsplit(f"https://{candidate}")
         host = parsed.hostname

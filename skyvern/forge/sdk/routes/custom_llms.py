@@ -71,7 +71,7 @@ async def _get_custom_llm(
     include_in_schema=False,
 )
 async def list_custom_llms(
-    current_org: Organization = Depends(org_auth_service.get_current_admin_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CustomLLMListResponse:
     tokens = await app.DATABASE.organizations.get_valid_org_auth_tokens(
         organization_id=current_org.organization_id,
@@ -108,7 +108,7 @@ async def list_custom_llms(
 )
 async def create_custom_llm(
     request: CustomLLMCreateRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_admin_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CustomLLMResponse:
     await _validate_custom_llm_api_base(request.config)
     token = await app.DATABASE.organizations.create_org_auth_token(
@@ -137,7 +137,7 @@ async def create_custom_llm(
 async def update_custom_llm(
     request: CustomLLMUpdateRequest,
     custom_llm_id: str = Path(..., description="The custom LLM id."),
-    current_org: Organization = Depends(org_auth_service.get_current_admin_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CustomLLMResponse:
     try:
         existing_custom_llm = await _get_custom_llm(current_org.organization_id, custom_llm_id)
@@ -172,7 +172,7 @@ async def update_custom_llm(
 )
 async def delete_custom_llm(
     custom_llm_id: str = Path(..., description="The custom LLM id."),
-    current_org: Organization = Depends(org_auth_service.get_current_admin_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> ClearOrganizationAuthTokenResponse:
     try:
         await app.DATABASE.organizations.invalidate_org_auth_token(
