@@ -277,7 +277,7 @@ from skyvern import Skyvern
 async def main():
     client = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
 
-    result = await client.schedules.create(
+    result = await client.agent.create_workflow_schedule(
         workflow_permanent_id="wpid_123456789",
         cron_expression="0 9 * * 1-5",
         timezone="America/New_York",
@@ -327,13 +327,13 @@ curl -X POST "https://api.skyvern.com/api/v1/workflows/wpid_123456789/schedules"
 <CodeGroup>
 ```python Python
 # Disable
-await client.schedules.disable(
+await client.agent.disable_workflow_schedule(
     workflow_permanent_id="wpid_123456789",
     workflow_schedule_id="wfs_abc123"
 )
 
 # Re-enable
-await client.schedules.enable(
+await client.agent.enable_workflow_schedule(
     workflow_permanent_id="wpid_123456789",
     workflow_schedule_id="wfs_abc123"
 )
@@ -356,7 +356,7 @@ Permanently remove a schedule. This cannot be undone. Runs that were already tri
 
 <CodeGroup>
 ```python Python
-await client.schedules.delete(
+await client.agent.delete_workflow_schedule_route(
     workflow_permanent_id="wpid_123456789",
     workflow_schedule_id="wfs_abc123"
 )
