@@ -108,7 +108,7 @@ def _require_scopes_from_token(token_data: dict) -> list[str]:
 @microsoft_oauth_router.post("/oauth/authorize")
 async def microsoft_oauth_authorize(
     request: CreateMicrosoftOAuthAuthorizeRequest,
-    current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    current_org: Annotated[Organization, Depends(org_auth_service.get_current_admin_org)],
     current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
 ) -> MicrosoftOAuthAuthorizeResponse:
     try:
@@ -137,7 +137,7 @@ async def microsoft_oauth_authorize(
 @microsoft_oauth_router.post("/oauth/callback")
 async def microsoft_oauth_callback(
     request: CreateMicrosoftOAuthCallbackRequest,
-    current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    current_org: Annotated[Organization, Depends(org_auth_service.get_current_admin_org)],
     current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
 ) -> MicrosoftOAuthCredentialResponse:
     context = await microsoft_oauth_service.load_pending_consent_context(
@@ -251,7 +251,7 @@ async def microsoft_oauth_callback(
 
 @microsoft_oauth_router.get("/oauth/credentials")
 async def list_microsoft_oauth_credentials(
-    current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    current_org: Annotated[Organization, Depends(org_auth_service.get_current_admin_org)],
     include_email: bool = False,
 ) -> MicrosoftOAuthCredentialListResponse:
     credentials = await microsoft_oauth_service.get_credentials_for_org(
@@ -275,7 +275,7 @@ async def list_microsoft_oauth_credentials(
 async def rename_microsoft_oauth_credential(
     credential_id: str,
     request: UpdateMicrosoftOAuthCredentialRequest,
-    current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    current_org: Annotated[Organization, Depends(org_auth_service.get_current_admin_org)],
 ) -> MicrosoftOAuthCredentialResponse:
     updated = await microsoft_oauth_service.rename_credential(
         organization_id=current_org.organization_id,
@@ -293,7 +293,7 @@ async def rename_microsoft_oauth_credential(
 )
 async def delete_microsoft_oauth_credential(
     credential_id: str,
-    current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    current_org: Annotated[Organization, Depends(org_auth_service.get_current_admin_org)],
 ) -> None:
     revoked = await microsoft_oauth_service.revoke_credential(
         organization_id=current_org.organization_id,

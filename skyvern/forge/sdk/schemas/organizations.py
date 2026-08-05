@@ -1,8 +1,14 @@
 from datetime import datetime
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+
+
+class OrganizationRole(StrEnum):
+    admin = "org:admin"
+    member = "org:member"
 
 
 class Organization(BaseModel):
@@ -10,6 +16,7 @@ class Organization(BaseModel):
 
     organization_id: str
     organization_name: str
+    role: OrganizationRole | None = Field(default=None, exclude=True)
     webhook_callback_url: str | None = None
     max_steps_per_run: int | None = None
     max_steps_per_workflow_run: int | None = None

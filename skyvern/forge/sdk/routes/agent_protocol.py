@@ -5252,7 +5252,7 @@ async def generate_task(
 )
 async def update_organization(
     org_update: OrganizationUpdate,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_admin_org),
 ) -> Organization:
     # Validate the per-org artifact URL expiry against the same bounds the
     # signing helper clamps to. Reject out-of-range values at the API edge so
@@ -5379,7 +5379,7 @@ async def get_current_organization(
 )
 async def get_api_keys(
     organization_id: str,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_admin_org),
 ) -> GetOrganizationAPIKeysResponse:
     if organization_id != current_org.organization_id:
         raise HTTPException(status_code=403, detail="You do not have permission to access this organization")
