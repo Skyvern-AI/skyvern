@@ -924,10 +924,16 @@ def _typed_ask_subject_auto_answer(ctx: CopilotContext, ask_subject: AskSubject,
             subject=ask_subject,
             resolved_refs=resolved,
         )
+        # An output_schema ask is usually "which page value is it?", and the asker has already named a
+        # candidate; telling it to choose a representation licensed freelance parsing while the
+        # designation route sat unused (SKY-13485). Point the ask at the read that binds instead.
         return (
-            "The outputs you asked to confirm are already pinned by this request's completion contract. "
-            f"Requested output paths: {', '.join(resolved)}. Author and test the workflow to produce them, "
-            "choosing a reasonable representation for each, instead of asking the user to re-confirm."
+            f"The output path is settled: {', '.join(resolved)}. Which page value it is, is yours to "
+            "decide from what you can see — do not ask the user. If the requested value is visible "
+            "now, read it off the live page: call evaluate with an expression whose result is just "
+            "that value exactly as rendered, and set output_path to the requested path on that call; "
+            "the extraction will bind to the value you observed. If it is not visible yet, author and "
+            "test the workflow to produce it."
         )
     # A request that named no output key is pinned to anonymous slots, so no name the model could
     # propose is citable and the coverage check above can never be satisfied. The contract still
@@ -2523,6 +2529,21 @@ def requested_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtrac
     return None
 
 
+def unbound_requested_output_paths_for_designation(ctx: AgentContext) -> set[str]:
+    """Requested paths no plan has bound yet, so the resolver only decides what is still open.
+
+    Keyed on the bound plan rather than on a witness existing: a declared read can leave a stale or
+    unbindable scalar behind, and treating that as settled retires the path while it is still unread
+    — the page that finally shows the value would never be offered (SKY-13485).
+    """
+    requested = _requested_output_paths_for_ctx(ctx)
+    if not requested:
+        return set()
+    plan = ctx.last_bound_requested_output_extraction_plan
+    bound = set(plan.requested_output_paths) if plan is not None else set()
+    return requested - bound
+
+
 def requested_scalar_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtractionPlan | None:
     """Extraction plan over the page-scalar subset of requested outputs (requested minus the
     download-registered paths), for the mixed download+scalar shape whose download half is
@@ -2755,7 +2776,27 @@ def synthesized_trajectory_reaches_goal(ctx: AgentContext) -> bool:
         _active_floor_rekeyed_runtime_outputs(ctx) and _last_scout_credential_fill_index(trajectory) is not None
     ):
         return _trajectory_reaches_post_credential_commit(ctx)
+    if _read_deliverable_reached(ctx):
+        return True
     return _trajectory_reaches_generic_goal(ctx, trajectory, include_download=True)
+
+
+def _read_deliverable_reached(ctx: AgentContext) -> bool:
+    """A read deliverable has no commit to reach; the bound requested-output extraction plan is its
+    reach evidence. Keys on the retained plan rather than a fresh derivation so reach stays monotone
+    per attempt, which is what the ownership latch requires (SKY-13485)."""
+    if _request_expects_unreached_download(ctx):
+        return False
+    # A mandated action is part of what was asked for, so a read that binds while it is still
+    # outstanding has not reached the goal. Non-method-mandated ones never arrive here — the caller
+    # routes them to the post-credential commit shape first.
+    if any(criterion.kind == "terminal_action" for criterion in _active_completion_criteria(ctx)):
+        return False
+    plan = ctx.last_bound_requested_output_extraction_plan
+    if plan is None:
+        return False
+    requested = _requested_output_paths_for_ctx(ctx)
+    return bool(requested) and requested.issubset(set(plan.requested_output_paths))
 
 
 def _trajectory_reaches_generic_goal(
