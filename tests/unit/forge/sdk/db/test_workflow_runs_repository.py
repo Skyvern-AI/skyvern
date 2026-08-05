@@ -1668,3 +1668,157 @@ async def test_gate_noncredential_key_lane_keeps_index_eligible_shape(
 
     for statement in statements:
         assert not _DEINDEXING_OR.search(statement), f"gate keyed lane de-indexed by widened OR: {statement}"
+
+
+@pytest.mark.asyncio
+async def test_wake_candidates_share_credential_lane_by_gate_ticket(sqlite_db: AgentDB) -> None:
+    # Excluded peers are all same-credential so any predicate regression (org scope, queued-only
+    # status, queued-after ordering) would surface as an extra or misordered candidate.
+    early_at = datetime(2026, 8, 4, 9, 0, tzinfo=timezone.utc)
+    done_at = datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc)
+    next_at = datetime(2026, 8, 4, 11, 0, tzinfo=timezone.utc)
+    third_at = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
+    fourth_at = datetime(2026, 8, 4, 13, 0, tzinfo=timezone.utc)
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _credential_run("wr_fan_done", done_at, "cred_f", status=WorkflowRunStatus.completed.value),
+                _credential_run("wr_fan_before", early_at, "cred_f"),
+                _credential_run("wr_fan_other_org", next_at, "cred_f", organization_id="org_other"),
+                _credential_run("wr_fan_running", next_at, "cred_f", status=WorkflowRunStatus.running.value),
+                _credential_run("wr_fan_next", next_at, "cred_f"),
+                _credential_run("wr_fan_third", third_at, "cred_f"),
+                _credential_run("wr_fan_fourth", fourth_at, "cred_f"),
+            ]
+        )
+        await session.commit()
+
+    waiters = await sqlite_db.workflow_runs.get_queued_runs_sharing_sequential_lanes("wr_fan_done")
+
+    assert [w.workflow_run_id for w in waiters] == ["wr_fan_next", "wr_fan_third"]
+
+
+@pytest.mark.asyncio
+async def test_wake_candidates_cover_run_sequentially_whole_workflow(sqlite_db: AgentDB) -> None:
+    # A different-credential waiter in a run_sequentially workflow has no depends_on edge and no
+    # shared credential/key, so only the whole-workflow lane can wake it; a plain session row
+    # fails the lane's admission condition.
+    done_at = datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc)
+    next_at = datetime(2026, 8, 4, 11, 0, tzinfo=timezone.utc)
+    async with sqlite_db.Session() as session:
+        session.add(
+            WorkflowModel(
+                workflow_id="wf_seq_wake",
+                workflow_permanent_id="wpid_ws_wake",
+                title="seq",
+                workflow_definition={},
+                run_sequentially=True,
+            )
+        )
+        session.add_all(
+            [
+                _credential_run(
+                    "wr_wsw_done",
+                    done_at,
+                    "cred_p",
+                    workflow_permanent_id="wpid_ws_wake",
+                    workflow_id="wf_seq_wake",
+                    status=WorkflowRunStatus.completed.value,
+                ),
+                _credential_run(
+                    "wr_wsw_next", next_at, "cred_q", workflow_permanent_id="wpid_ws_wake", workflow_id="wf_seq_wake"
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_wsw_plain_session",
+                    queued_at=next_at,
+                    workflow_permanent_id="wpid_ws_wake",
+                    workflow_id="wf_seq_wake",
+                    browser_session_id="pbs_wsw_plain",
+                ),
+            ]
+        )
+        await session.commit()
+
+    waiters = await sqlite_db.workflow_runs.get_queued_runs_sharing_sequential_lanes("wr_wsw_done")
+
+    assert [w.workflow_run_id for w in waiters] == ["wr_wsw_next"]
+
+
+@pytest.mark.asyncio
+async def test_wake_candidates_merge_lanes_and_keep_the_earliest(sqlite_db: AgentDB) -> None:
+    # The key-lane waiter is queued earlier than the credential-lane waiter, so the cross-lane
+    # merge must return it first; the later credential waiter survives because the merge never
+    # truncates across lanes (only the per-lane limit applies).
+    done_at = datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc)
+    key_at = datetime(2026, 8, 4, 10, 30, tzinfo=timezone.utc)
+    cred_at = datetime(2026, 8, 4, 11, 0, tzinfo=timezone.utc)
+    late_at = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _credential_run(
+                    "wr_merge_done",
+                    done_at,
+                    "cred_m",
+                    workflow_permanent_id="wpid_merge",
+                    sequential_key="KM",
+                    status=WorkflowRunStatus.completed.value,
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_merge_key",
+                    queued_at=key_at,
+                    workflow_permanent_id="wpid_merge",
+                    sequential_key="KM",
+                ),
+                _credential_run("wr_merge_cred", cred_at, "cred_m", workflow_permanent_id="wpid_other_merge"),
+                _credential_run("wr_merge_late", late_at, "cred_m", workflow_permanent_id="wpid_other_merge"),
+            ]
+        )
+        await session.commit()
+
+    waiters = await sqlite_db.workflow_runs.get_queued_runs_sharing_sequential_lanes("wr_merge_done")
+
+    assert [w.workflow_run_id for w in waiters] == ["wr_merge_key", "wr_merge_cred", "wr_merge_late"]
+
+
+@pytest.mark.asyncio
+async def test_wake_candidates_signal_every_lane_head(sqlite_db: AgentDB) -> None:
+    # A predecessor in three lanes (credential, browser session, workflow+key) with three distinct
+    # lane heads: a global cap of 2 would drop the latest-queued lane's head, which has no
+    # depends_on edge and would sleep until the fallback poll instead of starting.
+    done_at = datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc)
+    key_at = datetime(2026, 8, 4, 10, 30, tzinfo=timezone.utc)
+    cred_at = datetime(2026, 8, 4, 11, 0, tzinfo=timezone.utc)
+    sess_at = datetime(2026, 8, 4, 11, 30, tzinfo=timezone.utc)
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _credential_run(
+                    "wr_tri_done",
+                    done_at,
+                    "cred_t",
+                    browser_session_id="pbs_shared",
+                    workflow_permanent_id="wpid_tri",
+                    sequential_key="KT",
+                    status=WorkflowRunStatus.completed.value,
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_tri_key",
+                    queued_at=key_at,
+                    workflow_permanent_id="wpid_tri",
+                    sequential_key="KT",
+                ),
+                _credential_run("wr_tri_cred", cred_at, "cred_t", workflow_permanent_id="wpid_other_tri"),
+                _workflow_run_model(
+                    workflow_run_id="wr_tri_sess",
+                    queued_at=sess_at,
+                    browser_session_id="pbs_shared",
+                    workflow_permanent_id="wpid_other_tri2",
+                ),
+            ]
+        )
+        await session.commit()
+
+    waiters = await sqlite_db.workflow_runs.get_queued_runs_sharing_sequential_lanes("wr_tri_done")
+
+    assert [w.workflow_run_id for w in waiters] == ["wr_tri_key", "wr_tri_cred", "wr_tri_sess"]
