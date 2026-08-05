@@ -61,7 +61,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
-from skyvern.utils.secret_redaction import collect_redactable_secret_values
+from skyvern.utils.secret_redaction import collect_redactable_secret_values, is_redactable_secret_value
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
 
@@ -520,6 +520,53 @@ class WorkflowRunContext:
     def find_embedded_placeholder_tokens(self, text: str) -> list[str]:
         """Extract registered placeholder tokens found in *text*, longest-first."""
         return self._scan_placeholder_tokens(text)
+
+    def find_secret_placeholder_for_value(self, value: object) -> str | None:
+        """Return the registered placeholder token whose secret value is exactly *value*.
+
+        Lets an ordinary parameter value that duplicates a stored credential value be shown to the
+        planner as the same resolvable placeholder the credential already uses, instead of a raw
+        value the LLM-boundary redactor would one-way-replace with ``[REDACTED_SECRET]`` and then
+        type verbatim. Only whole-value matches qualify, so a scalar that merely contains a secret
+        substring is left for the redactor.
+
+        Only values the redactor itself would treat as secrets are eligible, so this matcher never
+        drifts below the redaction floor (short or sentinel values) and never re-tokenizes a value
+        that is already a registered placeholder key.
+        """
+        if not isinstance(value, str) or not value:
+            return None
+        # Runtime OTP codes are also registered as secrets but have their own resolution path; leave
+        # them for it rather than re-representing them here.
+        if value in self.runtime_otp_values:
+            return None
+        if not is_redactable_secret_value(value, self.secrets):
+            return None
+        for secret_id, secret_value in self.secrets.items():
+            if (
+                isinstance(secret_id, str)
+                and secret_id.startswith(RANDOM_SECRET_ID_PREFIX)
+                and isinstance(secret_value, str)
+                and secret_value == value
+            ):
+                return secret_id
+        return None
+
+    def represent_plaintext_secrets_as_placeholders(self, payload: Any) -> Any:
+        """Return a copy of *payload* with any scalar equal to a registered secret value replaced
+        by that secret's resolvable placeholder token.
+
+        Containers are rebuilt so the input is not mutated; non-matching scalars, existing
+        placeholders, and non-strings are returned unchanged.
+        """
+        if isinstance(payload, str):
+            token = self.find_secret_placeholder_for_value(payload)
+            return token if token is not None else payload
+        if isinstance(payload, dict):
+            return {key: self.represent_plaintext_secrets_as_placeholders(item) for key, item in payload.items()}
+        if isinstance(payload, list):
+            return [self.represent_plaintext_secrets_as_placeholders(item) for item in payload]
+        return payload
 
     def mask_secrets_in_data(self, data: Any, mask: str = "*****") -> Any:
         """

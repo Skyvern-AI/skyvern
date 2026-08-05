@@ -167,6 +167,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     settle_browser_downloads_for_context,
 )
 from skyvern.webeye.main_world_eval import evaluate_in_main_world
+from skyvern.webeye.navigation import revalidate_redirect_chain
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -5620,7 +5621,7 @@ async def handle_download_file_action(
             # the URL is usally requiring login credentials/cookides, so we should use browser navigation to access the URL instead of downloading the file directly
             validated_url = await asyncio.to_thread(validate_fetch_url, action.download_url)
             try:
-                await page.goto(validated_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+                response = await page.goto(validated_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
             except Exception as e:
                 error = str(e)
                 # some cases use this method to download a file. but it will be redirected away soon
@@ -5628,6 +5629,8 @@ async def handle_download_file_action(
                 # some cases playwright will raise error like "Page.goto: Download is starting"
                 if "net::ERR_ABORTED" not in error and "Page.goto: Download is starting" not in error:
                     raise e
+            else:
+                await revalidate_redirect_chain(response, validate_fetch_url, page.goto)
 
             LOG.info(
                 "DownloadFileAction: Downloaded file from URL",
@@ -6658,7 +6661,8 @@ async def handle_goto_url_action(
     step: Step,
 ) -> list[ActionResult]:
     validated_url = await asyncio.to_thread(validate_fetch_url, action.url)
-    await page.goto(validated_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    response = await page.goto(validated_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    await revalidate_redirect_chain(response, validate_fetch_url, page.goto)
     # Navigation invalidates the current scraped page's element ids; stop the batch so the
     # next step re-scrapes before any later actions run against the new DOM.
     result = ActionSuccess()
@@ -6960,6 +6964,10 @@ def _get_click_count(action: ClickAction | UploadFileAction) -> int:
     return 1
 
 
+def _is_policy_blocked_host(error: Exception) -> bool:
+    return isinstance(error, BlockedHost) and not isinstance(error, UnresolvableHost)
+
+
 async def _locator_click(
     locator: Locator,
     click_count: int,
@@ -7064,7 +7072,7 @@ async def chain_click(
 
         # The browser resolves through the run proxy and may reach hosts the worker cannot;
         # worker resolution failure is not a policy signal.
-        if isinstance(e, BlockedHost) and not isinstance(e, UnresolvableHost):
+        if _is_policy_blocked_host(e):
             action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
             return action_results
 
@@ -7217,16 +7225,22 @@ async def chain_click(
                     and action.y is None
                     and skyvern_element.get_tag_name() == InteractiveElement.A
                 ):
-                    navigated_href = await skyvern_element.try_navigate_via_href(page=page)
-                    if navigated_href:
-                        LOG.info(
-                            "Chain click: bypassed coordinate fallback via direct href navigation",
-                            action=action,
-                            element=str(skyvern_element),
-                            href=navigated_href,
-                        )
-                        action_results.append(ActionSuccess())
-                        return action_results
+                    try:
+                        navigated_href = await skyvern_element.try_navigate_via_href(page=page)
+                    except BlockedHost as e:
+                        if _is_policy_blocked_host(e):
+                            action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
+                            return action_results
+                    else:
+                        if navigated_href:
+                            LOG.info(
+                                "Chain click: bypassed coordinate fallback via direct href navigation",
+                                action=action,
+                                element=str(skyvern_element),
+                                href=navigated_href,
+                            )
+                            action_results.append(ActionSuccess())
+                            return action_results
             else:
                 # Element is visible and elementFromPoint returns the target itself,
                 # but Playwright's click still failed (e.g. element transiently

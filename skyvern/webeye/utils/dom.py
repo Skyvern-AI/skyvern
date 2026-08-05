@@ -47,6 +47,7 @@ from skyvern.webeye.dom_inspection import (
     read_resolved_anchor_href,
     read_whether_link_or_button,
 )
+from skyvern.webeye.navigation import revalidate_redirect_chain
 from skyvern.webeye.scraper.scraped_page import ScrapedPage, json_to_html
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, trim_element
 from skyvern.webeye.utils.page import SECRET_VISUAL_MASK_SCRIPT, SkyvernFrame
@@ -726,8 +727,7 @@ class SkyvernElement:
             element_id=self.get_id(),
         )
         try:
-            await frame.goto(resolved, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-            return resolved
+            response = await frame.goto(resolved, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
         except Exception as e:
             error = str(e)
             # Same exceptions ``navigate_to_a_href`` treats as effective
@@ -743,6 +743,11 @@ class SkyvernElement:
                 current_url=page.url,
             )
             return None
+
+        # Outside the except above on purpose: that handler swallows every failure into a
+        # coordinate-click fallback, which would turn a blocked redirect hop into a click.
+        await revalidate_redirect_chain(response, validate_fetch_url, page.goto)
+        return resolved
 
     async def find_blocking_element(
         self, dom: DomUtil, incremental_page: IncrementalScrapePage | None = None
@@ -1474,8 +1479,7 @@ class SkyvernElement:
             current_url=page.url,
         )
         try:
-            await page.goto(href, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-            return href
+            response = await page.goto(href, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
         except Exception as e:
             # some cases use this method to download a file. but it will be redirected away soon
             # and agent will run into ABORTED error.
@@ -1489,6 +1493,9 @@ class SkyvernElement:
 
             LOG.warning("Failed to navigate to the <a> href link", exc_info=True, href=href, current_url=page.url)
             raise
+
+        await revalidate_redirect_chain(response, validate_fetch_url, page.goto)
+        return href
 
     async def refresh_select_options(self) -> tuple[list, str] | None:
         if self.get_tag_name() != InteractiveElement.SELECT:
