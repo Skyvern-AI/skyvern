@@ -108,6 +108,9 @@ class TurnNarrativePayload(TypedDict):
     # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ...}, set when a mid-build
     # credential pause (credential_pause.py) resolved during this turn.
     credentialPause: NotRequired[dict[str, str]]
+    # {"credentialId": ..., "name": ...}, set when a credential was bound this turn without an ask
+    # (deterministic auto-bind); the FE renders it as a receipt with a Change affordance.
+    credentialAutoBound: NotRequired[dict[str, str]]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None
