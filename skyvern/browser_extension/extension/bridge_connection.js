@@ -10,6 +10,7 @@ import {
 
 const PING_INTERVAL_MS = 20_000;
 const SILENCE_TIMEOUT_MS = 45_000;
+const CONNECT_TIMEOUT_MS = 10_000;
 const RECONNECT_MAX_MS = 30_000;
 const AUTH_EXT_CONTEXT = "skyvern-ext-v1|";
 const AUTH_SERVER_CONTEXT = "skyvern-srv-v1|";
@@ -88,6 +89,7 @@ export class BridgeConnection {
     this.lastMessageAt = 0;
     this.reconnectDelayMs = 1_000;
     this.reconnectTimer = null;
+    this.connectTimer = null;
     this.pingTimer = null;
     this.silenceTimer = null;
     this.connectionGeneration = 0;
@@ -193,9 +195,19 @@ export class BridgeConnection {
     this.serverNonce = null;
     this.hmacKey = null;
     this.notifyState();
+    this.connectTimer = setTimeout(() => {
+      if (generation !== this.connectionGeneration || this.socket !== socket) {
+        return;
+      }
+      this.connectTimer = null;
+      if (socket.readyState === WebSocket.CONNECTING) {
+        this.failConnection("Could not reach the local Skyvern bridge.");
+      }
+    }, CONNECT_TIMEOUT_MS);
 
     socket.addEventListener("open", () => {
       if (generation === this.connectionGeneration) {
+        this.clearConnectTimer();
         this.lastMessageAt = Date.now();
         this.startHealthTimers();
       }
@@ -207,8 +219,7 @@ export class BridgeConnection {
     });
     socket.addEventListener("error", () => {
       if (generation === this.connectionGeneration) {
-        this.lastError = "Could not reach the local Skyvern bridge.";
-        this.notifyState();
+        this.failConnection("Could not reach the local Skyvern bridge.");
       }
     });
     socket.addEventListener("close", () => {
@@ -217,6 +228,7 @@ export class BridgeConnection {
       }
       this.socket = null;
       this.authenticated = false;
+      this.clearConnectTimer();
       this.stopHealthTimers();
       this.notifyState();
       this.scheduleReconnect();
@@ -435,26 +447,30 @@ export class BridgeConnection {
     }
   }
 
-  closeSocket() {
+  clearConnectTimer() {
+    if (this.connectTimer !== null) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
+  }
+
+  closeSocket(code = 1000, reason = "Disconnected") {
     this.connectionGeneration += 1;
     const socket = this.socket;
     this.socket = null;
     this.authenticated = false;
+    this.clearConnectTimer();
     this.stopHealthTimers();
     if (socket !== null && socket.readyState < WebSocket.CLOSING) {
-      socket.close(1000, "Disconnected");
+      socket.close(code, reason);
     }
     this.notifyState();
   }
 
   failConnection(message, code = 4400) {
     this.lastError = message;
-    this.authenticated = false;
-    const socket = this.socket;
-    if (socket !== null && socket.readyState < WebSocket.CLOSING) {
-      socket.close(code, message.slice(0, 120));
-    }
-    this.notifyState();
+    this.closeSocket(code, message.slice(0, 120));
+    this.scheduleReconnect();
   }
 
   notifyState() {

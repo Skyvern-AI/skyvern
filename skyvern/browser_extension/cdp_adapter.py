@@ -4,6 +4,7 @@ import asyncio
 import json
 import secrets
 from collections.abc import Coroutine
+from functools import partial
 from typing import TYPE_CHECKING
 
 import structlog
@@ -40,6 +41,20 @@ _CHILD_AUTO_ATTACH_PARAMS = {
     "flatten": True,
     "autoAttach": True,
     "waitForDebuggerOnStart": False,
+    "filter": [{"type": "iframe", "exclude": False}],
+}
+_UNSUPPORTED_CHILD_TARGET_TYPES = {"service_worker", "shared_worker", "worker"}
+_CHILD_AUTO_ATTACH_TIMEOUT_SECONDS = 3.0
+_CHILD_DETACH_TIMEOUT_SECONDS = 2.0
+_ROOT_TARGET_GATE_METHODS = {
+    "Browser.close",
+    "Target.activateTarget",
+    "Target.attachToTarget",
+    "Target.closeTarget",
+    "Target.createTarget",
+    "Target.getTargetInfo",
+    "Target.getTargets",
+    "Target.setDiscoverTargets",
 }
 
 
@@ -54,6 +69,7 @@ class ExtensionCdpAdapter:
         self._client_ws: web.WebSocketResponse | None = None
         self._client_guard = asyncio.Lock()
         self._send_lock = asyncio.Lock()
+        self._root_target_setup_lock = asyncio.Lock()
         self._auto_attach = False
         self._discover_targets = False
         self._attached_tabs: set[int] = set()
@@ -62,6 +78,10 @@ class ExtensionCdpAdapter:
         self._scope_generations: dict[int, int] = {}
         self._scope_tombstones: set[int] = set()
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._client_tasks: dict[web.WebSocketResponse, set[asyncio.Task[None]]] = {}
+        self._closing_client_websockets: set[web.WebSocketResponse] = set()
+        self._pending_child_sessions: set[str] = set()
+        self._pending_child_events: dict[str, list[dict]] = {}
 
     async def start(self) -> None:
         if self._runner is not None:
@@ -171,15 +191,16 @@ class ExtensionCdpAdapter:
         try:
             async for message in ws:
                 if message.type == WSMsgType.TEXT:
-                    await self._handle_client_text(ws, message.data)
+                    self._spawn_client_task(ws, self._handle_client_text(ws, message.data))
                 elif message.type == WSMsgType.ERROR:
                     break
                 elif message.type == WSMsgType.BINARY:
                     await ws.close(code=1003, message=b"text frames required")
                     break
         finally:
+            await self._cancel_client_tasks(ws)
             async with self._client_guard:
-                if self._client_ws is ws:
+                if self._client_ws is ws and ws not in self._closing_client_websockets:
                     self._client_ws = None
                     self._reset_connection_state()
         return ws
@@ -233,7 +254,10 @@ class ExtensionCdpAdapter:
             return
         if not is_cdp_method_allowed(method, params):
             raise ExtensionRequestError("CDP_METHOD_NOT_ALLOWED", "The requested CDP method is not allowed.")
-        args = {"tabId": tab_id, "method": method, "params": params}
+        relay_params = params
+        if method == "Target.setAutoAttach" and params.get("autoAttach") is True:
+            relay_params = {**params, "filter": [{"type": "iframe", "exclude": False}]}
+        args = {"tabId": tab_id, "method": method, "params": relay_params}
         if chrome_session_id is not None:
             args["sessionId"] = chrome_session_id
         relay_result = await self._relay.request("debugger.send", args)
@@ -250,18 +274,24 @@ class ExtensionCdpAdapter:
         params: dict,
         response_session_id: str | None = None,
     ) -> None:
+        if method == "Target.setAutoAttach":
+            async with self._root_target_setup_lock:
+                await self._set_auto_attach(ws, request_id, params, response_session_id)
+            return
+        if method in _ROOT_TARGET_GATE_METHODS:
+            # Auto-attach replaces temporary tab-<id> targets with main-frame ids.
+            # Wait for that setup without serializing these commands afterward.
+            async with self._root_target_setup_lock:
+                pass
+
         if method == "Browser.getVersion":
             await self._reply(ws, request_id, dict(_VERSION_RESULT), response_session_id)
         elif method == "Browser.setDownloadBehavior":
             await self._reply(ws, request_id, {}, response_session_id)
         elif method == "Browser.close":
             await self._reply(ws, request_id, {}, response_session_id)
-            await self._detach_all_tabs()
-            async with self._client_guard:
-                if self._client_ws is ws:
-                    self._client_ws = None
-            self._reset_connection_state()
-            await ws.close()
+            self._closing_client_websockets.add(ws)
+            self._spawn(self._shutdown_client(ws))
         elif method == "Browser.getWindowForTarget":
             await self._reply(
                 ws,
@@ -273,8 +303,6 @@ class ExtensionCdpAdapter:
             await self._reply(ws, request_id, {}, response_session_id)
         elif method == "Browser.getWindowBounds":
             await self._reply(ws, request_id, {"bounds": dict(_WINDOW_BOUNDS)}, response_session_id)
-        elif method == "Target.setAutoAttach":
-            await self._set_auto_attach(ws, request_id, params, response_session_id)
         elif method == "Target.setDiscoverTargets":
             await self._set_discover_targets(ws, request_id, params, response_session_id)
         elif method == "Target.getTargets":
@@ -531,15 +559,23 @@ class ExtensionCdpAdapter:
                 self._forget_tab(tab_id)
         await self._reply(ws, request_id, {}, response_session_id)
 
-    async def _handle_debugger_event(self, payload: dict) -> None:
+    async def _handle_debugger_event(self, payload: dict, replaying_pending_event: bool = False) -> None:
         tab_id = payload.get("tabId")
         method = payload.get("method")
         event_params = payload.get("params")
         if type(tab_id) is not int or not isinstance(method, str) or not isinstance(event_params, dict):
             return
+        payload_session_id = payload.get("sessionId")
+        if (
+            isinstance(payload_session_id, str)
+            and payload_session_id in self._pending_child_sessions
+            and not replaying_pending_event
+        ):
+            self._pending_child_events.setdefault(payload_session_id, []).append(payload)
+            return
         try:
-            if isinstance(payload.get("sessionId"), str):
-                outer_session_ids = [payload["sessionId"]]
+            if isinstance(payload_session_id, str):
+                outer_session_ids = [payload_session_id]
                 self._registry.resolve_session(outer_session_ids[0])
             else:
                 outer_session_ids = self._registry.root_session_ids(tab_id)
@@ -557,16 +593,38 @@ class ExtensionCdpAdapter:
                 # never surfaces that, and forwarding it duplicates the tab target.
                 if target_info.get("type") == "page":
                     return
-                self._registry.register_child_session(tab_id, child_session_id, target_info)
-                await self._emit_to_sessions(method, event_params, outer_session_ids)
-                if self._auto_attach:
-                    self._spawn(self._set_child_auto_attach(tab_id, child_session_id))
+                if target_info.get("type") in _UNSUPPORTED_CHILD_TARGET_TYPES:
+                    if child_session_id in self._pending_child_sessions:
+                        return
+                    self._pending_child_sessions.add(child_session_id)
+                    self._spawn(self._discard_unsupported_child(tab_id, child_session_id, target_info))
                     await asyncio.sleep(0)
+                    return
+                if self._auto_attach:
+                    if child_session_id in self._pending_child_sessions:
+                        return
+                    self._pending_child_sessions.add(child_session_id)
+                    self._spawn(
+                        self._initialize_child_target(
+                            tab_id,
+                            child_session_id,
+                            target_info,
+                            event_params,
+                            outer_session_ids,
+                        )
+                    )
+                    await asyncio.sleep(0)
+                else:
+                    self._registry.register_child_session(tab_id, child_session_id, target_info)
+                    await self._emit_to_sessions(method, event_params, outer_session_ids)
                 return
         elif method == "Target.detachedFromTarget":
             child_session_id = event_params.get("sessionId")
             if not isinstance(child_session_id, str):
                 return
+            if child_session_id in self._pending_child_sessions:
+                self._pending_child_sessions.discard(child_session_id)
+                self._spawn(self._discard_buffered_child_events(tab_id, child_session_id))
             try:
                 self._registry.resolve_session(child_session_id)
             except KeyError:
@@ -576,7 +634,14 @@ class ExtensionCdpAdapter:
             return
         await self._emit_to_sessions(method, event_params, outer_session_ids)
 
-    async def _set_child_auto_attach(self, tab_id: int, child_session_id: str) -> None:
+    async def _initialize_child_target(
+        self,
+        tab_id: int,
+        child_session_id: str,
+        target_info: dict,
+        event_params: dict,
+        outer_session_ids: list[str],
+    ) -> None:
         try:
             await self._relay.request(
                 "debugger.send",
@@ -586,12 +651,116 @@ class ExtensionCdpAdapter:
                     "method": "Target.setAutoAttach",
                     "params": dict(_CHILD_AUTO_ATTACH_PARAMS),
                 },
+                timeout=_CHILD_AUTO_ATTACH_TIMEOUT_SECONDS,
             )
-        except ExtensionRequestError as exc:
+        except Exception as exc:
             LOG.debug(
                 "browser_extension_child_auto_attach_failed",
                 method="Target.setAutoAttach",
-                error_code=exc.code,
+                error_code=exc.code if isinstance(exc, ExtensionRequestError) else "INTERNAL",
+                target_type=target_info.get("type"),
+            )
+            try:
+                await self._discard_buffered_child_events(tab_id, child_session_id)
+                await self._resume_and_detach_unserviceable_child(tab_id, child_session_id)
+            finally:
+                self._pending_child_sessions.discard(child_session_id)
+            return
+
+        if child_session_id not in self._pending_child_sessions or not self._auto_attach:
+            await self._discard_buffered_child_events(tab_id, child_session_id)
+            self._pending_child_sessions.discard(child_session_id)
+            return
+        live_outer_session_ids = []
+        for outer_session_id in outer_session_ids:
+            try:
+                self._registry.resolve_session(outer_session_id)
+            except KeyError:
+                continue
+            live_outer_session_ids.append(outer_session_id)
+        if not live_outer_session_ids:
+            try:
+                await self._discard_buffered_child_events(tab_id, child_session_id)
+                await self._resume_and_detach_unserviceable_child(tab_id, child_session_id)
+            finally:
+                self._pending_child_sessions.discard(child_session_id)
+            return
+        self._registry.register_child_session(tab_id, child_session_id, target_info)
+        await self._emit_to_sessions("Target.attachedToTarget", event_params, live_outer_session_ids)
+        await self._replay_buffered_child_events(child_session_id)
+        self._pending_child_sessions.discard(child_session_id)
+
+    async def _replay_buffered_child_events(self, child_session_id: str) -> None:
+        events = self._pending_child_events.get(child_session_id, [])
+        event_index = 0
+        while event_index < len(events):
+            payload = events[event_index]
+            event_index += 1
+            await self._handle_debugger_event(payload, replaying_pending_event=True)
+        self._pending_child_events.pop(child_session_id, None)
+
+    async def _discard_buffered_child_events(self, tab_id: int, child_session_id: str) -> None:
+        events = self._pending_child_events.pop(child_session_id, [])
+        buffered_child_session_ids: set[str] = set()
+        for payload in events:
+            if payload.get("method") != "Target.attachedToTarget":
+                continue
+            event_params = payload.get("params")
+            if not isinstance(event_params, dict):
+                continue
+            buffered_child_session_id = event_params.get("sessionId")
+            if not isinstance(buffered_child_session_id, str):
+                continue
+            buffered_child_session_ids.add(buffered_child_session_id)
+        for buffered_child_session_id in buffered_child_session_ids:
+            await self._discard_buffered_child_events(tab_id, buffered_child_session_id)
+            self._pending_child_sessions.discard(buffered_child_session_id)
+            await self._resume_and_detach_unserviceable_child(tab_id, buffered_child_session_id)
+
+    async def _discard_unsupported_child(self, tab_id: int, child_session_id: str, target_info: dict) -> None:
+        LOG.debug(
+            "browser_extension_child_target_skipped",
+            target_type=target_info.get("type"),
+        )
+        try:
+            await self._discard_buffered_child_events(tab_id, child_session_id)
+            await self._resume_and_detach_unserviceable_child(tab_id, child_session_id)
+        finally:
+            self._pending_child_sessions.discard(child_session_id)
+
+    async def _resume_and_detach_unserviceable_child(self, tab_id: int, child_session_id: str) -> None:
+        try:
+            await self._relay.request(
+                "debugger.send",
+                {
+                    "tabId": tab_id,
+                    "sessionId": child_session_id,
+                    "method": "Runtime.runIfWaitingForDebugger",
+                    "params": {},
+                },
+                timeout=_CHILD_DETACH_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            LOG.debug(
+                "browser_extension_child_resume_failed",
+                method="Runtime.runIfWaitingForDebugger",
+                error_type=type(exc).__name__,
+            )
+        try:
+            await self._relay.request(
+                "debugger.send",
+                {
+                    "tabId": tab_id,
+                    "method": "Target.detachFromTarget",
+                    "params": {"sessionId": child_session_id},
+                },
+                timeout=_CHILD_DETACH_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            LOG.debug(
+                "browser_extension_child_detach_failed",
+                method="Target.detachFromTarget",
+                error_type=type(exc).__name__,
             )
 
     async def _handle_hello_tabs(self, tabs: list[tuple[dict, int]]) -> None:
@@ -773,6 +942,15 @@ class ExtensionCdpAdapter:
                     "browser_extension_debugger_detach_failed", method="debugger.detach", error_type=type(exc).__name__
                 )
 
+    async def _shutdown_client(self, ws: web.WebSocketResponse) -> None:
+        await self._detach_all_tabs()
+        async with self._client_guard:
+            if self._client_ws is ws:
+                self._client_ws = None
+            self._closing_client_websockets.discard(ws)
+        self._reset_connection_state()
+        await ws.close()
+
     def _forget_tab(self, tab_id: int) -> None:
         self._attached_tabs.discard(tab_id)
         self._opener_ids.pop(tab_id, None)
@@ -802,8 +980,10 @@ class ExtensionCdpAdapter:
         return self._scope_generations.get(tab_id) == generation and tab_id not in self._scope_tombstones
 
     def _reset_connection_state(self) -> None:
+        current_task = asyncio.current_task()
         for task in self._background_tasks:
-            task.cancel()
+            if task is not current_task:
+                task.cancel()
         self._auto_attach = False
         self._discover_targets = False
         self._attached_tabs.clear()
@@ -811,12 +991,39 @@ class ExtensionCdpAdapter:
         self._opener_ids.clear()
         self._scope_generations.clear()
         self._scope_tombstones.clear()
+        self._closing_client_websockets.clear()
+        self._pending_child_sessions.clear()
+        self._pending_child_events.clear()
         self._registry.clear()
 
     def _spawn(self, coroutine: Coroutine[object, object, None]) -> None:
         task = asyncio.create_task(coroutine)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_task_done)
+
+    def _spawn_client_task(self, ws: web.WebSocketResponse, coroutine: Coroutine[object, object, None]) -> None:
+        task = asyncio.create_task(coroutine)
+        self._client_tasks.setdefault(ws, set()).add(task)
+        task.add_done_callback(partial(self._client_task_done, ws))
+
+    async def _cancel_client_tasks(self, ws: web.WebSocketResponse) -> None:
+        tasks = list(self._client_tasks.pop(ws, set()))
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _client_task_done(self, ws: web.WebSocketResponse, task: asyncio.Task[None]) -> None:
+        tasks = self._client_tasks.get(ws)
+        if tasks is not None:
+            tasks.discard(task)
+            if not tasks:
+                self._client_tasks.pop(ws, None)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            LOG.debug("browser_extension_client_task_failed", error_type=type(error).__name__)
 
     def _background_task_done(self, task: asyncio.Task[None]) -> None:
         self._background_tasks.discard(task)

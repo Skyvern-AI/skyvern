@@ -188,6 +188,27 @@ async def test_pair_claim_expired_nonce_is_forbidden(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [None, [], {"v": "1", "nonce": "present"}, {"v": 1}])
+async def test_pair_claim_bad_payload_is_forbidden_and_consumes_active_nonce(
+    relay_harness: RelayHarness,
+    payload: object,
+) -> None:
+    nonce = relay_harness.server.create_pairing_nonce()
+    async with ClientSession() as session:
+        response = await session.post(http_url(relay_harness, "/pair/claim"), json=payload)
+        consumed = await session.post(
+            http_url(relay_harness, "/pair/claim"),
+            json={"v": 1, "nonce": nonce},
+        )
+
+        assert response.status == 403
+        assert response.headers["Cache-Control"] == "no-store"
+        assert await response.json() == {"error": "invalid_nonce"}
+        assert consumed.status == 403
+        assert await consumed.json() == {"error": "invalid_nonce"}
+
+
+@pytest.mark.asyncio
 async def test_pair_begin_bad_proof_is_forbidden(relay_harness: RelayHarness) -> None:
     async with ClientSession() as session:
         response = await session.post(
@@ -341,6 +362,79 @@ async def test_request_response_error_and_timeout_paths(relay_harness: RelayHarn
             await timeout_task
         assert timeout_info.value.code == "INTERNAL"
         assert timeout_info.value.message == "extension request timed out: tabs.list"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_session_requests_are_written_in_issue_order() -> None:
+    server = ExtensionRelayServer(TOKEN, 0, lambda _event, _params: asyncio.sleep(0))
+    arrivals: list[int] = []
+
+    class OvertakingWebSocket:
+        closed = False
+
+        async def send_json(self, frame: dict) -> None:
+            sequence = frame["args"]["params"]["sequence"]
+            if sequence == 0:
+                await asyncio.sleep(0.01)
+            arrivals.append(sequence)
+            server._pending.pop(frame["id"]).set_result({"sequence": sequence})
+
+    server._websocket = OvertakingWebSocket()  # type: ignore[assignment]
+    server._connected_event.set()
+    tasks = []
+    for sequence in range(5):
+        tasks.append(
+            asyncio.create_task(
+                server.request(
+                    "debugger.send",
+                    {
+                        "tabId": 17,
+                        "sessionId": "child-17",
+                        "method": "Runtime.evaluate",
+                        "params": {"sequence": sequence},
+                    },
+                )
+            )
+        )
+        await asyncio.sleep(0)
+
+    assert await asyncio.gather(*tasks) == [{"sequence": sequence} for sequence in range(5)]
+    assert arrivals == list(range(5))
+
+
+@pytest.mark.asyncio
+async def test_slow_first_response_does_not_delay_second_request_arrival(
+    relay_harness: RelayHarness,
+) -> None:
+    async with ClientSession() as session:
+        websocket = await authenticate(session, relay_harness)
+        first_task = asyncio.create_task(
+            relay_harness.server.request(
+                "debugger.send",
+                {"tabId": 17, "sessionId": "child-17", "method": "Runtime.enable", "params": {}},
+            )
+        )
+        first_request = await websocket.receive_json()
+        second_task = asyncio.create_task(
+            relay_harness.server.request(
+                "debugger.send",
+                {
+                    "tabId": 17,
+                    "sessionId": "child-17",
+                    "method": "Runtime.runIfWaitingForDebugger",
+                    "params": {},
+                },
+            )
+        )
+
+        second_request = await websocket.receive_json(timeout=0.5)
+        assert [first_request["id"], second_request["id"]] == ["r-1", "r-2"]
+        await websocket.send_json({"v": 1, "type": "response", "id": second_request["id"], "ok": True, "result": {}})
+        assert await second_task == {}
+        assert not first_task.done()
+
+        await websocket.send_json({"v": 1, "type": "response", "id": first_request["id"], "ok": True, "result": {}})
+        assert await first_task == {}
 
 
 @pytest.mark.asyncio
