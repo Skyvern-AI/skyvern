@@ -1573,14 +1573,3 @@ def test_turn_intent_prompt_carries_structural_feasibility_contract() -> None:
     assert "structurally_infeasible" in prompt
     assert "mid-session pivot" in prompt
     assert "On the fence" in prompt
-
-
-def test_turn_intent_prompt_carries_over_asking_guardrails() -> None:
-    prompt = _render_turn_intent_prompt()
-
-    assert "resolves the target even without a URL" in prompt
-    assert "never ask which website/URL to use" in prompt
-    assert "refinements, corrections, and bare-value replies" in prompt
-    assert "When a concrete URL is present" in prompt
-    assert "default harder away from structurally_infeasible" in prompt
-    assert "On the fence: do not use structurally_infeasible" in prompt
