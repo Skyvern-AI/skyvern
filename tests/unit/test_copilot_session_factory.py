@@ -56,6 +56,71 @@ class TestFirstTurnCompaction:
         for recent in recent_three:
             assert small_summary_marker not in recent["output"]
 
+    def test_recent_code_sized_output_survives_session_compaction(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
+        from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+
+        code_sized = json.dumps({"ok": True, "data": {"code": "await page.click()\n" * 400}})
+        assert 2000 < len(code_sized) < _RECENT_TOOL_OUTPUT_CHAR_CAP
+        items: list[dict[str, Any]] = [
+            {"role": "user", "content": "please build me a workflow"},
+            {"type": "function_call_output", "call_id": "call-code", "output": code_sized},
+        ]
+        result = copilot_call_model_input_filter(_mk_input_data(items))
+        outputs = [it for it in result.input if it.get("type") == "function_call_output"]
+        assert outputs[0]["output"] == code_sized
+
+    def test_recent_overcap_output_truncates_and_warns_on_session_path(self) -> None:
+        import structlog.testing
+
+        from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
+        from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+
+        oversized = "x" * (_RECENT_TOOL_OUTPUT_CHAR_CAP + 1000)
+        items: list[dict[str, Any]] = [
+            {"role": "user", "content": "please build me a workflow"},
+            {"type": "function_call_output", "call_id": "call-big", "output": oversized},
+        ]
+        with structlog.testing.capture_logs() as logs:
+            result = copilot_call_model_input_filter(_mk_input_data(items))
+        outputs = [it for it in result.input if it.get("type") == "function_call_output"]
+        assert outputs[0]["output"].endswith("... [truncated]")
+        assert any(entry["event"] == "copilot_recent_tool_output_truncated" for entry in logs)
+
+    def test_emergency_truncation_logs_distinct_event_with_count(self) -> None:
+        import structlog.testing
+
+        from skyvern.forge.sdk.copilot.session_factory import make_copilot_call_model_input_filter
+
+        items: list[dict[str, Any]] = [
+            {"role": "user", "content": "please build me a workflow"},
+            *({"type": "function_call_output", "call_id": f"call-{i}", "output": "x" * 5000} for i in range(3)),
+            {"type": "function_call_output", "call_id": "call-small", "output": "ok"},
+        ]
+        tight_filter = make_copilot_call_model_input_filter(token_budget=200)
+        with structlog.testing.capture_logs() as logs:
+            tight_filter(_mk_input_data(items))
+        emergency = [entry for entry in logs if entry["event"] == "copilot_tool_output_emergency_truncated"]
+        assert [entry["cap"] for entry in emergency] == [2000, 300]
+        assert all(entry["truncated_count"] >= 2 for entry in emergency)
+
+    def test_soft_emergency_rung_spares_code_when_it_fits(self) -> None:
+        import structlog.testing
+
+        from skyvern.forge.sdk.copilot.session_factory import make_copilot_call_model_input_filter
+
+        items: list[dict[str, Any]] = [
+            {"role": "user", "content": "please build me a workflow"},
+            {"type": "function_call_output", "call_id": "call-big", "output": "x" * 40_000},
+        ]
+        soft_filter = make_copilot_call_model_input_filter(token_budget=800)
+        with structlog.testing.capture_logs() as logs:
+            result = soft_filter(_mk_input_data(items))
+        emergency = [entry for entry in logs if entry["event"] == "copilot_tool_output_emergency_truncated"]
+        assert [entry["cap"] for entry in emergency] == [2000]
+        outputs = [it for it in result.input if it.get("type") == "function_call_output"]
+        assert 2000 <= len(outputs[0]["output"]) <= 2020
+
     def test_filter_summarizes_older_function_call_args_on_first_turn(self) -> None:
         """F3/CORR-2 guard: older `function_call` items get their bulky
         ``arguments`` payload (e.g. a full workflow YAML) compacted, exactly

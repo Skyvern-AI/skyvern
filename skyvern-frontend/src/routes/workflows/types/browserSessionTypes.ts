@@ -16,6 +16,7 @@ interface BrowserSession {
   browser_type?: BrowserSessionType | null;
   generate_browser_profile?: boolean;
   vnc_streaming_supported: boolean;
+  stream_transport?: string | null;
 }
 
 interface Recording {

@@ -26,7 +26,10 @@ import { SaveSessionAsBrowserProfileDialog } from "@/routes/browserProfiles/Save
 import { useBackgroundBrowserProfileCreate } from "@/routes/browserProfiles/hooks/useBackgroundBrowserProfileCreate";
 import { CopyText } from "@/routes/workflows/editor/Workspace";
 import { type BrowserSession as BrowserSessionType } from "@/routes/workflows/types/browserSessionTypes";
-import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
+import {
+  resolveStreamTransport,
+  useBrowserStreamingMode,
+} from "@/hooks/useRuntimeConfig";
 import {
   StreamModeBadge,
   type StreamMode,
@@ -49,7 +52,6 @@ function BrowserSession() {
   const [isSaveProfileDialogOpen, setIsSaveProfileDialogOpen] = useState(false);
   const [vncFailed, setVncFailed] = useState(false);
   const { browserStreamingMode } = useBrowserStreamingMode();
-  const isCdpMode = browserStreamingMode === "cdp";
 
   useEffect(() => {
     setVncFailed(false);
@@ -72,6 +74,11 @@ function BrowserSession() {
   });
 
   const browserSession = query.data;
+  const isCdpMode =
+    resolveStreamTransport(
+      browserStreamingMode,
+      browserSession?.stream_transport,
+    ) === "cdp";
   const streamMode: StreamMode = isCdpMode
     ? "cdp"
     : browserSession?.vnc_streaming_supported
