@@ -1612,6 +1612,7 @@ class AgentFunction:
         *,
         organization_id: str | None = None,
         workflow_run_id: str | None = None,
+        browser_session_id: str | None = None,
     ) -> bool:
         """Solve and apply a reCAPTCHA token. OSS has no solver client."""
         return False

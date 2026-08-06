@@ -19,8 +19,10 @@ from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_EXPIRY_SECONDS,
     artifact_url_expiry_seconds_for_type,
     effective_artifact_url_expiry_seconds,
+    parse_artifact_content_url,
     parse_keyring,
     sign_artifact_url,
+    verify_artifact_signature,
 )
 from skyvern.forge.sdk.artifact.utils import replace_file_extension
 from skyvern.forge.sdk.core import skyvern_context
@@ -1401,6 +1403,51 @@ class ArtifactManager:
                 expiry_seconds=expiry_seconds,
             )
         return await app.STORAGE.get_share_link(artifact)
+
+    async def remint_content_url_if_unverified(self, url: str, organization_id: str | None) -> str | None:
+        """Re-sign a first-party artifact content URL whose signature does not verify.
+
+        ``sig`` is a 43-character capability token that has to survive the whole workflow
+        value plane verbatim; one dropped character turns a readable artifact into a 403
+        (SKY-13575). The server can always re-derive it, so when the carried signature
+        fails to verify — corrupted, absent, or expired — and the run's organization owns
+        the artifact, hand back a freshly signed URL.
+
+        Returns None when the URL is not ours, still verifies, or names an artifact this
+        organization cannot read; the caller then keeps the URL it already had.
+        """
+        if not organization_id:
+            return None
+        parsed = parse_artifact_content_url(url, settings.SKYVERN_BASE_URL)
+        if parsed is None:
+            return None
+        if settings.ARTIFACT_CONTENT_HMAC_KEYRING and parsed.expiry and parsed.kid and parsed.sig:
+            if verify_artifact_signature(
+                artifact_id=parsed.artifact_id,
+                expiry=parsed.expiry,
+                kid=parsed.kid,
+                sig=parsed.sig,
+                keyring=parse_keyring(settings.ARTIFACT_CONTENT_HMAC_KEYRING),
+            ):
+                return None
+
+        artifact = await app.DATABASE.artifacts.get_artifact_by_id(
+            artifact_id=parsed.artifact_id,
+            organization_id=organization_id,
+        )
+        if artifact is None:
+            return None
+        expiry_seconds = await self.resolve_artifact_url_expiry_seconds(organization_id)
+        reminted = await self.resolve_share_url(artifact, expiry_seconds=expiry_seconds)
+        if reminted is None:
+            return None
+        LOG.warning(
+            "Re-signed a first-party artifact URL whose signature did not verify",
+            artifact_id=parsed.artifact_id,
+            organization_id=organization_id,
+            signature_length=len(parsed.sig) if parsed.sig else 0,
+        )
+        return reminted
 
     async def get_share_link(self, artifact: Artifact) -> str | None:
         """Return a customer-facing URL for one artifact.
