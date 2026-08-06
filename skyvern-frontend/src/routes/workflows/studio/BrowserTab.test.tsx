@@ -51,6 +51,7 @@ vi.mock("../hooks/useWorkflowRunsQuery", () => ({
 }));
 vi.mock("@/hooks/useRuntimeConfig", () => ({
   useBrowserStreamingMode: () => ({ browserStreamingMode: "vnc" }),
+  useStreamTransport: () => ({ streamTransport: "vnc" }),
 }));
 vi.mock("posthog-js/react", () => ({
   usePostHog: () => ({ capture: vi.fn() }),

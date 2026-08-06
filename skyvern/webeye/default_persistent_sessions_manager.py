@@ -313,6 +313,16 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         browser_session = self._browser_sessions.get(session_id)
         return browser_session.browser_state if browser_session else None
 
+    async def get_observer_browser_state(
+        self, session_id: str, organization_id: str | None = None
+    ) -> BrowserState | None:
+        """The state this process already drives, so watching it adopts nothing."""
+        return await self.get_browser_state(session_id, organization_id)
+
+    async def release_observer_browser_state(self, session_id: str, browser_state: BrowserState) -> None:
+        """Nothing was adopted: this process drives the browser, and the run still needs it."""
+        return None
+
     async def set_browser_state(
         self, session_id: str, browser_state: BrowserState, organization_id: str | None = None
     ) -> None:
