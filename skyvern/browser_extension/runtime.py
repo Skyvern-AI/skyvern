@@ -77,8 +77,9 @@ class BrowserExtensionRuntime:
                 await _cleanup_failed_start(relay, adapter)
                 if exc.errno == errno.EADDRINUSE:
                     raise BrowserExtensionError(
-                        f"Browser extension relay port {resolved_port} is already in use; "
-                        f"set {_PORT_ENV} to a free port"
+                        f"Another Skyvern MCP session likely owns the browser-extension bridge on port {resolved_port}; "
+                        f"close that session, or set {_PORT_ENV} to a free port and update the bridge port in the Skyvern "
+                        "extension popup to match"
                     ) from exc
                 raise
             except BaseException:
