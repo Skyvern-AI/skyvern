@@ -7,7 +7,7 @@ import { toast } from "@/components/ui/use-toast";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { useCostCalculator } from "@/hooks/useCostCalculator";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
+import { useStreamTransport } from "@/hooks/useRuntimeConfig";
 import { getCredentialParam } from "@/util/env";
 import {
   StreamStatusPanel,
@@ -127,8 +127,8 @@ function TaskActions() {
   const taskIsNotFinalized = task && statusIsNotFinalized(task);
   const taskIsRunningOrQueued = task && statusIsRunningOrQueued(task);
   const browserSessionId = task?.browser_session_id;
-  const { browserStreamingMode } = useBrowserStreamingMode();
-  const shouldUseCdpStream = browserStreamingMode === "cdp";
+  const { streamTransport } = useStreamTransport(browserSessionId);
+  const shouldUseCdpStream = streamTransport === "cdp";
 
   useEffect(() => {
     // In VNC mode, BrowserStream handles live sessions. In CDP mode, this

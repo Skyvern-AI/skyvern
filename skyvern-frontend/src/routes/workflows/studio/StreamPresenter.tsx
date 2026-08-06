@@ -1,5 +1,5 @@
 import { BrowserStream } from "@/components/BrowserStream";
-import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
+import { useStreamTransport } from "@/hooks/useRuntimeConfig";
 import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
 
 type StreamPresenterProps = {
@@ -27,8 +27,13 @@ export function StreamPresenter({
   onUrlChange,
   onActivity,
 }: StreamPresenterProps) {
-  const { browserStreamingMode } = useBrowserStreamingMode();
-  const useCdp = browserStreamingMode === "cdp" && !isRecording;
+  const { streamTransport } = useStreamTransport(browserSessionId);
+  const useCdp = streamTransport === "cdp" && !isRecording;
+
+  if (!streamTransport) {
+    // Mounting either transport now would open a connection this session may not serve.
+    return null;
+  }
 
   if (useCdp) {
     // CDP frames must be explicitly centered; VNC handles this in its own CSS.
