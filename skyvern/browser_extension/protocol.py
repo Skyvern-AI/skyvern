@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 from skyvern.browser_extension.errors import BrowserExtensionError
 
 PROTOCOL_VERSION = 1
-EXTENSION_ID = "fmamdhmfeihjjaiheideemihnbpnokin"
+EXTENSION_ID = "dhommdmblflboaledbbfkdaapkadphlp"
 
 ALLOWED_OPS = frozenset(
     {

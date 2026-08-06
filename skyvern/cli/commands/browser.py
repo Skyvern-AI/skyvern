@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 import typer
 
+from skyvern._cli_bootstrap import prepare_cli_runtime
 from skyvern.browser_extension.auth import load_or_create_pairing_token
 from skyvern.browser_extension.errors import BrowserExtensionError
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime
@@ -68,6 +69,7 @@ from skyvern.cli.lazy import SkyvernTyperGroup
 from skyvern.cli.mcp_tools.browser import skyvern_login as tool_login
 from skyvern.cli.mcp_tools.browser import skyvern_run_task as tool_run_task
 from skyvern.cli.mcp_tools.inspection import skyvern_har_start, skyvern_har_stop
+from skyvern.utils.env_paths import EnvIntent
 
 browser_app = typer.Typer(cls=SkyvernTyperGroup, help="Browser automation commands.", no_args_is_help=True)
 session_app = typer.Typer(cls=SkyvernTyperGroup, help="Manage browser sessions.", no_args_is_help=True)
@@ -80,6 +82,12 @@ browser_app.add_typer(frame_app, name="frame")
 browser_app.add_typer(state_app, name="state")
 browser_app.add_typer(storage_app, name="storage")
 browser_app.add_typer(network_app, name="network")
+
+
+@browser_app.callback()
+def browser_callback() -> None:
+    """Load environment and mark the CLI runtime so credential-bearing clients hit the base-URL guard."""
+    prepare_cli_runtime(intent=EnvIntent.CLOUD)
 
 
 @dataclass(frozen=True)
