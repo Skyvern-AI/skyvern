@@ -373,6 +373,18 @@ async def test_hash_route_change_not_steered(monkeypatch) -> None:
     assert "next_action" not in second["data"]
 
 
+def test_recon_result_keeps_raw_payload_within_its_own_ceiling() -> None:
+    moderate = {"ok": True, "data": {"result": {"bodyText": "y" * 10_000}, "next_action_reason": "recon"}}
+    scouting._fit_evaluate_steer_under_cap(moderate, moderate["data"], keep_raw_page_payload=True)
+    assert moderate["data"]["result"]["bodyText"] == "y" * 10_000
+
+
+def test_recon_result_over_ceiling_sheds_down_to_recon_cap() -> None:
+    huge = {"ok": True, "data": {"result": "z" * 60_000, "raw_page_text": "w" * 30_000}}
+    scouting._fit_evaluate_steer_under_cap(huge, huge["data"], keep_raw_page_payload=True)
+    assert len(json.dumps(huge, default=str)) <= scouting._SCOUT_RECON_RESULT_CHAR_CAP
+
+
 @pytest.mark.asyncio
 async def test_repeat_scalar_result_sheds_under_cap(monkeypatch) -> None:
     ctx = _ctx()
@@ -392,8 +404,8 @@ async def test_repeat_scalar_result_sheds_under_cap(monkeypatch) -> None:
     serialized = json.dumps(second, default=str)
     assert second["data"].get("next_action") == "click"
     assert second["data"].get("actionable_targets")
-    assert len(serialized) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
-    assert '"next_action"' in serialized[: scouting._RECENT_TOOL_OUTPUT_CHAR_CAP]
+    assert len(serialized) <= scouting._SCOUT_RESULT_CHAR_CAP
+    assert '"next_action"' in serialized[: scouting._SCOUT_RESULT_CHAR_CAP]
 
 
 @pytest.mark.asyncio
@@ -417,8 +429,8 @@ async def test_first_loaded_result_table_sheds_large_payload_but_keeps_compositi
     assert ctx.latest_recorded_build_test_outcome.phase == "scout_evaluate"
     assert ctx.latest_recorded_build_test_outcome.reason_code == "loaded_result_targets_observed"
     assert ctx.latest_recorded_build_test_outcome.structural_key is not None
-    assert len(serialized) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
-    assert '"next_action"' in serialized[: scouting._RECENT_TOOL_OUTPUT_CHAR_CAP]
+    assert len(serialized) <= scouting._SCOUT_RESULT_CHAR_CAP
+    assert '"next_action"' in serialized[: scouting._SCOUT_RESULT_CHAR_CAP]
     assert "compose_extraction" in serialized
 
 
@@ -448,7 +460,7 @@ async def test_loaded_result_composition_targets_are_cap_aware_for_max_shaped_ev
     serialized = json.dumps(result, default=str)
     composition_targets = result["data"]["composition_targets"]
     target = composition_targets["targets"][0]
-    assert len(serialized) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert len(serialized) <= scouting._SCOUT_RESULT_CHAR_CAP
     assert result["data"]["next_action"] == "compose_extraction"
     assert composition_targets["result_container_count"] == 8
     assert composition_targets["table_result_container_count"] == 8
@@ -490,7 +502,7 @@ async def test_single_loaded_result_structural_target_fits_evaluate_cap_with_url
     serialized = json.dumps(result, default=str)
     composition_targets = result["data"]["composition_targets"]
     target = composition_targets["targets"][0]
-    assert len(serialized) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert len(serialized) <= scouting._SCOUT_RESULT_CHAR_CAP
     assert result["data"]["next_action"] == "compose_extraction"
     assert composition_targets["result_container_count"] == 1
     assert composition_targets["table_result_container_count"] == 1
@@ -537,8 +549,8 @@ async def test_repeat_nested_result_sheds_under_cap(monkeypatch) -> None:
     serialized = json.dumps(second, default=str)
     assert second["data"].get("next_action") == "click"
     assert second["data"].get("actionable_targets")
-    assert len(serialized) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
-    assert '"next_action"' in serialized[: scouting._RECENT_TOOL_OUTPUT_CHAR_CAP]
+    assert len(serialized) <= scouting._SCOUT_RESULT_CHAR_CAP
+    assert '"next_action"' in serialized[: scouting._SCOUT_RESULT_CHAR_CAP]
 
 
 @pytest.mark.asyncio
@@ -901,7 +913,7 @@ async def test_single_low_tier_link_auto_acts(monkeypatch) -> None:
     assert second["data"]["page"]["page_title"] == "Statement"
     assert "next_action" not in second["data"]
     assert "actionable_targets" not in second["data"]
-    assert len(json.dumps(second, default=str)) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert len(json.dumps(second, default=str)) <= scouting._SCOUT_RESULT_CHAR_CAP
 
 
 @pytest.mark.asyncio
@@ -929,7 +941,7 @@ async def test_auto_act_post_evidence_none_sheds_bulky_result_under_cap(monkeypa
     assert second["data"]["auto_acted"]["selector"] == "#stmt"
     assert second["data"]["auto_acted"].get("note")
     assert "page" not in second["data"]
-    assert len(json.dumps(second, default=str)) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert len(json.dumps(second, default=str)) <= scouting._SCOUT_RESULT_CHAR_CAP
 
 
 @pytest.mark.asyncio
@@ -975,7 +987,7 @@ async def test_auto_act_success_branch_sheds_oversized_page_under_cap(monkeypatc
     assert [call[0] for call in server.calls].count("skyvern_click") == 1
     assert "auto_acted" in second["data"]
     assert "page" in second["data"]
-    assert len(json.dumps(second, default=str)) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert len(json.dumps(second, default=str)) <= scouting._SCOUT_RESULT_CHAR_CAP
 
 
 @pytest.mark.asyncio
