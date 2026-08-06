@@ -9,6 +9,7 @@ from threading import RLock
 import httpx
 import structlog
 
+from skyvern._cli_bootstrap import CLOUD_URL_OPT_IN_MESSAGE, is_cli_runtime
 from skyvern.client import SkyvernEnvironment
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_MCP_USER_AGENT
@@ -64,7 +65,15 @@ def _resolve_self_base_url() -> str:
 def _build_cloud_client(api_key: str) -> Skyvern:
     from .session_manager import is_stateless_http_mode  # noqa: PLC0415 — circular import
 
-    base_url: str | None = _resolve_self_base_url() if is_stateless_http_mode() else _resolve_base_url()
+    if is_stateless_http_mode():
+        base_url: str | None = _resolve_self_base_url()
+    else:
+        # Guard is CLI-scoped on purpose: prod temporal workers run with SKYVERN_BASE_URL
+        # unset and reach this factory via copilot self-heal — refusing unconditionally
+        # here is a production outage, not a hardening.
+        if is_cli_runtime() and api_key != "PLACEHOLDER" and not settings.is_skyvern_base_url_explicitly_configured:
+            raise RuntimeError(CLOUD_URL_OPT_IN_MESSAGE)
+        base_url = _resolve_base_url()
     # Generated SDK methods send "x-user-agent": None when no per-call user_agent is given,
     # clobbering constructor-level headers in the merge; httpx client-level defaults survive
     # because None-valued headers are stripped before the request is sent (SKY-13333).

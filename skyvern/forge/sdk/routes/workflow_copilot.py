@@ -2119,6 +2119,7 @@ async def _new_copilot_chat_post(
                     organization_id=organization.organization_id,
                     chat_request=chat_request,
                     chat_history=convert_to_history_messages(chat_messages[-CHAT_HISTORY_CONTEXT_MESSAGES:]),
+                    prior_user_messages=convert_to_history_messages(chat_messages),
                     global_llm_context=global_llm_context,
                     debug_run_info_text=debug_run_info_text,
                     llm_api_handler=llm_api_handler,
