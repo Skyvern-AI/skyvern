@@ -41,6 +41,7 @@ from skyvern.forge.sdk.copilot.config import (
 )
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.enforcement import (
+    _RECENT_TOOL_OUTPUT_CHAR_CAP,
     KEEP_RECENT_TOOL_OUTPUTS,
     TOTAL_TIMEOUT_SECONDS,
     _mark_copilot_total_timeout,
@@ -1640,6 +1641,35 @@ def test_recent_outputs_preserved_full() -> None:
         assert pruned[i]["output"] == short
 
 
+def test_recent_code_sized_output_survives_untruncated() -> None:
+    # A code-bearing result in the recent window must reach the model whole; the cap
+    # is a pathological-payload tripwire, never a ration on legitimate code payloads.
+    code_sized = json.dumps({"ok": True, "data": {"code": "await page.click()\n" * 400}})
+    assert 2000 < len(code_sized) < _RECENT_TOOL_OUTPUT_CHAR_CAP
+    items = [_fco("c0", code_sized)]
+
+    pruned = _prune_input_list(items)
+    assert pruned[0]["output"] == code_sized
+
+
+def test_scout_budgets_stay_within_the_recent_window_cap() -> None:
+    from skyvern.forge.sdk.copilot.tools.scouting import _SCOUT_RECON_RESULT_CHAR_CAP, _SCOUT_RESULT_CHAR_CAP
+
+    # The shed-never-slice guarantee holds only while every scout budget fits inside
+    # the transcript's recent-window cap.
+    assert _SCOUT_RESULT_CHAR_CAP <= _SCOUT_RECON_RESULT_CHAR_CAP <= _RECENT_TOOL_OUTPUT_CHAR_CAP
+
+
+def test_old_code_output_synopsis_names_elided_code_size() -> None:
+    code = "await page.click()\n" * 300
+    old_output = json.dumps({"ok": True, "data": {"code": code}})
+    items = [_fco("c_old", old_output)] + [_fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)]
+
+    pruned = _prune_input_list(items)
+    synopsis = json.loads(pruned[0]["output"])
+    assert synopsis["code_chars_elided"] == len(code)
+
+
 def test_old_large_output_is_summarized() -> None:
     # An older, large JSON tool output gets compressed into a synopsis.
     heavy_payload = {
@@ -1702,15 +1732,19 @@ def test_summarize_short_output_is_unchanged() -> None:
 
 
 def test_recent_large_output_is_head_truncated_not_summarized() -> None:
-    # Big JSON in the most-recent slot should be head-truncated at 2000 chars,
+    import structlog.testing
+
+    # Over-cap JSON in the most-recent slot should be head-truncated,
     # NOT replaced with a summary.
-    large = '{"ok":true,"data":{"value":"' + ("y" * 3000) + '"}}'
+    large = '{"ok":true,"data":{"value":"' + ("y" * (_RECENT_TOOL_OUTPUT_CHAR_CAP + 1000)) + '"}}'
     items = [_fco("c_recent", large)]
-    pruned = _prune_input_list(items)
+    with structlog.testing.capture_logs() as logs:
+        pruned = _prune_input_list(items)
     out = pruned[0]["output"]
     assert out.startswith('{"ok":true,')
     assert out.endswith("\n... [truncated]")
-    assert len(out) <= 2020
+    assert len(out) <= _RECENT_TOOL_OUTPUT_CHAR_CAP + 20
+    assert any(entry["event"] == "copilot_recent_tool_output_truncated" for entry in logs)
 
 
 class TestEnforcement:
