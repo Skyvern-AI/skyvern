@@ -234,9 +234,16 @@ async def _run_mcp_with_cleanup(run_async: Any, *, browser_extension: bool = Fal
     extension_runtime: BrowserExtensionRuntime | None = None
     try:
         if browser_extension:
+            from skyvern.browser_extension.errors import BrowserExtensionError  # noqa: PLC0415
             from skyvern.browser_extension.runtime import BrowserExtensionRuntime  # noqa: PLC0415
 
-            extension_runtime = await BrowserExtensionRuntime.get_or_start()
+            try:
+                extension_runtime = await BrowserExtensionRuntime.get_or_start()
+            except BrowserExtensionError as exc:
+                LOG.warning(
+                    "Browser extension bridge startup failed; the bridge will be retried on first browser-tool use",
+                    error=str(exc),
+                )
         await run_async(**kwargs)
     finally:
         _mcp_cleanup_in_progress = True
