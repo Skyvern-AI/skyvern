@@ -301,7 +301,7 @@ class AgentContext:
     workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
 
     # Enforcement state. Set lazily by streaming_adapter, tools, and
-    # failure_tracking; declared here so _check_enforcement can read them on a
+    # failure_tracking; declared here so enforcement_decision can read them on a
     # fresh context without AttributeError.
     navigate_called: bool = False
     observation_after_navigate: bool = False
@@ -340,7 +340,6 @@ class AgentContext:
     last_scout_act_observe_packet: dict[str, Any] | None = None
     last_scout_act_observe_recapture_attempted: bool = False
     last_scout_act_observe_recapture_result: str = ""
-    ambiguous_bare_selector_rescout_context_key: str | None = None
     pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     challenge_gated_proxy_retry_count: int = 0
