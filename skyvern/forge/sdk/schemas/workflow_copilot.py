@@ -262,6 +262,7 @@ class WorkflowCopilotStreamMessageType(StrEnum):
     WORKFLOW_DRAFT = "workflow_draft"
     CREDENTIAL_REQUIRED = "credential_required"
     CODEGEN_PROGRESS = "codegen_progress"
+    TITLE_UPDATE = "title_update"
 
 
 class WorkflowCopilotProcessingUpdate(BaseModel):
@@ -480,6 +481,16 @@ class WorkflowCopilotWorkflowDraftUpdate(BaseModel):
         None,
         description="Staged workflow API response (same shape as terminal RESPONSE.updated_workflow). Drives mid-turn canvas updates.",
     )
+
+
+class WorkflowCopilotTitleUpdate(BaseModel):
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.TITLE_UPDATE, description="Message type"
+    )
+    turn_id: str = Field(..., description="UUID for the turn that named the agent")
+    workflow_permanent_id: str = Field(..., description="The agent that was named")
+    title: str = Field(..., description="The persisted title; only ever emitted after the write succeeded")
+    timestamp: datetime = Field(..., description="Server timestamp")
 
 
 class WorkflowCopilotCredentialRequiredUpdate(BaseModel):

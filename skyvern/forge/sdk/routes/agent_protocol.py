@@ -3035,6 +3035,15 @@ async def get_artifact_content(
             sig=sig,
             keyring=keyring,
         ):
+            # Signature length is the tell that separates a corrupted URL from an expired
+            # one: sign_artifact_url always emits exactly 43 base64url characters.
+            LOG.warning(
+                "Rejected artifact content request with an unverifiable signature",
+                artifact_id=artifact_id,
+                kid=kid,
+                expiry=expiry,
+                signature_length=len(sig),
+            )
             raise HTTPException(
                 status_code=http_status.HTTP_403_FORBIDDEN,
                 detail="Invalid or expired artifact URL",

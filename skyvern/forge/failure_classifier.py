@@ -153,6 +153,43 @@ def classify_from_failure_reason(
             }
         )
 
+    # The runner's fail-closed message for its internal faults (protocol errors, handshake
+    # failures, runner-side exceptions); user code cannot author this literal.
+    if "secure codeblock runner failed before completing" in reason:
+        categories.append(
+            {
+                "category": "INFRASTRUCTURE_ERROR",
+                "confidence_float": 0.95,
+                "reason_code": "secure_codeblock_runner_internal",
+                "reasoning": "Secure CodeBlock runner failed internally before completing",
+            }
+        )
+
+    # The sandbox child died without delivering a result. Usually a pod/deploy fault (child OOM
+    # and blocked operations get their own codes first), but user code can still self-terminate
+    # the interpreter, so confidence stays below the unambiguous runner arms.
+    if "secure codeblock sandbox process exited" in reason:
+        categories.append(
+            {
+                "category": "INFRASTRUCTURE_ERROR",
+                "confidence_float": 0.6,
+                "reason_code": "secure_codeblock_sandbox_exited",
+                "reasoning": "Secure CodeBlock sandbox child process died before completing",
+            }
+        )
+
+    # Runner-slot contention, not a fault; the distinct reason_code keeps it separable from
+    # real runner failures in analytics.
+    if "codeblock runner is already executing another codeblock" in reason:
+        categories.append(
+            {
+                "category": "INFRASTRUCTURE_ERROR",
+                "confidence_float": 0.9,
+                "reason_code": "secure_codeblock_runner_busy",
+                "reasoning": "Secure CodeBlock runner was busy with another CodeBlock",
+            }
+        )
+
     _is_timeout = "Timeout" in exc_name or "timeout" in reason
     _is_element_state_timeout = _is_timeout and bool(_ELEMENT_OPERATION_RE.search(reason))
 

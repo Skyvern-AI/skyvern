@@ -36,7 +36,11 @@ import skyvern
 from skyvern import analytics
 from skyvern.client.types.output_parameter import OutputParameter as BlockOutputParameter
 from skyvern.config import settings
-from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
+from skyvern.constants import (
+    DEFAULT_WORKFLOW_TITLES,
+    GET_DOWNLOADED_FILES_TIMEOUT,
+    SAVE_DOWNLOADED_FILES_TIMEOUT,
+)
 from skyvern.exceptions import (
     BlockedHost,
     BlockNotFound,
@@ -10009,7 +10013,7 @@ class WorkflowService:
 
         # Generate meaningful title if using default and has blocks
         title = request.title
-        if title == DEFAULT_WORKFLOW_TITLE and request.workflow_definition.blocks:
+        if title in DEFAULT_WORKFLOW_TITLES and request.workflow_definition.blocks:
             generated_title = await generate_workflow_title(
                 organization_id=organization_id,
                 blocks=request.workflow_definition.blocks,
