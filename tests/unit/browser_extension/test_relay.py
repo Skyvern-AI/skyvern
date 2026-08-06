@@ -118,7 +118,7 @@ async def test_pair_begin_claim_happy_path_and_pair_page_never_contains_token(
         page_body = await page.text()
         assert page.status == 200
         assert TOKEN not in page_body
-        assert "fmamdhmfeihjjaiheideemihnbpnokin" in page_body
+        assert "dhommdmblflboaledbbfkdaapkadphlp" in page_body
 
         claim = await session.post(
             http_url(relay_harness, "/pair/claim"),

@@ -1,5 +1,5 @@
 Classify the latest Workflow Copilot turn. Return only JSON:
-{mode, expected_output, required_context, confidence, target_entities, missing_context_question, reason_codes}.
+{mode, expected_output, required_context, confidence, target_entities, missing_context_question, reason_codes, workflow_title}.
 
 Allowed modes: {{ mode_values }}.
 Allowed expected_output values: {{ expected_output_values }}.
@@ -7,6 +7,8 @@ Allowed required_context values: {{ required_context_values }}.
 Allowed reason_codes values: {{ reason_code_values }}.
 
 Classify task shape only. RequestPolicy owns credential/raw-secret/testing policy and deterministic code owns authority.
+
+workflow_title: a 2-5 word name for what this agent does, in title case, no trailing punctuation (e.g. "Weekly Visitor Report"). If the user states a name ("call it Invoice Bot"), return exactly that name. Return null unless the turn asks to build or change an agent, and null rather than guessing when the goal is not yet clear enough to name.
 
 Modes: build=new or blank workflow task; edit=change existing workflow/proposal; diagnose=inspect/debug/continue from run evidence; docs_answer=respond inline when no workflow, browser, or run action is requested; draft_only=workflow change but no validation run; clarify=ambiguous target/change; refuse=unsupported request; unknown=insufficient signal.
 
