@@ -27,6 +27,7 @@ from skyvern.forge.sdk.artifact.signing import (
     _hmac_b64,
     artifact_url_expiry_seconds_for_type,
     effective_artifact_url_expiry_seconds,
+    parse_artifact_content_url,
     parse_keyring,
     sign_artifact_url,
     verify_artifact_signature,
@@ -408,3 +409,46 @@ class TestVerifyArtifactSignature:
             keys={_KID_V2: HmacKeyEntry(secret="newsecret", created_at="2026-03-12")},
         )
         assert not verify_artifact_signature(_ARTIFACT_ID, expiry, kid, sig, new_kr)
+
+
+class TestParseArtifactContentUrl:
+    def test_parses_signed_first_party_url(self) -> None:
+        keyring = _make_keyring()
+        url = sign_artifact_url(_BASE_URL, _ARTIFACT_ID, keyring)
+
+        parsed = parse_artifact_content_url(url, _BASE_URL)
+
+        assert parsed is not None
+        assert parsed.artifact_id == _ARTIFACT_ID
+        assert parsed.kid == _KID_V1
+        assert parsed.sig is not None and len(parsed.sig) == 43
+
+    def test_parses_unsigned_first_party_url(self) -> None:
+        parsed = parse_artifact_content_url(f"{_BASE_URL}{_CONTENT_PATH}", _BASE_URL)
+
+        assert parsed is not None
+        assert parsed.artifact_id == _ARTIFACT_ID
+        assert (parsed.expiry, parsed.kid, parsed.sig) == (None, None, None)
+
+    def test_tolerates_trailing_slash_on_base_url(self) -> None:
+        parsed = parse_artifact_content_url(f"{_BASE_URL}{_CONTENT_PATH}?sig=abc", f"{_BASE_URL}/")
+
+        assert parsed is not None and parsed.sig == "abc"
+
+    def test_honors_base_url_path_prefix(self) -> None:
+        parsed = parse_artifact_content_url(f"{_BASE_URL}/api{_CONTENT_PATH}", f"{_BASE_URL}/api")
+
+        assert parsed is not None and parsed.artifact_id == _ARTIFACT_ID
+
+    def test_rejects_foreign_origin(self) -> None:
+        assert parse_artifact_content_url(f"https://evil.example.com{_CONTENT_PATH}", _BASE_URL) is None
+
+    def test_rejects_other_first_party_paths(self) -> None:
+        assert parse_artifact_content_url(f"{_BASE_URL}/v1/artifacts/{_ARTIFACT_ID}", _BASE_URL) is None
+        assert parse_artifact_content_url(f"{_BASE_URL}/v1/runs/wr_1", _BASE_URL) is None
+
+    def test_rejects_non_http_urls(self) -> None:
+        assert parse_artifact_content_url("s3://bucket/key.pdf", _BASE_URL) is None
+
+    def test_rejects_empty_base_url(self) -> None:
+        assert parse_artifact_content_url(f"{_BASE_URL}{_CONTENT_PATH}", "") is None
