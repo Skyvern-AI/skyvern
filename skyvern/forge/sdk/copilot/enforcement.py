@@ -230,7 +230,13 @@ TOKENS_PER_RESIZED_IMAGE = 765
 # Keep the last N function_call_output items at full (head-truncated) size.
 # Older outputs collapse to a compact synopsis so context doesn't grow linearly.
 KEEP_RECENT_TOOL_OUTPUTS = 3
-_RECENT_TOOL_OUTPUT_CHAR_CAP = 2000
+# A tripwire against pathological payloads, not a routine ration: code-bearing tool
+# results (synthesized blocks, edit re-anchor echoes) run 3-30KB plus JSON escaping
+# and must reach the model whole, so the cap sits above that class with headroom.
+_RECENT_TOOL_OUTPUT_CHAR_CAP = 50_000
+# Older tool-call arguments that fail to summarize keep only this much; that channel
+# exists to shrink replayed context and must not follow the recent-window cap.
+_SUMMARIZED_TOOL_ARGUMENT_CHAR_CAP = 2000
 _TOOL_OUTPUT_SUMMARIZE_THRESHOLD = 300
 _TOOL_OUTPUT_TRUNCATION_SUFFIX = "\n... [older tool output truncated]"
 # Head-truncation marker for the recent tool-output window. Kept on a
@@ -1680,6 +1686,9 @@ def _summarize_tool_output(output: str) -> str:
 
     data = parsed.get("data")
     if isinstance(data, dict):
+        code = data.get("code")
+        if isinstance(code, str) and code:
+            synopsis["code_chars_elided"] = len(code)
         for key in ("overall_status", "workflow_run_id", "failure_reason", "url", "message"):
             val = data.get(key)
             if val is None or val == "":
@@ -1750,9 +1759,9 @@ def _summarize_tool_arguments(args_json: str) -> str:
     try:
         parsed = json.loads(args_json)
     except (TypeError, ValueError):
-        return args_json[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
+        return args_json[:_SUMMARIZED_TOOL_ARGUMENT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
     if not isinstance(parsed, dict):
-        return args_json[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
+        return args_json[:_SUMMARIZED_TOOL_ARGUMENT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
     compact: dict[str, Any] = {}
     for key, val in parsed.items():
         if isinstance(val, str) and len(val) > 500:
@@ -1766,7 +1775,16 @@ def _summarize_tool_arguments(args_json: str) -> str:
     try:
         return json.dumps(compact, separators=(",", ":"))
     except (TypeError, ValueError):
-        return args_json[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
+        return args_json[:_SUMMARIZED_TOOL_ARGUMENT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
+
+
+def log_recent_tool_output_truncation(truncated_count: int, largest_original_chars: int) -> None:
+    LOG.warning(
+        "copilot_recent_tool_output_truncated",
+        truncated_count=truncated_count,
+        cap=_RECENT_TOOL_OUTPUT_CHAR_CAP,
+        largest_original_chars=largest_original_chars,
+    )
 
 
 def _prune_input_list(items: list[Any]) -> list[Any]:
@@ -1788,6 +1806,8 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
     recent_fc_set = set(fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:])
 
     result: list[Any] = []
+    recent_truncated_count = 0
+    recent_truncated_largest = 0
     for i, item in enumerate(items):
         if i in drop_indices:
             result.append({"role": "user", "content": SCREENSHOT_PLACEHOLDER})
@@ -1798,11 +1818,13 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
             output = _item_field(item, "output")
             if isinstance(output, str):
                 if i in recent_fco_set:
-                    new_output = (
-                        output[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX
-                        if len(output) > _RECENT_TOOL_OUTPUT_CHAR_CAP
-                        else output
-                    )
+                    if len(output) > _RECENT_TOOL_OUTPUT_CHAR_CAP:
+                        new_output = output[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX
+                        if new_output != output:
+                            recent_truncated_count += 1
+                            recent_truncated_largest = max(recent_truncated_largest, len(output))
+                    else:
+                        new_output = output
                 else:
                     new_output = _summarize_tool_output(output)
                 if new_output != output:
@@ -1815,6 +1837,8 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
                     item = _replace_item_field(item, "arguments", new_args)
 
         result.append(item)
+    if recent_truncated_count:
+        log_recent_tool_output_truncation(recent_truncated_count, recent_truncated_largest)
     return result
 
 

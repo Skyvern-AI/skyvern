@@ -24,7 +24,12 @@ from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
-from skyvern.forge.sdk.routes.streaming.screencast import start_screencast_loop, wait_for_browser_state
+from skyvern.forge.sdk.routes.streaming.screencast import (
+    release_browser_state,
+    start_screencast_loop,
+    wait_for_browser_state,
+)
+from skyvern.forge.sdk.routes.streaming.verify import stream_transport
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.org_auth_service import get_current_org
@@ -65,6 +70,9 @@ async def task_stream(
 
     LOG.info("Started task streaming", task_id=task_id, organization_id=organization_id)
 
+    # A run streams the frames its own worker publishes (``CDPFramePublisher``), which reaches a
+    # browser this process does not hold — including an externally hosted one. Only a deployment
+    # that drives the browser in-process screencasts it directly.
     if settings.BROWSER_STREAMING_MODE == "cdp":
         await _local_screencast_for_task(websocket, task_id, organization_id)
         return
@@ -336,7 +344,7 @@ async def browser_session_streaming(
         organization_id=organization_id,
     )
 
-    if settings.BROWSER_STREAMING_MODE == "cdp":
+    if await stream_transport(browser_session_id, organization_id) == "cdp":
         await _local_screencast_for_browser_session(websocket, browser_session_id, organization_id)
         return
 
@@ -355,10 +363,14 @@ async def _run_local_screencast(
     wait_for_running: Callable[[], Awaitable[str | None]],
     check_finalized: Callable[[], Awaitable[bool]],
     get_current_status: Callable[[], Awaitable[str | None]],
+    # Required: a browser this process does not own is reachable only through the session that
+    # holds it, and that lookup is organization-scoped. Defaulting this made the remote path
+    # silently unreachable for whichever caller forgot to pass it.
+    organization_id: str,
     get_workflow_run_id: Callable[[], str | None] | None = None,
-    organization_id: str | None = None,
 ) -> None:
     id_key = f"{entity_type}_id"
+    browser_state = None
     try:
         early_exit_status = await wait_for_running()
         if early_exit_status is not None:
@@ -400,6 +412,8 @@ async def _run_local_screencast(
         LOG.warning("WebSocket connection error during local screencast", **{id_key: entity_id})
     except Exception:
         LOG.warning("Error in local screencast", **{id_key: entity_id}, exc_info=True)
+    finally:
+        await release_browser_state(browser_state, entity_type, entity_id)
 
 
 async def _local_screencast_for_workflow_run(
@@ -450,6 +464,7 @@ async def _local_screencast_for_workflow_run(
         wait_for_running=wait_for_running,
         check_finalized=check_finalized,
         get_current_status=get_current_status,
+        organization_id=organization_id,
     )
 
 
@@ -496,6 +511,7 @@ async def _local_screencast_for_task(
         wait_for_running=wait_for_running,
         check_finalized=check_finalized,
         get_current_status=get_current_status,
+        organization_id=organization_id,
         get_workflow_run_id=lambda: task_workflow_run_id,
     )
 
