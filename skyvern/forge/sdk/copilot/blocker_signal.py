@@ -339,7 +339,6 @@ _LOOP_PROGRESS_TOOLS = frozenset(
 )
 _ACTIVE_TERMINAL_REPLACEABLE_REASON_CODES = frozenset({"tool_error_per_tool_budget_rerun"})
 _TERMINAL_CHALLENGE_REPLACEABLE_REASON_CODES = frozenset({"tool_error_post_budget_challenge_result_evidence"})
-SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE = "tool_error_synthesized_block_persistence_required"
 SCHEMA_INCOMPATIBILITY_REASON_CODE = "schema_incompatibility"
 DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE = "loop_detected_discovery_exhausted_no_entry_url"
 _OUTPUT_CONTRACT_TERMINAL_REASON_CODES = frozenset(
@@ -383,12 +382,6 @@ def _should_stash_over_existing(
     if (
         incoming.internal_reason_code == "tool_error_post_budget_challenge_blocker"
         and existing.internal_reason_code in _TERMINAL_CHALLENGE_REPLACEABLE_REASON_CODES
-    ):
-        return True
-    if (
-        existing.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
-        and not existing.renders_final_reply
-        and incoming.renders_final_reply
     ):
         return True
     return False

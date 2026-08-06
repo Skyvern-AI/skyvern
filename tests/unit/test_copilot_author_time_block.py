@@ -401,7 +401,6 @@ def test_every_loop_plane_refusal_it_can_emit_is_declared() -> None:
     constants themselves, and fails if a rename moves a value out of the declared set.
     """
     carried = {
-        blocker_signal_module.SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
         blocker_signal_module.DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
         run_outcome_module.TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
         blockers_module._POST_BUDGET_CHALLENGE_RESULT_EVIDENCE_REASON,
