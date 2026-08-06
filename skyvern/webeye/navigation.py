@@ -8,7 +8,7 @@ from typing import Literal
 import structlog
 
 from skyvern.constants import PERMANENT_NAV_ERRORS, SKIP_INNER_NAV_RETRY_ERRORS
-from skyvern.exceptions import BlockedNavigationDestination, FailedToNavigateToUrl, InvalidUrl
+from skyvern.exceptions import BlockedHost, BlockedNavigationDestination, FailedToNavigateToUrl, InvalidUrl
 from skyvern.utils.url_validators import canonical_navigation_host, is_blocked_host
 
 LOG = structlog.get_logger()
@@ -64,9 +64,32 @@ def _navigation_hop_urls(response: object) -> list[str]:
     return urls
 
 
+async def revalidate_redirect_chain(
+    response: object,
+    validate: Callable[[str], object],
+    reset_page: NavigateFunc | None = None,
+) -> None:
+    """Re-check every hop the browser followed, plus the final destination.
+
+    ``validate`` must raise the exception family the call site already handles.
+    ``BlockedNavigationDestination`` is NOT a ``BlockedHost`` subclass, so passing the wrong
+    validator silently reroutes a blocked hop into the caller's success or fallback branch.
+    A provided ``reset_page`` is used to clear a refused destination without replacing its error.
+    """
+    try:
+        for hop_url in _navigation_hop_urls(response):
+            await asyncio.to_thread(validate, hop_url)
+    except BlockedHost:
+        if reset_page is not None:
+            try:
+                await reset_page("about:blank")
+            except Exception:
+                LOG.exception("Failed to reset page after redirect refusal")
+        raise
+
+
 async def _revalidate_navigation_response(response: object) -> None:
-    for hop_url in _navigation_hop_urls(response):
-        await asyncio.to_thread(validate_navigation_destination, hop_url)
+    await revalidate_redirect_chain(response, validate_navigation_destination)
 
 
 # Progressive wait_until degradation. Degrading to `domcontentloaded` and

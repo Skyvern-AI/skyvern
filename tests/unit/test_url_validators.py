@@ -303,6 +303,49 @@ def test_validate_fetch_url_blocks_localhost_resolving_to_private_host(monkeypat
         validate_fetch_url("http://localhost:8000/")
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ftp://public.example.test/file",
+        "chrome://settings",
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+    ],
+)
+def test_validate_fetch_url_refuses_other_schemes_without_resolving(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    """A scheme we refuse outright must not emit a DNS query for its host.
+
+    Resolving decides nothing for these, and it turns every rejected URL into a lookup of an
+    attacker-supplied name.
+    """
+    resolved: list[str] = []
+
+    def record(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        resolved.append(host)
+        raise socket.gaierror("should not be called")
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", record)
+
+    with pytest.raises(SkyvernHTTPException):
+        validate_fetch_url(url)
+
+    assert resolved == []
+
+
+def test_validate_fetch_url_still_resolves_a_backslash_authority_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The http backslash-authority vector still resolves; only refused schemes skip DNS."""
+
+    def resolves_internal(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.5", port or 0))]
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_internal)
+
+    with pytest.raises(BlockedHost):
+        validate_fetch_url("http://sneaky.example.test\\@public.example.test/")
+
+
 def test_validate_fetch_url_fails_closed_on_dns_error(monkeypatch: pytest.MonkeyPatch) -> None:
     def fails_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
         raise OSError("dns unavailable")

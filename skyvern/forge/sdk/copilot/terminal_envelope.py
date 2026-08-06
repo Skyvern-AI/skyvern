@@ -168,6 +168,18 @@ def _select_run_outcome_anchor(run_outcomes: Sequence[RecordedRunOutcome]) -> Re
     final_outcomes = [outcome for outcome in run_outcomes if outcome.verdict in _FINAL_RUN_VERDICTS]
     if not final_outcomes:
         return None
+    # An interim build-test verdict is a mid-build "keep building" signal, not an
+    # honest turn outcome, so it must not mask a later adjudicated run: prefer the
+    # last not_demonstrated among adjudicated outcomes. Only when the turn produced
+    # no adjudicated outcome at all — e.g. a suspicious-success repair ceiling whose
+    # de-facto-final run is interim-tagged because the loop stopped rather than
+    # continued — do interim verdicts anchor, preserving the honest terminal amber.
+    adjudicated = [outcome for outcome in final_outcomes if outcome.role != "interim_build_test"]
+    if adjudicated:
+        adjudicated_not_demonstrated = [outcome for outcome in adjudicated if outcome.verdict == "not_demonstrated"]
+        if adjudicated_not_demonstrated:
+            return adjudicated_not_demonstrated[-1]
+        return adjudicated[-1]
     last_not_demonstrated = [outcome for outcome in final_outcomes if outcome.verdict == "not_demonstrated"]
     if last_not_demonstrated:
         return last_not_demonstrated[-1]

@@ -4,6 +4,7 @@ narrative payload: ``responseKind`` from ``TurnOutcome.response_kind`` and
 
 from __future__ import annotations
 
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from skyvern.forge.sdk.copilot.context import (
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage, WorkflowCopilotChatSender
 from tests.unit.copilot_test_helpers import failed_second_factor_run
 from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
 from tests.unit.copilot_test_helpers import make_verified_goal_contract, passing_run, two_page_login_yaml
@@ -162,6 +164,60 @@ def test_backfill_adds_credential_prompt_from_text_marker_when_no_policy_signal(
     )
     assert result.narrative_payload is not None
     assert result.narrative_payload["credentialPrompt"] == {"reason": "assistant_directed"}
+
+
+def test_backfill_emits_credential_auto_bound_receipt() -> None:
+    ctx = _ctx(
+        request_policy=RequestPolicy(
+            auto_bound_credentials=[SimpleNamespace(credential_id="cred_work", name="Work login")]
+        )
+    )
+    result = _result(ctx, turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=_payload())
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["credentialAutoBound"] == {"credentialId": "cred_work", "name": "Work login"}
+
+
+def test_backfill_omits_credential_auto_bound_when_nothing_bound() -> None:
+    result = _result(
+        _ctx(request_policy=RequestPolicy()),
+        turn_outcome=_outcome(ResponseKind.BUILD),
+        narrative_payload=_payload(),
+    )
+    assert result.narrative_payload is not None
+    assert "credentialAutoBound" not in result.narrative_payload
+
+
+def test_backfill_credential_auto_bound_names_the_most_recent_bind() -> None:
+    # Turn-start bound one credential and a later live page bound another; the receipt names the most
+    # recent — the credential the run is actually signing in with now.
+    ctx = _ctx(
+        request_policy=RequestPolicy(
+            auto_bound_credentials=[
+                SimpleNamespace(credential_id="cred_turn_start", name="First"),
+                SimpleNamespace(credential_id="cred_live_page", name="Second"),
+            ]
+        )
+    )
+    result = _result(ctx, turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=_payload())
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["credentialAutoBound"] == {"credentialId": "cred_live_page", "name": "Second"}
+
+
+def test_credential_auto_bound_survives_narrative_payload_serialization() -> None:
+    # The persisted/streamed wire model validates narrative_payload against the TurnNarrativePayload
+    # TypedDict and drops any key it does not declare, so the credentialAutoBound line is load-bearing:
+    # without it the field silently vanishes from model_dump and the FE loses the receipt on reload.
+    message = WorkflowCopilotChatMessage(
+        workflow_copilot_chat_message_id="m1",
+        workflow_copilot_chat_id="c1",
+        sender=WorkflowCopilotChatSender.AI,
+        content="done",
+        created_at=datetime(2026, 1, 1),
+        modified_at=datetime(2026, 1, 1),
+        narrative_payload=_payload(credentialAutoBound={"credentialId": "cred_x", "name": "Work login"}),
+    )
+    dumped = message.model_dump()["narrative_payload"]
+    assert dumped["credentialAutoBound"] == {"credentialId": "cred_x", "name": "Work login"}
 
 
 def test_backfill_omits_credential_prompt_when_no_signal_present() -> None:

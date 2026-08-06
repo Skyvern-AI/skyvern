@@ -11498,6 +11498,9 @@ class TestGoalCompletionLandingImposition:
         committed = ctx.requested_output_extraction_candidate
         assert committed is not None
         ctx.synthesized_block_reopened_after_failed_run = True
+        # A retained plan reaches the goal and admits via the landing lane instead of rejecting;
+        # this contract is about the rejecting reopen path, so pin reach off.
+        ctx.last_bound_requested_output_extraction_plan = None
 
         unscouted_sibling = _yaml(
             f"""
@@ -11519,6 +11522,24 @@ class TestGoalCompletionLandingImposition:
         assert result.violations
         assert ctx.requested_output_extraction_candidate == committed
         assert ctx.pending_requested_output_extraction_candidate is None
+
+    def test_read_reach_admits_reimposition_and_keeps_the_committed_candidate(self) -> None:
+        # The retained plan reaches the goal for a read deliverable (SKY-13485), so the same reopen
+        # state admits via goal_reaching_spine_unlanded and re-lands the spine instead of rejecting.
+        ctx = _live_read_extraction_ctx()
+        workflow_update_module._maybe_impose_synthesized_code_block(_live_read_submitted_yaml(), ctx)
+        workflow_update_module._record_workflow_update_result(ctx, _persisted_workflow_result())
+        committed = ctx.requested_output_extraction_candidate
+        assert committed is not None
+        assert ctx.last_bound_requested_output_extraction_plan is not None
+        ctx.synthesized_block_reopened_after_failed_run = True
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(_live_read_submitted_yaml(), ctx)
+
+        assert not result.violations
+        assert workflow_update_module._imposition_admission_key_after_update(ctx) == "goal_reaching_spine_unlanded"
+        pending = ctx.pending_requested_output_extraction_candidate
+        assert pending is not None and pending.fingerprint == committed.fingerprint
 
 
 def _hand_authored_rung_yaml() -> str:
@@ -12145,6 +12166,96 @@ def _scalar_plan(*bindings: LiveReadBinding) -> RequestedOutputExtractionPlan:
         live_reads=tuple(bindings),
         identity="plan-identity",
     )
+
+
+class TestReadDeliverableReach:
+    """A read deliverable has no commit shape to reach; its bound extraction plan is the reach
+    evidence (SKY-13485). A login+read scout trajectory satisfies no commit clause, so without
+    this the imposition lane never opens and the compiled read never lands."""
+
+    _READ_PATH = "output.azure_error_count"
+
+    def _read_ctx(
+        self,
+        *criteria: CompletionCriterion,
+        plan: RequestedOutputExtractionPlan | None,
+    ) -> CopilotContext:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "read_value",
+                "read_expression": "document.querySelector('.tile').innerText",
+                "read_output_path": self._READ_PATH,
+                "trajectory_index": 0,
+                "source_url": "https://dashboard.example.test/records",
+            }
+        ]
+        ctx.completion_criteria_turn_state = SimpleNamespace(decision=SimpleNamespace(criteria=tuple(criteria)))
+        ctx.last_bound_requested_output_extraction_plan = plan
+        return ctx
+
+    def _read_criterion(self) -> CompletionCriterion:
+        return CompletionCriterion(
+            id="azure_error_count",
+            outcome="the number of azure errors is returned",
+            output_path=self._READ_PATH,
+        )
+
+    def _bound_plan(self) -> RequestedOutputExtractionPlan:
+        return _scalar_plan(_scalar_binding(self._READ_PATH, "records found", ".tile"))
+
+    def test_read_trajectory_with_bound_plan_reaches_goal(self) -> None:
+        ctx = self._read_ctx(self._read_criterion(), plan=self._bound_plan())
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+
+    def test_read_trajectory_without_plan_does_not_reach(self) -> None:
+        ctx = self._read_ctx(self._read_criterion(), plan=None)
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+
+    def test_plan_bound_to_other_paths_does_not_reach(self) -> None:
+        other = _scalar_plan(_scalar_binding("output.visitor_count", "Visitors", ".other"))
+        ctx = self._read_ctx(self._read_criterion(), plan=other)
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+
+    def test_unreached_download_request_ignores_the_plan_latch(self) -> None:
+        download = CompletionCriterion(
+            id="invoice_pdf",
+            outcome="the invoice PDF is downloaded",
+            output_path="output.invoice_pdf",
+            deliverable_kind="registered_download",
+        )
+        ctx = self._read_ctx(self._read_criterion(), download, plan=self._bound_plan())
+        ctx.reached_download_target = None
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+
+    def test_a_mandated_action_still_outstanding_is_not_reached(self) -> None:
+        # A method-mandated action never routes to the commit shape, so the read clause is the only
+        # thing standing between a bound plan and a "goal reached" on a spine that never acted.
+        mandated = CompletionCriterion(
+            id="durable_fill",
+            outcome="the live form is filled on the page this turn",
+            kind="terminal_action",
+            terminal_action_family="form",
+            method_mandated=True,
+        )
+        ctx = self._read_ctx(self._read_criterion(), mandated, plan=self._bound_plan())
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+
+    def test_terminal_action_request_keeps_the_commit_shape(self) -> None:
+        terminal = CompletionCriterion(
+            id="start_service_request",
+            outcome="the start-service request reaches its review page",
+            kind="terminal_action",
+            terminal_action_family="request",
+        )
+        ctx = self._read_ctx(self._read_criterion(), terminal, plan=self._bound_plan())
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
 
 
 _MIXED_DOWNLOAD_CODE = (

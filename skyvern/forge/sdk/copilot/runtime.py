@@ -396,6 +396,8 @@ class AgentContext:
     # while scouting the goal path, each tagged with how that state was reached.
     # Feeds the per-acted-page composition gate; never persisted into workflow YAML.
     flow_evidence: list[dict[str, Any]] = field(default_factory=list)
+    # Challenge-advisory reasons already surfaced to the model this turn, so the advisory fires once.
+    challenge_advisory_fired_reasons: set[str] = field(default_factory=set)
     pending_browser_interaction_observation: PendingBrowserInteractionObservation | None = None
     # In-turn side channel from workflow mutation calls: block label -> flow_evidence
     # observation step used to ground the newly authored page-acting block.
@@ -496,6 +498,7 @@ class AgentContext:
     synthesized_block_offered_goal_complete: bool = False
     # Probe-validated value elements the model designated, each pinned to the page it was resolved on.
     requested_output_designations: list[dict[str, Any]] = field(default_factory=list)
+    resolved_designation_fingerprints: set[str] = field(default_factory=set)
     requested_output_extraction_candidate: FrozenRequestedOutputExtractionCandidate | None = None
     # Candidate frozen by an imposition that has not been persisted yet; promoted to the committed
     # candidate only once the update it rode in on succeeds.

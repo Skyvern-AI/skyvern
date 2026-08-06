@@ -5,7 +5,9 @@ import pytest
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.testclient import TestClient
 
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.routes import internal_auth
+from skyvern.forge.sdk.schemas.organizations import OrganizationAuthTokenType
 
 
 def _request(client_host: str = "127.0.0.1") -> Request:
@@ -19,6 +21,12 @@ def _request(client_host: str = "127.0.0.1") -> Request:
             "scheme": "http",
         }
     )
+
+
+def _request_with_api_key() -> Request:
+    request = _request()
+    request.scope["headers"] = [(b"x-api-key", b"local-ui-session-canary")]
+    return request
 
 
 def test_is_local_request_returns_false_for_public_ip() -> None:
@@ -60,6 +68,34 @@ async def test_auth_status_rejects_private_non_loopback_address(monkeypatch: pyt
 
     assert exc_info.value.status_code == status.HTTP_403_FORBIDDEN
     evaluate_local_api_key.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auth_status_accepts_local_ui_session_without_authorization(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(internal_auth, "settings", SimpleNamespace(ENV="local"))
+    monkeypatch.setattr(internal_auth.app, "AGENT_FUNCTION", AgentFunction())
+    monkeypatch.setattr(internal_auth.app, "DATABASE", object())
+
+    async def resolve_ui_session(
+        token: str,
+        _db: object,
+        token_types: tuple[OrganizationAuthTokenType, ...],
+    ) -> object:
+        assert token == "local-ui-session-canary"
+        assert token_types == (
+            OrganizationAuthTokenType.api,
+            OrganizationAuthTokenType.ui_session,
+        )
+        return SimpleNamespace(
+            organization=SimpleNamespace(organization_id="org-local"),
+            payload=SimpleNamespace(exp=4102444800),
+        )
+
+    monkeypatch.setattr(internal_auth, "resolve_org_from_api_key", resolve_ui_session)
+
+    payload = await internal_auth.auth_status(_request_with_api_key())
+
+    assert payload == {"status": "ok"}
 
 
 def test_diagnostics_body_discloses_only_the_status() -> None:

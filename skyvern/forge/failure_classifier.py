@@ -141,6 +141,18 @@ def classify_from_failure_reason(
             }
         )
 
+    # The secure CodeBlock runner sidecar was absent on the pool this run landed on, so the block
+    # failed closed without executing any user code. That is a deploy-topology fault.
+    if "secure codeblock runner is unavailable" in reason:
+        categories.append(
+            {
+                "category": "INFRASTRUCTURE_ERROR",
+                "confidence_float": 0.95,
+                "reason_code": "secure_codeblock_runner_unavailable",
+                "reasoning": "Secure CodeBlock runner sidecar was unreachable",
+            }
+        )
+
     _is_timeout = "Timeout" in exc_name or "timeout" in reason
     _is_element_state_timeout = _is_timeout and bool(_ELEMENT_OPERATION_RE.search(reason))
 

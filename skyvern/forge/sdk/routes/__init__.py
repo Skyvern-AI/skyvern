@@ -16,6 +16,7 @@ from skyvern.forge.sdk.routes import scripts  # noqa: F401
 from skyvern.forge.sdk.routes import sdk  # noqa: F401
 from skyvern.forge.sdk.routes import self_heal  # noqa: F401
 from skyvern.forge.sdk.routes import streaming  # noqa: F401
+from skyvern.forge.sdk.routes import ui_session  # noqa: F401
 from skyvern.forge.sdk.routes import webhooks  # noqa: F401
 from skyvern.forge.sdk.routes import workflow_schedules  # noqa: F401
 from skyvern.forge.sdk.routes.streaming import cdp_input  # noqa: F401

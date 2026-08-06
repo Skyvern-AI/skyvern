@@ -59,7 +59,7 @@ _PLACEHOLDER_TOKEN_RE = re.compile(r"placeholder_\w+")
 _TOTP_SENTINEL_VALUES = frozenset({"BW_TOTP", "OP_TOTP", "AZ_TOTP"})
 
 
-def _is_redactable_secret_value(value: Any, secrets: Mapping[str, Any]) -> bool:
+def is_redactable_secret_value(value: Any, secrets: Mapping[str, Any]) -> bool:
     if not isinstance(value, str):
         return False
     if len(value) < MIN_SECRET_LENGTH:
@@ -86,7 +86,7 @@ def collect_redactable_secret_values(
 ) -> set[str]:
     values: set[str] = set()
     for value in [*secrets.values(), *extra_values]:
-        if _is_redactable_secret_value(value, secrets):
+        if is_redactable_secret_value(value, secrets):
             values.add(value)
     for value in otp_values:
         if _is_redactable_otp_value(value, secrets):

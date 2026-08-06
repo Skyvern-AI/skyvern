@@ -417,7 +417,14 @@ class GoogleSheetsWriteBlock(Block):
                 self.values, workflow_run_context, env=jinja_json_finalize_env
             )
 
-    def _coerce_values(self, raw: Any, *, column_offset: int = 0) -> list[list[Any]]:
+    def _coerce_values(self, raw: Any, *, column_offset: int = 0, absolute_columns: bool = False) -> list[list[Any]]:
+        """Rows for the write payload.
+
+        ``absolute_columns`` selects who the row's index 0 addresses: ``values.append`` writes from
+        the first column of the table it finds — not from the range's start column — so an append
+        addresses column A and a pinned range has to be padded for, while ``values.update`` writes
+        from its own start cell and addresses columns relative to it.
+        """
         if isinstance(raw, dict):
             if isinstance(raw.get("values"), list) and isinstance(raw.get("rows"), list):
                 LOG.warning("Google Sheets write payload has both 'values' and 'rows'; using 'values'")
@@ -434,7 +441,10 @@ class GoogleSheetsWriteBlock(Block):
         if not raw:
             return []
         if all(isinstance(row, list) for row in raw):
-            return cast(list[list[Any]], raw)
+            rows = cast(list[list[Any]], raw)
+            if absolute_columns and column_offset:
+                return [[None] * column_offset + row for row in rows]
+            return rows
         if all(isinstance(row, dict) for row in raw):
             if not self.column_mapping:
                 raise ValueError("column_mapping is required when writing a list of objects to Google Sheets")
@@ -451,7 +461,7 @@ class GoogleSheetsWriteBlock(Block):
                     raise ValueError(f"column_mapping target {target!r} exceeds the Google Sheets column limit (ZZZ)")
                 if col_index in seen_columns:
                     raise ValueError(f"column_mapping has duplicate destination column: {target!r}")
-                pos = col_index - column_offset
+                pos = col_index if absolute_columns else col_index - column_offset
                 if pos < 0:
                     raise ValueError(
                         f"column_mapping target {target!r} falls before the range start column; "
@@ -646,7 +656,11 @@ class GoogleSheetsWriteBlock(Block):
             )
 
         try:
-            rows = self._coerce_values(parsed_values, column_offset=leading_column_offset(a1))
+            rows = self._coerce_values(
+                parsed_values,
+                column_offset=leading_column_offset(a1),
+                absolute_columns=self.write_mode == "append",
+            )
         except ValueError as e:
             snippet = self.values[:200] if self.values else ""
             return await self.build_block_result(

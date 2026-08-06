@@ -23,9 +23,43 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.utils.page import JS_FUNCTION_DEFS, SkyvernFrame
 
-from .guards import GuardError
+from .guards import CREDENTIAL_HINT, GuardError
 
 LOG = structlog.get_logger(__name__)
+
+TYPE_PASSWORD_REFUSAL_MESSAGE = "Cannot type into password fields — credentials must not be passed through tool calls"
+COORDINATE_TYPE_TARGET_REFUSAL_MESSAGE = "could not verify the coordinate target; refusing to type"
+
+_COORDINATE_PASSWORD_TARGET_JS = """
+() => {
+  let element = document.activeElement;
+  while (element) {
+    const tag = (element.tagName || "").toLowerCase();
+    if (tag === "iframe" || tag === "frame") {
+      try {
+        element = element.contentDocument?.activeElement || null;
+      } catch {
+        return null;
+      }
+      if (!element) return null;
+      continue;
+    }
+    const shadowRoot = element.shadowRoot;
+    const shadowActiveElement = shadowRoot?.activeElement;
+    if (shadowActiveElement) {
+      element = shadowActiveElement;
+      continue;
+    }
+    if (tag.includes("-") && !shadowRoot) return null;
+    break;
+  }
+  if (!element || typeof element.getAttribute !== "function") return null;
+  const tag = (element.tagName || "").toLowerCase();
+  const type = (element.getAttribute("type") || "").toLowerCase();
+  const autocomplete = (element.getAttribute("autocomplete") || "").toLowerCase();
+  return tag === "input" && (type === "password" || autocomplete.includes("password"));
+}
+"""
 
 LOCALHOST_RECOVERY_HINT = (
     "Run `pip install skyvern && skyvern browser serve --tunnel` to bridge "
@@ -136,6 +170,49 @@ async def do_extract(
     parsed_schema = parse_extract_schema(schema)
     extracted = await page.extract(prompt=prompt, schema=parsed_schema, skip_refresh=skip_refresh)
     return ExtractResult(extracted=extracted)
+
+
+async def do_click_at(
+    page: Any,
+    x: float,
+    y: float,
+    button: str = "left",
+    click_count: int = 1,
+) -> None:
+    raw_page = page.page if hasattr(page, "page") else page
+    await raw_page.mouse.click(x, y, button=button, click_count=click_count)
+
+
+async def do_type_at(
+    page: Any,
+    x: float,
+    y: float,
+    text: str,
+    clear_first: bool = False,
+    press_enter: bool = False,
+) -> None:
+    raw_page = page.page if hasattr(page, "page") else page
+    await raw_page.mouse.click(x, y)
+    try:
+        is_password = await raw_page.evaluate(_COORDINATE_PASSWORD_TARGET_JS)
+    except Exception as exc:
+        raise GuardError(
+            COORDINATE_TYPE_TARGET_REFUSAL_MESSAGE,
+            "Use a selector or intent to target a verified non-password input",
+        ) from exc
+    if is_password is True:
+        raise GuardError(TYPE_PASSWORD_REFUSAL_MESSAGE, CREDENTIAL_HINT)
+    if is_password is not False:
+        raise GuardError(
+            COORDINATE_TYPE_TARGET_REFUSAL_MESSAGE,
+            "Use a selector or intent to target a verified non-password input",
+        )
+    if clear_first:
+        await raw_page.keyboard.press("ControlOrMeta+A")
+        await raw_page.keyboard.press("Backspace")
+    await raw_page.keyboard.type(text)
+    if press_enter:
+        await raw_page.keyboard.press("Enter")
 
 
 # -- Semantic locators --
