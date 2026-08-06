@@ -33,7 +33,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _classification_from_raw,
     _clean_email_list,
     _exact_credential_name_candidates,
-    _ground_login_target_urls,
+    _ground_user_provided_sites,
     _resolve_credentials,
     _saved_credential_names_mentioned,
     _seed_prior_approved_credentials,
@@ -684,11 +684,9 @@ async def test_resolver_exact_name_is_independent_of_classifier_label(
 
 
 @pytest.mark.asyncio
-async def test_explicit_id_and_explicit_name_resolve_together() -> None:
-    """Both stated references resolve; neither preempts the other (SKY-13552)."""
-    named = _cred("named-login", "cred_named")
+async def test_explicit_id_wins_and_skips_name_and_url_scan() -> None:
     by_ids = AsyncMock(return_value=[_cred("id-login", "cred_explicit")])
-    load_mock = AsyncMock(return_value=[named])
+    load_mock = AsyncMock(side_effect=AssertionError("organization scan should not run after an ID hit"))
     policy = RequestPolicy(
         credential_input_kind="credential_id",
         credential_refs=["cred_explicit", "named-login"],
@@ -698,14 +696,14 @@ async def test_explicit_id_and_explicit_name_resolve_together() -> None:
     await _resolve_direct(
         policy,
         user_message="Use credential ID cred_explicit and the saved credential named named-login.",
-        org_credentials=[named],
+        org_credentials=[],
         get_credentials=load_mock,
         get_credentials_by_ids=by_ids,
     )
 
-    assert [candidate.credential_id for candidate in policy.resolved_credentials] == ["cred_explicit", "cred_named"]
-    assert policy.requires_user_clarification is False
+    assert [candidate.credential_id for candidate in policy.resolved_credentials] == ["cred_explicit"]
     by_ids.assert_awaited_once_with(["cred_explicit"], organization_id="o_test")
+    load_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -713,6 +711,7 @@ async def test_explicit_id_wins_for_non_id_label_and_competing_url_match() -> No
     explicit = _cred("id-login", "cred_explicit")
     competing = _cred("url-login", "cred_url", tested_url="https://portal.example.com/login")
     by_ids = AsyncMock(return_value=[explicit])
+    load_mock = AsyncMock(side_effect=AssertionError("organization scan should not run after an ID hit"))
     policy = RequestPolicy(
         credential_input_kind="website_stored_credential",
         credential_refs=["cred_explicit"],
@@ -723,12 +722,13 @@ async def test_explicit_id_wins_for_non_id_label_and_competing_url_match() -> No
         policy,
         user_message="Use credential ID cred_explicit for https://portal.example.com/login.",
         org_credentials=[competing],
+        get_credentials=load_mock,
         get_credentials_by_ids=by_ids,
     )
 
     assert [candidate.credential_id for candidate in policy.resolved_credentials] == ["cred_explicit"]
-    assert policy.auto_bound_credentials == []
     by_ids.assert_awaited_once_with(["cred_explicit"], organization_id="o_test")
+    load_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -800,15 +800,19 @@ async def test_negated_explicit_id_does_not_resolve(user_message: str) -> None:
 @pytest.mark.parametrize(
     "user_message",
     [
-        "Use this as a documentation example: cred_prod.",
-        "Use the staging workflow; the notes mention cred_prod.",
-        'Document the string "cred_prod" in the workflow notes.',
+        # The two shapes users actually send, which the prose gate rejected (SKY-13552).
         "cred_prod\n\ncan you use this credential to log into the portal?",
         "Here's a credential you can use to test: cred_prod",
+        # Shapes that already resolved, kept so the widening did not narrow anything.
+        "use cred_prod to log in",
+        "cred_prod",
+        # Previously rejected for want of a use/with phrase; an ID the user typed is supplied.
+        "Use this as a documentation example: cred_prod.",
+        'Document the string "cred_prod" in the workflow notes.',
     ],
 )
-async def test_stated_explicit_id_resolves_regardless_of_prose_shape(user_message: str) -> None:
-    """A cred_ ID the user typed is supplied, whatever surrounds it; only negation withdraws it (SKY-13552)."""
+async def test_stated_credential_id_resolves_whatever_the_prose(user_message: str) -> None:
+    """A cred_ token the user typed is the supply; only negation withdraws it."""
     by_ids = AsyncMock(return_value=[_cred("prod-login", "cred_prod")])
     policy = RequestPolicy(
         credential_input_kind="credential_id",
@@ -983,8 +987,8 @@ async def test_bare_id_appositive_negation_revokes_earlier_authority() -> None:
 
 
 @pytest.mark.asyncio
-async def test_invalid_explicit_id_with_unknown_name_asks_instead_of_inferring() -> None:
-    """Nothing stated resolved, so the turn asks; it never falls through to the inference tiers."""
+async def test_invalid_explicit_id_does_not_fall_through_to_name() -> None:
+    load_mock = AsyncMock(side_effect=AssertionError("organization scan should not run after an explicit ID"))
     policy = RequestPolicy(
         credential_input_kind="credential_id",
         credential_refs=["cred_missing", "named-login"],
@@ -994,34 +998,14 @@ async def test_invalid_explicit_id_with_unknown_name_asks_instead_of_inferring()
         policy,
         user_message="Use credential ID cred_missing and the saved credential named named-login.",
         org_credentials=[],
+        get_credentials=load_mock,
     )
 
     assert policy.invalid_credential_ids == ["cred_missing"]
-    assert policy.resolved_credentials == []
     assert policy.clarification_reason == "credential_name_unresolved"
-    assert policy.requires_user_clarification is True
-
-
-@pytest.mark.asyncio
-async def test_invalid_explicit_id_rides_along_when_another_stated_reference_resolves() -> None:
-    """An unresolvable stated ID never blocks a stated reference that did resolve (SKY-13552)."""
-    by_ids = AsyncMock(return_value=[_cred("real-login", "cred_real")])
-    policy = RequestPolicy(
-        credential_input_kind="credential_id",
-        credential_refs=["cred_real", "cred_missing"],
-    )
-
-    await _resolve_direct(
-        policy,
-        user_message="Use cred_real and cred_missing to log in.",
-        org_credentials=[],
-        get_credentials_by_ids=by_ids,
-    )
-
-    assert [candidate.credential_id for candidate in policy.resolved_credentials] == ["cred_real"]
-    assert policy.invalid_credential_ids == ["cred_missing"]
-    assert policy.requires_user_clarification is False
-    assert policy.allow_run_blocks is True
+    assert policy.credential_ask_card_answerable is False
+    assert credential_pause_reason(SimpleNamespace(request_policy=policy)) is None
+    load_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1577,7 +1561,7 @@ async def test_website_kind_explicit_name_wins_over_url_matched_card() -> None:
 
 
 @pytest.mark.asyncio
-async def test_success_credential_id_and_stated_name_both_resolve() -> None:
+async def test_success_credential_id_intent_is_not_overridden_by_name_scan() -> None:
     by_ids = AsyncMock(return_value=[_cred("real", "cred_real")])
     load_mock = AsyncMock(return_value=[_cred("mock-portal-login", "cred_login")])
     policy = await _build_with_forced_classifier(
@@ -1587,13 +1571,14 @@ async def test_success_credential_id_and_stated_name_both_resolve() -> None:
             credential_refs=["cred_real"],
             classifier_status="success",
         ),
-        org_credentials=[_cred("mock-portal-login", "cred_login")],
+        org_credentials=[],
         get_credentials=load_mock,
         get_credentials_by_ids=by_ids,
     )
 
     assert policy.credential_input_kind == "credential_id"
-    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_real", "cred_login"]
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_real"]
+    load_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -3530,38 +3515,60 @@ async def test_basic_auth_in_a_login_url_never_reaches_the_admission_log() -> No
     assert "code=abc" not in logged
 
 
-class TestGroundLoginTargetUrls:
-    """The half that enforces "the user wrote it" — the whole basis of the release-origin claim."""
+class TestGroundUserProvidedSites:
+    """Everything the user themselves wrote grounds; anything only a model produced never does."""
 
     @staticmethod
-    def _ground(login_page_urls: list[str], user_message: str) -> list[str]:
-        policy = RequestPolicy(login_page_urls=login_page_urls)
-        _ground_login_target_urls(policy, user_message)
-        return policy.grounded_login_target_urls
+    def _ground(user_message: str, history: list[WorkflowCopilotChatHistoryMessage] | None = None) -> RequestPolicy:
+        policy = RequestPolicy(login_page_urls=["https://classifier-only.example/login"])
+        _ground_user_provided_sites(policy, user_message, history or [])
+        return policy
 
-    def test_a_url_only_the_classifier_named_is_dropped(self) -> None:
-        assert self._ground(["https://portal.example/login"], "log in with my saved credential") == []
+    @staticmethod
+    def _history(*messages: tuple[WorkflowCopilotChatSender, str]) -> list[WorkflowCopilotChatHistoryMessage]:
+        return [
+            WorkflowCopilotChatHistoryMessage(sender=sender, content=content, created_at=datetime.now(UTC))
+            for sender, content in messages
+        ]
 
-    def test_a_url_written_in_this_message_survives(self) -> None:
-        assert self._ground(
-            ["https://portal.example/login"],
-            "sign in at https://portal.example/login with my saved credential",
-        ) == ["https://portal.example/login"]
+    def test_a_url_only_the_classifier_named_never_grounds(self) -> None:
+        policy = self._ground("log in with my saved credential")
+        assert policy.user_provided_site_urls == []
 
-    def test_another_path_on_the_same_written_origin_survives(self) -> None:
-        assert self._ground(
-            ["https://portal.example/login"],
-            "read https://portal.example/reports/2026 for me",
-        ) == ["https://portal.example/login"]
+    def test_a_url_written_in_this_message_grounds(self) -> None:
+        policy = self._ground("sign in at https://portal.example/login with my saved credential")
+        assert policy.user_provided_site_urls == ["https://portal.example/login"]
 
-    def test_a_second_written_origin_is_kept_so_the_fill_seam_can_refuse_both(self) -> None:
-        grounded = self._ground(
-            ["https://portal.example/login", "https://tracker.example/login"],
-            "sign in at https://portal.example/login then file it at https://tracker.example/login",
+    def test_a_url_from_an_earlier_user_turn_grounds(self) -> None:
+        # The production dead end: the user pasted the URL a turn after naming the credential, and the
+        # old same-message rule refused it. Any message of this chat now counts.
+        policy = self._ground(
+            "use that credential to sign in",
+            self._history((WorkflowCopilotChatSender.USER, "here is the url: https://portal.example/login")),
         )
-        assert len(grounded) == 2
+        assert policy.user_provided_site_urls == ["https://portal.example/login"]
 
-    def test_an_origin_written_only_in_an_earlier_turn_is_dropped(self) -> None:
-        # Grounding reads the message asking for the fill, never the conversation: a link pasted in an
-        # earlier turn for another purpose must not license that origin for a later credential request.
-        assert self._ground(["https://evil.example/login"], "sign in with my bank credential") == []
+    def test_a_url_further_back_than_the_prompt_window_still_grounds(self) -> None:
+        """The prompt window is a model-context budget. A site is grounded by the user having written
+        it, so it must not expire when the message scrolls out of that window."""
+        history = self._history(
+            (WorkflowCopilotChatSender.USER, "start at https://portal.example/login"),
+            *[(WorkflowCopilotChatSender.USER, f"filler turn {i}") for i in range(12)],
+        )
+        policy = self._ground("now sign in there with my saved credential", history)
+
+        assert policy.user_provided_site_urls == ["https://portal.example/login"]
+
+    def test_a_url_only_an_assistant_message_carries_never_grounds(self) -> None:
+        policy = self._ground(
+            "go ahead",
+            self._history((WorkflowCopilotChatSender.AI, "I suggest signing in at https://evil.example/login")),
+        )
+        assert policy.user_provided_site_urls == []
+
+    def test_origins_are_deduplicated_and_both_sites_kept(self) -> None:
+        policy = self._ground(
+            "sign in at https://portal.example/login then file it at https://tracker.example/login "
+            "and check https://portal.example/reports too"
+        )
+        assert len(policy.user_provided_site_urls) == 2
