@@ -25,6 +25,7 @@ import {
 import { createPortal } from "react-dom";
 import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
 import { usePasteSkillHintStore } from "@/store/usePasteSkillHintStore";
@@ -53,6 +54,7 @@ import {
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
   WorkflowCopilotCredentialRequiredUpdate,
+  WorkflowCopilotTitleUpdate,
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
   WorkflowCopilotChatSummary,
@@ -394,6 +396,7 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotDesignStartUpdate
   | WorkflowCopilotDesignEndUpdate
   | WorkflowCopilotWorkflowDraftUpdate
+  | WorkflowCopilotTitleUpdate
   | WorkflowCopilotCredentialRequiredUpdate;
 
 // The live pause frame is a structural superset of the card's frame; only
@@ -552,6 +555,10 @@ function RunLifecycleLine({ content }: { content: string }) {
 export type WorkflowUpdateOptions = {
   persisted?: boolean;
   applied?: boolean;
+  // A mid-turn draft lands while the user may be renaming the agent, so its title is
+  // applied only if nothing has named it yet. Discrete applies (accept, snap-back)
+  // are authoritative and keep the force path.
+  midTurnDraft?: boolean;
 };
 
 interface WorkflowCopilotChatProps {
@@ -2338,6 +2345,19 @@ export function WorkflowCopilotChat({
                   }
                 }
                 return false;
+              case "title_update":
+                // The title store is shared across workflow swaps in one Workspace, and a
+                // stream survives the swap — so a frame from the workflow we left must not
+                // name the one we are now looking at.
+                if (payload.workflow_permanent_id !== workflowPermanentId) {
+                  return false;
+                }
+                // Backend already persisted it; reload reads canonical. This only
+                // moves the live title bar, and never over a user-chosen name.
+                useWorkflowTitleStore
+                  .getState()
+                  .setTitleFromCopilotIfDefault(payload.title);
+                return false;
               case "credential_required":
                 setLivePauseFrame(payload);
                 return false;
@@ -2372,7 +2392,9 @@ export function WorkflowCopilotChat({
                 // succeeds — a swallowed update would otherwise trigger a
                 // spurious snap-back at terminal.
                 if (payload.workflow) {
-                  const applied = applyWorkflowUpdate(payload.workflow);
+                  const applied = applyWorkflowUpdate(payload.workflow, {
+                    midTurnDraft: true,
+                  });
                   if (applied) {
                     const turnId = latestTurnId.current;
                     if (turnId) {
