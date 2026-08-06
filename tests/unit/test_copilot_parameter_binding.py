@@ -21,14 +21,10 @@ import pytest
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
-    POST_PARAMETER_BINDING_STOP_NUDGE,
-    POST_PARAMETER_BINDING_WARN_NUDGE,
-    POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE,
-    POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE,
     REPEATED_FRONTIER_STREAK_ESCALATE_AT,
     REPEATED_FRONTIER_STREAK_STOP_AT,
-    _check_enforcement,
     _repeated_frontier_failure_nudge,
+    enforcement_decision,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import compute_failure_signature
 from skyvern.forge.sdk.copilot.tools import _analyze_run_blocks, _parameter_binding_invariant_error
@@ -274,28 +270,28 @@ def test_signature_success_returns_none() -> None:
             REPEATED_FRONTIER_STREAK_ESCALATE_AT,
             0,
             "PARAMETER_BINDING_ERROR",
-            POST_PARAMETER_BINDING_WARN_NUDGE,
+            "post_parameter_binding_warn",
             id="warn_parameter_binding",
         ),
         pytest.param(
             REPEATED_FRONTIER_STREAK_STOP_AT,
             REPEATED_FRONTIER_STREAK_ESCALATE_AT,
             "PARAMETER_BINDING_ERROR",
-            POST_PARAMETER_BINDING_STOP_NUDGE,
+            "post_parameter_binding_stop",
             id="stop_parameter_binding",
         ),
         pytest.param(
             REPEATED_FRONTIER_STREAK_ESCALATE_AT,
             0,
             "ELEMENT_NOT_FOUND",
-            POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE,
+            "post_repeated_frontier_failure_warn",
             id="warn_generic",
         ),
         pytest.param(
             REPEATED_FRONTIER_STREAK_STOP_AT,
             REPEATED_FRONTIER_STREAK_ESCALATE_AT,
             "ANTI_BOT_DETECTION",
-            POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE,
+            "post_repeated_frontier_failure_stop",
             id="stop_generic",
         ),
     ],
@@ -305,7 +301,7 @@ def test_nudge_selection_matrix(streak: int, emitted_at: int, category: str, exp
     ctx.repeated_failure_streak_count = streak
     ctx.repeated_failure_nudge_emitted_at_streak = emitted_at
     ctx.last_failure_category_top = category
-    assert _repeated_frontier_failure_nudge(ctx) is expected_nudge
+    assert _repeated_frontier_failure_nudge(ctx) == expected_nudge
 
 
 def test_nudge_below_threshold_returns_none() -> None:
@@ -315,7 +311,7 @@ def test_nudge_below_threshold_returns_none() -> None:
     assert _repeated_frontier_failure_nudge(ctx) is None
 
 
-def test_check_enforcement_latches_parameter_binding_stop_at_stop_level() -> None:
+def test_enforcement_decision_latches_parameter_binding_stop_at_stop_level() -> None:
     """Regression: POST_PARAMETER_BINDING_STOP_NUDGE must latch at STOP_AT.
 
     Without the latch, the stop nudge re-fires every turn once streak reaches
@@ -330,8 +326,9 @@ def test_check_enforcement_latches_parameter_binding_stop_at_stop_level() -> Non
     ctx.last_test_ok = False
     ctx.test_after_update_done = True
 
-    first = _check_enforcement(ctx)
-    assert first is POST_PARAMETER_BINDING_STOP_NUDGE
+    first = enforcement_decision(ctx)
+    assert first is not None
+    assert first.rule == "post_parameter_binding_stop"
     assert ctx.repeated_failure_nudge_emitted_at_streak == REPEATED_FRONTIER_STREAK_STOP_AT
 
     # Same state — streak still STOP_AT. Without the latch fix the stop nudge
@@ -342,7 +339,7 @@ def test_check_enforcement_latches_parameter_binding_stop_at_stop_level() -> Non
     assert _repeated_frontier_failure_nudge(ctx) is None
 
 
-def test_check_enforcement_latches_generic_stop_at_stop_level() -> None:
+def test_enforcement_decision_latches_generic_stop_at_stop_level() -> None:
     """The generic stop nudge must also latch; ensures the refactor preserved
     prior behavior for non-parameter-binding categories."""
     ctx = _make_ctx()
@@ -352,7 +349,8 @@ def test_check_enforcement_latches_generic_stop_at_stop_level() -> None:
     ctx.last_test_ok = False
     ctx.test_after_update_done = True
 
-    first = _check_enforcement(ctx)
-    assert first is POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE
+    first = enforcement_decision(ctx)
+    assert first is not None
+    assert first.rule == "post_repeated_frontier_failure_stop"
     assert ctx.repeated_failure_nudge_emitted_at_streak == REPEATED_FRONTIER_STREAK_STOP_AT
     assert _repeated_frontier_failure_nudge(ctx) is None
