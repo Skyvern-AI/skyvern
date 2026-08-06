@@ -8,6 +8,19 @@ if TYPE_CHECKING:
 
 _DEFAULT_CLI_LOG_LEVEL = "WARNING"
 
+_CLI_RUNTIME_PREPARED = False
+
+CLOUD_URL_OPT_IN_MESSAGE = (
+    "Refusing to send an API key to the default production URL. "
+    "Set SKYVERN_BASE_URL to the base URL of the Skyvern deployment that issued this API key."
+)
+
+
+def is_cli_runtime() -> bool:
+    """True only in processes that entered through a CLI command; API servers and temporal workers never set this."""
+    return _CLI_RUNTIME_PREPARED
+
+
 _QUIET_CLI_LOGGERS = ("skyvern", "httpx", "litellm", "playwright", "httpcore")
 _RUNTIME_LOGGING_CONFIGURED = False
 _SILENCED_CLI_LOGGERS = ("posthog",)
@@ -54,8 +67,11 @@ def configure_cli_runtime_logging() -> None:
 
 def prepare_cli_runtime(intent: "EnvIntent | str") -> Path:
     """Load intent-scoped env files, then configure logging that imports settings."""
+    global _CLI_RUNTIME_PREPARED
+
     from skyvern.utils.env_paths import load_backend_env_files  # noqa: PLC0415
 
     env_path = load_backend_env_files(intent=intent)
     configure_cli_runtime_logging()
+    _CLI_RUNTIME_PREPARED = True
     return env_path

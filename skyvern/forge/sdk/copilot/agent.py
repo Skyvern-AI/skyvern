@@ -12,7 +12,7 @@ import os
 import re
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -350,6 +350,9 @@ class RequestPolicyGuardrailInputs:
     browser_session_id: str | None = None
     fix_origin: bool = False
     stored_completion_criteria: StoredCriteriaSnapshot | None = None
+    # Unlike chat_history_messages, this is not truncated to the prompt window: a site is grounded
+    # by the user having written it, which does not expire when the message leaves that window.
+    prior_user_messages: list[WorkflowCopilotChatHistoryMessage] = field(default_factory=list)
 
 
 class CopilotRequestPolicyMissingError(Exception):
@@ -4424,6 +4427,7 @@ def _build_copilot_input_guardrails(
                 organization_id=policy_inputs.organization_id,
                 handler=policy_inputs.request_policy_handler,
                 config=getattr(ctx, "copilot_config", None) if isinstance(ctx, CopilotContext) else None,
+                prior_user_messages=policy_inputs.prior_user_messages,
             )
             if isinstance(ctx, CopilotContext):
                 turn_intent_classifier_result = None
@@ -4804,6 +4808,7 @@ async def run_copilot_agent(
     api_key: str | None = None,
     security_rules: str = "",
     config: CopilotConfig | None = None,
+    prior_user_messages: Sequence[WorkflowCopilotChatHistoryMessage] = (),
     turn_index: int | None = None,
     turn_id: str | None = None,
     prior_copilot_workflow_yaml: str | None = None,
@@ -4843,6 +4848,7 @@ async def run_copilot_agent(
                     config=config,
                     turn_id=turn_id,
                     turn_index=normalized_turn_index,
+                    prior_user_messages=prior_user_messages,
                     prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
                     prior_block_count=prior_block_count,
                     ctx_sink=ctx_sink,
@@ -4922,6 +4928,7 @@ async def _run_copilot_turn_impl(
     config: CopilotConfig | None,
     turn_id: str,
     turn_index: int,
+    prior_user_messages: Sequence[WorkflowCopilotChatHistoryMessage] = (),
     prior_copilot_workflow_yaml: str | None = None,
     prior_block_count: int | None = None,
     ctx_sink: list[CopilotContext] | None = None,
@@ -5022,6 +5029,7 @@ async def _run_copilot_turn_impl(
         workflow_yaml=safe_workflow_yaml,
         chat_history_text=safe_chat_history_text,
         chat_history_messages=list(chat_history),
+        prior_user_messages=list(prior_user_messages),
         global_llm_context=safe_global_llm_context,
         organization_id=organization_id,
         request_policy_handler=await _resolve_request_policy_handler(
