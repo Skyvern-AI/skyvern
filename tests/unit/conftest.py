@@ -109,6 +109,16 @@ def reset_collapse_xp_assignment_memo():
     _clear()
 
 
+@pytest.fixture(autouse=True)
+def reset_mcp_stateless_http_mode():
+    """Keep MCP transport mode from leaking between independently collected test files."""
+    from skyvern.cli.core import session_manager
+
+    session_manager.set_stateless_http_mode(False)
+    yield
+    session_manager.set_stateless_http_mode(False)
+
+
 # -- shared copilot agent-template rendering helper --
 
 _AGENT_TEMPLATE_DEFAULTS = dict(
