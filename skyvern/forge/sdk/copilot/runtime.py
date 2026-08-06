@@ -301,7 +301,7 @@ class AgentContext:
     workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
 
     # Enforcement state. Set lazily by streaming_adapter, tools, and
-    # failure_tracking; declared here so _check_enforcement can read them on a
+    # failure_tracking; declared here so enforcement_decision can read them on a
     # fresh context without AttributeError.
     navigate_called: bool = False
     observation_after_navigate: bool = False

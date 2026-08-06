@@ -92,6 +92,18 @@ def _discovery_candidate_identity_bound(
     return "" not in normalized_names and len(normalized_names) == 1
 
 
+def _user_provided_entry_url(copilot_ctx: CopilotContext) -> str | None:
+    """A site the user gave this chat, when name lookup found nothing.
+
+    Lookup asks the world what a name refers to; this asks the conversation. A user who pasted the
+    URL has already answered, so exhausting the lookup and telling them to supply a URL they already
+    supplied is the dead end this avoids. Only the sole site they gave answers; several is a question.
+    """
+    policy = copilot_ctx.request_policy
+    urls = list(policy.user_provided_site_urls) if policy is not None else []
+    return urls[0] if len(urls) == 1 else None
+
+
 def _resolve_discovery_entry_url(site_or_url: str) -> tuple[str | None, str]:
     """Resolve the user-supplied site name/URL into a navigable URL.
 
@@ -935,7 +947,8 @@ async def _discover_workflow_entrypoint_impl(
             entry_url = entrypoint_candidate.url
             kind = "evidence_candidate"
         else:
-            kind = "unresolved"
+            entry_url = _user_provided_entry_url(copilot_ctx)
+            kind = "user_provided_site" if entry_url else "unresolved"
     if entry_url is None:
         result = _discovery_build_result(
             candidate_url=None,
