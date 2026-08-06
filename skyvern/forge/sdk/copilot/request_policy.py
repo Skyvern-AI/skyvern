@@ -234,14 +234,6 @@ _POSTFIX_CREDENTIAL_TOKEN_RE = re.compile(
     r"\b(?:use|using|with)\s+(?:my\s+|the\s+)?(?:saved\s+)?([A-Za-z0-9_.@:-]{2,100})\s+credential\b",
     re.I,
 )
-_EXPLICIT_CREDENTIAL_ID_CONTEXT_RE = re.compile(
-    r"\b(?:use|using|with|select|choose)\s+"
-    r"(?:(?:my|the|a)\s+)?(?:(?:saved|stored)\s+)?(?:credential(?:\s+id)?\s*)?"
-    r"(?::\s*)?$",
-    re.I,
-)
-_CREDENTIAL_ID_LABEL_CONTEXT_RE = re.compile(r"\bcredential\s+id\s*$", re.I)
-_CREDENTIAL_ID_COORDINATOR_RE = re.compile(r"\s*,?\s*(?:and|or)\s*$", re.I)
 _CREDENTIAL_REPLACEMENT_TARGET_RES = (
     re.compile(
         r"\bswitch(?:ing)?\s+to\b"
@@ -4606,6 +4598,11 @@ def _classifier_ref_stated_in_message(policy: RequestPolicy, user_message: str) 
 
 
 def _explicit_credential_ids(user_message: str) -> list[str]:
+    """Credential IDs the user's own message hands to this turn.
+
+    A ``cred_`` token is a structural identifier rather than English, so writing one is the
+    authority signal; the prose around it can only withdraw it, never qualify it.
+    """
     text = _credential_authority_text(user_message or "")
     explicit: list[str] = []
     matches = sorted(
@@ -4618,7 +4615,6 @@ def _explicit_credential_ids(user_message: str) -> list[str]:
         for match, credential_id in matches
         if _credential_reference_is_negated(text, match.start())
     }
-    last_explicit_end: int | None = None
     for match, credential_id in matches:
         if last_negated_mention.get(credential_id, -1) > match.start():
             continue
@@ -4626,18 +4622,7 @@ def _explicit_credential_ids(user_message: str) -> list[str]:
             text, match.start()
         ):
             continue
-        context = text[max(0, match.start() - 64) : match.start()]
-        if (
-            _EXPLICIT_CREDENTIAL_ID_CONTEXT_RE.search(context)
-            or _CREDENTIAL_ID_LABEL_CONTEXT_RE.search(context)
-            or match.group(0).strip() == text.strip()
-            or (
-                last_explicit_end is not None
-                and _CREDENTIAL_ID_COORDINATOR_RE.fullmatch(text[last_explicit_end : match.start()])
-            )
-        ):
-            explicit.append(credential_id)
-            last_explicit_end = match.end()
+        explicit.append(credential_id)
     return _clean_list(explicit)
 
 
