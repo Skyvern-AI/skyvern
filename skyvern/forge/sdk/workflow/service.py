@@ -45,6 +45,7 @@ from skyvern.exceptions import (
     BlockedHost,
     BlockNotFound,
     BrowserActionPolicyNotEnforceable,
+    BrowserProfileNotApplied,
     BrowserProfileNotFound,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
@@ -5672,14 +5673,28 @@ class WorkflowService:
                     url=login_url,
                 )
                 # A prior block may already have opened this run's browser; get_or_create_for_workflow_run
-                # then returns that cached context and ignores browser_profile_id, so the credential
-                # profile never loads. Stamping the run credential-seeded in that case would let the
-                # healthy-run bank whole-dir the unrelated context into the shared credential profile.
-                # Only credential-seed when we will actually load the profile into a fresh browser;
-                # otherwise degrade to fresh — the credential seed holds only when its
-                # profile loaded.
-                browser_already_open = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id) is not None
-                if browser_already_open:
+                # then returns that cached context and ignores browser_profile_id. Stamping the run
+                # credential-seeded when that context did NOT boot from this profile would let the
+                # healthy-run bank whole-dir an unrelated context into the shared credential profile.
+                # Credential-seed only when the profile is genuinely in the browser: either we load it
+                # into a fresh browser below, or the open browser already booted from it.
+                browser_state_open = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+                browser_already_open = browser_state_open is not None
+                # A script/setup boot applies the setup-stamped seed itself; when the open browser was
+                # booted from exactly the resolved profile, the credential seed is genuinely loaded.
+                open_browser_booted_this_profile = (
+                    browser_state_open is not None
+                    and browser_state_open.browser_artifacts.applied_browser_profile_id == resolved_browser_profile_id
+                )
+                if browser_already_open and open_browser_booted_this_profile:
+                    LOG.info(
+                        "Credential login block reached with a browser already booted from the resolved "
+                        "profile — keeping the credential seed",
+                        workflow_run_id=workflow_run_id,
+                        block_label=block.label,
+                        browser_profile_id=resolved_browser_profile_id,
+                    )
+                if browser_already_open and not open_browser_booted_this_profile:
                     LOG.warning(
                         "Credential login block reached with a browser already open; running fresh login "
                         "instead of credential-seeding to avoid banking an unrelated context",
@@ -5721,7 +5736,7 @@ class WorkflowService:
 
                 # Create the browser with the saved profile and navigate to the login block's URL. The
                 # user enters the post-login target URL; the saved cookies authenticate once it loads.
-                profile_loaded = bool(login_url) and not browser_already_open
+                profile_loaded = open_browser_booted_this_profile or (bool(login_url) and not browser_already_open)
                 if login_url and not browser_already_open:
                     try:
                         browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
@@ -5730,6 +5745,14 @@ class WorkflowService:
                             browser_profile_id=resolved_browser_profile_id,
                             browser_session_id=decision.attach_browser_session_id,
                         )
+                        if (
+                            not decision.attach_browser_session_id
+                            and browser_state.browser_artifacts.applied_browser_profile_id
+                            != resolved_browser_profile_id
+                        ):
+                            # The chosen browser creator (e.g. a remote/vendor browser) accepted the
+                            # profile id but never loaded it; the run must not stay credential-stamped.
+                            raise BrowserProfileNotApplied(resolved_browser_profile_id)
                         working_page = await browser_state.get_working_page()
                         if working_page and working_page.url == "about:blank":
                             await browser_state.navigate_to_url(page=working_page, url=login_url)
@@ -6434,7 +6457,7 @@ class WorkflowService:
                 ]
                 if patched_branches != block.branch_conditions:
                     block = block.model_copy(update={"branch_conditions": patched_branches})
-            elif block.next_block_label == finally_block_label:
+            if block.next_block_label == finally_block_label:
                 block = block.model_copy(update={"next_block_label": None})
             result.append(block)
         return result
@@ -9117,6 +9140,20 @@ class WorkflowService:
                 "Skipped persisting sink browser profile — seed failed to load, run used a fallback dir",
                 workflow_run_id=workflow_run.workflow_run_id,
                 browser_profile_id=sink_profile_id,
+            )
+            return
+        if (
+            workflow_run.browser_profile_id
+            and browser_state.browser_artifacts.applied_browser_profile_id != workflow_run.browser_profile_id
+        ):
+            # The stamped seed was never applied (e.g. a vendor-routed boot) — this directory does not
+            # extend the sink's accumulated state, so writing it back would erase the saved archive.
+            # Seedless accumulate rows (browser_profile_id None, sink set) still write by design.
+            LOG.warning(
+                "Skipped persisting sink browser profile — stamped seed profile was not applied to this browser",
+                workflow_run_id=workflow_run.workflow_run_id,
+                browser_profile_id=sink_profile_id,
+                seed_browser_profile_id=workflow_run.browser_profile_id,
             )
             return
         if effective_workflow_run_status != WorkflowRunStatus.completed:
