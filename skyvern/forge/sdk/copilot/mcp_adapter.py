@@ -39,7 +39,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     current_page_challenge_advisory_signal,
     register_no_progress_interaction_click,
     requested_output_paths_for_derivation,
-    synthesized_block_persistence_signal,
 )
 from skyvern.forge.sdk.copilot.loop_detection import (
     detect_failed_tool_step_loop_for_ctx,
@@ -503,22 +502,6 @@ class SkyvernOverlayMCPServer(MCPServer):
                     tool_name=tool_name,
                 )
                 return _copilot_to_call_tool_result({"ok": False, "error": challenge_advisory_payload})
-
-        persistence_signal = synthesized_block_persistence_signal(copilot_ctx, tool_name, arguments)
-        if persistence_signal is not None:
-            LOG.warning(
-                "Synthesized block persistence required before MCP tool",
-                tool_name=tool_name,
-                synthesized_block_offered_trajectory_len=getattr(
-                    copilot_ctx,
-                    "synthesized_block_offered_trajectory_len",
-                    None,
-                ),
-            )
-            payload = emit_blocker_signal_payload(copilot_ctx, persistence_signal)
-            result = {"ok": False, "error": payload}
-            record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
-            return _copilot_to_call_tool_result(result)
 
         loop_error = detect_failed_tool_step_loop_for_ctx(copilot_ctx, tool_name, arguments)
         if loop_error:
