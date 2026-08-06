@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from skyvern.forge.agent_functions import CopilotEntrypointCandidate, CopilotSiteOriginAssociation
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _ground_user_provided_sites
 from skyvern.forge.sdk.copilot.runtime import PendingBrowserInteractionObservation
 from skyvern.forge.sdk.copilot.tools import (
     _discovery_walk,
@@ -15,7 +17,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _rank_discovery_entrypoint_candidates,
     _resolve_discovery_entry_url,
 )
-from skyvern.forge.sdk.copilot.tools.discovery import _discovery_build_result
+from skyvern.forge.sdk.copilot.tools.discovery import _discovery_build_result, _user_provided_entry_url
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
@@ -790,3 +792,27 @@ async def test_capture_composition_evidence_warns_when_html_sliced_at_cap() -> N
     assert error is None
     assert evidence is not None
     assert "html_sliced_at_cap" in evidence["inspection_warnings"]
+
+
+class TestUserProvidedEntryUrl:
+    """Name lookup asks the world; this asks the conversation, so a URL the user already pasted is
+    not answered with a request for a URL."""
+
+    @staticmethod
+    def _ctx(user_message: str) -> SimpleNamespace:
+        policy = RequestPolicy()
+        _ground_user_provided_sites(policy, user_message, [])
+        return SimpleNamespace(request_policy=policy)
+
+    def test_the_only_site_the_user_gave_is_opened(self) -> None:
+        ctx = self._ctx("go to https://us.example.com/reports and pull the numbers")
+
+        assert _user_provided_entry_url(ctx) == "https://us.example.com/reports"
+
+    def test_several_sites_resolve_nothing(self) -> None:
+        ctx = self._ctx("check https://a.example.com and https://b.example.net")
+
+        assert _user_provided_entry_url(ctx) is None
+
+    def test_nothing_the_user_provided_resolves_nothing(self) -> None:
+        assert _user_provided_entry_url(self._ctx("no addresses here")) is None
