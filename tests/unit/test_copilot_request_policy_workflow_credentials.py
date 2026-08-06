@@ -799,14 +799,20 @@ async def test_negated_explicit_id_does_not_resolve(user_message: str) -> None:
 @pytest.mark.parametrize(
     "user_message",
     [
+        # The two shapes users actually send, which the prose gate rejected (SKY-13552).
+        "cred_prod\n\ncan you use this credential to log into the portal?",
+        "Here's a credential you can use to test: cred_prod",
+        # Shapes that already resolved, kept so the widening did not narrow anything.
+        "use cred_prod to log in",
+        "cred_prod",
+        # Previously rejected for want of a use/with phrase; an ID the user typed is supplied.
         "Use this as a documentation example: cred_prod.",
-        "Use the staging workflow; the notes mention cred_prod.",
-        "Do not use the old workflow because it mentions cred_prod.",
         'Document the string "cred_prod" in the workflow notes.',
     ],
 )
-async def test_unrelated_explicit_id_mention_does_not_resolve(user_message: str) -> None:
-    by_ids = AsyncMock(side_effect=AssertionError("unrelated credential IDs must not be resolved"))
+async def test_stated_credential_id_resolves_whatever_the_prose(user_message: str) -> None:
+    """A cred_ token the user typed is the supply; only negation withdraws it."""
+    by_ids = AsyncMock(return_value=[_cred("prod-login", "cred_prod")])
     policy = RequestPolicy(
         credential_input_kind="credential_id",
         credential_refs=["cred_prod"],
@@ -819,8 +825,9 @@ async def test_unrelated_explicit_id_mention_does_not_resolve(user_message: str)
         get_credentials_by_ids=by_ids,
     )
 
-    assert policy.resolved_credentials == []
-    by_ids.assert_not_awaited()
+    assert [candidate.credential_id for candidate in policy.resolved_credentials] == ["cred_prod"]
+    assert policy.requires_user_clarification is False
+    by_ids.assert_awaited_once_with(["cred_prod"], organization_id="o_test")
 
 
 @pytest.mark.asyncio

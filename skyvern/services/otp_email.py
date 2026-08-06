@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     from skyvern.forge.agent_functions import AgentFunction
 
 MAX_SEEN_EMAIL_MESSAGE_IDS = 500
+MAX_HYDRATION_FAILURE_WITHHOLDS = 2
+_HYDRATION_FAILURE_COUNTS_STATE_KEY = "gmail_hydration_failure_counts"
 
 
 @dataclass(frozen=True)
@@ -157,6 +159,7 @@ class GmailOTPSource:
                 created_after=created_after,
                 max_results=max_results,
                 client=client,
+                excluded_message_ids=excluded_message_ids,
             )
         except google_gmail_service.GmailAPIError as exc:
             raise EmailOTPSearchError(
@@ -165,14 +168,27 @@ class GmailOTPSource:
                 status=exc.status,
                 code=exc.code,
             ) from exc
-        return [
-            EmailOTPCandidate(
-                message_id=candidate.message_id,
-                content=candidate.content,
+        withhold_counts: dict[str, int] = context.provider_state.setdefault(credential_id, {}).setdefault(
+            _HYDRATION_FAILURE_COUNTS_STATE_KEY, {}
+        )
+        results: list[EmailOTPCandidate] = []
+        for candidate in candidates:
+            if candidate.message_id in excluded_message_ids:
+                continue
+            if candidate.hydration_failed:
+                withholds = withhold_counts.get(candidate.message_id, 0)
+                if withholds < MAX_HYDRATION_FAILURE_WITHHOLDS:
+                    # Withhold while hydration can still recover, then degrade to parsing
+                    # the assembled content so a permanent failure cannot stall the poll.
+                    withhold_counts[candidate.message_id] = withholds + 1
+                    continue
+            results.append(
+                EmailOTPCandidate(
+                    message_id=candidate.message_id,
+                    content=candidate.content,
+                )
             )
-            for candidate in candidates
-            if candidate.message_id not in excluded_message_ids
-        ]
+        return results
 
 
 class OutlookOTPSource:
