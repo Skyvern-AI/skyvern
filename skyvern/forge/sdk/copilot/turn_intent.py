@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+import unicodedata
 from collections.abc import Mapping
 from difflib import SequenceMatcher
 from enum import StrEnum
@@ -12,6 +13,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from skyvern.config import settings
+from skyvern.constants import DEFAULT_WORKFLOW_TITLES
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.copilot.context import StructuredContext, sanitize_global_llm_context_for_prompt
@@ -52,7 +54,10 @@ class TurnIntentMode(StrEnum):
 
 
 _LOW_CONFIDENCE_MUTATION_THRESHOLD = 0.5
-_MUTATING_CLASSIFIER_MODES = frozenset((TurnIntentMode.BUILD, TurnIntentMode.EDIT, TurnIntentMode.DRAFT_ONLY))
+_TITLE_MAX_CHARS = 60
+# Cc/Cf strip control and bidi-override characters; Cs/Co/Cn drop surrogates and unassigned.
+_TITLE_DISALLOWED_UNICODE_CATEGORIES = frozenset(("Cc", "Cf", "Cs", "Co", "Cn"))
+MUTATING_CLASSIFIER_MODES = frozenset((TurnIntentMode.BUILD, TurnIntentMode.EDIT, TurnIntentMode.DRAFT_ONLY))
 _EDIT_SPECIFIC_TARGET_ENTITY_TYPES = frozenset(
     ("block", "run", "proposed_workflow", "latest_assistant_proposal", "proposal", "workflow_change")
 )
@@ -256,6 +261,9 @@ class TurnIntentClassification(BaseModel):
     target_entities: dict[str, list[str]] = Field(default_factory=dict)
     missing_context_question: str | None = None
     reason_codes: list[TurnIntentReasonCode] = Field(default_factory=list)
+    # A naming candidate only; it never carries rename authority. Consumers must
+    # route it through ``sanitize_workflow_title_candidate``.
+    workflow_title: str | None = None
 
     @field_validator("required_context", mode="after")
     @classmethod
@@ -327,6 +335,26 @@ class TurnIntentClassifierResult(BaseModel):
 
 
 _GOAL_MAX_CHARS = 240
+
+
+def sanitize_workflow_title_candidate(value: object) -> str | None:
+    """The single sink every naming candidate passes through, model-produced or derived.
+
+    Rejects the placeholder titles outright: a candidate equal to a default would defeat
+    the value-based "is it still unnamed?" test every caller relies on.
+    """
+    if not isinstance(value, str):
+        return None
+    text = unicodedata.normalize("NFKC", value)
+    text = "".join(char for char in text if unicodedata.category(char) not in _TITLE_DISALLOWED_UNICODE_CATEGORIES)
+    text = redact_raw_secrets_for_prompt(" ".join(text.split()).strip().strip("\"'").strip())
+    if not text or text in DEFAULT_WORKFLOW_TITLES:
+        return None
+    if len(text) > _TITLE_MAX_CHARS:
+        head = text[:_TITLE_MAX_CHARS]
+        cut = head.rsplit(" ", 1)[0] if " " in head else head
+        text = cut.rstrip(" ,.;:-")
+    return text or None
 
 
 def _normalize_user_goal(user_message: str) -> str:
@@ -527,6 +555,7 @@ def _turn_intent_classification_from_raw(raw: object) -> TurnIntentClassificatio
         if isinstance(missing_context_question, str) and missing_context_question.strip()
         else None,
         reason_codes=_coerce_reason_codes(payload.get("reason_codes")),
+        workflow_title=sanitize_workflow_title_candidate(payload.get("workflow_title")),
     )
 
 
@@ -903,7 +932,7 @@ def build_turn_intent(
 
     if (
         classification is not None
-        and mode in _MUTATING_CLASSIFIER_MODES
+        and mode in MUTATING_CLASSIFIER_MODES
         and confidence < _LOW_CONFIDENCE_MUTATION_THRESHOLD
     ):
         mode = TurnIntentMode.CLARIFY
