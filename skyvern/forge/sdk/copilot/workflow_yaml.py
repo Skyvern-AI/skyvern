@@ -7,7 +7,7 @@ from typing import Any
 import structlog
 import yaml
 
-from skyvern.constants import DEFAULT_LOGIN_PROMPT
+from skyvern.constants import DEFAULT_LOGIN_PROMPT, DEFAULT_WORKFLOW_TITLES
 from skyvern.exceptions import WorkflowNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
@@ -28,6 +28,9 @@ from skyvern.schemas.workflows import (
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()
+
+# Wide enough that safe_dump never folds a title onto a second line.
+_YAML_NO_FOLD_WIDTH = 1 << 30
 
 
 def _proxy_location_alias_key(value: str) -> str:
@@ -366,6 +369,81 @@ def _yaml_pin_saved_session_ip(workflow_yaml: str | None) -> bool | None:
     return _yaml_bool_setting(workflow_yaml, "pin_saved_session_ip")
 
 
+def _is_root_title_key(line: str) -> bool:
+    """Whether ``line`` opens the document's own ``title`` key, quoted or not."""
+    if not line or line[:1].isspace() or ":" not in line:
+        return False
+    return line.split(":", 1)[0].strip().strip("\"'") == "title"
+
+
+def _verified_title_edit(original: str, edited: str, title: str) -> str:
+    """Keep a line-level edit only when the parser agrees it set the root title.
+
+    The scan reasons about lines while every consumer reasons about the parsed document;
+    a shape that makes those disagree keeps the original rather than a broken draft.
+    """
+    try:
+        if workflow_yaml_title(edited) == title:
+            return edited
+    except Exception:
+        pass
+    return original
+
+
+def with_workflow_yaml_title(workflow_yaml: str | None, title: str) -> str:
+    """Set ``title`` on a workflow YAML document, preserving the rest byte-for-byte.
+
+    Line-level rather than a parse/dump round-trip, which would reflow the model's block
+    scalars (code bodies, prompts) and churn every downstream diff.
+    """
+    # Sits on the proposal-persist path: a formatting concern must never cost the proposal.
+    if not workflow_yaml or not isinstance(title, str) or not title.strip():
+        return workflow_yaml or ""
+    # Unbounded width: at PyYAML's default of 80 a long title folds onto a second line, and
+    # a one-line replacement would leave the old continuation to be folded back into the new
+    # scalar — which compounds on every accepted turn.
+    serialized = yaml.safe_dump(
+        {"title": title}, default_flow_style=False, allow_unicode=True, width=_YAML_NO_FOLD_WIDTH
+    ).strip()
+    lines = workflow_yaml.splitlines()
+    trailing_newline = "\n" if workflow_yaml.endswith("\n") else ""
+    for index, line in enumerate(lines):
+        if not _is_root_title_key(line):
+            continue
+        # Drop the old value's continuation lines (a folded or block scalar), which would
+        # otherwise dangle after the replacement and be absorbed into the new title. A blank
+        # line inside a block scalar is part of it, so look past one for more indented text.
+        end = index + 1
+        while end < len(lines):
+            if lines[end][:1].isspace() and lines[end].strip():
+                end += 1
+                continue
+            following = next((offset for offset in range(end, len(lines)) if lines[offset].strip()), None)
+            if not lines[end].strip() and following is not None and lines[following][:1].isspace():
+                end = following + 1
+                continue
+            break
+        lines[index:end] = [serialized]
+        return _verified_title_edit(workflow_yaml, "\n".join(lines) + trailing_newline, title)
+    # Prepending ahead of a leading ``---`` would make two documents, which safe_load rejects.
+    insert_at = 1 if lines and lines[0].strip() == "---" else 0
+    lines.insert(insert_at, serialized)
+    return _verified_title_edit(workflow_yaml, "\n".join(lines) + trailing_newline, title)
+
+
+def workflow_yaml_title(workflow_yaml: str | None) -> str | None:
+    if not workflow_yaml:
+        return None
+    try:
+        parsed = yaml.safe_load(workflow_yaml)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    title = parsed.get("title")
+    return title.strip() if isinstance(title, str) and title.strip() else None
+
+
 def _redact_credentials_before_persistence(
     workflow_yaml: str, workflow_permanent_id: str, credential_values: Collection[str]
 ) -> str:
@@ -466,11 +544,27 @@ async def _process_workflow_yaml(
     if pin_saved_session_ip is None:
         pin_saved_session_ip = bool(current_workflow and getattr(current_workflow, "pin_saved_session_ip", False))
 
+    # Omission-must-inherit, same as the settings above: the model re-emits whatever title it was
+    # handed, so a draft still carrying the placeholder must not un-name an agent already named.
+    title = workflow_yaml_request.title or ""
+    if title in DEFAULT_WORKFLOW_TITLES or not title:
+        # First candidate that is an actual name: the submitted draft may still carry the
+        # placeholder while canonical holds a rename that landed mid-turn, and vice versa.
+        candidates = (
+            workflow_yaml_title(settings_fallback_yaml),
+            settings_fallback_workflow.title if settings_fallback_workflow is not None else None,
+        )
+        for candidate in candidates:
+            named = (candidate or "").strip()
+            if named and named not in DEFAULT_WORKFLOW_TITLES:
+                title = named
+                break
+
     now = datetime.now(timezone.utc)
     return Workflow(
         workflow_id=workflow_id,
         organization_id=organization_id,
-        title=workflow_yaml_request.title or "",
+        title=title,
         workflow_permanent_id=workflow_permanent_id,
         version=1,
         is_saved_task=workflow_yaml_request.is_saved_task,

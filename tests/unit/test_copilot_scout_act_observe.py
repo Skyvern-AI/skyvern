@@ -142,6 +142,7 @@ def _ctx(*, server: Any = None, source_url: str | None = _SOURCE_URL) -> SimpleN
         scout_trajectory=[],
         challenge_solve_attempts={},
         organization_id="o_test",
+        browser_session_id="bs_test",
         prior_fill_carry=[],
         fill_carry_rebound_done=False,
         pending_scout_source_url=source_url,
