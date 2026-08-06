@@ -8,7 +8,7 @@ import tldextract
 
 from skyvern.cli.core.session_manager import get_page
 from skyvern.forge import app
-from skyvern.forge.sdk.browser_action_policy import BrowserOrigin, canonicalize_origin
+from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, url_parts
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
@@ -234,26 +234,49 @@ async def _vault_named_sites(copilot_ctx: AgentContext, credential_id: str) -> l
     return uris
 
 
-def _missing_credential_origin_error(credential_id: str) -> str:
+def _missing_credential_origin_error(credential_id: str, page_url: str | None) -> str:
+    if page_url:
+        origin = loggable_origin(page_url)
+        return (
+            f"Credential `{credential_id}` cannot be filled on {origin}: the user has not named this site "
+            f"in this chat. Ask the user to confirm the sign-in site by pasting its URL — {origin} — "
+            "then retry."
+        )
     return (
-        f"Credential `{credential_id}` has no intended login origin, so it cannot be filled into the live browser. "
-        "Test the saved credential against its login page to bind it to that site, then inspect the page and retry."
+        f"Credential `{credential_id}` cannot be filled: no live page is open. "
+        "Navigate to the sign-in page first, then retry."
     )
 
 
-def _sole_grounded_login_target(policy: RequestPolicy) -> str | None:
-    """The one sign-in page this request grounds in the user's own words, if there is exactly one; a
-    request naming several grounds none, since nothing here can tell which of them a password belongs to.
+def _log_fill_grant(route: str, url: str, credential_id: str, source_message: int | None = None) -> None:
+    LOG.info(
+        "copilot credential fill grant",
+        route=route,
+        page_origin=loggable_origin(url),
+        credential_id=credential_id,
+        source_user_message=source_message,
+    )
+
+
+def _user_provided_site_url_match(policy: RequestPolicy, page_url: str) -> tuple[str | None, bool]:
+    """Match the live page against a site the user pasted, reporting whether the match was
+    site-level. Hosts outside the public suffix list (internal domains, localhost) have no
+    registrable site to compare, so they fall back to an exact-origin match.
     """
-    by_origin: dict[BrowserOrigin, str] = {}
-    for url in policy.grounded_login_target_urls:
-        parts = url_parts(url)
-        origin = canonicalize_origin(parts[2]) if parts else None
-        if origin is not None:
-            by_origin[origin] = url
-    if len(by_origin) != 1:
-        return None
-    return next(iter(by_origin.values()))
+    for url in policy.user_provided_site_urls:
+        if _same_site(page_url, url):
+            return url, True
+        if _still_on_admitted_site(page_url, url):
+            return url, False
+    return None, False
+
+
+def _request_settled_credential(policy: RequestPolicy, credential_id: str) -> bool:
+    """A non-model signal already answered which credential: the user named it this turn, or it is
+    the only credential resolved for this request (e.g. the one card answer, carried)."""
+    if policy.current_turn_named_credential_ids == {credential_id}:
+        return True
+    return {credential.credential_id for credential in policy.resolved_credentials} == {credential_id}
 
 
 async def _sole_org_password_credential_id(
@@ -300,26 +323,29 @@ async def _credential_fill_origin_grant(
 
     if not authority_error:
         if not isinstance(policy, RequestPolicy):
-            return None, _missing_credential_origin_error(credential_id)
+            return None, _missing_credential_origin_error(credential_id, None)
         intended_url = _resolved_credential_intended_url(policy, credential_id)
         if intended_url:
+            _log_fill_grant("admitted_or_tested", intended_url, credential_id)
             return _CredentialFillOriginGrant(intended_url), None
-        # A credential saved without a login URL has no record of where it belongs, but that is an
-        # absent answer rather than a contrary one. The sign-in page the user themselves named can
-        # supply the origin, provided something other than the model settled which credential to use.
         page_url = await _live_working_page_url(copilot_ctx) or ""
         # The vault entry names the site the user filed this credential under, so it answers where
         # the secret belongs without anyone having to run the test flow first.
         if page_url and any(_same_site(page_url, uri) for uri in await _vault_named_sites(copilot_ctx, credential_id)):
+            _log_fill_grant("vault_site", page_url, credential_id)
             return _CredentialFillOriginGrant(page_url, whole_site=True), None
-        grounded_target = _sole_grounded_login_target(policy)
-        if not page_url or grounded_target is None or not _still_on_admitted_site(page_url, grounded_target):
-            return None, _missing_credential_origin_error(credential_id)
-        if policy.current_turn_named_credential_ids == {credential_id}:
-            return _CredentialFillOriginGrant(page_url), None
-        if credential_id == await _sole_org_password_credential_id(load_once):
-            return _CredentialFillOriginGrant(page_url), None
-        return None, _ambiguous_unbound_credential_steer(credential_id, page_url)
+        if page_url:
+            matched_url, site_level = _user_provided_site_url_match(policy, page_url)
+            if matched_url is not None:
+                if _request_settled_credential(
+                    policy, credential_id
+                ) or credential_id == await _sole_org_password_credential_id(load_once):
+                    # An origin-only match (no registrable site) keeps the origin-scoped grant so the
+                    # release guard can still compare it; site matches travel the whole site.
+                    _log_fill_grant("user_url", page_url, credential_id, policy.user_site_url_sources.get(matched_url))
+                    return _CredentialFillOriginGrant(page_url, whole_site=site_level), None
+                return None, _ambiguous_unbound_credential_steer(credential_id, page_url)
+        return None, _missing_credential_origin_error(credential_id, page_url or None)
 
     if not isinstance(policy, RequestPolicy):
         return None, authority_error
@@ -332,9 +358,10 @@ async def _credential_fill_origin_grant(
         load_org_credentials=load_once,
     )
     if admission.admitted and admission.page_url:
+        _log_fill_grant("live_page_admission", admission.page_url, credential_id)
         return _CredentialFillOriginGrant(admission.page_url), None
     if admission.admitted:
-        return None, _missing_credential_origin_error(credential_id)
+        return None, _missing_credential_origin_error(credential_id, None)
     return None, admission.steer or authority_error
 
 
@@ -452,7 +479,7 @@ async def _fill_credential_field_impl(
             field=field,
             organization_id=copilot_ctx.organization_id,
         )
-        return finish({"ok": False, "error": policy_error or _missing_credential_origin_error(credential_id)})
+        return finish({"ok": False, "error": policy_error or _missing_credential_origin_error(credential_id, None)})
 
     value, credential_name, resolve_error = await _resolve_credential_fill_value(copilot_ctx, credential_id, field)
     if resolve_error or value is None:

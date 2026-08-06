@@ -138,3 +138,7 @@ DEFAULT_SCRIPT_RUN_ID = "default"
 
 # SkyvernPage constants
 SKYVERN_PAGE_MAX_SCRAPING_RETRIES = 2
+
+# Placeholder titles a workflow carries before anything names it. Two strings because
+# the frontend and backend defaults drifted apart.
+DEFAULT_WORKFLOW_TITLES = ("New Workflow", "New Agent")

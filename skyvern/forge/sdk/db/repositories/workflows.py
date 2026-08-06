@@ -7,7 +7,7 @@ from typing import Any, cast
 import structlog
 from sqlalchemy import exists, func, or_, select, update
 
-from skyvern.constants import DEFAULT_SCRIPT_RUN_ID
+from skyvern.constants import DEFAULT_SCRIPT_RUN_ID, DEFAULT_WORKFLOW_TITLES
 from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy, declare_policy
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
@@ -114,6 +114,44 @@ class WorkflowsRepository(BaseRepository):
         if organization_id:
             query = query.filter_by(organization_id=organization_id)
         return carried_policy(await session.scalar(query))
+
+    @db_operation("rename_workflow_if_still_default")
+    async def rename_workflow_if_still_default(
+        self,
+        workflow_id: str,
+        workflow_permanent_id: str,
+        organization_id: str,
+        title: str,
+    ) -> bool:
+        """Name a workflow only while it is still unnamed, atomically; returns whether it renamed.
+
+        Deliberately does not stamp ``created_by``/``edited_by`` — naming is not authorship, and
+        ``is_workflow_copilot_authored`` treats any copilot stamp as permanent lineage.
+        """
+        newer_version_exists = (
+            select(WorkflowModel.workflow_id)
+            .filter_by(workflow_permanent_id=workflow_permanent_id, organization_id=organization_id)
+            .filter(WorkflowModel.workflow_id != workflow_id)
+            .filter(WorkflowModel.deleted_at.is_(None))
+            .filter(
+                WorkflowModel.version
+                > select(WorkflowModel.version).filter_by(workflow_id=workflow_id).scalar_subquery()
+            )
+        )
+        rename_query = (
+            update(WorkflowModel)
+            .where(WorkflowModel.workflow_id == workflow_id)
+            .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
+            .where(WorkflowModel.organization_id == organization_id)
+            .where(WorkflowModel.deleted_at.is_(None))
+            .where(WorkflowModel.title.in_(DEFAULT_WORKFLOW_TITLES))
+            .where(~exists(newer_version_exists))
+            .values(title=title)
+        )
+        async with self.Session() as session:
+            result = await session.execute(rename_query)
+            await session.commit()
+            return bool(result.rowcount)
 
     @db_operation("create_workflow")
     async def create_workflow(
