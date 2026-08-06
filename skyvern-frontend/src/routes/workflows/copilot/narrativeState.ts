@@ -7,6 +7,7 @@ import { buildRevealOffsets } from "./actionReveal";
 import {
   CopilotResponseType,
   ProposalDisposition,
+  RunOutcomeRole,
   WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotDesignEndUpdate,
   WorkflowCopilotDesignStartUpdate,
@@ -88,6 +89,10 @@ export type BlockOutcome =
   | "not_demonstrated"
   | "not_evaluated";
 
+export function isInterimOutcome(role: RunOutcomeRole | undefined): boolean {
+  return role === "interim_build_test";
+}
+
 export interface TerminalEnvelopeFacts {
   runVerdict: BlockOutcome | null;
   runDisplayReason: string | null;
@@ -122,6 +127,7 @@ export interface BlockState {
   // Undefined when no verdict was recorded (older backend or unadjudicated run).
   outcome?: BlockOutcome;
   outcomeReason?: string;
+  outcomeRole?: RunOutcomeRole;
   lastSeenIteration: number;
   // Tool calls and results emitted while this block was running are
   // appended here so the expanded card shows what the agent did.
@@ -162,6 +168,7 @@ export interface ActivityEntry {
 // Closed vocabulary of the backend TurnOutcome.response_kind enum. Unknown
 // wire values parse to null so a newer backend cannot crash the renderer.
 export type TurnResponseKind =
+  | "answer"
   | "build"
   | "clarify"
   | "diagnose"
@@ -231,6 +238,7 @@ export interface TurnNarrativeState {
   // stopped rather than Draft (accepted).
   lastRunOutcome: {
     verdict: BlockOutcome;
+    role?: RunOutcomeRole;
     displayReason: string | null;
     activitySeqAtVerdict: number;
   } | null;
@@ -243,6 +251,9 @@ export interface TurnNarrativeState {
     outcome: "connected" | "skipped" | "timeout" | "declined";
     credentialId: string | null;
   } | null;
+  // Silently auto-bound credential, from the credentialAutoBound narrative signal — rendered as a
+  // receipt with a Change affordance so a confident-but-wrong pick can be corrected after the fact.
+  credentialAutoBound: { credentialId: string; name: string } | null;
 }
 
 export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
@@ -273,6 +284,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   lastRunOutcome: null,
   credentialPrompt: null,
   credentialPause: null,
+  credentialAutoBound: null,
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -293,7 +305,8 @@ export function parseUtcIsoMs(iso: string | null | undefined): number | null {
 }
 
 export function parseResponseKind(value: unknown): TurnResponseKind | null {
-  return value === "build" ||
+  return value === "answer" ||
+    value === "build" ||
     value === "clarify" ||
     value === "diagnose" ||
     value === "refuse" ||
@@ -330,6 +343,21 @@ export function parseCredentialPause(
   };
 }
 
+export function parseCredentialAutoBound(
+  value: unknown,
+): TurnNarrativeState["credentialAutoBound"] {
+  if (!value || typeof value !== "object") return null;
+  const o = value as Record<string, unknown>;
+  const credentialId = o.credentialId;
+  const name = o.name;
+  return typeof credentialId === "string" &&
+    credentialId.length > 0 &&
+    typeof name === "string" &&
+    name.length > 0
+    ? { credentialId, name }
+    : null;
+}
+
 // Tool calls that write the workflow definition. update_workflow only
 // validates/saves the draft; update_and_run_blocks also runs it, so it's
 // the one AUTHORING_TOOLS member that's also a RUN_TOOLS member (its
@@ -363,6 +391,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   select_option: "Selecting option",
   press_key: "Interacting with page",
   navigate_browser: "Opening page",
+  wait_for_either_state: "Waiting for the page",
   get_block_schema: "Checking workflow block options",
   inspect_current_workflow: "Inspecting workflow",
   discover_workflow_entrypoint: "Finding the entry page",
@@ -775,6 +804,7 @@ export function applyNarrativeEvent(
         // either, so always keep the prior values.
         outcome: previousBlock?.outcome,
         outcomeReason: previousBlock?.outcomeReason,
+        outcomeRole: previousBlock?.outcomeRole,
         recordedActions: previousBlock?.recordedActions,
         recordedActionsAt: previousBlock?.recordedActionsAt,
         lastSeenIteration: event.iteration,
@@ -800,6 +830,7 @@ export function applyNarrativeEvent(
               ...b,
               outcome: event.verdict,
               outcomeReason: event.display_reason ?? undefined,
+              outcomeRole: event.role ?? "adjudicated",
             }
           : b,
       );
@@ -810,6 +841,7 @@ export function applyNarrativeEvent(
         // verdict from a prior run cycle within the same turn.
         lastRunOutcome: {
           verdict: event.verdict,
+          role: event.role ?? "adjudicated",
           displayReason: event.display_reason ?? null,
           activitySeqAtVerdict: prev.activitySeq,
         },
@@ -987,12 +1019,17 @@ export function applyNarrativeEvent(
           ...hydrated,
           blocks,
           // Graft across the terminal replacement so a cancel mid-silence
-          // doesn't visually un-check the Draft phase (hydrated payloads
-          // never carry this client-only field). authoringCount/lastRunOutcome
-          // are intentionally NOT grafted — a stubs-only terminal checklist is
-          // correct there.
+          // doesn't visually un-check the Draft phase (hydrated payloads never
+          // carry these client-only fields). authoringCount is grafted too so a
+          // turn whose only authoring entry aged out of the capped activity
+          // list still completes Explore at the swap; lastRunOutcome is not —
+          // a cancel-mid-redraft marks Test stopped rather than Draft.
           draftingSignaledAt:
             hydrated.turnId === prev.turnId ? prev.draftingSignaledAt : null,
+          authoringCount:
+            hydrated.turnId === prev.turnId
+              ? prev.authoringCount
+              : hydrated.authoringCount,
           responseType: event.response_type ?? hydrated.responseType,
           cancelled: event.cancelled ?? hydrated.cancelled,
           proposalDisposition:
@@ -1152,6 +1189,12 @@ export function hydrateNarrativeFromPayload(
         return o;
       return undefined;
     })();
+    const outcomeRole: RunOutcomeRole | undefined =
+      outcome === undefined
+        ? undefined
+        : obj.outcomeRole === "interim_build_test"
+          ? "interim_build_test"
+          : "adjudicated";
     return {
       workflowRunBlockId:
         typeof obj.workflowRunBlockId === "string"
@@ -1160,6 +1203,7 @@ export function hydrateNarrativeFromPayload(
       label: typeof obj.label === "string" ? obj.label : "",
       blockType: typeof obj.blockType === "string" ? obj.blockType : "task",
       outcome,
+      outcomeRole,
       outcomeReason:
         typeof obj.outcomeReason === "string" ? obj.outcomeReason : undefined,
       state: ((): BlockState["state"] => {
@@ -1249,6 +1293,7 @@ export function hydrateNarrativeFromPayload(
       typeof payload.endedAt === "string" ? (payload.endedAt as string) : null,
     credentialPrompt: parseCredentialPrompt(payload.credentialPrompt),
     credentialPause: parseCredentialPause(payload.credentialPause),
+    credentialAutoBound: parseCredentialAutoBound(payload.credentialAutoBound),
   };
 }
 
@@ -1374,7 +1419,8 @@ export function notConfirmedOutcome(
       : null;
   }
   if (turn.lastRunOutcome !== null) {
-    return turn.lastRunOutcome.verdict === "not_demonstrated"
+    return turn.lastRunOutcome.verdict === "not_demonstrated" &&
+      !isInterimOutcome(turn.lastRunOutcome.role)
       ? {
           verdict: "not_demonstrated",
           displayReason: turn.lastRunOutcome.displayReason,
@@ -1383,7 +1429,10 @@ export function notConfirmedOutcome(
   }
   for (let i = turn.blocks.length - 1; i >= 0; i -= 1) {
     const block = turn.blocks[i]!;
-    if (block.outcome === "not_demonstrated") {
+    if (
+      block.outcome === "not_demonstrated" &&
+      !isInterimOutcome(block.outcomeRole)
+    ) {
       return {
         verdict: "not_demonstrated",
         displayReason: block.outcomeReason ?? null,
@@ -1421,7 +1470,7 @@ function adjudicatedSummaryParts(
     if (turn.responseKind === "refuse") {
       return { headline: "Declined", accent: "qa", glyph: "✦" };
     }
-    if (turn.responseKind === "diagnose") {
+    if (turn.responseKind === "answer" || turn.responseKind === "diagnose") {
       return { headline: "Answered", accent: "qa", glyph: "✦" };
     }
     if (

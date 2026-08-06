@@ -23,13 +23,14 @@ _CARD = CreditCardCredential(
 )
 
 
-def _context() -> WorkflowRunContext:
+def _context(*, mask_secrets: bool = True) -> WorkflowRunContext:
     return WorkflowRunContext(
         workflow_title="t",
         workflow_id="w_test",
         workflow_permanent_id="wpid_test",
         workflow_run_id="wr_test",
         aws_client=MagicMock(),
+        mask_secrets=mask_secrets,
     )
 
 
@@ -127,3 +128,20 @@ def test_long_secret_still_masks_as_substring() -> None:
 
     masked = context.mask_secrets_in_data({"log": "charged card 4111111111111111 ok"})
     assert masked == {"log": "charged card ***** ok"}
+
+
+def test_mask_secrets_in_data_masks_even_when_workflow_opted_out() -> None:
+    context = _context(mask_secrets=False)
+    context.secrets["password"] = "secret-value"
+
+    assert context.mask_secrets_in_data({"password": "secret-value"}) == {"password": "*****"}
+
+
+def test_mask_secrets_in_data_masks_even_when_global_flag_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(context_manager_module.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", False)
+    context = _context(mask_secrets=False)
+    context.secrets["password"] = "secret-value"
+
+    assert context.mask_secrets_in_data({"password": "secret-value"}) == {"password": "*****"}

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
+import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
@@ -17,6 +20,40 @@ skill_app = typer.Typer(help="Manage bundled skill reference files.")
 SKILLS_DIR = Path(__file__).parent / "skills"
 
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---", re.DOTALL)
+
+_QA_REPORT_MARKER = "<!-- skyvern-qa-report -->"
+_QA_REPORT_PATH = Path(".qa/latest-report.md")
+_QA_COMMENT_FIELDS_JQ = '.[] | {id: .id, login: .user.login, head: (.body | split("\n")[0])}'
+
+
+def _run_process(command: list[str]) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(command, shell=False, check=False, capture_output=True, text=True)
+    except OSError as exc:
+        console.print(f"Unable to run {command[0]}: {exc}", style="red", markup=False)
+        raise typer.Exit(code=1) from exc
+
+
+def _require_success(result: subprocess.CompletedProcess[str], action: str) -> str:
+    if result.returncode == 0:
+        return result.stdout.strip()
+    detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+    console.print(f"Unable to {action}: {detail}", style="red", markup=False)
+    raise typer.Exit(code=1)
+
+
+def _find_sticky_comment_id(comment_lines: str, login: str) -> str | None:
+    """Return the oldest comment by `login` whose body opens with the QA marker."""
+    for line in comment_lines.splitlines():
+        if not line.strip():
+            continue
+        try:
+            comment = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if comment.get("login") == login and str(comment.get("head", "")).strip() == _QA_REPORT_MARKER:
+            return str(comment.get("id", ""))
+    return None
 
 
 def get_skill_dirs() -> list[Path]:
@@ -133,3 +170,89 @@ def skill_copy(
             target = dst / d.name
             shutil.copytree(d, target, dirs_exist_ok=overwrite, ignore=_ignore)
         console.print(f"[green]Copied {len(dirs)} skills to {dst.resolve()}[/green]")
+
+
+@skill_app.command("post-qa-report")
+def post_qa_report() -> None:
+    """Create or update a pull request QA report comment from .qa/latest-report.md."""
+    report_file = _QA_REPORT_PATH
+    try:
+        report = report_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        console.print(f"Unable to read {report_file}: {exc}", style="red", markup=False)
+        raise typer.Exit(code=1) from exc
+
+    pr_result = _run_process(
+        [
+            "gh",
+            "pr",
+            "status",
+            "--json",
+            "number,state",
+            "--jq",
+            'if .currentBranch.state == "OPEN" then .currentBranch.number else empty end',
+        ]
+    )
+    if pr_result.returncode != 0:
+        detail = pr_result.stderr.strip() or pr_result.stdout.strip() or "unknown error"
+        console.print(f"Unable to check for an open PR: {detail}", style="red", markup=False)
+        console.print(f"Report remains at {report_file}.", style="yellow", markup=False)
+        raise typer.Exit(code=1)
+    if not pr_result.stdout.strip():
+        console.print(f"No open PR found. Report remains at {report_file}.", style="yellow", markup=False)
+        return
+    pr_number = pr_result.stdout.strip()
+    if not pr_number.isdecimal():
+        console.print("[red]Unable to determine a valid PR number.[/red]")
+        raise typer.Exit(code=1)
+
+    commit = _require_success(
+        _run_process(["git", "rev-parse", "--short", "HEAD"]),
+        "read the current commit",
+    )
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    comment_body = f"{_QA_REPORT_MARKER}\n## QA Report — {commit} — {timestamp}\n\n{report}\n"
+
+    # Only ever edit a comment this user authored: any account can post a body containing
+    # the marker, and editing on a bare marker match would delete someone else's comment.
+    login_result = _run_process(["gh", "api", "user", "--jq", ".login"])
+    login = login_result.stdout.strip() if login_result.returncode == 0 else ""
+    existing_comment_id = None
+    if login:
+        comments_result = _run_process(
+            [
+                "gh",
+                "api",
+                "--paginate",
+                f"repos/{{owner}}/{{repo}}/issues/{pr_number}/comments",
+                "--jq",
+                _QA_COMMENT_FIELDS_JQ,
+            ]
+        )
+        comment_lines = _require_success(comments_result, "look up the existing report comment")
+        existing_comment_id = _find_sticky_comment_id(comment_lines, login)
+    else:
+        console.print(
+            "Could not identify the authenticated gh user; posting a new comment instead of updating.",
+            style="yellow",
+            markup=False,
+        )
+
+    if existing_comment_id:
+        if not existing_comment_id.isdecimal():
+            console.print("[red]Unable to determine a valid report comment ID.[/red]")
+            raise typer.Exit(code=1)
+        post_command = [
+            "gh",
+            "api",
+            f"repos/{{owner}}/{{repo}}/issues/comments/{existing_comment_id}",
+            "-X",
+            "PATCH",
+            "-f",
+            f"body={comment_body}",
+        ]
+    else:
+        post_command = ["gh", "pr", "comment", pr_number, "--body", comment_body]
+
+    _require_success(_run_process(post_command), "post the report comment")
+    console.print("[green]Posted report to the pull request.[/green]")

@@ -105,6 +105,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "list_credentials": "Checking saved credentials",
     "validate_block": "Checking the block",
     "console_messages": "Reading the browser console",
+    "wait_for_either_state": "Waiting for the page",
     "fill_credential_field": "Entering saved credentials",
     "edit_block": "Editing block",
     "delete_block": "Deleting block",

@@ -20,6 +20,7 @@ from skyvern.forge.sdk.copilot.result_evidence import (
     LoadedResultCompositionEvidence,
     loaded_result_target_structure_signature,
 )
+from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeRole
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -75,6 +76,7 @@ class NarrativeBlock(TypedDict):
     endedAt: str | None
     outcome: NotRequired[str]
     outcomeReason: NotRequired[str]
+    outcomeRole: NotRequired[RunOutcomeRole]
 
 
 class NarrativeOutcomeAdjudication(TypedDict):
@@ -95,7 +97,7 @@ class TurnNarrativePayload(TypedDict):
     responseType: NotRequired[ResponseType]
     cancelled: NotRequired[bool]
     proposalDisposition: NotRequired[ProposalDisposition]
-    # TurnOutcome.response_kind value: "build" | "clarify" | "diagnose" | "refuse" | "recover".
+    # TurnOutcome.response_kind value: "answer" | "build" | "clarify" | "diagnose" | "refuse" | "recover".
     responseKind: NotRequired[str]
     terminalEnvelope: NotRequired[dict[str, Any]]
     # The ADR-0005 terminal adjudication (enforcement.verified_goal_claim_authorized):
@@ -108,6 +110,9 @@ class TurnNarrativePayload(TypedDict):
     # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ...}, set when a mid-build
     # credential pause (credential_pause.py) resolved during this turn.
     credentialPause: NotRequired[dict[str, str]]
+    # {"credentialId": ..., "name": ...}, set when a credential was bound this turn without an ask
+    # (deterministic auto-bind); the FE renders it as a receipt with a Change affordance.
+    credentialAutoBound: NotRequired[dict[str, str]]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None
@@ -627,7 +632,13 @@ def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_c
     sc = StructuredContext.from_json_str(raw_context)
     existing_ids = {record.credential_id for record in sc.approved_credentials}
     for credential in policy.resolved_credentials:
-        if credential.credential_id in existing_ids or credential.credential_id in policy.live_page_admitted_urls:
+        # A credential the user picked from the card is durable approval even though the resume
+        # stamped an origin for it; only page-vouched ids have to be re-earned.
+        stamped_by_page = (
+            credential.credential_id in policy.live_page_admitted_urls
+            and credential.credential_id != ctx.credential_pause_connected_credential_id
+        )
+        if credential.credential_id in existing_ids or stamped_by_page:
             continue
         sc.approved_credentials.append(ApprovedCredential(credential_id=credential.credential_id))
         existing_ids.add(credential.credential_id)
@@ -921,6 +932,9 @@ class CopilotContext(AgentContext):
     # exception in run_with_enforcement. Cleared at the top of every call to
     # _record_run_blocks_result so stale state can't leak across runs.
     last_test_non_retriable_nav_error: str | None = None
+    # Secure-runner codes from the latest run that were faults of the sandbox itself, joined.
+    # Cleared per run in _record_run_blocks_result, so a later clean run releases the guard.
+    last_infrastructure_tool_error: str | None = None
     # Normalized signature of the non-retriable nav error last nudged on.
     # Lets the stop nudge re-fire if the user retries with a different bad URL
     # (different signature) in the same session. Cleared on meaningful success.
@@ -979,8 +993,6 @@ class CopilotContext(AgentContext):
     # construction site, overriding this default.
     turn_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     turn_index: int = 0
-    design_start_emitted: bool = False
-    design_end_emitted: bool = False
     narrative_summary: str | None = None
 
     staged_workflow_yaml: str | None = None

@@ -5,9 +5,14 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAlias, Union
 
 from pydantic import (
     AliasChoices,
+    AnyHttpUrl,
     BaseModel,
     ConfigDict,
     Field,
+    TypeAdapter,
+    ValidationError,
+    ValidationInfo,
+    WebsocketUrl,
     field_serializer,
     field_validator,
     model_validator,
@@ -61,9 +66,11 @@ from skyvern.schemas.run_enums import (  # noqa: F401
     RunType,
 )
 from skyvern.utils.secret_headers import mask_header_values
-from skyvern.utils.url_validators import validate_url
+from skyvern.utils.url_validators import validate_browser_host, validate_url
 
 MAX_SEARCH_FETCH_LIMIT = 1000
+_BROWSER_ADDRESS_ADAPTER = TypeAdapter(AnyHttpUrl | WebsocketUrl)
+BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY = "browser_address_is_server_assigned"
 
 # Type checkers need string Literal values, while pydantic's discriminated
 # union preserves enum instances when runtime Literals use the enum members.
@@ -82,6 +89,26 @@ else:
         RunType.yutori_navigator,
     ]
     WorkflowRunTypeField = Literal[RunType.workflow_run]
+
+
+def _validate_browser_address(browser_address: str | None) -> str | None:
+    if not browser_address:
+        return browser_address
+
+    try:
+        parsed = _BROWSER_ADDRESS_ADAPTER.validate_python(browser_address)
+    except ValidationError as exc:
+        raise ValueError("browser_address must be an HTTP(S) or WebSocket URL with a host") from exc
+
+    if not parsed.host:
+        raise ValueError("browser_address must include a host")
+
+    validate_browser_host(parsed.host)
+    return browser_address
+
+
+def _browser_address_is_server_assigned(info: ValidationInfo) -> bool:
+    return bool(info.context and info.context.get(BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY))
 
 
 class TaskRunRequest(BaseModel):
@@ -210,6 +237,11 @@ class TaskRunRequest(BaseModel):
         if not url:
             return url
         return validate_url(url)
+
+    @field_validator("browser_address")
+    @classmethod
+    def validate_browser_address(cls, browser_address: str | None) -> str | None:
+        return _validate_browser_address(browser_address)
 
     @field_validator("webhook_url", "totp_url")
     @classmethod
@@ -377,6 +409,13 @@ class WorkflowRunRequest(BaseModel):
     @classmethod
     def _validate_run_metadata(cls, v: dict[str, str] | None) -> dict[str, str] | None:
         return normalize_run_metadata(v)
+
+    @field_validator("browser_address")
+    @classmethod
+    def validate_browser_address(cls, browser_address: str | None, info: ValidationInfo) -> str | None:
+        if _browser_address_is_server_assigned(info):
+            return browser_address
+        return _validate_browser_address(browser_address)
 
     @field_validator("webhook_url", "totp_url")
     @classmethod

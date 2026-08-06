@@ -19,6 +19,7 @@ from skyvern.forge.sdk.copilot.credential_pause import credential_pause_reason
 from skyvern.forge.sdk.copilot.credential_resolution import resolve_by_url
 from skyvern.forge.sdk.copilot.request_policy import (
     _AMBIGUOUS_URL_CREDENTIAL_QUESTION,
+    _AMBIGUOUS_URLLESS_CREDENTIAL_QUESTION,
     _LOGIN_CREDENTIAL_QUESTION,
     _SAVED_CREDENTIAL_NAME_QUESTION,
     _SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX,
@@ -26,10 +27,13 @@ from skyvern.forge.sdk.copilot.request_policy import (
     CREDENTIAL_DEFERRED_DRAFT_REASONS,
     CREDENTIAL_PROMPT_CLARIFICATION_REASONS,
     LiveCredentialAdmission,
+    LivePageResolutionRecord,
     RequestPolicy,
     _can_defer_unresolved_credential_name_for_draft,
     _classification_from_raw,
     _clean_email_list,
+    _exact_credential_name_candidates,
+    _ground_login_target_urls,
     _resolve_credentials,
     _saved_credential_names_mentioned,
     _seed_prior_approved_credentials,
@@ -38,6 +42,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     admit_credential_for_live_page,
     build_request_policy,
     credential_prompt_reason,
+    resolve_credential_for_live_page,
 )
 from skyvern.forge.sdk.copilot.tools.credentials import _credential_run_approval_error
 from skyvern.forge.sdk.schemas.credentials import CredentialType
@@ -512,6 +517,8 @@ async def test_success_empty_refs_resolves_named_credential(kind: str) -> None:
     assert policy.classifier_status == "success"
     assert policy.credential_input_kind == kind
     assert [c.credential_id for c in policy.resolved_credentials] == ["cred_login"]
+    # The user named the credential — not a silent auto-bind, so no receipt.
+    assert policy.auto_bound_credentials == []
     assert policy.clarification_reason != "credential_name_unresolved"
 
 
@@ -628,7 +635,28 @@ async def test_name_miss_does_not_advance_to_classifier_only_url() -> None:
     assert policy.resolved_credentials == []
     assert policy.clarification_reason == "credential_name_unresolved"
     assert "missing-name" in (policy.clarification_question or "")
+    assert policy.credential_ask_card_answerable is True
+    assert credential_pause_reason(SimpleNamespace(request_policy=policy)) == "login_credentials_unresolved"
     load_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["abc", "spare-portal"], ids=["three_char", "twelve_char"])
+async def test_url_less_ambiguity_is_independent_of_credential_name_length(name: str) -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Log into the portal at https://portal.example.com/login.",
+        classifier_policy=RequestPolicy(
+            credential_input_kind="website_stored_credential",
+            login_page_urls=["https://portal.example.com/login"],
+            login_intent=True,
+            classifier_status="success",
+        ),
+        org_credentials=[_cred(name, "cred_one"), _cred("other-login", "cred_two")],
+    )
+
+    assert policy.credential_ask_card_answerable is True
+    assert policy.credential_ask_candidate_ids == ["cred_one", "cred_two"]
+    assert credential_pause_reason(SimpleNamespace(request_policy=policy)) == "login_credentials_unresolved"
 
 
 @pytest.mark.asyncio
@@ -656,9 +684,11 @@ async def test_resolver_exact_name_is_independent_of_classifier_label(
 
 
 @pytest.mark.asyncio
-async def test_explicit_id_wins_and_skips_name_and_url_scan() -> None:
+async def test_explicit_id_and_explicit_name_resolve_together() -> None:
+    """Both stated references resolve; neither preempts the other (SKY-13552)."""
+    named = _cred("named-login", "cred_named")
     by_ids = AsyncMock(return_value=[_cred("id-login", "cred_explicit")])
-    load_mock = AsyncMock(side_effect=AssertionError("organization scan should not run after an ID hit"))
+    load_mock = AsyncMock(return_value=[named])
     policy = RequestPolicy(
         credential_input_kind="credential_id",
         credential_refs=["cred_explicit", "named-login"],
@@ -668,14 +698,14 @@ async def test_explicit_id_wins_and_skips_name_and_url_scan() -> None:
     await _resolve_direct(
         policy,
         user_message="Use credential ID cred_explicit and the saved credential named named-login.",
-        org_credentials=[],
+        org_credentials=[named],
         get_credentials=load_mock,
         get_credentials_by_ids=by_ids,
     )
 
-    assert [candidate.credential_id for candidate in policy.resolved_credentials] == ["cred_explicit"]
+    assert [candidate.credential_id for candidate in policy.resolved_credentials] == ["cred_explicit", "cred_named"]
+    assert policy.requires_user_clarification is False
     by_ids.assert_awaited_once_with(["cred_explicit"], organization_id="o_test")
-    load_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -683,7 +713,6 @@ async def test_explicit_id_wins_for_non_id_label_and_competing_url_match() -> No
     explicit = _cred("id-login", "cred_explicit")
     competing = _cred("url-login", "cred_url", tested_url="https://portal.example.com/login")
     by_ids = AsyncMock(return_value=[explicit])
-    load_mock = AsyncMock(side_effect=AssertionError("organization scan should not run after an ID hit"))
     policy = RequestPolicy(
         credential_input_kind="website_stored_credential",
         credential_refs=["cred_explicit"],
@@ -694,13 +723,12 @@ async def test_explicit_id_wins_for_non_id_label_and_competing_url_match() -> No
         policy,
         user_message="Use credential ID cred_explicit for https://portal.example.com/login.",
         org_credentials=[competing],
-        get_credentials=load_mock,
         get_credentials_by_ids=by_ids,
     )
 
     assert [candidate.credential_id for candidate in policy.resolved_credentials] == ["cred_explicit"]
+    assert policy.auto_bound_credentials == []
     by_ids.assert_awaited_once_with(["cred_explicit"], organization_id="o_test")
-    load_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -746,6 +774,7 @@ async def test_classifier_id_absent_from_current_message_does_not_resolve() -> N
         "Avoid using cred_prod.",
         "Exclude credential ID cred_prod.",
         "Do not use the old workflow because it still mentions credential ID cred_prod.",
+        "Do not use the old workflow because it mentions cred_prod.",
         "Do not use this credential, credential ID cred_prod.",
     ],
 )
@@ -773,12 +802,14 @@ async def test_negated_explicit_id_does_not_resolve(user_message: str) -> None:
     [
         "Use this as a documentation example: cred_prod.",
         "Use the staging workflow; the notes mention cred_prod.",
-        "Do not use the old workflow because it mentions cred_prod.",
         'Document the string "cred_prod" in the workflow notes.',
+        "cred_prod\n\ncan you use this credential to log into the portal?",
+        "Here's a credential you can use to test: cred_prod",
     ],
 )
-async def test_unrelated_explicit_id_mention_does_not_resolve(user_message: str) -> None:
-    by_ids = AsyncMock(side_effect=AssertionError("unrelated credential IDs must not be resolved"))
+async def test_stated_explicit_id_resolves_regardless_of_prose_shape(user_message: str) -> None:
+    """A cred_ ID the user typed is supplied, whatever surrounds it; only negation withdraws it (SKY-13552)."""
+    by_ids = AsyncMock(return_value=[_cred("prod-login", "cred_prod")])
     policy = RequestPolicy(
         credential_input_kind="credential_id",
         credential_refs=["cred_prod"],
@@ -791,8 +822,9 @@ async def test_unrelated_explicit_id_mention_does_not_resolve(user_message: str)
         get_credentials_by_ids=by_ids,
     )
 
-    assert policy.resolved_credentials == []
-    by_ids.assert_not_awaited()
+    assert [candidate.credential_id for candidate in policy.resolved_credentials] == ["cred_prod"]
+    assert policy.requires_user_clarification is False
+    by_ids.assert_awaited_once_with(["cred_prod"], organization_id="o_test")
 
 
 @pytest.mark.asyncio
@@ -951,8 +983,8 @@ async def test_bare_id_appositive_negation_revokes_earlier_authority() -> None:
 
 
 @pytest.mark.asyncio
-async def test_invalid_explicit_id_does_not_fall_through_to_name() -> None:
-    load_mock = AsyncMock(side_effect=AssertionError("organization scan should not run after an explicit ID"))
+async def test_invalid_explicit_id_with_unknown_name_asks_instead_of_inferring() -> None:
+    """Nothing stated resolved, so the turn asks; it never falls through to the inference tiers."""
     policy = RequestPolicy(
         credential_input_kind="credential_id",
         credential_refs=["cred_missing", "named-login"],
@@ -962,12 +994,34 @@ async def test_invalid_explicit_id_does_not_fall_through_to_name() -> None:
         policy,
         user_message="Use credential ID cred_missing and the saved credential named named-login.",
         org_credentials=[],
-        get_credentials=load_mock,
     )
 
     assert policy.invalid_credential_ids == ["cred_missing"]
+    assert policy.resolved_credentials == []
     assert policy.clarification_reason == "credential_name_unresolved"
-    load_mock.assert_not_awaited()
+    assert policy.requires_user_clarification is True
+
+
+@pytest.mark.asyncio
+async def test_invalid_explicit_id_rides_along_when_another_stated_reference_resolves() -> None:
+    """An unresolvable stated ID never blocks a stated reference that did resolve (SKY-13552)."""
+    by_ids = AsyncMock(return_value=[_cred("real-login", "cred_real")])
+    policy = RequestPolicy(
+        credential_input_kind="credential_id",
+        credential_refs=["cred_real", "cred_missing"],
+    )
+
+    await _resolve_direct(
+        policy,
+        user_message="Use cred_real and cred_missing to log in.",
+        org_credentials=[],
+        get_credentials_by_ids=by_ids,
+    )
+
+    assert [candidate.credential_id for candidate in policy.resolved_credentials] == ["cred_real"]
+    assert policy.invalid_credential_ids == ["cred_missing"]
+    assert policy.requires_user_clarification is False
+    assert policy.allow_run_blocks is True
 
 
 @pytest.mark.asyncio
@@ -1004,12 +1058,44 @@ async def test_multiple_name_hits_keep_the_existing_picker_and_skip_url() -> Non
     )
 
     assert policy.requires_user_clarification is True
-    assert policy.clarification_question is not None
-    assert policy.clarification_question.startswith(
-        "I found multiple stored credentials with that exact name. Which one should I use?"
+    assert (
+        policy.clarification_question
+        == "I found multiple stored credentials with that exact name. Which one should I use?"
     )
-    assert "`cred_url`" not in policy.clarification_question
+    # No prose credential dump: neither the named matches nor the unrelated URL cred are listed.
+    assert "cred_" not in policy.clarification_question
     load_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_name_collision_candidates_are_not_labelled_safe_matches() -> None:
+    """A name-formed ask has no login page vouching for its candidates.
+
+    Each candidate carrying some ``tested_url`` says nothing about *this* page, so the picker
+    must not call them safe matches even when every one of them has been tested somewhere.
+    """
+    policy = RequestPolicy(
+        credential_input_kind="website_stored_credential",
+        login_page_urls=["https://portal.example.com/login"],
+        login_intent=True,
+    )
+
+    await _resolve_direct(
+        policy,
+        user_message="Use the credential named shared-login.",
+        org_credentials=[
+            _cred("shared-login", "cred_one", tested_url="https://elsewhere.example.com/login"),
+            _cred("shared-login", "cred_two", tested_url="https://other.example.com/login"),
+        ],
+    )
+
+    assert policy.clarification_question is not None
+    # No prose enumeration at all — the card renders the full-org picker, so candidates are never
+    # labelled (neither "Safe matches" nor "Saved credentials"); they ride on the policy field.
+    assert "Saved credentials" not in policy.clarification_question
+    assert "Safe matches" not in policy.clarification_question
+    assert policy.credential_ask_candidate_ids == ["cred_one", "cred_two"]
+    assert policy.credential_ask_login_page_urls == []
 
 
 @pytest.mark.asyncio
@@ -1028,10 +1114,11 @@ async def test_url_tier_deduplicates_and_keeps_existing_picker() -> None:
         org_credentials=[first, first, second],
     )
 
-    assert policy.clarification_question is not None
-    assert policy.clarification_question.startswith(_AMBIGUOUS_URL_CREDENTIAL_QUESTION)
-    assert policy.clarification_question.count("`cred_first`") == 1
-    assert policy.clarification_question.count("`cred_second`") == 1
+    assert policy.clarification_question == _AMBIGUOUS_URL_CREDENTIAL_QUESTION
+    # The "Safe matches" prose dump is gone; the deduplicated candidate set now rides only on
+    # discovered_credentials (the FE renders the full org selector instead of a text list).
+    assert {c.credential_id for c in policy.discovered_credentials} == {"cred_first", "cred_second"}
+    assert len(policy.discovered_credentials) == 2
     load_mock.assert_awaited_once()
 
 
@@ -1381,13 +1468,17 @@ async def test_website_kind_multiple_url_less_credentials_ask_which_one() -> Non
     )
 
     assert policy.requires_user_clarification is True
-    assert policy.clarification_question is not None
-    assert policy.clarification_question.startswith(_AMBIGUOUS_URL_CREDENTIAL_QUESTION)
-    assert "first-login" in policy.clarification_question
-    assert "second-login" in policy.clarification_question
+    # One clean sentence, no prose credential dump; candidates ride on discovered_credentials / candidate_ids.
+    assert policy.clarification_question == _AMBIGUOUS_URLLESS_CREDENTIAL_QUESTION
+    assert "first-login" not in policy.clarification_question
+    assert "second-login" not in policy.clarification_question
     assert policy.clarification_reason == "credential_name_unresolved"
     assert sorted(c.credential_id for c in policy.discovered_credentials) == ["cred_one", "cred_two"]
     assert not policy.resolved_credentials
+    assert policy.credential_ask_card_answerable is True
+    assert policy.credential_ask_candidate_ids == ["cred_one", "cred_two"]
+    assert policy.credential_ask_login_page_urls == ["https://portal.example.com/login"]
+    assert credential_pause_reason(SimpleNamespace(request_policy=policy)) == "login_credentials_unresolved"
 
 
 @pytest.mark.asyncio
@@ -1406,9 +1497,10 @@ async def test_website_kind_multiple_url_matches_keep_disambiguation_reason() ->
         ],
     )
 
-    assert policy.clarification_question is not None
-    assert policy.clarification_question.startswith(_AMBIGUOUS_URL_CREDENTIAL_QUESTION)
+    # One clean sentence, no prose credential dump; candidates ride on discovered_credentials.
+    assert policy.clarification_question == _AMBIGUOUS_URL_CREDENTIAL_QUESTION
     assert policy.clarification_reason == "credential_name_unresolved"
+    assert policy.credential_ask_card_answerable is True
     assert sorted(c.credential_id for c in policy.discovered_credentials) == ["cred_one", "cred_two"]
 
 
@@ -1485,7 +1577,7 @@ async def test_website_kind_explicit_name_wins_over_url_matched_card() -> None:
 
 
 @pytest.mark.asyncio
-async def test_success_credential_id_intent_is_not_overridden_by_name_scan() -> None:
+async def test_success_credential_id_and_stated_name_both_resolve() -> None:
     by_ids = AsyncMock(return_value=[_cred("real", "cred_real")])
     load_mock = AsyncMock(return_value=[_cred("mock-portal-login", "cred_login")])
     policy = await _build_with_forced_classifier(
@@ -1495,14 +1587,13 @@ async def test_success_credential_id_intent_is_not_overridden_by_name_scan() -> 
             credential_refs=["cred_real"],
             classifier_status="success",
         ),
-        org_credentials=[],
+        org_credentials=[_cred("mock-portal-login", "cred_login")],
         get_credentials=load_mock,
         get_credentials_by_ids=by_ids,
     )
 
     assert policy.credential_input_kind == "credential_id"
-    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_real"]
-    load_mock.assert_not_awaited()
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_real", "cred_login"]
 
 
 @pytest.mark.asyncio
@@ -1704,6 +1795,8 @@ async def test_login_intent_none_kind_one_message_url_with_single_match_resolves
 
     assert policy.credential_input_kind == "none"
     assert [c.credential_id for c in policy.resolved_credentials] == ["cred_url"]
+    # A deterministic URL-tier bind fired with no ask — the auto-bind receipt is stamped.
+    assert [c.credential_id for c in policy.auto_bound_credentials] == ["cred_url"]
     assert policy.requires_user_clarification is False
     assert policy.clarification_question is None
 
@@ -1725,13 +1818,9 @@ async def test_login_intent_none_kind_multiple_host_matches_asks_pick_question()
 
     assert policy.credential_input_kind == "none"
     assert policy.requires_user_clarification is True
-    assert policy.clarification_question is not None
-    assert (
-        "I found multiple stored credentials for that login page. Which one should I use?"
-        in policy.clarification_question
-    )
-    assert "`cred_a`" in policy.clarification_question
-    assert "`cred_b`" in policy.clarification_question
+    # One clean sentence, no prose credential dump; the candidate set rides on discovered_credentials.
+    assert policy.clarification_question == _AMBIGUOUS_URL_CREDENTIAL_QUESTION
+    assert {c.credential_id for c in policy.discovered_credentials} == {"cred_a", "cred_b"}
     assert policy.clarification_reason == "credential_name_unresolved"
 
 
@@ -2213,6 +2302,8 @@ async def test_a_pasted_secret_under_login_intent_keeps_the_raw_secret_refusal()
     )
 
     assert policy.clarification_reason == "raw_secret"
+    assert policy.credential_ask_card_answerable is False
+    assert credential_pause_reason(SimpleNamespace(request_policy=policy)) is None
 
 
 def test_login_credentials_unresolved_surfaces_a_prompt_but_grants_no_deferred_draft_authority() -> None:
@@ -2697,6 +2788,15 @@ def test_a_named_credential_resolves_without_the_word_credential() -> None:
     assert _saved_credential_names_mentioned("use skyvern-datadog to login.", credentials) == ["skyvern-datadog"]
 
 
+def test_contraction_apostrophe_does_not_open_a_bogus_quoted_name() -> None:
+    """A contraction's apostrophe once paired with a later quote and swallowed the span between them as
+    a credential name (e.g. from "I've connected the credential 'hex'"). It must extract only 'hex'."""
+    candidates = _exact_credential_name_candidates("I've connected the credential 'hex' — continue.")
+
+    assert "hex" in candidates
+    assert not any("connected" in candidate for candidate in candidates)
+
+
 @pytest.mark.asyncio
 async def test_a_named_credential_resolves_when_the_classifier_misses_login_intent() -> None:
     """`login_intent` is a model-authored hint that varies run to run. Gating the saved-name scan on
@@ -2908,6 +3008,267 @@ class TestLivePageCredentialAdmission:
         assert admission.admitted is False
         load_mock.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_the_admission_fingerprint_names_the_fill_seam(self) -> None:
+        with capture_logs() as logs:
+            await _admit(
+                RequestPolicy(),
+                credential_id="cred_analytics",
+                page_url=_LIVE_LOGIN_URL,
+                org_credentials=[_cred("analytics", "cred_analytics", _SAVED_LOGIN_URL)],
+            )
+
+        emitted = [entry for entry in logs if entry["event"] == "copilot credential live-page admission"]
+        assert [(entry["seam"], entry["outcome"]) for entry in emitted] == [("fill", "admitted")]
+
+    @pytest.mark.asyncio
+    async def test_an_input_that_is_not_a_page_abstains_and_never_steers_the_user(self) -> None:
+        with capture_logs() as logs:
+            admission, load_mock = await _admit(
+                RequestPolicy(),
+                credential_id="cred_analytics",
+                page_url="current_page",
+                org_credentials=[_cred("analytics", "cred_analytics", _SAVED_LOGIN_URL)],
+            )
+
+        emitted = [entry for entry in logs if entry["event"] == "copilot credential live-page admission"]
+        assert admission.admitted is False
+        assert admission.steer is None
+        assert [(entry["seam"], entry["outcome"]) for entry in emitted] == [("fill", "abstain")]
+        load_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("page_url", "logged_identity"),
+        [
+            # Userinfo, query, fragment, params and path each carry the secret; none is identity.
+            ("scout:hunter2@current_page", "scout:"),
+            ("data:text/html,hunter2", "data:"),
+            ("current_page;jsessionid=hunter2", "current_page"),
+            ("custom://current_page?token=hunter2", "custom://current_page"),
+            ("custom://current_page#token=hunter2", "custom://current_page"),
+            ("custom://current_page/reset/hunter2", "custom://current_page"),
+            ("custom://current_page/x%3Ftoken=hunter2", "custom://current_page"),
+        ],
+    )
+    async def test_an_unresolvable_input_never_carries_a_secret_into_the_log(
+        self, page_url: str, logged_identity: str
+    ) -> None:
+        with capture_logs() as logs:
+            await _admit(
+                RequestPolicy(),
+                credential_id="cred_analytics",
+                page_url=page_url,
+                org_credentials=[_cred("analytics", "cred_analytics", _SAVED_LOGIN_URL)],
+            )
+
+        emitted = [entry for entry in logs if entry["event"] == "copilot credential live-page admission"]
+        assert "hunter2" not in emitted[0]["page_url"]
+        assert emitted[0]["page_url"] == logged_identity
+
+
+async def _resolve_live_page(
+    policy: RequestPolicy,
+    *,
+    page_url: str,
+    org_credentials: list[SimpleNamespace],
+) -> tuple[LivePageResolutionRecord, AsyncMock]:
+    load_mock = AsyncMock(return_value=org_credentials)
+    with patch("skyvern.forge.app.DATABASE.credentials.get_credentials", new=load_mock):
+        record = await resolve_credential_for_live_page(
+            policy,
+            organization_id="o_test",
+            page_url=page_url,
+        )
+    return record, load_mock
+
+
+class TestLivePageCredentialObservation:
+    """The observation seam asks the same question with no credential requested: whose page is this?"""
+
+    @pytest.mark.asyncio
+    async def test_a_sole_page_match_binds_and_writes_the_fill_seam_records(self) -> None:
+        policy = RequestPolicy()
+        record, _ = await _resolve_live_page(
+            policy,
+            page_url=_LIVE_LOGIN_URL,
+            org_credentials=[
+                _cred("analytics", "cred_analytics", _SAVED_LOGIN_URL),
+                _cred("billing", "cred_billing", "https://billing.example.com/login"),
+                _cred("urlless", "cred_urlless"),
+            ],
+        )
+
+        assert record.verdict == "resolved"
+        assert record.tier == "url_path"
+        assert [c.credential_id for c in record.candidates] == ["cred_analytics"]
+        assert [c.credential_id for c in policy.resolved_credentials] == ["cred_analytics"]
+        assert [c.credential_id for c in policy.auto_bound_credentials] == ["cred_analytics"]
+        assert policy.live_page_admitted_urls == {"cred_analytics": _LIVE_LOGIN_URL}
+
+    @pytest.mark.asyncio
+    async def test_a_page_reconfirming_a_turn_start_bind_is_not_double_stamped(self) -> None:
+        already = _cred("analytics", "cred_analytics", _SAVED_LOGIN_URL)
+        policy = RequestPolicy(resolved_credentials=[already])
+        await _resolve_live_page(
+            policy,
+            page_url=_LIVE_LOGIN_URL,
+            org_credentials=[already],
+        )
+
+        # A credential the turn already bound is not re-stamped as a fresh auto-bind by a later page.
+        assert policy.auto_bound_credentials == []
+        assert policy.live_page_admitted_urls == {}
+
+    @pytest.mark.asyncio
+    async def test_two_page_matches_bind_nothing_and_record_both_candidates(self) -> None:
+        policy = RequestPolicy()
+        record, _ = await _resolve_live_page(
+            policy,
+            page_url=_LIVE_LOGIN_URL,
+            org_credentials=[
+                _cred("analytics one", "cred_one", _SAVED_LOGIN_URL),
+                _cred("analytics two", "cred_two", _SAVED_LOGIN_URL),
+            ],
+        )
+
+        assert record.verdict == "ambiguous"
+        assert [c.credential_id for c in record.candidates] == ["cred_one", "cred_two"]
+        assert policy.resolved_credentials == []
+        assert policy.auto_bound_credentials == []
+        assert policy.live_page_admitted_urls == {}
+        assert policy.live_page_resolution is record
+
+    @pytest.mark.asyncio
+    async def test_decoys_only_bind_nothing(self) -> None:
+        policy = RequestPolicy()
+        record, _ = await _resolve_live_page(
+            policy,
+            page_url=_LIVE_LOGIN_URL,
+            org_credentials=[
+                _cred("billing", "cred_billing", "https://billing.example.com/login"),
+                _cred("urlless", "cred_urlless"),
+            ],
+        )
+
+        assert record.verdict == "no_match"
+        assert policy.resolved_credentials == []
+        assert policy.live_page_admitted_urls == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("page_url", "logged_identity"),
+        [
+            ("current_page", "current_page"),
+            ("about:blank", "about:"),
+            ("//analytics.example.com/login", "//analytics.example.com"),
+            # Too malformed to parse, so there is no identity to name and the outcome carries it.
+            ("http://[", ""),
+            ("http://[::1", ""),
+        ],
+    )
+    async def test_an_input_that_is_not_a_page_abstains_instead_of_claiming_no_match(
+        self, page_url: str, logged_identity: str
+    ) -> None:
+        policy = RequestPolicy()
+        with capture_logs() as logs:
+            record, load_mock = await _resolve_live_page(
+                policy,
+                page_url=page_url,
+                org_credentials=[_cred("analytics", "cred_analytics", _SAVED_LOGIN_URL)],
+            )
+
+        emitted = [entry for entry in logs if entry["event"] == "copilot credential live-page admission"]
+        assert record.verdict == "abstain"
+        assert [(entry["seam"], entry["outcome"]) for entry in emitted] == [("page_observation", "abstain")]
+        assert emitted[0]["page_url"] == logged_identity
+        assert policy.resolved_credentials == []
+        assert policy.live_page_resolution is None
+        load_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_card_credential_never_binds_as_a_login(self) -> None:
+        policy = RequestPolicy()
+        record, _ = await _resolve_live_page(
+            policy,
+            page_url=_LIVE_LOGIN_URL,
+            org_credentials=[_cred("card", "cred_card", _SAVED_LOGIN_URL, CredentialType.CREDIT_CARD)],
+        )
+
+        assert record.verdict == "no_match"
+        assert policy.resolved_credentials == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            RequestPolicy(raw_secret_detected=True),
+            RequestPolicy(allow_run_blocks=False),
+            RequestPolicy(email_signin_intent=True, login_intent=True),
+        ],
+    )
+    async def test_a_turn_without_run_authority_never_reads_credentials(self, policy: RequestPolicy) -> None:
+        record, load_mock = await _resolve_live_page(
+            policy,
+            page_url=_LIVE_LOGIN_URL,
+            org_credentials=[_cred("analytics", "cred_analytics", _SAVED_LOGIN_URL)],
+        )
+
+        assert record.verdict == "declined"
+        assert policy.resolved_credentials == []
+        assert policy.live_page_admitted_urls == {}
+        load_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_admission_fingerprint_fires_once_per_page(self) -> None:
+        policy = RequestPolicy()
+        org_credentials = [_cred("analytics", "cred_analytics", _SAVED_LOGIN_URL)]
+        with capture_logs() as logs:
+            await _resolve_live_page(policy, page_url=_LIVE_LOGIN_URL, org_credentials=org_credentials)
+            await _resolve_live_page(policy, page_url=_LIVE_LOGIN_URL, org_credentials=org_credentials)
+            await _resolve_live_page(
+                policy, page_url="https://other.example.com/login", org_credentials=org_credentials
+            )
+
+        emitted = [entry for entry in logs if entry["event"] == "copilot credential live-page admission"]
+        assert [entry["seam"] for entry in emitted] == ["page_observation", "page_observation"]
+        assert emitted[0]["outcome"] == "admitted"
+        assert emitted[0]["tier"] == "url_path"
+
+    @pytest.mark.asyncio
+    async def test_a_passwordless_email_turn_declines_under_the_observation_seam(self) -> None:
+        policy = RequestPolicy(email_signin_intent=True, login_intent=True)
+        with capture_logs() as logs:
+            record, _ = await _resolve_live_page(
+                policy,
+                page_url=_LIVE_LOGIN_URL,
+                org_credentials=[_cred("analytics", "cred_analytics", _SAVED_LOGIN_URL)],
+            )
+
+        emitted = [entry for entry in logs if entry["event"] == "copilot credential live-page admission"]
+        assert record.verdict == "declined"
+        # Both lines emit: the guard keys on outcome, so a decline cannot consume the token a later
+        # grant on the same URL needs.
+        assert [(entry["seam"], entry["outcome"]) for entry in emitted] == [
+            ("page_observation", "passwordless_declined"),
+            ("page_observation", "declined"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_later_unmatched_page_does_not_erase_the_login_pages_answer(self) -> None:
+        policy = RequestPolicy()
+        ambiguous_credentials = [
+            _cred("analytics one", "cred_one", _SAVED_LOGIN_URL),
+            _cred("analytics two", "cred_two", _SAVED_LOGIN_URL),
+        ]
+        await _resolve_live_page(policy, page_url=_LIVE_LOGIN_URL, org_credentials=ambiguous_credentials)
+        await _resolve_live_page(
+            policy, page_url="https://help.example.com/docs", org_credentials=ambiguous_credentials
+        )
+
+        assert policy.live_page_resolution is not None
+        assert policy.live_page_resolution.verdict == "ambiguous"
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["website_stored_credential", "credential_name"])
@@ -3032,7 +3393,9 @@ async def test_a_live_page_admission_does_not_carry_to_the_next_turn() -> None:
         page_url=_LIVE_LOGIN_URL,
         org_credentials=[_cred("analytics", "cred_analytics", _SAVED_LOGIN_URL)],
     )
-    carried_context = record_approved_credentials_in_global_llm_context(SimpleNamespace(request_policy=policy), None)
+    carried_context = record_approved_credentials_in_global_llm_context(
+        SimpleNamespace(request_policy=policy, credential_pause_connected_credential_id=None), None
+    )
 
     next_turn = RequestPolicy()
     with patch(
@@ -3165,3 +3528,40 @@ async def test_basic_auth_in_a_login_url_never_reaches_the_admission_log() -> No
     assert "hunter2" not in logged
     assert "admin:" not in logged
     assert "code=abc" not in logged
+
+
+class TestGroundLoginTargetUrls:
+    """The half that enforces "the user wrote it" — the whole basis of the release-origin claim."""
+
+    @staticmethod
+    def _ground(login_page_urls: list[str], user_message: str) -> list[str]:
+        policy = RequestPolicy(login_page_urls=login_page_urls)
+        _ground_login_target_urls(policy, user_message)
+        return policy.grounded_login_target_urls
+
+    def test_a_url_only_the_classifier_named_is_dropped(self) -> None:
+        assert self._ground(["https://portal.example/login"], "log in with my saved credential") == []
+
+    def test_a_url_written_in_this_message_survives(self) -> None:
+        assert self._ground(
+            ["https://portal.example/login"],
+            "sign in at https://portal.example/login with my saved credential",
+        ) == ["https://portal.example/login"]
+
+    def test_another_path_on_the_same_written_origin_survives(self) -> None:
+        assert self._ground(
+            ["https://portal.example/login"],
+            "read https://portal.example/reports/2026 for me",
+        ) == ["https://portal.example/login"]
+
+    def test_a_second_written_origin_is_kept_so_the_fill_seam_can_refuse_both(self) -> None:
+        grounded = self._ground(
+            ["https://portal.example/login", "https://tracker.example/login"],
+            "sign in at https://portal.example/login then file it at https://tracker.example/login",
+        )
+        assert len(grounded) == 2
+
+    def test_an_origin_written_only_in_an_earlier_turn_is_dropped(self) -> None:
+        # Grounding reads the message asking for the fill, never the conversation: a link pasted in an
+        # earlier turn for another purpose must not license that origin for a later credential request.
+        assert self._ground(["https://evil.example/login"], "sign in with my bank credential") == []

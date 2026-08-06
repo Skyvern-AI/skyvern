@@ -13,7 +13,6 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.custom_llms import (
-    CUSTOM_LLM_API_KEY_MASK,
     CustomLLM,
     CustomLLMConfig,
     CustomLLMCreateRequest,
@@ -21,6 +20,7 @@ from skyvern.forge.sdk.schemas.custom_llms import (
     CustomLLMProvider,
     CustomLLMResponse,
     CustomLLMUpdateRequest,
+    config_with_preserved_secrets,
     custom_llm_from_org_auth_token,
     custom_llm_response_from_org_auth_token,
 )
@@ -57,18 +57,6 @@ async def _get_custom_llm(
     raise NotFoundError("Custom LLM not found")
 
 
-def _config_with_preserved_api_key(config: CustomLLMConfig, existing_custom_llm: CustomLLM) -> CustomLLMConfig:
-    if config.api_key != CUSTOM_LLM_API_KEY_MASK:
-        return config
-
-    return CustomLLMConfig.model_validate(
-        {
-            **config.model_dump(),
-            "api_key": existing_custom_llm.config.api_key,
-        }
-    )
-
-
 @base_router.get(
     "/custom-llms",
     response_model=CustomLLMListResponse,
@@ -83,7 +71,7 @@ def _config_with_preserved_api_key(config: CustomLLMConfig, existing_custom_llm:
     include_in_schema=False,
 )
 async def list_custom_llms(
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CustomLLMListResponse:
     tokens = await app.DATABASE.organizations.get_valid_org_auth_tokens(
         organization_id=current_org.organization_id,
@@ -120,7 +108,7 @@ async def list_custom_llms(
 )
 async def create_custom_llm(
     request: CustomLLMCreateRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CustomLLMResponse:
     await _validate_custom_llm_api_base(request.config)
     token = await app.DATABASE.organizations.create_org_auth_token(
@@ -149,11 +137,11 @@ async def create_custom_llm(
 async def update_custom_llm(
     request: CustomLLMUpdateRequest,
     custom_llm_id: str = Path(..., description="The custom LLM id."),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CustomLLMResponse:
     try:
         existing_custom_llm = await _get_custom_llm(current_org.organization_id, custom_llm_id)
-        config = _config_with_preserved_api_key(request.config, existing_custom_llm)
+        config = config_with_preserved_secrets(request.config, existing_custom_llm.config)
         await _validate_custom_llm_api_base(config)
         token = await app.DATABASE.organizations.update_org_auth_token(
             organization_id=current_org.organization_id,
@@ -184,7 +172,7 @@ async def update_custom_llm(
 )
 async def delete_custom_llm(
     custom_llm_id: str = Path(..., description="The custom LLM id."),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> ClearOrganizationAuthTokenResponse:
     try:
         await app.DATABASE.organizations.invalidate_org_auth_token(

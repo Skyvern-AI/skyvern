@@ -26,8 +26,9 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
 from skyvern.forge.sdk.copilot.enforcement import (
+    current_page_challenge_advisory_signal,
+    one_time_code_fill_supersedes_challenge,
     synthesized_block_persistence_signal,
-    terminal_challenge_blocker_signal_from_current_page_evidence,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import (
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
@@ -64,12 +65,15 @@ from ._shared import (
 
 LOG = structlog.get_logger()
 
-_CURRENT_PAGE_TERMINAL_CHALLENGE_TOOLS = (
+_CURRENT_PAGE_CHALLENGE_ADVISORY_TOOLS = (
     BLOCK_RUNNING_TOOLS
     | PAGE_INSPECTION_TOOLS
     | frozenset({"click", "navigate_browser", "press_key", "scroll", "select_option", "type_text"})
 )
 _OUTPUT_CONTRACT_LADDER_AUTHORING_TOOLS = frozenset({"update_workflow", "update_and_run_blocks"})
+_INFRASTRUCTURE_TOOL_ERROR_BLOCKED_TOOLS = BLOCK_RUNNING_TOOLS | frozenset(
+    {"update_workflow", "edit_block", "delete_block"}
+)
 
 
 async def _safe_read_workflow_run(
@@ -664,6 +668,8 @@ def _post_budget_terminal_challenge_signal(
     reason = _post_run_terminal_challenge_reason(evidence)
     if not reason:
         return None
+    if one_time_code_fill_supersedes_challenge(ctx, evidence):
+        return None
 
     # Same-packet adjudication: when the observed page also carries result
     # evidence, the answer-from-observed-page path outranks a terminal claim.
@@ -722,14 +728,10 @@ def _post_budget_terminal_challenge_signal(
     return _terminal_challenge_signal(reason=reason, arguments=arguments, tool_name=tool_name)
 
 
-def _current_page_terminal_challenge_signal(
+def _current_page_challenge_advisory(
     ctx: AgentContext, arguments: dict[str, Any] | None, tool_name: str
 ) -> CopilotToolBlockerSignal | None:
-    signal = terminal_challenge_blocker_signal_from_current_page_evidence(
-        ctx,
-        blocked_tool=tool_name,
-        evidence_source="page_evidence",
-    )
+    signal = current_page_challenge_advisory_signal(ctx, blocked_tool=tool_name)
     if signal is None:
         return None
     requested_labels = _requested_block_label_set(arguments)
@@ -1366,6 +1368,9 @@ def _challenge_gated_anti_bot_rerun_signal(
 ) -> CopilotToolBlockerSignal | None:
     if not _last_run_has_terminal_anti_bot_blocker(ctx):
         return None
+    evidence = getattr(ctx, "composition_page_evidence", None)
+    if isinstance(evidence, dict) and one_time_code_fill_supersedes_challenge(ctx, evidence):
+        return None
     if tool_name == "update_and_run_blocks" and _challenge_gated_proxy_retry_allowed(ctx, arguments):
         return None
 
@@ -1408,9 +1413,11 @@ LOOP_PLANE_REFUSAL_REASON_CODES: frozenset[str] = frozenset(
         "code_authoring_guardrail_churn",
         "credential_priority_authoring_churn",
         "tool_error_terminal_challenge_blocker",
+        "tool_error_current_page_challenge_advisory",
         "tool_error_synthesized_block_persistence_required",
         "tool_error_challenge_gated_submit_disabled",
         "tool_error_non_retriable_nav",
+        "tool_error_infrastructure_unavailable",
         "tool_error_pending_reconciliation_no_input",
         "tool_error_pending_reconciliation_requires_input",
         "tool_error_per_tool_budget_rerun",
@@ -1436,10 +1443,41 @@ def _emit_loop_plane_refusal(ctx: AgentContext, signal: CopilotToolBlockerSignal
 
 def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any] | None = None) -> str | None:
     refresh_held_loop_blocker_evidence(ctx)
-    if tool_name in _CURRENT_PAGE_TERMINAL_CHALLENGE_TOOLS:
-        current_page_challenge_signal = _current_page_terminal_challenge_signal(ctx, arguments, tool_name)
-        if current_page_challenge_signal is not None:
-            return _emit_loop_plane_refusal(ctx, current_page_challenge_signal)
+    if tool_name in _CURRENT_PAGE_CHALLENGE_ADVISORY_TOOLS:
+        challenge_advisory = _current_page_challenge_advisory(ctx, arguments, tool_name)
+        if challenge_advisory is not None:
+            return _emit_loop_plane_refusal(ctx, challenge_advisory)
+
+    # The diagnosis contract's STOP only runs BETWEEN agent turns, so without this entrypoint
+    # check the model can re-author around an unreachable sandbox before the nudge ever fires.
+    infrastructure_error = getattr(ctx, "last_infrastructure_tool_error", None)
+    if (
+        tool_name in _INFRASTRUCTURE_TOOL_ERROR_BLOCKED_TOOLS
+        and isinstance(infrastructure_error, str)
+        and infrastructure_error
+    ):
+        return _emit_loop_plane_refusal(
+            ctx,
+            CopilotToolBlockerSignal(
+                blocker_kind="tool_error",
+                agent_steering_text=(
+                    f"The last run failed because the code sandbox was unreachable ({infrastructure_error[:200]}). "
+                    "The user's code is not at fault. Do NOT edit, delete, or re-run any block — reply to the "
+                    "user explaining that the code sandbox is unavailable and asking them to retry shortly."
+                ),
+                user_facing_reason=(
+                    "The code sandbox is unavailable right now, so I couldn't test your code block. "
+                    "Your code is unchanged — please try again in a few minutes."
+                ),
+                recovery_hint="ask_user_clarifying",
+                cleared_by_tools=frozenset(),
+                # The reply promises the user's code is unchanged, so the unpersisted draft
+                # has to survive the turn that says so.
+                preserves_workflow_draft=True,
+                internal_reason_code="tool_error_infrastructure_unavailable",
+                blocked_tool=tool_name,
+            ),
+        )
 
     persistence_signal = synthesized_block_persistence_signal(ctx, tool_name, arguments)
     if persistence_signal is not None:

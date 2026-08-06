@@ -49,7 +49,7 @@ def _ti(mode: TurnIntentMode) -> TurnIntent:
     [
         # Explicitly-non-build modes return the COMPOSING sentinel.
         (TurnIntentMode.EDIT, "no url", "no url", "", BuildPhase.COMPOSING),
-        (TurnIntentMode.DOCS_ANSWER, "what is a workflow?", "what is a workflow?", "", BuildPhase.COMPOSING),
+        (TurnIntentMode.ANSWER, "what is a workflow?", "what is a workflow?", "", BuildPhase.COMPOSING),
         (TurnIntentMode.DIAGNOSE, "the run failed", "the run failed", "", BuildPhase.COMPOSING),
         (TurnIntentMode.CLARIFY, "anything", "anything", "", BuildPhase.COMPOSING),
         (TurnIntentMode.REFUSE, "anything", "anything", "", BuildPhase.COMPOSING),

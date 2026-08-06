@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern.cli.core import browser_ops
 from skyvern.cli.core.browser_ops import do_act, do_extract, do_navigate, do_screenshot, parse_extract_schema
 from skyvern.cli.core.guards import (
     GuardError,
@@ -19,6 +21,11 @@ from skyvern.cli.core.session_ops import do_session_close, do_session_create, do
 from skyvern.client.types.extensions import Extensions
 
 CAPTCHA_SOLVER_EXTENSION: Extensions = "captcha-solver"
+LOCALHOST_RECOVERY_HINT = (
+    "Run `pip install skyvern && skyvern browser serve --tunnel` to bridge "
+    "your local dev server to a cloud browser via ngrok. "
+    "Or use `local=true` in skyvern_browser_session_create for a local browser."
+)
 
 # ---------------------------------------------------------------------------
 # guards.py
@@ -96,11 +103,12 @@ def test_resolve_ai_mode(selector: str | None, intent: str | None, expected: tup
 
 
 @pytest.mark.asyncio
-async def test_do_navigate_success() -> None:
+async def test_do_navigate_success(monkeypatch: pytest.MonkeyPatch) -> None:
     page = MagicMock()
     page.goto = AsyncMock()
     page.url = "https://example.com/final"
     page.title = AsyncMock(return_value="Example")
+    monkeypatch.setattr(browser_ops, "validate_fetch_url", lambda url: url)
 
     result = await do_navigate(page, "https://example.com")
     assert result.url == "https://example.com/final"
@@ -108,15 +116,79 @@ async def test_do_navigate_success() -> None:
 
 
 @pytest.mark.asyncio
-async def test_do_navigate_passes_wait_until_through() -> None:
+async def test_do_navigate_passes_wait_until_through(monkeypatch: pytest.MonkeyPatch) -> None:
     page = MagicMock()
     page.goto = AsyncMock()
     page.url = "https://example.com/final"
     page.title = AsyncMock(return_value="Example")
+    monkeypatch.setattr(browser_ops, "validate_fetch_url", lambda url: url)
 
     result = await do_navigate(page, "https://example.com", wait_until="badvalue")
     assert result.url == "https://example.com/final"
     page.goto.assert_awaited_once_with("https://example.com", timeout=30000, wait_until="badvalue")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param("http://169.254.169.254/", id="metadata"),
+        pytest.param("http://10.20.30.40/", id="private"),
+        pytest.param("http://127.0.0.2/", id="alternate-loopback"),
+        pytest.param("http://2130706433/", id="integer-loopback"),
+    ],
+)
+async def test_do_navigate_rejects_unsafe_url(url: str) -> None:
+    page = MagicMock()
+    page.goto = AsyncMock()
+
+    with pytest.raises(GuardError):
+        await do_navigate(page, url)
+
+    page.goto.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", ["http://localhost:3000/", "http://127.0.0.1:8000/"])
+async def test_do_navigate_allows_local_url_when_context_permits(url: str) -> None:
+    page = MagicMock()
+    page.goto = AsyncMock()
+    page.url = url
+    page.title = AsyncMock(return_value="Local")
+
+    result = await do_navigate(
+        page,
+        url,
+        can_access_localhost=True,
+        is_localhost_destination=True,
+    )
+
+    assert result.url == url
+    page.goto.assert_awaited_once_with(url, timeout=30000, wait_until=None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", ["http://169.254.169.254/", "http://10.20.30.40/"])
+async def test_do_navigate_rejects_non_loopback_internal_url_when_context_permits(url: str) -> None:
+    page = MagicMock()
+    page.goto = AsyncMock()
+
+    with pytest.raises(GuardError):
+        await do_navigate(page, url, can_access_localhost=True)
+
+    page.goto.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_do_navigate_rejects_local_url_when_context_does_not_permit() -> None:
+    page = MagicMock()
+    page.goto = AsyncMock()
+
+    with pytest.raises(GuardError) as exc_info:
+        await do_navigate(page, "http://127.0.0.1:8000/", is_localhost_destination=True)
+
+    assert exc_info.value.hint == LOCALHOST_RECOVERY_HINT
+    page.goto.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -353,7 +425,9 @@ async def test_do_session_list() -> None:
     session = MagicMock()
     session.browser_session_id = "pbs_1"
     session.status = "active"
-    session.started_at = None
+    # Set together with the address by the session worker; an address alone can be minted before
+    # the browser exists, so availability needs both.
+    session.started_at = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
     session.timeout = 60
     session.runnable_id = None
     session.browser_address = "ws://localhost:1234"

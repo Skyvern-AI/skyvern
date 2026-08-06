@@ -213,6 +213,79 @@ async def get_current_org_with_api_key(
     return await get_current_org_cached(x_api_key, app.DATABASE)
 
 
+def credential_route_token_types() -> tuple[OrganizationAuthTokenType, ...]:
+    token_types: tuple[OrganizationAuthTokenType, ...] = (OrganizationAuthTokenType.api,)
+    if app.AGENT_FUNCTION.credential_routes_accept_ui_session():
+        token_types += (OrganizationAuthTokenType.ui_session,)
+    return token_types
+
+
+async def _get_current_org_for_token_types(
+    x_api_key: str | None,
+    authorization: str | None,
+    token_types: Sequence[OrganizationAuthTokenType],
+) -> Organization:
+    if authorization:
+        try:
+            return await authenticate_helper(authorization)
+        except HTTPException:
+            if not x_api_key:
+                raise
+    if not x_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid credentials",
+        )
+    validation = await resolve_org_from_api_key(
+        x_api_key,
+        app.DATABASE,
+        token_types=token_types,
+    )
+    apply_request_org_context(validation.organization)
+    return validation.organization
+
+
+async def get_current_org_for_credential_routes(
+    # Header declaration must match get_current_org exactly: these dependencies are swapped on
+    # published routes, and any difference rewrites the committed OpenAPI document.
+    x_api_key: Annotated[
+        str | None,
+        Header(
+            description="Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+        ),
+    ] = None,
+    authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
+) -> Organization:
+    """Credential-bearing routes: a full API token or an interactive session in cloud.
+
+    Prefers ``authorization`` — unlike get_current_org, which prefers x-api-key — because the
+    cloud dashboard sends both and its x-api-key is the ui_session token being excluded there.
+    """
+    return await _get_current_org_for_token_types(
+        x_api_key,
+        authorization,
+        credential_route_token_types(),
+    )
+
+
+async def get_current_org_with_api_token(
+    organization_id: str,
+    x_api_key: Annotated[str | None, Header()] = None,
+    authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
+) -> Organization:
+    current_org = await _get_current_org_for_token_types(
+        x_api_key,
+        authorization,
+        (OrganizationAuthTokenType.api,),
+    )
+    if organization_id != current_org.organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to access this organization",
+        )
+    return current_org
+
+
 async def get_current_org_with_authentication(
     authorization: Annotated[str | None, Header()] = None,
 ) -> Organization:
@@ -342,6 +415,37 @@ async def authenticate_user_helper(authorization: str) -> str:
     return user_id
 
 
+def _validate_token_expiry(token_payload: TokenPayload) -> None:
+    if token_payload.exp <= time.time():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Auth token is expired",
+        )
+
+
+def _decode_token_before_cache(x_api_key: str) -> dict[str, object] | None:
+    try:
+        return jwt.decode(
+            x_api_key,
+            settings.SECRET_KEY,
+            algorithms=[ALGORITHM],
+            options={"verify_exp": False},
+        )
+    except PyJWTError:
+        return None
+
+
+def _validate_token_expiry_before_cache(payload: dict[str, object] | None) -> None:
+    if payload is None:
+        return
+    try:
+        token_payload = TokenPayload(**payload)
+    except ValidationError:
+        return
+
+    _validate_token_expiry(token_payload)
+
+
 async def resolve_org_from_api_key(
     x_api_key: str,
     db: AgentDB,
@@ -380,15 +484,9 @@ async def resolve_org_from_api_key(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Could not validate credentials",
         )
-    if api_key_data.exp < time.time():
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Auth token is expired",
-        )
-
     organization = await db.organizations.get_organization(organization_id=api_key_data.sub)
     if not organization:
-        LOG.warning("Organization not found", organization_id=api_key_data.sub, **payload)
+        LOG.warning("Organization not found", organization_id=api_key_data.sub)
         raise HTTPException(status_code=404, detail="Organization not found")
 
     api_key_db_obj: OrganizationAuthToken | None = None
@@ -409,7 +507,22 @@ async def resolve_org_from_api_key(
             detail="Invalid credentials",
         )
 
+    if (
+        api_key_db_obj.token_type == OrganizationAuthTokenType.ui_session
+        and payload.get("token_type") != OrganizationAuthTokenType.ui_session.value
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid credentials",
+        )
+    _validate_token_expiry(api_key_data)
+
     if api_key_db_obj.valid is False:
+        if api_key_db_obj.token_type == OrganizationAuthTokenType.ui_session:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invalid credentials",
+            )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Your API key has expired. Please retrieve the latest one from https://app.skyvern.com/settings",
@@ -426,9 +539,16 @@ _current_org_cache: TTLCache = TTLCache(maxsize=CACHE_SIZE, ttl=AUTHENTICATION_T
 
 
 @cached(cache=_current_org_cache)
-async def get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
+async def _get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
     """Authentication is cached for one hour."""
-    validation = await resolve_org_from_api_key(x_api_key, db)
+    validation = await resolve_org_from_api_key(
+        x_api_key,
+        db,
+        token_types=(
+            OrganizationAuthTokenType.api,
+            OrganizationAuthTokenType.ui_session,
+        ),
+    )
 
     # set organization_id in skyvern context and log context
     context = skyvern_context.current()
@@ -436,6 +556,27 @@ async def get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
         context.organization_id = validation.organization.organization_id
         context.organization_name = validation.organization.organization_name
     return validation.organization
+
+
+def _claims_ui_session(payload: dict[str, object] | None) -> bool:
+    return payload is not None and payload.get("token_type") == OrganizationAuthTokenType.ui_session.value
+
+
+async def get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
+    payload = _decode_token_before_cache(x_api_key)
+    _validate_token_expiry_before_cache(payload)
+    if _claims_ui_session(payload):
+        validation = await resolve_org_from_api_key(
+            x_api_key,
+            db,
+            token_types=(OrganizationAuthTokenType.ui_session,),
+        )
+        context = skyvern_context.current()
+        if context:
+            context.organization_id = validation.organization.organization_id
+            context.organization_name = validation.organization.organization_name
+        return validation.organization
+    return await _get_current_org_cached(x_api_key, db)
 
 
 def invalidate_cached_org(organization_id: str) -> None:

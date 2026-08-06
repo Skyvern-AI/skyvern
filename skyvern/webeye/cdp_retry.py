@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import TYPE_CHECKING, cast
+from urllib.parse import urlparse
 
 import structlog
 from playwright._impl._errors import Error as PWError
@@ -9,13 +10,16 @@ from playwright._impl._errors import TargetClosedError as PWTargetClosedError
 from playwright._impl._errors import TimeoutError as PWTimeoutError
 from playwright.async_api import Browser, Playwright
 
+import skyvern.exceptions as skyvern_exceptions
 from skyvern.config import settings
+from skyvern.exceptions import BlockedHost
+from skyvern.utils.url_validators import is_allowed_local_browser_host, resolve_fetch_host_ips, validate_browser_host
 from skyvern.webeye.browser_errors import (
     BrowserCdpConnectionError,
     BrowserTargetClosedError,
     BrowserTimeoutError,
 )
-from skyvern.webeye.cdp_connection import strip_browser_address_discriminator
+from skyvern.webeye.cdp_connection import redact_cdp_url, strip_browser_address_discriminator
 
 if TYPE_CHECKING:
     from skyvern.webeye.browser_engine import BrowserEngineSelection
@@ -34,6 +38,9 @@ _CDP_CONNECTION_ERROR_SUBSTR_FALLBACK = (
 # selected: they are raised beneath every driver, so no engine's native error families own them. Kept
 # as the shared floor under both the selection-aware and stock paths so migrating classification to a
 # selected engine never drops the cross-engine transport signal.
+# These three subclasses, never `OSError` itself: this predicate also gates cloud quarantine, and
+# `OSError` covers permanent local failures (missing or unexecutable browser binary, EACCES, EMFILE)
+# where retrying cannot succeed and pulling the address from the pool is wrong.
 _CDP_CONNECTION_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
     ConnectionRefusedError,
     ConnectionResetError,
@@ -45,12 +52,23 @@ def _has_transport_substring(exc: BaseException) -> bool:
     return any(s in str(exc).lower() for s in _CDP_CONNECTION_ERROR_SUBSTR_FALLBACK)
 
 
+def _is_unresolvable_host(exc: Exception) -> bool:
+    # Deliberate forward-compat, not dead code: UnresolvableHost exists on neither this branch nor
+    # main. #14201 introduces it and makes resolve_fetch_host_ips raise it instead of BlockedHost, so
+    # the exact type(exc) is BlockedHost check below is what carries this until that sibling lands.
+    unresolvable_host_type = cast(type[BlockedHost] | None, getattr(skyvern_exceptions, "UnresolvableHost", None))
+    if unresolvable_host_type is not None and isinstance(exc, unresolvable_host_type):
+        return True
+    return type(exc) is BlockedHost and isinstance(exc.__context__, (OSError, UnicodeError))
+
+
 def is_cdp_connection_error(exc: Exception, selection: BrowserEngineSelection | None = None) -> bool:
     """Decide whether a failed CDP connect/attach is a retryable connection error.
 
-    With no ``selection`` (no engine authority at this call site) classification uses stock
-    Playwright's error identities exactly as before, so the default path is byte-for-byte unchanged.
-    With a ``selection`` the retry decision keys off THAT run's selected-engine error families
+    Engine-neutral CDP errors normalized by a lower boundary are recognized with or without a
+    ``selection``. With no ``selection`` (no engine authority at this call site), native error
+    classification uses stock Playwright's identities. With a ``selection`` the retry decision keys off THAT run's
+    selected-engine error families
     (retryable-CDP / CDP-connection / target-closed / timeout) via the engine-neutral classifier, so a
     non-stock engine's native classes are recognized instead of stock Playwright's — and a foreign
     error (one this engine never raises) is not classified, so it falls through to ``False`` and the
@@ -60,6 +78,8 @@ def is_cdp_connection_error(exc: Exception, selection: BrowserEngineSelection | 
     coincidentally-matching message never does). This is a retry predicate only; it never wraps or
     normalizes ``exc`` — the native exception the caller re-raises stays intact.
     """
+    if isinstance(exc, BrowserCdpConnectionError):
+        return True
     if isinstance(exc, _CDP_CONNECTION_TRANSPORT_ERRORS):
         return True
     if selection is not None:
@@ -98,18 +118,35 @@ def _resolve_retry_budget() -> tuple[int, tuple[float, ...]]:
     return attempts, backoff
 
 
+async def _validate_browser_address_host(browser_address: str) -> None:
+    host = urlparse(browser_address).hostname
+    if not host:
+        return
+    await asyncio.to_thread(validate_browser_host, host, resolve_dns=False)
+    if not is_allowed_local_browser_host(host):
+        await asyncio.to_thread(resolve_fetch_host_ips, host)
+
+
 async def connect_over_cdp_with_retry(
     playwright: Playwright,
     browser_address: str,
     headers: dict[str, str] | None = None,
     log_browser_address: str | None = None,
     selection: BrowserEngineSelection | None = None,
+    validate_browser_address: bool = True,
+    retry: bool = True,
 ) -> Browser:
     browser_address = strip_browser_address_discriminator(browser_address)
-    browser_address_for_logs = log_browser_address or browser_address
+    browser_address_for_logs = log_browser_address or redact_cdp_url(browser_address)
     max_attempts, backoff_schedule = _resolve_retry_budget()
+    if not retry:
+        max_attempts = 1
+    address_validated = not validate_browser_address
     for attempt in range(1, max_attempts + 1):
         try:
+            if not address_validated:
+                await _validate_browser_address_host(browser_address)
+                address_validated = True
             browser = await playwright.chromium.connect_over_cdp(browser_address, headers=headers)
             if attempt > 1:
                 LOG.info(
@@ -119,13 +156,15 @@ async def connect_over_cdp_with_retry(
                 )
             return browser
         except Exception as e:
-            if not is_cdp_connection_error(e, selection) or attempt == max_attempts:
-                # When the caller passed log_browser_address as a safe label, the raw
-                # browser_address may carry session tokens in path/query — Playwright's
-                # exception text would otherwise expose them. Re-raise a RuntimeError
-                # with only the safe label + error class name.
+            is_resolution_error = _is_unresolvable_host(e)
+            if isinstance(e, BlockedHost) and not is_resolution_error:
+                raise
+            is_cdp_error = is_cdp_connection_error(e, selection)
+            is_retryable_error = is_resolution_error or is_cdp_error
+            if not is_retryable_error or attempt == max_attempts:
                 if log_browser_address is not None:
-                    raise RuntimeError(f"CDP connection to {log_browser_address} failed ({type(e).__name__})") from None
+                    error_type = BrowserCdpConnectionError if is_retryable_error else RuntimeError
+                    raise error_type(f"CDP connection to {log_browser_address} failed ({type(e).__name__})") from None
                 raise
             backoff = backoff_schedule[attempt - 1] if attempt - 1 < len(backoff_schedule) else backoff_schedule[-1]
             LOG.warning(

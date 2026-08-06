@@ -124,6 +124,7 @@ from skyvern.forge.sdk.services.credentials import (
     normalize_totp_config,
     parse_totp_config,
 )
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
@@ -445,7 +446,7 @@ async def fetch_credential_item_background(item_id: str) -> None:
 )
 async def send_totp_code(
     data: TOTPCodeCreate,
-    curr_org: Organization = Depends(org_auth_service.get_current_org),
+    curr_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> TOTPCode:
     totp_identifier = normalize_identifier_if_email(data.totp_identifier)
     redacted_totp_identifier = redact_otp_identifier_for_log(data.totp_identifier)
@@ -567,7 +568,7 @@ async def send_totp_code(
     include_in_schema=False,
 )
 async def get_totp_codes(
-    curr_org: Organization = Depends(org_auth_service.get_current_org),
+    curr_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
     totp_identifier: str | None = Query(
         None,
         description="Filter by TOTP identifier such as an email or phone number.",
@@ -691,7 +692,7 @@ async def create_credential(
         ],
         openapi_extra={"x-fern-sdk-parameter-name": "data"},
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialResponse:
     if isinstance(data.credential, NonEmptyPasswordCredential):
         await _normalize_authenticator_totp_for_organization_or_raise(
@@ -857,7 +858,7 @@ async def rename_credential(
         ...,
         description="The credential fields to update",
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialResponse:
     credential = await app.DATABASE.credentials.get_credential(
         credential_id=credential_id, organization_id=current_org.organization_id
@@ -942,7 +943,7 @@ async def test_login(
         ...,
         description="The login credentials and URL to test",
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TestLoginResponse:
     """Test a login with inline credentials without requiring a saved credential."""
@@ -1154,7 +1155,7 @@ async def test_credential(
         ...,
         description="Test configuration including the login URL",
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TestCredentialResponse:
     organization_id = current_org.organization_id
@@ -1385,7 +1386,7 @@ async def get_test_credential_status(
         description="The workflow run ID from the test initiation",
         examples=["wr_1234567890"],
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> TestCredentialStatusResponse:
     organization_id = current_org.organization_id
 
@@ -1496,7 +1497,7 @@ async def cancel_credential_test(
         description="The workflow run ID to cancel",
         examples=["wr_1234567890"],
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CancelTestResponse:
     organization_id = current_org.organization_id
 
@@ -1897,7 +1898,7 @@ async def update_credential(
         ],
         openapi_extra={"x-fern-sdk-parameter-name": "data"},
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialResponse:
     existing_credential = await app.DATABASE.credentials.get_credential(
         credential_id=credential_id, organization_id=current_org.organization_id
@@ -2056,7 +2057,7 @@ async def delete_credential(
         examples=["cred_1234567890"],
         openapi_extra={"x-fern-sdk-parameter-name": "credential_id"},
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> None:
     credential = await app.DATABASE.credentials.get_credential(
         credential_id=credential_id, organization_id=current_org.organization_id
@@ -2204,7 +2205,7 @@ async def get_credential_totp_code(
         description="The unique identifier of the credential",
         examples=["cred_1234567890"],
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialTotpCodeResponse:
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
@@ -2309,7 +2310,7 @@ async def get_credential(
         examples=["cred_1234567890"],
         openapi_extra={"x-fern-sdk-parameter-name": "credential_id"},
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialResponse:
     """Return non-sensitive metadata for a single credential.
 
@@ -2353,7 +2354,7 @@ async def get_credential(
     include_in_schema=False,
 )
 async def get_credentials(
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
     page: int = Query(
         1,
         ge=1,
@@ -2433,7 +2434,7 @@ def _to_credential_folder_response(folder: CredentialFolderModel, credential_cou
 @base_router.post("/credential_folders/", response_model=CredentialFolder, include_in_schema=False)
 async def create_credential_folder(
     data: CredentialFolderCreate = Body(..., description="The credential folder to create"),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialFolder:
     folder = await app.DATABASE.credential_folders.create_credential_folder(
         organization_id=current_org.organization_id,
@@ -2459,7 +2460,7 @@ async def create_credential_folder(
 @base_router.get("/credential_folders/{folder_id}/", response_model=CredentialFolder, include_in_schema=False)
 async def get_credential_folder(
     folder_id: str = Path(..., description="Credential folder ID", examples=["cfld_123"]),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialFolder:
     folder = await app.DATABASE.credential_folders.get_credential_folder(
         folder_id=folder_id,
@@ -2492,7 +2493,7 @@ async def get_credential_folders(
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(100, ge=1, le=500, description="Number of folders per page"),
     search: str | None = Query(None, description="Search folders by title or description"),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> list[CredentialFolder]:
     folders = await app.DATABASE.credential_folders.get_credential_folders(
         organization_id=current_org.organization_id,
@@ -2530,7 +2531,7 @@ async def get_credential_folders(
 async def update_credential_folder(
     folder_id: str = Path(..., description="Credential folder ID", examples=["cfld_123"]),
     data: CredentialFolderUpdate = Body(...),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialFolder:
     folder = await app.DATABASE.credential_folders.update_credential_folder(
         folder_id=folder_id,
@@ -2563,7 +2564,7 @@ async def update_credential_folder(
 @base_router.delete("/credential_folders/{folder_id}/", include_in_schema=False)
 async def delete_credential_folder(
     folder_id: str = Path(..., description="Credential folder ID", examples=["cfld_123"]),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> dict:
     success = await app.DATABASE.credential_folders.soft_delete_credential_folder(
         folder_id=folder_id,
@@ -2593,7 +2594,7 @@ async def delete_credential_folder(
 async def update_credential_folder_assignment(
     credential_id: str = Path(..., description="The ID of the credential.", examples=["cred_1234567890"]),
     data: UpdateCredentialFolderRequest = Body(...),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialResponse:
     try:
         credential = await app.DATABASE.credential_folders.set_credential_folder(
@@ -2623,7 +2624,7 @@ async def update_credential_folder_assignment(
     include_in_schema=False,
 )
 async def get_onepassword_token(
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CreateOnePasswordTokenResponse:
     """
     Get the current OnePassword service account token for the organization.
@@ -2669,7 +2670,7 @@ async def get_onepassword_token(
     include_in_schema=False,
 )
 async def list_onepassword_items(
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> OnePasswordItemsResponse:
     org_auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
         current_org.organization_id,
@@ -2804,7 +2805,7 @@ async def list_onepassword_items(
     include_in_schema=False,
 )
 async def list_bitwarden_items(
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> BitwardenItemsResponse:
     org_auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
         current_org.organization_id,
@@ -2849,7 +2850,7 @@ async def list_bitwarden_items(
 )
 async def update_onepassword_token(
     data: CreateOnePasswordTokenRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CreateOnePasswordTokenResponse:
     """
     Create or update a OnePassword service account token for the current organization.
@@ -2906,7 +2907,7 @@ async def update_onepassword_token(
 )
 async def clear_org_auth_credential(
     credential_provider: str = Path(..., description="The organization auth credential provider to clear."),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> ClearOrganizationAuthTokenResponse:
     """
     Clear the current organization auth credential for the organization.
@@ -2960,7 +2961,7 @@ def _to_safe_bitwarden_response(auth_token: BitwardenOrganizationAuthToken) -> B
     include_in_schema=False,
 )
 async def get_bitwarden_credential(
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> BitwardenCredentialResponse:
     """
     Get the current Bitwarden credential for the organization.
@@ -3007,7 +3008,7 @@ async def get_bitwarden_credential(
 )
 async def update_bitwarden_credential(
     request: CreateBitwardenCredentialRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> BitwardenCredentialResponse:
     """
     Create or update a Bitwarden credential for the current organization.
@@ -3059,7 +3060,7 @@ async def update_bitwarden_credential(
     include_in_schema=False,
 )
 async def get_azure_client_secret_credential(
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> AzureClientSecretCredentialResponse:
     """
     Get the current Azure Client Secret Credential for the organization.
@@ -3106,7 +3107,7 @@ async def get_azure_client_secret_credential(
 )
 async def update_azure_client_secret_credential(
     request: CreateAzureClientSecretCredentialRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> AzureClientSecretCredentialResponse:
     """
     Create or update an Azure Client Secret Credential for the current organization.
@@ -3162,7 +3163,7 @@ async def update_azure_client_secret_credential(
     include_in_schema=False,
 )
 async def get_custom_credential_service_config(
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CustomCredentialServiceConfigResponse:
     """
     Get the current custom credential service configuration for the organization.
@@ -3209,7 +3210,7 @@ async def get_custom_credential_service_config(
 )
 async def update_custom_credential_service_config(
     request: CreateCustomCredentialServiceConfigRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CustomCredentialServiceConfigResponse:
     """
     Create or update a custom credential service configuration for the current organization.
@@ -3267,7 +3268,7 @@ async def update_custom_credential_service_config(
 )
 async def test_custom_credential_service_connection(
     request: CreateCustomCredentialServiceConfigRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> TestConnectionResponse:
     """
     Test connectivity to the custom credential service API.
@@ -3332,6 +3333,7 @@ async def test_custom_credential_service_connection(
 async def _get_credential_vault_service(
     vault_type_override: CredentialVaultType | None = None,
 ) -> CredentialVaultService:
+    settings = SettingsManager.get_settings()
     vault_type = vault_type_override or settings.CREDENTIAL_VAULT_TYPE
     if vault_type == CredentialVaultType.SKYVERN:
         if not settings.is_local_credential_vault_enabled():

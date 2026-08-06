@@ -65,13 +65,13 @@ async def _cleanup_mcp_resources() -> None:
     from skyvern.cli.core.action_log import shutdown_action_log_worker  # noqa: PLC0415
     from skyvern.cli.core.client import close_skyvern  # noqa: PLC0415
     from skyvern.cli.core.mcp_http_auth import close_auth_db  # noqa: PLC0415
-    from skyvern.cli.core.session_manager import close_current_session  # noqa: PLC0415
+    from skyvern.cli.core.session_manager import close_all_sessions  # noqa: PLC0415
 
     try:
         await shutdown_action_log_worker()
     finally:
         try:
-            await close_current_session()
+            await close_all_sessions()
         finally:
             try:
                 await close_skyvern()
@@ -227,16 +227,29 @@ def _handle_mcp_shutdown_signal(_signum: int, _frame: Any) -> None:
     _mcp_main_task.cancel()
 
 
-async def _run_mcp_with_cleanup(run_async: Any, **kwargs: Any) -> None:
+async def _run_mcp_with_cleanup(run_async: Any, *, browser_extension: bool = False, **kwargs: Any) -> None:
     global _mcp_cleanup_done, _mcp_cleanup_in_progress, _mcp_main_task
     current_task = asyncio.current_task()
     _mcp_main_task = current_task
+    extension_runtime: BrowserExtensionRuntime | None = None
     try:
+        if browser_extension:
+            from skyvern.browser_extension.runtime import BrowserExtensionRuntime  # noqa: PLC0415
+
+            extension_runtime = await BrowserExtensionRuntime.get_or_start()
         await run_async(**kwargs)
     finally:
         _mcp_cleanup_in_progress = True
         try:
-            await _cleanup_mcp_resources()
+            try:
+                await _cleanup_mcp_resources()
+            finally:
+                if extension_runtime is None:
+                    from skyvern.browser_extension.runtime import BrowserExtensionRuntime  # noqa: PLC0415
+
+                    extension_runtime = BrowserExtensionRuntime.instance()
+                if extension_runtime is not None:
+                    await extension_runtime.shutdown()
         finally:
             _mcp_cleanup_done = True
             _mcp_cleanup_in_progress = False
@@ -607,11 +620,22 @@ def run_mcp(
             help="Return full tool responses including sdk_equivalent, browser_context, and timing.",
         ),
     ] = False,
+    browser_extension: Annotated[
+        bool,
+        typer.Option(
+            "--browser-extension/--no-browser-extension",
+            help="Start the relay for controlling Chrome through the Skyvern browser extension.",
+        ),
+    ] = False,
 ) -> None:
     """Run the MCP server with configurable transport for local or remote hosting."""
     global _mcp_eof_shutdown_requested, _mcp_shutdown_exit_code
     _mcp_eof_shutdown_requested = False
     _mcp_shutdown_exit_code = None
+    if browser_extension and transport != "stdio":
+        raise typer.BadParameter("--browser-extension requires --transport stdio", param_hint="--browser-extension")
+    if browser_extension:
+        os.environ.setdefault("BROWSER_TYPE", "extension-connect")
     prepare_cli_runtime(intent=EnvIntent.CLOUD)
     try:
         from skyvern.library.local_browser_profile import (  # noqa: PLC0415
@@ -646,7 +670,13 @@ def run_mcp(
             original_signal_handlers[signal.SIGTERM] = signal.signal(signal.SIGTERM, _handle_mcp_shutdown_signal)
             eof_watcher_stop, shutdown_complete = _start_stdin_eof_watcher()
             try:
-                asyncio.run(_run_mcp_with_cleanup(mcp.run_async, transport="stdio"))
+                asyncio.run(
+                    _run_mcp_with_cleanup(
+                        mcp.run_async,
+                        browser_extension=browser_extension,
+                        transport="stdio",
+                    )
+                )
             except asyncio.CancelledError:
                 if _mcp_shutdown_exit_code is None:
                     raise
@@ -660,6 +690,7 @@ def run_mcp(
         asyncio.run(
             _run_mcp_with_cleanup(
                 mcp.run_async,
+                browser_extension=browser_extension,
                 transport=transport,
                 host=host,
                 port=port,

@@ -6,6 +6,7 @@ from collections import OrderedDict
 from contextvars import ContextVar, Token
 from threading import RLock
 
+import httpx
 import structlog
 
 from skyvern.client import SkyvernEnvironment
@@ -64,11 +65,19 @@ def _build_cloud_client(api_key: str) -> Skyvern:
     from .session_manager import is_stateless_http_mode  # noqa: PLC0415 — circular import
 
     base_url: str | None = _resolve_self_base_url() if is_stateless_http_mode() else _resolve_base_url()
+    # Generated SDK methods send "x-user-agent": None when no per-call user_agent is given,
+    # clobbering constructor-level headers in the merge; httpx client-level defaults survive
+    # because None-valued headers are stripped before the request is sent (SKY-13333).
     return Skyvern(
         api_key=api_key,
         environment=SkyvernEnvironment.CLOUD,
         base_url=base_url,
         headers={"x-user-agent": SKYVERN_MCP_USER_AGENT},
+        httpx_client=httpx.AsyncClient(
+            timeout=60,
+            follow_redirects=True,
+            headers={"x-user-agent": SKYVERN_MCP_USER_AGENT},
+        ),
     )
 
 

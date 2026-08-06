@@ -160,13 +160,13 @@ class TransientPageTextObserver:
                     return rect.width > 0 && rect.height > 0;
                   };
 
-                  const emit = (node) => {
-                    const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
-                    if (!element || !isVisible(element)) return;
-                    let text = element instanceof HTMLElement && typeof element.innerText === "string"
+                  const innerTextOf = (element) =>
+                    element instanceof HTMLElement && typeof element.innerText === "string"
                       ? element.innerText
                       : element.textContent || "";
-                    text = normalize(text);
+
+                  const capture = (element) => {
+                    let text = normalize(innerTextOf(element));
                     if (text.length < minLength) return;
                     if (text.length > maxLength) text = text.slice(0, maxLength);
                     Promise.resolve(window[bindingName]({
@@ -176,6 +176,73 @@ class TransientPageTextObserver:
                       role: element.getAttribute("role"),
                       aria_live: element.getAttribute("aria-live"),
                     })).catch(() => {});
+                  };
+
+                  let state;
+                  // element -> deadline (ms epoch). Each deferred node carries its own recheck budget so a
+                  // node admitted late still gets the full window, independent of when other nodes were added.
+                  const pendingVisible = new Map();
+                  // The download handler reinstalls this observer after the action and before the wait; carry
+                  // not-yet-visible overlays across that reinstall so one inserted invisible under the previous
+                  // generation is not dropped before it animates into visibility.
+                  if (previousState && previousState.pendingVisible instanceof Map) {
+                    const carryNow = Date.now();
+                    for (const [carriedElement, carriedDeadline] of previousState.pendingVisible) {
+                      if (carriedElement && carriedElement.isConnected && carriedDeadline > carryNow) {
+                        pendingVisible.set(carriedElement, carriedDeadline);
+                      }
+                    }
+                  }
+                  const RECHECK_BUDGET_MS = 900;
+                  const SWEEP_INTERVAL_MS = 100;
+                  let sweepTimer = 0;
+                  const sweepPending = () => {
+                    sweepTimer = 0;
+                    if (window[key] !== state) {
+                      pendingVisible.clear();
+                      return;
+                    }
+                    const now = Date.now();
+                    for (const [element, deadline] of Array.from(pendingVisible)) {
+                      if (!element.isConnected) {
+                        pendingVisible.delete(element);
+                      } else if (isVisible(element)) {
+                        pendingVisible.delete(element);
+                        capture(element);
+                      } else if (now >= deadline) {
+                        pendingVisible.delete(element);
+                      }
+                    }
+                    if (pendingVisible.size > 0) scheduleSweep();
+                  };
+                  const scheduleSweep = () => {
+                    if (sweepTimer || pendingVisible.size === 0) return;
+                    sweepTimer = setTimeout(sweepPending, SWEEP_INTERVAL_MS);
+                  };
+                  // Overlays (toasts/dialogs) are frequently inserted invisible (opacity:0 / off-screen) and
+                  // animate in without another observed mutation, so a point-in-time visibility check at
+                  // insertion misses them. Re-check each admitted node until its own deadline (one shared
+                  // timer, no per-node timers) so it still becomes evidence once it turns visible.
+                  const deferVisibility = (element) => {
+                    if (pendingVisible.has(element)) {
+                      scheduleSweep();
+                      return;
+                    }
+                    if (pendingVisible.size >= 50) return;
+                    if (normalize(innerTextOf(element)).length < minLength) return;
+                    pendingVisible.set(element, Date.now() + RECHECK_BUDGET_MS);
+                    scheduleSweep();
+                  };
+
+                  const emit = (node) => {
+                    const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+                    if (!element) return;
+                    if (isVisible(element)) {
+                      pendingVisible.delete(element);
+                      capture(element);
+                    } else if (element.isConnected) {
+                      deferVisibility(element);
+                    }
                   };
 
                   let observer;
@@ -197,20 +264,17 @@ class TransientPageTextObserver:
                     });
                     const selectors = "[role='alert'],[role='status'],[aria-live]:not([aria-live='off'])";
                     const visibleSemanticElements = Array.from(document.querySelectorAll(selectors)).filter(isVisible);
-                    const textForElement = (element) => normalize(
-                      element instanceof HTMLElement && typeof element.innerText === "string"
-                        ? element.innerText
-                        : element.textContent || ""
-                    );
-                    const visibleSemanticTexts = visibleSemanticElements.map(textForElement);
+                    const visibleSemanticTexts = visibleSemanticElements.map((element) => normalize(innerTextOf(element)));
                     if (scanInitialVisibleState) {
                       const staleVisibleTexts = new Set(previousState?.visibleSemanticTexts || []);
                       for (const element of visibleSemanticElements) {
-                        if (!staleVisibleTexts.has(textForElement(element))) emit(element);
+                        if (!staleVisibleTexts.has(normalize(innerTextOf(element)))) capture(element);
                       }
                     }
-                    window[key] = { observer, bindingName, visibleSemanticTexts };
+                    state = { observer, bindingName, visibleSemanticTexts, pendingVisible };
+                    window[key] = state;
                     try { previousState?.observer?.disconnect?.(); } catch (e) {}
+                    scheduleSweep();
                   } catch (error) {
                     try { observer?.disconnect?.(); } catch (e) {}
                     throw error;

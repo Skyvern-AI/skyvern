@@ -24,11 +24,13 @@ from skyvern.cli.mcp_tools import cdp_input as mcp_cdp_input
 from skyvern.cli.mcp_tools import mcp
 from skyvern.client.errors import InternalServerError, UnprocessableEntityError
 from tests.unit._mcp_browser_fakes import (
+    make_mock_page,
     make_probe_locator,
     make_real_wait_for_timeout,
     make_select_like_page,
     make_select_option_page,
     make_skyvern_page,
+    patch_get_page,
 )
 
 
@@ -205,11 +207,11 @@ async def test_skyvern_run_task_timeout_returns_timeout_code(monkeypatch: pytest
 async def test_browser_tool_targeting_schema_prefers_direct_params() -> None:
     tools_by_name = {tool.name: tool for tool in await mcp.list_tools()}
     expectations = {
-        "skyvern_click": (("selector",), ("intent",)),
+        "skyvern_click": (("selector", "x", "y"), ("intent",)),
         "skyvern_drag": (("source_selector", "target_selector"), ("source_intent", "target_intent")),
         "skyvern_file_upload": (("selector",), ("intent",)),
         "skyvern_hover": (("selector",), ("intent",)),
-        "skyvern_type": (("selector",), ("intent",)),
+        "skyvern_type": (("selector", "x", "y"), ("intent",)),
         "skyvern_screenshot": (("selector",), ()),
         "skyvern_scroll": (("selector",), ("intent",)),
         "skyvern_select_option": (("selector",), ("intent",)),
@@ -295,6 +297,212 @@ def _direct_type_page(
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
     return fill, locator
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_coordinates_dispatches_raw_mouse_click(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = make_mock_page()
+    page.mouse.click = AsyncMock()
+    context = BrowserContext(mode="local")
+    patch_get_page(monkeypatch, mcp_browser, page, context)
+    resolve_ai_mode = Mock(side_effect=AssertionError("coordinate clicks must not resolve AI mode"))
+    select_native_option = AsyncMock(side_effect=AssertionError("coordinate clicks must not resolve selectors"))
+    monkeypatch.setattr(mcp_browser, "_resolve_ai_mode", resolve_ai_mode)
+    monkeypatch.setattr(mcp_browser, "select_native_option_if_targeted", select_native_option)
+
+    result = await mcp_browser.skyvern_click(x=12.5, y=24.0, button="right", click_count=2)
+
+    assert result["ok"] is True, result
+    page.mouse.click.assert_awaited_once_with(12.5, 24.0, button="right", click_count=2)
+    assert result["data"]["resolved_target"] == "coordinates (12.5, 24.0)"
+    assert result["data"]["sdk_equivalent"] == ("await page.mouse.click(12.5, 24.0, button='right', click_count=2)")
+    resolve_ai_mode.assert_not_called()
+    select_native_option.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_coordinates_focuses_then_types(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = make_mock_page()
+    page.mouse.click = AsyncMock()
+    page.keyboard.type = AsyncMock()
+    page.keyboard.press = AsyncMock()
+    page.evaluate = AsyncMock(return_value=False)
+    context = BrowserContext(mode="local")
+    patch_get_page(monkeypatch, mcp_browser, page, context)
+
+    result = await mcp_browser.skyvern_type(text="Noor", x=18.0, y=36.5, clear=False)
+
+    assert result["ok"] is True, result
+    page.mouse.click.assert_awaited_once_with(18.0, 36.5)
+    page.keyboard.type.assert_awaited_once_with("Noor")
+    page.keyboard.press.assert_not_awaited()
+    assert result["data"]["resolved_target"] == "coordinates (18.0, 36.5)"
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_coordinates_refuses_password_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = make_mock_page()
+    page.mouse.click = AsyncMock()
+    page.keyboard.type = AsyncMock()
+    page.keyboard.press = AsyncMock()
+    page.evaluate = AsyncMock(return_value=True)
+    context = BrowserContext(mode="local")
+    patch_get_page(monkeypatch, mcp_browser, page, context)
+
+    result = await mcp_browser.skyvern_type(text="not-a-secret", x=18.0, y=36.5, clear=False)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
+    assert "password" in result["error"]["message"].lower()
+    page.keyboard.type.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_coordinates_refuses_unverifiable_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = make_mock_page()
+    page.mouse.click = AsyncMock()
+    page.keyboard.type = AsyncMock()
+    page.keyboard.press = AsyncMock()
+    page.evaluate = AsyncMock(return_value=None)
+    context = BrowserContext(mode="local")
+    patch_get_page(monkeypatch, mcp_browser, page, context)
+
+    result = await mcp_browser.skyvern_type(text="Noor", x=18.0, y=36.5, clear=False)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
+    assert result["error"]["message"] == browser_ops.COORDINATE_TYPE_TARGET_REFUSAL_MESSAGE
+    page.keyboard.type.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_requires_both_coordinates_before_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    get_page = AsyncMock(side_effect=AssertionError("get_page should not be called for invalid coordinates"))
+    monkeypatch.setattr(mcp_browser, "get_page", get_page)
+
+    result = await mcp_browser.skyvern_click(x=12.5)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
+    assert "x" in result["error"]["message"] and "y" in result["error"]["message"]
+    get_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("x", "y"),
+    [
+        pytest.param(-1.0, 0.0, id="negative"),
+        pytest.param(float("inf"), 0.0, id="infinite"),
+        pytest.param(float("nan"), 0.0, id="nan"),
+    ],
+)
+async def test_skyvern_click_rejects_invalid_coordinates_before_session(
+    monkeypatch: pytest.MonkeyPatch,
+    x: float,
+    y: float,
+) -> None:
+    get_page = AsyncMock(side_effect=AssertionError("get_page should not be called for invalid coordinates"))
+    monkeypatch.setattr(mcp_browser, "get_page", get_page)
+
+    result = await mcp_browser.skyvern_click(x=x, y=y)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
+    get_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_rejects_selector_with_coordinates_before_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    get_page = AsyncMock(side_effect=AssertionError("get_page should not be called for conflicting targets"))
+    monkeypatch.setattr(mcp_browser, "get_page", get_page)
+
+    result = await mcp_browser.skyvern_type(text="Noor", selector="#first_name", x=18.0, y=36.5)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
+    assert "selector" in result["error"]["message"].lower()
+    assert "coordinates" in result["error"]["message"].lower()
+    get_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_execute_click_coordinates_flow_through_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = make_mock_page()
+    page.mouse.click = AsyncMock()
+    context = BrowserContext(mode="local")
+    get_page = patch_get_page(monkeypatch, mcp_browser, page, context)
+    get_page.return_value[0]._working_frame = None
+
+    result = await mcp_browser.skyvern_execute(
+        steps=[{"tool": "click", "params": {"x": 12.5, "y": 24.0, "button": "middle"}}]
+    )
+
+    assert result["ok"] is True, result
+    assert result["data"]["steps_completed"] == 1
+    page.mouse.click.assert_awaited_once_with(12.5, 24.0, button="middle", click_count=1)
+
+
+@pytest.mark.asyncio
+async def test_skyvern_execute_type_coordinates_flow_through_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = make_mock_page()
+    page.mouse.click = AsyncMock()
+    page.keyboard.type = AsyncMock()
+    page.keyboard.press = AsyncMock()
+    page.evaluate = AsyncMock(return_value=False)
+    context = BrowserContext(mode="local")
+    get_page = patch_get_page(monkeypatch, mcp_browser, page, context)
+    get_page.return_value[0]._working_frame = None
+
+    result = await mcp_browser.skyvern_execute(
+        steps=[
+            {
+                "tool": "type",
+                "params": {
+                    "text": "Noor",
+                    "x": 18.0,
+                    "y": 36.5,
+                    "clear_first": False,
+                    "press_enter": True,
+                },
+            }
+        ]
+    )
+
+    assert result["ok"] is True, result
+    page.mouse.click.assert_awaited_once_with(18.0, 36.5)
+    page.keyboard.type.assert_awaited_once_with("Noor")
+    page.keyboard.press.assert_awaited_once_with("Enter")
+
+
+@pytest.mark.asyncio
+async def test_coordinate_actions_record_explicit_trajectory_coordinates(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = make_mock_page()
+    page.mouse.click = AsyncMock()
+    page.keyboard.type = AsyncMock()
+    page.keyboard.press = AsyncMock()
+    page.evaluate = AsyncMock(return_value=False)
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    patch_get_page(monkeypatch, mcp_browser, page, context)
+    append_trajectory = Mock()
+    monkeypatch.setattr(mcp_browser, "append_trajectory_entry", append_trajectory)
+    monkeypatch.setattr(mcp_browser, "current_api_key_hash", lambda: None)
+
+    click_result = await mcp_browser.skyvern_click(x=12.5, y=24.0)
+    type_result = await mcp_browser.skyvern_type(text="Noor", x=18.0, y=36.5)
+
+    assert click_result["ok"] is True, click_result
+    assert type_result["ok"] is True, type_result
+    click_entry, type_entry = (entry.kwargs["entry"] for entry in append_trajectory.call_args_list)
+    assert "selector" not in click_entry
+    assert (click_entry["x"], click_entry["y"]) == (12.5, 24.0)
+    assert click_entry["sdk_equivalent"] == click_result["data"]["sdk_equivalent"]
+    assert "locator" not in click_entry["sdk_equivalent"]
+    assert "selector" not in type_entry
+    assert (type_entry["x"], type_entry["y"]) == (18.0, 36.5)
+    assert type_entry["sdk_equivalent"] == type_result["data"]["sdk_equivalent"]
+    assert "locator" not in type_entry["sdk_equivalent"]
+    assert "coordinates (" not in repr([click_entry, type_entry])
 
 
 # Default (resilient) keeps the shared MCP surface unchanged for external callers: a selector
@@ -751,6 +959,7 @@ def _sdk_equivalent_page(monkeypatch: pytest.MonkeyPatch) -> None:
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setenv("SKYVERN_DISABLE_CUSTOM_SELECT", "1")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    monkeypatch.setattr(mcp_browser, "validate_fetch_url", lambda url: url)
     monkeypatch.setattr(mcp_browser, "get_current_session", lambda: SimpleNamespace(_working_frame=None))
     monkeypatch.setattr(mcp_browser, "clear_session_ref_map", Mock())
     monkeypatch.setattr(
@@ -1375,6 +1584,8 @@ async def test_do_select_option_scan_observed_control_uses_widened_shape(
         {"text": "Select", "value": "", "dataValues": [""], "expanded": "true", "optionSelected": False},
         {"text": "Music", "value": "", "dataValues": ["music"], "expanded": "false", "optionSelected": False},
     ]
+    # SKY-12634: freeze the wall clock so a loaded CI runner cannot blow the 100ms budget.
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(return_value=0)))
 
     result = await do_select_option(page, "#category", "music", timeout=100)
 
@@ -1575,6 +1786,8 @@ async def test_do_select_option_scan_observed_bare_input_uses_typeahead(
         {"text": "", "value": "Fairview", "dataValues": [], "expanded": None, "optionSelected": False},
         {"text": "", "value": "Fairview", "dataValues": [], "expanded": None, "optionSelected": True},
     ]
+    # SKY-12634: freeze the wall clock so a loaded CI runner cannot blow the 100ms budget.
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(return_value=0)))
 
     assert await do_select_option(page, "#town", "Fairview", timeout=100) == "Fairview"
     control.fill.assert_awaited_once_with("Fairview", timeout=100)
@@ -2748,3 +2961,98 @@ async def test_inline_screenshot_is_also_persisted(monkeypatch: pytest.MonkeyPat
 
     assert result["data"]["path"] == artifact.path
     assert result["artifacts"] == [artifact.to_dict()]
+
+
+def _either_wait_page(
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: dict[str, float | Exception],
+) -> list[asyncio.Task]:
+    """Fake a page whose per-selector waits resolve after a delay, raise, or time out: an outcome of
+    None means the selector never appears, so that waiter times out the way Playwright's does. Returns
+    the waiter tasks so a caller can assert the tool drained them.
+    """
+    waiters: list[asyncio.Task] = []
+
+    async def wait_for_selector(selector: str, timeout: float = 30000, **_: object) -> SimpleNamespace:
+        task = asyncio.current_task()
+        if task is not None:
+            waiters.append(task)
+        outcome = outcomes.get(selector)
+        if isinstance(outcome, Exception):
+            raise outcome
+        if outcome is None:
+            await asyncio.sleep(timeout / 1000)
+            raise mcp_browser.PlaywrightTimeoutError(f"Timeout {timeout}ms exceeded waiting for {selector}")
+        await asyncio.sleep(outcome)
+        return SimpleNamespace(selector=selector)
+
+    _action_page(monkeypatch, wait_for_selector=AsyncMock(side_effect=wait_for_selector))
+    return waiters
+
+
+@pytest.mark.asyncio
+async def test_wait_timeout_on_one_selector_points_at_the_two_state_form(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The timeout is the moment the caller learns its guess was wrong — the error is where MCP puts
+    feedback a model can act on, so it names the form that would not have cost the ceiling."""
+    _either_wait_page(monkeypatch, {"#login": None})
+
+    result = await mcp_browser.skyvern_wait(selector="#login", timeout=1000)
+
+    assert result["ok"] is False
+    assert "skyvern_wait_for_either_state" in result["error"]["hint"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("appears", "expected"), [("#login", "selector_a"), ("#home", "selector_b")])
+async def test_wait_for_either_state_names_the_side_that_matched(
+    monkeypatch: pytest.MonkeyPatch,
+    appears: str,
+    expected: str,
+) -> None:
+    """One tool, one operation: both states are required, so the answer is always which one it is."""
+    absent = "#home" if appears == "#login" else "#login"
+    _either_wait_page(monkeypatch, {appears: 0.01, absent: None})
+
+    result = await mcp_browser.skyvern_wait_for_either_state(selector_a="#login", selector_b="#home", timeout=120000)
+
+    assert result["ok"] is True
+    assert result["data"]["matched_selector"] == appears
+    assert result["data"]["matched"] == expected
+
+
+@pytest.mark.asyncio
+async def test_wait_for_either_state_rejects_states_where_absence_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    _either_wait_page(monkeypatch, {"#login": 0.01, "#home": 0.01})
+
+    result = await mcp_browser.skyvern_wait_for_either_state(selector_a="#a", selector_b="#b", state="hidden")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
+
+
+@pytest.mark.parametrize("concise", [True, False])
+def test_either_state_output_schema_accepts_both_envelope_modes(concise: bool) -> None:
+    """Declared schemas are enforced at runtime, and the two envelope modes disagree on absent fields."""
+    import jsonschema
+
+    from skyvern.cli.core.result import set_concise_responses
+
+    set_concise_responses(concise)
+    try:
+        for envelope in (
+            mcp_browser.make_result(
+                "skyvern_wait_for_either_state",
+                browser_context=BrowserContext(mode="local"),
+                data={"matched_selector": "#home", "matched": "selector_b"},
+                timing_ms={"total": 5},
+            ),
+            mcp_browser.make_result(
+                "skyvern_wait_for_either_state",
+                ok=False,
+                browser_context=BrowserContext(mode="local"),
+                error=mcp_browser.make_error(mcp_browser.ErrorCode.TIMEOUT, "nope", "hint"),
+            ),
+        ):
+            jsonschema.validate(envelope, mcp_browser.EITHER_STATE_OUTPUT_SCHEMA)
+    finally:
+        set_concise_responses(False)

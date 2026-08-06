@@ -17,6 +17,7 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.services import otp_service
 from skyvern.services.otp_service import (
     OTPValue,
+    _clean_url,
     _get_otp_value_from_db,
     _get_otp_value_from_url,
     _is_mfa_like_parameter_key,
@@ -513,6 +514,58 @@ class TestGetOtpValueFromUrl:
         assert all(record.get("event") != "Failed to parse otp login from the totp url" for record in logs)
 
 
+class TestCleanUrl:
+    """Every HTML spelling of "&" must decode; nothing else may be touched."""
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("https://e.test/v?a=1&amp;token=abc", "https://e.test/v?a=1&token=abc"),
+            ("https://e.test/v?a=1&AMP;token=abc", "https://e.test/v?a=1&token=abc"),
+            ("https://e.test/v?a=1&#38;token=abc", "https://e.test/v?a=1&token=abc"),
+            ("https://e.test/v?a=1&#038;token=abc", "https://e.test/v?a=1&token=abc"),
+            ("https://e.test/v?a=1&#x26;token=abc", "https://e.test/v?a=1&token=abc"),
+            ("https://e.test/v?a=1&#X26;token=abc", "https://e.test/v?a=1&token=abc"),
+            # Legacy entity names used as ordinary query parameters must survive byte-exact.
+            ("https://e.test/v?token=abc&copy=1", "https://e.test/v?token=abc&copy=1"),
+            ("https://e.test/v?token=abc&amp=1", "https://e.test/v?token=abc&amp=1"),
+            ("https://e.test/v?token=abc&times=2", "https://e.test/v?token=abc&times=2"),
+            ("https://e.test/v?token=abc.", "https://e.test/v?token=abc"),
+        ],
+    )
+    def test_decodes_only_ampersands(self, raw: str, expected: str) -> None:
+        assert _clean_url(raw) == expected
+
+
+def _patch_otp_llm(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    otp_type: str,
+    otp_value: str | None,
+) -> AsyncMock:
+    """Patch the prompt/LLM/billing seams of parse_otp_login and return the LLM handler mock."""
+    handler = AsyncMock(
+        return_value={
+            "reasoning": "r",
+            "otp_type": otp_type,
+            "otp_value_found": otp_value is not None,
+            "otp_value": otp_value,
+        }
+    )
+    monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+    monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", handler, raising=False)
+    monkeypatch.setattr(
+        otp_service.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            has_sufficient_credit_for_otp_parse=AsyncMock(return_value=True),
+            charge_for_otp_parse=AsyncMock(),
+        ),
+        raising=False,
+    )
+    return handler
+
+
 class TestParseOtpLogin:
     @pytest.mark.asyncio
     async def test_parser_log_omits_raw_code_and_reasoning_keeps_metadata(
@@ -535,7 +588,7 @@ class TestParseOtpLogin:
         monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", fake_handler, raising=False)
 
         with structlog.testing.capture_logs() as logs:
-            result = await parse_otp_login(content="raw email body", organization_id="o_test")
+            result = await parse_otp_login(content="raw email body 135790", organization_id="o_test")
 
         assert result == OTPValue(value=raw, type="totp")
 
@@ -609,6 +662,387 @@ class TestParseOtpLogin:
 
         assert result is None
         charge.assert_awaited_once_with("o_test")
+
+    @pytest.mark.asyncio
+    async def test_bare_magic_link_url_stored_verbatim_without_llm(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.services import otp_service
+
+        # A ~1000-char Clerk magic link; the LLM must never see it (re-typing corrupts one char -> bad sig).
+        magic_link = "https://clerk.skyvern.com/v1/verify?token=" + "a1B2c3D4" * 120
+        llm_handler = AsyncMock()
+        charge = AsyncMock()
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", llm_handler, raising=False)
+        monkeypatch.setattr(
+            otp_service.app,
+            "AGENT_FUNCTION",
+            SimpleNamespace(
+                has_sufficient_credit_for_otp_parse=AsyncMock(return_value=True),
+                charge_for_otp_parse=charge,
+            ),
+            raising=False,
+        )
+
+        result = await parse_otp_login(content=f"  {magic_link}  ", organization_id="o_test")
+
+        assert result is not None
+        assert result.value == magic_link  # byte-exact, trimmed
+        assert result.type == OTPType.MAGIC_LINK
+        llm_handler.assert_not_awaited()  # LLM skipped entirely
+        charge.assert_awaited_once_with("o_test")  # still a billable parse — bill unchanged
+
+    @pytest.mark.asyncio
+    async def test_corrupted_llm_magic_link_recovered_verbatim_from_content(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.services import otp_service
+
+        magic_link = "https://clerk.skyvern.com/v1/verify?token=" + "Zm9vYmFy" * 100
+        content = f"Hi there, click to sign in:\n{magic_link}\nThanks!"  # blob -> LLM path, not the fast path
+        corrupted = magic_link.replace("skyvern", "skyverm")  # the classic rn->m corruption
+
+        async def corrupting_handler(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return {
+                "reasoning": "found link",
+                "otp_type": "magic_link",
+                "otp_value_found": True,
+                "otp_value": corrupted,
+            }
+
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", corrupting_handler, raising=False)
+        monkeypatch.setattr(
+            otp_service.app,
+            "AGENT_FUNCTION",
+            SimpleNamespace(
+                has_sufficient_credit_for_otp_parse=AsyncMock(return_value=True),
+                charge_for_otp_parse=AsyncMock(),
+            ),
+            raising=False,
+        )
+
+        result = await parse_otp_login(content=content, organization_id="o_test")
+
+        assert result is not None
+        assert result.value == magic_link  # corrupted LLM value rejected; verbatim recovered from content
+        assert corrupted not in result.value
+
+    @pytest.mark.asyncio
+    async def test_plain_code_email_still_parses(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.services import otp_service
+
+        content = "Your verification code is 428913. It expires in 10 minutes."
+
+        async def code_handler(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return {"reasoning": "found code", "otp_type": "totp", "otp_value_found": True, "otp_value": "428913"}
+
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", code_handler, raising=False)
+        monkeypatch.setattr(
+            otp_service.app,
+            "AGENT_FUNCTION",
+            SimpleNamespace(
+                has_sufficient_credit_for_otp_parse=AsyncMock(return_value=True),
+                charge_for_otp_parse=AsyncMock(),
+            ),
+            raising=False,
+        )
+
+        result = await parse_otp_login(content=content, organization_id="o_test")
+
+        assert result is not None
+        assert result.value == "428913"
+        assert result.type == OTPType.TOTP
+
+    @pytest.mark.asyncio
+    async def test_recovers_the_located_url_among_decoys_and_html(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.services import otp_service
+
+        magic_link = "https://clerk.skyvern.com/v1/verify?token=" + "Zm9vYmFy" * 100
+        content = (  # tracking/logo + unsubscribe decoys, real link inside an href="...">Sign anchor
+            "https://track.example.com/o.png?id=987654\n"
+            f'<a href="{magic_link}">Sign in</a>\n'
+            "https://example.com/unsubscribe?u=42"
+        )
+        corrupted = magic_link.replace("skyvern", "skyverm")  # one-char corruption of the located link
+
+        async def handler(*_a: object, **_k: object) -> dict[str, object]:
+            return {"reasoning": "r", "otp_type": "magic_link", "otp_value_found": True, "otp_value": corrupted}
+
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", handler, raising=False)
+        monkeypatch.setattr(
+            otp_service.app,
+            "AGENT_FUNCTION",
+            SimpleNamespace(
+                has_sufficient_credit_for_otp_parse=AsyncMock(return_value=True),
+                charge_for_otp_parse=AsyncMock(),
+            ),
+            raising=False,
+        )
+
+        result = await parse_otp_login(content=content, organization_id="o_test")
+
+        assert result is not None
+        assert result.value == magic_link  # the located link, not the logo/unsubscribe decoys
+        assert '">Sign' not in result.value  # href boundary respected — no trailing markup
+
+    @pytest.mark.asyncio
+    async def test_recovers_complete_url_when_llm_truncates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.services import otp_service
+
+        magic_link = "https://clerk.skyvern.com/v1/verify?token=" + "Zm9vYmFy" * 100
+        content = f"Sign in: {magic_link}"
+        truncated = magic_link[:600]  # an exact prefix — a substring of content, but incomplete
+
+        async def handler(*_a: object, **_k: object) -> dict[str, object]:
+            return {"reasoning": "r", "otp_type": "magic_link", "otp_value_found": True, "otp_value": truncated}
+
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", handler, raising=False)
+        monkeypatch.setattr(
+            otp_service.app,
+            "AGENT_FUNCTION",
+            SimpleNamespace(
+                has_sufficient_credit_for_otp_parse=AsyncMock(return_value=True),
+                charge_for_otp_parse=AsyncMock(),
+            ),
+            raising=False,
+        )
+
+        result = await parse_otp_login(content=content, organization_id="o_test")
+
+        assert result is not None
+        assert result.value == magic_link  # complete URL, not the truncated prefix the LLM returned
+
+    @pytest.mark.asyncio
+    async def test_spaced_numeric_code_returned_without_separators(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.services import otp_service
+
+        content = "Your code is 123 456 - enter it to continue."
+
+        async def handler(*_a: object, **_k: object) -> dict[str, object]:
+            return {"reasoning": "r", "otp_type": "totp", "otp_value_found": True, "otp_value": "123456"}
+
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", handler, raising=False)
+        monkeypatch.setattr(
+            otp_service.app,
+            "AGENT_FUNCTION",
+            SimpleNamespace(
+                has_sufficient_credit_for_otp_parse=AsyncMock(return_value=True),
+                charge_for_otp_parse=AsyncMock(),
+            ),
+            raising=False,
+        )
+
+        result = await parse_otp_login(content=content, organization_id="o_test")
+
+        assert result is not None
+        assert result.value == "123456"  # separators stripped — the digits the site expects
+
+    @pytest.mark.asyncio
+    async def test_recovers_url_stripping_trailing_sentence_punctuation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.services import otp_service
+
+        magic_link = "https://clerk.skyvern.com/v1/verify?token=" + "Zm9vYmFy" * 100
+        content = f"Please click {magic_link}."  # trailing period is prose, not part of the URL
+        corrupted = magic_link.replace("skyvern", "skyverm")
+
+        async def handler(*_a: object, **_k: object) -> dict[str, object]:
+            return {"reasoning": "r", "otp_type": "magic_link", "otp_value_found": True, "otp_value": corrupted}
+
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", handler, raising=False)
+        monkeypatch.setattr(
+            otp_service.app,
+            "AGENT_FUNCTION",
+            SimpleNamespace(
+                has_sufficient_credit_for_otp_parse=AsyncMock(return_value=True),
+                charge_for_otp_parse=AsyncMock(),
+            ),
+            raising=False,
+        )
+
+        result = await parse_otp_login(content=content, organization_id="o_test")
+
+        assert result is not None
+        assert result.value == magic_link  # trailing period stripped
+        assert not result.value.endswith(".")
+
+    @pytest.mark.asyncio
+    async def test_recovers_url_decoding_html_entities(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.services import otp_service
+
+        decoded = "https://clerk.skyvern.com/v1/verify?token=" + "Zm9vYmFy" * 100 + "&redirect=/home"
+        encoded_in_body = decoded.replace("&", "&amp;")
+        content = f'<a href="{encoded_in_body}">Sign in</a>'  # raw HTML email body
+        corrupted = decoded.replace("skyvern", "skyverm")
+
+        async def handler(*_a: object, **_k: object) -> dict[str, object]:
+            return {"reasoning": "r", "otp_type": "magic_link", "otp_value_found": True, "otp_value": corrupted}
+
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", handler, raising=False)
+        monkeypatch.setattr(
+            otp_service.app,
+            "AGENT_FUNCTION",
+            SimpleNamespace(
+                has_sufficient_credit_for_otp_parse=AsyncMock(return_value=True),
+                charge_for_otp_parse=AsyncMock(),
+            ),
+            raising=False,
+        )
+
+        result = await parse_otp_login(content=content, organization_id="o_test")
+
+        assert result is not None
+        assert result.value == decoded  # &amp; decoded to &, href boundary respected
+        assert "&amp;" not in result.value
+
+    @pytest.mark.asyncio
+    async def test_bare_url_fast_path_strips_trailing_sentence_punctuation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        magic_link = "https://example.test/verify?token=abc"
+        handler = _patch_otp_llm(monkeypatch, otp_type="magic_link", otp_value=None)
+
+        result = await parse_otp_login(content=f"{magic_link}.", organization_id="o_test")
+
+        assert result == OTPValue(value=magic_link, type=OTPType.MAGIC_LINK)  # period dropped, link still signs
+        handler.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_bare_url_fast_path_keeps_legacy_entity_query_parameter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        magic_link = "https://example.test/verify?token=abc&copy=1"  # "&copy" is also a legacy HTML entity
+        _patch_otp_llm(monkeypatch, otp_type="magic_link", otp_value=None)
+
+        result = await parse_otp_login(content=magic_link, organization_id="o_test")
+
+        assert result == OTPValue(value=magic_link, type=OTPType.MAGIC_LINK)  # not "...abc©=1"
+
+    @pytest.mark.asyncio
+    async def test_bare_url_fast_path_accepts_uppercase_scheme(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        magic_link = "HTTPS://example.test/verify?token=abc"
+        handler = _patch_otp_llm(monkeypatch, otp_type="magic_link", otp_value=None)
+
+        result = await parse_otp_login(content=magic_link, organization_id="o_test")
+
+        assert result == OTPValue(value=magic_link, type=OTPType.MAGIC_LINK)
+        handler.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_uppercase_scheme_url_in_text_recovered(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        magic_link = "HTTPS://example.test/verify?token=abc123"
+        _patch_otp_llm(monkeypatch, otp_type="magic_link", otp_value=magic_link)
+
+        result = await parse_otp_login(content=f"Sign in here: {magic_link} and welcome.", organization_id="o_test")
+
+        assert result is not None
+        assert result.value == magic_link  # candidate extraction is scheme-case-insensitive
+
+    @pytest.mark.asyncio
+    async def test_truncated_numeric_code_recovers_complete_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value="12345")
+
+        result = await parse_otp_login(content="Your verification code is 123456.", organization_id="o_test")
+
+        assert result is not None
+        assert result.value == "123456"  # the complete run, not the LLM's truncation
+
+    @pytest.mark.asyncio
+    async def test_truncation_ending_at_a_display_separator_recovers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value="123")
+
+        result = await parse_otp_login(content="Your code is 123-456", organization_id="o_test")
+
+        assert result is not None
+        assert result.value == "123456"  # a separator is not a token boundary for a code
+
+    @pytest.mark.asyncio
+    async def test_truncation_ending_at_a_space_separator_recovers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value="123")
+
+        result = await parse_otp_login(content="Your code is 123 456 to continue.", organization_id="o_test")
+
+        assert result is not None
+        assert result.value == "123456"
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_truncation_returns_nothing_rather_than_a_decoy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value="123")
+
+        result = await parse_otp_login(content="Order 1234. Your code is 123-456", organization_id="o_test")
+
+        assert result is None  # "1234" scores higher than "123456"; serving an order number would be worse
+
+    @pytest.mark.asyncio
+    async def test_adjacent_numeric_field_is_not_welded_onto_the_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value="123456")
+
+        result = await parse_otp_login(content="Use code 123456 10 minutes remaining", organization_id="o_test")
+
+        assert result is not None
+        assert result.value == "123456"  # not "12345610", a value that appears nowhere in the source
+
+    @pytest.mark.asyncio
+    async def test_tied_approximate_matches_return_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value="123458")
+
+        result = await parse_otp_login(content="Codes 123456 and 123457 were issued", organization_id="o_test")
+
+        assert result is None  # both score 0.833; picking either would be a guess
+
+    @pytest.mark.asyncio
+    async def test_code_repeated_in_the_message_is_one_candidate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value="12345")
+
+        result = await parse_otp_login(
+            content="Your code is 123456. Reminder: code 123456 expires soon.", organization_id="o_test"
+        )
+
+        assert result is not None
+        assert result.value == "123456"  # duplicates are not competing candidates
+
+    @pytest.mark.asyncio
+    async def test_bare_url_with_trailing_markup_is_not_fast_pathed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        magic_link = "https://example.test/verify?token=abc"
+        handler = _patch_otp_llm(monkeypatch, otp_type="magic_link", otp_value=magic_link)
+
+        result = await parse_otp_login(content=f"{magic_link}<br>", organization_id="o_test")
+
+        assert result is not None
+        assert result.value == magic_link  # markup excluded, not stored as part of the link
+        handler.assert_awaited()  # markup means it is not a bare URL, so the LLM path runs
+
+    @pytest.mark.asyncio
+    async def test_alphanumeric_truncation_at_separator_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value="AB")
+
+        result = await parse_otp_login(content="Your code is AB-12", organization_id="o_test")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_alphanumeric_code_accepted_when_complete(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value="AB12CD")
+
+        result = await parse_otp_login(content="Your code is AB12CD - it expires soon.", organization_id="o_test")
+
+        assert result is not None
+        assert result.value == "AB12CD"
+
+    @pytest.mark.asyncio
+    async def test_truncated_alphanumeric_code_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value="AB12C")
+
+        result = await parse_otp_login(content="Your code is AB12CD - it expires soon.", organization_id="o_test")
+
+        assert result is None  # no digit-run candidate to recover from; better than storing a short code
 
     @pytest.mark.asyncio
     async def test_does_not_charge_when_llm_call_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -756,20 +1190,27 @@ class TestPollOtpValueRetry:
     ) -> None:
         mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
         mock_email.return_value = None
-        otp = OTPValue(value="123456", type=OTPType.TOTP)
+        otp = OTPValue(value="https://auth.example.test/magic", type=OTPType.MAGIC_LINK)
         mock_db.return_value = otp
 
         result = await poll_otp_value(
             organization_id="o_test",
             task_id="tsk_test",
+            workflow_id="w_test",
             workflow_run_id="wr_test",
             workflow_permanent_id="wpid_test",
-            totp_identifier="otp@example.com",
+            totp_identifier="otp@example.test",
+            expected_otp_type=OTPType.MAGIC_LINK,
         )
 
         assert result == otp
         mock_email.assert_awaited_once()
         mock_db.assert_awaited_once()
+        assert mock_email.await_args is not None
+        assert mock_db.await_args is not None
+        assert mock_email.await_args.kwargs["workflow_id"] == "w_test"
+        assert mock_email.await_args.kwargs["expected_otp_type"] == OTPType.MAGIC_LINK
+        assert mock_db.await_args.kwargs["workflow_id"] == "w_test"
 
     @pytest.mark.asyncio
     @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)

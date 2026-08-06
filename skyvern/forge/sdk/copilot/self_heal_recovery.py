@@ -32,6 +32,7 @@ _SELF_HEAL_MCP_TOOL_ALLOWLIST = frozenset(
         "console_messages",
         "select_option",
         "press_key",
+        "wait_for_either_state",
     }
 )
 

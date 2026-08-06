@@ -9,13 +9,17 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal, cast
 
-DownloadKind = Literal["registered", "attribute", "extension"]
+DownloadKind = Literal["registered", "attribute", "extension", "observed"]
 
-# ``registered`` is the only kind backed by an actual browser download having fired (S1);
-# ``attribute``/``extension`` are S2 predictions from a scouted link.
+# ``registered`` (S1) and ``observed`` (S3) are backed by an actual browser download having fired;
+# ``attribute``/``extension`` are S2 predictions from a scouted link's href shape.
 DOWNLOAD_KIND_REGISTERED: DownloadKind = "registered"
 DOWNLOAD_KIND_ATTRIBUTE: DownloadKind = "attribute"
 DOWNLOAD_KIND_EXTENSION: DownloadKind = "extension"
+# A download the scout's own click produced. Href shape cannot see these: a query-parameter URL
+# serving a file via Content-Disposition has no extension and no ``download`` attribute, so the
+# href-shape prediction is blind to it and only the fired download proves the affordance.
+DOWNLOAD_KIND_OBSERVED: DownloadKind = "observed"
 
 # S2 may only mint a prediction; ``registered`` is S1-only and must never come from a nav target.
 _PREDICTED_DOWNLOAD_KINDS: frozenset[str] = frozenset({DOWNLOAD_KIND_ATTRIBUTE, DOWNLOAD_KIND_EXTENSION})
@@ -69,6 +73,7 @@ NAV_TARGET_DOWNLOAD_KIND_KEY = "download_kind"
 class _SourceStepKind(str, Enum):
     trajectory_recency = "trajectory_recency"
     registered_output = "registered_output"
+    observed_download = "observed_download"
 
 
 @dataclass(frozen=True)
@@ -148,6 +153,23 @@ def block_output_has_registered_download(block_output: Any) -> bool:
     if not isinstance(block_output, dict):
         return False
     return any(bool(block_output.get(key)) for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS)
+
+
+def derive_from_observed_download(*, selector: str, affordance_text: str = "") -> ReachedDownloadTarget | None:
+    """S3: mint a target from a download the scout's own click just produced.
+
+    Stronger evidence than S2 (the download fired) while still carrying the selector S1 lacks, so the
+    synthesizer can compile its terminal ``expect_download`` step against the exercised affordance."""
+    selector = _summary_str(selector)
+    if not selector:
+        return None
+    return ReachedDownloadTarget(
+        selector=selector,
+        affordance_text=_summary_str(affordance_text),
+        download_kind=DOWNLOAD_KIND_OBSERVED,
+        source_step=_SourceStepKind.observed_download.value,
+        already_registered=False,
+    )
 
 
 def derive_from_block_outputs(block_outputs_by_label: Any) -> ReachedDownloadTarget | None:

@@ -6,7 +6,10 @@ import pytest
 import structlog.testing
 
 from skyvern.forge.sdk.copilot import agent as agent_module
-from skyvern.forge.sdk.copilot.blocker_signal import clear_terminal_evidence_on_workflow_edit
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    CopilotToolBlockerSignal,
+    clear_terminal_evidence_on_workflow_edit,
+)
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.terminal_envelope import (
     TerminalOutcomeEnvelope,
@@ -102,6 +105,53 @@ def test_anchor_supersession_divergence_is_logged() -> None:
     assert not any("anchored a not_demonstrated verdict" in log["event"] for log in logs)
 
 
+def _interim_outcome(verdict: str, display_reason: str | None = None) -> RecordedRunOutcome:
+    return RecordedRunOutcome(verdict=verdict, display_reason=display_reason, role="interim_build_test")
+
+
+def test_run_anchor_ignores_interim_not_demonstrated_when_adjudicated_run_follows() -> None:
+    # Happy turn: an interim scout test run goes not_demonstrated mid-build, then the
+    # completed workflow demonstrates the goal. The envelope must not resurface the
+    # interim amber over the later adjudicated success.
+    envelope = _assemble(
+        run_outcomes=[
+            _interim_outcome("not_demonstrated", "The scout has not produced the goal yet."),
+            _run_outcome("demonstrated", "The extraction returned the value."),
+        ]
+    )
+
+    assert envelope.run_verdict == "demonstrated"
+    assert envelope.run_display_reason == "The extraction returned the value."
+
+
+def test_run_anchor_keeps_interim_amber_when_no_adjudicated_outcome() -> None:
+    # Repair ceiling: the loop stops after a suspicious-success run without ever
+    # producing an adjudicated outcome, so the interim not_demonstrated is the turn's
+    # honest terminal verdict and must still anchor amber.
+    envelope = _assemble(
+        run_outcomes=[
+            _interim_outcome("not_demonstrated", "The run completed but did not demonstrate the goal."),
+        ]
+    )
+
+    assert envelope.run_verdict == "not_demonstrated"
+    assert envelope.run_display_reason == "The run completed but did not demonstrate the goal."
+
+
+def test_run_anchor_prefers_adjudicated_not_demonstrated_over_earlier_interim() -> None:
+    # A genuine adjudicated failure on the completed workflow anchors amber even when an
+    # earlier interim run also went not_demonstrated.
+    envelope = _assemble(
+        run_outcomes=[
+            _interim_outcome("not_demonstrated", "Interim scout, still building."),
+            _run_outcome("not_demonstrated", "The extraction returned no value."),
+        ]
+    )
+
+    assert envelope.run_verdict == "not_demonstrated"
+    assert envelope.run_display_reason == "The extraction returned no value."
+
+
 @pytest.mark.parametrize(
     ("response_type", "verified", "workflow_applied", "proposal_disposition", "expected_next_state"),
     [
@@ -134,6 +184,7 @@ def test_next_state_derivation(
         ({"response_type": "ASK_QUESTION"}, "question"),
         ({"verified": True, "workflow_applied": True}, "update"),
         ({"proposal_disposition": "review_untested"}, "update"),
+        ({"turn_outcome_response_kind": "answer", "workflow_mutated": False}, "answer"),
         ({"turn_outcome_response_kind": "diagnose", "workflow_mutated": False}, "answer"),
         ({"turn_outcome_response_kind": "diagnose", "workflow_mutated": True}, "stopped"),
         ({"turn_outcome_response_kind": "refuse", "workflow_mutated": False}, "answer"),
@@ -216,7 +267,7 @@ def test_finalize_applied_state_keeps_question_for_user_action_required() -> Non
 
 
 def test_finalize_applied_state_preserves_answer_when_not_promoted_to_update() -> None:
-    envelope = _assemble(turn_outcome_response_kind="diagnose", workflow_mutated=False)
+    envelope = _assemble(turn_outcome_response_kind="answer", workflow_mutated=False)
     assert envelope.response_kind == "answer"
 
     finalized = finalize_applied_state(envelope, applied=False)
@@ -452,3 +503,117 @@ def test_render_terminal_message_keeps_answer_kind_replies_on_stopped_state() ->
 
     assert rendered == message
     assert replaced is False
+
+
+def test_render_terminal_message_keeps_deadline_copy_on_stopped_fallthrough() -> None:
+    envelope = _assemble(
+        proposal_disposition="auto_applicable",
+        run_outcomes=[],
+        terminal_cause="deadline_expired",
+    )
+    message = agent_module._TIMEOUT_REPLY_DEFAULT
+
+    rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
+
+    assert envelope.next_state == "stopped"
+    assert envelope.response_kind == "stopped"
+    assert rendered == message
+    assert rendered != "I stopped without confirming the goal was met."
+    assert replaced is True
+
+
+def test_render_terminal_message_still_generic_without_deadline_cause() -> None:
+    envelope = _assemble(proposal_disposition="auto_applicable", run_outcomes=[])
+
+    rendered, replaced = render_terminal_message(envelope, agent_module._TIMEOUT_REPLY_DEFAULT, cancelled=False)
+
+    assert rendered == "I stopped without confirming the goal was met."
+    assert replaced is True
+
+
+def test_render_terminal_message_held_draft_text_survives_with_deadline_cause() -> None:
+    envelope = _assemble(proposal_disposition="review_untested", terminal_cause="deadline_expired")
+    message = agent_module._TIMEOUT_REPLY_UNVALIDATED
+
+    rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
+
+    assert envelope.next_state == "proposal_pending"
+    assert rendered == message
+    assert replaced is True
+
+
+def test_render_terminal_message_held_draft_unreplaced_without_deadline_cause() -> None:
+    envelope = _assemble(proposal_disposition="review_untested")
+    message = agent_module._TIMEOUT_REPLY_UNVALIDATED
+
+    rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
+
+    assert rendered == message
+    assert replaced is False
+
+
+def test_render_terminal_message_cancelled_turn_ignores_deadline_cause() -> None:
+    envelope = _assemble(proposal_disposition="auto_applicable", terminal_cause="deadline_expired")
+
+    rendered, replaced = render_terminal_message(envelope, "cancelled-text", cancelled=True)
+
+    assert rendered == "cancelled-text"
+    assert replaced is False
+
+
+def test_render_terminal_message_completed_turn_is_not_stamped_by_deadline_cause() -> None:
+    # replaced=True overwrites a distinct narrativeSummary downstream, so an
+    # applied turn that happens to expire must not be stamped with its own text.
+    envelope = _assemble(
+        verified=True,
+        workflow_applied=True,
+        proposal_disposition="auto_applicable",
+        terminal_cause="deadline_expired",
+    )
+    message = agent_module._TIMEOUT_REPLY_TESTED
+
+    rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
+
+    assert envelope.next_state == "completed"
+    assert rendered == message
+    assert replaced is False
+
+
+def test_deadline_cause_survives_envelope_round_trip() -> None:
+    envelope = _assemble(proposal_disposition="auto_applicable", terminal_cause="deadline_expired")
+
+    payload = envelope.model_dump(mode="json")
+    finalized = finalize_applied_state(TerminalOutcomeEnvelope.model_validate(payload), applied=False)
+
+    assert payload["terminal_cause"] == "deadline_expired"
+    assert finalized.model_dump(mode="json")["terminal_cause"] == "deadline_expired"
+
+
+def test_envelope_carries_deadline_cause_when_blocker_override_rewrote_the_reason() -> None:
+    ctx = make_copilot_ctx()
+    ctx.copilot_total_timeout_exceeded = True
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="authority_denied",
+        agent_steering_text="Reply without updating the workflow.",
+        user_facing_reason="I can't update or run this workflow on this turn.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code="turn_intent_no_mutation_run_blocked",
+        blocked_tool="update_workflow",
+    )
+
+    result = agent_module._build_timeout_exit_result(ctx, global_llm_context=None)
+
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.terminal_reason != "timeout"
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["terminal_cause"] == "deadline_expired"
+
+
+def test_envelope_has_no_cause_when_deadline_did_not_expire() -> None:
+    ctx = make_copilot_ctx()
+    ctx.copilot_total_timeout_exceeded = False
+
+    result = agent_module._build_timeout_exit_result(ctx, global_llm_context=None)
+
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["terminal_cause"] is None

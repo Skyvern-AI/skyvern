@@ -87,6 +87,8 @@ class SkyvernContext:
     request_id: str | None = None
     organization_id: str | None = None
     organization_name: str | None = None
+    org_default_llm_key: str | None = None
+    org_default_secondary_llm_key: str | None = None
     task_id: str | None = None
     step_id: str | None = None
     workflow_id: str | None = None
@@ -96,7 +98,15 @@ class SkyvernContext:
     task_v2_id: str | None = None
     max_steps_override: int | None = None
     browser_session_id: str | None = None
+    # Immutable lease identity returned by the successful PBS begin_session call. Consumers carry
+    # both values forward; they never reconstruct ownership from mutable task or session rows.
+    browser_session_runnable_id: str | None = None
+    browser_session_runnable_generation_id: str | None = None
+    # Set only by run_sdk_action when it mints a bookkeeping run for a standalone action. A minted
+    # run never begins the browser session, so it must not be presented as the expected owner.
+    workflow_run_is_synthetic: bool = False
     browser_runtime: str | None = None
+    browser_address_is_server_assigned: bool = False
     tz_info: ZoneInfo | None = None
     run_id: str | None = None
     copilot_session_id: str | None = None
@@ -122,6 +132,11 @@ class SkyvernContext:
     browser_container_ip: str | None = None
     browser_container_task_arn: str | None = None
     feature_flag_entries: dict[str, bool | str | None] = field(default_factory=dict)
+    # Absolute event-loop time the run body's elapsed-time budget expires, set alongside the
+    # asyncio.timeout that enforces it. None when nothing is enforcing one. Read by work that
+    # may block for a long time, so it can give up and return rather than be cancelled — a
+    # cancellation propagates as BaseException and skips handlers that degrade gracefully.
+    max_elapsed_deadline: float | None = None
 
     # feature flags
     enable_page_ready_wait: bool = False

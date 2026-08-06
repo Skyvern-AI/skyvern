@@ -207,9 +207,11 @@ class Settings(BaseSettings):
     COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
     COPILOT_TURN_INTENT_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
     COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
-    # Consecutive repair runs that make no newly-verified forward progress before the
-    # copilot stops re-running and escalates honestly. Set very high to disable the ceiling.
-    COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
+    COPILOT_OUTPUT_DESIGNATION_TIMEOUT_SECONDS: float = 12.0
+    # A capture that runs out of time yields no page evidence at all, so the scout falls back to
+    # dumping the page. Measured attaches on a live dashboard reach 8.6s; the former 4s bound cut the
+    # tail off and a third of captures returned nothing.
+    COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 12.0
     # Bounded settle-then-re-perceive after a non-advancing click on a precondition-gated control:
     # re-probe the side-effect-free extractor a few times (hard-capped) until a just-issued AJAX populates.
     COPILOT_CLICK_SETTLE_MAX_PROBES: int = 3
@@ -231,6 +233,9 @@ class Settings(BaseSettings):
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
     WORKFLOW_COPILOT_TERMINAL_ENVELOPE_RENDER: bool = False
     WORKFLOW_COPILOT_QA_TOKEN_BUDGET: int | None = Field(default=None, gt=0)
+    # Process-global override of the per-turn copilot deadline, read once at import;
+    # changing it needs a hard restart. QA/debug only -- unset keeps the 900s default.
+    WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS: int | None = Field(default=None, gt=0)
     # Pause a BUILD turn in place on a typed mid-loop credential ask instead of ending it;
     # the FE resumes the same turn via a credential-connect card. Off = today's turn-terminal behavior.
     # Requires app.CACHE to be a shared cache (Redis) -- a same-process-only cache can't
@@ -265,6 +270,7 @@ class Settings(BaseSettings):
     # Algorithm used to sign the JWT
     SIGNATURE_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # one week
+    UI_SESSION_TOKEN_TTL_MINUTES: int = Field(default=60, gt=0)
 
     # Artifact storage settings
     ARTIFACT_STORAGE_PATH: str = f"{SKYVERN_DIR}/artifacts"
@@ -284,6 +290,11 @@ class Settings(BaseSettings):
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
     AWS_S3_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
     AWS_S3_BUCKET_UPLOADS: str = "skyvern-uploads"
+    # ISO-8601 UTC timestamp. Runs created at/after it that have zero DOWNLOAD artifact
+    # rows skip the legacy S3 LIST fallback in get_downloaded_files — such runs register
+    # every download as a row at save time (SKY-8861), so the LIST can only return empty.
+    # None keeps the LIST fallback for every run.
+    DOWNLOADS_EMPTY_S3_LISTING_CUTOVER: str | None = None
 
     # Azure Blob Storage settings
     AZURE_STORAGE_ACCOUNT_NAME: str | None = None
@@ -402,6 +413,11 @@ class Settings(BaseSettings):
     WORKFLOW_COPILOT_LITE_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
+    # The client-side timeout is a per-read gap applied per SDK attempt, so a provider that drips
+    # keep-alive bytes can hold a call open forever; the hard deadline bounds it in wall-clock time.
+    # Only the direct AsyncOpenAI client path (api_handler_factory.LLMCaller) applies this today.
+    ENFORCE_LLM_HARD_DEADLINE: bool = True
+    LLM_HARD_DEADLINE_GRACE_SECONDS: float = Field(default=10.0, ge=0)
     LLM_CONFIG_MAX_TOKENS: int = 4096
     LLM_CONFIG_TEMPERATURE: float = 0
     LLM_CONFIG_SUPPORT_VISION: bool = True  # Whether the model supports vision
@@ -421,10 +437,15 @@ class Settings(BaseSettings):
     ENABLE_VERTEX_AI: bool = False
     ENABLE_AZURE_CUA: bool = False
     ENABLE_OPENAI_COMPATIBLE: bool = False
+    ENABLE_XAI: bool = False
     # OPENAI
     OPENAI_API_KEY: str | None = None
     GPT5_REASONING_EFFORT: str | None = "medium"
     OPENAI_CUA_MODEL: str = "computer-use-preview"
+    # xAI
+    XAI_API_KEY: str | None = None
+    XAI_API_BASE: str = "https://api.x.ai/v1"
+    XAI_REASONING_EFFORT: str | None = "medium"
     # ANTHROPIC
     ANTHROPIC_API_KEY: str | None = None
     ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE4.6_SONNET"
@@ -634,7 +655,7 @@ class Settings(BaseSettings):
     OP_SERVICE_ACCOUNT_TOKEN: str | None = None
 
     # Where credentials are stored: skyvern, bitwarden, azure_vault, gcp, or custom
-    CREDENTIAL_VAULT_TYPE: str = "bitwarden"
+    CREDENTIAL_VAULT_TYPE: str = "skyvern"
     ENABLE_LOCAL_CREDENTIAL_VAULT: bool | None = None
     LOCAL_CREDENTIAL_VAULT_PATH: str = str(Path.home() / ".skyvern" / "credential_vault")
     LOCAL_CREDENTIAL_VAULT_KEY: str | None = None
@@ -668,6 +689,8 @@ class Settings(BaseSettings):
     ENABLE_CSS_SVG_PARSING: bool = True
 
     ENABLE_LOG_ARTIFACTS: bool = False
+    ENABLE_SECRET_ARTIFACT_REDACTION: bool = True
+    ENABLE_SECRET_VISUAL_MASKING: bool = True
     # Deployment-level fail-closed override; takes precedence over all CodeBlock entitlements.
     DISABLE_CODE_BLOCK_EXECUTION: bool = False
     ENABLE_CODE_BLOCK: bool = True
@@ -840,6 +863,10 @@ class Settings(BaseSettings):
             LOG.warning("Invalid WORKER_STALL_DUMP_SECONDS=%r; using default 0", value)
             return 0
 
+    @property
+    def is_skyvern_base_url_explicitly_configured(self) -> bool:
+        return "SKYVERN_BASE_URL" in self.model_fields_set
+
     def get_model_name_to_llm_key(self, organization_id: str | None = None) -> dict[str, dict[str, str]]:
         """
         Keys are model names available to blocks in the frontend. These map to key names
@@ -870,6 +897,9 @@ class Settings(BaseSettings):
         }
 
         mapping["mercury-2"] = {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"}
+
+        if self.ENABLE_XAI:
+            mapping["grok-4.5"] = {"llm_key": "XAI_GROK_4_5", "label": "Grok 4.5"}
 
         # Their configs are registered only under ENABLE_OPENROUTER, so without it the dropdown
         # would offer models that resolve to unregistered configs and fail at runtime.

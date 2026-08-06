@@ -15,7 +15,8 @@ real database -- all DB / LLM / agent surfaces are patched.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import contextlib
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -30,23 +31,37 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as agent_module
-from skyvern.forge.sdk.copilot.context import AgentResult
-from skyvern.forge.sdk.copilot.terminal_envelope import assemble_terminal_envelope
+from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
+from skyvern.forge.sdk.copilot.context import AgentResult, TurnNarrativePayload
+from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
+from skyvern.forge.sdk.copilot.terminal_envelope import (
+    INTERRUPTED_TERMINAL_MESSAGE,
+    INTERRUPTED_TERMINAL_REASON,
+    assemble_terminal_envelope,
+)
+from skyvern.forge.sdk.copilot.turn_outcome import build_minimal_turn_outcome
 from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 from skyvern.forge.sdk.routes.workflow_copilot import (
     COPILOT_V2_FLAG_KEY,
+    RECONCILE_ABANDON_AFTER_SECONDS,
+    _persist_turn_messages,
     _validate_copilot_audio_artifact_id,
     convert_to_history_messages,
     workflow_copilot_chat_audio,
+    workflow_copilot_chat_history,
     workflow_copilot_chat_post,
 )
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    CopilotPendingTurn,
+    WorkflowCopilotChat,
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
     WorkflowCopilotStreamErrorUpdate,
     WorkflowCopilotStreamResponseUpdate,
 )
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from tests.unit.copilot_route_test_support import install_fake_create, setup_new_copilot_mocks
 
 
@@ -75,7 +90,13 @@ def _make_chat_request(
     )
 
 
-def _terminal_payload(*, verified: bool, workflow_applied: bool) -> dict[str, Any]:
+def _terminal_payload(
+    *,
+    verified: bool,
+    workflow_applied: bool,
+    workflow_mutated: bool = True,
+    turn_outcome_response_kind: str = "build",
+) -> dict[str, Any]:
     envelope = assemble_terminal_envelope(
         response_type="REPLY",
         verified=verified,
@@ -85,8 +106,8 @@ def _terminal_payload(*, verified: bool, workflow_applied: bool) -> dict[str, An
         blocker_reason=None,
         halt_kind=None,
         attempted="Attempted full run.",
-        workflow_mutated=True,
-        turn_outcome_response_kind="build",
+        workflow_mutated=workflow_mutated,
+        turn_outcome_response_kind=turn_outcome_response_kind,
     )
     assert envelope is not None
     return envelope.model_dump(mode="json")
@@ -507,6 +528,60 @@ async def test_finalise_normal_turn_flag_on_stopped_envelope_renders_terminal_te
     assert persisted_payload["terminalMessage"] == expected
     assert persisted_payload["narrativeSummary"] == expected
     assert persisted_payload["terminalEnvelope"]["rendered_from_envelope"] is True
+
+
+@pytest.mark.asyncio
+async def test_finalise_normal_turn_preserves_and_persists_answer_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "should_render_copilot_terminal_from_envelope",
+        AsyncMock(return_value=True),
+    )
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    answer = "Google Sheets steps can read rows through a connected integration."
+    outcome = build_minimal_turn_outcome(answer, response_kind=ResponseKind.ANSWER)
+    agent_result = AgentResult(
+        user_response=answer,
+        updated_workflow=None,
+        global_llm_context=None,
+        response_type="REPLY",
+        narrative_payload=_narrative_payload(),
+        turn_outcome=outcome,
+        terminal_envelope=_terminal_payload(
+            verified=False,
+            workflow_applied=False,
+            workflow_mutated=False,
+            turn_outcome_response_kind="answer",
+        ),
+    )
+    setup_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, setup_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=None,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    response_frame = stream.send.await_args.args[0]
+    assert response_frame.message == answer
+    assert response_frame.terminal_envelope is not None
+    assert response_frame.terminal_envelope["response_kind"] == "answer"
+    assert response_frame.terminal_envelope["user_action_required"] is False
+    persisted = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs
+    assert persisted["content"] == answer
+    assert persisted["turn_outcome"].response_kind is ResponseKind.ANSWER
 
 
 @pytest.mark.asyncio
@@ -1305,8 +1380,8 @@ async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
         call.kwargs.get("content")
         for call in app.DATABASE.workflow_params.create_workflow_copilot_chat_message.await_args_list
     ]
-    assert "Please update it" in contents
-    assistant_contents = [content for content in contents if isinstance(content, str) and content != "Please update it"]
+    assert app.DATABASE.workflow_params.start_copilot_turn.await_args.kwargs["user_message"] == "Please update it"
+    assistant_contents = [content for content in contents if isinstance(content, str)]
     assert len(assistant_contents) == 1
     assert expected_summary in assistant_contents[0]
     assert "The workflow was not modified" in assistant_contents[0]
@@ -2774,3 +2849,773 @@ async def test_persist_state_auto_applicable_without_staged_commit_still_protect
     )
 
     app.DATABASE.workflow_params.update_workflow_copilot_chat.assert_not_awaited()
+
+
+_NOW = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
+
+
+def _make_copilot_workflow(title: str, modified_at: datetime) -> Workflow:
+    return Workflow(
+        workflow_id="wf-1",
+        organization_id="org-1",
+        title=title,
+        workflow_permanent_id="wpid-1",
+        version=1,
+        is_saved_task=False,
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
+        created_at=_NOW - timedelta(days=1),
+        modified_at=modified_at,
+    )
+
+
+def _fingerprint_of(workflow: Workflow) -> str:
+    return workflow_content_fingerprint(workflow.model_dump(mode="json"))
+
+
+def _make_pending_turn(turn_id: str, age_seconds: float, **overrides: Any) -> CopilotPendingTurn:
+    return CopilotPendingTurn(
+        turn_id=turn_id,
+        started_at=datetime.now(timezone.utc) - timedelta(seconds=age_seconds),
+        **overrides,
+    )
+
+
+def _make_persisted_chat(
+    pending: list[CopilotPendingTurn], proposed_workflow: dict | None = None
+) -> WorkflowCopilotChat:
+    return WorkflowCopilotChat(
+        workflow_copilot_chat_id="chat-1",
+        organization_id="org-1",
+        workflow_permanent_id="wpid-1",
+        proposed_workflow=proposed_workflow,
+        auto_accept=False,
+        pending_turns={entry.turn_id: entry for entry in pending},
+        created_at=_NOW,
+        modified_at=_NOW,
+    )
+
+
+class _FakeCopilotChatStore:
+    """In-memory double of the chat/message repo surface reconcile-on-read touches."""
+
+    def __init__(self, chat: WorkflowCopilotChat) -> None:
+        self.chat = chat
+        self.messages: list[WorkflowCopilotChatMessage] = []
+        self.claim_calls: list[str] = []
+
+    def add_message(
+        self,
+        sender: WorkflowCopilotChatSender,
+        content: str,
+        turn_outcome: TurnOutcome | None = None,
+    ) -> WorkflowCopilotChatMessage:
+        message = WorkflowCopilotChatMessage(
+            workflow_copilot_chat_message_id=f"wccm-{len(self.messages)}",
+            workflow_copilot_chat_id=self.chat.workflow_copilot_chat_id,
+            sender=sender,
+            content=content,
+            turn_outcome=turn_outcome,
+            created_at=_NOW,
+            modified_at=_NOW,
+        )
+        self.messages.append(message)
+        return message
+
+    @property
+    def assistant_messages(self) -> list[WorkflowCopilotChatMessage]:
+        return [m for m in self.messages if m.sender == WorkflowCopilotChatSender.AI]
+
+    @property
+    def user_messages(self) -> list[WorkflowCopilotChatMessage]:
+        return [m for m in self.messages if m.sender == WorkflowCopilotChatSender.USER]
+
+    async def get_workflow_copilot_chat_by_id(
+        self, organization_id: str, workflow_copilot_chat_id: str
+    ) -> WorkflowCopilotChat:
+        return self.chat
+
+    async def get_workflow_copilot_chat_messages(
+        self, workflow_copilot_chat_id: str
+    ) -> list[WorkflowCopilotChatMessage]:
+        return list(self.messages)
+
+    async def create_workflow_copilot_chat_message(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        sender: WorkflowCopilotChatSender,
+        content: str,
+        audio_artifact_id: str | None = None,
+        global_llm_context: str | None = None,
+        turn_outcome: TurnOutcome | None = None,
+        narrative_payload: Any = None,
+    ) -> WorkflowCopilotChatMessage:
+        return self.add_message(sender, content, turn_outcome)
+
+    async def replace_workflow_copilot_chat_message(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_message_id: str,
+        content: str,
+        global_llm_context: str | None,
+        turn_outcome: TurnOutcome | None,
+        narrative_payload: TurnNarrativePayload | None = None,
+    ) -> WorkflowCopilotChatMessage | None:
+        for index, message in enumerate(self.messages):
+            if message.workflow_copilot_chat_message_id == workflow_copilot_chat_message_id:
+                replaced = message.model_copy(update={"content": content, "turn_outcome": turn_outcome})
+                self.messages[index] = replaced
+                return replaced
+        return None
+
+    async def record_pending_copilot_turn_canonical_write(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        turn_id: str,
+        fingerprint: str,
+    ) -> None:
+        entry = self.chat.pending_turns.get(turn_id)
+        if entry is not None:
+            entry.canonical_write_fingerprint = fingerprint
+
+    async def claim_pending_copilot_turn(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        turn_id: str,
+        claim_before: datetime,
+    ) -> bool:
+        self.claim_calls.append(turn_id)
+        entry = self.chat.pending_turns.get(turn_id)
+        if entry is None:
+            return False
+        if entry.recovering_at is not None and entry.recovering_at > claim_before:
+            return False
+        entry.recovering_at = datetime.now(timezone.utc)
+        return True
+
+    async def clear_pending_copilot_turn(
+        self, organization_id: str, workflow_copilot_chat_id: str, turn_id: str
+    ) -> None:
+        self.chat.pending_turns.pop(turn_id, None)
+
+    async def update_workflow_copilot_chat(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        proposed_workflow: dict | None = None,
+        auto_accept: bool | None = None,
+    ) -> WorkflowCopilotChat:
+        self.chat.proposed_workflow = proposed_workflow
+        return self.chat
+
+
+def _install_reconcile_store(
+    monkeypatch: pytest.MonkeyPatch,
+    chat: WorkflowCopilotChat,
+    canonical: Workflow | None = None,
+) -> tuple[_FakeCopilotChatStore, AsyncMock]:
+    store = _FakeCopilotChatStore(chat)
+    app.DATABASE.workflow_params = store
+    app.DATABASE.workflows = SimpleNamespace(get_workflow_by_permanent_id=AsyncMock(return_value=canonical))
+    restore_mock = AsyncMock()
+    monkeypatch.setattr(workflow_copilot_route, "_restore_workflow_definition", restore_mock)
+    return store, restore_mock
+
+
+async def _load_history(chat_id: str = "chat-1") -> Any:
+    return await workflow_copilot_chat_history(
+        workflow_copilot_chat_id=chat_id,
+        organization=SimpleNamespace(organization_id="org-1"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_chat_history_marks_abandoned_turn_interrupted_not_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn whose process died leaves the user row plus an honest interrupted outcome."""
+    chat = _make_persisted_chat([_make_pending_turn("turn-a", RECONCILE_ABANDON_AFTER_SECONDS + 60)])
+    store, restore_mock = _install_reconcile_store(monkeypatch, chat)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+
+    response = await _load_history()
+
+    assert [m.content for m in store.user_messages] == ["build me a scraper"]
+    assert len(store.assistant_messages) == 1
+    outcome = store.assistant_messages[0].turn_outcome
+    assert outcome is not None
+    assert outcome.terminal_reason == INTERRUPTED_TERMINAL_REASON
+    assert outcome.terminal_reason != "cancel"
+    assert outcome.response_kind == ResponseKind.RECOVER
+    assert outcome.copilot_turn_id == "turn-a"
+    assert chat.pending_turns == {}
+    assert response.chat_history[-1].turn_outcome is not None
+    restore_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_chat_history_leaves_a_young_pending_turn_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    chat = _make_persisted_chat([_make_pending_turn("turn-a", 30)])
+    store, _ = _install_reconcile_store(monkeypatch, chat)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+
+    await _load_history()
+
+    assert store.assistant_messages == []
+    assert "turn-a" in chat.pending_turns
+
+
+@pytest.mark.asyncio
+async def test_chat_history_shows_the_user_message_while_the_turn_is_still_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reloading mid-turn — a tab refresh — shows the user's message without inventing an outcome."""
+    chat = _make_persisted_chat([_make_pending_turn("turn-a", 30)])
+    store, _ = _install_reconcile_store(monkeypatch, chat)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+
+    response = await _load_history()
+
+    assert [m.content for m in response.chat_history] == ["build me a scraper"]
+    assert all(m.turn_outcome is None for m in response.chat_history)
+    assert "turn-a" in chat.pending_turns
+
+
+@pytest.mark.asyncio
+async def test_chat_history_leaves_a_turn_inside_its_enforcement_budget_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Past the 900s agent budget but still live in wall clock thanks to a credential pause."""
+    chat = _make_persisted_chat([_make_pending_turn("turn-a", 1000)])
+    store, _ = _install_reconcile_store(monkeypatch, chat)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+
+    await _load_history()
+
+    assert store.assistant_messages == []
+    assert "turn-a" in chat.pending_turns
+
+
+@pytest.mark.asyncio
+async def test_reconcile_restores_real_cdp_headers_not_the_masked_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-turn snapshot is a JSON dump, which masks cdp_connect_headers; restoring it verbatim would destroy them."""
+    pre_turn = _make_copilot_workflow("Before the turn", _NOW - timedelta(hours=2))
+    pre_turn.cdp_connect_headers = {"x-api-key": "real-secret"}
+    mid_turn_draft = _make_copilot_workflow("Half-built draft", datetime.now(timezone.utc) - timedelta(seconds=1500))
+    mid_turn_draft.cdp_connect_headers = {"x-api-key": "real-secret"}
+    chat = _make_persisted_chat(
+        [
+            _make_pending_turn(
+                "turn-a",
+                RECONCILE_ABANDON_AFTER_SECONDS + 60,
+                pre_turn_workflow=pre_turn.model_dump(mode="json"),
+                canonical_write_fingerprint=_fingerprint_of(mid_turn_draft),
+            )
+        ]
+    )
+    store, restore_mock = _install_reconcile_store(monkeypatch, chat, canonical=mid_turn_draft)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+
+    await _load_history()
+
+    restore_mock.assert_awaited_once()
+    assert restore_mock.await_args.args[0].cdp_connect_headers == {"x-api-key": "real-secret"}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_does_not_stash_a_canonical_the_dying_turn_already_restored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finalizer that restored canonical just before the kill leaves no displaced draft to stash."""
+    pre_turn = _make_copilot_workflow("Before the turn", _NOW - timedelta(hours=2))
+    turn_draft = _make_copilot_workflow("Half-built draft", datetime.now(timezone.utc) - timedelta(seconds=1600))
+    already_restored = _make_copilot_workflow("Before the turn", datetime.now(timezone.utc) - timedelta(seconds=1500))
+    chat = _make_persisted_chat(
+        [
+            _make_pending_turn(
+                "turn-a",
+                RECONCILE_ABANDON_AFTER_SECONDS + 60,
+                pre_turn_workflow=pre_turn.model_dump(mode="json"),
+                canonical_write_fingerprint=_fingerprint_of(turn_draft),
+            )
+        ]
+    )
+    store, _ = _install_reconcile_store(monkeypatch, chat, canonical=already_restored)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+
+    response = await _load_history()
+
+    assert response.proposed_workflow is None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_restores_canonical_and_stashes_the_mid_turn_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pre_turn = _make_copilot_workflow("Before the turn", _NOW - timedelta(hours=2))
+    mid_turn_draft = _make_copilot_workflow("Half-built draft", datetime.now(timezone.utc) - timedelta(seconds=1500))
+    chat = _make_persisted_chat(
+        [
+            _make_pending_turn(
+                "turn-a",
+                RECONCILE_ABANDON_AFTER_SECONDS + 60,
+                pre_turn_workflow=pre_turn.model_dump(mode="json"),
+                canonical_write_fingerprint=_fingerprint_of(mid_turn_draft),
+            )
+        ]
+    )
+    store, restore_mock = _install_reconcile_store(monkeypatch, chat, canonical=mid_turn_draft)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+
+    response = await _load_history()
+
+    restore_mock.assert_awaited_once()
+    restored_workflow = restore_mock.await_args.args[0]
+    assert restored_workflow.title == "Before the turn"
+    assert restored_workflow.workflow_definition == pre_turn.workflow_definition
+    assert response.proposed_workflow is not None
+    assert response.proposed_workflow["title"] == "Half-built draft"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_keeps_an_unowned_canonical_change_rather_than_undoing_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An auto-accept commit records no ownership; undoing it would discard work the user opted to apply."""
+    pre_turn = _make_copilot_workflow("Before the turn", _NOW - timedelta(hours=2))
+    committed = _make_copilot_workflow("Auto-accepted build", datetime.now(timezone.utc) - timedelta(seconds=1500))
+    chat = _make_persisted_chat(
+        [
+            _make_pending_turn(
+                "turn-a",
+                RECONCILE_ABANDON_AFTER_SECONDS + 60,
+                pre_turn_workflow=pre_turn.model_dump(mode="json"),
+            )
+        ]
+    )
+    store, restore_mock = _install_reconcile_store(monkeypatch, chat, canonical=committed)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+
+    response = await _load_history()
+
+    restore_mock.assert_not_awaited()
+    assert response.proposed_workflow is None
+    assert len(store.assistant_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_canonical_alone_when_the_turn_never_wrote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pre_turn = _make_copilot_workflow("Untouched", _NOW - timedelta(hours=2))
+    chat = _make_persisted_chat(
+        [
+            _make_pending_turn(
+                "turn-a",
+                RECONCILE_ABANDON_AFTER_SECONDS + 60,
+                pre_turn_workflow=pre_turn.model_dump(mode="json"),
+            )
+        ]
+    )
+    store, restore_mock = _install_reconcile_store(monkeypatch, chat, canonical=pre_turn)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+
+    response = await _load_history()
+
+    restore_mock.assert_not_awaited()
+    assert response.proposed_workflow is None
+    assert len(store.assistant_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_canonical_alone_when_someone_else_wrote_after_the_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hand edit landing after the turn's own write forfeits the turn's rollback claim."""
+    pre_turn = _make_copilot_workflow("Before the turn", _NOW - timedelta(days=2))
+    turn_draft = _make_copilot_workflow("Half-built draft", datetime.now(timezone.utc) - timedelta(seconds=1600))
+    later_edit = _make_copilot_workflow("Edited by hand afterwards", datetime.now(timezone.utc))
+    chat = _make_persisted_chat(
+        [
+            _make_pending_turn(
+                "turn-a",
+                RECONCILE_ABANDON_AFTER_SECONDS * 3,
+                pre_turn_workflow=pre_turn.model_dump(mode="json"),
+                canonical_write_fingerprint=_fingerprint_of(turn_draft),
+            )
+        ]
+    )
+    store, restore_mock = _install_reconcile_store(monkeypatch, chat, canonical=later_edit)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+
+    response = await _load_history()
+
+    restore_mock.assert_not_awaited()
+    assert response.proposed_workflow is None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_keeps_an_earlier_proposal_when_keep_pending_was_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pre_turn = _make_copilot_workflow("Before the turn", _NOW - timedelta(hours=2))
+    mid_turn_draft = _make_copilot_workflow("Half-built draft", datetime.now(timezone.utc) - timedelta(seconds=1500))
+    earlier_proposal = {"workflow_id": "wf-1", "title": "Earlier proposal"}
+    chat = _make_persisted_chat(
+        [
+            _make_pending_turn(
+                "turn-a",
+                RECONCILE_ABANDON_AFTER_SECONDS + 60,
+                pre_turn_workflow=pre_turn.model_dump(mode="json"),
+                canonical_write_fingerprint=_fingerprint_of(mid_turn_draft),
+                pre_turn_proposed_workflow=earlier_proposal,
+                keep_pending_proposal=True,
+            )
+        ],
+        proposed_workflow=earlier_proposal,
+    )
+    store, restore_mock = _install_reconcile_store(monkeypatch, chat, canonical=mid_turn_draft)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+
+    response = await _load_history()
+
+    restore_mock.assert_awaited_once()
+    assert response.proposed_workflow == earlier_proposal
+
+
+@pytest.mark.asyncio
+async def test_reconcile_completes_after_a_crash_mid_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A recovery that died after claiming the turn is reclaimed and still yields one reply."""
+    entry = _make_pending_turn("turn-a", RECONCILE_ABANDON_AFTER_SECONDS * 3)
+    entry.recovering_at = datetime.now(timezone.utc) - timedelta(seconds=RECONCILE_ABANDON_AFTER_SECONDS * 2)
+    chat = _make_persisted_chat([entry])
+    store, _ = _install_reconcile_store(monkeypatch, chat)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+
+    await _load_history()
+
+    assert len(store.assistant_messages) == 1
+    assert chat.pending_turns == {}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_skips_a_turn_another_reader_is_already_recovering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = _make_pending_turn("turn-a", RECONCILE_ABANDON_AFTER_SECONDS + 60)
+    entry.recovering_at = datetime.now(timezone.utc)
+    chat = _make_persisted_chat([entry])
+    store, _ = _install_reconcile_store(monkeypatch, chat)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+
+    await _load_history()
+
+    assert store.assistant_messages == []
+    assert "turn-a" in chat.pending_turns
+
+
+@pytest.mark.asyncio
+async def test_reconcile_handles_two_overlapping_abandoned_turns(monkeypatch: pytest.MonkeyPatch) -> None:
+    chat = _make_persisted_chat(
+        [
+            _make_pending_turn("turn-a", RECONCILE_ABANDON_AFTER_SECONDS + 120),
+            _make_pending_turn("turn-b", RECONCILE_ABANDON_AFTER_SECONDS + 60),
+        ]
+    )
+    store, _ = _install_reconcile_store(monkeypatch, chat)
+    store.add_message(WorkflowCopilotChatSender.USER, "first ask")
+    store.add_message(WorkflowCopilotChatSender.USER, "second ask")
+
+    await _load_history()
+
+    recovered_turn_ids = [m.turn_outcome.copilot_turn_id for m in store.assistant_messages if m.turn_outcome]
+    assert sorted(recovered_turn_ids) == ["turn-a", "turn-b"]
+    assert chat.pending_turns == {}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_drops_the_marker_of_a_turn_that_already_replied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finalised turn whose marker clear failed must not be rolled back or answered twice."""
+    pre_turn = _make_copilot_workflow("Before the turn", _NOW - timedelta(hours=2))
+    committed = _make_copilot_workflow("Accepted build", datetime.now(timezone.utc) - timedelta(seconds=1500))
+    chat = _make_persisted_chat(
+        [
+            _make_pending_turn(
+                "turn-a",
+                RECONCILE_ABANDON_AFTER_SECONDS + 60,
+                pre_turn_workflow=pre_turn.model_dump(mode="json"),
+            )
+        ]
+    )
+    store, restore_mock = _install_reconcile_store(monkeypatch, chat, canonical=committed)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+    store.add_message(
+        WorkflowCopilotChatSender.AI,
+        "Done.",
+        TurnOutcome(response_kind=ResponseKind.BUILD, copilot_turn_id="turn-a"),
+    )
+
+    response = await _load_history()
+
+    assert len(store.assistant_messages) == 1
+    assert chat.pending_turns == {}
+    restore_mock.assert_not_awaited()
+    assert response.proposed_workflow is None
+
+
+@pytest.mark.asyncio
+async def test_persist_turn_messages_is_idempotent_for_one_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A second finalizer pass for the same turn adds no duplicate user or assistant row."""
+    chat = _make_persisted_chat([_make_pending_turn("turn-a", 10)])
+    store, _ = _install_reconcile_store(monkeypatch, chat)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+
+    for _ in range(2):
+        await _persist_turn_messages(
+            chat=chat,
+            turn_id="turn-a",
+            user_message="build me a scraper",
+            audio_artifact_id=None,
+            user_row_already_persisted=True,
+            assistant_content="Here is your workflow.",
+            global_llm_context=None,
+            turn_outcome=TurnOutcome(response_kind=ResponseKind.BUILD),
+            narrative_payload=None,
+        )
+
+    assert len(store.user_messages) == 1
+    assert len(store.assistant_messages) == 1
+    assert store.assistant_messages[0].turn_outcome is not None
+    assert store.assistant_messages[0].turn_outcome.copilot_turn_id == "turn-a"
+
+
+@pytest.mark.asyncio
+async def test_a_finished_turn_replaces_the_interrupted_row_rather_than_dropping_its_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery can reach a slow-but-live turn first; when that turn finishes, its reply is the truth."""
+    chat = _make_persisted_chat([_make_pending_turn("turn-a", 10)])
+    store, _ = _install_reconcile_store(monkeypatch, chat)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+    store.add_message(
+        WorkflowCopilotChatSender.AI,
+        INTERRUPTED_TERMINAL_MESSAGE,
+        TurnOutcome(
+            response_kind=ResponseKind.RECOVER,
+            reason_code=INTERRUPTED_TERMINAL_REASON,
+            terminal_reason=INTERRUPTED_TERMINAL_REASON,
+            copilot_turn_id="turn-a",
+        ),
+    )
+
+    await _persist_turn_messages(
+        chat=chat,
+        turn_id="turn-a",
+        user_message="build me a scraper",
+        audio_artifact_id=None,
+        user_row_already_persisted=True,
+        assistant_content="Here is your workflow.",
+        global_llm_context=None,
+        turn_outcome=TurnOutcome(response_kind=ResponseKind.BUILD),
+        narrative_payload=None,
+    )
+
+    assert len(store.assistant_messages) == 1
+    assert store.assistant_messages[0].content == "Here is your workflow."
+    outcome = store.assistant_messages[0].turn_outcome
+    assert outcome is not None
+    assert outcome.terminal_reason != INTERRUPTED_TERMINAL_REASON
+
+
+def test_reconcile_threshold_outlasts_the_turn_enforcement_ceiling() -> None:
+    assert RECONCILE_ABANDON_AFTER_SECONDS > TOTAL_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_marker_survives_a_finalizer_that_raises_with_no_assistant_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No assistant row was written, so the turn stays recoverable instead of being orphaned."""
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    captured = install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = SimpleNamespace(
+        user_response="Here is your workflow.",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        unvalidated=False,
+        turn_outcome=None,
+    )
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    monkeypatch.setattr(
+        workflow_copilot_route,
+        "_persist_turn_messages",
+        AsyncMock(side_effect=RuntimeError("database down")),
+    )
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test-key"}
+
+    await workflow_copilot_chat_post(request, _make_chat_request(), SimpleNamespace(organization_id="org-1"))
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+    stream.is_disconnected = AsyncMock(return_value=False)
+    handler = captured["handler"]
+    assert callable(handler)
+    with contextlib.suppress(RuntimeError):
+        await handler(stream)
+
+    assert app.DATABASE.workflow_params.start_copilot_turn.await_count == 1
+    app.DATABASE.workflow_params.clear_pending_copilot_turn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_writes_no_outcome_when_the_canonical_restore_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient restore failure must not persist a 'recovered' turn over a stranded canonical."""
+    pre_turn = _make_copilot_workflow("Before the turn", _NOW - timedelta(hours=2))
+    mid_turn_draft = _make_copilot_workflow("Half-built draft", datetime.now(timezone.utc) - timedelta(seconds=1500))
+    entry = _make_pending_turn(
+        "turn-a",
+        RECONCILE_ABANDON_AFTER_SECONDS + 60,
+        pre_turn_workflow=pre_turn.model_dump(mode="json"),
+        canonical_write_fingerprint=_fingerprint_of(mid_turn_draft),
+    )
+    chat = _make_persisted_chat([entry])
+    store, restore_mock = _install_reconcile_store(monkeypatch, chat, canonical=mid_turn_draft)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+    restore_mock.side_effect = RuntimeError("restore failed")
+
+    await _load_history()
+
+    assert store.assistant_messages == []
+    assert "turn-a" in chat.pending_turns
+
+    restore_mock.side_effect = None
+    entry.recovering_at = None
+
+    await _load_history()
+
+    assert len(store.assistant_messages) == 1
+    assert store.assistant_messages[0].turn_outcome is not None
+    assert store.assistant_messages[0].turn_outcome.terminal_reason == INTERRUPTED_TERMINAL_REASON
+    assert chat.pending_turns == {}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_does_not_roll_back_a_later_turns_canonical_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older abandoned turn must not attribute — and undo — a newer turn's canonical edit."""
+    pre_turn = _make_copilot_workflow("Before the turn", _NOW - timedelta(hours=2))
+    later_write = _make_copilot_workflow(
+        "Written by the later turn", datetime.now(timezone.utc) - timedelta(seconds=1350)
+    )
+    older_draft = _make_copilot_workflow("Older turn draft", datetime.now(timezone.utc) - timedelta(seconds=1500))
+    older = _make_pending_turn(
+        "turn-a",
+        RECONCILE_ABANDON_AFTER_SECONDS + 180,
+        pre_turn_workflow=pre_turn.model_dump(mode="json"),
+        canonical_write_fingerprint=_fingerprint_of(older_draft),
+    )
+    newer = _make_pending_turn("turn-b", RECONCILE_ABANDON_AFTER_SECONDS + 80)
+    chat = _make_persisted_chat([older, newer])
+    store, restore_mock = _install_reconcile_store(monkeypatch, chat, canonical=later_write)
+    store.add_message(WorkflowCopilotChatSender.USER, "first ask")
+    store.add_message(WorkflowCopilotChatSender.USER, "second ask")
+
+    response = await _load_history()
+
+    restore_mock.assert_not_awaited()
+    recovered = sorted(m.turn_outcome.copilot_turn_id for m in store.assistant_messages if m.turn_outcome)
+    assert recovered == ["turn-a", "turn-b"]
+    assert chat.pending_turns == {}
+    assert response.proposed_workflow is None
+
+
+@pytest.mark.asyncio
+async def test_finalise_normal_turn_persists_deadline_cause_and_keeps_timeout_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "should_render_copilot_terminal_from_envelope",
+        AsyncMock(return_value=True),
+    )
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    timeout_copy = "I ran out of time processing your request. Here's what I have so far."
+    envelope = assemble_terminal_envelope(
+        response_type="REPLY",
+        verified=False,
+        workflow_applied=False,
+        proposal_disposition="auto_applicable",
+        run_outcomes=[],
+        blocker_reason=None,
+        halt_kind=None,
+        attempted=None,
+        workflow_mutated=False,
+        turn_outcome_response_kind=None,
+        terminal_cause="deadline_expired",
+    )
+    assert envelope is not None
+    agent_result = AgentResult(
+        user_response=timeout_copy,
+        updated_workflow=None,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        narrative_payload=_narrative_payload(),
+        terminal_envelope=envelope.model_dump(mode="json"),
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    response_frame = stream.send.await_args.args[0]
+    assert response_frame.terminal_envelope is not None
+    assert response_frame.terminal_envelope["terminal_cause"] == "deadline_expired"
+    assert response_frame.message == timeout_copy
+
+    persisted_payload = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs[
+        "narrative_payload"
+    ]
+    assert persisted_payload["terminalEnvelope"]["terminal_cause"] == "deadline_expired"
+    assert persisted_payload["terminalMessage"] == timeout_copy
+    assert persisted_payload["narrativeSummary"] == timeout_copy

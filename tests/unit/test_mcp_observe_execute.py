@@ -1840,6 +1840,26 @@ class TestSkyvernExecuteMCP:
         assert step_error["details"]["selector"] == "#field"
 
     @pytest.mark.asyncio
+    async def test_execute_forwards_both_selectors_to_the_two_state_wait(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """_TOOL_ACCEPTED_PARAMS drops unlisted params silently, degrading the wait to one selector."""
+        page = _make_page()
+        ctx = BrowserContext(mode="local")
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+        wait = AsyncMock(return_value={"ok": True, "data": {}})
+        monkeypatch.setattr(mcp_browser, "skyvern_wait_for_either_state", wait)
+
+        await mcp_browser.skyvern_execute(
+            steps=[
+                {
+                    "tool": "wait_for_either_state",
+                    "params": {"selector_a": "#login", "selector_b": "#home", "timeout": 90000},
+                }
+            ]
+        )
+
+        assert wait.await_args.kwargs["selector_b"] == "#home"
+
+    @pytest.mark.asyncio
     async def test_execute_wait_error_does_not_leak_headers(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _make_page()
         page.validate = AsyncMock(

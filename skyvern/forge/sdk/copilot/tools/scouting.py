@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import structlog
 
 from skyvern.config import settings
+from skyvern.forge import app
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     bind_post_run_page_path_failure,
@@ -54,6 +55,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     has_actionable_steer_content,
     has_bounded_page_schema,
     has_witnessed_value_content,
+    packet_describes_a_clearable_overlay,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import FillCarry
@@ -66,10 +68,14 @@ from skyvern.forge.sdk.copilot.enforcement import (
     reset_no_progress_interaction_count,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import (
+    DOWNLOAD_KIND_OBSERVED,
     ReachedDownloadTarget,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import (
     derive_from_navigation_targets as _derive_reached_download_from_nav_targets,
+)
+from skyvern.forge.sdk.copilot.reached_download_target import (
+    derive_from_observed_download,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import guidance_for as _reached_download_guidance_for
 from skyvern.forge.sdk.copilot.result_evidence import (
@@ -318,16 +324,27 @@ async def _capture_scout_role_name(ctx: AgentContext, selector: str | None) -> N
     if not selector:
         return
     parsed = _role_name_from_selector(selector)
+    source = "selector"
     if parsed is not None:
         role, name = parsed
     else:
+        source = "page_read"
         captured = await _capture_accessible_role_name(
             ctx, selector, timeout_seconds=_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS
         )
         if captured is None:
+            # A read that never answered and one that answered namelessly leave the same empty
+            # trajectory, and only the first is a timeout worth widening.
+            LOG.info("copilot_scout_role_name_unavailable", reason="page_read_failed", source=source)
             return
         role, name = captured
     if not role or not name:
+        LOG.info(
+            "copilot_scout_role_name_unavailable",
+            reason="empty_role" if not role else "empty_name",
+            source=source,
+            role=role,
+        )
         return
     ctx.pending_scout_role_name = (selector, role, name)
 
@@ -1388,7 +1405,9 @@ _EVALUATE_ACTIONABLE_ACT_INSTRUCTION = (
 )
 _EVALUATE_RESULT_COMPOSITION_INSTRUCTION = (
     "Loaded results are already visible on the current page; inspect this page for composition or author an "
-    "extraction/validation block from the loaded results instead of re-reading it."
+    "extraction/validation block from the loaded results instead of re-reading it. For each requested output "
+    "value you can see, pass it to inspect_page_for_composition's requested_output_reads as the value exactly "
+    "as rendered plus the label above it, and the page will pin the read for you."
 )
 
 
@@ -1787,7 +1806,21 @@ async def _maybe_steer_evaluate_to_action(
             return False
         record_scouted_output_coverage(ctx, parsed, contract=contract)
         _record_scout_page_observation(ctx, parsed)
-        loaded_results = _mint_current_loaded_result_source(ctx, parsed, url=url)
+        # An overlay the loop can clear takes precedence over reading what it obscured; the dismiss
+        # control is already among the actionable targets, so the model chooses rather than being
+        # vetoed, and the next observation sees the page. Checked before results are minted rather
+        # than after: a packet describing only a dialog has no results to mint, so gating this on
+        # having minted some left it dead in the one case it exists for.
+        overlay_only = packet_describes_a_clearable_overlay(parsed)
+        if overlay_only:
+            LOG.info("copilot_evaluate_result_composition_deferred_to_obstruction", url=url)
+        # Recording an observation is independent of whether it steers. A page whose relations do not
+        # mint a loaded result is steered as actionable instead, and appending only on the composition
+        # branch discarded those packets outright: the log page carrying the requested count was
+        # observed, steered as actionable, and never reached the binder at all (SKY-13226).
+        if has_bounded_page_schema(parsed):
+            _append_flow_evidence(ctx, parsed, reached_via="current_page")
+        loaded_results = None if overlay_only else _mint_current_loaded_result_source(ctx, parsed, url=url)
         if loaded_results is not None:
             _reset_evaluate_tracker(ctx)
             ctx.latest_evaluate_result_composition_steer = loaded_results
@@ -1889,6 +1922,79 @@ def _with_trajectory_anchor(ctx: AgentContext, target: ReachedDownloadTarget) ->
     return replace(target, trajectory_anchor=anchor)
 
 
+async def _scout_session_download_names(ctx: AgentContext) -> frozenset[str] | None:
+    """Filenames currently registered in the scout's browser session, or empty when unavailable.
+
+    Read-only and failure-tolerant: this only sharpens download detection, so a storage hiccup must
+    never break a scout click."""
+    browser_session_id = ctx.browser_session_id
+    organization_id = ctx.organization_id
+    if not browser_session_id or not organization_id:
+        return None
+    try:
+        files = await app.STORAGE.list_downloaded_files_in_browser_session(
+            organization_id=organization_id, browser_session_id=browser_session_id
+        )
+    except Exception:
+        LOG.warning("copilot_scout_download_snapshot_failed", exc_info=True)
+        return None
+    return frozenset(str(name) for name in files or ())
+
+
+async def _maybe_attach_observed_download_target(
+    ctx: AgentContext,
+    result: dict[str, Any],
+    *,
+    selector: str,
+    url: str,
+) -> None:
+    """S3: pin the clicked affordance when the scout's own click produced a new download.
+
+    href shape cannot see a command-style download URL, so without this the model authors the
+    download step freehand instead of receiving the synthesizer's uncaught terminal."""
+    data = result.get("data")
+    if not isinstance(data, dict) or not selector:
+        return
+    before = ctx.pending_scout_download_snapshot
+    ctx.pending_scout_download_snapshot = None
+    if before is None:
+        return
+    try:
+        after = await _scout_session_download_names(ctx)
+        if after is None or not (after - before):
+            return
+        target = derive_from_observed_download(selector=selector, affordance_text=_scout_click_text(result))
+        if target is None:
+            return
+        data["reached_download_target"] = target.to_dict()
+        data["reached_download_guidance"] = _reached_download_guidance_for(target)
+        ctx.reached_download_target = _with_trajectory_anchor(ctx, target)
+        if ctx.synthesized_block_offered and not ctx.update_workflow_called:
+            ctx.synthesized_block_offered = False
+            ctx.synthesized_block_offered_goal_complete = False
+        _register_reached_download_scout_interaction(ctx, target, url=url)
+        LOG.info(
+            "copilot_reached_download_target_steer",
+            url=url,
+            download_kind=target.download_kind,
+            already_registered=target.already_registered,
+        )
+    except Exception:
+        LOG.warning("copilot_observed_download_target_attach_failed", exc_info=True)
+
+
+def _scout_click_text(result: dict[str, Any]) -> str:
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return ""
+    text = data.get("text") or data.get("accessible_name") or ""
+    return text if isinstance(text, str) else ""
+
+
+def _is_observed_download_target(target: object) -> bool:
+    return getattr(target, "download_kind", None) == DOWNLOAD_KIND_OBSERVED
+
+
 async def _maybe_attach_reached_download_target(
     ctx: AgentContext,
     result: dict[str, Any],
@@ -1915,6 +2021,11 @@ async def _maybe_attach_reached_download_target(
             return
         target = _derive_reached_download_from_nav_targets(parsed.get("navigation_targets"))
         if target is None:
+            return
+        if _is_observed_download_target(ctx.reached_download_target):
+            # A download that actually fired outranks a prediction from link shape; without this the
+            # later writer would repoint the target at an affordance nothing has exercised.
+            LOG.info("copilot_reached_download_target_prediction_yielded_to_observed", url=url)
             return
         data["reached_download_target"] = target.to_dict()
         data["reached_download_guidance"] = _reached_download_guidance_for(target)

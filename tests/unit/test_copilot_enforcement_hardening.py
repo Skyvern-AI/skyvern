@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -52,6 +53,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _recover_from_context_overflow,
     _scouted_spine_missing_text,
     _strip_input_images,
+    _witnessed_values_by_path,
     register_no_progress_interaction_click,
     reset_no_progress_interaction_count,
     synthesized_trajectory_reaches_goal,
@@ -491,3 +493,148 @@ def test_reject_count_resets_only_on_non_repeat_without_frontier_unchanged() -> 
     assert _code_authoring_reject_count_resets(False, True) is False
     assert _code_authoring_reject_count_resets(None, False) is False
     assert _code_authoring_reject_count_resets(True, False) is False
+
+
+# ---------------------------------------------------------------------------
+# Repair obligation — a turn may not finalize a draft its own build test disproved
+# ---------------------------------------------------------------------------
+
+
+class _FakeFinalResult:
+    """Minimal stand-in for RunResultStreaming carrying one final model response."""
+
+    def __init__(self, response_type: str, user_response: str) -> None:
+        self._payload = json.dumps({"type": response_type, "user_response": user_response})
+
+    @property
+    def final_output(self) -> str:
+        return self._payload
+
+
+def _failed_run_ctx(next_action: Any, *, observed: bool = True) -> Any:
+    ctx = _fresh_context()
+    ctx.test_after_update_done = True
+    ctx.last_test_ok = False
+    ctx.latest_diagnosis_repair_contract = _repair_contract(next_action)
+    if observed:
+        ctx.post_run_page_observation_after_failed_test = True
+        ctx.post_run_page_observation_tool = "inspect_page_for_composition"
+        ctx.post_run_page_observation_workflow_run_id = "wr_x"
+        ctx.last_run_blocks_workflow_run_id = "wr_x"
+    return ctx
+
+
+def test_observed_reply_cannot_finalize_while_repair_is_owed() -> None:
+    """The production shape: failed run -> inspect once -> report the blocker -> turn ends."""
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+
+    ctx = _failed_run_ctx(RepairNextAction.REPAIR)
+    result = _FakeFinalResult("REPLY", "The latest bill link opens an email-delivery form.")
+
+    assert _check_enforcement(ctx, result) is not None
+
+
+def test_observed_reply_finalizes_once_repair_is_discharged() -> None:
+    """A contract that no longer asks for repair releases the turn — the obligation is typed."""
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+
+    ctx = _failed_run_ctx(RepairNextAction.NO_CHANGE)
+    result = _FakeFinalResult("REPLY", "Downloaded the latest invoice.")
+
+    assert _check_enforcement(ctx, result) is None
+
+
+def test_ask_question_still_finalizes_while_repair_is_owed() -> None:
+    """Needing the user is a legitimate exit; another repair round cannot supply the answer."""
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+
+    ctx = _failed_run_ctx(RepairNextAction.REPAIR)
+    ctx.failed_test_nudge_count = 99  # counters exhausted
+    result = _FakeFinalResult("ASK_QUESTION", "Which account should I use?")
+
+    assert _check_enforcement(ctx, result) is None
+
+
+def test_exhausted_nudge_counters_do_not_release_an_open_repair_obligation() -> None:
+    """Counters bound nudge repetition; they were never evidence the failure was addressed."""
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+
+    ctx = _failed_run_ctx(RepairNextAction.REPAIR)
+    ctx.failed_test_nudge_count = 99
+    result = _FakeFinalResult("REPLY", "I drafted the workflow; it attempts to download the bill.")
+
+    assert _check_enforcement(ctx, result) == POST_FAILED_TEST_NUDGE
+
+
+def test_stop_decision_releases_the_turn_even_with_counters_exhausted() -> None:
+    """Typed terminal evidence, not a counter, is what ends a repairable failure."""
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+
+    ctx = _failed_run_ctx(RepairNextAction.STOP)
+    ctx.failed_test_nudge_count = 99
+    result = _FakeFinalResult("REPLY", "This site requires a mailed statement request.")
+
+    assert _check_enforcement(ctx, result) is None
+
+
+def test_repair_obligation_releases_the_turn_once_its_rounds_are_spent() -> None:
+    """A failure that looks repairable but is not must still be reportable, not re-nudged forever."""
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+    from skyvern.forge.sdk.copilot.enforcement import MAX_REPAIR_OBLIGATION_NUDGES
+
+    ctx = _failed_run_ctx(RepairNextAction.REPAIR)
+    ctx.failed_test_nudge_count = 99
+    result = _FakeFinalResult("REPLY", "This site offers no downloadable statement.")
+
+    # Held open while rounds remain.
+    assert _check_enforcement(ctx, result) == POST_FAILED_TEST_NUDGE
+
+    ctx.repair_obligation_nudge_count = MAX_REPAIR_OBLIGATION_NUDGES
+    assert _check_enforcement(ctx, result) is None
+
+
+class TestWitnessArbitration:
+    def _ctx(self, reads: list[str]) -> SimpleNamespace:
+        packet = {
+            "source_tool": "inspect_page_for_composition",
+            "key_value_relations": [
+                {"key_text": "logs found", "value_text": "1.41K", "visible": True, "value_visible": True}
+            ],
+        }
+        return SimpleNamespace(
+            flow_evidence=[{"evidence": packet, "reached_via": "current_page", "had_bounded_schema": True, "step": 0}],
+            scout_trajectory=[
+                {
+                    "tool_name": "read_value",
+                    "read_output_path": "output.azure_error_count",
+                    "read_output_path_source": "declared",
+                    "read_result_value": value,
+                }
+                for value in reads
+            ],
+        )
+
+    def test_conflicting_reads_resolve_to_the_value_the_page_still_shows(self) -> None:
+        # Live shape (SKY-13226): a login-form probe and the real read both claimed the path; dropping
+        # the pair left the one requested output with no witness at all.
+        ctx = self._ctx(['{"passwordId":"password"}', "1.41K"])
+        assert _witnessed_values_by_path(ctx) == {"output.azure_error_count": "1.41K"}
+
+    def test_a_conflict_the_page_corroborates_for_none_still_carries_no_witness(self) -> None:
+        ctx = self._ctx(["junk-a", "junk-b"])
+        assert _witnessed_values_by_path(ctx) == {}
+
+    def test_a_read_that_only_inherited_the_path_witnesses_nothing(self) -> None:
+        # An early probe of a login form was promoted to the requested output because it was the only
+        # path on offer, and its JSON then stood as the witness for a figure the page had not shown.
+        ctx = self._ctx([])
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "read_value",
+                "read_output_path": "output.azure_error_count",
+                "read_output_path_source": "elimination",
+                "read_result_value": '{"passwordId": "password"}',
+            }
+        ]
+
+        assert _witnessed_values_by_path(ctx) == {}

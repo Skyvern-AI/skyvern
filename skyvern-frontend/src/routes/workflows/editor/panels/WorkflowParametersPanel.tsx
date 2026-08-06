@@ -25,7 +25,8 @@ import {
   removeKeyFromNodesParameterKeys,
   replaceJinjaReferenceInNodes,
 } from "../workflowEditorUtils";
-import { DeleteConfirmationDialog } from "@/components/DeleteConfirmationDialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { AffectedBlocksNotice } from "../AffectedBlocksNotice";
 import { AppNode } from "../nodes";
 
 const WORKFLOW_EDIT_PANEL_WIDTH = 20 * 16;
@@ -196,22 +197,24 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
           </ScrollAreaViewport>
         </ScrollArea>
       </div>
-      <DeleteConfirmationDialog
+      <ConfirmDialog
         open={deleteDialogState.open}
         onOpenChange={(open) => {
           if (!open) {
             setDeleteDialogState({ open: false, parameterKey: null });
           }
         }}
-        title="Delete Input"
-        description={`Are you sure you want to delete "${deleteDialogState.parameterKey}"?`}
-        affectedBlocks={affectedBlocksForDelete}
+        title={`Delete input "${deleteDialogState.parameterKey}"?`}
+        description="This input will be deleted from the agent."
+        reversible
         onConfirm={() => {
           if (deleteDialogState.parameterKey) {
             handleDeleteParameter(deleteDialogState.parameterKey);
           }
         }}
-      />
+      >
+        <AffectedBlocksNotice affectedBlocks={affectedBlocksForDelete} />
+      </ConfirmDialog>
       {operationPanelState.active && (
         <div
           className="absolute"

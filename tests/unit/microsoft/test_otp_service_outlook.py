@@ -22,6 +22,23 @@ def _agent(monkeypatch: pytest.MonkeyPatch, credentials: list[SimpleNamespace]) 
     return AgentFunction()
 
 
+@pytest.mark.parametrize(
+    ("subject", "body"),
+    [
+        ("Your sign-in link", "Use this link to access your account: https://auth.example.test/session"),
+        ("Verification code", "Your verification code is 123456."),
+    ],
+)
+def test_otp_candidate_accepts_authentication_messages(subject: str, body: str) -> None:
+    candidate = outlook._otp_candidate(
+        {"subject": subject, "body": {"content": body}},
+        message_id="message",
+        received_datetime=datetime(2026, 8, 4, tzinfo=timezone.utc),
+    )
+
+    assert candidate is not None
+
+
 @pytest.mark.asyncio
 async def test_outlook_source_uses_mail_read_credential_and_persists_candidate(
     monkeypatch: pytest.MonkeyPatch,

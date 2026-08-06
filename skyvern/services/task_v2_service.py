@@ -23,7 +23,10 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.api_handler_factory import (
+    LLMAPIHandlerFactory,
+    get_org_aware_primary_llm_api_handler,
+)
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     CustomLLMNotFoundError,
     ensure_custom_llm_model_registered_for_org,
@@ -131,7 +134,9 @@ async def _validate_task_v2_model_for_org(organization: Organization, model: dic
 
 
 def _get_task_v2_llm_api_handler(task_v2: TaskV2) -> Any:
-    return LLMAPIHandlerFactory.get_override_llm_api_handler(task_v2.llm_key, default=app.LLM_API_HANDLER)
+    return LLMAPIHandlerFactory.get_override_llm_api_handler(
+        task_v2.llm_key, default=get_org_aware_primary_llm_api_handler()
+    )
 
 
 def _generate_data_extraction_schema_for_loop(loop_values_key: str) -> dict:
@@ -566,6 +571,8 @@ async def run_task_v2(
     context = SkyvernContext(
         organization_id=organization_id,
         organization_name=organization.organization_name,
+        org_default_llm_key=organization.default_llm_key,
+        org_default_secondary_llm_key=organization.default_secondary_llm_key,
         root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
         task_v2_id=task_v2_id,
         run_id=current_run_id,
@@ -575,6 +582,10 @@ async def run_task_v2(
         trigger_type=parent_context.trigger_type if parent_context else None,
         use_flex_llm_routing=parent_context.use_flex_llm_routing if parent_context else False,
         consecutive_captcha_timeouts=parent_context.consecutive_captcha_timeouts if parent_context else 0,
+        # The parent run body's asyncio.timeout stays binding inside this scope; dropping the
+        # deadline would let long-blocking work (e.g. a throttled vendor create) wait past it
+        # and be cancelled instead of giving up in time to degrade.
+        max_elapsed_deadline=parent_context.max_elapsed_deadline if parent_context else None,
         preserve_transient_ui_capture=parent_context.preserve_transient_ui_capture if parent_context else None,
         preserve_transient_ui_capture_resolved=(
             parent_context.preserve_transient_ui_capture_resolved if parent_context else False
@@ -799,12 +810,29 @@ async def run_task_v2_helper(
     yaml_parameters: list[PARAMETER_YAML_TYPES] = []
     current_url: str | None = None
 
+    if browser_session_id:
+        # Task V2 bypasses WorkflowService's normal browser-session acquisition path. Establish
+        # the same immutable workflow lease here before the public BrowserManager call so the
+        # worker can prove ownership without recomputing it later from mutable task/context data.
+        lease_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+            browser_session_id=browser_session_id,
+            runnable_type="workflow_run",
+            runnable_id=root_workflow_run_id,
+            organization_id=organization_id,
+        )
+        context.browser_session_runnable_id = root_workflow_run_id
+        context.browser_session_runnable_generation_id = lease_generation_id
+
     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
         workflow_run=workflow_run,
         url=str(task_v2.url) if task_v2.url else None,
         browser_session_id=browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
         navigate=False,
+        browser_session_runnable_id=root_workflow_run_id if browser_session_id else None,
+        browser_session_runnable_generation_id=(
+            context.browser_session_runnable_generation_id if browser_session_id else None
+        ),
     )
 
     page = await browser_state.get_working_page()
@@ -1548,6 +1576,7 @@ async def _set_up_workflow_context(workflow: Workflow, workflow_run_id: str, org
         [],
         None,
         workflow,
+        mask_secrets=getattr(workflow, "mask_secrets", False),
     )
 
 
@@ -1978,7 +2007,7 @@ async def _generate_compute_task(
             prior_attempt=prior_attempt,
             safety_error=safety_error,
         )
-        compute_response = await app.LLM_API_HANDLER(
+        compute_response = await _get_task_v2_llm_api_handler(task_v2)(
             compute_prompt,
             task_v2=task_v2,
             prompt_name="task_v2_generate_compute_code",
@@ -2013,7 +2042,10 @@ async def _generate_compute_task(
         raise last_error or InsecureCodeDetected("Failed to synthesize safe compute code")
 
     label = f"compute_{generate_random_string()}"
-    code_block_yaml = CodeBlockYAML(label=label, code=safe_code)
+    # A non-null prompt is what makes the editor render the code-first node; "" is runtime-neutral
+    # (every backend prompt check is truthiness based) and leaves the Goal for the user, because a
+    # fabricated one would arm runtime self-heal on a data-only block.
+    code_block_yaml = CodeBlockYAML(label=label, code=safe_code, prompt="")
     output_parameter = await app.WORKFLOW_SERVICE.create_output_parameter_for_block(
         workflow_id=workflow_id,
         block_yaml=code_block_yaml,
@@ -2023,6 +2055,7 @@ async def _generate_compute_task(
             label=label,
             code=safe_code,
             parameters=[],
+            prompt="",
             output_parameter=output_parameter,
         ),
         [code_block_yaml],

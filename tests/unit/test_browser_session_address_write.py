@@ -19,7 +19,7 @@ VENDOR_UPSTREAM = "wss://connect.vendor.example?sessionId=deadbeef-1234"
 ORG_ID = "org_test"
 
 
-async def _write_address(mock_session: MagicMock) -> None:
+async def _write_address(mock_session: MagicMock, *, mark_started: bool = False) -> None:
     repo = BrowserSessionsRepository(session_factory=lambda: MockAsyncSessionCtx(mock_session))
     await repo.set_persistent_browser_session_browser_address(
         browser_session_id="pbs_123",
@@ -29,6 +29,7 @@ async def _write_address(mock_session: MagicMock) -> None:
         organization_id="org_123",
         upstream_cdp_url=UPSTREAM,
         browser_vendor="websocket",
+        mark_started=mark_started,
     )
 
 
@@ -40,6 +41,21 @@ async def test_address_write_persists_the_routing_fields() -> None:
     assert mock_pbs.browser_address == PROXIED
     assert mock_pbs.upstream_cdp_url == UPSTREAM
     assert mock_pbs.browser_vendor == "websocket"
+
+
+@pytest.mark.asyncio
+async def test_the_session_clock_starts_only_when_the_caller_asks_for_it() -> None:
+    """An address that names the session rather than the browser can be published before anything
+    is provisioned, and starting the timeout clock there would expire a session that has no
+    browser yet — so writing an address no longer implies the session started."""
+    unstarted = MagicMock(started_at=None)
+    await _write_address(make_mock_session(unstarted))
+
+    started = MagicMock(started_at=None)
+    await _write_address(make_mock_session(started), mark_started=True)
+
+    assert unstarted.started_at is None
+    assert started.started_at is not None
 
 
 @pytest.mark.asyncio

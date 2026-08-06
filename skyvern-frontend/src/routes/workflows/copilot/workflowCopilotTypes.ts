@@ -247,12 +247,15 @@ export type WorkflowCopilotRunOutcomeVerdict =
   | "not_demonstrated"
   | "not_evaluated";
 
+export type RunOutcomeRole = "adjudicated" | "interim_build_test";
+
 export interface WorkflowCopilotRunOutcomeUpdate {
   type: "run_outcome";
   workflow_run_id: string;
   workflow_run_block_ids: string[];
   block_labels: string[];
   verdict: WorkflowCopilotRunOutcomeVerdict;
+  role?: RunOutcomeRole;
   reason_code?: string | null;
   display_reason?: string | null;
   iteration: number;

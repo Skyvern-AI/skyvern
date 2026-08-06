@@ -964,6 +964,13 @@ describe("hydrateNarrativeFromPayload — terminal adjudication fields", () => {
     expect(turn?.verifiedSuccess).toBe(true);
   });
 
+  it("hydrates the answer response kind from persisted payloads", () => {
+    const turn = hydrateNarrativeFromPayload(
+      reproClarifyPayload({ responseKind: "answer" }),
+    );
+    expect(turn?.responseKind).toBe("answer");
+  });
+
   it("treats absent fields as null", () => {
     const turn = hydrateNarrativeFromPayload(reproClarifyPayload());
     expect(turn?.responseKind).toBeNull();
@@ -1010,6 +1017,95 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     expect(summary.headline).toBe("Outcome not confirmed");
     expect(summary.accent).toBe("warn");
     expect(summary.glyph).toBe("!");
+  });
+
+  it("suppresses the live turn warning for an interim last-run outcome", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        responseType: "REPLY",
+        verifiedSuccess: false,
+        lastRunOutcome: {
+          verdict: "not_demonstrated",
+          role: "interim_build_test",
+          displayReason: "The workflow still needs its extraction block.",
+          activitySeqAtVerdict: 3,
+        },
+      }),
+    );
+
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+  });
+
+  it("suppresses the live turn warning for an interim per-block outcome", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        responseType: "REPLY",
+        verifiedSuccess: false,
+        blocks: [
+          {
+            ...summaryBlock("open_search"),
+            outcome: "not_demonstrated",
+            outcomeRole: "interim_build_test",
+            outcomeReason: "The workflow still needs its extraction block.",
+          },
+        ],
+      }),
+    );
+
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+  });
+
+  it("keeps an explicitly adjudicated outcome warning", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        responseType: "REPLY",
+        verifiedSuccess: false,
+        lastRunOutcome: {
+          verdict: "not_demonstrated",
+          role: "adjudicated",
+          displayReason: "The goal was not demonstrated.",
+          activitySeqAtVerdict: 3,
+        },
+      }),
+    );
+
+    expect(summary.headline).toBe("Outcome not confirmed");
+    expect(summary.accent).toBe("warn");
+  });
+
+  it("keeps the terminal envelope authoritative over interim live state", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        responseType: "REPLY",
+        verifiedSuccess: false,
+        terminalEnvelope: {
+          runVerdict: "not_demonstrated",
+          runDisplayReason: "The final run did not demonstrate the goal.",
+        },
+        lastRunOutcome: {
+          verdict: "not_demonstrated",
+          role: "interim_build_test",
+          displayReason: "The workflow still needs its extraction block.",
+          activitySeqAtVerdict: 3,
+        },
+        blocks: [
+          {
+            ...summaryBlock("open_search"),
+            outcome: "not_demonstrated",
+            outcomeRole: "interim_build_test",
+          },
+        ],
+      }),
+    );
+
+    expect(summary.headline).toBe("Outcome not confirmed");
+    expect(summary.accent).toBe("warn");
   });
 
   it("uses hydrated not_demonstrated block outcomes when lastRunOutcome is absent", () => {
@@ -1192,6 +1288,7 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     ["recover", "Question"],
     ["refuse", "Declined"],
     ["diagnose", "Answered"],
+    ["answer", "Answered"],
   ] as const)(
     "maps non-build kind %s to %s with qa accent",
     (kind, headline) => {
@@ -1444,6 +1541,7 @@ describe("computeTurnSummary — uxV1 disposition-first reorder (SKY-12136)", ()
   it.each([
     ["refuse", "Declined"],
     ["diagnose", "Answered"],
+    ["answer", "Answered"],
   ] as const)(
     "leaves %s as %s under uxV1 — only the clarify/Question case renames",
     (kind, headline) => {

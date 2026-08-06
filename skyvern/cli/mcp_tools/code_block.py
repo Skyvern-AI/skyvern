@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import textwrap
 from typing import Annotated, Any
 
 from pydantic import Field
@@ -216,7 +217,9 @@ async def skyvern_code_block_synthesize(
         )
 
     data = {
-        "code": synthesized.code,
+        # The synthesizer emits wrapper-indented code for the copilot stitch path; this tool's
+        # contract is a standalone block, so dedent before returning.
+        "code": textwrap.dedent(synthesized.code),
         "parameters": synthesized.parameters,
         "steps": synthesized.steps,
         "notes": synthesized.notes,

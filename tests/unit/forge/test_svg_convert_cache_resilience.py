@@ -202,6 +202,39 @@ async def test_svg_convert_does_not_retry_llm_when_cache_set_fails(monkeypatch: 
     assert "children" not in element
 
 
+def test_svg_converter_stays_disabled_without_global_or_org_fast(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolver = MagicMock(side_effect=AssertionError("org resolver must not bypass the None gate"))
+    monkeypatch.setattr(
+        agent_functions,
+        "app",
+        SimpleNamespace(SVG_CSS_CONVERTER_LLM_API_HANDLER=None),
+    )
+    monkeypatch.setattr(agent_functions, "get_org_aware_secondary_llm_api_handler", resolver)
+
+    assert agent_functions._get_org_aware_svg_css_converter_llm_api_handler() is None
+    resolver.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_svg_converter_uses_org_fast_when_global_is_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    handler = AsyncMock(return_value={"shape": "search icon", "recognized": True})
+    monkeypatch.setattr(
+        agent_functions,
+        "app",
+        SimpleNamespace(CACHE=_MemoryCache(), SVG_CSS_CONVERTER_LLM_API_HANDLER=None),
+    )
+    resolver = MagicMock(return_value=handler)
+    monkeypatch.setattr(agent_functions, "get_org_aware_secondary_llm_api_handler", resolver)
+    skyvern_context.ensure_context().org_default_secondary_llm_key = "CUSTOM_LLM_oat_fast"
+
+    element = _svg_element()
+    await agent_functions._convert_svg_to_string(element)
+
+    resolver.assert_called_once_with()
+    handler.assert_awaited_once()
+    assert element["attributes"] == {"alt": "search icon"}
+
+
 @pytest.mark.asyncio
 async def test_svg_convert_uses_local_fallback_when_redis_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = 0

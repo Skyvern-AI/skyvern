@@ -386,6 +386,24 @@ def unzip_files(zip_file_path: str, output_dir: str) -> None:
         zip_ref.extractall(output_dir)
 
 
+def unzip_bytes_to_temp_directory(zip_bytes: bytes, prefix: str) -> str:
+    """Extract a downloaded archive into a fresh temp directory and return its path.
+
+    The archive must be CLOSED before ZipFile reopens it by path: a write smaller than the io buffer
+    (~8KB) is otherwise still unflushed, so ZipFile sees an empty file and raises BadZipFile.
+    """
+    temp_dir = make_temp_directory(prefix=prefix)
+    with create_named_temporary_file(delete=False) as temp_zip_file:
+        temp_zip_file.write(zip_bytes)
+        temp_zip_file_path = temp_zip_file.name
+    try:
+        unzip_files(temp_zip_file_path, temp_dir)
+    finally:
+        # Cookie-bearing archives must not accumulate in TEMP_PATH on every retrieve.
+        os.unlink(temp_zip_file_path)
+    return temp_dir
+
+
 _REMOTE_URL_PREFIXES = ("http://", "https://", "s3://", "gs://", "azure://", "www.")
 
 

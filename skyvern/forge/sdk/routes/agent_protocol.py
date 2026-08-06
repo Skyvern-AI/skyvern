@@ -42,7 +42,12 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_for_organization
+from skyvern.forge.sdk.api.llm.custom_llm_registry import (
+    CUSTOM_LLM_KEY_PREFIX,
+    ensure_custom_llm_registered_for_org,
+    is_custom_llm_key,
+    load_custom_llm_configs_for_organization,
+)
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactSignedUrl, ArtifactType
 from skyvern.forge.sdk.artifact.signing import (
@@ -139,6 +144,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
 from skyvern.schemas.runs import (
+    BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY,
     CUA_ENGINES,
     MAX_SEARCH_FETCH_LIMIT,
     BlockRunRequest,
@@ -3385,7 +3391,7 @@ async def webhook(
             "Webhook signature or timestamp missing",
             x_skyvern_signature=x_skyvern_signature,
             x_skyvern_timestamp=x_skyvern_timestamp,
-            payload=payload,
+            payload_length=len(payload),
         )
         raise HTTPException(
             status_code=http_status.HTTP_400_BAD_REQUEST,
@@ -3401,7 +3407,7 @@ async def webhook(
         "Webhook received",
         x_skyvern_signature=x_skyvern_signature,
         x_skyvern_timestamp=x_skyvern_timestamp,
-        payload=payload,
+        payload_length=len(payload),
         generated_signature=generated_signature,
         valid_signature=x_skyvern_signature == generated_signature,
     )
@@ -3564,7 +3570,11 @@ async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api
         )
 
     if workflow_run.browser_session_id:
-        await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(workflow_run.browser_session_id, organization_id)
+        await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
+            workflow_run.browser_session_id,
+            organization_id,
+            expected_runnable_id=workflow_run.workflow_run_id,
+        )
 
     # get all the child workflow runs and cancel them
     child_workflow_runs = await app.DATABASE.workflow_runs.get_workflow_runs_by_parent_workflow_run_id(
@@ -3608,25 +3618,28 @@ def _workflow_run_request_from_workflow_request(
     title: str | None,
     workflow_request: WorkflowRequestBody,
 ) -> WorkflowRunRequest:
-    return WorkflowRunRequest(
-        workflow_id=workflow_id,
-        title=title,
-        parameters=workflow_request.data,
-        proxy_location=workflow_request.proxy_location,
-        webhook_url=workflow_request.webhook_callback_url,
-        totp_url=workflow_request.totp_verification_url,
-        totp_identifier=workflow_request.totp_identifier,
-        browser_session_id=workflow_request.browser_session_id,
-        browser_profile_id=workflow_request.browser_profile_id,
-        start_fresh_browser=workflow_request.start_fresh_browser,
-        max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
-        max_elapsed_time_minutes=getattr(workflow_request, "max_elapsed_time_minutes", None),
-        extra_http_headers=workflow_request.extra_http_headers,
-        cdp_connect_headers=workflow_request.cdp_connect_headers,
-        browser_address=workflow_request.browser_address,
-        run_with=workflow_request.run_with,
-        ai_fallback=workflow_request.ai_fallback,
-        run_metadata=workflow_request.run_metadata,
+    return WorkflowRunRequest.model_validate(
+        {
+            "workflow_id": workflow_id,
+            "title": title,
+            "parameters": workflow_request.data,
+            "proxy_location": workflow_request.proxy_location,
+            "webhook_url": workflow_request.webhook_callback_url,
+            "totp_url": workflow_request.totp_verification_url,
+            "totp_identifier": workflow_request.totp_identifier,
+            "browser_session_id": workflow_request.browser_session_id,
+            "browser_profile_id": workflow_request.browser_profile_id,
+            "start_fresh_browser": workflow_request.start_fresh_browser,
+            "max_screenshot_scrolls": workflow_request.max_screenshot_scrolls,
+            "max_elapsed_time_minutes": getattr(workflow_request, "max_elapsed_time_minutes", None),
+            "extra_http_headers": workflow_request.extra_http_headers,
+            "cdp_connect_headers": workflow_request.cdp_connect_headers,
+            "browser_address": workflow_request.browser_address,
+            "run_with": workflow_request.run_with,
+            "ai_fallback": workflow_request.ai_fallback,
+            "run_metadata": workflow_request.run_metadata,
+        },
+        context={BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY: True},
     )
 
 
@@ -5274,6 +5287,32 @@ async def update_organization(
                 "max_steps_per_workflow_run — pick one"
             ),
         )
+    for field_name, llm_key, clear_llm_key in [
+        ("default_llm_key", org_update.default_llm_key, org_update.clear_default_llm_key),
+        (
+            "default_secondary_llm_key",
+            org_update.default_secondary_llm_key,
+            org_update.clear_default_secondary_llm_key,
+        ),
+    ]:
+        if clear_llm_key and llm_key is not None:
+            raise HTTPException(
+                status_code=http_status.HTTP_400_BAD_REQUEST,
+                detail=f"clear_{field_name} cannot be combined with a non-null {field_name} — pick one",
+            )
+        if llm_key is not None and (
+            not is_custom_llm_key(llm_key)
+            or not await ensure_custom_llm_registered_for_org(
+                llm_key.removeprefix(CUSTOM_LLM_KEY_PREFIX),
+                current_org.organization_id,
+                app.DATABASE,
+            )
+        ):
+            raise HTTPException(
+                status_code=http_status.HTTP_400_BAD_REQUEST,
+                detail=f"{field_name} must reference a valid custom LLM for this organization",
+            )
+
     updated = await app.DATABASE.organizations.update_organization(
         current_org.organization_id,
         max_steps_per_run=org_update.max_steps_per_run,
@@ -5283,6 +5322,10 @@ async def update_organization(
         webhook_callback_url=org_update.webhook_callback_url,
         artifact_url_expiry_seconds=org_update.artifact_url_expiry_seconds,
         clear_artifact_url_expiry_seconds=org_update.clear_artifact_url_expiry_seconds,
+        default_llm_key=org_update.default_llm_key,
+        clear_default_llm_key=org_update.clear_default_llm_key,
+        default_secondary_llm_key=org_update.default_secondary_llm_key,
+        clear_default_secondary_llm_key=org_update.clear_default_secondary_llm_key,
     )
 
     org_auth_service.invalidate_cached_org(current_org.organization_id)
@@ -5336,7 +5379,7 @@ async def get_current_organization(
 )
 async def get_api_keys(
     organization_id: str,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_with_api_token),
 ) -> GetOrganizationAPIKeysResponse:
     if organization_id != current_org.organization_id:
         raise HTTPException(status_code=403, detail="You do not have permission to access this organization")

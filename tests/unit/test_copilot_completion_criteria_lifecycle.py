@@ -327,6 +327,17 @@ def test_reconcile_no_criteria_anywhere_is_noop() -> None:
             ),
             id="antecedent-family",
         ),
+        pytest.param(
+            (
+                CompletionCriterion(
+                    id="__copilot_requested_output__output_visitors_last_7_days",
+                    outcome="the number of visitors in the last 7 days is output",
+                    output_path="output.visitors_last_7_days",
+                    requested_output_label="visitors",
+                ),
+            ),
+            id="requested-output-label",
+        ),
     ],
 )
 def test_criteria_json_round_trip_preserves_fields(criteria: tuple[CompletionCriterion, ...]) -> None:

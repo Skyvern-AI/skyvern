@@ -11,6 +11,7 @@ from skyvern.forge.sdk.api.real_azure import RealAsyncAzureStorageClient
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.azure import AzureStorage
 from skyvern.forge.sdk.artifact.storage.base import SENSITIVE_SHARE_URL_EXPIRY_HOURS
+from skyvern.forge.sdk.artifact.storage.recording_test_helpers import fake_prepared_recording
 
 # Test constants
 TEST_CONTAINER = "test-azure-container"
@@ -68,19 +69,28 @@ class TestAzureStorageBrowserSessionFiles:
         """Test syncing a file with date in path (videos/har)."""
         test_file = tmp_path / "recording.webm"
         test_file.write_bytes(b"fake video data")
+        prepared_file = tmp_path / "recording.mp4"
+        prepared_file.write_bytes(b"fake mp4 data")
 
-        uri = await azure_storage.sync_browser_session_file(
-            organization_id=TEST_ORGANIZATION_ID,
-            browser_session_id=TEST_BROWSER_SESSION_ID,
-            artifact_type="videos",
-            local_file_path=str(test_file),
-            remote_path="recording.webm",
-            date="2025-01-15",
-        )
+        with patch(
+            "skyvern.forge.sdk.artifact.storage.azure.prepare_recording_for_upload",
+            lambda path: fake_prepared_recording(path, str(prepared_file)),
+        ):
+            with patch("skyvern.forge.sdk.artifact.storage.azure.sync_run_recording_clips", new=AsyncMock()):
+                uri = await azure_storage.sync_browser_session_file(
+                    organization_id=TEST_ORGANIZATION_ID,
+                    browser_session_id=TEST_BROWSER_SESSION_ID,
+                    artifact_type="videos",
+                    local_file_path=str(test_file),
+                    remote_path="recording.webm",
+                    date="2025-01-15",
+                )
 
-        expected_uri = f"azure://{TEST_CONTAINER}/v1/{settings.ENV}/{TEST_ORGANIZATION_ID}/browser_sessions/{TEST_BROWSER_SESSION_ID}/videos/2025-01-15/recording.webm"
+        expected_uri = f"azure://{TEST_CONTAINER}/v1/{settings.ENV}/{TEST_ORGANIZATION_ID}/browser_sessions/{TEST_BROWSER_SESSION_ID}/videos/2025-01-15/recording.mp4"
         assert uri == expected_uri
-        azure_storage.async_client.upload_file_from_path.assert_called_once()
+        azure_storage.async_client.upload_file_from_path.assert_called_once_with(
+            expected_uri, str(prepared_file), tier=StandardBlobTier.HOT, tags={"test": "tag"}
+        )
 
     async def test_sync_browser_session_file_without_date(
         self, azure_storage: AzureStorageForTests, tmp_path: Path

@@ -63,6 +63,24 @@ const LONG_OUTCOME_REASON =
   "The verification challenge kept reappearing after submit, and each retry landed back on the same gate instead of the requested destination page.";
 const SHORT_OUTCOME_REASON = "A verification challenge prevented confirmation";
 
+const interimRunTurn = (): TurnNarrativeState => ({
+  ...inFlightTurn(),
+  blocks: [
+    {
+      ...completedBlock("block_1"),
+      outcome: "not_demonstrated",
+      outcomeRole: "interim_build_test",
+      outcomeReason: SHORT_OUTCOME_REASON,
+    },
+  ],
+  lastRunOutcome: {
+    verdict: "not_demonstrated",
+    role: "interim_build_test",
+    displayReason: SHORT_OUTCOME_REASON,
+    activitySeqAtVerdict: 0,
+  },
+});
+
 afterEach(() => {
   cleanup();
 });
@@ -123,6 +141,64 @@ describe("NarrativeView collapse default", () => {
     expect(
       screen.getByText("Waiting for the first block to start…"),
     ).toBeTruthy();
+  });
+
+  it.each([false, true])(
+    "renders an interim completed row as neutral in uxV1=%s",
+    (uxV1) => {
+      render(<NarrativeView turn={interimRunTurn()} uxV1={uxV1} />);
+
+      const row = screen.getByTitle("Highlight block_1 on canvas");
+      expect(row.textContent).toContain("ran");
+      expect(row.textContent).not.toContain("!");
+      expect(row.textContent).not.toContain("✓");
+      expect(screen.queryByText(/Outcome not confirmed/)).toBeNull();
+      expect(screen.queryByText(SHORT_OUTCOME_REASON)).toBeNull();
+    },
+  );
+
+  it.each([undefined, "adjudicated" as const])(
+    "keeps role=%s not-demonstrated rows amber",
+    (outcomeRole) => {
+      const block: BlockState = {
+        ...completedBlock("block_1"),
+        outcome: "not_demonstrated",
+        outcomeReason: SHORT_OUTCOME_REASON,
+        ...(outcomeRole ? { outcomeRole } : {}),
+      };
+      render(<NarrativeView turn={{ ...inFlightTurn(), blocks: [block] }} />);
+
+      const row = screen.getByTitle("Highlight block_1 on canvas");
+      expect(row.textContent).toContain("!");
+      expect(row.textContent).not.toContain("✓");
+      expect(screen.getByText(/Outcome not confirmed/)).toBeTruthy();
+      expect(screen.getByText(new RegExp(SHORT_OUTCOME_REASON))).toBeTruthy();
+    },
+  );
+
+  it("hydrates an interim outcome into the same neutral row treatment", () => {
+    const hydrated = hydrateNarrativeFromPayload({
+      turnId: "turn-hydrated-interim",
+      turnIndex: 0,
+      mode: "build",
+      blocks: [
+        {
+          ...completedBlock("block_1"),
+          outcome: "not_demonstrated",
+          outcomeRole: "interim_build_test",
+          outcomeReason: SHORT_OUTCOME_REASON,
+        },
+      ],
+      terminal: null,
+    })!;
+    render(<NarrativeView turn={hydrated} />);
+
+    const row = screen.getByTitle("Highlight block_1 on canvas");
+    expect(row.textContent).toContain("ran");
+    expect(row.textContent).not.toContain("!");
+    expect(row.textContent).not.toContain("✓");
+    expect(screen.queryByText(/Outcome not confirmed/)).toBeNull();
+    expect(screen.queryByText(SHORT_OUTCOME_REASON)).toBeNull();
   });
 
   it("expands via the summary card and re-collapses via the labeled control", () => {
@@ -355,5 +431,72 @@ describe("NarrativeView collapse default", () => {
     const head = screen.getByRole("button", { name: new RegExp(HEADLINE) });
     expect(head.textContent).toContain("Built it.");
     expect(head.textContent).not.toContain("Outcome not confirmed:");
+  });
+});
+
+const pureAskTurn = (): TurnNarrativeState => ({
+  ...EMPTY_NARRATIVE,
+  turnId: "turn-ask",
+  turnIndex: 0,
+  mode: "clarify",
+  responseType: "ASK_QUESTION",
+  terminal: "response",
+  narrativeSummary: "Which login should I use?",
+});
+
+const SCOUT_NARRATION = "Checked the login page for SSO options.";
+
+const askAfterScoutingTurn = (): TurnNarrativeState => ({
+  ...pureAskTurn(),
+  turnId: "turn-ask-scouted",
+  designStarted: true,
+  designActivity: [
+    { kind: "narration", text: SCOUT_NARRATION, iteration: 0, id: "n-1" },
+  ],
+});
+
+describe("NarrativeView rollup expand affordance", () => {
+  it("renders a pure needs-input ask as a plain, non-expandable card", () => {
+    render(<NarrativeView turn={pureAskTurn()} uxV1 />);
+
+    expect(screen.getByText("Which login should I use?")).toBeTruthy();
+    expect(screen.queryByRole("button")).toBeNull();
+    expect(document.querySelector("[aria-expanded]")).toBeNull();
+  });
+
+  it("keeps the chevron for an ask that follows scouting and reveals the thought stream on expand", () => {
+    render(<NarrativeView turn={askAfterScoutingTurn()} uxV1 />);
+
+    const head = screen.getByRole("button");
+    expect(head.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText(SCOUT_NARRATION)).toBeNull();
+
+    fireEvent.click(head);
+    expect(screen.getByRole("button", { name: "Collapse turn" })).toBeTruthy();
+    expect(screen.getByText(SCOUT_NARRATION)).toBeTruthy();
+  });
+
+  it("still shows the expand chevron for a build turn with blocks", () => {
+    render(<NarrativeView turn={terminalBuildTurn()} />);
+
+    const head = screen.getByRole("button", { name: new RegExp(HEADLINE) });
+    expect(head.getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.click(head);
+    expect(screen.getByRole("button", { name: "Collapse turn" })).toBeTruthy();
+  });
+
+  it("gains the expand affordance when activity arrives after a content-free render", () => {
+    const { rerender } = render(<NarrativeView turn={pureAskTurn()} uxV1 />);
+    expect(screen.queryByRole("button")).toBeNull();
+
+    rerender(
+      <NarrativeView
+        turn={{ ...pureAskTurn(), blocks: [completedBlock("block_1")] }}
+        uxV1
+      />,
+    );
+    const head = screen.getByRole("button");
+    expect(head.getAttribute("aria-expanded")).toBe("false");
   });
 });

@@ -8,6 +8,7 @@ import {
   TrashIcon,
 } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   Card,
   CardContent,
@@ -569,44 +570,24 @@ function LabelManagement() {
         existingGroups={groups.map((group) => group.key)}
       />
 
-      <Dialog
+      <ConfirmDialog
         open={labelToDelete !== null}
         onOpenChange={(next) => {
-          if (!next && !deleteMutation.isPending) {
+          if (!next) {
             setLabelToDelete(null);
           }
         }}
-      >
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>Delete label “{labelToDelete?.value}”?</DialogTitle>
-            <DialogDescription>
-              This removes it from {usageLabel(deleteCount)} and from the “
-              {labelToDelete?.key}” group. This can’t be undone.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setLabelToDelete(null)}
-              disabled={deleteMutation.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              className="gap-2"
-              disabled={deleteMutation.isPending}
-              onClick={confirmDelete}
-            >
-              {deleteMutation.isPending ? (
-                <ReloadIcon className="h-4 w-4 animate-spin" />
-              ) : null}
-              Delete
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        title={`Delete label "${labelToDelete?.value ?? ""}"?`}
+        description={
+          <p>
+            This removes it from {usageLabel(deleteCount)} and from the "
+            {labelToDelete?.key ?? ""}" group.
+          </p>
+        }
+        contentClassName="sm:max-w-md"
+        isPending={deleteMutation.isPending}
+        onConfirm={confirmDelete}
+      />
     </div>
   );
 }

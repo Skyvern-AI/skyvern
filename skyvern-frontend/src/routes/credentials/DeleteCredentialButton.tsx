@@ -1,14 +1,8 @@
-import {
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
+import { useState } from "react";
+
 import { getClient } from "@/api/AxiosClient";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   Tooltip,
   TooltipContent,
@@ -19,7 +13,7 @@ import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
-import { ReloadIcon, TrashIcon } from "@radix-ui/react-icons";
+import { TrashIcon } from "@radix-ui/react-icons";
 import { CredentialApiResponse } from "@/api/types";
 type Props = {
   credential: CredentialApiResponse;
@@ -28,6 +22,7 @@ type Props = {
 function DeleteCredentialButton({ credential }: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
+  const [open, setOpen] = useState(false);
 
   const deleteCredentialMutation = useMutation({
     mutationFn: async (id: string) => {
@@ -38,6 +33,7 @@ function DeleteCredentialButton({ credential }: Props) {
       queryClient.invalidateQueries({
         queryKey: ["credentials"],
       });
+      setOpen(false);
       toast({
         title: "Credential deleted",
         variant: "success",
@@ -54,48 +50,40 @@ function DeleteCredentialButton({ credential }: Props) {
   });
 
   return (
-    <Dialog>
+    <>
       <TooltipProvider>
         <Tooltip>
           <TooltipTrigger asChild>
-            <DialogTrigger asChild>
-              <Button size="icon" variant="tertiary" className="h-8 w-9">
-                <TrashIcon className="size-5" />
-              </Button>
-            </DialogTrigger>
+            <Button
+              size="icon"
+              variant="tertiary"
+              className="h-8 w-9"
+              onClick={() => setOpen(true)}
+            >
+              <TrashIcon className="size-5" />
+            </Button>
           </TooltipTrigger>
           <TooltipContent>Delete Credential</TooltipContent>
         </Tooltip>
       </TooltipProvider>
-      <DialogContent onCloseAutoFocus={(e) => e.preventDefault()}>
-        <DialogHeader>
-          <DialogTitle>Are you sure?</DialogTitle>
-        </DialogHeader>
-        <div className="text-sm text-slate-400">
-          The credential{" "}
-          <span className="font-bold text-primary">{credential.name}</span> will
-          be PERMANENTLY deleted. The Skyvern team has no way to restore a
-          credential once it's deleted.
-        </div>
-        <DialogFooter>
-          <DialogClose asChild>
-            <Button variant="secondary">Cancel</Button>
-          </DialogClose>
-          <Button
-            variant="destructive"
-            onClick={() => {
-              deleteCredentialMutation.mutate(credential.credential_id);
-            }}
-            disabled={deleteCredentialMutation.isPending}
-          >
-            {deleteCredentialMutation.isPending && (
-              <ReloadIcon className="mr-2 size-4 animate-spin" />
-            )}
-            Delete
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+      <ConfirmDialog
+        open={open}
+        onOpenChange={setOpen}
+        title="Delete credential?"
+        description={
+          <p>
+            The credential{" "}
+            <span className="font-bold text-primary">{credential.name}</span>{" "}
+            will be permanently deleted.
+          </p>
+        }
+        reversibilityNote="The Skyvern team can't restore a credential once it's deleted."
+        isPending={deleteCredentialMutation.isPending}
+        onConfirm={() =>
+          deleteCredentialMutation.mutate(credential.credential_id)
+        }
+      />
+    </>
   );
 }
 

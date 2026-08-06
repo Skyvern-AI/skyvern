@@ -19,6 +19,7 @@ import {
   effectiveMode,
   formatElapsed,
   isBlockOk,
+  isInterimOutcome,
   latestBlocksByLabel,
   notConfirmedOutcome,
   parseUtcIsoMs,
@@ -353,11 +354,18 @@ function FBlockRun({
   const isRunning = block.state === "running";
   const isCompleted = block.state === "completed";
   const isEvaluating = isCompleted && block.outcome === "evaluating";
+  const isInterimNotDemonstrated =
+    isCompleted &&
+    block.outcome === "not_demonstrated" &&
+    isInterimOutcome(block.outcomeRole);
   // A row stuck in `evaluating` at turn end (dropped stream) renders the
   // neutral "ran" treatment — never the live verifying beat, never green.
   const isVerifying = isEvaluating && !turnEnded;
-  const isRanNeutral = isEvaluating && turnEnded;
-  const isOutcomeNotShown = isCompleted && block.outcome === "not_demonstrated";
+  const isRanNeutral = (isEvaluating && turnEnded) || isInterimNotDemonstrated;
+  const isOutcomeNotShown =
+    isCompleted &&
+    block.outcome === "not_demonstrated" &&
+    !isInterimNotDemonstrated;
   const isOk = isBlockOk(block);
   const isFail = block.state === "failed";
   const isDraft = block.state === "drafted";
@@ -1012,18 +1020,15 @@ function accentBg(accent: TurnSummary["accent"]): string {
 interface TurnHeadProps {
   summary: TurnSummary;
   expanded: boolean;
-  onClick: () => void;
+  onClick?: () => void;
   subtitle?: ReactNode;
 }
 
 function TurnHead({ summary, expanded, onClick, subtitle }: TurnHeadProps) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-expanded={expanded}
-      className="flex w-full items-start gap-3 px-3.5 py-3 text-left"
-    >
+  const expandable = Boolean(onClick);
+  const headClass = "flex w-full items-start gap-3 px-3.5 py-3 text-left";
+  const body = (
+    <>
       <span
         className={`flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full border text-[12px] font-bold ${accentBg(
           summary.accent,
@@ -1045,14 +1050,31 @@ function TurnHead({ summary, expanded, onClick, subtitle }: TurnHeadProps) {
         </div>
         {subtitle}
       </div>
-      <span
-        className={`mt-1 shrink-0 text-[14px] text-muted-foreground transition-transform dark:text-slate-500 ${
-          expanded ? "rotate-90" : ""
-        }`}
-        aria-hidden="true"
-      >
-        ›
-      </span>
+      {expandable ? (
+        <span
+          className={`mt-1 shrink-0 text-[14px] text-muted-foreground transition-transform dark:text-slate-500 ${
+            expanded ? "rotate-90" : ""
+          }`}
+          aria-hidden="true"
+        >
+          ›
+        </span>
+      ) : null}
+    </>
+  );
+
+  if (!expandable) {
+    return <div className={headClass}>{body}</div>;
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-expanded={expanded}
+      className={headClass}
+    >
+      {body}
     </button>
   );
 }
@@ -1097,13 +1119,20 @@ function RollupCard({
   const failed = rollupBlocks.filter((b) => b.state === "failed");
   const showCommit = !summary.isQA && completed.length > 0;
   const showChecklist = Boolean(uxV1) && showPhaseChecklist(turn);
+  // Expand only earns a chevron when DetailView adds content beyond the head's
+  // message — a pure ask (no scouting) re-renders the same text, so no chevron.
+  const hasExpandableDetail =
+    showChecklist ||
+    turn.blocks.length > 0 ||
+    (turn.designStarted && (turn.draft?.blockCount ?? 0) > 0) ||
+    turn.designActivity.some((e) => e.kind === "narration");
 
   return (
     <div className="overflow-hidden rounded-xl border border-border/60 bg-slate-elevation2">
       <TurnHead
         summary={summary}
         expanded={false}
-        onClick={onExpand}
+        onClick={hasExpandableDetail ? onExpand : undefined}
         subtitle={
           subtitle ? (
             <div

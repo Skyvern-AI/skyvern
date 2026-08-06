@@ -1241,6 +1241,24 @@ def test_allows_explicit_unresolved_credential_id_for_untested_draft() -> None:
     assert verdict.allowed
 
 
+def test_rejects_credential_ref_the_user_did_not_state_even_for_untested_draft() -> None:
+    """A cred_ ref carried only in credential_refs (model-authored or negated) is not draft-bindable (SKY-13552)."""
+    verdict = evaluate_output_policy(
+        request_policy=_policy(
+            resolved_credentials=[],
+            credential_input_kind="credential_id",
+            credential_refs=["cred_carried"],
+            invalid_credential_ids=[],
+            allow_missing_credentials_in_draft=True,
+            allow_run_blocks=False,
+        ),
+        workflow_yaml=_workflow_yaml().replace("cred_safe", "cred_carried"),
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE in verdict.reason_codes
+
+
 def test_rejects_unrequested_credential_id_even_when_untested_draft_allows_missing_credentials() -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(
@@ -1521,7 +1539,7 @@ def test_actuation_obligation_unrelated_prior_steer_stays_recoverable() -> None:
     assert evaluation.reason_code == ACTUATION_OBLIGATION_STEER_REASON_CODE
 
 
-@pytest.mark.parametrize("mode", [TurnIntentMode.DOCS_ANSWER, TurnIntentMode.DIAGNOSE])
+@pytest.mark.parametrize("mode", [TurnIntentMode.ANSWER, TurnIntentMode.DIAGNOSE])
 def test_actuation_obligation_allows_non_actuation_intents(mode: TurnIntentMode) -> None:
     evaluation = evaluate_actuation_obligation(
         turn_intent=TurnIntent(mode=mode, authority=TurnIntentAuthority(may_update_workflow=False)),
@@ -1785,7 +1803,7 @@ def test_sdk_output_guardrail_allows_unknown_click_with_authority_denied_blocker
 @pytest.mark.parametrize(
     ("reason", "expected_terms"),
     [
-        (OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE, ("credential", "confirm")),
+        (OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE, ("credential", "credential id")),
         (OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED, ("credential", "url", "re-select")),
     ],
 )
@@ -1901,7 +1919,7 @@ workflow_definition:
 
     assert result.response_type == "ASK_QUESTION"
     assert "credential" in result.user_response.lower()
-    assert "confirm" in result.user_response.lower()
+    assert "credential id" in result.user_response.lower()
     assert "I could not safely return" not in result.user_response
 
 

@@ -10,14 +10,17 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 from fastapi import HTTPException
+from fastmcp import FastMCP
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+from starlette.testclient import TestClient
 
 from skyvern.cli.core import client as client_mod
-from skyvern.cli.core import mcp_http_auth
+from skyvern.cli.core import mcp_http_auth, session_manager
+from skyvern.cli.core.result import BrowserContext
 
 _TEST_BASE_URL = "http://testserver"
 
@@ -25,6 +28,12 @@ _TEST_BASE_URL = "http://testserver"
 @pytest.fixture(autouse=True)
 def _reset_auth_context() -> None:
     client_mod._api_key_override.set(None)
+    session_manager._current_session.set(None)
+    session_manager._global_session = None
+    session_manager._copilot_sessions.clear()
+    session_manager._organization_sessions.clear()
+    session_manager._current_organization_id.set(None)
+    session_manager.set_stateless_http_mode(False)
     mcp_http_auth._auth_db = None
     mcp_http_auth._api_key_validation_cache.clear()
     mcp_http_auth._API_KEY_CACHE_TTL_SECONDS = 30.0
@@ -262,6 +271,152 @@ async def test_mcp_http_auth_sets_request_scoped_api_key(monkeypatch: pytest.Mon
         "organization_id": "org_123",
     }
     assert client_mod.get_active_api_key() != "sk_live_abc"
+
+
+@pytest.mark.asyncio
+async def test_stateful_http_session_is_scoped_to_authenticated_organization_with_exact_session_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = "pbs_owned_session"
+    first_browser = SimpleNamespace(owner="first")
+    denied_connection = AsyncMock(side_effect=PermissionError("session is not owned by this organization"))
+    monkeypatch.setattr(
+        session_manager,
+        "get_skyvern",
+        lambda: SimpleNamespace(connect_to_cloud_browser_session=denied_connection),
+    )
+
+    async def session_endpoint(request: Request) -> JSONResponse:
+        payload = await request.json()
+        if payload["action"] == "seed":
+            state = session_manager.SessionState(
+                browser=first_browser,
+                context=BrowserContext(mode="cloud_session", session_id=session_id),
+                api_key_hash=session_manager.active_api_key_hash(),
+            )
+            session_manager.set_current_session(state)
+            session_manager.register_copilot_session(session_id, state, organization_id="org_first")
+            return JSONResponse({"owner": first_browser.owner})
+
+        try:
+            browser, _ = await session_manager.resolve_browser(session_id=payload["session_id"])
+        except PermissionError:
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        return JSONResponse({"owner": browser.owner})
+
+    app = Starlette(
+        routes=[Route("/mcp", endpoint=session_endpoint, methods=["POST"])],
+        middleware=[Middleware(mcp_http_auth.MCPAPIKeyMiddleware)],
+    )
+    shared_api_key = "sk_shared_test_key"
+    validate_oauth_token = AsyncMock(
+        side_effect=[
+            SimpleNamespace(validation=_build_validation("org_first"), api_key=shared_api_key),
+            SimpleNamespace(validation=_build_validation("org_second"), api_key=shared_api_key),
+        ]
+    )
+    monkeypatch.setattr(mcp_http_auth, "validate_mcp_oauth_token", validate_oauth_token)
+
+    first_response = await _request(
+        app,
+        "POST",
+        "/mcp",
+        headers={"authorization": f"Bearer {_jwtish_token(payload={'sub': 'first'})}"},
+        json={"action": "seed"},
+    )
+    second_response = await _request(
+        app,
+        "POST",
+        "/mcp",
+        headers={"authorization": f"Bearer {_jwtish_token(payload={'sub': 'second'})}"},
+        json={"action": "resolve", "session_id": session_id},
+    )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 403
+    assert denied_connection.await_count == 1
+    assert session_manager._current_session.get() is None
+
+
+def test_stateful_fastmcp_transport_rejects_exact_session_id_from_another_organization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = FastMCP("session-owner-test")
+
+    @server.tool
+    async def session_owner() -> str:
+        return session_manager._current_organization_id.get() or "missing"
+
+    validations = {
+        "sk_org_first": _build_validation("org_first"),
+        "sk_org_first_rotated": _build_validation("org_first"),
+        "sk_org_second": _build_validation("org_second"),
+    }
+
+    async def validate_api_key(api_key: str) -> mcp_http_auth.MCPAPIKeyValidation:
+        return validations[api_key]
+
+    monkeypatch.setattr(mcp_http_auth, "validate_mcp_api_key", validate_api_key)
+    app = server.http_app(
+        path="/",
+        middleware=[Middleware(mcp_http_auth.MCPAPIKeyMiddleware)],
+        stateless_http=False,
+        json_response=True,
+    )
+    initialize_request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1"},
+        },
+    }
+    tool_request = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": "session_owner", "arguments": {}},
+    }
+    headers = {
+        "accept": "application/json, text/event-stream",
+        "content-type": "application/json",
+    }
+
+    with TestClient(app) as client:
+        initialize_response = client.post(
+            "/",
+            headers={**headers, "x-api-key": "sk_org_first"},
+            json=initialize_request,
+        )
+        session_id = initialize_response.headers["mcp-session-id"]
+        rotated_credential_response = client.post(
+            "/",
+            headers={
+                **headers,
+                "x-api-key": "sk_org_first_rotated",
+                "mcp-session-id": session_id,
+            },
+            json=tool_request,
+        )
+        hijack_response = client.post(
+            "/",
+            headers={
+                **headers,
+                "x-api-key": "sk_org_second",
+                "mcp-session-id": session_id,
+            },
+            json=tool_request,
+        )
+
+    assert initialize_response.status_code == 200
+    assert rotated_credential_response.status_code == 404
+    assert rotated_credential_response.json()["error"]["message"] == "Session not found"
+    assert hijack_response.status_code == 404
+    assert hijack_response.json()["error"]["message"] == "Session not found"
+    assert session_manager._current_session.get() is None
+    assert session_manager._current_organization_id.get() is None
 
 
 @pytest.mark.asyncio

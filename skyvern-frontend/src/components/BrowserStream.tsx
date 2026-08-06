@@ -40,7 +40,10 @@ import {
   StreamStatusPanel,
   type StreamDiagnostic,
 } from "@/routes/streaming/StreamDiagnostics";
-import { handleVncClipboardPasteShortcut } from "@/components/browserStreamClipboard";
+import {
+  handleVncClipboardPasteShortcut,
+  type HeldMetaSides,
+} from "@/components/browserStreamClipboard";
 
 import "./browser-stream.css";
 
@@ -347,6 +350,10 @@ function BrowserStream({
   const rfbRef = useRef<RFB | null>(null);
   const onActivityRef = useRef(onActivity);
   const userCanSendVncInputRef = useRef(false);
+  const heldMetaSidesRef = useRef<HeldMetaSides>({
+    left: false,
+    right: false,
+  });
   const observerRef = useRef<MutationObserver | null>(null);
   const messageReconnectAttemptsRef = useRef(0);
   const messageReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
@@ -927,16 +934,63 @@ function BrowserStream({
     }
 
     const handleKeyDown = (event: KeyboardEvent) => {
+      // Track only Meta keydowns noVNC's canvas receives: restoring a side noVNC never tracked would strand the modifier remotely, since noVNC drops keyups for keys it never saw down.
+      if (event.key === "Meta" && event.target instanceof HTMLCanvasElement) {
+        if (event.code === "MetaLeft") {
+          heldMetaSidesRef.current = {
+            ...heldMetaSidesRef.current,
+            left: true,
+          };
+        } else if (event.code === "MetaRight") {
+          heldMetaSidesRef.current = {
+            ...heldMetaSidesRef.current,
+            right: true,
+          };
+        }
+      }
+
       if (!userCanSendVncInputRef.current) {
         return;
       }
 
-      void handleVncClipboardPasteShortcut(event, rfbRef.current);
+      void handleVncClipboardPasteShortcut(event, rfbRef.current, {
+        getHeldMetaSides: () => heldMetaSidesRef.current,
+        onPasteError: () => {
+          toast({
+            title: "Paste failed",
+            description:
+              "Skyvern couldn't read your clipboard. Allow clipboard access for this site and try again.",
+            variant: "destructive",
+          });
+        },
+      });
+    };
+
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.key === "Meta" && event.code === "MetaLeft") {
+        heldMetaSidesRef.current = {
+          ...heldMetaSidesRef.current,
+          left: false,
+        };
+      } else if (event.key === "Meta" && event.code === "MetaRight") {
+        heldMetaSidesRef.current = {
+          ...heldMetaSidesRef.current,
+          right: false,
+        };
+      }
+    };
+
+    const handleBlur = () => {
+      heldMetaSidesRef.current = { left: false, right: false };
     };
 
     canvasContainer.addEventListener("keydown", handleKeyDown, true);
+    window.addEventListener("keyup", handleKeyUp, true);
+    window.addEventListener("blur", handleBlur);
     return () => {
       canvasContainer.removeEventListener("keydown", handleKeyDown, true);
+      window.removeEventListener("keyup", handleKeyUp, true);
+      window.removeEventListener("blur", handleBlur);
     };
   }, [canvasContainer]);
 
