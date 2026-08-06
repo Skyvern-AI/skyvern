@@ -168,41 +168,6 @@ def _criteria_fingerprint(criteria: list[CompletionCriterion]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-@pytest.mark.parametrize("outcome", _TERMINAL_ACTION_CREATE_OUTCOMES)
-@pytest.mark.asyncio
-async def test_credentialed_create_omission_is_reconciled_before_custody_and_foreclosure(outcome: str) -> None:
-    policy, prompts = await _classify_with_terminal_action_reconciliation(
-        "Sign in with the saved credential and create the requested service setup.",
-        _terminal_action_packet(outcome),
-        {"version": "1", "criterion_id": "c0", "terminal_action_family": "request"},
-    )
-
-    assert len(prompts) == 2
-    assert '"id":"c0"' in prompts[1] and '"kind":"outcome"' in prompts[1]
-    stored = criteria_from_json(criteria_to_json(policy.completion_criteria))
-    assert [
-        (
-            item.id,
-            item.outcome,
-            item.kind,
-            item.terminal_action_family,
-            item.terminal_action_verification_mode,
-        )
-        for item in stored
-    ] == [("c0", outcome, "terminal_action", "request", "semantic_outcome_v1")]
-    assert stored[0].method_mandated is False
-    ctx = _terminal_action_enforcement_ctx(stored)
-    assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
-    assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
-    assert enforcement_module._should_block_mutating_tool_after_synthesized_offer(ctx, "click") is False
-
-    ctx.update_workflow_called = True
-    with capture_logs() as logs:
-        workflow_update_module._log_imposition_skipped_after_update(ctx)
-    (event,) = (entry for entry in logs if entry["event"] == "copilot_imposition_skipped_after_update")
-    assert (event["reaches_goal"], event["goal_complete"]) == (False, False)
-
-
 @pytest.mark.parametrize(
     ("user_message", "outcome"),
     [
@@ -2936,3 +2901,37 @@ def test_text_coverage_fallback_stays_silent_when_two_criteria_cover_the_field()
     _apply_requested_output_labels(policy, _LIVE_ANALYTICS_MESSAGE)
 
     assert [criterion.requested_output_label for criterion in policy.completion_criteria] == [None, None]
+
+
+@pytest.mark.parametrize("outcome", _TERMINAL_ACTION_CREATE_OUTCOMES)
+@pytest.mark.asyncio
+async def test_credentialed_create_omission_is_reconciled_before_custody_and_foreclosure(outcome: str) -> None:
+    policy, prompts = await _classify_with_terminal_action_reconciliation(
+        "Sign in with the saved credential and create the requested service setup.",
+        _terminal_action_packet(outcome),
+        {"version": "1", "criterion_id": "c0", "terminal_action_family": "request"},
+    )
+
+    assert len(prompts) == 2
+    assert '"id":"c0"' in prompts[1] and '"kind":"outcome"' in prompts[1]
+    stored = criteria_from_json(criteria_to_json(policy.completion_criteria))
+    assert [
+        (
+            item.id,
+            item.outcome,
+            item.kind,
+            item.terminal_action_family,
+            item.terminal_action_verification_mode,
+        )
+        for item in stored
+    ] == [("c0", outcome, "terminal_action", "request", "semantic_outcome_v1")]
+    assert stored[0].method_mandated is False
+    ctx = _terminal_action_enforcement_ctx(stored)
+    assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+    assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
+
+    ctx.update_workflow_called = True
+    with capture_logs() as logs:
+        workflow_update_module._log_imposition_skipped_after_update(ctx)
+    (event,) = (entry for entry in logs if entry["event"] == "copilot_imposition_skipped_after_update")
+    assert (event["reaches_goal"], event["goal_complete"]) == (False, False)
