@@ -49,11 +49,12 @@ def _make_workflow_run(
     return wr
 
 
-def _make_browser_state() -> MagicMock:
+def _make_browser_state(applied_browser_profile_id: str | None = None) -> MagicMock:
     bs = MagicMock()
     bs.browser_artifacts.browser_session_dir = "/tmp/fake_profile"
     bs.browser_artifacts._seed_load_failed = False
     bs.browser_artifacts._seed_capture_failed = False
+    bs.browser_artifacts.applied_browser_profile_id = applied_browser_profile_id
     return bs
 
 
@@ -526,7 +527,7 @@ async def test_engine_on_writes_resolved_sink_profile(monkeypatch: pytest.Monkey
     workflow_run = _make_workflow_run(
         WorkflowRunStatus.completed, browser_profile_id="bp_seed", browser_sink_profile_id="bp_sink"
     )
-    store_session_mock = _patch_clean_up_deps(monkeypatch, _make_browser_state())
+    store_session_mock = _patch_clean_up_deps(monkeypatch, _make_browser_state(applied_browser_profile_id="bp_seed"))
     monkeypatch.setattr(app.AGENT_FUNCTION, "is_browser_memory_engine_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(app.AGENT_FUNCTION, "bank_credential_profile_on_healthy_run", AsyncMock())
 
@@ -541,6 +542,29 @@ async def test_engine_on_writes_resolved_sink_profile(monkeypatch: pytest.Monkey
         "o_test", profile_id="bp_sink", directory="/tmp/fake_profile"
     )
     store_session_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_engine_on_skips_sink_write_when_stamped_seed_not_applied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stamped seed the browser never applied (vendor-routed boot) must not be overwritten by an
+    unrelated directory; seedless accumulate rows are unaffected (browser_profile_id None)."""
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    workflow = _make_workflow(persist=True)
+    workflow_run = _make_workflow_run(
+        WorkflowRunStatus.completed, browser_profile_id="bp_seed", browser_sink_profile_id="bp_sink"
+    )
+    _patch_clean_up_deps(monkeypatch, _make_browser_state(applied_browser_profile_id=None))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_browser_memory_engine_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "bank_credential_profile_on_healthy_run", AsyncMock())
+
+    svc = WorkflowService()
+    monkeypatch.setattr(svc, "persist_video_data", AsyncMock())
+    monkeypatch.setattr(svc, "get_tasks_by_workflow_run_id", AsyncMock(return_value=[]))
+
+    await svc.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, need_call_webhook=False)
+
+    app.STORAGE.store_browser_profile.assert_not_awaited()
 
 
 @pytest.mark.asyncio
