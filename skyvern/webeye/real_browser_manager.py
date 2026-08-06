@@ -934,6 +934,7 @@ class RealBrowserManager(BrowserManager):
                 "Creating browser state for workflow run",
                 sampling=True,
                 workflow_run_id=workflow_run.workflow_run_id,
+                browser_profile_id=browser_profile_id or "none",
             )
             if browser_session_id and workflow_run.organization_id:
                 session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(

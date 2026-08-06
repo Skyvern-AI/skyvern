@@ -30,6 +30,10 @@ class BrowserArtifacts(BaseModel):
     needs_cdp_frame_publisher: bool = False
     # Optional opaque identifier for a remote browser session.
     remote_browser_session_id: str | None = None
+    # The saved browser profile the creator actually applied to this browser's user-data-dir.
+    # None when none was requested or the chosen creator could not load one (remote/vendor browsers,
+    # storage miss, corruption fallback) — consumers must treat None as "profile not applied".
+    applied_browser_profile_id: str | None = None
     _browser_console_log_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
     # Tombstoned synchronously before any await, so set_popup_video_listener can't
     # re-register a page's video after RealBrowserState decides to discard it.
