@@ -15,6 +15,8 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
 )
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools.scouting import (
+    _MAX_CHALLENGE_SOLVE_ATTEMPTS,
+    _MAX_CHALLENGE_SOLVE_ATTEMPTS_PER_TURN,
     _challenge_identity,
     solve_challenge_when_evidence_settles,
 )
@@ -61,6 +63,7 @@ def _mock_context() -> AgentContext:
     """
     attrs = {
         "organization_id": "org_123",
+        "browser_session_id": "bs_789",
         "workflow_id": "w_456",
         "workflow_permanent_id": "wpid_456",
         "scouted_interactions": [],
@@ -73,6 +76,11 @@ def _mock_context() -> AgentContext:
     undeclared = sorted(set(attrs) - declared)
     assert not undeclared, f"not AgentContext fields: {undeclared}"
     return SimpleNamespace(**attrs)
+
+
+def _mock_page_evidence_cleared() -> dict[str, Any]:
+    """What a re-perception sees once the challenge is gone."""
+    return {"current_url": "https://example.com/login", "forms": [{"fields": [{"name": "u", "selector": "#u"}]}]}
 
 
 @pytest.mark.asyncio
@@ -124,17 +132,130 @@ async def test_attempt_scout_captcha_solve_challenge_detected_and_solved() -> No
         patch(
             "skyvern.forge.sdk.copilot.tools.scouting._code_block_solve_captcha_builtin",
             new_callable=AsyncMock,
+            return_value=True,
         ) as mock_solve,
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting._bounded_code_block_recaptcha_token_populated",
+            new_callable=AsyncMock,
+            side_effect=[False, True],
+        ),
     ):
         result = await solve_challenge_when_evidence_settles(
             ctx, page_evidence, url="https://example.com/login", observed_after_interaction=True
         )
 
     assert result is True
-    mock_solve.assert_called_once()
+    assert mock_solve.await_args.kwargs == {"organization_id": "org_123", "browser_session_id": "bs_789"}
     boundary = ctx.scout_trajectory[-1]
     assert boundary["tool_name"] == "click"
     assert composition_challenge_carrier(boundary) is ChallengeEvidenceSource.CHALLENGE_STATE
+    assert boundary["challenge_state"]["outcome"] == "solved"
+
+
+@pytest.mark.asyncio
+async def test_an_unsatisfied_widget_is_not_recorded_as_solved() -> None:
+    """A widget still rendered and carrying no token was not satisfied."""
+    ctx = _mock_context()
+    ctx.scout_trajectory = [{"tool_name": "click", "selector": "#s", "source_url": "u"}]
+    mock_browser_state = AsyncMock()
+    mock_browser_state.get_working_page.return_value = AsyncMock()
+
+    with (
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting.resolve_browser_state_for_context",
+            return_value=mock_browser_state,
+        ),
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting._code_block_solve_captcha_builtin",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting._bounded_code_block_recaptcha_token_populated",
+            new_callable=AsyncMock,
+            side_effect=[False, False],
+        ),
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting._code_block_recaptcha_response_field_present",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+    ):
+        result = await solve_challenge_when_evidence_settles(
+            ctx, _mock_page_evidence_with_challenge(), url="https://example.com/login", observed_after_interaction=True
+        )
+
+    assert result is False
+    assert ctx.scout_trajectory[-1]["challenge_state"]["outcome"] == "attempted"
+
+
+@pytest.mark.asyncio
+async def test_a_token_that_was_already_there_is_not_credited_as_this_solve() -> None:
+    """A response left by an unrelated widget would otherwise let any passing arm claim this
+    challenge; only a token that appears across the attempt counts."""
+    ctx = _mock_context()
+    ctx.scout_trajectory = [{"tool_name": "click", "selector": "#s", "source_url": "u"}]
+    mock_browser_state = AsyncMock()
+    mock_browser_state.get_working_page.return_value = AsyncMock()
+
+    with (
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting.resolve_browser_state_for_context",
+            return_value=mock_browser_state,
+        ),
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting._code_block_solve_captcha_builtin",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting._bounded_code_block_recaptcha_token_populated",
+            new_callable=AsyncMock,
+            side_effect=[True, True],
+        ),
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting._code_block_recaptcha_response_field_present",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+    ):
+        result = await solve_challenge_when_evidence_settles(
+            ctx, _mock_page_evidence_with_challenge(), url="https://example.com/login", observed_after_interaction=True
+        )
+
+    assert result is False
+    assert ctx.scout_trajectory[-1]["challenge_state"]["outcome"] == "attempted"
+
+
+@pytest.mark.asyncio
+async def test_an_arm_that_never_ran_is_not_credited_as_a_solve() -> None:
+    """No probe matched, so nothing touched the page and nothing may be credited."""
+    ctx = _mock_context()
+    ctx.scout_trajectory = [{"tool_name": "click", "selector": "#s", "source_url": "u"}]
+    mock_browser_state = AsyncMock()
+    mock_browser_state.get_working_page.return_value = AsyncMock()
+
+    with (
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting.resolve_browser_state_for_context",
+            return_value=mock_browser_state,
+        ),
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting._code_block_solve_captcha_builtin",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting._bounded_code_block_recaptcha_token_populated",
+            new_callable=AsyncMock,
+            side_effect=[False, True],
+        ),
+    ):
+        result = await solve_challenge_when_evidence_settles(
+            ctx, _mock_page_evidence_with_challenge(), url="https://example.com/login", observed_after_interaction=True
+        )
+
+    assert result is False
 
 
 @pytest.mark.asyncio
@@ -231,7 +352,13 @@ async def test_inspection_capture_solves_without_attributing_the_carrier() -> No
         patch(
             "skyvern.forge.sdk.copilot.tools.scouting._code_block_solve_captcha_builtin",
             new_callable=AsyncMock,
+            return_value=True,
         ) as mock_solve,
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting._bounded_code_block_recaptcha_token_populated",
+            new_callable=AsyncMock,
+            side_effect=[False, True],
+        ),
     ):
         result = await solve_challenge_when_evidence_settles(
             ctx,
@@ -389,7 +516,7 @@ async def test_a_distinct_challenge_gets_its_own_attempts() -> None:
     # would make this pass whether or not per-challenge keying works.
     spent = dict(_mock_page_evidence_with_challenge())
     spent["challenge_controls"] = [{"tag": "div", "id": "c", "data_sitekey": "sitekey-already-spent"}]
-    ctx.challenge_solve_attempts = {_challenge_identity(spent): 99}
+    ctx.challenge_solve_attempts = {_challenge_identity(spent): _MAX_CHALLENGE_SOLVE_ATTEMPTS}
     mock_browser_state = AsyncMock()
     mock_browser_state.get_working_page.return_value = AsyncMock()
 
@@ -401,7 +528,13 @@ async def test_a_distinct_challenge_gets_its_own_attempts() -> None:
         patch(
             "skyvern.forge.sdk.copilot.tools.scouting._code_block_solve_captcha_builtin",
             new_callable=AsyncMock,
+            return_value=True,
         ) as mock_solve,
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting._bounded_code_block_recaptcha_token_populated",
+            new_callable=AsyncMock,
+            side_effect=[False, True],
+        ),
     ):
         result = await solve_challenge_when_evidence_settles(
             ctx,
@@ -475,6 +608,7 @@ async def test_a_state_only_carrier_is_not_reported_as_solved() -> None:
         patch(
             "skyvern.forge.sdk.copilot.tools.scouting._code_block_solve_captcha_builtin",
             new_callable=AsyncMock,
+            return_value=False,
         ),
     ):
         await solve_challenge_when_evidence_settles(
@@ -482,3 +616,72 @@ async def test_a_state_only_carrier_is_not_reported_as_solved() -> None:
         )
 
     assert ctx.scout_trajectory[-1]["challenge_state"]["outcome"] == "attempted"
+
+
+@pytest.mark.asyncio
+async def test_a_widget_that_rotates_its_identity_cannot_outspend_the_turn() -> None:
+    """Every input to the challenge identity is page-controlled, so a page that re-keys its widget
+    on each render never reaches the per-identity cap; the turn total is what actually bounds it."""
+    ctx = _mock_context()
+    ctx.challenge_solve_attempts = {f"spent-{index}": 1 for index in range(_MAX_CHALLENGE_SOLVE_ATTEMPTS_PER_TURN)}
+    mock_browser_state = AsyncMock()
+    mock_browser_state.get_working_page.return_value = AsyncMock()
+
+    with (
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting.resolve_browser_state_for_context",
+            return_value=mock_browser_state,
+        ),
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting._code_block_solve_captcha_builtin",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as mock_solve,
+    ):
+        result = await solve_challenge_when_evidence_settles(
+            ctx,
+            _mock_page_evidence_with_challenge(),
+            url="https://example.com/login",
+            observed_after_interaction=False,
+        )
+
+    assert result is False
+    mock_solve.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_challenge_with_no_response_field_is_credited_on_the_arm_alone() -> None:
+    """Turnstile and plain checkbox challenges carry no reCAPTCHA response field, so requiring a
+    token transition would report every one of them unsolved however well the arm did."""
+    ctx = _mock_context()
+    ctx.scout_trajectory = [{"tool_name": "click", "selector": "#s", "source_url": "u"}]
+    mock_browser_state = AsyncMock()
+    mock_browser_state.get_working_page.return_value = AsyncMock()
+
+    with (
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting.resolve_browser_state_for_context",
+            return_value=mock_browser_state,
+        ),
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting._code_block_solve_captcha_builtin",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting._bounded_code_block_recaptcha_token_populated",
+            new_callable=AsyncMock,
+            side_effect=[False, False],
+        ),
+        patch(
+            "skyvern.forge.sdk.copilot.tools.scouting._code_block_recaptcha_response_field_present",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+    ):
+        result = await solve_challenge_when_evidence_settles(
+            ctx, _mock_page_evidence_with_challenge(), url="https://example.com/login", observed_after_interaction=True
+        )
+
+    assert result is True
+    assert ctx.scout_trajectory[-1]["challenge_state"]["outcome"] == "solved"

@@ -1,4 +1,4 @@
-"""Tests for the pre-discovery entry-point-URL ASK gate in _check_enforcement.
+"""Tests for the pre-discovery entry-point-URL ASK gate in enforcement_decision.
 
 A fresh BUILD turn that names a site but no exact URL enters BuildPhase.INITIAL.
 The model is supposed to call discover_workflow_entrypoint, but at temperature=1
@@ -23,11 +23,10 @@ from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_FAILURE_STREAK_ESCAP
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_PRE_DISCOVERY_URL_QUESTION_NUDGES,
-    PRE_DISCOVERY_URL_QUESTION_NUDGE,
     PRESENT_COMPLETION_CONTRACT_ASK_RETRY,
-    _check_enforcement,
     _pre_discovery_url_question_nudge,
     _response_coverage_nudge,
+    enforcement_decision,
 )
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.request_slots import is_canonical_request_slot_path
@@ -113,19 +112,19 @@ def _present_contract_ctx(**overrides: object) -> _Ctx:
 def test_pre_discovery_url_ask_in_initial_phase_steers_to_discovery() -> None:
     ctx = _Ctx()
     nudge = _pre_discovery_url_question_nudge(ctx, _URL_ASK)
-    assert nudge == PRE_DISCOVERY_URL_QUESTION_NUDGE
+    assert nudge.rule == "pre_discovery_url_question"
     assert ctx.pre_discovery_url_question_nudge_count == 1
 
 
 def test_pre_discovery_url_ask_fires_through_response_coverage_gate() -> None:
     ctx = _Ctx()
-    assert _response_coverage_nudge(ctx, _URL_ASK) == PRE_DISCOVERY_URL_QUESTION_NUDGE
+    assert _response_coverage_nudge(ctx, _URL_ASK).rule == "pre_discovery_url_question"
 
 
 def test_pre_discovery_url_ask_in_discovering_phase_steers_to_discovery() -> None:
     ctx = _Ctx()
     ctx.build_phase = BuildPhase.DISCOVERING
-    assert _pre_discovery_url_question_nudge(ctx, _URL_ASK) == PRE_DISCOVERY_URL_QUESTION_NUDGE
+    assert _pre_discovery_url_question_nudge(ctx, _URL_ASK).rule == "pre_discovery_url_question"
 
 
 def test_no_nudge_after_discovery_ran_this_turn() -> None:
@@ -205,7 +204,7 @@ def test_any_pre_discovery_ask_on_structural_triple_steers_to_discovery() -> Non
     # when the phrasing names neither a URL nor a site.
     ctx = _Ctx()
     ask = {"type": "ASK_QUESTION", "user_response": "Where should the agent begin?"}
-    assert _pre_discovery_url_question_nudge(ctx, ask) == PRE_DISCOVERY_URL_QUESTION_NUDGE
+    assert _pre_discovery_url_question_nudge(ctx, ask).rule == "pre_discovery_url_question"
     assert ctx.pre_discovery_url_question_nudge_count == 1
 
 
@@ -217,7 +216,7 @@ def test_any_pre_discovery_ask_on_structural_triple_steers_to_discovery() -> Non
 def test_pre_discovery_nudge_is_bounded() -> None:
     ctx = _Ctx()
     for expected_count in range(1, MAX_PRE_DISCOVERY_URL_QUESTION_NUDGES + 1):
-        assert _pre_discovery_url_question_nudge(ctx, _URL_ASK) == PRE_DISCOVERY_URL_QUESTION_NUDGE
+        assert _pre_discovery_url_question_nudge(ctx, _URL_ASK).rule == "pre_discovery_url_question"
         assert ctx.pre_discovery_url_question_nudge_count == expected_count
     assert _pre_discovery_url_question_nudge(ctx, _URL_ASK) is None
     assert ctx.pre_discovery_url_question_nudge_count == MAX_PRE_DISCOVERY_URL_QUESTION_NUDGES
@@ -226,14 +225,14 @@ def test_pre_discovery_nudge_is_bounded() -> None:
 def test_present_completion_contract_ask_returns_internal_retry() -> None:
     ctx = _present_contract_ctx()
 
-    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) == PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK).rule == "present_completion_contract_ask_retry"
 
 
 def test_present_completion_contract_ask_has_no_per_rule_cap() -> None:
     ctx = _present_contract_ctx()
 
-    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) == PRESENT_COMPLETION_CONTRACT_ASK_RETRY
-    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) == PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK).rule == "present_completion_contract_ask_retry"
+    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK).rule == "present_completion_contract_ask_retry"
 
 
 @pytest.mark.parametrize(
@@ -350,7 +349,7 @@ def test_output_schema_ask_auto_answers_when_the_contract_only_holds_anonymous_s
 
     assert nudge is not None
     assert nudge != PRESENT_COMPLETION_CONTRACT_ASK_RETRY
-    assert "yours to choose" in nudge
+    assert "yours to choose" in nudge.message
     events = [entry for entry in logs if entry["event"] == "copilot_ask_subject_auto_answered"]
     assert len(events) == 1
     assert events[0]["resolved_refs"] == []
@@ -367,9 +366,9 @@ def test_output_schema_ask_with_covered_refs_routes_to_the_declaring_read() -> N
 
     assert nudge is not None
     assert nudge != PRESENT_COMPLETION_CONTRACT_ASK_RETRY
-    assert _REQUESTED_OUTPUT_PATHS[1] in nudge
-    assert "output_path" in nudge
-    assert "reasonable representation" not in nudge
+    assert _REQUESTED_OUTPUT_PATHS[1] in nudge.message
+    assert "output_path" in nudge.message
+    assert "reasonable representation" not in nudge.message
     events = [entry for entry in logs if entry["event"] == "copilot_ask_subject_auto_answered"]
     assert len(events) == 1
     assert events[0]["resolved_refs"] == [_REQUESTED_OUTPUT_PATHS[1]]
@@ -404,7 +403,7 @@ def test_output_schema_ask_with_covering_refs_auto_answers() -> None:
     assert nudge is not None
     assert nudge != PRESENT_COMPLETION_CONTRACT_ASK_RETRY
     for path in _REQUESTED_OUTPUT_PATHS:
-        assert path in nudge
+        assert path in nudge.message
     events = [entry for entry in logs if entry["event"] == "copilot_ask_subject_auto_answered"]
     assert len(events) == 1
     assert events[0]["subject"] == "output_schema"
@@ -455,7 +454,7 @@ def test_typed_subject_ask_before_a_genuine_attempt_keeps_the_legacy_retry(ask: 
     build-first retry; only a resolved auto-answer skips it."""
     ctx = _present_contract_ctx(request_policy=_output_path_contract_policy())
 
-    assert _response_coverage_nudge(ctx, ask) == PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+    assert _response_coverage_nudge(ctx, ask).rule == "present_completion_contract_ask_retry"
 
 
 @pytest.mark.parametrize(
@@ -485,7 +484,7 @@ def test_unresolved_typed_ask_logs_which_outcome_it_got(ctx_factory: Callable[[]
 def test_absent_subject_present_contract_ask_keeps_legacy_retry() -> None:
     ctx = _present_contract_ctx(request_policy=_output_path_contract_policy())
 
-    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) == PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK).rule == "present_completion_contract_ask_retry"
 
 
 def test_definition_level_output_path_does_not_count_as_coverage() -> None:
@@ -511,7 +510,7 @@ def test_present_completion_contract_ask_admits_after_scout_only_marker() -> Non
     ctx = _present_contract_ctx(test_after_update_done=True)
 
     assert ctx.has_genuine_workflow_attempt() is False
-    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) == PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK).rule == "present_completion_contract_ask_retry"
 
 
 _PARITY_MARKER_STATES = [
@@ -531,7 +530,8 @@ _PARITY_MARKER_STATES = [
 def test_recycle_admission_is_superset_of_backstop_block(marker: dict[str, object]) -> None:
     ctx = _present_contract_ctx(**marker)
     workflow_attempted = ctx.has_genuine_workflow_attempt()
-    recycle_admits = _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) == PRESENT_COMPLETION_CONTRACT_ASK_RETRY
+    recycle_decision = _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK)
+    recycle_admits = recycle_decision is not None and recycle_decision.rule == "present_completion_contract_ask_retry"
 
     backstop_would_fire = not workflow_attempted
     if backstop_would_fire:
@@ -578,7 +578,7 @@ def test_output_schema_ask_auto_answers_after_genuine_attempt() -> None:
     assert nudge is not None
     assert nudge != PRESENT_COMPLETION_CONTRACT_ASK_RETRY
     for path in _REQUESTED_OUTPUT_PATHS:
-        assert path in nudge
+        assert path in nudge.message
 
 
 def test_floor_rekeyed_contract_covers_output_schema_ask() -> None:
@@ -666,11 +666,11 @@ def test_enforcement_auto_answers_rekeyed_output_schema_ask_mid_build() -> None:
     ctx = _enforcement_ctx(_rekeyed_contract_policy())
     result = SimpleNamespace(final_output=json.dumps(_output_schema_ask(list(_REQUESTED_OUTPUT_PATHS))))
 
-    nudge = _check_enforcement(ctx, result)
+    nudge = enforcement_decision(ctx, result)
 
     assert nudge is not None
     for path in _REQUESTED_OUTPUT_PATHS:
-        assert path in nudge
+        assert path in nudge.message
 
 
 def test_definition_level_rekeyed_path_stays_out_of_the_prompt_summary() -> None:
