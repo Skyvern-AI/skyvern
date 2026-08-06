@@ -662,9 +662,6 @@ class RequestPolicy:
             "allow_missing_credentials_in_draft": self.allow_missing_credentials_in_draft,
             "credential_draft_deferred_explicitly": self.credential_draft_deferred_explicitly,
             "resolved_credential_count": len(self.resolved_credentials),
-            "current_turn_named_credential_count": len(self.current_turn_named_credential_ids),
-            "invalid_credential_id_count": len(self.invalid_credential_ids),
-            "auto_bound_credential_count": len(self.auto_bound_credentials),
             "has_completion_contract": bool(self.completion_contract),
             "completion_criteria_count": len(self.graded_completion_criteria()),
             "completion_criteria_implicit_count": sum(
@@ -4603,10 +4600,11 @@ def _classifier_ref_stated_in_message(policy: RequestPolicy, user_message: str) 
 def _explicit_credential_ids(user_message: str) -> list[str]:
     """Credential IDs the user's own message hands to this turn.
 
-    Accepts the canonical ``cred_`` form and ``_MALFORMED_CREDENTIAL_ID_RE``'s ``cred <12+ digits>``
-    normalization; surrounding prose can only withdraw a token, never qualify it.
+    A ``cred_`` token is a structural identifier rather than English, so writing one is the
+    authority signal; the prose around it can only withdraw it, never qualify it.
     """
     text = _credential_authority_text(user_message or "")
+    explicit: list[str] = []
     matches = sorted(
         [(match, match.group(0)) for match in _CREDENTIAL_ID_RE.finditer(text)]
         + [(match, f"cred_{match.group(1)}") for match in _MALFORMED_CREDENTIAL_ID_RE.finditer(text)],
@@ -4617,15 +4615,15 @@ def _explicit_credential_ids(user_message: str) -> list[str]:
         for match, credential_id in matches
         if _credential_reference_is_negated(text, match.start())
     }
-    return _clean_list(
-        [
-            credential_id
-            for match, credential_id in matches
-            if last_negated_mention.get(credential_id, -1) <= match.start()
-            and not _credential_reference_is_negated(text, match.start())
-            and not _credential_reference_is_unrelated_replacement(text, match.start())
-        ]
-    )
+    for match, credential_id in matches:
+        if last_negated_mention.get(credential_id, -1) > match.start():
+            continue
+        if _credential_reference_is_negated(text, match.start()) or _credential_reference_is_unrelated_replacement(
+            text, match.start()
+        ):
+            continue
+        explicit.append(credential_id)
+    return _clean_list(explicit)
 
 
 def credential_candidate_label(credential: Credential) -> str:
@@ -5009,29 +5007,23 @@ async def _resolve_credentials(
     # regardless of the classifier label. Do not trust stale/model-authored
     # credential_refs that are absent from the latest user message.
     ids = _explicit_credential_ids(user_message)
-    explicit_name_candidates = _credential_name_candidates(user_message)
     if ids:
         existing = await app.DATABASE.credentials.get_credentials_by_ids(ids, organization_id=organization_id)
         found = {credential.credential_id for credential in existing}
         policy.resolved_credentials = existing
         _record_current_turn_named_credentials(policy, existing)
         policy.invalid_credential_ids = [credential_id for credential_id in ids if credential_id not in found]
-        # An unresolvable stated ID asks rather than falling through to the inference tiers below,
-        # but it never blocks another stated reference that did resolve.
-        if not explicit_name_candidates:
-            if existing or not policy.invalid_credential_ids:
-                return
-            if policy.testing_intent == "skip_test":
-                policy.allow_run_blocks = False
-                policy.allow_missing_credentials_in_draft = True
-                return
+        if policy.invalid_credential_ids and policy.testing_intent != "skip_test":
             formatted = ", ".join(f"`{credential_id}`" for credential_id in policy.invalid_credential_ids)
             _block(
                 policy,
                 f"The credential ID(s) {formatted} were not found in this organization. Please provide a valid saved credential ID or explicitly ask for an unvalidated draft that will not be run yet.",
                 reason="credential_name_unresolved",
             )
-            return
+        elif policy.invalid_credential_ids:
+            policy.allow_run_blocks = False
+            policy.allow_missing_credentials_in_draft = True
+        return
 
     # `login_intent` is a classifier-authored hint that misses on runs where the model does not set
     # it, so a message asking for a login in its own words must still count. A classifier that failed
@@ -5042,7 +5034,7 @@ async def _resolve_credentials(
         or (policy.classifier_status != "fallback" and login_phrase_asserted)
         or _classifier_ref_stated_in_message(policy, user_message)
     )
-    name_candidates = explicit_name_candidates
+    name_candidates = _credential_name_candidates(user_message)
     credentials: list[Credential] | None = None
     # Only a request that already asserts a login or credential intent may be matched against the
     # org's saved names; without that gate an unrelated message would scan the credential list.
@@ -5056,7 +5048,7 @@ async def _resolve_credentials(
             [credential for credential in credentials if credential.name in name_candidates]
         )
         if len(named_matches) == 1:
-            policy.resolved_credentials = _deduplicate_credentials(list(policy.resolved_credentials) + named_matches)
+            policy.resolved_credentials = named_matches
             _record_current_turn_named_credentials(policy, named_matches)
             if (
                 policy.classifier_status == "fallback"
@@ -5085,9 +5077,6 @@ async def _resolve_credentials(
                 reason="credential_name_unresolved",
                 card_answerable=True,
             )
-            return
-        if policy.resolved_credentials:
-            # A stated ID already resolved; an unmatched name rides along as a finding, not a wall.
             return
         if policy.testing_intent == "skip_test" or defer_unresolved_credential_name:
             policy.allow_run_blocks, policy.allow_missing_credentials_in_draft = False, True

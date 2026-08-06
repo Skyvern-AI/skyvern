@@ -746,6 +746,7 @@ class WorkflowRunModel(Base):
     totp_identifier = Column(String)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     max_elapsed_time_minutes = Column(Integer, nullable=True)
+    browser_runtime = Column(String, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
     cdp_connect_headers = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True, index=True)

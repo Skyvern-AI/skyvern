@@ -56,6 +56,10 @@ class SkyvernException(Exception):
         # so the concrete name stays in logs/monitoring but never reaches end users.
         return type(self).__name__
 
+    @property
+    def message_is_user_facing(self) -> bool:
+        return False
+
 
 class SkyvernPageAnalysisTimeout(SkyvernException):
     pass
@@ -643,6 +647,9 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
 
     @staticmethod
     def _get_detail(exception: Exception) -> str:
+        if isinstance(exception, SkyvernException) and exception.message_is_user_facing:
+            return exception.message or "Unexpected browser creation failure."
+
         if isinstance(exception, CdpConnectionConfigurationError):
             return exception.message or str(exception)
 

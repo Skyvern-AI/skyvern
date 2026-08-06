@@ -3969,7 +3969,7 @@ class TestRequestPolicyCredentialResolution:
         assert policy.completion_contract_status == "present"
 
     @pytest.mark.asyncio
-    async def test_missing_user_supplied_credential_id_rides_along_when_another_resolves(self, monkeypatch) -> None:
+    async def test_missing_user_supplied_credential_ids_ask_for_clarification(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot import request_policy as policy_module
         from skyvern.forge.sdk.copilot.request_policy import build_request_policy
 
@@ -3992,12 +3992,14 @@ class TestRequestPolicyCredentialResolution:
         assert policy.credential_input_kind == "credential_id"
         assert policy.credential_refs == ["cred_valid", "cred_missing"]
         assert policy.invalid_credential_ids == ["cred_missing"]
-        # A stated ID that resolved carries the turn; the unresolvable one rides along as a
-        # recorded finding instead of walling the request (SKY-13552).
-        assert [credential.credential_id for credential in policy.resolved_credentials] == ["cred_valid"]
-        assert policy.user_response_policy != "ask_clarification"
-        assert policy.allow_update_workflow is True
-        assert policy.allow_run_blocks is True
+        assert policy.user_response_policy == "ask_clarification"
+        assert policy.allow_update_workflow is False
+        assert policy.allow_run_blocks is False
+        assert policy.allow_missing_credentials_in_draft is False
+        assert policy.clarification_question
+        assert "cred_missing" in policy.clarification_question
+        assert "not found in this organization" in policy.clarification_question
+        assert "unvalidated draft" in policy.clarification_question
         get_credentials_by_ids.assert_awaited_once_with(["cred_valid", "cred_missing"], organization_id="org-1")
 
     @pytest.mark.asyncio
