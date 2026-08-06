@@ -187,3 +187,55 @@ async def test_owned_workflow_run_context_is_removed_on_cleanup(
             await run_sdk_action(mock_request, organization=mock_organization)
 
     mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context.assert_called_once_with("wr_owned")
+
+
+@pytest.mark.asyncio
+async def test_minted_workflow_run_is_marked_synthetic_on_context(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    # SKY-13518: the minted run never begins the browser session, so the context must mark it
+    # synthetic — downstream browser acquisition must not present it as the expected session owner.
+    mock_request.workflow_run_id = None
+    workflow = MagicMock(workflow_id="w_test", workflow_permanent_id="wpid_test", title="t")
+    workflow_run = MagicMock(workflow_run_id="wr_owned", workflow_id="w_test")
+    mock_app.WORKFLOW_SERVICE.create_empty_workflow = AsyncMock(return_value=workflow)
+    mock_app.WORKFLOW_SERVICE.setup_workflow_run = AsyncMock(return_value=workflow_run)
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_completed = AsyncMock(return_value=workflow_run)
+    with (
+        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+        patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("stop inside try"),
+        ),
+    ):
+        mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)
+        with pytest.raises(RuntimeError, match="stop inside try"):
+            await run_sdk_action(mock_request, organization=mock_organization)
+
+    replaced_context = mock_ctx.replace.call_args.args[0]
+    assert replaced_context.workflow_run_is_synthetic is True
+
+
+@pytest.mark.asyncio
+async def test_client_provided_workflow_run_is_not_marked_synthetic(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    # A client-provided run may genuinely own the session (it can have begun it), so ownership
+    # must still be asserted for it.
+    with (
+        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+        patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("stop inside try"),
+        ),
+    ):
+        mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)
+        with pytest.raises(RuntimeError, match="stop inside try"):
+            await run_sdk_action(mock_request, organization=mock_organization)
+
+    replaced_context = mock_ctx.replace.call_args.args[0]
+    assert replaced_context.workflow_run_is_synthetic is False

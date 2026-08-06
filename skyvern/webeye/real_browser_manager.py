@@ -222,6 +222,7 @@ class _EngineSelectionOwner:
 class _PersistentSessionLease:
     session_id: str
     organization_id: str
+    # Only a runnable that owns the session may create a cleanup lease.
     runnable_id: str
     browser_state: BrowserState
     runnable_generation_id: str | None = None
@@ -805,10 +806,15 @@ class RealBrowserManager(BrowserManager):
 
         if browser_session_id:
             context = skyvern_context.current()
+            # A synthetic run (minted per-action by run_sdk_action) never begins the session, so
+            # presenting it as the expected owner can only ever fail the ownership guard (SKY-13518).
+            owner_fallback_id = (
+                None if context is not None and context.workflow_run_is_synthetic else workflow_run.workflow_run_id
+            )
             expected_runnable_id = (
                 browser_session_runnable_id
                 or (context.browser_session_runnable_id if context else None)
-                or workflow_run.workflow_run_id
+                or owner_fallback_id
             )
             expected_runnable_generation_id = browser_session_runnable_generation_id or (
                 context.browser_session_runnable_generation_id if context else None
@@ -840,14 +846,17 @@ class RealBrowserManager(BrowserManager):
                 )
             else:
                 LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
-                await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
-                self._persistent_session_leases[workflow_run.workflow_run_id] = _PersistentSessionLease(
-                    session_id=browser_session_id,
-                    organization_id=workflow_run.organization_id,
-                    runnable_id=expected_runnable_id,
-                    runnable_generation_id=expected_runnable_generation_id,
-                    browser_state=browser_state,
-                )
+                # An SDK-minted synthetic run only reads a session owned by another runnable.
+                # It cannot rebind that runnable's download directory or acquire a cleanup lease.
+                if expected_runnable_id is not None:
+                    await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
+                    self._persistent_session_leases[workflow_run.workflow_run_id] = _PersistentSessionLease(
+                        session_id=browser_session_id,
+                        organization_id=workflow_run.organization_id,
+                        runnable_id=expected_runnable_id,
+                        runnable_generation_id=expected_runnable_generation_id,
+                        browser_state=browser_state,
+                    )
                 page = await browser_state.get_working_page()
                 if page:
                     if url and navigate:
@@ -891,14 +900,15 @@ class RealBrowserManager(BrowserManager):
                             )
                             if browser_state is None:
                                 raise
-                            self._persistent_session_leases[workflow_run.workflow_run_id] = _PersistentSessionLease(
-                                session_id=browser_session_id,
-                                organization_id=workflow_run.organization_id,
-                                runnable_id=expected_runnable_id,
-                                runnable_generation_id=expected_runnable_generation_id,
-                                browser_state=browser_state,
-                            )
-                            await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
+                            if expected_runnable_id is not None:
+                                self._persistent_session_leases[workflow_run.workflow_run_id] = _PersistentSessionLease(
+                                    session_id=browser_session_id,
+                                    organization_id=workflow_run.organization_id,
+                                    runnable_id=expected_runnable_id,
+                                    runnable_generation_id=expected_runnable_generation_id,
+                                    browser_state=browser_state,
+                                )
+                                await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
                             page = await browser_state.get_working_page()
                             if page is not None:
                                 await browser_state.navigate_to_url(page=page, url=url)

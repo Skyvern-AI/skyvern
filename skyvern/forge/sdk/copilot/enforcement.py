@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_c
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     CREDENTIAL_FILL_TOOL_NAME,
     LIVE_SCOUT_CREDENTIAL_FIELDS,
+    ONE_TIME_CODE_CREDENTIAL_FIELD,
     ObligationFinding,
     credential_scout_gap,
     credential_submit_boundary_index,
@@ -101,6 +102,7 @@ from skyvern.forge.sdk.copilot.context import (
     parsed_ask_refs,
 )
 from skyvern.forge.sdk.copilot.credential_pause import credential_pause_would_fire, maybe_credential_pause
+from skyvern.forge.sdk.copilot.credential_resolution import url_parts
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairLoopState,
     RepairNextAction,
@@ -505,12 +507,18 @@ def terminal_challenge_blocker_signal_from_page_evidence(
     evidence_source: str = "page_evidence",
     evidence: dict[str, Any] | None = None,
 ) -> CopilotToolBlockerSignal | None:
-    page_reason = _structured_page_challenge_reason(ctx, evidence)
+    packet = evidence if evidence is not None else getattr(ctx, "composition_page_evidence", None)
+    page_reason = _structured_page_challenge_reason(ctx, packet)
     if page_reason is None:
         return None
-    carrier = composition_challenge_carrier(
-        evidence if evidence is not None else getattr(ctx, "composition_page_evidence", None)
-    )
+    if isinstance(packet, Mapping) and one_time_code_fill_supersedes_challenge(ctx, packet):
+        LOG.info(
+            "copilot_terminal_challenge_declined_credential_served",
+            blocked_tool=blocked_tool,
+            evidence_source=evidence_source,
+        )
+        return None
+    carrier = composition_challenge_carrier(packet)
     return _terminal_challenge_halt_signal(
         ctx,
         evidence_source=evidence_source,
@@ -540,9 +548,105 @@ def _current_page_evidence_candidates(ctx: Any) -> list[dict[str, Any]]:
         if isinstance(packet, dict):
             candidates.append(packet)
     single = getattr(ctx, "composition_page_evidence", None)
-    if isinstance(single, dict):
+    # Both writers alias the packet they appended, so identity keeps one candidate out of two.
+    if isinstance(single, dict) and not any(single is packet for packet in candidates):
         candidates.append(single)
     return candidates
+
+
+# Challenge kinds a saved one-time code cannot answer, whoever else is on the page. `unknown` is the
+# DOM detector's verdict for every anti-bot vendor it has no name for, so it belongs here too.
+_CODE_UNSATISFIABLE_CHALLENGE_KIND_TERMS = (
+    "captcha",
+    "robot",
+    "turnstile",
+    "cloudflare",
+    "access",
+    "human",
+    "unknown",
+)
+
+
+def _observed_page_key(url: Any) -> str | None:
+    if not isinstance(url, str) or not url.strip().lower().startswith(("http://", "https://")):
+        return None
+    parts = url_parts(url.strip())
+    return parts[1] if parts else None
+
+
+def _one_time_code_fill_targets(ctx: Any) -> set[tuple[str, str]]:
+    """(page key, selector) for every saved one-time code this turn filled.
+
+    Keyed by page as well as selector because an observation packet records only the selector, and
+    the same selector text recurs across sites.
+    """
+    targets: set[tuple[str, str]] = set()
+    for item in getattr(ctx, "scout_trajectory", None) or []:
+        if not isinstance(item, Mapping):
+            continue
+        if str(item.get("tool_name") or "").strip() != CREDENTIAL_FILL_TOOL_NAME:
+            continue
+        if str(item.get("credential_field") or "").strip() != ONE_TIME_CODE_CREDENTIAL_FIELD:
+            continue
+        page = _observed_page_key(item.get("source_url"))
+        selector = str(item.get("selector") or "").strip()
+        if page and selector:
+            targets.add((page, selector))
+    return targets
+
+
+def _challenge_a_code_cannot_answer(evidence: Mapping[str, Any]) -> bool:
+    """A deny-list on purpose: an unrecognized kind stays answerable rather than halting.
+
+    `challenge_state.kind` is free-form vision output, so an allow-list would fail closed on the
+    misread this ticket exists to fix — the witnessed failure was labelled `other`.
+    """
+    controls = evidence.get("challenge_controls")
+    if isinstance(controls, list) and interactive_challenge_controls(controls):
+        return True
+    challenge_state = evidence.get("challenge_state")
+    kind = str(challenge_state.get("kind") or "").lower() if isinstance(challenge_state, Mapping) else ""
+    return any(term in kind for term in _CODE_UNSATISFIABLE_CHALLENGE_KIND_TERMS)
+
+
+def one_time_code_fill_supersedes_challenge(ctx: Any, evidence: Mapping[str, Any]) -> bool:
+    """Whether this turn filled a saved one-time code into the observed page after this challenge
+    was captured.
+
+    Scoped to challenges older than the code so it can never outlive one: a submit reaches the page
+    by routes that mint no observation of their own (an Enter keypress, a block run), so anything
+    observed after the fill is left to halt.
+    """
+    # Nothing is superseded by a packet that reports no challenge, and a caller may hold one whose
+    # stop was decided by the run rather than by this page.
+    if not isinstance(evidence, dict) or _structured_page_challenge_reason(ctx, evidence) is None:
+        return False
+    page = _observed_page_key(evidence.get("current_url") or evidence.get("inspected_url"))
+    if page is None or _challenge_a_code_cannot_answer(evidence):
+        return False
+    targets = _one_time_code_fill_targets(ctx)
+    if not targets:
+        return False
+    challenge_seen = False
+    for entry in getattr(ctx, "flow_evidence", None) or []:
+        if not isinstance(entry, dict):
+            continue
+        packet = entry.get("evidence")
+        if not isinstance(packet, dict):
+            continue
+        # Both writers alias the appended packet into `composition_page_evidence`; a shallow copy
+        # there would silently make this never match, which halts rather than misfires.
+        if packet is evidence:
+            challenge_seen = True
+            continue
+        if not challenge_seen or str(packet.get("interaction_tool") or "").strip() != CREDENTIAL_FILL_TOOL_NAME:
+            continue
+        selector = str(packet.get("interaction_selector") or "").strip()
+        # An interaction packet carries the post-interaction URL, so it is attributable to the page
+        # it acted on only by the source it recorded.
+        if (page, selector) in targets and _observed_page_key(packet.get("interaction_source_url")) == page:
+            return True
+    return False
 
 
 def terminal_challenge_blocker_signal_from_current_page_evidence(
@@ -567,6 +671,49 @@ def terminal_challenge_blocker_signal_from_current_page_evidence(
         if signal is not None:
             return signal
     return None
+
+
+CURRENT_PAGE_CHALLENGE_ADVISORY_REASON_CODE = "tool_error_current_page_challenge_advisory"
+
+
+def current_page_challenge_advisory_signal(
+    ctx: Any, *, blocked_tool: str, evidence_source: str = "page_evidence"
+) -> CopilotToolBlockerSignal | None:
+    """A fire-once advisory in place of the current-page pre-veto: the model sees the challenge
+    verdict and decides, holding facts this plane cannot see — what it filled and what it holds.
+
+    Terminal stopping stays with the producers that key on outcomes: a run that failed with
+    anti-bot evidence, the loop plane, budget. A page that merely looks like a wall has not
+    stopped anything yet.
+    """
+    signal = terminal_challenge_blocker_signal_from_current_page_evidence(
+        ctx, blocked_tool=blocked_tool, evidence_source=evidence_source
+    )
+    if signal is None:
+        return None
+    reason = str(signal.extra.get("evidence_reason") or "a verification challenge")
+    fired = getattr(ctx, "challenge_advisory_fired_reasons", None)
+    if not isinstance(fired, set) or reason in fired:
+        return None
+    fired.add(reason)
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=(
+            f"Structured page evidence flags the current page as a verification challenge: {reason}. "
+            "This is advisory, not a wall. If the page is asking for something this turn already holds — "
+            "for example a one-time code from the resolved credential — fill it, submit it, and continue. "
+            "If it is a genuine anti-bot wall you cannot satisfy, do NOT retry the same path; reply to the "
+            "user naming the blocker."
+        ),
+        user_facing_reason="The page may be showing a verification step; I'm checking whether I can complete it.",
+        recovery_hint="retry_with_different_tool",
+        cleared_by_tools=frozenset({blocked_tool}),
+        preserves_workflow_draft=True,
+        renders_final_reply=False,
+        internal_reason_code=CURRENT_PAGE_CHALLENGE_ADVISORY_REASON_CODE,
+        blocked_tool=blocked_tool,
+        extra={key: value for key, value in signal.extra.items() if key != "run_outcome_reason_code"},
+    )
 
 
 def _maybe_stash_terminal_challenge_halt(ctx: Any) -> None:
@@ -924,10 +1071,16 @@ def _typed_ask_subject_auto_answer(ctx: CopilotContext, ask_subject: AskSubject,
             subject=ask_subject,
             resolved_refs=resolved,
         )
+        # An output_schema ask is usually "which page value is it?", and the asker has already named a
+        # candidate; telling it to choose a representation licensed freelance parsing while the
+        # designation route sat unused (SKY-13485). Point the ask at the read that binds instead.
         return (
-            "The outputs you asked to confirm are already pinned by this request's completion contract. "
-            f"Requested output paths: {', '.join(resolved)}. Author and test the workflow to produce them, "
-            "choosing a reasonable representation for each, instead of asking the user to re-confirm."
+            f"The output path is settled: {', '.join(resolved)}. Which page value it is, is yours to "
+            "decide from what you can see — do not ask the user. If the requested value is visible "
+            "now, read it off the live page: call evaluate with an expression whose result is just "
+            "that value exactly as rendered, and set output_path to the requested path on that call; "
+            "the extraction will bind to the value you observed. If it is not visible yet, author and "
+            "test the workflow to produce it."
         )
     # A request that named no output key is pinned to anonymous slots, so no name the model could
     # propose is citable and the coverage check above can never be satisfied. The contract still
@@ -2523,6 +2676,21 @@ def requested_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtrac
     return None
 
 
+def unbound_requested_output_paths_for_designation(ctx: AgentContext) -> set[str]:
+    """Requested paths no plan has bound yet, so the resolver only decides what is still open.
+
+    Keyed on the bound plan rather than on a witness existing: a declared read can leave a stale or
+    unbindable scalar behind, and treating that as settled retires the path while it is still unread
+    — the page that finally shows the value would never be offered (SKY-13485).
+    """
+    requested = _requested_output_paths_for_ctx(ctx)
+    if not requested:
+        return set()
+    plan = ctx.last_bound_requested_output_extraction_plan
+    bound = set(plan.requested_output_paths) if plan is not None else set()
+    return requested - bound
+
+
 def requested_scalar_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtractionPlan | None:
     """Extraction plan over the page-scalar subset of requested outputs (requested minus the
     download-registered paths), for the mixed download+scalar shape whose download half is
@@ -2755,7 +2923,27 @@ def synthesized_trajectory_reaches_goal(ctx: AgentContext) -> bool:
         _active_floor_rekeyed_runtime_outputs(ctx) and _last_scout_credential_fill_index(trajectory) is not None
     ):
         return _trajectory_reaches_post_credential_commit(ctx)
+    if _read_deliverable_reached(ctx):
+        return True
     return _trajectory_reaches_generic_goal(ctx, trajectory, include_download=True)
+
+
+def _read_deliverable_reached(ctx: AgentContext) -> bool:
+    """A read deliverable has no commit to reach; the bound requested-output extraction plan is its
+    reach evidence. Keys on the retained plan rather than a fresh derivation so reach stays monotone
+    per attempt, which is what the ownership latch requires (SKY-13485)."""
+    if _request_expects_unreached_download(ctx):
+        return False
+    # A mandated action is part of what was asked for, so a read that binds while it is still
+    # outstanding has not reached the goal. Non-method-mandated ones never arrive here — the caller
+    # routes them to the post-credential commit shape first.
+    if any(criterion.kind == "terminal_action" for criterion in _active_completion_criteria(ctx)):
+        return False
+    plan = ctx.last_bound_requested_output_extraction_plan
+    if plan is None:
+        return False
+    requested = _requested_output_paths_for_ctx(ctx)
+    return bool(requested) and requested.issubset(set(plan.requested_output_paths))
 
 
 def _trajectory_reaches_generic_goal(

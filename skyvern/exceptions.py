@@ -1376,6 +1376,14 @@ class BrowserSessionAlreadyOccupiedError(SkyvernHTTPException):
         super().__init__(f"Browser session {browser_session_id} is already occupied by {runnable_id}")
 
 
+class BrowserSessionOwnershipConflict(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(
+            f"Persistent browser session {browser_session_id} is owned by a different runnable",
+            status_code=HTTPStatus.CONFLICT,
+        )
+
+
 class BrowserSessionNotRenewable(SkyvernException):
     def __init__(self, reason: str, browser_session_id: str) -> None:
         super().__init__(f"Browser session {browser_session_id} is not renewable: {reason}")

@@ -4765,6 +4765,22 @@ class ForgeAgent:
     ) -> dict[str, Any] | list | str | None:
         final_navigation_payload = task.navigation_payload
 
+        # Represent any plaintext parameter value that exactly equals a stored credential value as
+        # that credential's resolvable placeholder token BEFORE the synthetic values below (the real
+        # verification code and the "123456" TOTP format hint) are injected, so those synthetic
+        # values can never be turned into resolvable credential tokens. Otherwise such a value would
+        # be one-way-redacted to [REDACTED_SECRET] at the LLM boundary and typed verbatim; here the
+        # planner never sees the raw value and the existing input path resolves the token before
+        # browser input.
+        if (
+            task.workflow_run_id is not None
+            and task.workflow_run_id in app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts
+        ):
+            workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
+            final_navigation_payload = workflow_run_context.represent_plaintext_secrets_as_placeholders(
+                final_navigation_payload
+            )
+
         current_context = skyvern_context.ensure_context()
         verification_code = current_context.totp_codes.get(task.task_id)
         if verification_code:

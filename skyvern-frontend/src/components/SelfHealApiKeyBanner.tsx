@@ -14,9 +14,9 @@ function getCopy(status: BannerStatus): { title: string; description: string } {
   switch (status) {
     case "missing_api_key":
       return {
-        title: "Frontend API key missing",
+        title: "UI credential missing",
         description:
-          "The UI is not sending an x-api-key header. Authenticated requests will fail until local auth is repaired.",
+          "The UI has no runtime credential. Authenticated requests will fail until the UI server can mint a session or a runtime key is stored.",
       };
     case "invalid_format":
       return {
@@ -42,7 +42,7 @@ function getCopy(status: BannerStatus): { title: string; description: string } {
       return {
         title: "Skyvern API requests are unauthorized",
         description:
-          "The backend rejected a UI request. This usually means the frontend API key, backend API key, and local Docker database are out of sync.",
+          "The backend rejected a UI request. This usually means UI session minting, the backend API key, and the local database are out of sync.",
       };
     case "error":
     default:
@@ -86,8 +86,12 @@ function SelfHealApiKeyBanner() {
           {bannerStatus !== "error" ? (
             <>
               <p>
-                {copy.description} Run <code>skyvern doctor --fix</code> in the
-                project directory, then restart local services if prompted.
+                {copy.description} For local development, set{" "}
+                <code>SKYVERN_API_KEY</code> in{" "}
+                <code className="mx-1">skyvern-frontend/.env</code> and restart{" "}
+                <code>npm run dev</code>. Otherwise run{" "}
+                <code>skyvern doctor --fix</code> in the project directory, then
+                restart local services if prompted.
               </p>
               {data?.detail ? (
                 <p className="text-xs text-slate-300">{data.detail}</p>

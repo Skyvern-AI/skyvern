@@ -20,6 +20,7 @@ from skyvern.forge.sdk.copilot.result_evidence import (
     LoadedResultCompositionEvidence,
     loaded_result_target_structure_signature,
 )
+from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeRole
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -75,6 +76,7 @@ class NarrativeBlock(TypedDict):
     endedAt: str | None
     outcome: NotRequired[str]
     outcomeReason: NotRequired[str]
+    outcomeRole: NotRequired[RunOutcomeRole]
 
 
 class NarrativeOutcomeAdjudication(TypedDict):
@@ -108,6 +110,9 @@ class TurnNarrativePayload(TypedDict):
     # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ...}, set when a mid-build
     # credential pause (credential_pause.py) resolved during this turn.
     credentialPause: NotRequired[dict[str, str]]
+    # {"credentialId": ..., "name": ...}, set when a credential was bound this turn without an ask
+    # (deterministic auto-bind); the FE renders it as a receipt with a Change affordance.
+    credentialAutoBound: NotRequired[dict[str, str]]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None

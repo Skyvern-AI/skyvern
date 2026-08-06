@@ -102,6 +102,9 @@ class SkyvernContext:
     # both values forward; they never reconstruct ownership from mutable task or session rows.
     browser_session_runnable_id: str | None = None
     browser_session_runnable_generation_id: str | None = None
+    # Set only by run_sdk_action when it mints a bookkeeping run for a standalone action. A minted
+    # run never begins the browser session, so it must not be presented as the expected owner.
+    workflow_run_is_synthetic: bool = False
     browser_runtime: str | None = None
     browser_address_is_server_assigned: bool = False
     tz_info: ZoneInfo | None = None

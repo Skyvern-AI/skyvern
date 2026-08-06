@@ -6,7 +6,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from skyvern.forge.sdk.copilot.context import ProposalDisposition, ResponseType, TurnNarrativePayload
-from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeVerdict
+from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeRole, RunOutcomeVerdict
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 
 
@@ -431,6 +431,7 @@ class WorkflowCopilotRunOutcomeUpdate(BaseModel):
         default_factory=list, description="Block labels of the adjudicated run; key the persisted narrative payload"
     )
     verdict: RunOutcomeVerdict = Field(..., description="Recorded outcome verdict for the run")
+    role: RunOutcomeRole = Field("adjudicated", description="Display scope of the recorded run verdict")
     reason_code: RunOutcomeReasonCode | None = Field(
         None, description="Machine-readable cause for a not_demonstrated verdict"
     )
