@@ -627,10 +627,12 @@ class RequestPolicy:
     # cred_ id — as distinct from approvals carried in from earlier turns. Naming a credential
     # answers which one to use, which is what lets the login page answer where it may be typed.
     current_turn_named_credential_ids: set[str] = field(default_factory=set)
-    # Login targets the classifier named that the user also wrote themselves. The classifier alone
-    # decides which URL is a sign-in page but is not authority for the origin a password reaches, so
-    # only the intersection may vouch for a fill.
-    grounded_login_target_urls: list[str] = field(default_factory=list)
+    # Sites the user themselves provided anywhere in this chat, one URL per origin. A credential may
+    # only be released onto one of these (or a vault/tested match); a site only a model produced is
+    # never eligible.
+    user_provided_site_urls: list[str] = field(default_factory=list)
+    # Which user message (1-based) each of those URLs came from, so a release records its provenance.
+    user_site_url_sources: dict[str, int] = field(default_factory=dict)
     credential_ask_candidate_ids: list[str] = field(default_factory=list)
     existing_workflow_credential_ids: list[str] = field(default_factory=list)
     # Sorted at the trace/JSON boundary; YAML traversal uses sets.
@@ -928,7 +930,8 @@ TRANSCRIPT_ANCHOR_CHAR_CAP = 512
 _TRANSCRIPT_RETAINED_MIN_CHARS = 512
 _TRANSCRIPT_MARKER_RESERVE = 32
 _EMPTY_SLOT_SENTINEL = "(none)"
-_REDACTED_REFUSED_SECRET_TURN = "[raw credentials redacted — this turn was refused]"
+REDACTED_REFUSED_SECRET_TURN = "[raw credentials redacted — this turn was refused]"
+_REDACTED_REFUSED_SECRET_TURN = REDACTED_REFUSED_SECRET_TURN
 
 
 @dataclass(frozen=True)
@@ -961,7 +964,7 @@ def _safe_slot(text: str | None, cap: int) -> str:
     return _middle_truncate(escape_code_fences(redact_raw_secrets_for_prompt(bounded)), cap)
 
 
-def _redact_refused_secret_turns(
+def redact_refused_secret_turns(
     messages: list[WorkflowCopilotChatHistoryMessage],
 ) -> list[WorkflowCopilotChatHistoryMessage]:
     """Replace the content of any user turn answered with the raw-secret refusal.
@@ -1007,7 +1010,7 @@ def build_transcript_context(
     ):
         filtered = filtered[:-1]
 
-    filtered = _redact_refused_secret_turns(filtered)
+    filtered = redact_refused_secret_turns(filtered)
 
     user_indices = [i for i, m in enumerate(filtered) if m.sender == WorkflowCopilotChatSender.USER]
     ai_indices = [i for i, m in enumerate(filtered) if m.sender == WorkflowCopilotChatSender.AI]
@@ -4869,18 +4872,38 @@ def _prior_approved_credential_ids_from_context(global_llm_context: str) -> set[
     }
 
 
-def _ground_login_target_urls(policy: RequestPolicy, user_message: str) -> None:
-    """Keep the classifier's login targets this message also carries, so neither a URL the model authored
-    nor one the user pasted in an older turn for another purpose becomes an origin a password reaches.
+def _ground_user_provided_sites(
+    policy: RequestPolicy,
+    user_message: str,
+    full_chat_history: Sequence[WorkflowCopilotChatHistoryMessage],
+) -> None:
+    """Record every site the user themselves gave this chat, so the fill seam can release a credential
+    onto one of them and never onto a site only a model produced.
+
+    Linking a later "log into pathfold" back to a URL from an earlier turn is the agent's job, not
+    this function's: it reads the whole conversation. What is recorded here is only the deterministic
+    part — the origins the user actually wrote.
     """
-    typed_origins = {
-        parts[2]
-        for candidate in URL_CANDIDATE_RE.findall(user_message or "")
-        if (parts := _url_parts(candidate.rstrip(".,;:!?")))
-    }
-    policy.grounded_login_target_urls = [
-        url for url in policy.login_page_urls if (parts := _url_parts(url)) and parts[2] in typed_origins
+    user_texts = [
+        message.content
+        for message in full_chat_history
+        if message.sender == WorkflowCopilotChatSender.USER and message.content
     ]
+    user_texts.append(user_message or "")
+    seen_origins: set[str] = set()
+    urls: list[str] = []
+    sources: dict[str, int] = {}
+    for index, text in enumerate(user_texts, start=1):
+        for candidate in URL_CANDIDATE_RE.findall(text):
+            cleaned = candidate.rstrip(".,;:!?")
+            parts = _url_parts(cleaned)
+            if parts is None or parts[2] in seen_origins:
+                continue
+            seen_origins.add(parts[2])
+            urls.append(cleaned)
+            sources[cleaned] = index
+    policy.user_provided_site_urls = urls
+    policy.user_site_url_sources = sources
 
 
 def _record_current_turn_named_credentials(policy: RequestPolicy, credentials: Sequence[Credential]) -> None:
@@ -5659,6 +5682,9 @@ async def build_request_policy(
     handler: LLMAPIHandler | None,
     active_criteria: list[CompletionCriterion] | None = None,
     config: CopilotConfig | None = None,
+    # The whole chat, not the model-context tail `chat_history` carries: a site is grounded by the
+    # user having written it, which does not expire when the message leaves the prompt window.
+    prior_user_messages: Sequence[WorkflowCopilotChatHistoryMessage] = (),
     _preclassified_policy: RequestPolicy | None = None,
 ) -> RequestPolicy:
     policy = _preclassified_policy
@@ -5699,6 +5725,10 @@ async def build_request_policy(
     policy.resolved_signin_email = policy.resolved_signin_email or (
         carried if carried and is_email_address(carried) else None
     )
+
+    # Unconditional: a turn blocked here can resume mid-turn (credential card), and the resumed
+    # fill still needs to know which sites the user has provided.
+    _ground_user_provided_sites(policy, user_message, prior_user_messages or chat_history)
 
     if policy.raw_secret_detected and policy.raw_secret_handling == "redacted_draft":
         policy.testing_intent = "skip_test"
@@ -5772,7 +5802,6 @@ async def build_request_policy(
             # conservative clarification flag; _resolve_credentials will block
             # again if the lookup is missing or ambiguous.
             policy.requires_user_clarification = False
-            _ground_login_target_urls(policy, user_message)
             await _resolve_credentials(
                 policy,
                 organization_id,
@@ -5859,6 +5888,7 @@ async def build_request_policy_trust_floor(
     organization_id: str,
     handler: LLMAPIHandler | None,
     config: CopilotConfig | None = None,
+    prior_user_messages: Sequence[WorkflowCopilotChatHistoryMessage] = (),
 ) -> RequestPolicy:
     policy = await _classify_request_trust_floor(
         user_message,
@@ -5876,6 +5906,7 @@ async def build_request_policy_trust_floor(
         organization_id=organization_id,
         handler=handler,
         config=config,
+        prior_user_messages=prior_user_messages,
         _preclassified_policy=policy,
     )
 

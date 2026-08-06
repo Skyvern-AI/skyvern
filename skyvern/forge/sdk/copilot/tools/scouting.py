@@ -91,7 +91,12 @@ from skyvern.forge.sdk.copilot.runtime import (
     resolve_browser_state_for_context,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
-from skyvern.forge.sdk.workflow.models.block import CodeBlockCaptchaError, _code_block_solve_captcha_builtin
+from skyvern.forge.sdk.workflow.models.block import (
+    CodeBlockCaptchaError,
+    _bounded_code_block_recaptcha_token_populated,
+    _code_block_recaptcha_response_field_present,
+    _code_block_solve_captcha_builtin,
+)
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
@@ -792,6 +797,10 @@ def _record_scouted_interaction(
 
 
 _MAX_CHALLENGE_SOLVE_ATTEMPTS = 3
+# Measured: a healthy turn re-enters the ladder 4-5 times for one widget, because a token
+# expires long before a turn ends. Sized well clear of that so it bounds a page rotating its
+# identity to outspend us, without cutting a legitimate turn short.
+_MAX_CHALLENGE_SOLVE_ATTEMPTS_PER_TURN = 12
 
 
 def _challenge_identity(evidence: dict[str, Any]) -> str:
@@ -840,7 +849,7 @@ async def solve_challenge_when_evidence_settles(
     url: str | None,
     observed_after_interaction: bool,
 ) -> bool:
-    """Try the shared solve routes on a challenge in just-settled evidence; True if it passed.
+    """Try the shared solve routes on a challenge in just-settled evidence; True when one landed.
 
     Call from a capture exit, never a tool hook: a settled packet describes the page as it now
     is, and ``observed_after_interaction`` follows from the seam — the act-observe capture runs
@@ -865,6 +874,16 @@ async def solve_challenge_when_evidence_settles(
     attempts = ctx.challenge_solve_attempts.get(identity, 0)
     if attempts >= _MAX_CHALLENGE_SOLVE_ATTEMPTS:
         return False
+    # Every input to the identity is page-controlled, so a widget that rotates its sitekey or id
+    # mints a fresh one on each observation and never reaches the per-identity cap. The solver
+    # costs real money on a platform-wide account, so the turn needs a bound the page cannot move.
+    if sum(ctx.challenge_solve_attempts.values()) >= _MAX_CHALLENGE_SOLVE_ATTEMPTS_PER_TURN:
+        LOG.info(
+            "copilot_scout_captcha_turn_budget_spent",
+            url=url,
+            organization_id=ctx.organization_id,
+        )
+        return False
     ctx.challenge_solve_attempts[identity] = attempts + 1
 
     # Read once so the handlers below report a failure without touching the context again.
@@ -878,8 +897,19 @@ async def solve_challenge_when_evidence_settles(
         page = await browser_state.get_working_page()
         if page is None:
             return False
+        # Crediting a token that was already there would let an unrelated widget's response pass
+        # this challenge off as solved, so the transition is what counts. An unreadable baseline
+        # withholds that credit rather than failing the solve that has not happened yet.
+        try:
+            token_before = await _bounded_code_block_recaptcha_token_populated(page)
+        except Exception:
+            token_before = None
         # In-DOM checkbox, then the Turnstile extension, then the reCAPTCHA token route.
-        await _code_block_solve_captcha_builtin(page, organization_id=organization_id)
+        arm_passed = await _code_block_solve_captcha_builtin(
+            page,
+            organization_id=organization_id,
+            browser_session_id=ctx.browser_session_id,
+        )
     except CodeBlockCaptchaError:
         LOG.info(
             "copilot_scout_captcha_solve_failed",
@@ -898,16 +928,29 @@ async def solve_challenge_when_evidence_settles(
         )
         return False
 
-    # "attempted", not "solved": the routes return normally when their probes match nothing, so a
-    # carrier asserted by challenge_state alone can complete here without anything being solved.
+    # A reCAPTCHA widget stays rendered after it is satisfied, so its continued presence says
+    # nothing; the response token going from absent to present is what the platform treats as the
+    # authoritative solve signal. An unreadable read withholds the credit rather than inventing it.
+    try:
+        token_after = await _bounded_code_block_recaptcha_token_populated(page)
+        judged_by_token = await _code_block_recaptcha_response_field_present(page)
+    except Exception:
+        token_after = None
+        judged_by_token = False
+    # Turnstile and plain checkbox challenges carry no response field, so an arm passing is all
+    # there is to go on; where a field exists, the transition is what separates this solve from a
+    # response some other widget left behind.
+    solved = arm_passed and (token_before is False and token_after is True if judged_by_token else True)
+
     if observed_after_interaction:
-        _record_challenge_encounter(ctx, carrier, outcome="attempted")
+        _record_challenge_encounter(ctx, carrier, outcome="solved" if solved else "attempted")
     LOG.info(
-        "copilot_scout_captcha_solved",
+        "copilot_scout_captcha_solve_attempted",
         url=url,
         organization_id=organization_id,
+        solved=solved,
     )
-    return True
+    return solved
 
 
 def _page_evidence_has_selector(value: Any, selector: str) -> bool:

@@ -28,7 +28,6 @@ from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge
 from skyvern.forge.sdk.copilot.enforcement import (
     current_page_challenge_advisory_signal,
     one_time_code_fill_supersedes_challenge,
-    synthesized_block_persistence_signal,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import (
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
@@ -1414,7 +1413,6 @@ LOOP_PLANE_REFUSAL_REASON_CODES: frozenset[str] = frozenset(
         "credential_priority_authoring_churn",
         "tool_error_terminal_challenge_blocker",
         "tool_error_current_page_challenge_advisory",
-        "tool_error_synthesized_block_persistence_required",
         "tool_error_challenge_gated_submit_disabled",
         "tool_error_non_retriable_nav",
         "tool_error_infrastructure_unavailable",
@@ -1478,10 +1476,6 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
                 blocked_tool=tool_name,
             ),
         )
-
-    persistence_signal = synthesized_block_persistence_signal(ctx, tool_name, arguments)
-    if persistence_signal is not None:
-        return _emit_loop_plane_refusal(ctx, persistence_signal)
 
     # While a typed output-contract actuation ladder is still unresolved for the authoring tools, the
     # bounded ladder (not a generic loop backstop) owns the turn's outcome; the guards re-engage the moment
