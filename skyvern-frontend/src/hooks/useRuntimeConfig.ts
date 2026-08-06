@@ -1,4 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { browserStreamingMode as buildTimeBrowserStreamingMode } from "@/util/env";
 import { useQuery } from "@tanstack/react-query";
 
@@ -56,9 +57,56 @@ function useBrowserStreamingMode() {
   };
 }
 
+function resolveStreamTransport(
+  globalMode: BrowserStreamingMode,
+  sessionTransport: string | null | undefined,
+): BrowserStreamingMode {
+  const normalized = (sessionTransport ?? "").trim().toLowerCase();
+  if (!STREAMING_MODES.has(normalized)) {
+    return globalMode;
+  }
+  return normalized as BrowserStreamingMode;
+}
+
+function useStreamTransport(browserSessionId?: string | null) {
+  const { browserStreamingMode } = useBrowserStreamingMode();
+  const credentialGetter = useCredentialGetter();
+  const query = useQuery<{ stream_transport?: string | null }>({
+    // Deliberately the same key BrowserSession.tsx uses for its session query,
+    // so react-query dedupes the fetch on pages that already load the session.
+    queryKey: ["browserSession", browserSessionId],
+    queryFn: async () => {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      return client
+        .get(`/browser_sessions/${browserSessionId}`)
+        .then((response) => response.data);
+    },
+    enabled: Boolean(browserSessionId),
+    staleTime: 5 * 60 * 1000,
+    refetchOnWindowFocus: false,
+    retry: 1,
+  });
+
+  // Undefined until the session answers. Reporting the deployment default in the meantime is a
+  // different claim from "this session streams that way", and a consumer acting on it opens a
+  // stream the session may not serve, then swaps once the real answer lands.
+  const pending = Boolean(browserSessionId) && query.isPending;
+
+  return {
+    streamTransport: pending
+      ? undefined
+      : resolveStreamTransport(
+          browserStreamingMode,
+          query.data?.stream_transport,
+        ),
+  };
+}
+
 export {
   browserStreamingLabel,
   normalizeBrowserStreamingMode,
+  resolveStreamTransport,
   useBrowserStreamingMode,
   useRuntimeConfig,
+  useStreamTransport,
 };
