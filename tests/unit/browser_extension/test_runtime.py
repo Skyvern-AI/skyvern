@@ -159,10 +159,13 @@ async def test_port_resolution_prefers_explicit_then_environment_then_default(mo
 async def test_port_in_use_has_actionable_browser_extension_error(monkeypatch: pytest.MonkeyPatch) -> None:
     _, adapters, _ = install_stubs(monkeypatch, relay_start_error=OSError(errno.EADDRINUSE, "address in use"))
 
-    with pytest.raises(BrowserExtensionError, match="SKYVERN_BROWSER_EXTENSION_PORT") as error_info:
+    with pytest.raises(BrowserExtensionError) as error_info:
         await BrowserExtensionRuntime.get_or_start(23001)
 
-    assert "23001" in str(error_info.value)
+    message = str(error_info.value)
+    assert "23001" in message
+    assert "SKYVERN_BROWSER_EXTENSION_PORT" in message
+    assert "extension popup" in message
     assert adapters[0].stop_count == 1
     assert BrowserExtensionRuntime.instance() is None
 
