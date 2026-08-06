@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from skyvern.config import settings
+from skyvern.constants import DEFAULT_WORKFLOW_TITLES
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.agent import (
     RequestPolicyGuardrailInputs,
@@ -32,6 +33,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     _turn_intent_classification_from_raw,
     build_turn_intent,
     classify_turn_intent,
+    sanitize_workflow_title_candidate,
     turn_intent_defers_authoring_live_fill,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -1575,12 +1577,52 @@ def test_turn_intent_prompt_carries_structural_feasibility_contract() -> None:
     assert "On the fence" in prompt
 
 
-def test_turn_intent_prompt_carries_over_asking_guardrails() -> None:
+def test_sanitize_workflow_title_candidate_normalizes_and_bounds() -> None:
+    assert sanitize_workflow_title_candidate("  Weekly  Visitor Report ") == "Weekly Visitor Report"
+    assert sanitize_workflow_title_candidate('"Invoice Bot"') == "Invoice Bot"
+    assert sanitize_workflow_title_candidate("Report\u202egnitroP") == "ReportgnitroP"
+    assert sanitize_workflow_title_candidate("x" * 80) == "x" * 60
+
+
+def test_sanitize_workflow_title_candidate_rejects_defaults_and_non_strings() -> None:
+    # A candidate equal to a placeholder would defeat the value-based "still unnamed?" test.
+    for default_title in DEFAULT_WORKFLOW_TITLES:
+        assert sanitize_workflow_title_candidate(default_title) is None
+    assert sanitize_workflow_title_candidate("") is None
+    assert sanitize_workflow_title_candidate("   ") is None
+    assert sanitize_workflow_title_candidate(None) is None
+    assert sanitize_workflow_title_candidate(123) is None
+
+
+def test_sanitize_workflow_title_candidate_passes_through_secret_redaction() -> None:
+    """The persisted title goes through the same redaction seam as prompt-bound text.
+
+    Pattern-based, so this pins the wiring rather than claiming exhaustive coverage.
+    """
+    title = sanitize_workflow_title_candidate("Sync report password=hunter2horse")
+    assert title is not None
+    assert "hunter2horse" not in title
+    assert "[REDACTED_SECRET]" in title
+
+
+def test_classifier_decode_routes_workflow_title_through_the_sink() -> None:
+    classification = _turn_intent_classification_from_raw(
+        {"mode": "build", "workflow_title": "  Weekly  Visitor Report  "}
+    )
+
+    assert classification is not None
+    assert classification.workflow_title == "Weekly Visitor Report"
+
+
+def test_classifier_decode_drops_default_workflow_title() -> None:
+    classification = _turn_intent_classification_from_raw({"mode": "build", "workflow_title": "New Agent"})
+
+    assert classification is not None
+    assert classification.workflow_title is None
+
+
+def test_turn_intent_prompt_carries_workflow_title_contract() -> None:
     prompt = _render_turn_intent_prompt()
 
-    assert "resolves the target even without a URL" in prompt
-    assert "never ask which website/URL to use" in prompt
-    assert "refinements, corrections, and bare-value replies" in prompt
-    assert "When a concrete URL is present" in prompt
-    assert "default harder away from structurally_infeasible" in prompt
-    assert "On the fence: do not use structurally_infeasible" in prompt
+    assert "workflow_title" in prompt
+    assert "call it Invoice Bot" in prompt

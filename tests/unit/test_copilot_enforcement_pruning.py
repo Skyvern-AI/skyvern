@@ -45,7 +45,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     KEEP_RECENT_TOOL_OUTPUTS,
     SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
     TOTAL_TIMEOUT_SECONDS,
-    _check_enforcement,
     _mark_copilot_total_timeout,
     _mark_copilot_total_timeout_if_elapsed,
     _maybe_synthesized_block_offer_msg,
@@ -59,6 +58,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _summarize_tool_output,
     aggressive_prune,
     arm_credential_scout_reopen,
+    enforcement_decision,
     mint_scout_observation_contract_for_ctx,
     pre_run_gated_outputs_without_path,
     record_scouted_output_coverage,
@@ -1922,7 +1922,7 @@ def test_unrecoverable_contract_stop_preempts_failed_test_nudge() -> None:
     )
 
     with pytest.raises(CopilotUnrecoverableToolError):
-        _check_enforcement(ctx)
+        enforcement_decision(ctx)
 
     assert ctx.failed_test_nudge_count == 0
 
@@ -2394,8 +2394,11 @@ def test_aggressive_prune_drops_orphan_from_eight_pair_repro() -> None:
     assert _call_ids(pruned, "function_call_output") == ["call_5", "call_6", "call_7"]
 
 
+# tail_size samples the boundaries that change behaviour: below one pair, exactly one
+# pair, either side of KEEP_RECENT_TOOL_OUTPUTS, the production default, and longer
+# than the 21 non-screenshot items _tool_history(10) builds.
 @pytest.mark.parametrize("pair_count", [1, 2, 4, 8, 10])
-@pytest.mark.parametrize("tail_size", range(1, 21))
+@pytest.mark.parametrize("tail_size", [1, 2, 3, 4, 7, 25])
 @pytest.mark.parametrize("interleave_screenshots", [False, True])
 @pytest.mark.parametrize("attr_style", [False, True])
 def test_aggressive_prune_never_keeps_orphaned_tool_results(
@@ -2478,7 +2481,7 @@ def test_copilot_config_ignores_qa_budget_in_cloud(monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tail_size", range(1, 21))
+@pytest.mark.parametrize("tail_size", [1, 2, 3, 4, 7, 25])
 @pytest.mark.parametrize("attr_style", [False, True])
 async def test_context_overflow_session_rewrite_stores_pair_valid_history(
     monkeypatch: pytest.MonkeyPatch,
@@ -2623,13 +2626,13 @@ class TestEnforcement:
 
     def test_no_enforcement_when_nothing_pending(self) -> None:
         ctx = self._make_ctx()
-        assert _check_enforcement(ctx) is None
+        assert enforcement_decision(ctx) is None
 
     def test_post_navigate_nudge(self) -> None:
         ctx = self._make_ctx(navigate_called=True, observation_after_navigate=False)
-        nudge = _check_enforcement(ctx)
+        nudge = enforcement_decision(ctx)
         assert nudge is not None
-        assert "observe" in nudge.lower() or "inspect" in nudge.lower()
+        assert nudge.rule == "post_navigate"
         assert ctx.navigate_enforcement_done is True
 
     def test_post_navigate_only_fires_once(self) -> None:
@@ -2638,13 +2641,13 @@ class TestEnforcement:
             observation_after_navigate=False,
             navigate_enforcement_done=True,
         )
-        assert _check_enforcement(ctx) is None
+        assert enforcement_decision(ctx) is None
 
     def test_post_update_nudge(self) -> None:
         ctx = self._make_ctx(update_workflow_called=True, test_after_update_done=False)
-        nudge = _check_enforcement(ctx)
+        nudge = enforcement_decision(ctx)
         assert nudge is not None
-        assert "test" in nudge.lower() or "run_blocks" in nudge.lower()
+        assert nudge.rule == "post_update"
 
     def test_navigate_takes_priority_over_update(self) -> None:
         ctx = self._make_ctx(
@@ -2653,8 +2656,9 @@ class TestEnforcement:
             update_workflow_called=True,
             test_after_update_done=False,
         )
-        nudge = _check_enforcement(ctx)
-        assert "observe" in nudge.lower() or "inspect" in nudge.lower()
+        nudge = enforcement_decision(ctx)
+        assert nudge is not None
+        assert nudge.rule == "post_navigate"
 
     def test_intermediate_success_nudge_for_multistep_goal(self) -> None:
         ctx = self._make_ctx(
@@ -2665,11 +2669,9 @@ class TestEnforcement:
             user_message="Go to france.fr and then download all french regulations",
             coverage_nudge_count=0,
         )
-        from skyvern.forge.sdk.copilot.enforcement import POST_INTERMEDIATE_SUCCESS_NUDGE
-
         # Coverage gate only fires when the model tries to emit a REPLY.
-        nudge = _check_enforcement(ctx, self._reply_result("draft response"))
-        assert nudge == POST_INTERMEDIATE_SUCCESS_NUDGE
+        nudge = enforcement_decision(ctx, self._reply_result("draft response"))
+        assert nudge.rule == "post_intermediate_success"
         assert ctx.coverage_nudge_count == 1
 
     def test_no_intermediate_success_nudge_for_single_step_goal(self) -> None:
@@ -2681,7 +2683,7 @@ class TestEnforcement:
             user_message="Go to france.fr",
             coverage_nudge_count=0,
         )
-        assert _check_enforcement(ctx, self._reply_result("done")) is None
+        assert enforcement_decision(ctx, self._reply_result("done")) is None
 
     def test_intermediate_success_nudge_fires_for_two_blocks(self) -> None:
         """Key regression: nudge must fire even when block_count > 1."""
@@ -2694,10 +2696,8 @@ class TestEnforcement:
             user_message="Go to france.fr and then download all french regulations and extract the titles",
             coverage_nudge_count=0,
         )
-        from skyvern.forge.sdk.copilot.enforcement import POST_INTERMEDIATE_SUCCESS_NUDGE
-
-        nudge = _check_enforcement(ctx, self._reply_result("two-block draft"))
-        assert nudge == POST_INTERMEDIATE_SUCCESS_NUDGE
+        nudge = enforcement_decision(ctx, self._reply_result("two-block draft"))
+        assert nudge.rule == "post_intermediate_success"
 
     def test_intermediate_nudge_respects_global_cap(self) -> None:
         from skyvern.forge.sdk.copilot.enforcement import MAX_INTERMEDIATE_NUDGES
@@ -2710,7 +2710,7 @@ class TestEnforcement:
             user_message="Go to france.fr and then download all french regulations",
             coverage_nudge_count=MAX_INTERMEDIATE_NUDGES,
         )
-        assert _check_enforcement(ctx, self._reply_result("capped")) is None
+        assert enforcement_decision(ctx, self._reply_result("capped")) is None
 
     def test_intermediate_nudge_does_not_fire_for_ten_plus_blocks(self) -> None:
         ctx = self._make_ctx(
@@ -2721,7 +2721,7 @@ class TestEnforcement:
             user_message="Go to france.fr and then download all french regulations",
             coverage_nudge_count=0,
         )
-        assert _check_enforcement(ctx, self._reply_result("ten blocks")) is None
+        assert enforcement_decision(ctx, self._reply_result("ten blocks")) is None
 
     def test_ask_question_always_passes_even_with_coverage_gap(self) -> None:
         """Regression guard: ASK_QUESTION must never be blocked by coverage."""
@@ -2738,7 +2738,7 @@ class TestEnforcement:
         ask = MagicMock()
         ask.final_output = json.dumps({"type": "ASK_QUESTION", "user_response": "Which source?"})
         ask.new_items = []
-        assert _check_enforcement(ctx, ask) is None
+        assert enforcement_decision(ctx, ask) is None
 
     def test_plain_labeled_ask_question_passes_even_with_coverage_gap(self) -> None:
         ctx = self._make_ctx(
@@ -2752,36 +2752,28 @@ class TestEnforcement:
         ask = MagicMock()
         ask.final_output = "ASK_QUESTION\nWhich source?"
         ask.new_items = []
-        assert _check_enforcement(ctx, ask) is None
+        assert enforcement_decision(ctx, ask) is None
 
     def test_explore_without_workflow_nudge(self) -> None:
-        from skyvern.forge.sdk.copilot.enforcement import POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE
-
         ctx = self._make_ctx(
             navigate_called=True,
             observation_after_navigate=True,
             update_workflow_called=False,
             test_after_update_done=False,
         )
-        nudge = _check_enforcement(ctx)
-        assert nudge == POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE
+        nudge = enforcement_decision(ctx)
+        assert nudge.rule == "post_explore_without_workflow"
         assert ctx.explore_without_workflow_nudge_count == 1
 
     def test_explore_without_workflow_not_when_update_called(self) -> None:
-        from skyvern.forge.sdk.copilot.enforcement import (
-            POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE,
-            POST_UPDATE_NUDGE,
-        )
-
         ctx = self._make_ctx(
             navigate_called=True,
             observation_after_navigate=True,
             update_workflow_called=True,
             test_after_update_done=False,
         )
-        nudge = _check_enforcement(ctx)
-        assert nudge == POST_UPDATE_NUDGE
-        assert nudge != POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE
+        nudge = enforcement_decision(ctx)
+        assert nudge.rule == "post_update"
         assert ctx.explore_without_workflow_nudge_count == 0
 
     def test_update_without_test_allowed_for_explicit_untested_draft(self) -> None:
@@ -2791,25 +2783,20 @@ class TestEnforcement:
             test_after_update_done=False,
         )
 
-        assert _check_enforcement(ctx) is None
+        assert enforcement_decision(ctx) is None
 
     def test_explore_without_workflow_not_when_test_done(self) -> None:
-        from skyvern.forge.sdk.copilot.enforcement import POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE
-
         ctx = self._make_ctx(
             navigate_called=True,
             observation_after_navigate=True,
             update_workflow_called=False,
             test_after_update_done=True,
         )
-        nudge = _check_enforcement(ctx)
-        assert nudge != POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE
+
+        assert enforcement_decision(ctx) is None
 
     def test_explore_without_workflow_respects_cap(self) -> None:
-        from skyvern.forge.sdk.copilot.enforcement import (
-            MAX_EXPLORE_WITHOUT_WORKFLOW_NUDGES,
-            POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE,
-        )
+        from skyvern.forge.sdk.copilot.enforcement import MAX_EXPLORE_WITHOUT_WORKFLOW_NUDGES
 
         ctx = self._make_ctx(
             navigate_called=True,
@@ -2818,21 +2805,18 @@ class TestEnforcement:
             test_after_update_done=False,
             explore_without_workflow_nudge_count=MAX_EXPLORE_WITHOUT_WORKFLOW_NUDGES,
         )
-        nudge = _check_enforcement(ctx)
-        assert nudge != POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE
+
+        assert enforcement_decision(ctx) is None
 
     def test_explore_without_workflow_not_without_observation(self) -> None:
-        from skyvern.forge.sdk.copilot.enforcement import POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE
-
         ctx = self._make_ctx(
             navigate_called=True,
             observation_after_navigate=False,
             update_workflow_called=False,
             test_after_update_done=False,
         )
-        nudge = _check_enforcement(ctx)
-        # Should get navigate nudge, not explore-without-workflow
-        assert nudge != POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE
+        nudge = enforcement_decision(ctx)
+        assert nudge.rule == "post_navigate"
         assert ctx.explore_without_workflow_nudge_count == 0
 
     @pytest.mark.asyncio

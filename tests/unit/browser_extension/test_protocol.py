@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import zipfile
+from pathlib import Path
 
 import pytest
 
 from skyvern.browser_extension.errors import BrowserExtensionError
+from skyvern.browser_extension.package_extension import package_extension
 from skyvern.browser_extension.protocol import (
     ALLOWED_CDP_METHOD_PREFIXES,
     ALLOWED_EVENTS,
@@ -62,7 +67,7 @@ def test_unknown_message_type_raises() -> None:
 
 def test_protocol_allowlists_match_contract() -> None:
     assert PROTOCOL_VERSION == 1
-    assert EXTENSION_ID == "fmamdhmfeihjjaiheideemihnbpnokin"
+    assert EXTENSION_ID == "dhommdmblflboaledbbfkdaapkadphlp"
     assert ALLOWED_OPS == frozenset(
         {
             "debugger.attach",
@@ -97,6 +102,31 @@ def test_protocol_allowlists_match_contract() -> None:
             "INTERNAL",
         }
     )
+
+
+def test_manifest_key_derives_extension_id() -> None:
+    extension_dir = Path(__file__).parents[3] / "skyvern" / "browser_extension" / "extension"
+    manifest = json.loads((extension_dir / "manifest.json").read_text())
+    public_key = base64.b64decode(manifest["key"], validate=True)
+    digest_prefix = hashlib.sha256(public_key).hexdigest()[:32]
+    derived_extension_id = "".join(chr(ord("a") + int(nibble, 16)) for nibble in digest_prefix)
+
+    assert derived_extension_id == EXTENSION_ID
+
+
+def test_package_extension_builds_store_upload_zip(tmp_path: Path) -> None:
+    output_path = package_extension(tmp_path / "skyvern-agent.zip")
+
+    with zipfile.ZipFile(output_path) as archive:
+        names = set(archive.namelist())
+        packaged_manifest = json.loads(archive.read("manifest.json"))
+
+    assert "key" not in packaged_manifest
+    assert "service_worker.js" in names
+    assert "README.md" not in names
+
+    second_path = package_extension(tmp_path / "skyvern-agent-second.zip")
+    assert output_path.read_bytes() == second_path.read_bytes()
 
 
 def test_build_request_checks_operation_allowlist() -> None:
