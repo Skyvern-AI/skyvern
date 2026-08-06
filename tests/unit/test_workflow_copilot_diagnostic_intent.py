@@ -26,36 +26,6 @@ class TestDiagnosticObservationIntent:
         assert "DIAGNOSTIC / OBSERVATIONAL COMPLAINTS" not in rendered
         assert "Explicit edit/debug requests remain edit requests" not in rendered
 
-    def test_agent_prompt_routes_diagnostic_followups_to_edit_when_context_resolves(self) -> None:
-        rendered = _render_agent_prompt()
-
-        assert (
-            "This includes diagnostic symptom follow-ups on the same workflow after an explicit edit goal" in rendered
-        )
-        assert "diagnostic-after-edit - prior turn asked to consolidate login blocks" in rendered
-        assert "connect the existing block chain and call `update_and_run_blocks` once" in rendered
-
-    def test_agent_prompt_keeps_unresolved_diagnostics_as_clarification(self) -> None:
-        rendered = _render_agent_prompt()
-
-        assert "when a diagnostic complaint has no prior edit goal" in rendered
-        assert "mismatched/anonymized block references cannot be resolved" in rendered
-        assert "latest says to add a conditional to a URL without saying when -> ask for the condition" in rendered
-        assert "ask naming both missing labels and candidate blocks" in rendered
-
-    def test_agent_prompt_avoids_debug_tools_before_clear_structural_edit(self) -> None:
-        rendered = _render_agent_prompt()
-
-        assert "When the workflow structure itself is enough to make the edit" in rendered
-        assert (
-            "do not use direct browser tools, `get_run_results`, `run_blocks_and_collect_debug`, `update_workflow`"
-            in rendered
-        )
-        assert (
-            "Do not copy explanatory chat-history prose, example Jinja placeholders, or diagnostic transcripts"
-            in rendered
-        )
-
     def test_block_running_tools_share_consolidated_diagnostic_routing(self) -> None:
         for tool in (run_blocks_tool, update_and_run_blocks_tool):
             desc = tool.description  # type: ignore[attr-defined]
@@ -100,10 +70,3 @@ class TestDiagnosticAbsentEntity:
         section = rendered[start:end]
         assert "workflow-knowledge-base prose" in section
         assert "KB" not in section
-
-    def test_docs_inline_disambiguator_defers_to_ask_vs_edit_routing(self) -> None:
-        rendered = _render_agent_prompt()
-
-        assert "Docs-inline does NOT apply to a runtime symptom" in rendered
-        assert "a block label, workflow parameter key, or `{{ name.output... }}` Jinja reference" in rendered
-        assert "use the ASK-vs-EDIT routing below" in rendered

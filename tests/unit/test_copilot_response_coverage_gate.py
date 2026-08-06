@@ -1,4 +1,4 @@
-"""Tests for the response-aware coverage gate in _check_enforcement.
+"""Tests for the response-aware coverage gate in enforcement_decision.
 
 Covers a regression where a 2-action user goal slipped past enforcement
 because the old `premature_completion_nudge_done` latch was bypassed by a
@@ -20,13 +20,9 @@ from skyvern.forge.sdk.copilot.enforcement import (
     MAX_FORMAT_NUDGES,
     MAX_INTERMEDIATE_NUDGES,
     MAX_NO_WORKFLOW_NUDGES,
-    POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE,
-    POST_FORMAT_NUDGE,
-    POST_INTERMEDIATE_SUCCESS_NUDGE,
-    POST_NO_WORKFLOW_DELIVERY_NUDGE,
-    _check_enforcement,
     _is_progress_narration,
     _response_coverage_nudge,
+    enforcement_decision,
 )
 
 
@@ -107,7 +103,7 @@ def test_reply_with_coverage_gap_fires_nudge() -> None:
     ctx = _post_success_ctx("go to example.com and download the regulations")
     parsed = {"type": "REPLY", "user_response": "I created a nav block."}
     nudge = _response_coverage_nudge(ctx, parsed)
-    assert nudge == POST_INTERMEDIATE_SUCCESS_NUDGE
+    assert nudge.rule == "post_intermediate_success"
     assert ctx.coverage_nudge_count == 1
 
 
@@ -133,7 +129,7 @@ def test_coverage_nudge_respects_counter_cap() -> None:
     ctx = _post_success_ctx("go to X and download Y")
     parsed = {"type": "REPLY", "user_response": "one block draft"}
     for _ in range(MAX_INTERMEDIATE_NUDGES):
-        assert _response_coverage_nudge(ctx, parsed) == POST_INTERMEDIATE_SUCCESS_NUDGE
+        assert _response_coverage_nudge(ctx, parsed).rule == "post_intermediate_success"
     # One more call — the cap should now let the response through.
     assert _response_coverage_nudge(ctx, parsed) is None
 
@@ -156,8 +152,9 @@ def test_ask_question_before_acting_on_discovery_candidate_fires_nudge() -> None
     nudge = _response_coverage_nudge(ctx, parsed)
 
     assert nudge is not None
-    assert nudge.startswith(POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE)
-    assert "https://example.com/" in nudge
+    assert nudge.rule == "post_discovery_entrypoint_url_question"
+    # nosemgrep false positive: asserts the advisory interpolates the resolved entrypoint.
+    assert "https://example.com/" in nudge.message  # nosemgrep: incomplete-url-substring-sanitization
     assert ctx.discovery_entrypoint_url_question_nudge_count == 1
 
 
@@ -253,7 +250,7 @@ def test_reply_claiming_workflow_without_update_fires_nudge() -> None:
     ctx = _Ctx()
     parsed = {"type": "REPLY", "user_response": "Here's the workflow."}
 
-    assert _response_coverage_nudge(ctx, parsed) == POST_NO_WORKFLOW_DELIVERY_NUDGE
+    assert _response_coverage_nudge(ctx, parsed).rule == "post_no_workflow_delivery"
     assert ctx.no_workflow_nudge_count == 1
 
 
@@ -264,7 +261,7 @@ def test_initial_part_workflow_claim_without_update_fires_nudge() -> None:
         "user_response": "In the meantime, I've drafted the initial part of your workflow with placeholders.",
     }
 
-    assert _response_coverage_nudge(ctx, parsed) == POST_NO_WORKFLOW_DELIVERY_NUDGE
+    assert _response_coverage_nudge(ctx, parsed).rule == "post_no_workflow_delivery"
     assert ctx.no_workflow_nudge_count == 1
 
 
@@ -273,7 +270,7 @@ def test_no_workflow_delivery_nudge_respects_counter_cap() -> None:
     parsed = {"type": "REPLY", "user_response": "I created a workflow for this."}
 
     for _ in range(MAX_NO_WORKFLOW_NUDGES):
-        assert _response_coverage_nudge(ctx, parsed) == POST_NO_WORKFLOW_DELIVERY_NUDGE
+        assert _response_coverage_nudge(ctx, parsed).rule == "post_no_workflow_delivery"
     assert _response_coverage_nudge(ctx, parsed) is None
 
 
@@ -326,7 +323,7 @@ def test_format_nudge_fires_for_progress_narration_without_coverage_gap() -> Non
         "user_response": "I ran the first block. Next I will proceed to add the rest.",
     }
     nudge = _response_coverage_nudge(ctx, parsed)
-    assert nudge == POST_FORMAT_NUDGE
+    assert nudge.rule == "post_format"
     assert ctx.format_nudge_count == 1
 
 
@@ -334,7 +331,7 @@ def test_format_nudge_respects_counter_cap() -> None:
     ctx = _post_success_ctx("go to X and download Y", block_count=2)
     parsed = {"type": "REPLY", "user_response": "Next I will proceed."}
     for _ in range(MAX_FORMAT_NUDGES):
-        assert _response_coverage_nudge(ctx, parsed) == POST_FORMAT_NUDGE
+        assert _response_coverage_nudge(ctx, parsed).rule == "post_format"
     assert _response_coverage_nudge(ctx, parsed) is None
 
 
@@ -342,13 +339,13 @@ def test_coverage_nudge_takes_priority_over_format_nudge() -> None:
     # Coverage gap AND progress narration — coverage fires first, counter advances.
     ctx = _post_success_ctx("go to X and download Y", block_count=1)
     parsed = {"type": "REPLY", "user_response": "Next I will proceed with more blocks."}
-    assert _response_coverage_nudge(ctx, parsed) == POST_INTERMEDIATE_SUCCESS_NUDGE
+    assert _response_coverage_nudge(ctx, parsed).rule == "post_intermediate_success"
     assert ctx.coverage_nudge_count == 1
     assert ctx.format_nudge_count == 0
 
 
 # ---------------------------------------------------------------------------
-# Integrated _check_enforcement — no-op-turn bypass closed (main regression)
+# Integrated enforcement_decision — no-op-turn bypass closed (main regression)
 # ---------------------------------------------------------------------------
 
 
@@ -365,10 +362,10 @@ def test_no_op_turn_bypass_closed_goes_to_phrasing() -> None:
         "I ran the first block (open_home). The navigation block completed. "
         "I did not attempt further blocks yet. Next I will proceed."
     )
-    nudge = _check_enforcement(ctx, result)
+    nudge = enforcement_decision(ctx, result)
     # Either branch is a valid fix for the regression — verify the format
     # branch specifically since the coverage heuristic misses this phrasing.
-    assert nudge == POST_FORMAT_NUDGE
+    assert nudge.rule == "post_format"
 
 
 def test_no_op_turn_bypass_closed_multi_action() -> None:
@@ -376,8 +373,8 @@ def test_no_op_turn_bypass_closed_multi_action() -> None:
     (explicit 'go to' + 'download'). The coverage branch fires."""
     ctx = _post_success_ctx("go to example.com and download the regulations")
     result = _reply_result("Ran one block; will do the rest next.")
-    nudge = _check_enforcement(ctx, result)
-    assert nudge == POST_INTERMEDIATE_SUCCESS_NUDGE
+    nudge = enforcement_decision(ctx, result)
+    assert nudge.rule == "post_intermediate_success"
 
 
 def test_ask_question_reaches_user_after_any_state() -> None:
@@ -386,20 +383,20 @@ def test_ask_question_reaches_user_after_any_state() -> None:
     incomplete, so the agent can ask for credentials / disambiguate."""
     ctx = _post_success_ctx("login and download my records")
     result = _ask_question_result("Which credential should I use for this login?")
-    assert _check_enforcement(ctx, result) is None
+    assert enforcement_decision(ctx, result) is None
 
 
-def test_check_enforcement_without_result_skips_response_peek() -> None:
+def test_enforcement_decision_without_result_skips_response_peek() -> None:
     """Pre-screenshot-handoff path passes result=None. State-based branches
     still fire; response peek is skipped."""
     ctx = _Ctx()
     ctx.navigate_called = True  # but no observation_after_navigate
     # navigate_enforcement_done is still False
-    nudge = _check_enforcement(ctx, None)
+    nudge = enforcement_decision(ctx, None)
     assert nudge is not None  # navigate nudge fires
 
 
-def test_check_enforcement_clean_reply_passes_through() -> None:
+def test_enforcement_decision_clean_reply_passes_through() -> None:
     ctx = _post_success_ctx("go to example.com and extract the top 3 stories", block_count=2)
     result = _reply_result("I created a 2-block workflow that extracts the top 3 stories.")
-    assert _check_enforcement(ctx, result) is None
+    assert enforcement_decision(ctx, result) is None

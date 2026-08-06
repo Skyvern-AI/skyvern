@@ -13,9 +13,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcom
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_FAILED_TEST_NUDGES,
-    POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE,
-    POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE,
-    _check_enforcement,
+    enforcement_decision,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import (
     compute_failure_signature,
@@ -1378,18 +1376,18 @@ def test_repeated_failure_end_to_end_flow_1_then_warn_then_stop() -> None:
 
     update_repeated_failure_state(ctx, result)
     assert ctx.repeated_failure_streak_count == 1
-    assert _check_enforcement(ctx) is None
+    assert enforcement_decision(ctx) is None
 
     update_repeated_failure_state(ctx, result)
     assert ctx.repeated_failure_streak_count == 2
-    assert _check_enforcement(ctx) == POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE
+    assert enforcement_decision(ctx).rule == "post_repeated_frontier_failure_warn"
     assert ctx.repeated_failure_streak_count == 2
-    assert _check_enforcement(ctx) != POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE
+    assert enforcement_decision(ctx) is None
 
     update_repeated_failure_state(ctx, result)
     assert ctx.repeated_failure_streak_count == 3
-    assert _check_enforcement(ctx) == POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE
-    assert _check_enforcement(ctx) != POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE
+    assert enforcement_decision(ctx).rule == "post_repeated_frontier_failure_stop"
+    assert enforcement_decision(ctx) is None
 
 
 def test_compute_failure_signature_none_on_clean_success() -> None:

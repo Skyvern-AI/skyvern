@@ -1,10 +1,10 @@
 """Tests for enforcement hardening landed in copilot-stack/06b:
 
-* fresh ``CopilotContext`` flows through ``_check_enforcement`` without raising
+* fresh ``CopilotContext`` flows through ``enforcement_decision`` without raising
   AttributeError (enforcement fields have dataclass defaults).
 * ``_prune_input_list`` compacts the ``arguments`` field of older tool calls
   so large payloads (like a full workflow YAML) don't accumulate.
-* ``_check_enforcement`` does NOT clear ``last_test_suspicious_success`` after
+* ``enforcement_decision`` does NOT clear ``last_test_suspicious_success`` after
   emitting the nudge — if the agent ignores it and replies again, the nudge
   must re-fire.
 * ``_recover_from_context_overflow`` strips image payloads out of the current
@@ -38,14 +38,7 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     VerificationResult,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
-    POST_FAILED_TEST_INSPECT_FIRST_NUDGE,
-    POST_FAILED_TEST_NUDGE,
-    POST_NAVIGATE_NUDGE,
-    POST_PER_TOOL_BUDGET_NUDGE,
-    POST_PER_TOOL_BUDGET_STOP_NUDGE,
-    POST_SUSPICIOUS_SUCCESS_NUDGE,
     SCREENSHOT_PLACEHOLDER,
-    _check_enforcement,
     _code_authoring_reject_count_resets,
     _is_context_window_error,
     _needs_inspect_before_repair_nudge,
@@ -54,6 +47,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _scouted_spine_missing_text,
     _strip_input_images,
     _witnessed_values_by_path,
+    enforcement_decision,
     register_no_progress_interaction_click,
     reset_no_progress_interaction_count,
     synthesized_trajectory_reaches_goal,
@@ -69,9 +63,9 @@ from tests.unit.conftest import make_copilot_context as _fresh_context
 # ---------------------------------------------------------------------------
 
 
-def test_check_enforcement_on_fresh_agent_context_returns_none() -> None:
+def test_enforcement_decision_on_fresh_agent_context_returns_none() -> None:
     ctx = _fresh_context()
-    assert _check_enforcement(ctx) is None
+    assert enforcement_decision(ctx) is None
 
 
 def test_failed_test_nudge_counter_increments_on_fresh_context() -> None:
@@ -82,7 +76,7 @@ def test_failed_test_nudge_counter_increments_on_fresh_context() -> None:
     ctx.last_test_ok = False
     ctx.last_test_failure_reason = "something broke"
     # First call should emit and increment without AttributeError.
-    assert _check_enforcement(ctx) is not None
+    assert enforcement_decision(ctx) is not None
     assert ctx.failed_test_nudge_count == 1
 
 
@@ -126,7 +120,7 @@ def test_failed_test_routes_to_inspect_first_when_repairable_and_unobserved() ->
     ctx.test_after_update_done = True
     ctx.last_test_ok = False
     ctx.latest_diagnosis_repair_contract = _repair_contract(RepairNextAction.REPAIR)
-    assert _check_enforcement(ctx) == POST_FAILED_TEST_INSPECT_FIRST_NUDGE
+    assert enforcement_decision(ctx).rule == "post_failed_test_inspect_first"
 
 
 def test_second_consecutive_per_tool_budget_trip_routes_to_stop_nudge() -> None:
@@ -137,11 +131,11 @@ def test_second_consecutive_per_tool_budget_trip_routes_to_stop_nudge() -> None:
     ctx.last_test_ok = False
     ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
     # First budget trip earns one smaller-frontier retry nudge.
-    assert _check_enforcement(ctx) == POST_PER_TOOL_BUDGET_NUDGE
+    assert enforcement_decision(ctx).rule == "post_per_tool_budget"
     assert ctx.per_tool_budget_nudge_count == 1
     # Second consecutive budget trip -> finalize/STOP nudge, not another re-run.
     ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
-    assert _check_enforcement(ctx) == POST_PER_TOOL_BUDGET_STOP_NUDGE
+    assert enforcement_decision(ctx).rule == "post_per_tool_budget_stop"
     assert ctx.per_tool_budget_nudge_count == 2
 
 
@@ -157,7 +151,7 @@ def test_failed_test_is_generic_once_reached_page_observed() -> None:
     ctx.post_run_page_observation_tool = "inspect_page_for_composition"
     ctx.post_run_page_observation_workflow_run_id = "wr_x"
     ctx.last_run_blocks_workflow_run_id = "wr_x"
-    assert _check_enforcement(ctx) == POST_FAILED_TEST_NUDGE
+    assert enforcement_decision(ctx).rule == "post_failed_test"
 
 
 # ---------------------------------------------------------------------------
@@ -214,12 +208,12 @@ def test_suspicious_success_nudge_refires_on_subsequent_turn() -> None:
     ctx.last_test_ok = None
     ctx.last_test_suspicious_success = True
 
-    first = _check_enforcement(ctx)
-    assert first == POST_SUSPICIOUS_SUCCESS_NUDGE
+    first = enforcement_decision(ctx)
+    assert first.rule == "post_suspicious_success"
     # Without a rerun, the flag must still be set so the nudge fires again.
     assert ctx.last_test_suspicious_success is True
-    second = _check_enforcement(ctx)
-    assert second == POST_SUSPICIOUS_SUCCESS_NUDGE
+    second = enforcement_decision(ctx)
+    assert second.rule == "post_suspicious_success"
 
 
 # ---------------------------------------------------------------------------
@@ -324,18 +318,18 @@ def test_update_enforcement_from_tool_resets_navigate_latch_on_new_navigate() ->
     assert ctx.navigate_enforcement_done is False
 
 
-def test_check_enforcement_refires_navigate_nudge_after_latch_reset() -> None:
+def test_enforcement_decision_refires_navigate_nudge_after_latch_reset() -> None:
     ctx = _fresh_context()
     # First navigate-without-observe: nudge fires, latch set.
     ctx.navigate_called = True
     ctx.observation_after_navigate = False
-    assert _check_enforcement(ctx) == POST_NAVIGATE_NUDGE
+    assert enforcement_decision(ctx).rule == "post_navigate"
     assert ctx.navigate_enforcement_done is True
 
     # Agent re-navigates without observing; the streaming adapter re-arms the latch.
     _update_enforcement_from_tool(ctx, "navigate_browser", {"ok": True, "data": {}})
     # Nudge fires again on the new cycle.
-    assert _check_enforcement(ctx) == POST_NAVIGATE_NUDGE
+    assert enforcement_decision(ctx).rule == "post_navigate"
 
 
 # ---------------------------------------------------------------------------
@@ -531,7 +525,7 @@ def test_observed_reply_cannot_finalize_while_repair_is_owed() -> None:
     ctx = _failed_run_ctx(RepairNextAction.REPAIR)
     result = _FakeFinalResult("REPLY", "The latest bill link opens an email-delivery form.")
 
-    assert _check_enforcement(ctx, result) is not None
+    assert enforcement_decision(ctx, result) is not None
 
 
 def test_observed_reply_finalizes_once_repair_is_discharged() -> None:
@@ -541,7 +535,7 @@ def test_observed_reply_finalizes_once_repair_is_discharged() -> None:
     ctx = _failed_run_ctx(RepairNextAction.NO_CHANGE)
     result = _FakeFinalResult("REPLY", "Downloaded the latest invoice.")
 
-    assert _check_enforcement(ctx, result) is None
+    assert enforcement_decision(ctx, result) is None
 
 
 def test_ask_question_still_finalizes_while_repair_is_owed() -> None:
@@ -552,7 +546,7 @@ def test_ask_question_still_finalizes_while_repair_is_owed() -> None:
     ctx.failed_test_nudge_count = 99  # counters exhausted
     result = _FakeFinalResult("ASK_QUESTION", "Which account should I use?")
 
-    assert _check_enforcement(ctx, result) is None
+    assert enforcement_decision(ctx, result) is None
 
 
 def test_exhausted_nudge_counters_do_not_release_an_open_repair_obligation() -> None:
@@ -563,7 +557,7 @@ def test_exhausted_nudge_counters_do_not_release_an_open_repair_obligation() -> 
     ctx.failed_test_nudge_count = 99
     result = _FakeFinalResult("REPLY", "I drafted the workflow; it attempts to download the bill.")
 
-    assert _check_enforcement(ctx, result) == POST_FAILED_TEST_NUDGE
+    assert enforcement_decision(ctx, result).rule == "post_failed_test"
 
 
 def test_stop_decision_releases_the_turn_even_with_counters_exhausted() -> None:
@@ -574,7 +568,7 @@ def test_stop_decision_releases_the_turn_even_with_counters_exhausted() -> None:
     ctx.failed_test_nudge_count = 99
     result = _FakeFinalResult("REPLY", "This site requires a mailed statement request.")
 
-    assert _check_enforcement(ctx, result) is None
+    assert enforcement_decision(ctx, result) is None
 
 
 def test_repair_obligation_releases_the_turn_once_its_rounds_are_spent() -> None:
@@ -587,10 +581,10 @@ def test_repair_obligation_releases_the_turn_once_its_rounds_are_spent() -> None
     result = _FakeFinalResult("REPLY", "This site offers no downloadable statement.")
 
     # Held open while rounds remain.
-    assert _check_enforcement(ctx, result) == POST_FAILED_TEST_NUDGE
+    assert enforcement_decision(ctx, result).rule == "post_failed_test"
 
     ctx.repair_obligation_nudge_count = MAX_REPAIR_OBLIGATION_NUDGES
-    assert _check_enforcement(ctx, result) is None
+    assert enforcement_decision(ctx, result) is None
 
 
 class TestWitnessArbitration:
