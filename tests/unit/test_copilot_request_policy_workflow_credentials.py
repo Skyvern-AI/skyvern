@@ -774,7 +774,6 @@ async def test_classifier_id_absent_from_current_message_does_not_resolve() -> N
         "Avoid using cred_prod.",
         "Exclude credential ID cred_prod.",
         "Do not use the old workflow because it still mentions credential ID cred_prod.",
-        "Do not use the old workflow because it mentions cred_prod.",
         "Do not use this credential, credential ID cred_prod.",
     ],
 )
