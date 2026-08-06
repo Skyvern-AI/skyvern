@@ -54,6 +54,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotDesignStartUpdate,
     WorkflowCopilotNarrationUpdate,
     WorkflowCopilotStreamMessageType,
+    WorkflowCopilotTitleUpdate,
     WorkflowCopilotToolCallUpdate,
     WorkflowCopilotToolResultUpdate,
     WorkflowCopilotTurnMode,
@@ -712,6 +713,17 @@ async def emit_turn_start(stream: EventSourceStream, ctx: CopilotContext) -> Non
             mode=WorkflowCopilotTurnMode(mode_value),
             timestamp=now,
             prior_block_count=ctx.prior_block_count,
+        )
+    )
+
+
+async def emit_title_update(stream: EventSourceStream, ctx: CopilotContext, title: str) -> None:
+    await stream.send(
+        WorkflowCopilotTitleUpdate(
+            turn_id=ctx.turn_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            title=title,
+            timestamp=datetime.now(timezone.utc),
         )
     )
 
