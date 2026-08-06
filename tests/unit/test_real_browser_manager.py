@@ -794,6 +794,33 @@ async def test_get_video_artifacts_non_webm_skips_ffmpeg(tmp_path) -> None:
     assert artifacts[0].video_data == b"mp4-bytes"
 
 
+@pytest.mark.asyncio
+async def test_get_video_artifacts_empty_snapshot_path_does_not_warn() -> None:
+    """The finalize=False snapshot path runs once per step on browsers that never record
+    locally (vendor/CDP/persistent sessions), where an empty list is the expected state."""
+    browser_state = MagicMock()
+    browser_state.browser_artifacts.video_artifacts = []
+
+    with patch.object(real_browser_manager, "LOG") as mock_log:
+        artifacts = await RealBrowserManager().get_video_artifacts(browser_state=browser_state, finalize=False)
+
+    assert artifacts == []
+    mock_log.warning.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_video_artifacts_empty_finalize_path_warns() -> None:
+    """At finalize time the browser is closing, so a missing recording is a real signal."""
+    browser_state = MagicMock()
+    browser_state.browser_artifacts.video_artifacts = []
+
+    with patch.object(real_browser_manager, "LOG") as mock_log:
+        artifacts = await RealBrowserManager().get_video_artifacts(browser_state=browser_state)
+
+    assert artifacts == []
+    mock_log.warning.assert_called_once()
+
+
 def _make_page_mock(video_path: str | None) -> MagicMock:
     page = MagicMock()
     if video_path is None:

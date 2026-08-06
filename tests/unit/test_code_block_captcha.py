@@ -94,6 +94,7 @@ class FakePage:
         self.continue_button.click = AsyncMock(side_effect=self._continue)
         self.frames = list(frames or [])
         self.url = url
+        self.evaluated: list[str] = []
 
     async def _continue(self) -> None:
         self.checkbox._count = 0
@@ -110,6 +111,9 @@ class FakePage:
 
     async def wait_for_timeout(self, _milliseconds: int) -> None:
         await asyncio.sleep(0)
+
+    async def evaluate(self, expression: str, *_args: object) -> None:
+        self.evaluated.append(expression)
 
 
 @pytest.mark.asyncio
@@ -514,7 +518,32 @@ async def test_real_sandbox_solve_captcha_raises_constant_sanitized_error(
         page,
         organization_id="org-1",
         workflow_run_id="wr-1",
+        browser_session_id=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_builtin_reports_whether_an_arm_ran(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A page with no challenge markers must be distinguishable from a solve, so callers that
+    re-perceive after a solve do not re-perceive a page nothing touched."""
+    agent_function = type(
+        "AgentFunctionStub",
+        (),
+        {
+            "auto_solve_captchas": AsyncMock(return_value=False),
+            "solve_recaptcha_token": AsyncMock(return_value=True),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+
+    assert await block_module._code_block_solve_captcha_builtin(FakePage()) is False
+    assert (
+        await block_module._code_block_solve_captcha_builtin(
+            FakePage(recaptcha=True), organization_id="org-1", browser_session_id="bs-1"
+        )
+        is True
+    )
+    assert agent_function.solve_recaptcha_token.await_args.kwargs["browser_session_id"] == "bs-1"
 
 
 def test_solve_captcha_is_reserved_in_sandbox_namespace() -> None:
@@ -552,3 +581,64 @@ async def test_extension_arm_is_bounded_and_falls_through_on_hang(
 
     agent_function.auto_solve_captchas.assert_awaited_once()
     agent_function.solve_recaptcha_token.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_an_unsolved_anchor_click_closes_the_challenge_it_opened(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clicking the anchor escalates to an image challenge whose overlay covers the page and
+    outlives the arm, so a click that won no token has to put the widget back."""
+    agent_function = type(
+        "AgentFunctionStub",
+        (),
+        {
+            "auto_solve_captchas": AsyncMock(return_value=False),
+            "solve_recaptcha_token": AsyncMock(return_value=False),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    parent_frame = FakePage(token_values=["", ""])
+    page = FakePage(
+        recaptcha=True,
+        frames=[
+            FakeFrame(
+                url="https://www.google.com/recaptcha/api2/anchor",
+                anchor=FakeLocator(count=1),
+                parent_frame=parent_frame,
+            )
+        ],
+    )
+
+    with pytest.raises(CodeBlockCaptchaError):
+        await block_module._code_block_solve_captcha_builtin(page, organization_id="org-1")
+
+    assert any("grecaptcha" in expression for expression in page.evaluated)
+
+
+@pytest.mark.asyncio
+async def test_an_anchor_click_that_left_a_token_is_not_reset_away(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reset discards whatever response it finds, so it must not run over a token already there."""
+    agent_function = type(
+        "AgentFunctionStub",
+        (),
+        {
+            "auto_solve_captchas": AsyncMock(return_value=False),
+            "solve_recaptcha_token": AsyncMock(return_value=False),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    parent_frame = FakePage(token_values=["tok", "tok"])
+    page = FakePage(
+        recaptcha=True,
+        frames=[
+            FakeFrame(
+                url="https://www.google.com/recaptcha/api2/anchor",
+                anchor=FakeLocator(count=1),
+                parent_frame=parent_frame,
+            )
+        ],
+    )
+
+    with pytest.raises(CodeBlockCaptchaError):
+        await block_module._code_block_solve_captcha_builtin(page, organization_id="org-1")
+
+    assert not any("grecaptcha" in expression for expression in page.evaluated)

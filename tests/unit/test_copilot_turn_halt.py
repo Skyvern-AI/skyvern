@@ -9,8 +9,8 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
-    _check_enforcement,
     _maybe_stash_terminal_challenge_halt,
+    enforcement_decision,
     terminal_challenge_blocker_signal_from_current_page_evidence,
     terminal_challenge_blocker_signal_from_page_evidence,
 )
@@ -125,7 +125,7 @@ def test_enforcement_backstop_converts_existing_terminal_blocker_signal() -> Non
     stash_blocker_signal(ctx, signal)
 
     with pytest.raises(CopilotTurnHalt) as exc_info:
-        _check_enforcement(ctx)
+        enforcement_decision(ctx)
 
     assert ctx.turn_halt is exc_info.value.halt
     assert exc_info.value.halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
