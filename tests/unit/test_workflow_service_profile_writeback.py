@@ -7,6 +7,8 @@ overwrite the shared S3 profile with their dirty state.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -17,6 +19,7 @@ from skyvern.forge.sdk.workflow.browser_profile_key import build_workflow_browse
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.webeye.browser_manager import BrowserCleanupResult
+from skyvern.webeye.profile_cookie_merge import BANKED_COOKIES_FILENAME
 
 
 def _make_workflow(persist: bool = True) -> MagicMock:
@@ -49,11 +52,12 @@ def _make_workflow_run(
     return wr
 
 
-def _make_browser_state() -> MagicMock:
+def _make_browser_state(applied_browser_profile_id: str | None = None) -> MagicMock:
     bs = MagicMock()
     bs.browser_artifacts.browser_session_dir = "/tmp/fake_profile"
     bs.browser_artifacts._seed_load_failed = False
     bs.browser_artifacts._seed_capture_failed = False
+    bs.browser_artifacts.applied_browser_profile_id = applied_browser_profile_id
     return bs
 
 
@@ -526,7 +530,7 @@ async def test_engine_on_writes_resolved_sink_profile(monkeypatch: pytest.Monkey
     workflow_run = _make_workflow_run(
         WorkflowRunStatus.completed, browser_profile_id="bp_seed", browser_sink_profile_id="bp_sink"
     )
-    store_session_mock = _patch_clean_up_deps(monkeypatch, _make_browser_state())
+    store_session_mock = _patch_clean_up_deps(monkeypatch, _make_browser_state(applied_browser_profile_id="bp_seed"))
     monkeypatch.setattr(app.AGENT_FUNCTION, "is_browser_memory_engine_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(app.AGENT_FUNCTION, "bank_credential_profile_on_healthy_run", AsyncMock())
 
@@ -541,6 +545,29 @@ async def test_engine_on_writes_resolved_sink_profile(monkeypatch: pytest.Monkey
         "o_test", profile_id="bp_sink", directory="/tmp/fake_profile"
     )
     store_session_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_engine_on_skips_sink_write_when_stamped_seed_not_applied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stamped seed the browser never applied (vendor-routed boot) must not be overwritten by an
+    unrelated directory; seedless accumulate rows are unaffected (browser_profile_id None)."""
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    workflow = _make_workflow(persist=True)
+    workflow_run = _make_workflow_run(
+        WorkflowRunStatus.completed, browser_profile_id="bp_seed", browser_sink_profile_id="bp_sink"
+    )
+    _patch_clean_up_deps(monkeypatch, _make_browser_state(applied_browser_profile_id=None))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_browser_memory_engine_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "bank_credential_profile_on_healthy_run", AsyncMock())
+
+    svc = WorkflowService()
+    monkeypatch.setattr(svc, "persist_video_data", AsyncMock())
+    monkeypatch.setattr(svc, "get_tasks_by_workflow_run_id", AsyncMock(return_value=[]))
+
+    await svc.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, need_call_webhook=False)
+
+    app.STORAGE.store_browser_profile.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -832,6 +859,33 @@ async def test_sink_writeback_suppressed_when_seed_profile_failed_to_load(monkey
         effective_workflow_run_status=WorkflowRunStatus.completed,
     )
     store.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sink_full_write_drops_the_seed_era_banked_sidecar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The sidecar restored from the seed archive rides this dir into the sink profile, where every later
+    # boot would replay it over a fresher Cookies database. The closed browser's database is authoritative.
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    banked = tmp_path / BANKED_COOKIES_FILENAME
+    banked.write_text(json.dumps([{"name": "seed_era", "value": "x", "domain": "example.test", "path": "/"}]))
+    store = AsyncMock()
+    monkeypatch.setattr(app.STORAGE, "store_browser_profile", store)
+    wr = _make_workflow_run(WorkflowRunStatus.completed, browser_sink_profile_id="bp")
+    bs = _make_browser_state_b2(seed_cookies=[], seed_etag=None, fresh_login=False)
+    bs.browser_artifacts.browser_session_dir = str(tmp_path)
+
+    await WorkflowService()._persist_run_sink_profile_if_needed(
+        workflow_run=wr,
+        browser_state=bs,
+        close_browser_on_completion=True,
+        effective_workflow_run_status=WorkflowRunStatus.completed,
+    )
+
+    store.assert_awaited_once()
+    assert not banked.exists()
 
 
 @pytest.mark.asyncio
