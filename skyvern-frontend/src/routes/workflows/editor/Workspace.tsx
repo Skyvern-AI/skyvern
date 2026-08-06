@@ -1599,7 +1599,11 @@ function Workspace({
 
   const applyWorkflowUpdate = (
     workflowData: WorkflowVersion,
-    options?: { persisted?: boolean; userDriven?: boolean },
+    options?: {
+      persisted?: boolean;
+      userDriven?: boolean;
+      midTurnDraft?: boolean;
+    },
   ) => {
     const settings: WorkflowSettings = {
       proxyLocation: workflowData.proxy_location ?? ProxyLocation.Residential,
@@ -1650,9 +1654,16 @@ function Workspace({
     useWorkflowParametersStore.getState().setParameters(initialParameters);
 
     // Sync title so snap-back on Reject reverts the editor's title bar
-    // alongside the canvas blocks.
+    // alongside the canvas blocks. A mid-turn draft is not authoritative: it must
+    // not clobber a rename made while the turn was running, and a draft still
+    // carrying the placeholder must not mark the title as generated.
     if (typeof workflowData.title === "string") {
-      useWorkflowTitleStore.getState().setTitle(workflowData.title);
+      const titleStore = useWorkflowTitleStore.getState();
+      if (options?.midTurnDraft) {
+        titleStore.setTitleFromCopilotIfDefault(workflowData.title);
+      } else {
+        titleStore.syncTitleFromWorkflow(workflowData.title);
+      }
     }
 
     if (options?.persisted) {
