@@ -3279,6 +3279,60 @@ export function WorkflowCopilotChat({
                         />
                       );
                     })()}
+                    {(() => {
+                      if (
+                        isLoadingHistory ||
+                        !copilotUxV1Enabled ||
+                        turnId === null
+                      )
+                        return null;
+                      const autoBound = message.narrative.credentialAutoBound;
+                      // A co-occurring credential ask/pause owns this turn's credential UI and its
+                      // credentialResolutions[turnId] entry; the auto-bind receipt would double up and
+                      // mis-adopt that ask's resolution, so it defers whenever a card frame exists.
+                      if (
+                        !autoBound ||
+                        credentialCardFrameFor(message.narrative)
+                      )
+                        return null;
+                      // The receipt renders on any message (scrollback-safe). Before a Change it shows
+                      // the auto-bound credential with a Change picker; after one, the local resolution
+                      // routes into CredentialCard's existing "Continuing with 'X'…" receipt.
+                      const localResolution = credentialResolutions[turnId];
+                      const canContinue =
+                        isLastMessage ||
+                        strandedTerminalContinuations.has(turnId);
+                      return (
+                        <CredentialCard
+                          frame={{
+                            type: "credential_required",
+                            reason: "workflow_credential_inputs_unbound",
+                          }}
+                          mode="auto-bound"
+                          autoBound={autoBound}
+                          // Not while a turn is in flight: the shared continue path would still record
+                          // an optimistic "connected" even though it suppresses the actual send.
+                          canChange={canContinue && !isLoading}
+                          reloadKey={credentialsReloadKey}
+                          resolvedOutcome={localResolution}
+                          continued={Boolean(localResolution?.continued)}
+                          // Change re-enters the same terminal-continue path a terminal ask pick uses
+                          // (send "Use the credential <id> — continue", or open the add modal). A silent
+                          // bind never has a live pause, so never the typed credential-response path.
+                          onConnect={(credentialId, name) =>
+                            credentialId
+                              ? continueAfterTerminalConnect(
+                                  turnId,
+                                  credentialId,
+                                  name ?? localResolution?.name,
+                                  canContinue,
+                                )
+                              : openCredentialModal(null, turnId, canContinue)
+                          }
+                          onSkip={() => {}}
+                        />
+                      );
+                    })()}
                   </div>
                 );
               }

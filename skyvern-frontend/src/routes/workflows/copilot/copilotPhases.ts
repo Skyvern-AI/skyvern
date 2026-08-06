@@ -12,6 +12,7 @@ import {
   TurnNarrativeState,
   condenseActivityEntries,
   formatElapsed,
+  isInterimOutcome,
   latestBlocksByLabel,
   parseUtcIsoMs,
   toolCallIdOf,
@@ -252,7 +253,7 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
   const isCancelled = turn.cancelled === true;
   const anyFailed = latestBlocks.some((b) => b.state === "failed");
   const anyNotDemonstrated = latestBlocks.some(
-    (b) => b.outcome === "not_demonstrated",
+    (b) => b.outcome === "not_demonstrated" && !isInterimOutcome(b.outcomeRole),
   );
 
   function reached(id: CopilotPhaseId): boolean {

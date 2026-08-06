@@ -181,6 +181,8 @@
             "pages": [
               "developers/optimization/browser-sessions",
               "developers/optimization/browser-profiles",
+              "developers/optimization/browser-tunneling",
+              "developers/optimization/chrome-extension",
               "developers/optimization/cost-control"
             ]
           },

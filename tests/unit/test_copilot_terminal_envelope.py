@@ -105,6 +105,53 @@ def test_anchor_supersession_divergence_is_logged() -> None:
     assert not any("anchored a not_demonstrated verdict" in log["event"] for log in logs)
 
 
+def _interim_outcome(verdict: str, display_reason: str | None = None) -> RecordedRunOutcome:
+    return RecordedRunOutcome(verdict=verdict, display_reason=display_reason, role="interim_build_test")
+
+
+def test_run_anchor_ignores_interim_not_demonstrated_when_adjudicated_run_follows() -> None:
+    # Happy turn: an interim scout test run goes not_demonstrated mid-build, then the
+    # completed workflow demonstrates the goal. The envelope must not resurface the
+    # interim amber over the later adjudicated success.
+    envelope = _assemble(
+        run_outcomes=[
+            _interim_outcome("not_demonstrated", "The scout has not produced the goal yet."),
+            _run_outcome("demonstrated", "The extraction returned the value."),
+        ]
+    )
+
+    assert envelope.run_verdict == "demonstrated"
+    assert envelope.run_display_reason == "The extraction returned the value."
+
+
+def test_run_anchor_keeps_interim_amber_when_no_adjudicated_outcome() -> None:
+    # Repair ceiling: the loop stops after a suspicious-success run without ever
+    # producing an adjudicated outcome, so the interim not_demonstrated is the turn's
+    # honest terminal verdict and must still anchor amber.
+    envelope = _assemble(
+        run_outcomes=[
+            _interim_outcome("not_demonstrated", "The run completed but did not demonstrate the goal."),
+        ]
+    )
+
+    assert envelope.run_verdict == "not_demonstrated"
+    assert envelope.run_display_reason == "The run completed but did not demonstrate the goal."
+
+
+def test_run_anchor_prefers_adjudicated_not_demonstrated_over_earlier_interim() -> None:
+    # A genuine adjudicated failure on the completed workflow anchors amber even when an
+    # earlier interim run also went not_demonstrated.
+    envelope = _assemble(
+        run_outcomes=[
+            _interim_outcome("not_demonstrated", "Interim scout, still building."),
+            _run_outcome("not_demonstrated", "The extraction returned no value."),
+        ]
+    )
+
+    assert envelope.run_verdict == "not_demonstrated"
+    assert envelope.run_display_reason == "The extraction returned no value."
+
+
 @pytest.mark.parametrize(
     ("response_type", "verified", "workflow_applied", "proposal_disposition", "expected_next_state"),
     [

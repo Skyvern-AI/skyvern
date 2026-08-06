@@ -5379,7 +5379,7 @@ async def get_current_organization(
 )
 async def get_api_keys(
     organization_id: str,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_with_api_token),
 ) -> GetOrganizationAPIKeysResponse:
     if organization_id != current_org.organization_id:
         raise HTTPException(status_code=403, detail="You do not have permission to access this organization")

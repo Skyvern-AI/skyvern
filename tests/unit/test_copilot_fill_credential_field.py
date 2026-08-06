@@ -14,6 +14,7 @@ from typing import Any, AsyncIterator
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot import tools as tools_module
@@ -21,6 +22,7 @@ from skyvern.forge.sdk.copilot.build_phase import _BROWSER_PRIMITIVE_TOOLS
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.tools import credential_fill as credential_fill_module
+from skyvern.forge.sdk.copilot.tools import mcp_hooks as mcp_hooks_module
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.schemas.credentials import CredentialType, CredentialVaultType, PasswordCredential, TotpType
 
@@ -1111,6 +1113,108 @@ class TestObservationSeamCredentialBinding:
 
         assert result["ok"] is False
         assert page.fill_calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_placeholder_observation_url_is_resolved_to_the_live_page_before_binding(self) -> None:
+        policy = RequestPolicy()
+        ctx = _ctx(request_policy=policy)
+        result: dict[str, Any] = {"ok": True}
+
+        with (
+            patch.object(mcp_hooks_module, "_fallback_page_info", AsyncMock(return_value=(_FIXTURE_LOGIN_URL, ""))),
+            patch(
+                "skyvern.forge.app.DATABASE.credentials.get_credentials",
+                new=AsyncMock(return_value=[_org_credential("cred_analytics", "analytics", _FIXTURE_LOGIN_URL)]),
+            ),
+        ):
+            await mcp_hooks_module._bind_login_credential_for_observed_url(ctx, "current_page", result)
+
+        assert result["resolved_login_credential_id"] == "cred_analytics"
+        assert result["resolved_login_page_url"] == _FIXTURE_LOGIN_URL
+        assert policy.live_page_admitted_urls == {"cred_analytics": _FIXTURE_LOGIN_URL}
+
+    @pytest.mark.asyncio
+    async def test_a_resolved_page_matching_nothing_still_binds_nothing(self) -> None:
+        policy = RequestPolicy()
+        ctx = _ctx(request_policy=policy)
+        result: dict[str, Any] = {"ok": True}
+
+        with (
+            patch.object(mcp_hooks_module, "_fallback_page_info", AsyncMock(return_value=(_FIXTURE_LOGIN_URL, ""))),
+            patch(
+                "skyvern.forge.app.DATABASE.credentials.get_credentials",
+                new=AsyncMock(return_value=[_org_credential("cred_billing", "billing", _DECOY_LOGIN_URL)]),
+            ),
+        ):
+            await mcp_hooks_module._bind_login_credential_for_observed_url(ctx, "current_page", result)
+
+        assert "resolved_login_credential_id" not in result
+        assert "resolved_login_page_url" not in result
+        assert policy.resolved_credentials == []
+
+    @pytest.mark.asyncio
+    async def test_a_resolved_page_matching_two_credentials_offers_both_and_binds_neither(self) -> None:
+        policy = RequestPolicy()
+        ctx = _ctx(request_policy=policy)
+        result: dict[str, Any] = {"ok": True}
+
+        with (
+            patch.object(mcp_hooks_module, "_fallback_page_info", AsyncMock(return_value=(_FIXTURE_LOGIN_URL, ""))),
+            patch(
+                "skyvern.forge.app.DATABASE.credentials.get_credentials",
+                new=AsyncMock(
+                    return_value=[
+                        _org_credential("cred_one", "analytics one", _FIXTURE_LOGIN_URL),
+                        _org_credential("cred_two", "analytics two", _FIXTURE_LOGIN_URL),
+                    ]
+                ),
+            ),
+        ):
+            await mcp_hooks_module._bind_login_credential_for_observed_url(ctx, "current_page", result)
+
+        assert result["candidate_login_credentials"] == [
+            {"credential_id": "cred_one", "name": "analytics one"},
+            {"credential_id": "cred_two", "name": "analytics two"},
+        ]
+        assert "resolved_login_credential_id" not in result
+        assert policy.resolved_credentials == []
+
+    @pytest.mark.asyncio
+    async def test_a_turn_without_run_authority_never_reads_the_live_page(self) -> None:
+        policy = RequestPolicy(allow_run_blocks=False)
+        ctx = _ctx(request_policy=policy)
+        reread = AsyncMock(return_value=(_FIXTURE_LOGIN_URL, ""))
+
+        with patch.object(mcp_hooks_module, "_fallback_page_info", reread):
+            await mcp_hooks_module._bind_login_credential_for_observed_url(ctx, "current_page", {"ok": True})
+
+        reread.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("observed_url", ["current_page", "http://[", "http://[::1"])
+    # No URL at all is absence of evidence; one that is not a page is evidence about no page. The
+    # seam separates them, and neither may become a claim about the org's credentials.
+    @pytest.mark.parametrize(("reread_url", "outcome"), [("", "declined"), ("about:blank", "abstain")])
+    async def test_an_unresolvable_observation_url_reads_no_credentials_at_all(
+        self, observed_url: str, reread_url: str, outcome: str
+    ) -> None:
+        policy = RequestPolicy()
+        ctx = _ctx(request_policy=policy)
+        result: dict[str, Any] = {"ok": True}
+        load_mock = AsyncMock(return_value=[_org_credential("cred_analytics", "analytics", _FIXTURE_LOGIN_URL)])
+
+        with (
+            capture_logs() as logs,
+            patch.object(mcp_hooks_module, "_fallback_page_info", AsyncMock(return_value=(reread_url, ""))),
+            patch("skyvern.forge.app.DATABASE.credentials.get_credentials", new=load_mock),
+        ):
+            await mcp_hooks_module._bind_login_credential_for_observed_url(ctx, observed_url, result)
+
+        emitted = [entry for entry in logs if entry["event"] == "copilot credential live-page admission"]
+        assert [(entry["seam"], entry["outcome"]) for entry in emitted] == [("page_observation", outcome)]
+        assert "resolved_login_credential_id" not in result
+        assert policy.resolved_credentials == []
+        load_mock.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_two_matches_surface_both_ids_and_bind_nothing(self) -> None:

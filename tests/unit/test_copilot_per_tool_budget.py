@@ -32,6 +32,7 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     VerificationResult,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
+    CURRENT_PAGE_CHALLENGE_ADVISORY_REASON_CODE,
     MAX_PER_TOOL_BUDGET_NUDGES,
     POST_ANTI_BOT_FAILED_TEST_NUDGE,
     POST_FAILED_TEST_NUDGE,
@@ -43,10 +44,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
 from skyvern.forge.sdk.copilot.failure_tracking import (
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
     compute_failure_signature,
-)
-from skyvern.forge.sdk.copilot.run_outcome import (
-    TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
-    TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
 )
 from skyvern.forge.sdk.copilot.tools import (
     WatchdogExitReason,
@@ -64,6 +61,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _tool_loop_error,
     _watchdog_user_failure_reason,
 )
+from skyvern.forge.sdk.copilot.tools.blockers import _challenge_gated_anti_bot_rerun_signal
 from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind
 from tests.unit.conftest import make_copilot_context as _fresh_context
 
@@ -159,7 +157,7 @@ def test_composition_anti_bot_reason_reads_typed_challenge_state_without_legacy_
     assert "challenge-gated disabled submit/search control: Search" in reason
 
 
-def test_block_running_halts_on_current_page_terminal_challenge_before_repair_loop() -> None:
+def test_block_running_gets_the_challenge_advisory_before_repair_loop() -> None:
     ctx = _fresh_context()
     ctx.composition_page_evidence = {
         "observed_after_workflow_run": True,
@@ -176,12 +174,11 @@ def test_block_running_halts_on_current_page_terminal_challenge_before_repair_lo
 
     assert msg is not None
     assert ctx.blocker_signal is not None
-    assert ctx.blocker_signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
-    assert ctx.blocker_signal.extra["run_outcome_reason_code"] == TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE
+    assert ctx.blocker_signal.internal_reason_code == CURRENT_PAGE_CHALLENGE_ADVISORY_REASON_CODE
     assert ctx.blocker_signal.extra["evidence_source"] == "page_evidence"
     assert ctx.blocker_signal.extra["block_labels"] == ["search_lookup"]
-    assert ctx.turn_halt is not None
-    assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+    assert ctx.turn_halt is None
+    assert _tool_loop_error(ctx, "update_and_run_blocks", {"block_labels": ["search_lookup"]}) is None
 
 
 def test_block_running_does_not_halt_current_page_challenge_when_results_are_present() -> None:
@@ -202,7 +199,7 @@ def test_block_running_does_not_halt_current_page_challenge_when_results_are_pre
     assert ctx.turn_halt is None
 
 
-def test_block_running_halts_current_page_challenge_with_empty_result_shell() -> None:
+def test_block_running_gets_the_challenge_advisory_on_an_empty_result_shell() -> None:
     ctx = _fresh_context()
     ctx.composition_page_evidence = {
         "observed_after_workflow_run": True,
@@ -220,9 +217,8 @@ def test_block_running_halts_current_page_challenge_with_empty_result_shell() ->
 
     assert msg is not None
     assert ctx.blocker_signal is not None
-    assert ctx.blocker_signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
-    assert ctx.turn_halt is not None
-    assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+    assert ctx.blocker_signal.internal_reason_code == CURRENT_PAGE_CHALLENGE_ADVISORY_REASON_CODE
+    assert ctx.turn_halt is None
 
 
 def test_block_running_after_budget_current_url_requires_inspection_first() -> None:
@@ -712,7 +708,7 @@ def test_tool_loop_error_allows_new_smaller_label_after_budget_problem() -> None
     )
 
 
-def test_tool_loop_error_blocks_challenge_gated_disabled_submit_rerun() -> None:
+def test_challenge_advisory_then_attempt_keyed_rerun_stop_on_unchanged_path() -> None:
     ctx = _fresh_context()
     ctx.workflow_yaml = """
 title: Registry standard credential lookup
@@ -749,13 +745,27 @@ workflow_definition:
     )
 
     assert msg is not None
-    assert "Structured challenge evidence confirms this path is blocked" in msg
     assert ctx.blocker_signal is not None
-    assert ctx.blocker_signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
-    assert ctx.blocker_signal.renders_final_reply is True
+    assert ctx.blocker_signal.internal_reason_code == CURRENT_PAGE_CHALLENGE_ADVISORY_REASON_CODE
+    assert ctx.blocker_signal.renders_final_reply is False
+    assert ctx.turn_halt is None
+
+    repeat = _tool_loop_error(
+        ctx,
+        "update_and_run_blocks",
+        {
+            "workflow_yaml": ctx.workflow_yaml,
+            "block_labels": ["fill_sample_record_search"],
+        },
+    )
+
+    assert repeat is not None
+    assert ctx.latest_tool_blocker_signal is not None
+    assert ctx.latest_tool_blocker_signal.internal_reason_code == "tool_error_challenge_gated_submit_disabled"
+    assert ctx.latest_tool_blocker_signal.renders_final_reply is True
 
 
-def test_tool_loop_error_blocks_current_page_challenge_with_changed_proxy_location() -> None:
+def test_challenge_advisory_then_single_proxy_retry_then_attempt_keyed_stop() -> None:
     ctx = _fresh_context()
     ctx.last_failed_workflow_yaml = """
 title: Registry standard credential lookup
@@ -798,10 +808,36 @@ workflow_definition:
     )
 
     assert msg is not None
-    assert "do NOT try a proxy/location switch" in msg
-    assert ctx.challenge_gated_proxy_retry_count == 0
     assert ctx.blocker_signal is not None
-    assert ctx.blocker_signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+    assert ctx.blocker_signal.internal_reason_code == CURRENT_PAGE_CHALLENGE_ADVISORY_REASON_CODE
+    assert ctx.turn_halt is None
+
+    proxy_retry = _tool_loop_error(
+        ctx,
+        "update_and_run_blocks",
+        {
+            "workflow_yaml": changed_proxy_yaml,
+            "block_labels": ["fill_sample_record_search"],
+        },
+    )
+
+    assert proxy_retry is None
+
+    exhausted = _tool_loop_error(
+        ctx,
+        "update_and_run_blocks",
+        {
+            "workflow_yaml": changed_proxy_yaml,
+            "block_labels": ["fill_sample_record_search"],
+        },
+    )
+
+    assert exhausted is not None
+    assert ctx.latest_tool_blocker_signal is not None
+    assert ctx.latest_tool_blocker_signal.internal_reason_code == "tool_error_challenge_gated_submit_disabled"
+    assert ctx.challenge_gated_proxy_retry_count == 1
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == CURRENT_PAGE_CHALLENGE_ADVISORY_REASON_CODE
 
 
 def test_tool_loop_error_blocks_post_budget_challenge_even_with_changed_proxy_location() -> None:
@@ -1635,3 +1671,113 @@ def test_rendered_challenge_widget_still_produces_terminal_reason() -> None:
     reason = _post_run_terminal_challenge_reason(evidence)
     assert reason is not None
     assert "disabled" in reason
+
+
+_CODE_PAGE_URL = "https://example.com/account/login/totp?next=%2Freports"
+
+
+def _code_page_challenge_evidence() -> dict:
+    """A challenge on a one-time-code page, of a kind a saved code can answer."""
+    return _challenge_gated_post_run_evidence(
+        current_url=_CODE_PAGE_URL,
+        challenge_state={
+            "detected": True,
+            "kind": "other",
+            "requires_human_verification": True,
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Next", "disabled": True}],
+        },
+    )
+
+
+def _arm_code_already_filled(ctx: CopilotContext, evidence: dict) -> None:
+    """Put the challenge in flow evidence, then a one-time-code fill observed after it."""
+    ctx.composition_page_evidence = evidence
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "fill_credential_field",
+            "selector": "#totp",
+            "source_url": _CODE_PAGE_URL,
+            "credential_field": "totp",
+        }
+    ]
+    ctx.flow_evidence = [
+        {"evidence": evidence},
+        {
+            "evidence": {
+                "current_url": _CODE_PAGE_URL,
+                "interaction_tool": "fill_credential_field",
+                "interaction_selector": "#totp",
+                "interaction_source_url": _CODE_PAGE_URL,
+            }
+        },
+    ]
+
+
+def _arm_challenge_gated_rerun(ctx: CopilotContext) -> None:
+    ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
+    ctx.last_test_failure_reason = "blocker: the submit control was disabled by a verification challenge"
+
+
+def test_post_budget_challenge_declines_a_code_page_the_turn_already_answered() -> None:
+    ctx = _armed_post_run_context()
+    _arm_code_already_filled(ctx, _code_page_challenge_evidence())
+
+    assert _post_budget_terminal_challenge_signal(ctx, _BLOCK_LABEL_ARGS, "update_and_run_blocks") is None
+
+
+def test_post_budget_challenge_still_fires_without_a_one_time_code_fill() -> None:
+    ctx = _armed_post_run_context()
+    ctx.composition_page_evidence = _code_page_challenge_evidence()
+
+    assert _post_budget_terminal_challenge_signal(ctx, _BLOCK_LABEL_ARGS, "update_and_run_blocks") is not None
+
+
+def test_challenge_gated_rerun_declines_a_code_page_the_turn_already_answered() -> None:
+    ctx = _armed_post_run_context()
+    _arm_challenge_gated_rerun(ctx)
+    _arm_code_already_filled(ctx, _code_page_challenge_evidence())
+
+    assert _challenge_gated_anti_bot_rerun_signal(ctx, _BLOCK_LABEL_ARGS, "get_run_results") is None
+
+
+def test_challenge_gated_rerun_still_fires_without_a_one_time_code_fill() -> None:
+    ctx = _armed_post_run_context()
+    _arm_challenge_gated_rerun(ctx)
+    ctx.composition_page_evidence = _code_page_challenge_evidence()
+
+    assert _challenge_gated_anti_bot_rerun_signal(ctx, _BLOCK_LABEL_ARGS, "get_run_results") is not None
+
+
+def test_challenge_gated_rerun_still_fires_when_no_page_evidence_was_captured() -> None:
+    """With no page observation there is nothing to order the fill against, so the stop stands."""
+    ctx = _armed_post_run_context()
+    _arm_challenge_gated_rerun(ctx)
+    ctx.last_test_failure_reason = "blocker: bot detection challenge interrupted the run"
+    ctx.composition_page_evidence = None
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "fill_credential_field",
+            "selector": "#totp",
+            "source_url": _CODE_PAGE_URL,
+            "credential_field": "totp",
+        }
+    ]
+
+    assert _challenge_gated_anti_bot_rerun_signal(ctx, _BLOCK_LABEL_ARGS, "get_run_results") is not None
+
+
+def test_challenge_gated_rerun_still_fires_on_a_benign_packet_after_a_code_fill() -> None:
+    """A run-reported bot wall is not answered by a code typed into an unchallenged page."""
+    ctx = _armed_post_run_context()
+    _arm_challenge_gated_rerun(ctx)
+    ctx.last_test_failure_reason = "blocker: bot detection challenge interrupted the run"
+    benign = {
+        "current_url": _CODE_PAGE_URL,
+        "inspected_url": _CODE_PAGE_URL,
+        "observed_after_workflow_run": True,
+        "forms": [],
+    }
+    _arm_code_already_filled(ctx, benign)
+
+    assert _challenge_gated_anti_bot_rerun_signal(ctx, _BLOCK_LABEL_ARGS, "get_run_results") is not None

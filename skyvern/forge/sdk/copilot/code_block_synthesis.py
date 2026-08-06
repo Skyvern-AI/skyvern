@@ -103,10 +103,11 @@ CREDENTIAL_FILL_CODE_PATTERN = re.compile(r"\.fill\(\s*(?:[A-Za-z_]\w*\.\w+|awai
 # Credential fields the scout must fill live before a code block reading them may persist;
 # `.otp()` resolves at runtime only, so totp never requires (or credits) a live scout fill.
 LIVE_SCOUT_CREDENTIAL_FIELDS = frozenset({"username", "password"})
+ONE_TIME_CODE_CREDENTIAL_FIELD = "totp"
 
 
 def credential_fill_source(locator_expr: str, param_key: str, field: str) -> str:
-    if field == "totp":
+    if field == ONE_TIME_CODE_CREDENTIAL_FIELD:
         return f"await {locator_expr}.fill(await {param_key}.otp())"
     return f"await {locator_expr}.fill({param_key}.{field})"
 

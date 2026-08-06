@@ -27,6 +27,7 @@ _BODY_SEMAPHORE_LIMIT = 5  # concurrent CDP body downloads (worst case: 5 * 10s 
 if TYPE_CHECKING:
     from playwright.async_api import Frame, Page
 
+    from skyvern.browser_extension.runtime import BrowserExtensionRuntime
     from skyvern.library.skyvern_browser import SkyvernBrowser
     from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
 
@@ -150,6 +151,8 @@ def _session_ref_key(
 
     if resolved_session_id:
         return (organization_id, "cloud_session", resolved_session_id, api_key_hash)
+    if context is not None and context.mode == "extension":
+        return (organization_id, "extension", "own-browser", api_key_hash)
     if resolved_cdp_url:
         return (organization_id, "cdp", resolved_cdp_url, api_key_hash)
     return None
@@ -395,6 +398,7 @@ def _matches_current(
     *,
     session_id: str | None = None,
     cdp_url: str | None = None,
+    extension_runtime: BrowserExtensionRuntime | None = None,
     local: bool = False,
 ) -> bool:
     if current.browser is None or current.context is None:
@@ -404,11 +408,21 @@ def _matches_current(
 
     if session_id:
         return current.context.mode == "cloud_session" and current.context.session_id == session_id
+    if extension_runtime is not None:
+        return current.context.mode == "extension"
     if cdp_url:
         return current.context.mode == "cdp" and current.context.cdp_url == cdp_url
     if local:
         return current.context.mode == "local"
     return False
+
+
+def _extension_browser_is_connected(browser: SkyvernBrowser) -> bool:
+    try:
+        playwright_browser = browser.browser
+        return playwright_browser is not None and playwright_browser.is_connected()
+    except Exception:
+        return False
 
 
 async def resolve_browser(
@@ -418,6 +432,8 @@ async def resolve_browser(
     create_session: bool = False,
     timeout: int | None = None,
     headless: bool = False,
+    *,
+    extension_runtime: BrowserExtensionRuntime | None = None,
 ) -> tuple[SkyvernBrowser, BrowserContext]:
     """Resolve browser from parameters or current session.
 
@@ -428,13 +444,27 @@ async def resolve_browser(
     skyvern = get_skyvern()
     current = get_current_session()
 
-    if _stateless_http_mode and not (session_id or cdp_url or local or create_session):
+    if _stateless_http_mode and not (session_id or cdp_url or extension_runtime or local or create_session):
         raise BrowserNotAvailableError()
 
-    if _matches_current(current, session_id=session_id, cdp_url=cdp_url, local=local):
+    if _matches_current(
+        current,
+        session_id=session_id,
+        cdp_url=cdp_url,
+        extension_runtime=extension_runtime,
+        local=local,
+    ):
         if current.browser is None or current.context is None:
             raise RuntimeError("Expected active browser and context for matching session")
-        return current.browser, current.context
+        if extension_runtime is None or _extension_browser_is_connected(current.browser):
+            return current.browser, current.context
+        try:
+            await _close_session_state(current, close_via_active_client=False)
+        except Exception:
+            pass
+        finally:
+            set_current_session(SessionState())
+        current = get_current_session()
 
     # Cloud sessions created by the MCP session tool intentionally do not open a
     # second CDP connection. Connect lazily when a browser tool is used; this
@@ -480,6 +510,12 @@ async def resolve_browser(
                 session_id=session_id,
                 can_access_localhost=_explicit_cloud_session_can_access_localhost(),
             )
+            set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
+            return browser, ctx
+
+        if extension_runtime is not None:
+            browser = await skyvern.connect_to_browser_extension(extension_runtime)
+            ctx = BrowserContext(mode="extension", can_access_localhost=True)
             set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
             return browser, ctx
 

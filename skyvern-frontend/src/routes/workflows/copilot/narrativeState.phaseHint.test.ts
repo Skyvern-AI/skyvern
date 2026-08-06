@@ -196,6 +196,7 @@ describe("applyNarrativeEvent — lastRunOutcome", () => {
     );
     expect(s.lastRunOutcome).toEqual({
       verdict: "not_demonstrated",
+      role: "adjudicated",
       displayReason: "outcome not confirmed",
       activitySeqAtVerdict: 1,
     });

@@ -29,14 +29,17 @@ def _normalize_json_dumps(payload: dict) -> str:
 def create_access_token(
     subject: Union[str, Any],
     expires_delta: timedelta | None = None,
+    token_type: str | None = None,
 ) -> str:
-    if expires_delta:
+    if expires_delta is not None:
         expire = datetime.utcnow() + expires_delta
     else:
         expire = datetime.utcnow() + timedelta(
             minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES,
         )
     to_encode = {"exp": expire, "sub": str(subject)}
+    if token_type is not None:
+        to_encode["token_type"] = token_type
     encoded_jwt = jwt.encode(
         to_encode,
         settings.SECRET_KEY,
