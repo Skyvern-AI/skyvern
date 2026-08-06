@@ -285,7 +285,7 @@ def credential_pause_reason(ctx: Any) -> str | None:
 def credential_pause_would_fire(ctx: Any, copilot_config: CopilotConfig | None) -> bool:
     """Synchronous subset of maybe_credential_pause's guards.
 
-    Called from both here and enforcement.py's _check_enforcement so the two
+    Called from both here and enforcement.py's enforcement_decision so the two
     can't drift: enforcement pre-empts hygiene nudges based on this same
     prediction, and a client/kill-switch/latch mismatch between the two would
     either suppress nudges for a pause that will never fire, or let a nudge
@@ -350,7 +350,12 @@ def _apply_connected_credential_to_policy(ctx: Any, policy: RequestPolicy, crede
         credential_id=credential.credential_id,
         bound_origin=loggable_origin(admitted_url) if admitted_url else None,
     )
-    policy.resolved_credentials.append(credential)
+    if credential.credential_id not in {resolved.credential_id for resolved in policy.resolved_credentials}:
+        policy.resolved_credentials.append(credential)
+    # The card answer is the user naming this credential, and it supersedes any earlier mention:
+    # the fill seam's which-credential check is set equality, so adding instead of replacing would
+    # refuse the very credential the user just picked.
+    policy.current_turn_named_credential_ids = {credential.credential_id}
     policy.allow_run_blocks = True
     policy.clarification_reason = "none"
     policy.allow_missing_credentials_in_draft = False
