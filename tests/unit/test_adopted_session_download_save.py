@@ -884,3 +884,27 @@ async def test_refetch_allows_permitted_destination(tmp_path, download_destinati
 
     assert saved is not None and saved.exists()
     assert saved.read_bytes() == download_destinations.PUBLIC_BODY
+
+
+@pytest.mark.asyncio
+async def test_save_path_requires_no_redirect_hop_authorizer(tmp_path) -> None:
+    """The production interceptor carries no authorizer, so this path must never demand one.
+
+    Asserted against the real CDPDownloadInterceptor rather than a MagicMock: a mock
+    auto-creates any attribute, satisfies `hasattr` and `callable`, and so cannot observe
+    an authorizer requirement at all — which is how one previously reached production.
+    """
+    from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
+
+    interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+    assert not hasattr(interceptor, "_redirect_hop_authorizer")
+
+    download = _download()
+    page = _page_with_refetch()
+    page.context._skyvern_cdp_download_interceptor = interceptor
+    page.context._skyvern_cdp_download_interceptor_bind_lock = asyncio.Lock()
+
+    saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+
+    assert saved is not None and saved.exists()
+    download.save_as.assert_awaited_once()
