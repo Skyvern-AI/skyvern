@@ -368,6 +368,7 @@ function FBlockRun({
     !isInterimNotDemonstrated;
   const isOk = isBlockOk(block);
   const isFail = block.state === "failed";
+  const isStopped = block.state === "stopped";
   const isDraft = block.state === "drafted";
 
   const accentBorder = isRunning
@@ -432,7 +433,10 @@ function FBlockRun({
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const defaultOpen = isRunning || isFail || (hasActions && !turnEnded);
   const open = userOpen === null ? defaultOpen : userOpen;
-  const toggleable = isOk || isOutcomeNotShown || isVerifying || isRanNeutral;
+  // A stop stays inspectable but not self-opening: the user knows why it
+  // stopped, so it should not demand attention the way a failure does.
+  const toggleable =
+    isOk || isOutcomeNotShown || isVerifying || isRanNeutral || isStopped;
   useTick(isRunning);
   useTick(hasActions && (replayingAction || elapsedReveal < totalMs), 150);
   const elapsed = formatElapsed(block.startedAt, block.endedAt);
@@ -447,9 +451,11 @@ function FBlockRun({
           ? `ran${elapsed ? ` · ${elapsed}` : ""}`
           : isFail
             ? "halted"
-            : isDraft
-              ? "drafted"
-              : "queued";
+            : isStopped
+              ? `stopped${elapsed ? ` · ${elapsed}` : ""}`
+              : isDraft
+                ? "drafted"
+                : "queued";
   const collapsedOutcomeReason = isOutcomeNotShown
     ? normalizeOutcomeReason(block.outcomeReason ?? outcomeReasonFallback)
     : null;
@@ -481,6 +487,8 @@ function FBlockRun({
             "…"
           ) : isFail ? (
             "✕"
+          ) : isStopped ? (
+            "■"
           ) : isRunning ? (
             <Spinner />
           ) : (
@@ -706,6 +714,8 @@ function phaseGlyph(status: PhaseStatus): ReactNode {
       return "✓";
     case "fail":
       return "✕";
+    case "stopped":
+      return "■";
     case "active":
       return <Spinner />;
     default:
@@ -721,6 +731,8 @@ function phasePuckClasses(status: PhaseStatus): string {
       return "border-rose-400/60 bg-rose-500/15 text-rose-700 dark:text-rose-300";
     case "active":
       return "border-blue-400/60 bg-blue-500/15 text-blue-700 dark:text-blue-300";
+    case "stopped":
+      return "border-slate-400/60 bg-slate-elevation4 text-muted-foreground";
     default:
       return "border-slate-500/60 bg-slate-elevation3 text-slate-600";
   }
@@ -1117,6 +1129,7 @@ function RollupCard({
   const rollupBlocks = latestBlocksByLabel(turn.blocks);
   const completed = rollupBlocks.filter((b) => isBlockOk(b));
   const failed = rollupBlocks.filter((b) => b.state === "failed");
+  const stopped = rollupBlocks.filter((b) => b.state === "stopped");
   const showCommit = !summary.isQA && completed.length > 0;
   const showChecklist = Boolean(uxV1) && showPhaseChecklist(turn);
   // Expand only earns a chevron when DetailView adds content beyond the head's
@@ -1221,6 +1234,39 @@ function RollupCard({
                     uxV1
                       ? "text-[11px] text-rose-700 dark:text-rose-300/80"
                       : "font-mono text-[11px] text-rose-700 dark:text-rose-300/80"
+                  }
+                  title={uxV1 ? b.label : undefined}
+                >
+                  {uxV1 ? humanizeBlockLabel(b.label) : b.label}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {stopped.length > 0 ? (
+        <div className="border-t border-white/5 pb-3 pl-[52px] pr-3.5 pt-2.5">
+          <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[.06em] text-muted-foreground">
+            Stopped
+          </div>
+          <ul className="m-0 flex list-none flex-col gap-1 p-0">
+            {stopped.map((b) => (
+              <li
+                key={b.label}
+                className="flex items-baseline gap-1.5 text-[12px] leading-[1.5] text-tertiary-foreground"
+              >
+                <span
+                  className="w-3.5 shrink-0 text-center text-[11px] font-bold text-muted-foreground"
+                  aria-hidden="true"
+                >
+                  ■
+                </span>
+                <span
+                  className={
+                    uxV1
+                      ? "text-[11px] text-muted-foreground"
+                      : "font-mono text-[11px] text-muted-foreground"
                   }
                   title={uxV1 ? b.label : undefined}
                 >
