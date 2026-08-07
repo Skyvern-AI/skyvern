@@ -192,7 +192,7 @@ function BrowserSession() {
               </Button>
               <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
                 <DialogTrigger asChild>
-                  <Button variant="ghost">
+                  <Button variant="destructive">
                     <StopIcon className="mr-2 h-4 w-4" />
                     Stop
                   </Button>
@@ -242,6 +242,7 @@ function BrowserSession() {
                 browserSessionId={browserSessionId}
                 interactive={true}
                 showControlButtons={true}
+                enableUrlInput={true}
               />
             )}
             {!isCdpMode &&

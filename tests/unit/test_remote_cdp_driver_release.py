@@ -126,7 +126,15 @@ async def test_close_timeout_bounds_interceptor_drain_and_cleans_suspended_task(
 ) -> None:
     pw = _pw_stub()
     context = _context_stub()
-    interceptor = CDPDownloadInterceptor()
+    inert_monitor = MagicMock(name="inert_network_egress_monitor")
+    inert_authorizer = AsyncMock(
+        name="inert_redirect_hop_authorizer",
+        side_effect=AssertionError("unexpected direct HTTP request"),
+    )
+    interceptor = CDPDownloadInterceptor(
+        network_egress_monitor=inert_monitor,
+        redirect_hop_authorizer=inert_authorizer,
+    )
     interceptor._accepting_browser_downloads = True
     context._skyvern_cdp_download_interceptor = interceptor
     started = asyncio.Event()
