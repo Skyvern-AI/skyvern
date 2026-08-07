@@ -1,11 +1,11 @@
 import asyncio
 import time
+import weakref
 from dataclasses import dataclass
 from typing import Annotated, Sequence
 
 import jwt
 import structlog
-from asyncache import cached
 from cachetools import TTLCache
 from fastapi import Header, HTTPException, status
 from jwt.exceptions import PyJWTError
@@ -22,7 +22,7 @@ from skyvern.forge.sdk.workflow.models.tags import CallerType
 
 LOG = structlog.get_logger()
 
-AUTHENTICATION_TTL = 60 * 60  # one hour
+AUTHENTICATION_TTL = 60  # one minute
 CACHE_SIZE = 128
 ALGORITHM = "HS256"
 SKYVERN_UI_USER_AGENT = "skyvern-ui"
@@ -536,26 +536,45 @@ async def resolve_org_from_api_key(
 
 
 _current_org_cache: TTLCache = TTLCache(maxsize=CACHE_SIZE, ttl=AUTHENTICATION_TTL)
+_CurrentOrgCacheKey = tuple[str, AgentDB]
+_current_org_cache_locks: weakref.WeakValueDictionary[_CurrentOrgCacheKey, asyncio.Lock] = weakref.WeakValueDictionary()
+_current_org_cache_invalidation_generation = 0
 
 
-@cached(cache=_current_org_cache)
+def _get_current_org_cache_lock(cache_key: _CurrentOrgCacheKey) -> asyncio.Lock:
+    lock = _current_org_cache_locks.get(cache_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _current_org_cache_locks[cache_key] = lock
+    return lock
+
+
 async def _get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
-    """Authentication is cached for one hour."""
-    validation = await resolve_org_from_api_key(
-        x_api_key,
-        db,
-        token_types=(
-            OrganizationAuthTokenType.api,
-            OrganizationAuthTokenType.ui_session,
-        ),
-    )
+    """Validate API-key authentication and cache successful results for one minute."""
+    cache_key = (x_api_key, db)
+    try:
+        return _current_org_cache[cache_key]
+    except KeyError:
+        pass
 
-    # set organization_id in skyvern context and log context
-    context = skyvern_context.current()
-    if context:
-        context.organization_id = validation.organization.organization_id
-        context.organization_name = validation.organization.organization_name
-    return validation.organization
+    async with _get_current_org_cache_lock(cache_key):
+        try:
+            return _current_org_cache[cache_key]
+        except KeyError:
+            pass
+
+        invalidation_generation = _current_org_cache_invalidation_generation
+        validation = await resolve_org_from_api_key(x_api_key, db)
+
+        # set organization_id in skyvern context and log context
+        context = skyvern_context.current()
+        if context:
+            context.organization_id = validation.organization.organization_id
+            context.organization_name = validation.organization.organization_name
+
+        if invalidation_generation == _current_org_cache_invalidation_generation:
+            _current_org_cache[cache_key] = validation.organization
+        return validation.organization
 
 
 def _claims_ui_session(payload: dict[str, object] | None) -> bool:
@@ -580,9 +599,10 @@ async def get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
 
 
 def invalidate_cached_org(organization_id: str) -> None:
-    """
-    Drop every cached ``Organization`` entry whose id matches.
-    """
+    """Drop every cached ``Organization`` entry whose id matches."""
+    global _current_org_cache_invalidation_generation
+
+    _current_org_cache_invalidation_generation += 1
     keys_to_remove = [
         key
         for key, value in list(_current_org_cache.items())
