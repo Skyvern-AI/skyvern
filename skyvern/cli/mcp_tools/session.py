@@ -33,11 +33,18 @@ from ._session import (
     set_current_session,
 )
 
-_EXTENSION_NOT_CONNECTED_GUIDANCE = (
-    "Skyvern browser extension is not connected. Install it: run `skyvern browser extension-path`, open "
-    "chrome://extensions, enable Developer mode, Load unpacked, and select that directory. Then run "
-    "`skyvern browser extension-token`, paste the token into the extension popup, and click Connect. Then retry."
-)
+
+def _extension_not_connected_guidance(*, pairing_opened: bool) -> str:
+    if pairing_opened:
+        return (
+            "Skyvern browser extension is not connected. A secure pairing tab was opened. Approve the connection, "
+            "approve pairing in the Skyvern Agent confirmation tab, and retry."
+        )
+    return (
+        "Skyvern browser extension is not connected and the pairing tab could not be opened automatically. Run "
+        "`skyvern browser extension-pair`, approve the connection, approve pairing in the Skyvern Agent confirmation "
+        "tab, and retry."
+    )
 
 
 def _session_api_key_hash() -> str | None:
@@ -145,6 +152,7 @@ async def skyvern_browser_session_create(
             try:
                 runtime = await BrowserExtensionRuntime.get_or_start()
                 if not await runtime.wait_for_extension(10.0):
+                    pairing_opened = runtime.open_pairing_page()
                     timer.mark("sdk")
                     return make_result(
                         "skyvern_browser_session_create",
@@ -152,7 +160,7 @@ async def skyvern_browser_session_create(
                         timing_ms=timer.timing_ms,
                         error=make_error(
                             ErrorCode.BROWSER_NOT_FOUND,
-                            _EXTENSION_NOT_CONNECTED_GUIDANCE,
+                            _extension_not_connected_guidance(pairing_opened=pairing_opened),
                             "",
                         ),
                     )
@@ -178,7 +186,7 @@ async def skyvern_browser_session_create(
                     timing_ms=timer.timing_ms,
                     error=make_error(
                         ErrorCode.BROWSER_NOT_FOUND,
-                        _EXTENSION_NOT_CONNECTED_GUIDANCE,
+                        _extension_not_connected_guidance(pairing_opened=False),
                         "",
                     ),
                 )
