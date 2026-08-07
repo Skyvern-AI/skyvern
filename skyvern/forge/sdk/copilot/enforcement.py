@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import json
 import os
 import re
@@ -110,6 +111,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     looks_like_workflow_delivery_claim,
     parse_final_response,
 )
+from skyvern.forge.sdk.copilot.reached_download_target import can_deliver_registered_download
 from skyvern.forge.sdk.copilot.request_policy import (
     REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS,
     CompletionCriterion,
@@ -144,6 +146,7 @@ from skyvern.forge.sdk.copilot.terminal_predicates import (
     outcome_criteria_evaluated,
     outcome_fully_verified,
 )
+from skyvern.forge.sdk.copilot.todo_list import _inapplicable_criterion_ids, unmet_action_deliverable_criteria
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
     blocker_signal_is_genuinely_terminal,
@@ -257,6 +260,13 @@ PRESENT_COMPLETION_CONTRACT_ASK_RETRY = (
     "completion contract / completion criteria and no separate required clarification is active. Continue authoring "
     "the workflow from the existing contract, then run/test it before responding. Only ask the user if a separate "
     "required input is missing under RequestPolicy or TurnIntent."
+)
+
+DELIVERABLE_PERMISSION_ASK_RETRY = (
+    "Permission for this deliverable is already granted: the request's completion contract orders it "
+    "({criterion_outcomes}), so do not ask whether to produce it — produce it and verify it. If several "
+    "concrete candidates match the request, pick the one the request best describes and say in your reply "
+    "which you took and anything about it the user could not have known."
 )
 
 
@@ -952,6 +962,56 @@ def recycle_admits_present_completion_contract_ask(ctx: CopilotContext) -> bool:
     return not ctx.has_genuine_workflow_attempt()
 
 
+def deliverable_permission_ask_bounced(
+    *,
+    ask_subject: AskSubject | None,
+    admission_base: bool,
+    retry_admitted: bool,
+    unmet_criteria: Sequence[CompletionCriterion],
+    ask_refs: Sequence[str],
+) -> bool:
+    """Pure decision shared by the live gate and offline replay: a permission ask for a
+    download the contract already orders bounces back to the build.
+
+    The ask must cite an unmet criterion's own output path. The subject label is model-chosen,
+    so without that binding a confirmation for an unrelated irreversible side effect (a payment
+    on a request that also downloads a receipt) could be answered by a download's authority.
+    """
+    if retry_admitted or ask_subject != "deliverable_permission" or not admission_base:
+        return False
+    ordered_paths = {criterion.output_path for criterion in unmet_criteria if criterion.output_path}
+    return bool(ordered_paths) and bool(ordered_paths & set(ask_refs))
+
+
+def _dump_ask_gate_decision(ctx: CopilotContext, parsed: dict[str, Any], *, outcome: str) -> None:
+    """Write the ask-gate decision and its inputs when a local run asks for them, so an admission
+    change replays offline against real captured asks instead of costing a live turn each."""
+    directory = os.environ.get("COPILOT_DUMP_ASK_INPUTS")
+    if not directory or settings.ENV != "local":
+        return
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        policy = ctx.request_policy
+        criteria = policy.graded_completion_criteria() if isinstance(policy, RequestPolicy) else []
+        satisfied_ids = sorted(_inapplicable_criterion_ids(ctx))
+        payload = {
+            "outcome": outcome,
+            "ask_subject": coerce_ask_subject(parsed.get("ask_subject")),
+            "ask_refs": parsed_ask_refs(parsed.get("refs")),
+            "user_response": parsed.get("user_response"),
+            "admission_base": _present_completion_contract_ask_admission_base(ctx),
+            "has_genuine_workflow_attempt": ctx.has_genuine_workflow_attempt(),
+            "turn_intent_mode": ctx.turn_intent.mode if ctx.turn_intent else None,
+            "criteria": [dataclasses.asdict(criterion) for criterion in criteria],
+            "satisfied_criterion_ids": satisfied_ids,
+        }
+        target = os.path.join(directory, f"ask-{outcome}-{uuid.uuid4().hex[:8]}.json")
+        with open(os.open(target, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600), "w") as handle:
+            json.dump(payload, handle, default=str)
+    except Exception:
+        LOG.info("copilot_ask_gate_input_dump_failed", exc_info=True)
+
+
 def _present_completion_contract_ask_retry(ctx: CopilotContext, parsed: dict[str, Any]) -> EnforcementDecision | None:
     if parsed.get("type") != "ASK_QUESTION":
         return None
@@ -962,8 +1022,33 @@ def _present_completion_contract_ask_retry(ctx: CopilotContext, parsed: dict[str
         if _present_completion_contract_ask_admission_base(ctx):
             auto_answer = _typed_ask_subject_auto_answer(ctx, ask_subject, parsed)
             if auto_answer is not None:
+                _dump_ask_gate_decision(ctx, parsed, outcome="auto_answered")
                 return EnforcementDecision(rule="typed_ask_subject_auto_answer", message=auto_answer)
     retry_admitted = recycle_admits_present_completion_contract_ask(ctx)
+    ordered = unmet_action_deliverable_criteria(ctx)
+    if deliverable_permission_ask_bounced(
+        ask_subject=ask_subject,
+        admission_base=_present_completion_contract_ask_admission_base(ctx),
+        retry_admitted=retry_admitted,
+        unmet_criteria=ordered,
+        ask_refs=parsed_ask_refs(parsed.get("refs")),
+    ):
+        if ordered:
+            _dump_ask_gate_decision(ctx, parsed, outcome="deliverable_permission_retry")
+            LOG.info(
+                "copilot_ask_subject_passed_through",
+                subject=ask_subject,
+                outcome="deliverable_permission_retry",
+                criterion_ids=[criterion.id for criterion in ordered],
+                **ctx.genuine_attempt_parity_fields(),
+            )
+            return EnforcementDecision(
+                rule="deliverable_permission_ask_retry",
+                message=DELIVERABLE_PERMISSION_ASK_RETRY.format(
+                    criterion_outcomes="; ".join(criterion.outcome for criterion in ordered)
+                ),
+            )
+    _dump_ask_gate_decision(ctx, parsed, outcome="build_first_retry" if retry_admitted else "reached_user")
     if ask_subject is not None:
         LOG.info(
             "copilot_ask_subject_passed_through",
@@ -2369,7 +2454,7 @@ def download_satisfied_requested_output_paths(ctx: AgentContext) -> set[str]:
     ``registered_download`` deliverables. Empty unless a download target with a captured selector
     was reached. Author-time seam classification only — it never credits scout coverage."""
     download = ctx.reached_download_target
-    if download is None or not download.selector:
+    if download is None or not download.selector or not can_deliver_registered_download(download):
         return set()
     requested = _requested_output_paths_for_ctx(ctx)
     # The scout reads page scalars; it can never read a file that exists only once a download fires.

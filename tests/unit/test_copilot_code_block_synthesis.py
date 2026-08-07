@@ -5610,3 +5610,32 @@ def test_a_designated_read_waits_for_a_figure_the_page_has_not_rendered_yet() ->
         relation_label="Visitors",
     )
     assert "wait_for_timeout" not in "\n".join(_key_value_scalar_read_statements(relation, "_value", guard_empty=True))
+
+
+class TestObservedRenderSynthesis:
+    def test_observed_render_target_emits_no_download_terminal(self) -> None:
+        target = _download_target(
+            download_kind="observed_render",
+            source_step="observed_render",
+            selector='a[href="Command?op=getImage&image=07/10/2025"]',
+            affordance_text="07/10/2025",
+            rendered_url="https://example.com/Command?op=getImage&image=07/10/2025",
+        )
+        result = synthesize_code_block([_nav_click()], reached_download_target=target)
+        assert result is not None
+        # A render-type affordance never fires a browser download, so expect_download would hang;
+        # byte capture needs execution-layer registration, so no terminal of any kind is compiled.
+        assert "expect_download" not in result.code
+        assert "screenshot" not in result.code
+        assert '"downloaded_files"' not in result.code
+        ast.parse("async def _block(page):\n" + result.code)
+
+    def test_observed_render_requires_rendered_url(self) -> None:
+        from skyvern.forge.sdk.copilot.reached_download_target import derive_from_observed_render
+
+        assert derive_from_observed_render(selector="a.bill", rendered_url="") is None
+        assert derive_from_observed_render(selector="", rendered_url="https://example.com/x") is None
+        target = derive_from_observed_render(selector="a.bill", rendered_url="https://example.com/x")
+        assert target is not None
+        assert target.download_kind == "observed_render"
+        assert target.to_dict()["rendered_url"] == "https://example.com/x"

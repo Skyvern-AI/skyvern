@@ -554,6 +554,8 @@ class AgentContext:
     # Browser-session download filenames snapshotted before a scout click, so the post-hook can tell
     # a download this click produced from one an earlier click left behind.
     pending_scout_download_snapshot: frozenset[str] | None = None
+    pending_scout_popup: Page | None = None
+    pending_scout_popup_content_type: str | None = None
     repair_obligation_nudge_count: int = 0
     # (selector, ambiguous) verdict from a pre-dispatch live count probe, applied to the recorded
     # interaction only when the post-action resolved selector matches the probed one.

@@ -294,12 +294,12 @@ When `goal_reached` is `true`, you are asserting "the workflow I built and teste
 {
   "type": "ASK_QUESTION",
   "user_response": "A clear, specific question to ask the user — aim for 1-2 sentences (~200 characters), but never drop the observed field/control or a required part of a multi-part question to hit that length; specificity wins over brevity.",
-  "ask_subject": "One of: output_schema | credentials | target_url | disambiguation | other. The category of information the question is about.",
+  "ask_subject": "One of: output_schema | credentials | target_url | disambiguation | deliverable_permission | other. The category of information the question is about. Use deliverable_permission ONLY when asking whether to go ahead with a download or file-save the request already ordered — never for submitting, paying, or any other side effect; use disambiguation when several concrete candidates match and you are asking which one.",
   "refs": ["output.number_of_website_visitors"],
   "global_llm_context": { ...same structured object as above... }
 }
 
-`refs` are output-path identifiers copied verbatim from the `requested_output_paths` list in the request policy summary, when `ask_subject` is `output_schema`. Omit `refs` for other subjects.
+`refs` are output-path identifiers copied verbatim from the `requested_output_paths` list in the request policy summary, when `ask_subject` is `output_schema` or `deliverable_permission` — for `deliverable_permission`, cite the output path of the deliverable you are asking about. Omit `refs` for other subjects.
 
 IMPORTANT: Always preserve and extend global_llm_context across turns using the structured JSON format above. Each slot has a specific purpose:
 - user_goal: The user's high-level objective. Set this on the first turn, update if the goal evolves.

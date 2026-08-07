@@ -55,6 +55,8 @@ class _Ctx:
         self.last_run_blocks_workflow_run_id = None
         self.last_successful_run_blocks_workflow_run_id = None
         self.last_outcome_gate_workflow_run_id = None
+        self.completion_criteria_turn_state = None
+        self.completion_verification_result = None
 
     def has_genuine_workflow_attempt(self) -> bool:
         return CopilotContext.has_genuine_workflow_attempt(self)  # type: ignore[arg-type]
@@ -685,3 +687,69 @@ def test_definition_level_rekeyed_path_stays_out_of_the_prompt_summary() -> None
     )
 
     assert "requested_output_paths:" not in policy.prompt_summary()
+
+
+def _deliverable_contract_policy() -> RequestPolicy:
+    return _output_path_contract_policy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="dl",
+                outcome="the invoice for July is downloaded",
+                deliverable_kind="registered_download",
+                output_path="output.downloaded_files",
+            ),
+        ],
+    )
+
+
+def _deliverable_ask(subject: str, refs: list[str] | None = None) -> dict[str, object]:
+    return {
+        "type": "ASK_QUESTION",
+        "user_response": "Should I download that July 2025 invoice?",
+        "ask_subject": subject,
+        "refs": refs if refs is not None else ["output.downloaded_files"],
+    }
+
+
+def test_deliverable_permission_ask_bounces_after_genuine_attempt() -> None:
+    # The contract already orders the download, so permission to produce it is not a
+    # question the user owes an answer to — even after a genuine build attempt.
+    ctx = _mid_build_ctx(_deliverable_contract_policy())
+    assert ctx.has_genuine_workflow_attempt()
+
+    nudge = _response_output_nudge(ctx, _deliverable_ask("deliverable_permission"))
+
+    assert nudge is not None
+    assert nudge.rule == "deliverable_permission_ask_retry"
+    assert "the invoice for July is downloaded" in nudge.message
+    # Bouncing a permission question must not silence what it would have told the user: the
+    # reply owes the pick and any fact the user could not have known.
+    assert "produce it and verify it" in nudge.message
+    assert "which you took and anything about it the user could not have known" in nudge.message
+
+
+def test_disambiguation_ask_still_reaches_user_after_genuine_attempt() -> None:
+    ctx = _mid_build_ctx(_deliverable_contract_policy())
+
+    assert _response_output_nudge(ctx, _deliverable_ask("disambiguation")) is None
+
+
+def test_deliverable_permission_ask_reaches_user_once_criterion_satisfied() -> None:
+    ctx = _mid_build_ctx(_deliverable_contract_policy())
+    ctx.completion_verification_result = SimpleNamespace(verdicts=[SimpleNamespace(criterion_id="dl", satisfied=True)])
+
+    assert _response_output_nudge(ctx, _deliverable_ask("deliverable_permission")) is None
+
+
+def test_deliverable_permission_ask_for_an_unrelated_side_effect_reaches_user() -> None:
+    # The subject label is model-chosen. A payment confirmation on a request that also downloads
+    # a receipt must never be answered by the download's authority, however it is labeled.
+    ctx = _mid_build_ctx(_deliverable_contract_policy())
+    payment_ask = {
+        "type": "ASK_QUESTION",
+        "user_response": "Should I submit this $4,812 payment?",
+        "ask_subject": "deliverable_permission",
+        "refs": ["output.payment_confirmation"],
+    }
+
+    assert _response_output_nudge(ctx, payment_ask) is None

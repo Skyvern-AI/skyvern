@@ -31,7 +31,7 @@ ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
 COPILOT_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
 ProposalDisposition = Literal["no_proposal", "auto_applicable", "review_untested", "review_tested"]
 
-AskSubject = Literal["output_schema", "credentials", "target_url", "disambiguation", "other"]
+AskSubject = Literal["output_schema", "credentials", "target_url", "disambiguation", "deliverable_permission", "other"]
 COPILOT_ASK_SUBJECTS: tuple[AskSubject, ...] = get_args(AskSubject)
 
 

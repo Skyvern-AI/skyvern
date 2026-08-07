@@ -48,6 +48,7 @@ from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory, r
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, get_tzinfo_from_proxy
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding, VideoArtifact
+from skyvern.webeye.browser_engine import BrowserEngineBootstrapError
 from skyvern.webeye.cdp_connection import (
     build_cdp_connect_headers,
 )
@@ -747,7 +748,7 @@ class BrowserContextFactory:
                 with suppress(Exception):
                     await cleanup_func()
 
-            if not isinstance(e, Exception) or isinstance(e, UnknownBrowserType):
+            if not isinstance(e, Exception) or isinstance(e, (UnknownBrowserType, BrowserEngineBootstrapError)):
                 raise e
 
             raise UnknownErrorWhileCreatingBrowserContext(browser_type, e) from e
