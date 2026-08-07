@@ -45,6 +45,8 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory, resolve_run_download_id
+from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
+from skyvern.forge.sdk.core.http_request_authorization import deny_unenrolled_redirect_hop
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, get_tzinfo_from_proxy
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding, VideoArtifact
@@ -1205,7 +1207,13 @@ async def _connect_to_cdp_browser(
     # This captures downloads via the Fetch domain and saves them locally.
     if parsed_headers.enable_download:
         download_dir = initialize_download_dir()
-        interceptor = CDPDownloadInterceptor(output_dir=download_dir)
+        # No run-scoped network authority is threaded into this OSS creator; the interceptor stays
+        # unenrolled, which fails closed on every intercepted request rather than defaulting open.
+        interceptor = CDPDownloadInterceptor(
+            output_dir=download_dir,
+            network_egress_monitor=BrowserNetworkEgressMonitor.unenrolled(),
+            redirect_hop_authorizer=deny_unenrolled_redirect_hop,
+        )
 
         # Enable interception on all existing pages
         for page in browser_context.pages:
