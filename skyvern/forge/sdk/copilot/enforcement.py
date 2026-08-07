@@ -22,7 +22,6 @@ from skyvern.config import settings
 from skyvern.forge.sdk.copilot import config as copilot_config_defaults
 from skyvern.forge.sdk.copilot import streaming_adapter
 from skyvern.forge.sdk.copilot.blocker_signal import (
-    SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
     CopilotToolBlockerSignal,
     clear_tool_blocker_signals_for_reason_codes,
     stash_blocker_signal,
@@ -40,6 +39,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     CREDENTIAL_FILL_TOOL_NAME,
     LIVE_SCOUT_CREDENTIAL_FIELDS,
     ONE_TIME_CODE_CREDENTIAL_FIELD,
+    SYNTHESIZED_OFFER_SENTINEL,
     ObligationFinding,
     credential_scout_gap,
     credential_submit_boundary_index,
@@ -103,7 +103,6 @@ from skyvern.forge.sdk.copilot.output_extraction_plan import (
     value_shown_in_selectable_evidence,
 )
 from skyvern.forge.sdk.copilot.output_policy import (
-    completion_criterion_requires_browser_fill_delivery,
     normalize_response_scaffolding,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
@@ -151,7 +150,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     raise_if_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
-from skyvern.forge.sdk.copilot.turn_intent import RequiredContextKey, TurnIntent, TurnIntentMode
+from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentMode
 from skyvern.forge.sdk.copilot.turn_ownership import (
     TurnClaimant,
     claim_turn,
@@ -214,13 +213,6 @@ NUDGE_SENTINEL = "[copilot:nudge] "
 SCREENSHOT_PLACEHOLDER = SCREENSHOT_SENTINEL + "[prior screenshot removed to save context]"
 TOKEN_BUDGET = DEFAULT_TOKEN_BUDGET
 SYNTHESIZED_BLOCK_PERSISTENCE_TOOL = "update_and_run_blocks"
-_SYNTHESIZED_BLOCK_PERSISTENCE_ALLOWED_TOOLS = frozenset(
-    {SYNTHESIZED_BLOCK_PERSISTENCE_TOOL, "fill_credential_field", "update_workflow"}
-)
-_ACTUATION_OBLIGATION_REQUIRED_FILL_TOOL = "type_text"
-_SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS = frozenset(
-    {"click", "press_key", "type_text", "select_option", "navigate_browser"}
-)
 # Both tools re-author the workflow draft and clear the coverage-reopen flag; the steer must fire
 # for either or an update_workflow re-author silently spends the one-shot rescout.
 _SYNTHESIZED_BLOCK_REAUTHORING_TOOLS = frozenset({SYNTHESIZED_BLOCK_PERSISTENCE_TOOL, "update_workflow"})
@@ -239,7 +231,13 @@ TOKENS_PER_RESIZED_IMAGE = 765
 # Keep the last N function_call_output items at full (head-truncated) size.
 # Older outputs collapse to a compact synopsis so context doesn't grow linearly.
 KEEP_RECENT_TOOL_OUTPUTS = 3
-_RECENT_TOOL_OUTPUT_CHAR_CAP = 2000
+# A tripwire against pathological payloads, not a routine ration: code-bearing tool
+# results (synthesized blocks, edit re-anchor echoes) run 3-30KB plus JSON escaping
+# and must reach the model whole, so the cap sits above that class with headroom.
+_RECENT_TOOL_OUTPUT_CHAR_CAP = 50_000
+# Older tool-call arguments that fail to summarize keep only this much; that channel
+# exists to shrink replayed context and must not follow the recent-window cap.
+_SUMMARIZED_TOOL_ARGUMENT_CHAR_CAP = 2000
 _TOOL_OUTPUT_SUMMARIZE_THRESHOLD = 300
 _TOOL_OUTPUT_TRUNCATION_SUFFIX = "\n... [older tool output truncated]"
 # Head-truncation marker for the recent tool-output window. Kept on a
@@ -1657,9 +1655,31 @@ def _is_nudge_message(item: Any) -> bool:
     return isinstance(content, str) and content.startswith(NUDGE_SENTINEL)
 
 
+def _is_synthesized_offer_message(item: Any) -> bool:
+    if _item_field(item, "role") != "user":
+        return False
+    content = _item_field(item, "content")
+    return isinstance(content, str) and content.startswith(SYNTHESIZED_OFFER_SENTINEL)
+
+
 def is_synthetic_user_message(item: Any) -> bool:
-    """Return True if item is a screenshot or nudge (not a real user turn)."""
-    return is_screenshot_message(item) or _is_nudge_message(item)
+    """Return True if item is a screenshot, nudge, or synthesized-block offer
+    (not a real user turn)."""
+    return is_screenshot_message(item) or _is_nudge_message(item) or _is_synthesized_offer_message(item)
+
+
+def collapse_superseded_synthesized_offers(items: list[Any]) -> list[Any]:
+    """Drop every synthesized-block offer except the newest: a refreshed offer supersedes its
+    predecessors, and offers ride as user messages no other compaction rung touches. Applied on
+    every model-input assembly path before token estimation; the opening item is never dropped.
+    """
+    offer_indices = [i for i, item in enumerate(items) if i > 0 and _is_synthesized_offer_message(item)]
+    if len(offer_indices) <= 1:
+        return items
+    stale = set(offer_indices[:-1])
+    dropped_chars = sum(len(_item_field(items[i], "content") or "") for i in stale)
+    LOG.info("copilot_superseded_offers_dropped", dropped=len(stale), dropped_chars=dropped_chars)
+    return [item for i, item in enumerate(items) if i not in stale]
 
 
 def _truncated_output_fallback(output: str) -> str:
@@ -1689,6 +1709,9 @@ def _summarize_tool_output(output: str) -> str:
 
     data = parsed.get("data")
     if isinstance(data, dict):
+        code = data.get("code")
+        if isinstance(code, str) and code:
+            synopsis["code_chars_elided"] = len(code)
         for key in ("overall_status", "workflow_run_id", "failure_reason", "url", "message"):
             val = data.get(key)
             if val is None or val == "":
@@ -1759,9 +1782,9 @@ def _summarize_tool_arguments(args_json: str) -> str:
     try:
         parsed = json.loads(args_json)
     except (TypeError, ValueError):
-        return args_json[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
+        return args_json[:_SUMMARIZED_TOOL_ARGUMENT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
     if not isinstance(parsed, dict):
-        return args_json[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
+        return args_json[:_SUMMARIZED_TOOL_ARGUMENT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
     compact: dict[str, Any] = {}
     for key, val in parsed.items():
         if isinstance(val, str) and len(val) > 500:
@@ -1775,7 +1798,16 @@ def _summarize_tool_arguments(args_json: str) -> str:
     try:
         return json.dumps(compact, separators=(",", ":"))
     except (TypeError, ValueError):
-        return args_json[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
+        return args_json[:_SUMMARIZED_TOOL_ARGUMENT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
+
+
+def log_recent_tool_output_truncation(truncated_count: int, largest_original_chars: int) -> None:
+    LOG.warning(
+        "copilot_recent_tool_output_truncated",
+        truncated_count=truncated_count,
+        cap=_RECENT_TOOL_OUTPUT_CHAR_CAP,
+        largest_original_chars=largest_original_chars,
+    )
 
 
 def _prune_input_list(items: list[Any]) -> list[Any]:
@@ -1787,6 +1819,7 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
     function_call items keep the last KEEP_RECENT_TOOL_OUTPUTS at full size
     (head-truncated); older ones collapse to JSON synopses.
     """
+    items = collapse_superseded_synthesized_offers(items)
     screenshot_indices = [i for i, item in enumerate(items) if is_screenshot_message(item)]
     drop_indices = set(screenshot_indices[:-1])
 
@@ -1797,6 +1830,8 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
     recent_fc_set = set(fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:])
 
     result: list[Any] = []
+    recent_truncated_count = 0
+    recent_truncated_largest = 0
     for i, item in enumerate(items):
         if i in drop_indices:
             result.append({"role": "user", "content": SCREENSHOT_PLACEHOLDER})
@@ -1807,11 +1842,13 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
             output = _item_field(item, "output")
             if isinstance(output, str):
                 if i in recent_fco_set:
-                    new_output = (
-                        output[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX
-                        if len(output) > _RECENT_TOOL_OUTPUT_CHAR_CAP
-                        else output
-                    )
+                    if len(output) > _RECENT_TOOL_OUTPUT_CHAR_CAP:
+                        new_output = output[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX
+                        if new_output != output:
+                            recent_truncated_count += 1
+                            recent_truncated_largest = max(recent_truncated_largest, len(output))
+                    else:
+                        new_output = output
                 else:
                     new_output = _summarize_tool_output(output)
                 if new_output != output:
@@ -1824,6 +1861,8 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
                     item = _replace_item_field(item, "arguments", new_args)
 
         result.append(item)
+    if recent_truncated_count:
+        log_recent_tool_output_truncation(recent_truncated_count, recent_truncated_largest)
     return result
 
 
@@ -3105,151 +3144,6 @@ def _should_force_advisory_run_dispatch(ctx: Any) -> bool:
     return not blocker_signal_is_genuinely_terminal(getattr(ctx, "blocker_signal", None))
 
 
-def _should_force_synthesized_block_persistence(ctx: Any) -> bool:
-    if getattr(ctx, "update_workflow_called", False) and not synthesized_persistence_reopened(ctx):
-        return False
-    if not _turn_intent_can_update_and_run_without_user_input(getattr(ctx, "turn_intent", None)):
-        return False
-    if normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)) != (
-        BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    ):
-        return False
-    if not getattr(ctx, "synthesized_block_offered", False):
-        return False
-    trajectory = getattr(ctx, "scout_trajectory", None) or []
-    if (getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0) != len(trajectory):
-        return False
-    if not getattr(ctx, "synthesized_block_offered_goal_complete", False):
-        return False
-    return synthesized_trajectory_is_goal_complete(ctx)
-
-
-def _should_block_mutating_tool_after_synthesized_offer(ctx: Any, tool_name: str) -> bool:
-    if tool_name not in _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS:
-        return False
-    if _active_non_method_mandated_terminal_actions(ctx) or _active_floor_rekeyed_runtime_outputs(ctx):
-        if not synthesized_trajectory_is_goal_complete(ctx):
-            return False
-    else:
-        if uncovered_requested_output_paths(ctx):
-            return False
-        if _credential_flow_scout_gap_incomplete(ctx, getattr(ctx, "scout_trajectory", None) or []):
-            return False
-    if getattr(ctx, "update_workflow_called", False) and not synthesized_persistence_reopened(ctx):
-        return False
-    if not _turn_intent_can_update_and_run_without_user_input(getattr(ctx, "turn_intent", None)):
-        return False
-    if normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)) != (
-        BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    ):
-        return False
-    if not getattr(ctx, "synthesized_block_offered", False):
-        return False
-    trajectory = getattr(ctx, "scout_trajectory", None) or []
-    return (getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0) == len(trajectory)
-
-
-def _ambiguous_bare_selector_repair_context(ctx: Any) -> Any | None:
-    repair_context = getattr(ctx, "last_code_authoring_repair_context", None)
-    if getattr(repair_context, "reason_code", None) != "ambiguous_bare_selector":
-        return None
-    if getattr(repair_context, "workflow_run_id", None):
-        return None
-    if getattr(ctx, "last_run_blocks_workflow_run_id", None):
-        return None
-    return repair_context
-
-
-def _ambiguous_bare_selector_rescout_key(ctx: Any) -> str | None:
-    repair_context = _ambiguous_bare_selector_repair_context(ctx)
-    if repair_context is None:
-        return None
-    if getattr(repair_context, "refiner_selector", None):
-        return None
-    selector_alternatives = getattr(repair_context, "selector_alternatives", None)
-    if isinstance(selector_alternatives, list) and selector_alternatives:
-        return None
-    payload = {
-        "block_label": str(getattr(repair_context, "block_label", "") or ""),
-        "selector": str(getattr(repair_context, "selector", "") or ""),
-        "source_url": str(getattr(repair_context, "source_url", "") or ""),
-    }
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
-
-
-def _ambiguous_bare_selector_rescout_signal_state(ctx: Any, tool_name: str) -> str | None:
-    if tool_name != "evaluate":
-        return None
-    repair_context = _ambiguous_bare_selector_repair_context(ctx)
-    if repair_context is None:
-        return None
-    if getattr(repair_context, "refiner_selector", None):
-        return "block"
-    selector_alternatives = getattr(repair_context, "selector_alternatives", None)
-    if isinstance(selector_alternatives, list) and selector_alternatives:
-        return "block"
-    key = _ambiguous_bare_selector_rescout_key(ctx)
-    if key is None:
-        return None
-    if getattr(ctx, "ambiguous_bare_selector_rescout_context_key", None) == key:
-        return "block"
-    # Track the one allowed same-page rescout for this author-time repair context.
-    ctx.ambiguous_bare_selector_rescout_context_key = key
-    return "allow"
-
-
-def _actuation_obligation_live_fill_delivery_required(ctx: CopilotContext) -> bool:
-    turn_intent = getattr(ctx, "turn_intent", None)
-    if (
-        not isinstance(turn_intent, TurnIntent)
-        or turn_intent.mode != TurnIntentMode.BUILD
-        or RequiredContextKey.BROWSER_STATE not in turn_intent.required_context
-    ):
-        return False
-    if normalize_block_authoring_policy(ctx.block_authoring_policy) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return False
-    request_policy = getattr(ctx, "request_policy", None)
-    criteria: list[CompletionCriterion] = []
-    if isinstance(request_policy, RequestPolicy):
-        criteria.extend(request_policy.completion_criteria)
-    turn_state = getattr(ctx, "completion_criteria_turn_state", None)
-    if turn_state is not None and turn_state.decision is not None:
-        criteria.extend(turn_state.decision.criteria)
-    if any(completion_criterion_requires_browser_fill_delivery(criterion) for criterion in criteria):
-        return True
-    trajectory = getattr(ctx, "scout_trajectory", None)
-    return trajectory_has_browser_fill_interaction(trajectory) if isinstance(trajectory, list) else False
-
-
-def _actuation_obligation_required_fill_tool(ctx: CopilotContext) -> str | None:
-    if _actuation_obligation_live_fill_delivery_required(ctx):
-        return _ACTUATION_OBLIGATION_REQUIRED_FILL_TOOL
-    return None
-
-
-def _actuation_obligation_admits_required_fill_tool(ctx: CopilotContext, tool_name: str) -> bool:
-    return tool_name == _actuation_obligation_required_fill_tool(ctx)
-
-
-def _actuation_obligation_admits_login_completion_tool(
-    ctx: CopilotContext, tool_name: str, arguments: Mapping[str, Any] | None
-) -> bool:
-    if tool_name not in _SYNTHESIZED_BLOCK_COMMIT_TOOLS:
-        return False
-    # Only Enter commits a login form, matching what _first_stable_login_submit_index credits as a
-    # submit; every other keystroke stays gated. Absent arguments fail closed — the signature
-    # defaults them to None, so a caller that omits them must not admit arbitrary keystrokes.
-    if tool_name == "press_key" and (
-        not isinstance(arguments, Mapping) or str(arguments.get("key") or "").strip() != "Enter"
-    ):
-        return False
-    if not _actuation_obligation_live_fill_delivery_required(ctx):
-        return False
-    if _last_scout_credential_fill_index(ctx.scout_trajectory) is None:
-        return False
-    return not _trajectory_reaches_post_credential_commit(ctx)
-
-
 def arm_credential_scout_reopen(ctx: AgentContext, identity_digest: str) -> bool:
     """Arm a one-shot scout-window reopen for the first author-time credential-scout reject per
     (structural identity + credential binding) digest. A repeat identical reject returns False and
@@ -3259,56 +3153,6 @@ def arm_credential_scout_reopen(ctx: AgentContext, identity_digest: str) -> bool
     ctx.credential_scout_rescout_context_key = identity_digest
     ctx.synthesized_block_reopened_for_credential_scout = True
     return True
-
-
-def _credential_scout_reopen_admits_evaluate(ctx: CopilotContext, tool_name: str) -> bool:
-    return tool_name == "evaluate" and bool(ctx.synthesized_block_reopened_for_credential_scout)
-
-
-def synthesized_block_persistence_signal(
-    ctx: Any, tool_name: str, arguments: Mapping[str, Any] | None = None
-) -> CopilotToolBlockerSignal | None:
-    if tool_name in _SYNTHESIZED_BLOCK_PERSISTENCE_ALLOWED_TOOLS:
-        return None
-    ambiguous_selector_rescout_state = _ambiguous_bare_selector_rescout_signal_state(ctx, tool_name)
-    if ambiguous_selector_rescout_state == "allow":
-        return None
-    if _credential_scout_reopen_admits_evaluate(ctx, tool_name):
-        claim_turn(ctx, TurnClaimant.CREDENTIAL_SCOUT_REOPEN)
-        return None
-    if _actuation_obligation_admits_required_fill_tool(ctx, tool_name):
-        claim_turn(ctx, TurnClaimant.ACTUATION_OBLIGATION_FILL)
-        return None
-    if _actuation_obligation_admits_login_completion_tool(ctx, tool_name, arguments):
-        claim_turn(ctx, TurnClaimant.ACTUATION_OBLIGATION_LOGIN_COMPLETION)
-        return None
-    if (
-        ambiguous_selector_rescout_state != "block"
-        and not _should_force_synthesized_block_persistence(ctx)
-        and not _should_block_mutating_tool_after_synthesized_offer(ctx, tool_name)
-    ):
-        return None
-    return CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text=(
-            "A synthesized code block offer is already available for this authoring turn. "
-            f"Call {SYNTHESIZED_BLOCK_PERSISTENCE_TOOL} with that block now before any more scouting, "
-            "reading, page evaluation, or browser interaction. This blocker clears only after "
-            f"{SYNTHESIZED_BLOCK_PERSISTENCE_TOOL} succeeds."
-        ),
-        user_facing_reason="I need to save and test the drafted workflow before scouting more.",
-        recovery_hint="retry_with_different_tool",
-        cleared_by_tools=frozenset({SYNTHESIZED_BLOCK_PERSISTENCE_TOOL}),
-        preserves_workflow_draft=True,
-        renders_final_reply=False,
-        internal_reason_code=SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
-        blocked_tool=tool_name,
-        extra={
-            "synthesized_block_offered_trajectory_len": (
-                getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0
-            ),
-        },
-    )
 
 
 def _runner_kwargs_with_forced_tool_choice(runner_kwargs: dict[str, Any], tool_name: str) -> dict[str, Any]:
@@ -3387,16 +3231,14 @@ async def run_with_enforcement(
             "enforcement_iteration",
             data={"iteration": iteration, "elapsed_seconds": round(elapsed, 3)},
         ):
-            force_synthesized_block_persistence = _should_force_synthesized_block_persistence(ctx)
             force_advisory_run_dispatch = _should_force_advisory_run_dispatch(ctx)
             # The advisory-dispatch force claims the actuation ladder itself (same-claimant), so the
             # grant-consumption path can never self-deadlock.
             if force_advisory_run_dispatch:
                 claim_turn(ctx, TurnClaimant.OUTPUT_CONTRACT_ACTUATION)
-            force_run_dispatch = force_synthesized_block_persistence or force_advisory_run_dispatch
             current_runner_kwargs = (
                 _runner_kwargs_with_forced_tool_choice(runner_kwargs, SYNTHESIZED_BLOCK_PERSISTENCE_TOOL)
-                if force_run_dispatch
+                if force_advisory_run_dispatch
                 else runner_kwargs
             )
             effective_run_config = current_runner_kwargs.get("run_config")
@@ -3406,11 +3248,10 @@ async def run_with_enforcement(
             turn_intent = getattr(ctx, "turn_intent", None)
             turn_intent_authority = getattr(turn_intent, "authority", None)
             LOG.info(
-                "copilot synthesized persistence force decision",
-                force_synthesized_block_persistence=force_synthesized_block_persistence,
+                "copilot advisory run dispatch force decision",
                 force_advisory_run_dispatch=force_advisory_run_dispatch,
-                forced_tool_name=(SYNTHESIZED_BLOCK_PERSISTENCE_TOOL if force_run_dispatch else None),
-                chosen_tool_name=(SYNTHESIZED_BLOCK_PERSISTENCE_TOOL if force_run_dispatch else None),
+                forced_tool_name=(SYNTHESIZED_BLOCK_PERSISTENCE_TOOL if force_advisory_run_dispatch else None),
+                chosen_tool_name=(SYNTHESIZED_BLOCK_PERSISTENCE_TOOL if force_advisory_run_dispatch else None),
                 turn_intent_mode=getattr(getattr(turn_intent, "mode", None), "value", None),
                 turn_intent_may_update_workflow=getattr(turn_intent_authority, "may_update_workflow", None),
                 turn_intent_may_run_blocks=getattr(turn_intent_authority, "may_run_blocks", None),

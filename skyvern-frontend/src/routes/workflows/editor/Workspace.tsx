@@ -50,7 +50,7 @@ import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { resolveWorkspaceBrowserSessionBindings } from "./browserSessionBindings";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
-import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
+import { useStreamTransport } from "@/hooks/useRuntimeConfig";
 import {
   StreamModeBadge,
   StreamStatusPanel,
@@ -201,6 +201,7 @@ import { useWorkflowYamlEditorLifecycle } from "./hooks/useWorkflowYamlEditorLif
 import {
   preservedFinallyBlockLabel,
   workflowVersionFromSaveData,
+  yamlCommitInputs,
 } from "./workflowVersionFromSaveData";
 import "./workspace-styles.css";
 
@@ -529,7 +530,6 @@ function Workspace({
   const { data: workflowRun } = useWorkflowRunQuery();
   const studioRunId = useStudioRunId();
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
-  const { browserStreamingMode } = useBrowserStreamingMode();
 
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
@@ -578,11 +578,6 @@ function Workspace({
   const [isCopilotTurnActive, setIsCopilotTurnActive] = useState(false);
   const blockScriptStore = useBlockScriptStore();
   const recordingStore = useRecordingStore();
-  const isCdpStreamingMode =
-    browserStreamingMode === "cdp" && !recordingStore.isRecording;
-  // Record Browser exfiltration requires VNC even when the org default is CDP streaming.
-  const preferVncStream =
-    browserStreamingMode !== "cdp" || recordingStore.isRecording;
   const cacheKey = workflow?.cache_key ?? "";
 
   // Block delete confirmation dialog state
@@ -774,6 +769,15 @@ function Workspace({
   });
 
   const activeDebugSession = debugSession ?? null;
+
+  const { streamTransport } = useStreamTransport(
+    activeDebugSession?.browser_session_id,
+  );
+  const isCdpStreamingMode =
+    streamTransport === "cdp" && !recordingStore.isRecording;
+  // Record Browser exfiltration requires VNC even when the transport is CDP streaming.
+  const preferVncStream =
+    streamTransport !== "cdp" || recordingStore.isRecording;
 
   const workflowChangesStore = useWorkflowHasChangesStore();
 
@@ -1776,12 +1780,16 @@ function Workspace({
       );
       return false;
     }
+    const { definition: draftDefinition, definitionYaml } = yamlCommitInputs(
+      parsed,
+      yamlStore.draft,
+    );
     try {
       const client = await getClient(credentialGetter, "sans-api-v1");
       const response = await client.post<WorkflowYAMLConversionResponse>(
         "/workflow/copilot/convert-yaml-to-blocks",
         {
-          workflow_definition_yaml: yamlStore.draft,
+          workflow_definition_yaml: definitionYaml,
           workflow_id: saveData.workflow.workflow_id,
         },
       );
@@ -1858,7 +1866,7 @@ function Workspace({
         try {
           await saveWorkflow.mutateAsync({
             blocks: upgradedBlocks,
-            parameters: parsed?.parameters ?? [],
+            parameters: draftDefinition?.parameters ?? [],
             workflowDefinitionVersion: upgradedVersion,
             settings: { ...saveData.settings, finallyBlockLabel },
           });
@@ -2544,7 +2552,7 @@ function Workspace({
                   </div>
                 )}
 
-                {/* Live browser: mode comes from BROWSER_STREAMING_MODE / runtime config */}
+                {/* Live browser: mode comes from the session's stream transport, falling back to runtime config */}
                 {showVncBrowserPanel && (
                   <div className="skyvern-vnc-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
                     <div key={reloadKey} className="w-full flex-1">

@@ -368,8 +368,9 @@ async def resolve_local_or_download_file(
         if max_size_mb is not None and os.path.getsize(resolved) > max_size_mb * 1024 * 1024:
             raise DownloadFileMaxSizeExceeded(max_size_mb)
         return resolved
-    if parse_artifact_content_url(file_url, settings.SKYVERN_BASE_URL) is not None:
-        file_url = await app.ARTIFACT_MANAGER.remint_content_url_if_unverified(file_url, organization_id) or file_url
+    parsed = parse_artifact_content_url(file_url, settings.SKYVERN_BASE_URL)
+    if parsed is not None:
+        file_url = await app.ARTIFACT_MANAGER.remint_content_url_if_unverified(parsed, organization_id) or file_url
     return await download_file(file_url, max_size_mb=max_size_mb, organization_id=organization_id)
 
 

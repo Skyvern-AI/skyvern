@@ -77,4 +77,5 @@ async def test_get_browser_session_enables_strict_download_lookup() -> None:
         browser_session,
         app_mock.STORAGE,
         fail_download_lookup=True,
+        include_stream_transport=True,
     )
