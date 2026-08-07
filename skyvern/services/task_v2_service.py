@@ -2135,7 +2135,14 @@ async def _generate_goto_url_task(
     )
 
 
-async def get_thought_timelines(*, task_v2_id: str, organization_id: str) -> list[WorkflowRunTimeline]:
+async def get_thought_timelines(
+    *, task_v2_id: str, organization_id: str, cap_output_values: bool = False
+) -> list[WorkflowRunTimeline]:
+    from skyvern.forge.sdk.workflow.service import (  # noqa: PLC0415
+        truncate_oversized_response_text,
+        truncate_oversized_response_value,
+    )
+
     thoughts = await app.DATABASE.observer.get_thoughts(
         task_v2_id=task_v2_id,
         organization_id=organization_id,
@@ -2144,6 +2151,23 @@ async def get_thought_timelines(*, task_v2_id: str, organization_id: str) -> lis
             ThoughtType.user_goal_check,
         ],
     )
+    if cap_output_values:
+        # A thought's generated text and structured output ride this response beside
+        # block outputs and are rendered directly by the run-detail UI.
+        thoughts = [
+            thought.model_copy(
+                update={
+                    "output": truncate_oversized_response_value(
+                        thought.output, thought_id=thought.observer_thought_id, field="output"
+                    ),
+                    **{
+                        field: truncate_oversized_response_text(getattr(thought, field))
+                        for field in ("user_input", "observation", "thought", "answer")
+                    },
+                }
+            )
+            for thought in thoughts
+        ]
     return [
         WorkflowRunTimeline(
             type=WorkflowRunTimelineType.thought,
@@ -2627,15 +2651,18 @@ async def _summarize_task_v2(
     )
 
 
-async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
+async def build_task_v2_run_response(task_v2: TaskV2, cap_output_values: bool = False) -> TaskRunResponse:
     """Build TaskRunResponse object for webhook backward compatibility."""
+    from skyvern.forge.sdk.workflow.service import truncate_oversized_response_value  # noqa: PLC0415
     from skyvern.services import workflow_service  # noqa: PLC0415
 
     workflow_run_resp = None
     if task_v2.workflow_run_id:
         try:
             workflow_run_resp = await workflow_service.get_workflow_run_response(
-                task_v2.workflow_run_id, organization_id=task_v2.organization_id
+                task_v2.workflow_run_id,
+                organization_id=task_v2.organization_id,
+                cap_output_values=cap_output_values,
             )
         except Exception:
             LOG.warning(
@@ -2652,7 +2679,11 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
         run_id=task_v2.observer_cruise_id,
         run_type=RunType.task_v2,
         status=task_v2.status,
-        output=task_v2.output,
+        output=(
+            truncate_oversized_response_value(task_v2.output, task_v2_id=task_v2.observer_cruise_id)
+            if cap_output_values
+            else task_v2.output
+        ),
         failure_reason=workflow_run_resp.failure_reason if workflow_run_resp else None,
         queued_at=task_v2.queued_at,
         started_at=task_v2.started_at,
