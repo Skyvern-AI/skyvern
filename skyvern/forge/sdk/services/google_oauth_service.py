@@ -497,7 +497,6 @@ def build_authorize_url(
     url, _returned_state = flow.authorization_url(
         access_type="offline",
         prompt="consent",
-        include_granted_scopes="true",
     )
     # Flow.code_verifier is None when autogenerate is False AND we didn't set
     # it; that path is unreachable here, but raise (not assert) so a future
