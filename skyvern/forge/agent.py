@@ -5560,11 +5560,11 @@ class ForgeAgent:
             if getattr(task, key) != value
         }
 
+        start_time = task.started_at.replace(tzinfo=UTC) if task.started_at else task.created_at.replace(tzinfo=UTC)
+        duration_seconds = (datetime.now(UTC) - start_time).total_seconds()
         # Track task duration when task is completed, failed, or terminated
         if status in [TaskStatus.completed, TaskStatus.failed, TaskStatus.terminated]:
-            start_time = task.started_at.replace(tzinfo=UTC) if task.started_at else task.created_at.replace(tzinfo=UTC)
             queued_seconds = (start_time - task.created_at.replace(tzinfo=UTC)).total_seconds()
-            duration_seconds = (datetime.now(UTC) - start_time).total_seconds()
             LOG.info(
                 "Task duration metrics",
                 task_id=task.task_id,
@@ -5575,14 +5575,22 @@ class ForgeAgent:
                 organization_id=task.organization_id,
                 failure_reason=failure_reason,
             )
-
         await save_task_logs(task.task_id)
         LOG.info("Updating task in db", task_id=task.task_id, diff=update_comparison, sampling=True)
-        return await app.DATABASE.tasks.update_task(
+        updated_task = await app.DATABASE.tasks.update_task(
             task.task_id,
             organization_id=task.organization_id,
             **updates,
         )
+        # Minutes emit after the terminal write lands and only on the non-final ->
+        # final transition (task holds the pre-write status), so neither a retried
+        # failed write nor a repeated terminal update double-counts the run;
+        # is_final() includes canceled and timed_out, matching the workflow-run gate.
+        if task.workflow_run_id is None and status.is_final() and not task.status.is_final():
+            await app.AGENT_FUNCTION.record_run_duration(
+                run_type="task_v1", status=str(status), duration_seconds=duration_seconds
+            )
+        return updated_task
 
     async def _handle_completed_step_with_parallel_verification(
         self,
