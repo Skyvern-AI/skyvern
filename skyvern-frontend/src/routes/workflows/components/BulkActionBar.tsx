@@ -269,7 +269,7 @@ function BulkActionBar({
     }
     downloadFile(
       `agents-export-${selectedWorkflows.length}.zip`,
-      Uint8Array.from(zipSync(entries)).buffer,
+      new Uint8Array(zipSync(entries)),
       "application/zip",
     );
   }

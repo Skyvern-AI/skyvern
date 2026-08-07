@@ -15,14 +15,10 @@ function titlesOf(yamls: string[]): Array<string | null> {
   return yamls.map((yaml) => extractTitleFromYaml(yaml));
 }
 
-// Vitest's jsdom TextEncoder creates bytes in a different realm than fflate's
-// Uint8Array constructor. Copy into a library-created array so zipSync treats
-// the value as file data rather than recursively flattening its numeric keys.
-function zipText(text: string): Uint8Array {
-  const encoded = strToU8(text);
-  const bytes = strToU8("\0".repeat(encoded.length), true);
-  bytes.set(encoded);
-  return bytes;
+// fflate is loaded in Node's realm while Vitest runs tests in jsdom's realm.
+// Copy encoded bytes so zipSync recognizes them as Uint8Array file contents.
+function archiveBytes(text: string): Uint8Array {
+  return new Uint8Array(strToU8(text));
 }
 
 describe("expandFileToWorkflowYamls", () => {
@@ -99,8 +95,8 @@ describe("unzipArchive", () => {
     // Mirrors BulkActionBar.handleBulkExport's ZIP branch: one sanitized,
     // deduped entry per agent.
     const zipped = zipSync({
-      "Workflow A.yaml": zipText(convertToYAML(workflowA)),
-      "Workflow B.yaml": zipText(convertToYAML(workflowB)),
+      "Workflow A.yaml": archiveBytes(convertToYAML(workflowA)),
+      "Workflow B.yaml": archiveBytes(convertToYAML(workflowB)),
     });
 
     const entries = unzipArchive(zipped);
@@ -113,8 +109,8 @@ describe("unzipArchive", () => {
 
   it("round-trips zipped per-agent files back into individual workflows", () => {
     const zipped = zipSync({
-      "Workflow A.yaml": zipText(convertToYAML(workflowA)),
-      "Workflow B.yaml": zipText(convertToYAML(workflowB)),
+      "Workflow A.yaml": archiveBytes(convertToYAML(workflowA)),
+      "Workflow B.yaml": archiveBytes(convertToYAML(workflowB)),
     });
 
     const expanded = unzipArchive(zipped).flatMap((entry) =>
@@ -126,8 +122,8 @@ describe("unzipArchive", () => {
 
   it("ignores empty entries", () => {
     const zipped = zipSync({
-      "empty.yaml": zipText(""),
-      "Workflow A.yaml": zipText(convertToYAML(workflowA)),
+      "empty.yaml": new Uint8Array(0),
+      "Workflow A.yaml": archiveBytes(convertToYAML(workflowA)),
     });
 
     const entries = unzipArchive(zipped);
@@ -137,10 +133,10 @@ describe("unzipArchive", () => {
 
   it("ignores non-workflow files, including macOS zip metadata junk", () => {
     const zipped = zipSync({
-      "Workflow A.yaml": zipText(convertToYAML(workflowA)),
-      "__MACOSX/._Workflow A.yaml": zipText("junk"),
-      ".DS_Store": zipText("junk"),
-      "notes.txt": zipText("not a workflow"),
+      "Workflow A.yaml": archiveBytes(convertToYAML(workflowA)),
+      "__MACOSX/._Workflow A.yaml": archiveBytes("junk"),
+      ".DS_Store": archiveBytes("junk"),
+      "notes.txt": archiveBytes("not a workflow"),
     });
 
     const entries = unzipArchive(zipped);
@@ -157,7 +153,7 @@ describe("unzipArchive", () => {
   it("rejects an archive with too many entries", () => {
     const files: Record<string, Uint8Array> = {};
     for (let i = 0; i < 201; i++) {
-      files[`workflow-${i}.yaml`] = zipText(convertToYAML(workflowA));
+      files[`workflow-${i}.yaml`] = archiveBytes(convertToYAML(workflowA));
     }
     const zipped = zipSync(files);
 
