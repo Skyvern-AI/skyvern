@@ -1868,7 +1868,7 @@ async def test_route_error_before_write_keeps_older_proposal_despite_attempted_f
     )
     agent_result = SimpleNamespace(
         user_response="unused",
-        updated_workflow=SimpleNamespace(model_dump=lambda mode: {"title": "fresh draft"}),
+        updated_workflow=SimpleNamespace(title="fresh draft", model_dump=lambda mode: {"title": "fresh draft"}),
         global_llm_context=None,
         workflow_yaml="title: fresh draft\n",
         workflow_was_persisted=False,
@@ -1938,7 +1938,7 @@ async def test_route_error_after_real_fresh_write_clears_it_even_with_no_prior_p
     )
     agent_result = SimpleNamespace(
         user_response="Here is your draft.",
-        updated_workflow=SimpleNamespace(model_dump=lambda mode: {"title": "fresh draft"}),
+        updated_workflow=SimpleNamespace(title="fresh draft", model_dump=lambda mode: {"title": "fresh draft"}),
         global_llm_context=None,
         workflow_yaml="title: fresh draft\n",
         workflow_was_persisted=False,
@@ -2283,7 +2283,8 @@ async def test_unvalidated_timeout_wip_overrides_auto_accept(
         description="Original description",
         workflow_definition=None,
     )
-    proposal = MagicMock(spec=["model_dump"])
+    proposal = MagicMock(spec=["model_dump", "title"])
+    proposal.title = "WIP"
     proposal.model_dump.return_value = {"workflow_id": "wf-canonical"}
     agent_result = SimpleNamespace(
         user_response="I ran out of time before I could finish testing.",
@@ -2464,7 +2465,8 @@ async def test_legacy_path_persists_copilot_yaml_on_proposal(
         auto_accept=False,
     )
 
-    proposal = MagicMock(spec=["model_dump"])
+    proposal = MagicMock(spec=["model_dump", "title"])
+    proposal.title = "Updated"
     proposal.model_dump.return_value = {"workflow_id": "wf-canonical", "title": "Updated"}
 
     workflow_yaml = "title: Updated\nworkflow_definition:\n  blocks: []\n"
@@ -2521,7 +2523,7 @@ async def test_persist_state_keeps_verified_review_tested_proposal(monkeypatch: 
         SimpleNamespace(update_workflow_copilot_chat=AsyncMock()),
     )
     agent_result = SimpleNamespace(
-        updated_workflow=SimpleNamespace(model_dump=lambda mode: {"title": "built"}),
+        updated_workflow=SimpleNamespace(title="built", model_dump=lambda mode: {"title": "built"}),
         workflow_yaml="title: built\n",
         clear_proposed_workflow=False,
         proposal_disposition="review_tested",
@@ -2645,7 +2647,7 @@ async def test_persist_state_keep_pending_proposal_does_not_block_new_proposal_o
         SimpleNamespace(update_workflow_copilot_chat=AsyncMock()),
     )
     agent_result = _make_bypassed_proposal_agent_result(
-        updated_workflow=SimpleNamespace(model_dump=lambda mode: {"title": "new draft"}),
+        updated_workflow=SimpleNamespace(title="new draft", model_dump=lambda mode: {"title": "new draft"}),
         workflow_yaml="title: new draft\n",
     )
 
