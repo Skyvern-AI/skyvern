@@ -3018,7 +3018,16 @@ def synthesize_code_block(
             }
         )
 
-    if compile_download_target and reached_download_target is not None:
+    if (
+        compile_download_target
+        and reached_download_target is not None
+        and reached_download_target.download_kind == "observed_render"
+    ):
+        # A render-type affordance fires no download event, so the expect_download terminal below
+        # would hang; registering captured bytes needs the execution layer (blocked on the
+        # render-capture registration ticket), so no terminal is emitted for this kind yet.
+        pass
+    elif compile_download_target and reached_download_target is not None:
         # The download affordance is observed in nav_targets, not necessarily a trajectory click, so the
         # download is an appended terminal step compiled from the typed target — never an in-place click upgrade.
         # Awaiting the download value lands the file in the run-scoped downloads dir; the execution-layer

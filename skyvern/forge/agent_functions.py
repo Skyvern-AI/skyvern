@@ -857,6 +857,21 @@ async def _convert_css_shape_to_string(
 
 
 class AgentFunction:
+    async def record_run_duration(
+        self,
+        run_type: str,
+        status: str,
+        duration_seconds: float,
+        workflow_run_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> None:
+        """Cloud overrides this to emit run-duration telemetry; the OSS default is a no-op.
+
+        workflow_run_id/organization_id let the override refine run_type (e.g. a
+        workflow run that backs a task_v2) without the caller paying for the lookup.
+        """
+        return None
+
     workflow_schedules_enabled: bool = settings.ENABLE_WORKFLOW_SCHEDULES
     """Whether the workflow scheduler routes should serve traffic on this build.
 
