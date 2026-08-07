@@ -68,10 +68,16 @@ from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDe
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
 from skyvern.utils.email_validation import normalize_identifier_if_email
 from skyvern.utils.url_validators import pinned_ip_client
+from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_state import BrowserState
-from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
+from skyvern.webeye.scraper.scraped_page import (
+    ELEMENT_NODE_ATTRIBUTES,
+    CleanupElementTreeFunc,
+    ScrapedPage,
+    json_to_html,
+)
 from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame, take_element_screenshot
 
@@ -889,6 +895,86 @@ class AgentFunction:
     def supports_sequential_credentials(self) -> bool:
         """Whether this deployment can execute credentials marked run_sequentially."""
         return False
+
+    def begin_browser_observation(self) -> None:
+        """Notify an extension that a new browser observation is starting."""
+
+    def record_browser_observation_failure(self, reason: str) -> None:
+        """Notify an extension that browser content could not be fully observed."""
+
+    async def inspect_browser_observation(
+        self,
+        inner_text: str,
+        element_tree: list[dict[str, Any]],
+        semantic_text: str | None,
+    ) -> None:
+        """Offer a complete browser observation to an extension."""
+
+    def needs_browser_observation(self) -> bool:
+        """Return whether an extension consumes browser observations at all.
+
+        Call sites use this to skip building an observation nothing will read.
+        """
+        return False
+
+    def needs_browser_observation_text(self) -> bool:
+        """Return whether the extension needs supplemental rendered text."""
+        return False
+
+    def transform_browser_elements_for_prompt(self, elements: str) -> str:
+        """Transform browser-derived elements before they enter an agent prompt."""
+        return elements
+
+    async def inspect_browser_dialog(
+        self,
+        dialog_type: str,
+        message: str,
+        default_value: str | None,
+    ) -> bool:
+        """Return whether asynchronous inspection requires the browser dialog to be dismissed."""
+        return False
+
+    def should_dismiss_browser_dialog(
+        self,
+        dialog_type: str,
+        message: str,
+        default_value: str | None,
+    ) -> bool:
+        """Return whether an extension requires the browser dialog to be dismissed."""
+        return False
+
+    def should_block_browser_action(self, action_type: ActionType) -> bool:
+        """Return whether an extension policy blocks a proposed browser action."""
+        return False
+
+    def enforce_browser_action_policy(self, action_type: ActionType) -> None:
+        """Allow an extension to stop a browser action before it mutates the page."""
+
+    def register_browser_origin_authority(
+        self,
+        *,
+        task_id: str,
+        workflow_run_id: str | None,
+        url: str,
+    ) -> None:
+        """Offer a task's explicitly declared browser origin to an extension."""
+
+    async def enforce_browser_action_egress_policy(
+        self,
+        *,
+        action: Action,
+        task: Task,
+        page: Page,
+        scraped_page: ScrapedPage,
+    ) -> None:
+        """Allow an extension to enforce browser destination policy for a proposed action."""
+
+    def enforce_cached_browser_script_policy(self) -> None:
+        """Allow an extension to stop cached browser code before it executes."""
+
+    def should_use_cached_browser_scripts(self) -> bool:
+        """Return whether cached browser code may be selected for this run."""
+        return True
 
     def is_wait_time_optimization_enabled(self) -> bool:
         return False
@@ -2188,6 +2274,20 @@ class AgentFunction:
                 timeout=httpx.Timeout(timeout_seconds),
             )
 
+    def enforce_external_request_policy(
+        self,
+        *,
+        declared_url: str,
+        rendered_url: str,
+        destination_is_dynamic: bool,
+    ) -> str | None:
+        """Validate an external request and optionally constrain redirects to one origin.
+
+        OSS intentionally leaves this extension seam inert. Cloud deployments may return
+        the canonical origin that redirects must retain or raise to block the request.
+        """
+        return None
+
     async def post_totp_verification_request(
         self,
         url: str,
@@ -2296,8 +2396,7 @@ class AgentFunction:
     def get_copilot_security_rules(self) -> str:
         """Return security guardrails for the workflow copilot system prompt.
 
-        Override in cloud to inject prompt injection defenses.
-        OSS returns empty string (no hardening).
+        Extensions may provide additional policy text. The default is empty.
         """
         return ""
 
