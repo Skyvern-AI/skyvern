@@ -220,6 +220,7 @@ from skyvern.services.webhook_delivery import (
     deliver_webhook_with_retries,
     describe_delivery_error,
 )
+from skyvern.services.workflow_script_service import BLOCK_TYPES_THAT_SHOULD_BE_CACHED
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.secret_headers import merge_masked_headers
 from skyvern.utils.secret_redaction import redact_console_log_bytes, redact_har_bytes
@@ -390,17 +391,6 @@ def _select_recording_urls_in_window(
 
 
 CacheInvalidationReason = Literal["updated_block", "new_block", "removed_block"]
-BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
-    BlockType.TASK,
-    BlockType.TaskV2,
-    BlockType.ACTION,
-    BlockType.NAVIGATION,
-    BlockType.EXTRACTION,
-    BlockType.LOGIN,
-    BlockType.FILE_DOWNLOAD,
-    BlockType.FOR_LOOP,
-    BlockType.WHILE_LOOP,
-}
 
 
 def _collect_uncached_loop_children(
@@ -4573,6 +4563,14 @@ class WorkflowService:
         if context.is_static_script:
             return
 
+        # Per-block mints exist to cache block functions incrementally. A workflow
+        # with no cacheable block types has nothing block-level to cache — its
+        # script is fully derivable at end of run, so mint once there (SKY-13659).
+        if not any(
+            block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED for block in workflow.workflow_definition.blocks
+        ):
+            return
+
         disable_script_generation = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
             "DISABLE_GENERATE_SCRIPT_AFTER_BLOCK",
             workflow_run.workflow_run_id,
@@ -7713,15 +7711,31 @@ class WorkflowService:
         ai_fallback: bool | None = None,
         failure_category: list[dict] | None = None,
     ) -> WorkflowRun:
-        workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
-            workflow_run_id=workflow_run_id,
-            status=status,
-            failure_reason=failure_reason,
-            run_with=run_with,
-            ai_fallback=ai_fallback,
-            failure_category=failure_category,
-        )
-        await self._after_workflow_run_status_write(workflow_run, status)
+        # Final transitions are claimed conditionally so run-minutes emit exactly once
+        # per run even when a cancel and the run's own finalizer race; the loser still
+        # performs the unconditional overwrite the finalizer has always done, silently.
+        flipped_to_final = False
+        workflow_run: WorkflowRun | None = None
+        if status.is_final():
+            workflow_run = await app.DATABASE.workflow_runs.update_workflow_run_if_not_final(
+                workflow_run_id=workflow_run_id,
+                status=status,
+                failure_reason=failure_reason,
+                run_with=run_with,
+                ai_fallback=ai_fallback,
+                failure_category=failure_category,
+            )
+            flipped_to_final = workflow_run is not None
+        if workflow_run is None:
+            workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
+                workflow_run_id=workflow_run_id,
+                status=status,
+                failure_reason=failure_reason,
+                run_with=run_with,
+                ai_fallback=ai_fallback,
+                failure_category=failure_category,
+            )
+        await self._after_workflow_run_status_write(workflow_run, status, emit_run_minutes=flipped_to_final)
         return workflow_run
 
     async def _update_workflow_run_status_if_not_final(
@@ -7766,7 +7780,9 @@ class WorkflowService:
         await self._after_workflow_run_status_write(workflow_run, WorkflowRunStatus.timed_out)
         return workflow_run
 
-    async def _after_workflow_run_status_write(self, workflow_run: WorkflowRun, status: WorkflowRunStatus) -> None:
+    async def _after_workflow_run_status_write(
+        self, workflow_run: WorkflowRun, status: WorkflowRunStatus, emit_run_minutes: bool = True
+    ) -> None:
         workflow_run_id = workflow_run.workflow_run_id
         if status.is_final():
             # Free extraction-cache entries for this run.
@@ -7791,6 +7807,14 @@ class WorkflowService:
                 trigger_type=workflow_run.trigger_type,
                 workflow_schedule_id=workflow_run.workflow_schedule_id,
             )
+            if emit_run_minutes and workflow_run.parent_workflow_run_id is None:
+                await app.AGENT_FUNCTION.record_run_duration(
+                    run_type="workflow_run",
+                    status=str(status),
+                    duration_seconds=duration_seconds,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=workflow_run.organization_id,
+                )
             await self._apply_completion_run_tags_best_effort(workflow_run)
             self._schedule_workflow_run_terminal_hooks(
                 workflow_run_id=workflow_run_id,
@@ -8268,6 +8292,14 @@ class WorkflowService:
             trigger_type=updated.trigger_type,
             workflow_schedule_id=updated.workflow_schedule_id,
         )
+        if updated.parent_workflow_run_id is None:
+            await app.AGENT_FUNCTION.record_run_duration(
+                run_type="workflow_run",
+                status=str(WorkflowRunStatus.canceled),
+                duration_seconds=duration_seconds,
+                workflow_run_id=workflow_run_id,
+                organization_id=updated.organization_id,
+            )
         await self._apply_completion_run_tags_best_effort(updated)
 
         self._schedule_workflow_run_terminal_hooks(
@@ -10721,17 +10753,64 @@ class WorkflowService:
             blocks_to_update_count=len(blocks_to_update),
         )
 
-        created_script = await app.DATABASE.scripts.create_script(
+        # The published lookup above cannot see the pending script this run's
+        # per-block mints created. Reuse it (regenerate + promote) instead of
+        # minting a duplicate script with identical content (SKY-13659). The
+        # regeneration also closes the race with the fire-and-forget last
+        # per-block mint, which may still be in flight.
+        pending_script = None
+        pending_workflow_script = await app.DATABASE.scripts.get_workflow_script(
             organization_id=workflow.organization_id,
-            run_id=workflow_run.workflow_run_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            statuses=[ScriptStatus.pending],
         )
+        if pending_workflow_script:
+            pending_script = await app.DATABASE.scripts.get_script(
+                script_id=pending_workflow_script.script_id,
+                organization_id=workflow.organization_id,
+            )
+
+        if pending_script:
+            # Mint a NEW revision under the pending script_id rather than writing
+            # into the pending revision itself: script_files is unique on
+            # (script_revision_id, file_path) and create_script_file conflict-noops,
+            # so regenerating in place would keep the stale pending main.py — which
+            # the still-in-flight per-block mint can overwrite. A fresh revision
+            # persists the final source and wins the cache lookup (latest version).
+            version_stats = await app.DATABASE.scripts.get_script_version_stats(
+                organization_id=workflow.organization_id,
+                script_ids=[pending_script.script_id],
+            )
+            latest_version, _ = version_stats.get(pending_script.script_id, (pending_script.version, 0))
+            created_script = await app.DATABASE.scripts.create_script(
+                organization_id=workflow.organization_id,
+                run_id=workflow_run.workflow_run_id,
+                script_id=pending_script.script_id,
+                version=latest_version + 1,
+            )
+            LOG.info(
+                "Reusing run's pending script id for final mint instead of creating a new script",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                script_id=created_script.script_id,
+                pending_revision_id=pending_script.script_revision_id,
+                new_revision_id=created_script.script_revision_id,
+                new_version=created_script.version,
+                cache_key_value=rendered_cache_key_value,
+            )
+        else:
+            created_script = await app.DATABASE.scripts.create_script(
+                organization_id=workflow.organization_id,
+                run_id=workflow_run.workflow_run_id,
+            )
 
         await workflow_script_service.generate_workflow_script(
             workflow_run=workflow_run,
             workflow=workflow,
             script=created_script,
             rendered_cache_key_value=rendered_cache_key_value,
-            cached_script=None,
+            cached_script=pending_script,
             updated_block_labels=None,
         )
 
