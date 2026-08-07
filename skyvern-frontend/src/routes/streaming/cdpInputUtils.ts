@@ -4,6 +4,47 @@ export function mouseButtonName(button: number): string {
   return "left";
 }
 
+// CDP's Input.dispatchKeyEvent only performs the browser's default edit action (delete
+// forward/backward, arrow-key caret movement, etc.) for non-printable keys when given a
+// windowsVirtualKeyCode alongside eventType "rawKeyDown" - key/code alone are a no-op.
+const VIRTUAL_KEY_CODES: Record<string, number> = {
+  Backspace: 8,
+  Tab: 9,
+  Enter: 13,
+  Escape: 27,
+  PageUp: 33,
+  PageDown: 34,
+  End: 35,
+  Home: 36,
+  ArrowLeft: 37,
+  ArrowUp: 38,
+  ArrowRight: 39,
+  ArrowDown: 40,
+  Insert: 45,
+  Delete: 46,
+  F1: 112,
+  F2: 113,
+  F3: 114,
+  F4: 115,
+  F5: 116,
+  F6: 117,
+  F7: 118,
+  F8: 119,
+  F9: 120,
+  F10: 121,
+  F11: 122,
+  F12: 123,
+};
+
+export function virtualKeyCodeFor(
+  e: Pick<KeyboardEvent, "key" | "code">,
+): number | undefined {
+  if (e.key === " ") {
+    return 32;
+  }
+  return VIRTUAL_KEY_CODES[e.key] ?? VIRTUAL_KEY_CODES[e.code];
+}
+
 export function getModifiers(
   e: Pick<KeyboardEvent, "altKey" | "ctrlKey" | "metaKey" | "shiftKey">,
 ): number {

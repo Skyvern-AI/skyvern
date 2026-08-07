@@ -211,6 +211,7 @@ from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
+from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.real_browser_state import RealBrowserState
@@ -603,17 +604,26 @@ class Block(BaseModel, abc.ABC):
                     skyvern_context.current(), fallback_run_id=workflow_run_id
                 )
                 try:
-                    adopted_context = browser_state.browser_context
-                    adopted_browser = adopted_context.browser if adopted_context else None
-                    rebind_page = None if adopted_browser is not None else await browser_state.get_working_page()
-                    if adopted_browser is not None or rebind_page is not None:
-                        await rebind_download_dir(adopted_browser, run_id=rebind_run_id, page=rebind_page)
+                    if browser_state.browser_artifacts.download_binding == DownloadBinding.SESSION_DIR:
+                        # Provider-owned remote binding: preserve the provider-selected destination
+                        # instead of re-pointing downloads to a run-scoped dir.
                         LOG.info(
-                            "Rebound download dir on adopted persistent session",
+                            "Skipping download-dir rebind on adopted session: preserving provider-selected destination",
                             browser_session_id=browser_session_id,
                             workflow_run_id=workflow_run_id,
-                            run_id=rebind_run_id,
                         )
+                    else:
+                        adopted_context = browser_state.browser_context
+                        adopted_browser = adopted_context.browser if adopted_context else None
+                        rebind_page = None if adopted_browser is not None else await browser_state.get_working_page()
+                        if adopted_browser is not None or rebind_page is not None:
+                            await rebind_download_dir(adopted_browser, run_id=rebind_run_id, page=rebind_page)
+                            LOG.info(
+                                "Rebound download dir on adopted persistent session",
+                                browser_session_id=browser_session_id,
+                                workflow_run_id=workflow_run_id,
+                                run_id=rebind_run_id,
+                            )
                 except Exception:
                     LOG.warning(
                         "Failed to rebind download dir on adopted persistent session",
@@ -710,15 +720,24 @@ class Block(BaseModel, abc.ABC):
                 skyvern_context.current(), fallback_run_id=workflow_run_id
             )
             try:
-                owning_browser = browser_state.browser_context.browser if browser_state.browser_context else None
-                rebind_page = None if owning_browser is not None else await browser_state.get_working_page()
-                if owning_browser is not None or rebind_page is not None:
-                    await rebind_download_dir(owning_browser, run_id=rebind_run_id, page=rebind_page)
+                if browser_state.browser_artifacts.download_binding == DownloadBinding.SESSION_DIR:
+                    # Defense-in-depth: a mismatched caller (e.g. a cached adopted state fetched without a
+                    # browser_session_id) must never rebind a provider-owned remote binding off its
+                    # provider-selected destination.
                     LOG.info(
-                        "Rebound download dir on workflow-run browser",
+                        "Skipping workflow-run download-dir rebind: preserving provider-selected destination",
                         workflow_run_id=workflow_run_id,
-                        run_id=rebind_run_id,
                     )
+                else:
+                    owning_browser = browser_state.browser_context.browser if browser_state.browser_context else None
+                    rebind_page = None if owning_browser is not None else await browser_state.get_working_page()
+                    if owning_browser is not None or rebind_page is not None:
+                        await rebind_download_dir(owning_browser, run_id=rebind_run_id, page=rebind_page)
+                        LOG.info(
+                            "Rebound download dir on workflow-run browser",
+                            workflow_run_id=workflow_run_id,
+                            run_id=rebind_run_id,
+                        )
             except Exception:
                 LOG.warning(
                     "Failed to rebind download dir on workflow-run browser",

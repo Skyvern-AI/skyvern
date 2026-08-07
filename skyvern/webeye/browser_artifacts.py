@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from enum import Enum
 
 import aiofiles
 import structlog
@@ -9,6 +10,19 @@ from playwright.async_api import Page
 from pydantic import BaseModel, PrivateAttr
 
 LOG = structlog.get_logger()
+
+
+class DownloadBinding(str, Enum):
+    """Where this browser's downloads are bound.
+
+    RUN_DIR (default): the run-scoped directory; downloads are rebound there and read locally. This is
+    the local/default behavior for local runs and any non-provider-owned session.
+    SESSION_DIR: a provider-owned remote download destination. The run-dir rebind must be skipped and a
+    URL replay is forbidden, so the provider-selected destination is preserved.
+    """
+
+    RUN_DIR = "run_dir"
+    SESSION_DIR = "session_dir"
 
 
 class VideoArtifact(BaseModel):
@@ -30,6 +44,10 @@ class BrowserArtifacts(BaseModel):
     needs_cdp_frame_publisher: bool = False
     # Optional opaque identifier for a remote browser session.
     remote_browser_session_id: str | None = None
+    # Download destination binding for this browser. SESSION_DIR (a provider-owned remote destination)
+    # means the run-dir rebind must be skipped and URL replay forbidden; RUN_DIR (default) preserves
+    # local/default delivery. See DownloadBinding.
+    download_binding: DownloadBinding = DownloadBinding.RUN_DIR
     # The saved browser profile the creator actually applied to this browser's user-data-dir.
     # None when none was requested or the chosen creator could not load one (remote/vendor browsers,
     # storage miss, corruption fallback) — consumers must treat None as "profile not applied".
