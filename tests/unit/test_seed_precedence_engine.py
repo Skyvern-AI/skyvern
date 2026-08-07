@@ -297,6 +297,27 @@ async def test_credential_override_heal_only_under_engine(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
+async def test_explicit_pick_never_consults_the_credential_opt_out_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A deliberate pick outranks the automatic opt-out: both the workflow dropdown pick and the run-form
+    # override must resolve without ever reaching the credential resolver that carries the gate, so no
+    # future gate placement there can suppress a pick. Seeds, but never as a workflow sink (read-only).
+    svc = _svc(monkeypatch, pick_role="credential", credential=None)
+    credential_seed = AsyncMock(return_value=None)
+    monkeypatch.setattr(svc, "_resolve_credential_browser_profile_id_for_setup", credential_seed)
+
+    seed, source, sink = await _resolve(svc, _workflow(pick="bp_opted_out_cred"))
+    assert (seed, sink) == ("bp_opted_out_cred", None)
+    assert source is not BrowserSeedSource.fresh
+
+    assert await _resolve(svc, _workflow(), override="bp_opted_out_cred") == (
+        "bp_opted_out_cred",
+        BrowserSeedSource.override,
+        None,
+    )
+    credential_seed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_pick_beats_browser_profile_key(monkeypatch: pytest.MonkeyPatch) -> None:
     # Correction 3: an explicit plain pick wins deterministically over browser_profile_key. The key only
     # selects WHICH own auto-profile applies in the no-pick rows, so it is ignored (never ensured) here.
@@ -864,12 +885,12 @@ async def test_setup_credential_resolves_single_login_block(monkeypatch: pytest.
     monkeypatch.setattr(
         app.DATABASE.credentials,
         "get_credential",
-        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred")),
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred", auto_profile_disabled=False)),
     )
     monkeypatch.setattr(
         app.DATABASE.browser_sessions,
         "get_browser_profile",
-        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred")),
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred", auto_profile_disabled=False)),
     )
     workflow = _workflow_with_blocks(_login_block("login", _credential_parameter("login", "cred_1")))
 
@@ -881,6 +902,66 @@ async def test_setup_credential_resolves_single_login_block(monkeypatch: pytest.
     )
 
     assert result == "bp_cred"
+
+
+@pytest.mark.asyncio
+async def test_setup_credential_opt_out_resolves_fresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
+    monkeypatch.setattr(
+        app.DATABASE.credentials,
+        "get_credential",
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred", auto_profile_disabled=True)),
+    )
+    get_browser_profile = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred"))
+    monkeypatch.setattr(app.DATABASE.browser_sessions, "get_browser_profile", get_browser_profile)
+    workflow = _workflow_with_blocks(_login_block("login", _credential_parameter("login", "cred_1")))
+
+    result = await WorkflowService()._resolve_setup_credential_seed(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        engine_enabled=True,
+        parameter_values={},
+    )
+
+    assert result is None
+    get_browser_profile.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mid_run_credential_opt_out_is_engine_gated(monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = WorkflowService()
+    monkeypatch.setattr(svc, "_resolve_login_block_credential_ids", AsyncMock(return_value=["cred_1"]))
+    monkeypatch.setattr(
+        app.DATABASE.credentials,
+        "get_credential",
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred", auto_profile_disabled=True)),
+    )
+    get_browser_profile = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred"))
+    monkeypatch.setattr(app.DATABASE.browser_sessions, "get_browser_profile", get_browser_profile)
+    engine_enabled = AsyncMock(side_effect=[True, False])
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_browser_memory_engine_enabled", engine_enabled)
+    workflow_run = SimpleNamespace(organization_id="o_test")
+    block = SimpleNamespace(parameters=[])
+
+    opted_out = await svc._resolve_login_block_browser_profile_id(
+        block=block,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        workflow_permanent_id="wpid_test",
+        workflow_run=workflow_run,  # type: ignore[arg-type]
+    )
+    flag_off = await svc._resolve_login_block_browser_profile_id(
+        block=block,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        workflow_permanent_id="wpid_test",
+        workflow_run=workflow_run,  # type: ignore[arg-type]
+    )
+
+    assert opted_out is None
+    assert flag_off == "bp_cred"
+    assert get_browser_profile.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -910,7 +991,7 @@ async def test_setup_credential_best_effort_on_profile_lookup_failure(monkeypatc
     monkeypatch.setattr(
         app.DATABASE.credentials,
         "get_credential",
-        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred")),
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred", auto_profile_disabled=False)),
     )
     monkeypatch.setattr(
         app.DATABASE.browser_sessions,
@@ -944,7 +1025,7 @@ async def test_setup_credential_resolves_pool_credential(monkeypatch: pytest.Mon
         "get_selection",
         AsyncMock(return_value="cred_pool"),
     )
-    get_credential = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_pool"))
+    get_credential = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_pool", auto_profile_disabled=False))
     monkeypatch.setattr(app.DATABASE.credentials, "get_credential", get_credential)
     monkeypatch.setattr(
         app.DATABASE.browser_sessions,
@@ -977,7 +1058,9 @@ async def test_setup_credential_resolves_fallback_db_selection(monkeypatch: pyte
         "get_selection",
         AsyncMock(return_value="cred_fallback"),
     )
-    get_credential = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_fallback"))
+    get_credential = AsyncMock(
+        return_value=SimpleNamespace(browser_profile_id="bp_fallback", auto_profile_disabled=False)
+    )
     monkeypatch.setattr(app.DATABASE.credentials, "get_credential", get_credential)
     monkeypatch.setattr(
         app.DATABASE.browser_sessions,
@@ -1009,7 +1092,7 @@ async def test_setup_credential_uses_same_rich_resolver_as_block(monkeypatch: py
     monkeypatch.setattr(
         app.DATABASE.credentials,
         "get_credential",
-        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_rich")),
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_rich", auto_profile_disabled=False)),
     )
     monkeypatch.setattr(
         app.DATABASE.browser_sessions,
@@ -1071,7 +1154,9 @@ async def test_setup_credential_prefers_request_value_over_default_for_workflow_
     # value lives only in the in-memory render params. Seeding must use it, not the parameter default, or a
     # cached-script run seeds the wrong account.
     monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
-    get_credential = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_request"))
+    get_credential = AsyncMock(
+        return_value=SimpleNamespace(browser_profile_id="bp_request", auto_profile_disabled=False)
+    )
     monkeypatch.setattr(app.DATABASE.credentials, "get_credential", get_credential)
     monkeypatch.setattr(
         app.DATABASE.browser_sessions,
@@ -1102,7 +1187,7 @@ async def test_setup_credential_resolves_dereferenced_binding_for_fallback_param
     # yet, the rich resolver would return the raw reference; setup must use the dereferenced value.
     monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
     monkeypatch.setattr(app.DATABASE.workflow_run_credential_selections, "get_selection", AsyncMock(return_value=None))
-    get_credential = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_deref"))
+    get_credential = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_deref", auto_profile_disabled=False))
     monkeypatch.setattr(app.DATABASE.credentials, "get_credential", get_credential)
     monkeypatch.setattr(
         app.DATABASE.browser_sessions,
