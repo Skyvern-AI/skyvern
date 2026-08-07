@@ -5846,15 +5846,15 @@ wheels = [
 
 [[package]]
 name = "rustwright"
-version = "0.1.1"
+version = "0.2.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/51/80/c4b1fe7f942b8fbbf0420295cb265413bb6ad874d2064a53e95782c7d8c5/rustwright-0.1.1.tar.gz", hash = "sha256:9a42264eaa7c7aa1a11eaa81a34699e8b8c83a504bd6eb3c61a444c242a5b98d", size = 3831062, upload-time = "2026-07-15T16:13:00.029Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/91/d3/455dcc38c7f57550a5af15393b00130cebd987334d81922125235d70a7c5/rustwright-0.2.0.tar.gz", hash = "sha256:24dade849f3570e46896b4b8853efa4172aa58ca5235b53c46198608d25fcb3a", size = 4266965, upload-time = "2026-08-02T18:35:34.239Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b3/ea/878236a78cd0da88a629471501b01b5aef92eecce438b0e6ab8de670199f/rustwright-0.1.1-cp38-abi3-macosx_10_12_x86_64.whl", hash = "sha256:fcfb8afc5ec10146727d7d57b66528022a37fd9bc2408c25dcdc72868521e131", size = 4302856, upload-time = "2026-07-15T16:12:51.297Z" },
-    { url = "https://files.pythonhosted.org/packages/b9/52/3ccddd9f1e5436e543149b16c5f50bf9fd5fab27fcf7be7a7f8e9b795931/rustwright-0.1.1-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:01f969f691acb2b61f830c32e2b23c97c59a108b661086bde58652d84821841f", size = 4126466, upload-time = "2026-07-15T16:12:53.138Z" },
-    { url = "https://files.pythonhosted.org/packages/f4/cb/4d8714e27ba6ea0a430f96a1baf3b09c56a75d2920a467bb44d03cf95bca/rustwright-0.1.1-cp38-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:ddc60409aa12478c9617b742356be7f5baae81b17e77dabfbe040fc43864fa4e", size = 3877892, upload-time = "2026-07-15T16:12:54.721Z" },
-    { url = "https://files.pythonhosted.org/packages/ff/a1/9e1b3224e9a2c82e7b44d9abbb00a0e65e6b7ff40a5cfa6832f783330051/rustwright-0.1.1-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:4c9bd1a72db79fbfaf20ba829a74564e8a82088ae8a939daff1cf3c9c3e7f8cd", size = 4500875, upload-time = "2026-07-15T16:12:56.668Z" },
-    { url = "https://files.pythonhosted.org/packages/60/74/47ee2c9f924fa25b522826a5761a1b0e362789d9f668f51f09cab784a03c/rustwright-0.1.1-cp38-abi3-win_amd64.whl", hash = "sha256:fc44f2be7918c98fd444522848d506786cb35b4e2e02a9efc722734f4e700458", size = 4235069, upload-time = "2026-07-15T16:12:58.353Z" },
+    { url = "https://files.pythonhosted.org/packages/d3/25/f3657b15b8c7294961db8c5e4e093e29bf51aa9a22cc94a65e4dddcc1783/rustwright-0.2.0-cp38-abi3-macosx_10_12_x86_64.whl", hash = "sha256:74dce9efb5fee963be147ba11e90f88e253b59e8b1d2f577262ee5b99ac539d1", size = 3207662, upload-time = "2026-08-02T18:35:26.286Z" },
+    { url = "https://files.pythonhosted.org/packages/f2/0c/844dc6acf2afcfe8c2631c6922fec587bc25804add9c9185c64eb1694a12/rustwright-0.2.0-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:ebdd147216afa514b4d9a4255f8af2305b18c13f0890aa239e810ab34765d754", size = 3069742, upload-time = "2026-08-02T18:35:28.193Z" },
+    { url = "https://files.pythonhosted.org/packages/40/04/7281b818885ebbd42b9fe0f7ce5dbebe138049aa4699e50a9ee42070e40f/rustwright-0.2.0-cp38-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:81e3d45a76191a2775adab796c99d435357ae716ce954f098f11ed69c2c98133", size = 3147131, upload-time = "2026-08-02T18:35:29.716Z" },
+    { url = "https://files.pythonhosted.org/packages/b4/e6/bc9467d11aafe4f14d458b1fba9eb9737d3cdb15c2f36d33ff982b0efa0d/rustwright-0.2.0-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:d9f1c90fd55736ff984689ee8f2e0195355f1f46b3eabede5d24ff0165524d5e", size = 3307048, upload-time = "2026-08-02T18:35:31.222Z" },
+    { url = "https://files.pythonhosted.org/packages/5a/fc/27f25fb883e30045c445d368b1c26d8bd4ddbf809e13569305c4511b473a/rustwright-0.2.0-cp38-abi3-win_amd64.whl", hash = "sha256:5c5b66d539c0424b8eb7bc135de8def722c4b3fcaacfcc9b24ec59d1fc8089d2", size = 3702366, upload-time = "2026-08-02T18:35:32.821Z" },
 ]
 
 [[package]]
@@ -6341,7 +6341,7 @@ dev = [
     { name = "twine", specifier = ">=6.1.0,<7" },
     { name = "types-requests", specifier = ">=2.31.0.2,<3" },
 ]
-rustwright = [{ name = "rustwright", specifier = "==0.1.1" }]
+rustwright = [{ name = "rustwright", specifier = "==0.2.0" }]
 
 [[package]]
 name = "sniffio"
