@@ -1,3 +1,5 @@
+import textwrap
+
 import pytest
 import yaml
 
@@ -8,6 +10,7 @@ from skyvern.forge.sdk.copilot.code_block_steps import (
     derive_code_block_steps_in_yaml,
     fill_code_block_prompts_in_yaml,
 )
+from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.webeye.actions.action_types import ActionType
 
 
@@ -82,6 +85,37 @@ def test_derive_steps_returns_dicts_with_templated_descriptions():
         {"description": 'Click "Submit"', "action_type": "click", "line_start": 3, "line_end": 3},
         {"description": 'Type into "Email"', "action_type": "input_text", "line_start": 4, "line_end": 4},
     ]
+
+
+def test_synthesized_and_derived_steps_share_exact_field_set():
+    trajectory = [
+        {
+            "tool_name": "type_text",
+            "selector": "#search",
+            "source_url": "https://example.com/catalog",
+            "typed_value": "widget",
+            "role": "textbox",
+            "accessible_name": "Search",
+        },
+        {
+            "tool_name": "click",
+            "selector": "#search-submit",
+            "source_url": "https://example.com/catalog",
+            "role": "button",
+            "accessible_name": "Submit",
+        },
+    ]
+    synthesized = synthesize_code_block(trajectory)
+    assert synthesized is not None
+
+    standalone_code = textwrap.dedent(synthesized.code)
+    derived_steps = derive_code_block_steps(standalone_code)
+    expected_fields = {"description", "action_type", "line_start", "line_end"}
+
+    for producer_name, steps in (("synthesize", synthesized.steps), ("derive", derived_steps)):
+        assert steps, f"{producer_name} must produce representative steps"
+        for step in steps:
+            assert set(step) == expected_fields, producer_name
 
 
 def test_derive_steps_empty_code_is_empty():
