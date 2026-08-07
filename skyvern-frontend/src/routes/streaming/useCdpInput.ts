@@ -7,6 +7,7 @@ import {
   getModifiers,
   mapCoordinates,
   mapMouseCoordinates,
+  virtualKeyCodeFor,
 } from "./cdpInputUtils";
 
 // 4411 is emitted mid-session (page resolution or dispatch failed), so unlike a setup-time close it
@@ -318,14 +319,20 @@ export function useCdpInput({
     (e: React.KeyboardEvent) => {
       if (!interactive || !userIsControlling) return;
       e.preventDefault();
-      sendInputEvent({
+      const isPrintable = e.key.length === 1;
+      const windowsVirtualKeyCode = virtualKeyCodeFor(e);
+      const payload: Record<string, unknown> = {
         type: "keyEvent",
-        eventType: "keyDown",
+        eventType: isPrintable ? "keyDown" : "rawKeyDown",
         key: e.key,
         code: e.code,
-        text: e.key.length === 1 ? e.key : "",
+        text: isPrintable ? e.key : "",
         modifiers: getModifiers(e),
-      });
+      };
+      if (windowsVirtualKeyCode !== undefined) {
+        payload.windowsVirtualKeyCode = windowsVirtualKeyCode;
+      }
+      sendInputEvent(payload);
     },
     [interactive, userIsControlling, sendInputEvent],
   );
@@ -334,13 +341,18 @@ export function useCdpInput({
     (e: React.KeyboardEvent) => {
       if (!interactive || !userIsControlling) return;
       e.preventDefault();
-      sendInputEvent({
+      const windowsVirtualKeyCode = virtualKeyCodeFor(e);
+      const payload: Record<string, unknown> = {
         type: "keyEvent",
         eventType: "keyUp",
         key: e.key,
         code: e.code,
         modifiers: getModifiers(e),
-      });
+      };
+      if (windowsVirtualKeyCode !== undefined) {
+        payload.windowsVirtualKeyCode = windowsVirtualKeyCode;
+      }
+      sendInputEvent(payload);
     },
     [interactive, userIsControlling, sendInputEvent],
   );
