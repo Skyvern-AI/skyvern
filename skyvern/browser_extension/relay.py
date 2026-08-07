@@ -280,31 +280,6 @@ _PAIR_PAGE_TEMPLATE = """<!doctype html>
     [data-state="success"] .approval-controls,
     [data-state="error"] .approval-controls { display: none; }
 
-    .recovery { display: grid; gap: .4rem; }
-    .recovery[hidden] { display: none; }
-    .recovery-label { color: var(--subtle); font-size: .67rem; font-weight: 650; }
-
-    .copy-chip {
-      display: flex;
-      width: fit-content;
-      max-width: 100%;
-      min-width: 0;
-      align-items: center;
-      justify-content: space-between;
-      gap: .75rem;
-      padding: .7rem .8rem;
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      color: var(--text);
-      background: var(--surface-subtle);
-      font: inherit;
-      cursor: copy;
-    }
-
-    .copy-chip:hover { border-color: var(--border-strong); background: #202126; }
-    .copy-chip code { overflow: hidden; font: 600 .68rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
-    .copy-label { flex: none; color: var(--muted); font-size: .66rem; font-weight: 650; }
-
     @keyframes spin { to { transform: rotate(360deg); } }
     @media (max-width: 34rem) {
       .page-shell { padding: 1rem; }
@@ -338,7 +313,6 @@ _PAIR_PAGE_TEMPLATE = """<!doctype html>
 
       body { background: #f5f5f7; }
       .pairing-card { box-shadow: 0 1rem 2.5rem rgb(32 33 36 / 10%); }
-      .copy-chip:hover { background: #ececef; }
     }
   </style>
 </head>
@@ -396,12 +370,12 @@ _PAIR_PAGE_TEMPLATE = """<!doctype html>
           </div>
         </div>
 
-        <div class="approval-controls">
+        <div id="approval-controls" class="approval-controls">
           <button id="approve" class="approve-button" type="button">
             <span class="spinner" aria-hidden="true"></span>
             <span id="approve-label">Approve connection</span>
           </button>
-          <p class="fine-print">This link expires in 2 minutes and can be used once.</p>
+          <p class="fine-print">Secure pairing links expire after 2 minutes and can be used once.</p>
         </div>
 
         <section id="status" class="status-panel" role="status" aria-live="polite" hidden>
@@ -418,13 +392,6 @@ _PAIR_PAGE_TEMPLATE = """<!doctype html>
             <h2 id="status-title" class="status-title"></h2>
           </div>
           <p id="status-message" class="status-message"></p>
-          <div id="recovery" class="recovery" hidden>
-            <span class="recovery-label">Start a new pairing link</span>
-            <button id="copy-command" class="copy-chip" type="button" aria-label="Copy skyvern browser extension-pair">
-              <code id="recovery-command">skyvern browser extension-pair</code>
-              <span id="copy-label" class="copy-label">Copy</span>
-            </button>
-          </div>
         </section>
       </div>
     </main>
@@ -432,12 +399,9 @@ _PAIR_PAGE_TEMPLATE = """<!doctype html>
   <script>
     (() => {
       const nonce = location.hash.slice(1);
-      const command = "skyvern browser extension-pair";
+      const approvalControls = document.getElementById("approval-controls");
       const button = document.getElementById("approve");
       const buttonLabel = document.getElementById("approve-label");
-      const copyButton = document.getElementById("copy-command");
-      const copyLabel = document.getElementById("copy-label");
-      const recovery = document.getElementById("recovery");
       const serverAddress = document.getElementById("server-address");
       const status = document.getElementById("status");
       const statusTitle = document.getElementById("status-title");
@@ -445,20 +409,27 @@ _PAIR_PAGE_TEMPLATE = """<!doctype html>
 
       serverAddress.textContent = `127.0.0.1:${location.port}`;
 
-      function showState(kind, title, message, showRecovery = false) {
+      function showState(kind, title, message) {
         document.body.dataset.state = kind;
         status.hidden = false;
         statusTitle.textContent = title;
         statusMessage.textContent = message;
-        recovery.hidden = !showRecovery;
+      }
+
+      function showMissingRequest() {
+        approvalControls.hidden = true;
+        showState(
+          "error",
+          "Pairing request required",
+          "Retry the browser session request in your MCP client, or run skyvern browser extension-pair again.",
+        );
       }
 
       function showExpired() {
         showState(
           "error",
           "Pairing link expired",
-          "This one-time link is no longer valid. Start a new pairing request to continue.",
-          true,
+          "Retry the browser session request in your MCP client, or run skyvern browser extension-pair again.",
         );
       }
 
@@ -466,25 +437,8 @@ _PAIR_PAGE_TEMPLATE = """<!doctype html>
         showState(
           "error",
           "Skyvern Agent isn’t available",
-          "Install or enable the Skyvern Agent Chrome extension, then start a new pairing request.",
-          true,
+          "Install or enable the Skyvern Agent Chrome extension, then retry the browser session request.",
         );
-      }
-
-      async function copyRecoveryCommand() {
-        try {
-          await navigator.clipboard.writeText(command);
-        } catch (_error) {
-          const range = document.createRange();
-          range.selectNodeContents(document.getElementById("recovery-command"));
-          const selection = globalThis.getSelection();
-          selection.removeAllRanges();
-          selection.addRange(range);
-          document.execCommand("copy");
-          selection.removeAllRanges();
-        }
-        copyLabel.textContent = "Copied";
-        setTimeout(() => { copyLabel.textContent = "Copy"; }, 1600);
       }
 
       button.addEventListener("click", async () => {
@@ -493,7 +447,7 @@ _PAIR_PAGE_TEMPLATE = """<!doctype html>
         buttonLabel.textContent = "Approving…";
         document.body.dataset.state = "approving";
         if (!nonce) {
-          showExpired();
+          showMissingRequest();
           return;
         }
         try {
@@ -530,8 +484,7 @@ _PAIR_PAGE_TEMPLATE = """<!doctype html>
                 showState(
                   "error",
                   "Pairing request wasn’t accepted",
-                  "The extension could not open the confirmation step. Start a new pairing request to try again.",
-                  true,
+                  "Retry the browser session request in your MCP client, or run skyvern browser extension-pair again.",
                 );
               }
             },
@@ -540,13 +493,14 @@ _PAIR_PAGE_TEMPLATE = """<!doctype html>
           showState(
             "error",
             "Pairing couldn’t be completed",
-            "Check that the local MCP server is running, then start a new pairing request.",
-            true,
+            "Check that the local MCP server is running, then retry the browser session request or run skyvern browser extension-pair again.",
           );
         }
       });
 
-      copyButton.addEventListener("click", () => { void copyRecoveryCommand(); });
+      if (!nonce) {
+        showMissingRequest();
+      }
     })();
   </script>
 </body>
@@ -590,6 +544,33 @@ class ExtensionRelayServer:
         self._pairing_nonce = nonce
         self._pairing_nonce_created_at = time.monotonic()
         return nonce
+
+    def get_or_create_pairing_nonce(self) -> str:
+        nonce = self._pairing_nonce
+        created_at = self._pairing_nonce_created_at
+        if nonce is not None and created_at is not None and time.monotonic() - created_at < _PAIRING_NONCE_TTL_SECONDS:
+            return nonce
+        return self.create_pairing_nonce()
+
+    def _is_interactive_pairing_request(self, request: web.Request) -> bool:
+        try:
+            origin = urlsplit(request.headers.get("Origin", ""))
+            origin_port = origin.port or (80 if origin.scheme == "http" else None)
+        except ValueError:
+            return False
+        return (
+            request.content_type == "application/json"
+            and origin.scheme == "http"
+            and origin.hostname == "127.0.0.1"
+            and origin_port == self.bound_port
+            and not origin.username
+            and not origin.password
+            and not origin.path
+            and not origin.query
+            and not origin.fragment
+            and request.headers.get("Sec-Fetch-Mode") == "cors"
+            and request.headers.get("Sec-Fetch-Site") == "same-origin"
+        )
 
     async def start(self) -> None:
         if self._runner is not None:
@@ -679,10 +660,11 @@ class ExtensionRelayServer:
                 "Cache-Control": "no-store",
                 "Content-Security-Policy": (
                     "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
-                    "img-src data:; connect-src 'self'"
+                    "img-src data:; connect-src 'self'; frame-ancestors 'none'"
                 ),
                 "Referrer-Policy": "no-referrer",
                 "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY",
             },
         )
 
@@ -700,6 +682,10 @@ class ExtensionRelayServer:
         )
 
     async def _handle_pair_claim(self, request: web.Request) -> web.Response:
+        if not self._is_interactive_pairing_request(request):
+            LOG.info("browser_extension_pair_claim", outcome="invalid_source")
+            return web.json_response({"error": "invalid_source"}, status=403, headers={"Cache-Control": "no-store"})
+
         active_nonce = self._pairing_nonce
         created_at = self._pairing_nonce_created_at
         self._pairing_nonce = None

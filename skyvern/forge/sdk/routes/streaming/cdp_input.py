@@ -13,6 +13,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from playwright.async_api import CDPSession
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
+from skyvern.exceptions import BlockedNavigationDestination, InvalidUrl
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.streaming.auth import auth, require_client_id
@@ -29,7 +30,9 @@ from skyvern.forge.sdk.routes.streaming.screencast import (
 )
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.navigation import revalidate_redirect_chain, validate_navigation_destination
 
 LOG = structlog.get_logger()
 
@@ -42,6 +45,8 @@ _MAX_KEY_LEN = 32
 _MAX_CODE_LEN = 32
 _MODIFIER_MASK = 0xF
 _MAX_VK_CODE = 0xFE
+# Matches the length Skyvern's own InvalidUrl exception documents as its supported max.
+_MAX_URL_LEN = 2083
 ACTIVE_PAGE_INPUT_REFRESH_INTERVAL = 0.5
 
 
@@ -253,13 +258,64 @@ _EVENT_DISPATCH_MAP: dict[str, tuple[t.Callable[[dict], dict | None], str]] = {
 }
 
 
+async def _dispatch_navigate_event(
+    page: object,
+    msg: dict,
+    log_id_key: str,
+    log_id_value: str,
+    websocket: WebSocket,
+) -> None:
+    raw_url = msg.get("url")
+    if not isinstance(raw_url, str) or not raw_url.strip() or len(raw_url) > _MAX_URL_LEN:
+        LOG.warning("CDP input: navigate validation failed", **{log_id_key: log_id_value}, reason="malformed_url")
+        await websocket.send_json({"kind": "navigate-error", "reason": "invalid_url"})
+        return
+
+    try:
+        # Normalize (bare host -> https://, well-formedness) before validating or navigating so
+        # the browser is never asked to load exactly what the user typed unvalidated.
+        url = await asyncio.to_thread(prepend_scheme_and_validate_url, raw_url)
+    except InvalidUrl:
+        LOG.warning("CDP input: navigate validation failed", **{log_id_key: log_id_value}, reason="invalid_url")
+        await websocket.send_json({"kind": "navigate-error", "reason": "invalid_url"})
+        return
+
+    try:
+        # Fail closed before any request reaches the remote browser -- the same choke point
+        # every real page.goto in the codebase funnels through (see navigate_with_retry).
+        await asyncio.to_thread(validate_navigation_destination, url)
+    except BlockedNavigationDestination as error:
+        LOG.info("CDP input: navigate blocked", **{log_id_key: log_id_value}, reason=error.reason)
+        await websocket.send_json({"kind": "navigate-error", "reason": "blocked"})
+        return
+
+    response = await page.goto(url)  # type: ignore[attr-defined]
+    try:
+        # page.goto follows redirects at the network layer, so a validated public entry point
+        # can still land on an internal host -- re-check the followed chain (SKY-13112 pattern).
+        await revalidate_redirect_chain(response, validate_navigation_destination)
+    except BlockedNavigationDestination as error:
+        LOG.info("CDP input: navigate blocked via redirect", **{log_id_key: log_id_value}, reason=error.reason)
+        try:
+            await page.goto("about:blank")  # type: ignore[attr-defined]
+        except Exception:
+            LOG.exception("CDP input: failed to reset page after redirect refusal", **{log_id_key: log_id_value})
+        await websocket.send_json({"kind": "navigate-error", "reason": "blocked"})
+
+
 async def _dispatch_event(
     cdp_session: CDPSession,
+    page: object,
     kind: str,
     msg: dict,
     log_id_key: str,
     log_id_value: str,
+    websocket: WebSocket,
 ) -> None:
+    if kind == "navigateEvent":
+        await _dispatch_navigate_event(page, msg, log_id_key, log_id_value, websocket)
+        return
+
     entry = _EVENT_DISPATCH_MAP.get(kind)
     if entry is None:
         return
@@ -338,7 +394,7 @@ async def _run_input_loop(
             continue
 
         try:
-            await _dispatch_event(cdp_session, kind, msg, log_id_key, log_id_value)
+            await _dispatch_event(cdp_session, input_session.page, kind, msg, log_id_key, log_id_value, websocket)
         except Exception:
             LOG.warning(
                 "CDP input: failed to dispatch event; closing input channel",
