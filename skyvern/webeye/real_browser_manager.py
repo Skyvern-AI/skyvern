@@ -30,6 +30,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_artifacts import DownloadBinding, VideoArtifact
 from skyvern.webeye.browser_engine import (
+    BrowserEngineBootstrapError,
     BrowserEngineContext,
     BrowserEngineSelection,
     resolve_browser_engine,
@@ -225,7 +226,9 @@ class _EngineSelectionOwner:
 
     __slots__ = ("task", "terminal")
 
-    def __init__(self, task: asyncio.Task[BrowserEngineSelection]) -> None:
+    def __init__(self, task: asyncio.Future[BrowserEngineSelection]) -> None:
+        # A resolver Task (single-flight) or an already-resolved Future (a guarded-repinned effective
+        # selection). Both satisfy the await/shield/done/cancel surface waiters use.
         self.task = task
         self.terminal = False
 
@@ -486,6 +489,19 @@ class RealBrowserManager(BrowserManager):
         if self._engine_owners.get(run_key) is owner:
             del self._engine_owners[run_key]
 
+    def _repin_engine_selection(self, run_key: str | None, selection: BrowserEngineSelection) -> None:
+        """Replace a run's pinned engine owner with an already-resolved ``selection`` so later
+        browser-resource creation reuses it. Guarded no-op for an ephemeral (``run_key`` None),
+        already-removed, or ``terminal`` owner — never resurrects a missing/terminal owner."""
+        if run_key is None:
+            return
+        owner = self._engine_owners.get(run_key)
+        if owner is None or owner.terminal:
+            return
+        resolved: asyncio.Future[BrowserEngineSelection] = asyncio.get_running_loop().create_future()
+        resolved.set_result(selection)
+        owner.task = resolved
+
     async def _create_browser_state(
         self,
         proxy_location: ProxyLocationInput = None,
@@ -502,9 +518,11 @@ class RealBrowserManager(BrowserManager):
         engine_run_key: str | None = None,
         engine_workflow_run_id: str | None = None,
     ) -> BrowserState:
+        run_key = engine_run_key or canonical_run_key(
+            workflow_run_id=workflow_run_id, task_id=task_id, script_id=script_id
+        )
         engine_selection = await self.get_or_resolve_engine_selection(
-            run_key=engine_run_key
-            or canonical_run_key(workflow_run_id=workflow_run_id, task_id=task_id, script_id=script_id),
+            run_key=run_key,
             context=BrowserEngineContext(
                 organization_id=organization_id,
                 # Engine-flag identity only: a caller that pins under workflow_run_id while keeping it out
@@ -518,62 +536,92 @@ class RealBrowserManager(BrowserManager):
                 browser_source=settings.BROWSER_TYPE,
             ),
         )
-        LOG.info(
-            "Creating browser state",
-            task_id=task_id,
-            workflow_run_id=workflow_run_id,
-            browser_source=settings.BROWSER_TYPE,
-            **engine_selection.attribution(),
-        )
-        pw = await engine_selection.start_driver()
         context = skyvern_context.current()
-        try:
-            (
-                browser_context,
-                browser_artifacts,
-                browser_cleanup,
-            ) = await BrowserContextFactory.create_browser_context(
-                pw,
-                proxy_location=proxy_location,
-                url=url,
+
+        async def _start(selection: BrowserEngineSelection) -> BrowserState:
+            LOG.info(
+                "Creating browser state",
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                script_id=script_id,
-                organization_id=organization_id,
-                extra_http_headers=extra_http_headers,
-                cdp_connect_headers=cdp_connect_headers,
-                browser_address=browser_address,
-                browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
-                browser_profile_id=browser_profile_id,
-                engine_selection=engine_selection,
+                browser_source=settings.BROWSER_TYPE,
+                **selection.attribution(),
             )
-        except BaseException:
-            # start() already launched the local Node driver, so a failed context
-            # creation (e.g. a remote-CDP connect_over_cdp error) would leak that driver
-            # per attempt; stop it here, time-bounded like RealBrowserState.close() so a
-            # hung stop() cannot stall the original error. BaseException so a cancellation
-            # also releases the driver; a stop() error/timeout must never mask the original.
             try:
-                async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
-                    await pw.stop()
-            except Exception:
-                LOG.warning(
-                    "Failed to stop Playwright driver after browser-context creation failure",
+                pw = await selection.start_driver()
+            except Exception as start_error:
+                # Mark a fallback-eligible driver-start failure so the boundary can degrade once; a
+                # no-fallback selection (and CancelledError, a BaseException) propagates unchanged.
+                if selection.boot_fallback_selection is None:
+                    raise
+                raise BrowserEngineBootstrapError(f"{selection.name} driver failed to start") from start_error
+            try:
+                (
+                    browser_context,
+                    browser_artifacts,
+                    browser_cleanup,
+                ) = await BrowserContextFactory.create_browser_context(
+                    pw,
+                    proxy_location=proxy_location,
+                    url=url,
                     task_id=task_id,
                     workflow_run_id=workflow_run_id,
-                    exc_info=True,
+                    workflow_permanent_id=workflow_permanent_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    extra_http_headers=extra_http_headers,
+                    cdp_connect_headers=cdp_connect_headers,
+                    browser_address=browser_address,
+                    browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
+                    browser_profile_id=browser_profile_id,
+                    engine_selection=selection,
                 )
-            raise
-        return RealBrowserState(
-            pw=pw,
-            browser_context=browser_context,
-            page=None,
-            browser_artifacts=browser_artifacts,
-            browser_cleanup=browser_cleanup,
-            release_driver_on_close=browser_address is not None,
-            engine_selection=engine_selection,
-        )
+            except BaseException:
+                # start() launched the local Node driver; stop it (time-bounded) so a failed context
+                # creation doesn't leak it, and never let a stop() error/timeout mask the original.
+                try:
+                    async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+                        await pw.stop()
+                except Exception:
+                    LOG.warning(
+                        "Failed to stop Playwright driver after browser-context creation failure",
+                        task_id=task_id,
+                        workflow_run_id=workflow_run_id,
+                        exc_info=True,
+                    )
+                raise
+            return RealBrowserState(
+                pw=pw,
+                browser_context=browser_context,
+                page=None,
+                browser_artifacts=browser_artifacts,
+                browser_cleanup=browser_cleanup,
+                release_driver_on_close=browser_address is not None,
+                engine_selection=selection,
+            )
+
+        # At most two attempts: a fallback-eligible (Rustwright) selection degrades EXACTLY ONCE to its
+        # classical boot fallback before any usable context; the classical has none, so it then propagates.
+        boot_fallback = engine_selection.boot_fallback_selection
+        try:
+            state = await _start(engine_selection)
+        except BrowserEngineBootstrapError:
+            if boot_fallback is None:
+                raise
+            LOG.warning(
+                "Browser engine boot failed before a usable context; falling back once to its classical engine",
+                failed_engine=engine_selection.name,
+                fallback_engine=boot_fallback.name,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+            self._repin_engine_selection(run_key, boot_fallback)
+            return await _start(boot_fallback)
+        if boot_fallback is not None:
+            # Commit-strip: re-pin the same engine with its boot fallback removed so a later same-run
+            # recreation reuses the effective engine and can no longer fall back.
+            self._repin_engine_selection(run_key, replace(engine_selection, boot_fallback_selection=None))
+        return state
 
     def evict_page(self, page_id: str) -> None:
         self.pages.pop(page_id, None)

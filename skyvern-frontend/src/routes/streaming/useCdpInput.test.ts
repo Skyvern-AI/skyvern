@@ -64,6 +64,44 @@ async function renderInputHook() {
   });
 }
 
+async function renderControllingInputHook() {
+  const { result } = renderHook(() =>
+    useCdpInput({
+      inputWsUrl: "wss://input.test",
+      interactive: true,
+      viewportWidth: 1280,
+      viewportHeight: 720,
+    }),
+  );
+
+  await act(async () => {
+    await Promise.resolve();
+  });
+  act(() => {
+    result.current.setUserIsControlling(true);
+  });
+
+  return result;
+}
+
+function fakeKeyboardEvent(key: string, code: string): React.KeyboardEvent {
+  return {
+    key,
+    code,
+    altKey: false,
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    preventDefault: vi.fn(),
+  } as unknown as React.KeyboardEvent;
+}
+
+function latestSocketSend() {
+  const socket = MockWebSocket.instances[MockWebSocket.instances.length - 1];
+  if (!socket) throw new Error("No WebSocket was constructed");
+  return socket.send;
+}
+
 function closeLatestSocket(code: number) {
   const socket = MockWebSocket.instances[MockWebSocket.instances.length - 1];
   if (!socket) throw new Error("No WebSocket was constructed");
@@ -127,5 +165,135 @@ describe("useCdpInput reconnects", () => {
     await advanceReconnectDelay();
 
     expect(MockWebSocket.instances).toHaveLength(6);
+  });
+});
+
+describe("useCdpInput key handling", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    MockWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", MockWebSocket);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  // SKY-13682: Delete (and every other non-printable key - Backspace, Enter, arrows, ...) was a
+  // no-op in the remote page. CDP's Input.dispatchKeyEvent only performs the default edit action
+  // when non-printable keys carry a windowsVirtualKeyCode, dispatched as eventType "rawKeyDown".
+  it("sends windowsVirtualKeyCode and eventType rawKeyDown for Delete", async () => {
+    const result = await renderControllingInputHook();
+
+    act(() => {
+      result.current.handlers.handleKeyDown(
+        fakeKeyboardEvent("Delete", "Delete"),
+      );
+    });
+
+    const send = latestSocketSend();
+    expect(send).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "keyEvent",
+        eventType: "rawKeyDown",
+        key: "Delete",
+        code: "Delete",
+        text: "",
+        modifiers: 0,
+        windowsVirtualKeyCode: 46,
+      }),
+    );
+  });
+
+  it("sends windowsVirtualKeyCode and eventType rawKeyDown for Backspace", async () => {
+    const result = await renderControllingInputHook();
+
+    act(() => {
+      result.current.handlers.handleKeyDown(
+        fakeKeyboardEvent("Backspace", "Backspace"),
+      );
+    });
+
+    const send = latestSocketSend();
+    expect(send).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "keyEvent",
+        eventType: "rawKeyDown",
+        key: "Backspace",
+        code: "Backspace",
+        text: "",
+        modifiers: 0,
+        windowsVirtualKeyCode: 8,
+      }),
+    );
+  });
+
+  // Numpad Delete with NumLock off reports key "Delete" (same as the main Delete key) with a
+  // different `code`; the vk lookup keys off `key` first so both resolve to the same edit action.
+  it("resolves numpad Delete (NumLock off) the same as the main Delete key", async () => {
+    const result = await renderControllingInputHook();
+
+    act(() => {
+      result.current.handlers.handleKeyDown(
+        fakeKeyboardEvent("Delete", "NumpadDecimal"),
+      );
+    });
+
+    const send = latestSocketSend();
+    expect(send).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "keyEvent",
+        eventType: "rawKeyDown",
+        key: "Delete",
+        code: "NumpadDecimal",
+        text: "",
+        modifiers: 0,
+        windowsVirtualKeyCode: 46,
+      }),
+    );
+  });
+
+  it("still sends printable text entry as keyDown with no windowsVirtualKeyCode", async () => {
+    const result = await renderControllingInputHook();
+
+    act(() => {
+      result.current.handlers.handleKeyDown(fakeKeyboardEvent("a", "KeyA"));
+    });
+
+    const send = latestSocketSend();
+    expect(send).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "keyEvent",
+        eventType: "keyDown",
+        key: "a",
+        code: "KeyA",
+        text: "a",
+        modifiers: 0,
+      }),
+    );
+  });
+
+  it("includes windowsVirtualKeyCode on keyUp for non-printable keys", async () => {
+    const result = await renderControllingInputHook();
+
+    act(() => {
+      result.current.handlers.handleKeyUp(
+        fakeKeyboardEvent("Delete", "Delete"),
+      );
+    });
+
+    const send = latestSocketSend();
+    expect(send).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "keyEvent",
+        eventType: "keyUp",
+        key: "Delete",
+        code: "Delete",
+        modifiers: 0,
+        windowsVirtualKeyCode: 46,
+      }),
+    );
   });
 });

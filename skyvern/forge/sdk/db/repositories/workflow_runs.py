@@ -478,6 +478,7 @@ class WorkflowRunsRepository(BaseRepository):
         status: WorkflowRunStatus,
         failure_reason: str | None = None,
         run_with: str | None = None,
+        ai_fallback: bool | None = None,
         failure_category: list[dict[str, Any]] | None = None,
     ) -> WorkflowRun | None:
         """Transition a workflow run to ``status`` only if it is not already in a
@@ -502,6 +503,8 @@ class WorkflowRunsRepository(BaseRepository):
             values["failure_reason"] = failure_reason
         if run_with is not None:
             values["run_with"] = run_with
+        if ai_fallback is not None:
+            values["ai_fallback"] = ai_fallback
         if failure_category is not None:
             values["failure_category"] = failure_category
 

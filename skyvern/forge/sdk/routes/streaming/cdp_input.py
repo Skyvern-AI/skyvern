@@ -22,7 +22,11 @@ from skyvern.forge.sdk.routes.streaming.registries import (
     stream_ref_dec,
     try_stream_ref_inc,
 )
-from skyvern.forge.sdk.routes.streaming.screencast import _resolve_working_page, wait_for_browser_state
+from skyvern.forge.sdk.routes.streaming.screencast import (
+    _resolve_working_page,
+    release_browser_state,
+    wait_for_browser_state,
+)
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.webeye.browser_state import BrowserState
@@ -371,6 +375,7 @@ async def cdp_input_stream(
 
     cdp_session: CDPSession | None = None
     input_session: ActivePageCdpInputSession | None = None
+    browser_state: BrowserState | None = None
     stream_registered = False
     try:
         deadline = time.monotonic() + 120
@@ -429,6 +434,7 @@ async def cdp_input_stream(
     except Exception:
         LOG.warning("CDP input: unexpected error", workflow_run_id=workflow_run_id, exc_info=True)
     finally:
+        await release_browser_state(browser_state, "workflow_run", workflow_run_id)
         if stream_registered:
             await stream_ref_dec(workflow_run_id)
         if input_session is not None:
@@ -461,6 +467,7 @@ async def cdp_input_browser_session_stream(
     )
 
     input_session: ActivePageCdpInputSession | None = None
+    browser_state: BrowserState | None = None
     try:
         session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
             session_id=browser_session_id,
@@ -507,6 +514,7 @@ async def cdp_input_browser_session_stream(
     except Exception:
         LOG.warning("CDP input: unexpected error", browser_session_id=browser_session_id, exc_info=True)
     finally:
+        await release_browser_state(browser_state, "browser_session", browser_session_id)
         if input_session is not None:
             await input_session.close()
         await channel.close()

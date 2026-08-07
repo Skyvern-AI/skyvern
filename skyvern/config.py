@@ -828,6 +828,10 @@ class Settings(BaseSettings):
     OTEL_SERVICE_NAME: str = "skyvern"
     OTEL_EXPORTER_OTLP_ENDPOINT: str = ""
     OTEL_METRICS_ENABLED: bool = True
+    # Comma-separated instrument-name globs allowed to export; everything else is
+    # dropped at the SDK so accidental instrumentation cannot inflate metrics cost.
+    # Empty disables the allowlist (export everything).
+    OTEL_METRICS_ALLOWLIST: str = "skyvern.*,persistent_browsers.*,redis.connection_pool.*,db.connection_pool.*,api.event_loop.*,webeye.browser_factory.*,analytics.*"
     OTEL_LOGS_ENABLED: bool = True
     OTEL_EXPORTER_INSECURE: bool = True
     # Log level for the OTLP gRPC exporter's own logger. Raise above WARNING (e.g.
