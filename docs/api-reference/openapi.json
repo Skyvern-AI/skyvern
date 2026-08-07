@@ -11389,6 +11389,12 @@
             "title": "Browser Profile Id",
             "description": "Optional plain browser profile to link as this credential's saved profile. Must be an unmanaged profile in your organization that no other credential already owns."
           },
+          "auto_profile_disabled": {
+            "type": "boolean",
+            "title": "Auto Profile Disabled",
+            "description": "Disable automatic saving and reuse of this credential's browser profile.",
+            "default": false
+          },
           "pin_saved_session_ip": {
             "type": "boolean",
             "title": "Pin Saved Session Ip",
@@ -11799,6 +11805,18 @@
             ],
             "title": "Browser Profile Id",
             "description": "Browser profile ID linked to this credential"
+          },
+          "auto_profile_disabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Profile Disabled",
+            "description": "Whether automatic saving and reuse of this credential's browser profile is disabled."
           },
           "pin_saved_session_ip": {
             "type": "boolean",
