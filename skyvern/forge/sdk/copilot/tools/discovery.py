@@ -92,6 +92,50 @@ def _discovery_candidate_identity_bound(
     return "" not in normalized_names and len(normalized_names) == 1
 
 
+def _user_provided_entry_url(copilot_ctx: CopilotContext) -> str | None:
+    """A site the user gave this chat, when name lookup found nothing.
+
+    Lookup asks the world what a name refers to; this asks the conversation. A user who pasted the
+    URL has already answered, so exhausting the lookup and telling them to supply a URL they already
+    supplied is the dead end this avoids. Only the sole site they gave answers; several is a question.
+    """
+    policy = copilot_ctx.request_policy
+    urls = list(policy.user_provided_site_urls) if policy is not None else []
+    return urls[0] if len(urls) == 1 else None
+
+
+def _site_name_names_host(site_name: str, url: str) -> bool:
+    """Whether a hostname label opens with the requested name.
+
+    A label may extend the name (`datadog` names `datadoghq`) but may not merely contain it, so
+    `ups` does not name `groupsupport`.
+    """
+    normalized = _normalize_discovery_name(site_name or "")
+    if len(normalized) < 3:
+        return False
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        return False
+    return any(_normalize_discovery_name(label).startswith(normalized) for label in host.split("."))
+
+
+def _credential_entry_url(copilot_ctx: CopilotContext, site_name: str) -> str | None:
+    """The login page a credential resolved for this turn already signs in at.
+
+    Only a credential whose host carries the requested name answers, because approvals persist
+    across turns and a later request for a different site would otherwise open this one.
+    """
+    policy = copilot_ctx.request_policy
+    credentials = list(policy.resolved_credentials) if policy is not None else []
+    named: list[str] = []
+    for credential in credentials:
+        url = (credential.tested_url or "").strip()
+        if url and url not in named and _site_name_names_host(site_name, url):
+            named.append(url)
+    return named[0] if len(named) == 1 else None
+
+
 def _resolve_discovery_entry_url(site_or_url: str) -> tuple[str | None, str]:
     """Resolve the user-supplied site name/URL into a navigable URL.
 
@@ -620,7 +664,9 @@ async def _discovery_walk(
         anti_bot_has_no_candidate_evidence = (
             not form_fields and candidate_title_score == 0 and candidate_anchor_score == 0
         )
-        if anti_bot_detected or login_wall_detected:
+        # A sign-in page carries no lead of its own when nothing on it matches the intent.
+        login_page_is_the_only_lead = candidate_title_score == 0 and candidate_anchor_score == 0
+        if anti_bot_detected or (login_wall_detected and not login_page_is_the_only_lead):
             # Tag walls so the scorer-miss fallback refuses them even when they degrade to no_candidate.
             evidence_trail[-1]["wall"] = True
         if anti_bot_detected and anti_bot_has_no_candidate_evidence:
@@ -642,13 +688,19 @@ async def _discovery_walk(
                 confidence=0.0,
                 failure_reason="anti_bot_wall",
             )
-        if login_wall_detected:
+        if login_wall_detected and login_page_is_the_only_lead and entrypoint_candidate is None:
+            # A sign-in page is where a credentialed workflow starts, so a URL the user or their
+            # own credential supplied is reported as the candidate rather than refused. Sign-in
+            # pages routinely ship verification widgets, which the run solves; a page carrying a
+            # challenge and nothing else already refused above. A machine-selected candidate falls
+            # through to the binding checks below instead.
+            evidence_trail[-1]["page_kind"] = "login"
             return build_result(
-                candidate_url=None,
-                candidate_form_fields=[],
+                candidate_url=current_url,
+                candidate_form_fields=form_fields,
                 evidence_trail=evidence_trail,
-                confidence=0.0,
-                failure_reason="login_wall",
+                confidence=1.0,
+                failure_reason=None,
             )
 
         if entrypoint_candidate is not None:
@@ -935,7 +987,14 @@ async def _discover_workflow_entrypoint_impl(
             entry_url = entrypoint_candidate.url
             kind = "evidence_candidate"
         else:
-            kind = "unresolved"
+            entry_url = _user_provided_entry_url(copilot_ctx)
+            kind = "user_provided_site" if entry_url else "unresolved"
+    if entry_url is None:
+        # A multi-word site name is not a bare word, so this is the only point a stored login page
+        # is reachable for one.
+        entry_url = _credential_entry_url(copilot_ctx, site_or_url)
+        if entry_url:
+            kind = "credential_tested_url"
     if entry_url is None:
         result = _discovery_build_result(
             candidate_url=None,

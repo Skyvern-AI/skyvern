@@ -6,7 +6,6 @@ import pytest
 from skyvern.forge.sdk.copilot.tools.integrations import _list_integrations, _serialize
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
-from tests.unit.conftest import render_agent_prompt
 
 ORGANIZATION_ID = "o_test_org"
 
@@ -124,11 +123,6 @@ def test_serializer_is_an_allowlist_so_a_new_token_field_cannot_leak() -> None:
     for name in TOKEN_FIELD_NAMES:
         assert name not in entry
     assert not any("SECRET_" in str(value) for value in entry.values())
-
-
-def test_prompt_routes_oauth_accounts_to_the_right_lookup() -> None:
-    rendered = render_agent_prompt()
-    assert "appear ONLY in `list_integrations`" in rendered
 
 
 @pytest.mark.asyncio

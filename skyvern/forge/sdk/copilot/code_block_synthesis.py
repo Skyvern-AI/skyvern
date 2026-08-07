@@ -4102,6 +4102,11 @@ def _render_artifact_metadata_block(metadata: Mapping[str, Any]) -> str:
     return json.dumps(metadata, indent=2, sort_keys=True)
 
 
+# The rendered offer's message content must begin with this sentinel; the
+# supersede-collapse and synthetic-turn classification key on the prefix.
+SYNTHESIZED_OFFER_SENTINEL = "SYNTHESIZED CODE BLOCK (offered once)."
+
+
 def render_synthesized_offer_text(
     synthesized: SynthesizedCodeBlock,
     trajectory: Sequence[Mapping[str, Any]] | None = None,
@@ -4120,7 +4125,7 @@ def render_synthesized_offer_text(
         )
     )
     parts = [
-        "SYNTHESIZED CODE BLOCK (offered once). The page interactions you scouted were compiled into a "
+        SYNTHESIZED_OFFER_SENTINEL + " The page interactions you scouted were compiled into a "
         "deterministic Playwright snippet. Persist it VERBATIM as a `code` block labeled "
         f"`{_SYNTHESIZED_BLOCK_LABEL}` via update_workflow / update_and_run_blocks. {extraction_instruction}",
         "```python",

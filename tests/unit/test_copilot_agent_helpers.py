@@ -27,15 +27,10 @@ from skyvern.forge.sdk.copilot.agent import (
     _synthesized_block_offer_prompt,
     _verified_workflow_or_none,
 )
-from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
-    AuthoringParameterBindingCandidate,
-    build_authoring_parameter_binding_directive,
-)
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     PostRunPagePathFailure,
-    PostRunPagePathTarget,
     RecordedBuildTestOutcome,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
@@ -353,6 +348,19 @@ workflow_definition:
         assert evidence.block_verified == ["extract_results"]
         assert evidence.verified_from_current_browser_state is True
         assert evidence.unverified_block_labels == ["expand_results"]
+
+    def test_partial_verification_renders_as_unverified_for_the_agent(self) -> None:
+        partial = WorkflowVerificationEvidence(
+            block_verified=["extract_results"],
+            unverified_block_labels=["expand_results"],
+            live_page_state_verified=True,
+        )
+
+        rendered = partial.render_prompt_block()
+
+        assert "full_workflow_verified: false" in rendered
+        assert "unverified_block_labels:\n  - expand_results" in rendered
+        assert WorkflowVerificationEvidence().render_prompt_block() == ""
 
     def test_rewrite_includes_navigation_follow_up_when_category_matches(self) -> None:
         from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
@@ -695,31 +703,6 @@ workflow_definition:
         assert "verified part of it" in reply_b
         assert "has not been verified end-to-end" in reply_b
 
-    def test_runtime_verification_evidence_prompt_surfaces_state_for_agent(self) -> None:
-        ctx = _ctx(
-            workflow_verification_evidence=WorkflowVerificationEvidence(
-                block_verified=["extract_results"],
-                live_page_state_verified=True,
-                test_attempted_but_incomplete=True,
-                per_tool_budget_on_block=["search_registry"],
-                verified_from_current_browser_state=True,
-                current_url_observed_after_workflow_run=True,
-                current_url_may_encode_runtime_state=True,
-                unverified_block_labels=["search_registry"],
-                current_url="https://example.com/lookup",
-            )
-        )
-
-        prompt = agent_module._runtime_verification_evidence_prompt(ctx)
-
-        assert "RUNTIME VERIFICATION EVIDENCE" in prompt
-        assert "full_workflow_verified: false" in prompt
-        assert "test_attempted_but_incomplete: true" in prompt
-        assert "current_url_observed_after_workflow_run: true" in prompt
-        assert "current_url_may_encode_runtime_state: true" in prompt
-        assert "per_tool_budget_on_block:" in prompt
-        assert "run only missing block labels" in prompt
-
     def test_unresolved_symbol_repair_context_prompt_is_policy_gated(self, monkeypatch: pytest.MonkeyPatch) -> None:
         info_calls: list[tuple[str, dict[str, str | list[str]]]] = []
 
@@ -783,31 +766,6 @@ workflow_definition:
             },
         ) in info_calls
 
-    def test_unresolved_symbol_repair_context_prompt_creates_exact_parameter_when_missing(self) -> None:
-        repair_context = CodeAuthoringRepairContext(
-            block_label="order_status",
-            reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
-            unresolved_names=["confirmation_number"],
-            parameter_keys=[],
-            available_parameter_keys=[],
-            binding_candidates=["confirmation_number"],
-        )
-        ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-            last_code_authoring_repair_context=repair_context,
-        )
-
-        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
-
-        assert "available_parameter_keys: (none)" in prompt
-        assert "binding_candidates: confirmation_number" in prompt
-        assert (
-            "confirmation_number -> create workflow string parameter key confirmation_number -> parameter_keys -> "
-            "bare variable confirmation_number"
-        ) in prompt
-        assert "do not hardcode the eval value" in prompt
-        assert "rerun via update_and_run_blocks" in prompt
-
     def test_missing_output_dependency_prompt_uses_available_outputs_not_workflow_parameters(self) -> None:
         repair_context = CodeAuthoringRepairContext(
             block_label="read_resource_table",
@@ -837,65 +795,6 @@ workflow_definition:
         assert "do not create a workflow parameter for missing_output_key" in prompt
         assert "create workflow string parameter key create_resource_output" not in prompt
 
-    def test_synthesized_parameter_binding_prompt_uses_exact_key(self) -> None:
-        repair_context = CodeAuthoringRepairContext(
-            block_label="order_status",
-            reason_code="synthesized_parameter_binding_ambiguous",
-            unresolved_names=["enter_confirmation"],
-            parameter_keys=["enter_confirmation"],
-            available_parameter_keys=["confirmation_number"],
-            binding_candidates=["enter_confirmation", "confirmation_number"],
-            parameter_binding_directive=build_authoring_parameter_binding_directive(
-                structural_key="definition-reject",
-                source_origin="https://example.com",
-                candidates=[
-                    AuthoringParameterBindingCandidate(
-                        declared_key="confirmation_number",
-                        field_selector="#confirmation",
-                    )
-                ],
-            ),
-        )
-        ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-            last_code_authoring_repair_context=repair_context,
-        )
-
-        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
-
-        assert "reason_code: synthesized_parameter_binding_ambiguous" in prompt
-        assert "binding_candidates: enter_confirmation, confirmation_number" in prompt
-        assert "parameter_binding_pairs:" in prompt
-        assert "confirmation_number -> #confirmation" in prompt
-        assert "declare and use the exact workflow input key" in prompt
-        assert "include that exact key in the code block's parameter_keys" in prompt
-        assert "reference it as a bare Python variable in code" in prompt
-        assert "do not guess or hardcode the runtime value" in prompt
-        assert "rerun via update_and_run_blocks" in prompt
-
-    def test_ambiguous_selector_repair_context_prompt_includes_selector_details(self) -> None:
-        repair_context = CodeAuthoringRepairContext(
-            block_label="order_status",
-            reason_code="ambiguous_bare_selector",
-            selector="button",
-            source_url="https://example.com/orders",
-            refiner_selector='button[data-action="status"]',
-            repair_instruction="Use a unique selector from the same page before saving the code block.",
-        )
-        ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-            last_code_authoring_repair_context=repair_context,
-        )
-
-        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
-
-        assert "CODE AUTHORING REPAIR CONTEXT" in prompt
-        assert "reason_code: ambiguous_bare_selector" in prompt
-        assert "selector: button" in prompt
-        assert "source_url: https://example.com/orders" in prompt
-        assert 'refiner_selector: button[data-action="status"]' in prompt
-        assert "Use a unique selector from the same page" in prompt
-
     def test_ambiguous_selector_repair_context_prompt_includes_same_page_alternatives(self) -> None:
         repair_context = CodeAuthoringRepairContext(
             block_label="order_status",
@@ -923,43 +822,6 @@ workflow_definition:
         assert "stable role/name/data attribute" in prompt
         assert "button:nth-of-type" not in prompt
         assert "secret-token" not in prompt
-
-    def test_runtime_repair_context_prompt_includes_failure_and_page_state(self) -> None:
-        repair_context = CodeAuthoringRepairContext(
-            block_label="search_registry",
-            reason_code="runtime_block_failure",
-            runtime_failure_reason='Timeout waiting for locator("#results")',
-            runtime_failure_class="timeout_waiting_for_selector",
-            failed_block_status="failed",
-            workflow_run_id="wr_failed",
-            current_origin="https://example.test",
-            current_url_present=True,
-            current_title_present=True,
-            page_evidence_source="inspect_page_for_composition",
-            observed_after_workflow_run=True,
-            page_form_summaries=["Search #search"],
-            page_result_summaries=["No results No matching records"],
-            page_action_summaries=["Search button.search disabled"],
-        )
-        ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-            last_code_authoring_repair_context=repair_context,
-        )
-
-        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
-
-        assert 'runtime_failure_reason: Timeout waiting for locator("#results")' in prompt
-        assert "runtime_failure_class: timeout_waiting_for_selector" in prompt
-        assert "failed_block_status: failed" in prompt
-        assert "current_origin: https://example.test" in prompt
-        assert "current_url_present: true" in prompt
-        assert "current_title_present: true" in prompt
-        assert "observed_after_workflow_run: true" in prompt
-        assert "page_forms: Search #search" in prompt
-        assert "page_results: No results No matching records" in prompt
-        assert "page_actions: Search button.search disabled" in prompt
-        assert "adapt the next code block to the observed page state" in prompt
-        assert "do not re-emit the same failing selector or name path" in prompt
 
     def test_metadata_repair_context_prompt_includes_failure_and_contract_guidance(self) -> None:
         long_reason = "missing requested output child paths " + ("x" * 220)
@@ -1008,80 +870,6 @@ workflow_definition:
         assert "Declare code_artifact_metadata goal_value_paths" in prompt
         assert "Coastal" not in prompt
 
-    def test_recorded_build_test_outcome_prompt_renders_structural_grounding(self) -> None:
-        ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
-                phase="persisted_block_run",
-                attempted_tool="update_and_run_blocks",
-                attempted_block_label="search_records",
-                verdict="repairable_failure",
-                reason_code="runtime_block_failure",
-                workflow_run_id="wr_failed",
-                structural_failure_identity="runtime:timeout_waiting_for_selector:failed",
-                page_evidence_refs=["form:Search #search", "result:#results rows=unknown"],
-                observed_evidence_summary="Timeout waiting for results.",
-            ),
-        )
-
-        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
-
-        assert "RECORDED BUILD-TEST OUTCOME" in prompt
-        assert "phase: persisted_block_run" in prompt
-        assert "reason_code: runtime_block_failure" in prompt
-        assert "page_evidence_refs: form:Search #search, result:#results rows=unknown" in prompt
-        assert "change the next authored step, selector, extraction, or binding based on" in prompt
-
-    def test_recorded_build_test_outcome_prompt_renders_exact_post_run_page_path_actions(self) -> None:
-        ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
-                phase="persisted_block_run",
-                attempted_tool="update_and_run_blocks",
-                verdict="repairable_failure",
-                reason_code="outcome_not_demonstrated",
-                workflow_run_id="wr_failed",
-                structural_failure_identity="completion:page-path",
-                page_path_failure=PostRunPagePathFailure(
-                    kind="challenge",
-                    workflow_run_id="wr_failed",
-                    current_url="https://example.test/challenge",
-                    continuation_targets=(
-                        PostRunPagePathTarget(kind="challenge", selector="#notRobot"),
-                        PostRunPagePathTarget(kind="challenge", selector="#continue"),
-                    ),
-                    enter_allowed=True,
-                ),
-            ),
-        )
-
-        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
-
-        assert "POST-RUN PAGE-PATH CONTINUATION:" in prompt
-        assert "kind: challenge" in prompt
-        assert "- allowed click: selector=#notRobot" in prompt
-        assert "- allowed Enter: selector=#continue" in prompt
-        assert "Do not navigate away or re-author the workflow" in prompt
-
-    def test_recorded_build_test_outcome_prompt_requires_fresh_inspection_when_page_path_is_unbound(self) -> None:
-        ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
-                phase="persisted_block_run",
-                attempted_tool="update_and_run_blocks",
-                verdict="repairable_failure",
-                reason_code="outcome_not_demonstrated",
-                workflow_run_id="wr_failed",
-                structural_failure_identity="completion:page-path",
-            ),
-        )
-
-        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
-
-        assert "POST-RUN PAGE-PATH CONTRACT UNBOUND:" in prompt
-        assert 'inspect_page_for_composition with target_url="current_page"' in prompt
-        assert "Do not use evaluate as a substitute" in prompt
-
     def test_recorded_build_test_outcome_prompt_does_not_offer_page_actions_for_non_page_outcome(self) -> None:
         ctx = _ctx(
             block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
@@ -1106,33 +894,6 @@ workflow_definition:
         assert "POST-RUN PAGE-PATH CONTINUATION:" not in prompt
         assert "POST-RUN PAGE-PATH CONTRACT UNBOUND:" not in prompt
 
-    def test_recorded_build_test_outcome_prompt_renders_exact_missing_output_paths(self) -> None:
-        ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
-                phase="persisted_block_run",
-                attempted_tool="update_and_run_blocks",
-                verdict="repairable_failure",
-                reason_code="outcome_not_demonstrated",
-                structural_failure_identity="completion:unsatisfied-output",
-                missing_requested_output_facts=[
-                    {
-                        "output_path": "output.confirmation_number",
-                        "output_root": "output",
-                        "value_status": "no_typed_value",
-                        "reason_code": "no_evidence",
-                    }
-                ],
-            ),
-        )
-
-        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
-
-        assert "output_path=output.confirmation_number" in prompt
-        assert "output_root=output" in prompt
-        assert "Use the exact output_path values in goal_value_paths and returned output" in prompt
-        assert "output_root is diagnostic grouping only" in prompt
-
     def test_recorded_build_test_outcome_prompt_surfaces_observed_page_values(self) -> None:
         long_value = "Request WTR-1842-DEMO for account 100245 confirmed. " + "detail " * 40
         ctx = _ctx(
@@ -1155,30 +916,6 @@ workflow_definition:
         assert "WTR-1842-DEMO" in value_line
         assert "100245" in value_line
         assert len(value_line) > 200
-
-    def test_recorded_build_test_outcome_prompt_binds_observed_values_on_metadata_reject(self) -> None:
-        ctx = _ctx(
-            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
-                phase="author_time_reject",
-                attempted_tool="update_workflow",
-                verdict="authoring_rejected",
-                reason_code="metadata_reject",
-                structural_failure_identity="author_time:metadata_reject",
-                observed_page_value_excerpt="Request WTR-1842-DEMO for account 100245 confirmed.",
-                missing_requested_output_facts=[
-                    {"output_root": "output", "output_path": "output.confirmation_number"},
-                    {"output_root": "output", "output_path": "output.account_number"},
-                ],
-            ),
-        )
-
-        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
-
-        assert "OBSERVED PAGE VALUES CONTRACT" in prompt
-        assert "observed_values: Request WTR-1842-DEMO for account 100245 confirmed." in prompt
-        assert "- output.confirmation_number: <observed value>" in prompt
-        assert "- output.account_number: <observed value>" in prompt
 
 
 class TestVerifiedWorkflowOrNone:
@@ -2098,6 +1835,7 @@ class TestRequestPolicyInputGuardrail:
             organization_id="org-1",
             handler=policy_inputs.request_policy_handler,
             config=None,
+            prior_user_messages=policy_inputs.prior_user_messages,
         )
 
     @pytest.mark.asyncio
@@ -4231,7 +3969,7 @@ class TestRequestPolicyCredentialResolution:
         assert policy.completion_contract_status == "present"
 
     @pytest.mark.asyncio
-    async def test_missing_user_supplied_credential_id_rides_along_when_another_resolves(self, monkeypatch) -> None:
+    async def test_missing_user_supplied_credential_ids_ask_for_clarification(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot import request_policy as policy_module
         from skyvern.forge.sdk.copilot.request_policy import build_request_policy
 
@@ -4254,12 +3992,14 @@ class TestRequestPolicyCredentialResolution:
         assert policy.credential_input_kind == "credential_id"
         assert policy.credential_refs == ["cred_valid", "cred_missing"]
         assert policy.invalid_credential_ids == ["cred_missing"]
-        # A stated ID that resolved carries the turn; the unresolvable one rides along as a
-        # recorded finding instead of walling the request (SKY-13552).
-        assert [credential.credential_id for credential in policy.resolved_credentials] == ["cred_valid"]
-        assert policy.user_response_policy != "ask_clarification"
-        assert policy.allow_update_workflow is True
-        assert policy.allow_run_blocks is True
+        assert policy.user_response_policy == "ask_clarification"
+        assert policy.allow_update_workflow is False
+        assert policy.allow_run_blocks is False
+        assert policy.allow_missing_credentials_in_draft is False
+        assert policy.clarification_question
+        assert "cred_missing" in policy.clarification_question
+        assert "not found in this organization" in policy.clarification_question
+        assert "unvalidated draft" in policy.clarification_question
         get_credentials_by_ids.assert_awaited_once_with(["cred_valid", "cred_missing"], organization_id="org-1")
 
     @pytest.mark.asyncio
@@ -4474,7 +4214,12 @@ workflow_definition:
         monkeypatch.setattr(
             policy_module.app,
             "DATABASE",
-            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[]))),
+            SimpleNamespace(
+                credentials=SimpleNamespace(
+                    get_credentials_by_ids=AsyncMock(return_value=[]),
+                    get_credentials=AsyncMock(return_value=[]),
+                )
+            ),
         )
 
         captured: dict[str, str] = {}
@@ -4712,12 +4457,12 @@ workflow_definition:
             handler=handler,
         )
 
+        # Names are read by the model, so a turn with no classifier resolves none; the turn still
+        # proceeds and the credential stays reachable by ID or from the Credentials UI.
         assert policy.classifier_status == "fallback"
         assert policy.classifier_failure_kind == "provider_error"
         assert policy.completion_contract_status == "present"
-        assert policy.credential_input_kind == "credential_name"
-        assert policy.credential_refs == ["mock-portal-login"]
-        assert policy.resolved_credentials == [credential]
+        assert policy.resolved_credentials == []
 
     @pytest.mark.asyncio
     async def test_fallback_policy_does_not_substring_match_saved_credential_name(self, monkeypatch) -> None:
@@ -4744,7 +4489,7 @@ workflow_definition:
         assert policy.completion_contract_status == "present"
         assert policy.credential_input_kind == "none"
         assert policy.credential_refs == []
-        credentials.get_credentials.assert_not_called()
+        assert policy.resolved_credentials == []
 
     @pytest.mark.asyncio
     async def test_request_policy_url_matching_and_skip_draft(self, monkeypatch) -> None:
@@ -5895,24 +5640,6 @@ class TestResponseTypeClassificationRuleReachesAgent:
         assert prompt.index("RESPONSE-TYPE CLASSIFICATION") < prompt.index("**Option 1: Reply to the user**")
 
 
-class TestValidationClassificationOutputContractRule:
-    def test_build_system_prompt_requires_exact_top_level_classification_contract_keys(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _build_system_prompt
-
-        prompt = _build_system_prompt(tool_usage_guide="", security_rules="")
-
-        assert "validation_classification_output_contracts" in prompt
-        assert "explicitly `return` a dict" in prompt
-        assert "Do not rely on schema defaults or exposed top-level locals" in prompt
-        assert "exact `return_key` as a top-level key" in prompt
-        assert "goal_value_paths" in prompt
-        assert "extraction_schema" in prompt
-        assert "reject code-only output blocks without that metadata" in prompt
-        assert "observed_gate_phrase" in prompt
-        assert "Synonyms such as `path_login_only`, `classification`, or prose in `evidence_text`" in prompt
-        assert "do not replace the required key" in prompt
-
-
 class TestCopilotConfig:
     def test_system_prompt_uses_custom_security_rules(self) -> None:
         prompt = agent_module._build_system_prompt(
@@ -6206,38 +5933,6 @@ class TestRequestPolicyTranscriptContext:
 
 
 class TestRequestPolicyPromptRendering:
-    @pytest.mark.asyncio
-    async def test_classifier_prompt_includes_all_structural_slots(self) -> None:
-        captured: dict[str, str] = {}
-
-        async def handler(prompt: str, prompt_name: str) -> dict[str, str]:
-            captured["prompt"] = prompt
-            captured["prompt_name"] = prompt_name
-            return {"credential_input_kind": "none", "testing_intent": "unspecified"}
-
-        await _classify_request(
-            user_message="azure_credentials",
-            workflow_yaml="title: Test",
-            chat_history=_history(
-                ("user", "build a login workflow"),
-                ("ai", "drafted v1"),
-                ("user", "use my saved creds"),
-                ("ai", "Which saved credential should I use?"),
-            ),
-            global_llm_context="",
-            handler=_with_empty_request_slots(handler),
-        )
-
-        prompt = captured["prompt"]
-        assert "Earliest retained user turn" in prompt
-        assert "Latest prior user turn" in prompt
-        assert "Latest assistant turn" in prompt
-        assert "Retained recent history" in prompt
-        assert "build a login workflow" in prompt
-        assert "use my saved creds" in prompt
-        assert "Which saved credential should I use?" in prompt
-        assert "drafted v1" in prompt
-
     @pytest.mark.asyncio
     async def test_classifier_prompt_renders_sentinel_for_empty_slots(self) -> None:
         captured: dict[str, str] = {}

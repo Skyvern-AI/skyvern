@@ -12,7 +12,6 @@ import structlog
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
     GENUINELY_TERMINAL_BLOCKER_REASON_CODES,
-    SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
     CopilotToolBlockerSignal,
     blocker_signal_is_genuinely_terminal,
     build_llm_tool_error_payload,
@@ -36,10 +35,6 @@ class TurnClaimant(StrEnum):
     GENUINELY_TERMINAL = "genuinely_terminal"
     OUTPUT_CONTRACT_ACTUATION = "output_contract_actuation"
     CREDENTIAL_PRIORITY_CHURN = "credential_priority_authoring_churn"
-    ACTUATION_OBLIGATION_FILL = "actuation_obligation_fill"
-    ACTUATION_OBLIGATION_LOGIN_COMPLETION = "actuation_obligation_login_completion"
-    CREDENTIAL_SCOUT_REOPEN = "credential_scout_reopen"
-    SYNTHESIZED_BLOCK_PERSISTENCE_FORCE = "synthesized_block_persistence_force"
     CODE_AUTHORING_CHURN = "code_authoring_guardrail_churn"
     LOOP_DETECTED = "loop_detected"
 
@@ -61,20 +56,7 @@ _PRECEDENCE_ORDER: tuple[TurnClaimant, ...] = (
     # Bound-8 credential-priority churn defers only to terminal evidence and the actuation ladder,
     # preserving the credential-scout reply.
     TurnClaimant.CREDENTIAL_PRIORITY_CHURN,
-    # Actuation-obligation fill carve-out admits the required fill tool through the persistence
-    # gate; predicate-gated at its call site, never an unconditional rank flip.
-    TurnClaimant.ACTUATION_OBLIGATION_FILL,
-    # Login-completion carve-out admits the submit and 2FA-confirm interactions the admitted fills
-    # began; predicate-gated at its call site and bounded by the post-credential commit.
-    TurnClaimant.ACTUATION_OBLIGATION_LOGIN_COMPLETION,
-    # Post-run page-path repair admits only its outcome-bound click/Enter window.
-    # One-shot credential-scout reopen admits evaluate through the persistence gate;
-    # predicate-gated at its call site.
-    TurnClaimant.CREDENTIAL_SCOUT_REOPEN,
-    # A budget-exhausted churn halt is the loop exit and outranks the persistence force, whose
-    # accepted-save channel has already failed by then; the pair only co-occurs on synthesized turns.
     TurnClaimant.CODE_AUTHORING_CHURN,
-    TurnClaimant.SYNTHESIZED_BLOCK_PERSISTENCE_FORCE,
     # Loop detectors defer to every steering gate above them.
     TurnClaimant.LOOP_DETECTED,
 )
@@ -86,10 +68,6 @@ CLAIMANT_REASON_CODE_FAMILIES: dict[TurnClaimant, frozenset[str]] = {
     TurnClaimant.GENUINELY_TERMINAL: GENUINELY_TERMINAL_BLOCKER_REASON_CODES,
     TurnClaimant.OUTPUT_CONTRACT_ACTUATION: frozenset(),
     TurnClaimant.CREDENTIAL_PRIORITY_CHURN: frozenset({"credential_priority_authoring_churn"}),
-    TurnClaimant.ACTUATION_OBLIGATION_FILL: frozenset(),
-    TurnClaimant.ACTUATION_OBLIGATION_LOGIN_COMPLETION: frozenset(),
-    TurnClaimant.CREDENTIAL_SCOUT_REOPEN: frozenset(),
-    TurnClaimant.SYNTHESIZED_BLOCK_PERSISTENCE_FORCE: frozenset({SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE}),
     TurnClaimant.CODE_AUTHORING_CHURN: frozenset({"code_authoring_guardrail_churn"}),
     TurnClaimant.LOOP_DETECTED: frozenset(
         {
@@ -106,16 +84,6 @@ _CLAIMANT_BY_REASON_CODE: dict[str, TurnClaimant] = {
     for claimant, reason_codes in CLAIMANT_REASON_CODE_FAMILIES.items()
     for reason_code in reason_codes
 }
-
-# Claimants whose ownership lasts only for the duration of the claiming call: the claim records
-# reachability and conflicts, but never suppresses a later gate or render on the same turn.
-_TRANSIENT_CLAIMANTS = frozenset(
-    {
-        TurnClaimant.ACTUATION_OBLIGATION_FILL,
-        TurnClaimant.ACTUATION_OBLIGATION_LOGIN_COMPLETION,
-        TurnClaimant.CREDENTIAL_SCOUT_REOPEN,
-    }
-)
 
 
 def claimant_outranks(candidate: TurnClaimant, incumbent: TurnClaimant) -> bool:
@@ -217,8 +185,6 @@ def effective_signal_claimant(ctx: AgentContext, signal: CopilotToolBlockerSigna
 
 
 def _claim_is_live(ctx: AgentContext, claim: PrecedenceClaim) -> bool:
-    if claim.claimant in _TRANSIENT_CLAIMANTS:
-        return False
     if claim.claimant is TurnClaimant.OUTPUT_CONTRACT_ACTUATION:
         return output_contract_ladder_unresolved(ctx)
     if claim.claimant is TurnClaimant.GENUINELY_TERMINAL and turn_halt_is_genuinely_terminal(ctx.turn_halt):

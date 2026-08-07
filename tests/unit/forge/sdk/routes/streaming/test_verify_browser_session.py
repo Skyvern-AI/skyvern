@@ -209,3 +209,31 @@ class TestVerifyBrowserSessionLocalShortCircuit:
             result = await verify_browser_session("bs_test", "o_test")
 
         assert result is None
+
+
+class TestVerifyBrowserSessionPerSessionTransport:
+    @pytest.mark.asyncio
+    async def test_cdp_transport_bypasses_missing_address_when_global_is_vnc(self) -> None:
+        session = _make_session(
+            browser_address=None,
+            status=PersistentBrowserSessionStatus.running,
+        )
+
+        manager = MagicMock()
+        manager.get_session = AsyncMock(return_value=session)
+        manager.get_browser_address = AsyncMock(
+            side_effect=AssertionError("must not wait for address when the session's transport is cdp"),
+        )
+
+        with (
+            patch("skyvern.forge.sdk.routes.streaming.verify.app") as app_mock,
+            patch("skyvern.forge.sdk.routes.streaming.verify.settings") as settings_mock,
+        ):
+            app_mock.PERSISTENT_SESSIONS_MANAGER = manager
+            app_mock.AGENT_FUNCTION.resolve_stream_transport = AsyncMock(return_value="cdp")
+            settings_mock.BROWSER_STREAMING_MODE = "vnc"
+            result = await verify_browser_session("bs_test", "o_test")
+
+        assert result is not None
+        assert result.browser_address == ""
+        manager.get_browser_address.assert_not_called()

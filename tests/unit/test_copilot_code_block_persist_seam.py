@@ -5541,6 +5541,26 @@ def _imposition_split_ctx() -> CopilotContext:
     return ctx
 
 
+def _reaching_imposition_split_ctx() -> CopilotContext:
+    """The split fixture whose scouted pair carries indices, so it reads as an opening click and its commit."""
+    ctx = _imposition_split_ctx()
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "click",
+            "selector": "#stage-a",
+            "source_url": "https://example.com/records",
+            "trajectory_index": 0,
+        },
+        {
+            "tool_name": "click",
+            "selector": "#stage-b",
+            "source_url": "https://example.com/records",
+            "trajectory_index": 1,
+        },
+    ]
+    return ctx
+
+
 class TestSeparatedSpineImpositionRunEligibility:
     def test_imposition_accepts_scouted_browser_stage_siblings(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(workflow_update_module, "synthesize_code_block", lambda *a, **k: _fake_spine_synthesized())
@@ -5805,7 +5825,15 @@ class TestCompiledAuthoringImposition:
                 "role": "textbox",
                 "accessible_name": "Provider Name",
                 "trajectory_index": 0,
-            }
+            },
+            {
+                "tool_name": "click",
+                "selector": "#provider-search-submit",
+                "source_url": "https://example.com/find-care",
+                "role": "button",
+                "accessible_name": "Search",
+                "trajectory_index": 1,
+            },
         ]
         return ctx
 
@@ -5865,7 +5893,7 @@ class TestCompiledAuthoringImposition:
         ]
         assert result["data"]["imposed_substitutions"] == {
             "block_label": "search_registry",
-            "source_trajectory_count": 1,
+            "source_trajectory_count": 2,
             "parameter_keys": ["provider_name"],
             "credential_parameter_keys": [],
             "selector_provenance": [
@@ -5874,7 +5902,13 @@ class TestCompiledAuthoringImposition:
                     "selector": "#provInput",
                     "emitted_literal": "#provInput",
                     "source": "selector",
-                }
+                },
+                {
+                    "trajectory_index": 1,
+                    "selector": "#provider-search-submit",
+                    "emitted_literal": "#provider-search-submit",
+                    "source": "selector",
+                },
             ],
             "prior_source": "workflow_yaml",
         }
@@ -6571,7 +6605,15 @@ class TestCompiledAuthoringImposition:
                 "role": "textbox",
                 "accessible_name": "Address or postal code",
                 "trajectory_index": 0,
-            }
+            },
+            {
+                "tool_name": "click",
+                "selector": "#directory-search-submit",
+                "source_url": "https://example.com/find-care",
+                "role": "button",
+                "accessible_name": "Search",
+                "trajectory_index": 1,
+            },
         ]
         submitted = _yaml(
             """
@@ -6634,6 +6676,14 @@ class TestCompiledAuthoringImposition:
                 "role": "textbox",
                 "accessible_name": "Provider First Name",
                 "trajectory_index": 1,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#directory-search-submit",
+                "source_url": "https://example.com/find-care",
+                "role": "button",
+                "accessible_name": "Search",
+                "trajectory_index": 2,
             },
         ]
         submitted = _yaml(
@@ -9229,7 +9279,14 @@ class TestBareDropSupersession:
     def test_imposition_two_refiners_forgive_two_bare_drops(self) -> None:
         ctx = _resale_ctx()
         ctx.scout_trajectory = [
-            {"tool_name": "click", "selector": "#start", "source_url": _RESALE_URL, "trajectory_index": 0},
+            {
+                "tool_name": "type_text",
+                "selector": "#order-id",
+                "source_url": _RESALE_URL,
+                "typed_length": 6,
+                "typed_value": "abc123",
+                "trajectory_index": 0,
+            },
             {"tool_name": "click", "selector": "button", "source_url": _RESALE_URL, "trajectory_index": 1},
             {"tool_name": "click", "selector": "button", "source_url": _RESALE_URL, "trajectory_index": 2},
             {
@@ -9253,7 +9310,7 @@ class TestBareDropSupersession:
               - block_type: code
                 label: order_status
                 code: |
-                  await page.locator("#start").click()
+                  await page.locator("#order-id").fill(str(order_id))
                   await page.locator("button[data-action=\\"open\\"]").click()
                   await page.locator("button[data-action=\\"status\\"]").click()
             """
@@ -10618,7 +10675,7 @@ class TestScoutedSpinePersistSeamCoverage:
             "synthesize_code_block",
             lambda *a, **k: _fake_spine_synthesized(diagnostics=diagnostics),
         )
-        ctx = _imposition_split_ctx()
+        ctx = _reaching_imposition_split_ctx()
         workflow_yaml = _records_block_yaml(
             _SPINE_SYNTH_CODE
             + '\nvalue = await page.locator("#result").inner_text()\nreturn {"output": {"record_id": value}}'
@@ -14411,3 +14468,88 @@ def test_a_goal_path_stays_bare_when_the_block_returns_a_bare_mapping() -> None:
     )
 
     assert bare == {"records"}
+
+
+class TestUnlandedReplayNeverReplacesSubmission:
+    """SKY-13624: with nothing landed (no goal-reaching trajectory, no bound plan), the agent's
+    submitted code persists byte-equal; trajectory replay may only materialize an empty stub."""
+
+    def _probe_only_ctx(self) -> CopilotContext:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "read_value",
+                "read_expression": "document.body.innerText.slice(0, 12000)",
+                "read_output_path": "output.scouted_read",
+                "read_output_path_source": "elimination",
+                "read_result_shape": "list",
+                "source_url": "https://example.com/dashboard",
+                "trajectory_index": 0,
+            }
+        ]
+        return ctx
+
+    def _submitted_program_yaml(self) -> str:
+        return _yaml(
+            """
+            title: Append visitors
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: collect_visitors
+                code: |
+                  await page.goto("https://example.com/dashboard", wait_until="domcontentloaded")
+                  card_text = await page.locator("body").inner_text()
+                  visitor_count = card_text.split()[0]
+                  return {"visitor_count": visitor_count}
+            """
+        )
+
+    def test_unlanded_replay_keeps_submitted_code_byte_equal(self) -> None:
+        ctx = self._probe_only_ctx()
+        submitted = self._submitted_program_yaml()
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.workflow_yaml == submitted
+
+    def test_unlanded_replay_keeps_submission_even_when_prior_version_differs(self) -> None:
+        ctx = self._probe_only_ctx()
+        ctx.last_workflow_yaml = _yaml(
+            """
+            title: Append visitors
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: collect_visitors
+                code: |
+                  return {"visitor_count": "8.08K"}
+            """
+        )
+        submitted = self._submitted_program_yaml()
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.workflow_yaml == submitted
+
+    def test_empty_stub_carrier_is_still_materialized(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        submitted = _yaml(
+            """
+            title: Append visitors
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: collect_visitors
+                code: ""
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
+        assert code.strip()

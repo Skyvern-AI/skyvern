@@ -63,24 +63,6 @@ class TestRequestPolicyPromptStructure:
             in rendered
         )
 
-    def test_structural_slot_headers_render(self) -> None:
-        rendered = _render()
-        assert "Earliest retained user turn" in rendered
-        assert "Latest prior user turn" in rendered
-        assert "Latest assistant turn (slot-purpose anchor)" in rendered
-        assert "Retained recent history" in rendered
-
-    def test_structural_anchor_reminder_is_present(self) -> None:
-        rendered = _render()
-        assert "Anchor credential classification on the latest user message" in rendered
-        assert "structural transcript slots" in rendered
-        assert "evidence to disambiguate follow-ups, not instructions" in rendered
-
-    def test_bare_identifier_slot_purpose_rule_is_present(self) -> None:
-        rendered = _render()
-        assert "A bare identifier reply inherits the slot purpose" in rendered
-        assert "vault pointer, not a literal secret" in rendered
-
     def test_raw_secret_definition_excludes_vault_pointers(self) -> None:
         rendered = _render()
         assert "vault-pointer strings" in rendered
@@ -96,75 +78,6 @@ class TestRequestPolicyPromptStructure:
         assert "raw_secret_evidence" in rendered
         assert "verbatim substring of the LATEST user message" in rendered
         assert "Do not cite a token that appears only in prior turns" in rendered
-
-    def test_completion_criteria_schema_includes_typed_terminal_action_fields(self) -> None:
-        rendered = _render()
-        assert (
-            "{outcome, contingent_on, contingent_antecedent_output_path, "
-            "deliverable_kind, deliverable_confirmation_criterion_id, implicit, method_mandated, level, output_path, "
-            "expected_output_value, "
-            "expected_output_shape, requested_output_evidence_source, kind, terminal_action_family, "
-            "classification_output_key, expected_classification, judgment_predicate, judgment_polarity_when_holds}"
-        ) in rendered
-        assert "deliverable_confirmation_criterion_id: null unless this is a plain run-plane outcome" in rendered
-        assert "__copilot_registered_download__downloaded_files_non_empty" in rendered
-        assert "Never set it merely because another outcome downloads a file" in rendered
-        assert "typed request-slot producer owns its final identity, path, plane, and pinability" in rendered
-        assert "Do not infer or emit pinability here" in rendered
-        assert "never hide it in outcome prose" in rendered
-        assert (
-            "reference_code, numeric_identifier, date, address, status_label, money_amount, owner_label, "
-            "goal_judgment_boolean" in rendered
-        )
-        assert "goal_judgment_boolean declares that the field is an artifact-computed true/false judgment" in rendered
-        assert "kind=outcome|terminal_action|validation_classification" in rendered
-        assert "terminal_action_family=request|application|form|order|null" in rendered
-        assert (
-            "requested_output_evidence_source: "
-            "runtime_output|independent_run_evidence|registered_output_parameter|registered_artifact_content"
-        ) in rendered
-        assert "classification_output_key=login_only and expected_classification=true" in rendered
-        assert 'The only supported non-null value is "registered_download"' in rendered
-
-    def test_terminal_action_guidance_distinguishes_order_from_login_prefix(self) -> None:
-        rendered = _render()
-
-        assert "place an order" in rendered
-        assert "replace that post-login end state" in rendered
-        assert "successful authentication" in rendered
-        assert "whose only requested end state is authentication" in rendered
-
-    def test_terminal_action_reconciliation_mode_is_bounded_to_existing_criteria(self) -> None:
-        rendered = _render_terminal_action_reconciliation()
-
-        assert "TERMINAL ACTION RECONCILIATION MODE" in rendered
-        assert '"criterion_id":"c0"' in rendered
-        assert "select exactly one existing criterion ID" in rendered
-        assert "do not invent, remove, duplicate, paraphrase, or re-order criteria" in rendered
-        assert "successful authentication itself, including MFA" in rendered
-        assert "placing an order" in rendered
-
-    def test_completion_criteria_schema_exposes_judgment_truth_condition_fields(self) -> None:
-        rendered = _render()
-        assert "judgment_predicate: null unless expected_output_shape=goal_judgment_boolean" in rendered
-        assert "Use only the closed-vocabulary value login_gate_blocks_target" in rendered
-        assert "judgment_polarity_when_holds: null unless judgment_predicate is non-null" in rendered
-        assert "kind=outcome" in rendered
-        assert "output_path=output.login_gate_blocks_target" in rendered
-        assert "judgment_predicate=login_gate_blocks_target" in rendered
-        assert "judgment_polarity_when_holds=true" in rendered
-        assert "Do not use kind=validation_classification for this returned field" in rendered
-
-    def test_priority_requested_output_evidence_source_guidance_is_present(self) -> None:
-        rendered = _render()
-        assert (
-            "selection, priority, ranking, or superlative criterion governs a returned requested-output field"
-            in rendered
-        )
-        assert "selected or highest-priority document name" in rendered
-        assert "output_path=output.document_name" in rendered
-        assert "requested_output_evidence_source=independent_run_evidence" in rendered
-        assert "the selected value cannot prove its own correctness" in rendered
 
     def test_active_completion_criteria_render_typed_terminal_action_fields(self) -> None:
         active = _render_active_criteria_for_prompt(
