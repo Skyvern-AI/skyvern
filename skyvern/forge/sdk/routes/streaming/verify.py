@@ -91,7 +91,7 @@ async def verify_browser_session(
     browser_address = browser_session.browser_address if browser_session.is_browser_ready else None
 
     if not browser_address:
-        if settings.BROWSER_STREAMING_MODE == "cdp":
+        if await stream_transport(browser_session_id, organization_id) == "cdp":
             browser_address = ""
         else:
             LOG.info(
@@ -320,3 +320,18 @@ async def loop_verify_workflow_run(verifiable: MessageChannel | VncChannel) -> N
         verifiable.browser_session = browser_session
 
         await asyncio.sleep(Constants.POLL_INTERVAL_FOR_VERIFICATION_SECONDS)
+
+
+async def stream_transport(browser_session_id: str | None, organization_id: str) -> str:
+    try:
+        return await app.AGENT_FUNCTION.resolve_stream_transport(
+            browser_session_id=browser_session_id, organization_id=organization_id
+        )
+    except Exception:
+        LOG.warning(
+            "Could not resolve the stream transport; using the deployment default",
+            browser_session_id=browser_session_id,
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return settings.BROWSER_STREAMING_MODE

@@ -857,6 +857,21 @@ async def _convert_css_shape_to_string(
 
 
 class AgentFunction:
+    async def record_run_duration(
+        self,
+        run_type: str,
+        status: str,
+        duration_seconds: float,
+        workflow_run_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> None:
+        """Cloud overrides this to emit run-duration telemetry; the OSS default is a no-op.
+
+        workflow_run_id/organization_id let the override refine run_type (e.g. a
+        workflow run that backs a task_v2) without the caller paying for the lookup.
+        """
+        return None
+
     workflow_schedules_enabled: bool = settings.ENABLE_WORKFLOW_SCHEDULES
     """Whether the workflow scheduler routes should serve traffic on this build.
 
@@ -920,6 +935,16 @@ class AgentFunction:
         Always yes here: a self-hosted deployment runs every browser itself.
         """
         return True
+
+    async def resolve_stream_transport(
+        self, *, browser_session_id: str | None, organization_id: str | None, ip_address: str | None = None
+    ) -> str:
+        """Which live-view transport serves this session: "vnc" or "cdp".
+
+        A self-hosted deployment streams every browser the same way, so the
+        deployment-wide setting decides.
+        """
+        return settings.BROWSER_STREAMING_MODE
 
     async def select_browser_session_recordings(
         self,
@@ -1076,6 +1101,22 @@ class AgentFunction:
         session, so a run that has a CodeBlock but no caller-supplied session needs one created
         for it before block execution. OSS has no runner and returns False; cloud overrides to
         consult the same env/flag gate as should_use_codeblock_runner.
+        """
+        return False
+
+    async def should_route_to_secure_runner_pool(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str | None,
+        workflow_permanent_id: str | None = None,
+        workflow_id: str | None = None,
+    ) -> bool:
+        """Whether this run must be dispatched to a worker pool that has the runner sidecar.
+
+        Answered at dispatch, before a queue is chosen, so it is run-level: no block context
+        exists yet. OSS has no runner and returns False; cloud overrides to consult the same
+        gate as should_use_codeblock_runner.
         """
         return False
 

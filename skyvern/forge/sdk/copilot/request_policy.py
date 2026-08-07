@@ -218,22 +218,6 @@ _INVALID_CONDITIONAL_CONTAINER_MARKERS = (
     "inside conditional",
     "within conditional",
 )
-# The leading (?<!\w) keeps a contraction's apostrophe ("I've", "can't") from opening a quote and
-# pairing with a later one, which would swallow the run between them as a bogus credential name.
-_QUOTED_CREDENTIAL_NAME_RE = re.compile(r"(?:`([^`]{1,100})`|\"([^\"]{1,100})\"|(?<!\w)'([^']{1,100})')")
-_NAMED_CREDENTIAL_TOKEN_RE = re.compile(
-    r"\b(?:saved\s+credential|credential)\s+(?:named|called)\s+([A-Za-z0-9_.@:-]{2,100})\b",
-    re.I,
-)
-_DIRECT_CREDENTIAL_TOKEN_RE = re.compile(
-    r"\b(?:use|using|with)\s+(?:the\s+)?(?:saved\s+)?credential"
-    r"(?:\s+(?:named|called))?\s+([A-Za-z0-9_.@:-]{2,100})\b",
-    re.I,
-)
-_POSTFIX_CREDENTIAL_TOKEN_RE = re.compile(
-    r"\b(?:use|using|with)\s+(?:my\s+|the\s+)?(?:saved\s+)?([A-Za-z0-9_.@:-]{2,100})\s+credential\b",
-    re.I,
-)
 _CREDENTIAL_REPLACEMENT_TARGET_RES = (
     re.compile(
         r"\bswitch(?:ing)?\s+to\b"
@@ -263,7 +247,6 @@ _CREDENTIAL_REPLACEMENT_OBJECT_RE = re.compile(
     r"(?:\s+(?:(?:id|named|called)\s+)?[A-Za-z0-9_.@:-]{2,100})?)\s*",
     re.I,
 )
-_CREDENTIAL_QUOTE_CONTEXT_RE = re.compile(r"\b(?:credentials?|log[\s-]?in)\b", re.I)
 _NEGATED_CREDENTIAL_CONTEXT_RE = re.compile(
     r"(?:"
     r"\b(?:do\s+not|don't|never|without|avoid(?:ing)?|exclud(?:e|ed|es|ing))\b"
@@ -277,9 +260,6 @@ _EXPLICIT_LOGIN_ACTION_RE = re.compile(
     r"(?<![/\w-])(?:log[\s-]?in|login|sign[\s-]?in)\b"
     r"(?!\s+(?:form|page|path|route|screen|url)\b)",
     re.I,
-)
-_CREDENTIAL_REFERENCE_STOPWORDS = frozenset(
-    {"a", "an", "credential", "for", "login", "my", "saved", "stored", "the", "to"}
 )
 _CODE_BLOCK_AUTHORING_MARKERS = ("code block", "code-block", "codeblock")
 _LOGIN_BLOCK_BAN_MARKERS = ("do not create a login block", "don't create a login block", "no login block")
@@ -4441,10 +4421,6 @@ async def _classify_request(
     return policy
 
 
-def _quote_in_credential_context(user_message: str, quote_start: int) -> bool:
-    return bool(_CREDENTIAL_QUOTE_CONTEXT_RE.search(user_message[max(0, quote_start - 48) : quote_start]))
-
-
 def _credential_reference_is_negated(user_message: str, reference_start: int) -> bool:
     clause_start = max(user_message.rfind(delimiter, 0, reference_start) for delimiter in (".", "!", "?", "\n", ";"))
     context = user_message[clause_start + 1 : reference_start]
@@ -4480,71 +4456,20 @@ def _credential_authority_text(user_message: str) -> str:
     return f"use {user_message[max(replacement_targets) :].lstrip()}"
 
 
-def _exact_credential_name_candidates(user_message: str) -> list[str]:
-    text = _credential_authority_text(user_message or "")
-    mentions: list[tuple[str, int, bool, bool]] = []
-
-    def add_mention(value: str, start: int, *, context_matches: bool = True) -> None:
-        value = value.strip()
-        if not context_matches or not value or value.lower() in _CREDENTIAL_REFERENCE_STOPWORDS:
-            return
-        mentions.append(
-            (
-                value,
-                start,
-                _credential_reference_is_negated(text, start),
-                _credential_reference_is_unrelated_replacement(text, start),
-            )
-        )
-
-    for match in _QUOTED_CREDENTIAL_NAME_RE.finditer(text):
-        group_index = next((index for index, group in enumerate(match.groups(), start=1) if group), 1)
-        value = (match.group(group_index) or "").strip()
-        add_mention(
-            value,
-            match.start(),
-            context_matches=_quote_in_credential_context(text, match.start()),
-        )
-    for match in _NAMED_CREDENTIAL_TOKEN_RE.finditer(text):
-        add_mention(match.group(1), match.start(1))
-    for match in _DIRECT_CREDENTIAL_TOKEN_RE.finditer(text):
-        add_mention(match.group(1), match.start(1))
-    for match in _POSTFIX_CREDENTIAL_TOKEN_RE.finditer(text):
-        add_mention(match.group(1), match.start(1))
-
-    last_negated_mention = {
-        value: start for value, start, is_negated, is_unrelated in mentions if is_negated and not is_unrelated
-    }
-    return _clean_list(
-        [
-            value
-            for value, start, is_negated, is_unrelated in mentions
-            if not is_negated and not is_unrelated and last_negated_mention.get(value, -1) < start
-        ]
-    )
-
-
-def _credential_name_candidates(user_message: str) -> list[str]:
-    # Classifier refs are model-authored hints, not current-turn credential
-    # authority. Resolve names only from deterministic, affirmative references
-    # in the latest user message.
-    return _exact_credential_name_candidates(user_message)
-
-
 _CREDENTIAL_NAME_MIN_DISTINCTIVE_LENGTH = 4
-# Labels that mean the classifier read this turn as referring to a stored credential at all.
-_CREDENTIAL_REFERENCE_INPUT_KINDS = frozenset({"credential_id", "credential_name", "website_stored_credential"})
 
 
-def _explicit_login_action_asserted(user_message: str) -> bool:
-    """Whether the message asks for a login in its own words, ignoring phrasings that refuse one.
+def _asserted_in_own_words(user_message: str, phrase: re.Pattern[str]) -> bool:
+    """Whether the message uses the phrase affirmatively, ignoring occurrences that refuse one.
 
     Shares the negation rule with saved-name matching, so "do not log in with prod" authorizes neither.
     """
     text = _credential_authority_text(user_message or "")
-    return any(
-        not _credential_reference_is_negated(text, match.start()) for match in _EXPLICIT_LOGIN_ACTION_RE.finditer(text)
-    )
+    return any(not _credential_reference_is_negated(text, match.start()) for match in phrase.finditer(text))
+
+
+def _explicit_login_action_asserted(user_message: str) -> bool:
+    return _asserted_in_own_words(user_message, _EXPLICIT_LOGIN_ACTION_RE)
 
 
 def _wrapper_start(text: str, index: int) -> int:
@@ -4554,47 +4479,78 @@ def _wrapper_start(text: str, index: int) -> int:
     return index
 
 
-def _name_stated_affirmatively(text: str, name: str) -> bool:
+def _name_stated_affirmatively(text: str, name: str, *, min_length: int = 1) -> bool:
     name = (name or "").strip()
-    if len(name) < _CREDENTIAL_NAME_MIN_DISTINCTIVE_LENGTH or name.lower() in _CREDENTIAL_REFERENCE_STOPWORDS:
+    if len(name) < min_length:
         return False
-    pattern = rf"(?<![A-Za-z0-9_.@:-]){re.escape(name)}(?![A-Za-z0-9_.@:-])"
+    # A dot only continues the name when a name character follows it, so a saved name ending a
+    # sentence still matches while `prod` never claims `prod.staging`.
+    pattern = rf"(?<![A-Za-z0-9_.@:-]){re.escape(name)}(?!\.?[A-Za-z0-9_@:-])"
+    last_affirmative = last_negated = -1
     for match in re.finditer(pattern, text, re.IGNORECASE):
         # Negation reads the clause before the reference, and any wrapper around the name belongs to
         # it: from inside the quotes, "credential, `prod`" no longer reads as an appositive.
         start = _wrapper_start(text, match.start())
-        if not _credential_reference_is_negated(text, start) and not _credential_reference_is_unrelated_replacement(
-            text, start
-        ):
-            return True
-    return False
+        if _credential_reference_is_unrelated_replacement(text, start):
+            continue
+        if _credential_reference_is_negated(text, start):
+            last_negated = start
+        else:
+            last_affirmative = start
+    # A name the message goes on to exclude is withdrawn, however affirmatively it was stated first.
+    return last_affirmative > last_negated
 
 
-def _saved_credential_names_mentioned(user_message: str, credentials: list[Credential]) -> list[str]:
-    """Saved names a message states outright, e.g. "use skyvern-datadog to login".
+def _saved_credential_names_mentioned(
+    policy: RequestPolicy, user_message: str, credentials: list[Credential]
+) -> list[str]:
+    """Saved names this turn refers to: the names read out of the message, kept when the org has a
+    credential by that name.
 
-    The saved names are known, so match on them rather than on the prose around them.
+    Searching the message for each saved name instead would match any text that happens to equal
+    one — "rename the hex block", or a `/hex` path inside a URL — so the reading is left to the
+    model and this checks its answer against what the org actually has. The message is still read
+    for negation, which the extraction does not carry.
     """
     text = _credential_authority_text(user_message or "")
+    stated = {
+        ref.strip().casefold()
+        for ref in policy.credential_refs
+        if isinstance(ref, str) and ref.strip() and _name_stated_affirmatively(text, ref.strip())
+    }
+    # Names are not unique and differ freely in case, so every saved name a ref could mean is a
+    # candidate and the picker asks, rather than one of them being bound on the org's row order.
     return _clean_list(
         [
             (credential.name or "").strip()
             for credential in credentials
-            if _name_stated_affirmatively(text, credential.name or "")
+            if (credential.name or "").strip().casefold() in stated
         ]
     )
 
 
-def _classifier_ref_stated_in_message(policy: RequestPolicy, user_message: str) -> bool:
-    """Whether a credential-labelled turn's extracted name appears affirmatively in this message.
+def _classifier_refs_stated_in_message(
+    policy: RequestPolicy, user_message: str, *, min_length: int = _CREDENTIAL_NAME_MIN_DISTINCTIVE_LENGTH
+) -> list[str]:
+    """Names read out of this message that it also states affirmatively.
 
-    Which credential label the classifier chose must not decide whether a name the user wrote is
-    looked up by name (SKY-12917), but a turn it never called a credential request may not scan.
+    Not credential authority — the org's saved names decide that; this only lets the turn name a
+    credential it could not find. Which label the reading carried does not gate it (SKY-12917).
     """
-    if policy.classifier_status == "fallback" or policy.credential_input_kind not in _CREDENTIAL_REFERENCE_INPUT_KINDS:
-        return False
+    if policy.classifier_status == "fallback":
+        return []
     text = _credential_authority_text(user_message or "")
-    return any(isinstance(ref, str) and _name_stated_affirmatively(text, ref) for ref in policy.credential_refs)
+    return _clean_list(
+        [
+            ref
+            for ref in policy.credential_refs
+            if isinstance(ref, str)
+            and not _CREDENTIAL_ID_RE.fullmatch(ref)
+            # A model-authored ref is not a known name, so it still needs to look like one before it
+            # can be echoed back to the user.
+            and _name_stated_affirmatively(text, ref, min_length=min_length)
+        ]
+    )
 
 
 def _explicit_credential_ids(user_message: str) -> list[str]:
@@ -4725,7 +4681,9 @@ def _has_resolvable_credential_scope(policy: RequestPolicy, user_message: str = 
         return False
     if _explicit_credential_ids(user_message):
         return True
-    if _credential_name_candidates(user_message):
+    # Whether a name is distinctive enough to quote back at the user is a different question from
+    # whether the turn named a credential at all, and a saved `qa` answers the second one.
+    if _classifier_refs_stated_in_message(policy, user_message, min_length=1):
         return True
     if policy.login_page_urls:
         return True
@@ -4955,9 +4913,9 @@ def _can_defer_unresolved_credential_name_for_draft(
 ) -> bool:
     if policy.clarification_reason != "credential_name_unresolved":
         return False
-    # A classifier-carried name may justify leaving an unvalidated placeholder
-    # in a draft, but _credential_name_candidates still requires current-turn
-    # anchoring before the name can enter resolved_credentials and authorize a run.
+    # A classifier-carried name may justify leaving an unvalidated placeholder in a draft, but a
+    # name still has to match a saved credential before it can enter resolved_credentials and
+    # authorize a run.
     if policy.credential_refs:
         return True
     if _has_resolvable_credential_scope(policy, user_message):
@@ -5026,26 +4984,21 @@ async def _resolve_credentials(
         return
 
     # `login_intent` is a classifier-authored hint that misses on runs where the model does not set
-    # it, so a message asking for a login in its own words must still count. A classifier that failed
-    # outright is a different case: a degraded turn never enumerates the org's saved credentials.
+    # it, so a message asking for a login or naming a credential in its own words must still count. A
+    # classifier that failed outright is a different case: a degraded turn never enumerates the org's
+    # saved credentials.
+    stated_refs = _classifier_refs_stated_in_message(policy, user_message)
     login_phrase_asserted = _explicit_login_action_asserted(user_message)
-    may_scan_saved_names = (
-        policy.login_intent
-        or (policy.classifier_status != "fallback" and login_phrase_asserted)
-        or _classifier_ref_stated_in_message(policy, user_message)
-    )
-    name_candidates = _credential_name_candidates(user_message)
+    # Only a turn that reported a name has anything to look up, so a message about nothing of the
+    # kind never reads the org's credentials.
     credentials: list[Credential] | None = None
-    # Only a request that already asserts a login or credential intent may be matched against the
-    # org's saved names; without that gate an unrelated message would scan the credential list.
-    if not name_candidates and may_scan_saved_names:
+    name_candidates: list[str] = []
+    if policy.credential_refs:
         credentials = await _load_credentials(organization_id)
-        name_candidates = _saved_credential_names_mentioned(user_message, credentials)
-    if name_candidates:
-        if credentials is None:
-            credentials = await _load_credentials(organization_id)
+        name_candidates = _saved_credential_names_mentioned(policy, user_message, credentials)
+    if name_candidates or stated_refs:
         named_matches = _deduplicate_credentials(
-            [credential for credential in credentials if credential.name in name_candidates]
+            [credential for credential in credentials or [] if credential.name in name_candidates]
         )
         if len(named_matches) == 1:
             policy.resolved_credentials = named_matches
@@ -5087,9 +5040,9 @@ async def _resolve_credentials(
             policy.allow_run_blocks = False
             return
         question = (
-            f"I could not find a stored credential named `{name_candidates[0]}`. Please choose an existing credential "
+            f"I could not find a stored credential named `{stated_refs[0]}`. Please choose an existing credential "
             "by exact name or a credential ID beginning with cred_."
-            if policy.credential_input_kind == "credential_name"
+            if policy.credential_input_kind == "credential_name" and stated_refs
             else _clarification_question(policy)
         )
         _block(
