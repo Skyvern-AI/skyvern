@@ -32,8 +32,8 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _can_defer_unresolved_credential_name_for_draft,
     _classification_from_raw,
     _clean_email_list,
-    _exact_credential_name_candidates,
     _ground_user_provided_sites,
+    _has_resolvable_credential_scope,
     _resolve_credentials,
     _saved_credential_names_mentioned,
     _seed_prior_approved_credentials,
@@ -352,10 +352,10 @@ async def test_fallback_code_block_credential_request_saves_draft_without_runnin
             handler=None,
         )
 
+    # Names are read by the model, so a turn with no classifier resolves none — the draft still
+    # saves without running, which is what this fallback owes the user.
     assert policy.classifier_status == "fallback"
-    assert policy.credential_input_kind == "credential_name"
-    assert policy.credential_refs == ["mock-portal-login-email-otp"]
-    assert policy.resolved_credentials == [credential]
+    assert policy.resolved_credentials == []
     assert policy.allow_update_workflow is True
     assert policy.allow_run_blocks is False
     assert policy.allow_missing_credentials_in_draft is True
@@ -506,11 +506,17 @@ async def _build_with_forced_classifier(
     "kind",
     ["none", "credential_id", "credential_name", "website_stored_credential", "placeholder"],
 )
-async def test_success_empty_refs_resolves_named_credential(kind: str) -> None:
+async def test_an_extracted_name_resolves_under_any_credential_label(kind: str) -> None:
+    """Which label the classifier chose must not decide whether the name it read is looked up
+    (SKY-12917); the name itself is the signal. A name it never read resolves nothing — reading the
+    message is the model's job, and searching prose for each saved name matched things like a `/hex`
+    URL segment."""
     credential = _cred("mock-portal-login", "cred_login")
     policy = await _build_with_forced_classifier(
         user_message="Sign in with the saved credential named mock-portal-login.",
-        classifier_policy=RequestPolicy(credential_input_kind=kind, classifier_status="success"),
+        classifier_policy=RequestPolicy(
+            credential_input_kind=kind, credential_refs=["mock-portal-login"], classifier_status="success"
+        ),
         org_credentials=[credential, _cred("other", "cred_other")],
     )
 
@@ -528,6 +534,7 @@ async def test_success_website_kind_with_nonmatching_url_resolves_named_credenti
     policy = await _build_with_forced_classifier(
         user_message="Log in with the saved credential named mock-portal-login here.",
         classifier_policy=RequestPolicy(
+            credential_refs=["mock-portal-login"],
             credential_input_kind="website_stored_credential",
             login_page_urls=["https://unrelated.example.com/login"],
             classifier_status="success",
@@ -547,6 +554,7 @@ async def test_success_website_kind_prefers_named_credential_over_matching_url()
     policy = await _build_with_forced_classifier(
         user_message="Log in with the saved credential named other-login.",
         classifier_policy=RequestPolicy(
+            credential_refs=["other-login"],
             credential_input_kind="website_stored_credential",
             login_page_urls=["https://portal.example.com/login"],
             classifier_status="success",
@@ -576,13 +584,24 @@ async def _resolve_direct(
     return load_mock, by_ids_mock
 
 
-@pytest.mark.parametrize(
-    "user_message",
-    ["Use credential ID cred_current.", "Use the saved credential named current-login."],
-)
-def test_draft_deferral_recognizes_current_turn_credential_scope(user_message: str) -> None:
+_CURRENT_TURN_CREDENTIAL_SCOPES = [
+    pytest.param("Use credential ID cred_current.", "none", [], id="explicit_id"),
+    pytest.param(
+        "Use the saved credential named current-login.",
+        "credential_name",
+        ["current-login"],
+        id="corroborated_name",
+    ),
+]
+
+
+@pytest.mark.parametrize(("user_message", "kind", "credential_refs"), _CURRENT_TURN_CREDENTIAL_SCOPES)
+def test_draft_deferral_recognizes_current_turn_credential_scope(
+    user_message: str, kind: str, credential_refs: list[str]
+) -> None:
     policy = RequestPolicy(
-        credential_input_kind="none",
+        credential_input_kind=kind,
+        credential_refs=credential_refs,
         clarification_reason="credential_name_unresolved",
     )
 
@@ -593,13 +612,13 @@ def test_draft_deferral_recognizes_current_turn_credential_scope(user_message: s
     )
 
 
-@pytest.mark.parametrize(
-    "user_message",
-    ["Use credential ID cred_current.", "Use the saved credential named current-login."],
-)
-def test_repeated_question_deferral_preserves_current_turn_credential_scope(user_message: str) -> None:
+@pytest.mark.parametrize(("user_message", "kind", "credential_refs"), _CURRENT_TURN_CREDENTIAL_SCOPES)
+def test_repeated_question_deferral_preserves_current_turn_credential_scope(
+    user_message: str, kind: str, credential_refs: list[str]
+) -> None:
     policy = RequestPolicy(
-        credential_input_kind="none",
+        credential_input_kind=kind,
+        credential_refs=credential_refs,
         clarification_reason="credential_name_unresolved",
     )
     history = [
@@ -641,6 +660,40 @@ async def test_name_miss_does_not_advance_to_classifier_only_url() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["credential_name", "credential_id", "website_stored_credential"])
+async def test_an_unmatched_stated_name_asks_instead_of_binding_another_credential(kind: str) -> None:
+    """Naming a credential the org does not have must ask, not let the sole-credential rule hand
+    the turn a different one by elimination, whichever credential label carried the ref."""
+    unrelated = _cred("personal-bank", "cred_bank")
+    policy = RequestPolicy(credential_input_kind=kind, credential_refs=["acme-prd"], login_intent=True)
+
+    await _resolve_direct(
+        policy,
+        user_message="Log in to https://acme.example.com/login with credential acme-prd.",
+        org_credentials=[unrelated],
+    )
+
+    assert policy.resolved_credentials == []
+    assert policy.auto_bound_credentials == []
+
+
+@pytest.mark.asyncio
+async def test_a_vague_credential_reference_still_resolves_the_sole_credential() -> None:
+    """ "Use my credential" with exactly one saved credential has an obvious answer; asking which
+    one would be a question with one option."""
+    sole = _cred("personal-bank", "cred_bank")
+    policy = RequestPolicy(credential_input_kind="credential_name", login_intent=True)
+
+    await _resolve_direct(
+        policy,
+        user_message="Log in to https://acme.example.com/login with my credential.",
+        org_credentials=[sole],
+    )
+
+    assert [credential.credential_id for credential in policy.resolved_credentials] == ["cred_bank"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("name", ["abc", "spare-portal"], ids=["three_char", "twelve_char"])
 async def test_url_less_ambiguity_is_independent_of_credential_name_length(name: str) -> None:
     policy = await _build_with_forced_classifier(
@@ -664,13 +717,9 @@ async def test_url_less_ambiguity_is_independent_of_credential_name_length(name:
     "kind",
     ["none", "raw_secret", "credential_id", "credential_name", "website_stored_credential", "placeholder"],
 )
-@pytest.mark.parametrize("credential_refs", [[], ["mock-portal-login"]], ids=["without_refs", "with_refs"])
-async def test_resolver_exact_name_is_independent_of_classifier_label(
-    kind: str,
-    credential_refs: list[str],
-) -> None:
+async def test_resolver_exact_name_is_independent_of_classifier_label(kind: str) -> None:
     credential = _cred("mock-portal-login", "cred_login")
-    policy = RequestPolicy(credential_input_kind=kind, credential_refs=credential_refs)
+    policy = RequestPolicy(credential_input_kind=kind, credential_refs=["mock-portal-login"])
 
     await _resolve_direct(
         policy,
@@ -686,7 +735,6 @@ async def test_resolver_exact_name_is_independent_of_classifier_label(
 @pytest.mark.asyncio
 async def test_explicit_id_wins_and_skips_name_and_url_scan() -> None:
     by_ids = AsyncMock(return_value=[_cred("id-login", "cred_explicit")])
-    load_mock = AsyncMock(side_effect=AssertionError("organization scan should not run after an ID hit"))
     policy = RequestPolicy(
         credential_input_kind="credential_id",
         credential_refs=["cred_explicit", "named-login"],
@@ -697,13 +745,11 @@ async def test_explicit_id_wins_and_skips_name_and_url_scan() -> None:
         policy,
         user_message="Use credential ID cred_explicit and the saved credential named named-login.",
         org_credentials=[],
-        get_credentials=load_mock,
         get_credentials_by_ids=by_ids,
     )
 
     assert [candidate.credential_id for candidate in policy.resolved_credentials] == ["cred_explicit"]
     by_ids.assert_awaited_once_with(["cred_explicit"], organization_id="o_test")
-    load_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -711,7 +757,6 @@ async def test_explicit_id_wins_for_non_id_label_and_competing_url_match() -> No
     explicit = _cred("id-login", "cred_explicit")
     competing = _cred("url-login", "cred_url", tested_url="https://portal.example.com/login")
     by_ids = AsyncMock(return_value=[explicit])
-    load_mock = AsyncMock(side_effect=AssertionError("organization scan should not run after an ID hit"))
     policy = RequestPolicy(
         credential_input_kind="website_stored_credential",
         credential_refs=["cred_explicit"],
@@ -722,13 +767,11 @@ async def test_explicit_id_wins_for_non_id_label_and_competing_url_match() -> No
         policy,
         user_message="Use credential ID cred_explicit for https://portal.example.com/login.",
         org_credentials=[competing],
-        get_credentials=load_mock,
         get_credentials_by_ids=by_ids,
     )
 
     assert [candidate.credential_id for candidate in policy.resolved_credentials] == ["cred_explicit"]
     by_ids.assert_awaited_once_with(["cred_explicit"], organization_id="o_test")
-    load_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -774,6 +817,7 @@ async def test_classifier_id_absent_from_current_message_does_not_resolve() -> N
         "Avoid using cred_prod.",
         "Exclude credential ID cred_prod.",
         "Do not use the old workflow because it still mentions credential ID cred_prod.",
+        "Do not use the old workflow because it mentions cred_prod.",
         "Do not use this credential, credential ID cred_prod.",
     ],
 )
@@ -907,7 +951,7 @@ async def test_chained_replacement_uses_final_affirmative_id() -> None:
 async def test_unrelated_replacement_does_not_grant_credential_id_authority() -> None:
     alpha = _cred("alpha", "cred_alpha")
     by_ids = AsyncMock(side_effect=AssertionError("documentation ID must not gain credential authority"))
-    policy = RequestPolicy(credential_input_kind="credential_name")
+    policy = RequestPolicy(credential_input_kind="credential_name", credential_refs=["alpha"])
 
     await _resolve_direct(
         policy,
@@ -923,7 +967,7 @@ async def test_unrelated_replacement_does_not_grant_credential_id_authority() ->
 @pytest.mark.asyncio
 async def test_unrelated_replacement_does_not_grant_credential_name_authority() -> None:
     unrelated = _cred("new-login", "cred_new")
-    policy = RequestPolicy(credential_input_kind="credential_name")
+    policy = RequestPolicy(credential_input_kind="credential_name", credential_refs=["alpha", "new-login"])
 
     await _resolve_direct(
         policy,
@@ -939,7 +983,7 @@ async def test_unrelated_replacement_does_not_grant_credential_name_authority() 
 @pytest.mark.asyncio
 async def test_unrelated_replacement_does_not_grant_postfix_credential_name_authority() -> None:
     unrelated = _cred("new-login", "cred_new")
-    policy = RequestPolicy(credential_input_kind="credential_name")
+    policy = RequestPolicy(credential_input_kind="credential_name", credential_refs=["alpha", "new-login"])
 
     await _resolve_direct(
         policy,
@@ -987,7 +1031,6 @@ async def test_bare_id_appositive_negation_revokes_earlier_authority() -> None:
 
 @pytest.mark.asyncio
 async def test_invalid_explicit_id_does_not_fall_through_to_name() -> None:
-    load_mock = AsyncMock(side_effect=AssertionError("organization scan should not run after an explicit ID"))
     policy = RequestPolicy(
         credential_input_kind="credential_id",
         credential_refs=["cred_missing", "named-login"],
@@ -997,20 +1040,18 @@ async def test_invalid_explicit_id_does_not_fall_through_to_name() -> None:
         policy,
         user_message="Use credential ID cred_missing and the saved credential named named-login.",
         org_credentials=[],
-        get_credentials=load_mock,
     )
 
     assert policy.invalid_credential_ids == ["cred_missing"]
     assert policy.clarification_reason == "credential_name_unresolved"
     assert policy.credential_ask_card_answerable is False
     assert credential_pause_reason(SimpleNamespace(request_policy=policy)) is None
-    load_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_duplicate_name_hits_are_deduplicated_by_credential_id() -> None:
     credential = _cred("named-login", "cred_named")
-    policy = RequestPolicy(credential_input_kind="placeholder")
+    policy = RequestPolicy(credential_input_kind="placeholder", credential_refs=["named-login"])
 
     await _resolve_direct(
         policy,
@@ -1025,6 +1066,7 @@ async def test_duplicate_name_hits_are_deduplicated_by_credential_id() -> None:
 @pytest.mark.asyncio
 async def test_multiple_name_hits_keep_the_existing_picker_and_skip_url() -> None:
     policy = RequestPolicy(
+        credential_refs=["shared-login"],
         credential_input_kind="website_stored_credential",
         login_page_urls=["https://portal.example.com/login"],
         login_intent=True,
@@ -1058,6 +1100,7 @@ async def test_name_collision_candidates_are_not_labelled_safe_matches() -> None
     must not call them safe matches even when every one of them has been tested somewhere.
     """
     policy = RequestPolicy(
+        credential_refs=["shared-login"],
         credential_input_kind="website_stored_credential",
         login_page_urls=["https://portal.example.com/login"],
         login_intent=True,
@@ -1129,7 +1172,7 @@ async def test_zero_hit_policy_is_byte_identical_for_each_label(
 ) -> None:
     policy = RequestPolicy(credential_input_kind=kind)
 
-    load_mock, by_ids = await _resolve_direct(
+    _, by_ids = await _resolve_direct(
         policy,
         user_message="Continue with the workflow.",
         org_credentials=[],
@@ -1143,7 +1186,6 @@ async def test_zero_hit_policy_is_byte_identical_for_each_label(
         policy.clarification_reason,
         policy.clarification_question,
     ) == expected
-    load_mock.assert_not_awaited()
     by_ids.assert_not_awaited()
 
 
@@ -1153,6 +1195,7 @@ async def test_build_path_named_candidate_overrides_only_credential_target_clari
         user_message="Sign in with the saved credential named mock-portal-login.",
         classifier_policy=RequestPolicy(
             credential_input_kind="website_stored_credential",
+            credential_refs=["mock-portal-login"],
             requires_user_clarification=True,
             clarification_reason="missing_target_context",
             classifier_status="success",
@@ -1171,7 +1214,6 @@ async def test_build_path_named_candidate_overrides_only_credential_target_clari
 
 @pytest.mark.asyncio
 async def test_classifier_stale_name_ref_without_current_message_anchor_does_not_resolve() -> None:
-    load_mock = AsyncMock(side_effect=AssertionError("stale classifier refs must not scan credentials"))
     policy = await _build_with_forced_classifier(
         user_message="Continue with the workflow.",
         classifier_policy=RequestPolicy(
@@ -1180,12 +1222,10 @@ async def test_classifier_stale_name_ref_without_current_message_anchor_does_not
             classifier_status="success",
         ),
         org_credentials=[],
-        get_credentials=load_mock,
     )
 
     assert policy.resolved_credentials == []
     assert policy.clarification_reason == "none"
-    load_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1203,7 +1243,6 @@ async def test_classifier_stale_name_ref_without_current_message_anchor_does_not
     ],
 )
 async def test_classifier_name_ref_requires_exact_affirmative_credential_context(user_message: str) -> None:
-    load_mock = AsyncMock(side_effect=AssertionError("untrusted classifier refs must not scan credentials"))
     policy = RequestPolicy(
         credential_input_kind="credential_name",
         credential_refs=["prod"],
@@ -1213,11 +1252,9 @@ async def test_classifier_name_ref_requires_exact_affirmative_credential_context
         policy,
         user_message=user_message,
         org_credentials=[],
-        get_credentials=load_mock,
     )
 
     assert policy.resolved_credentials == []
-    load_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1232,6 +1269,7 @@ async def test_later_affirmative_name_resolves_after_excluded_name(user_message:
     policy = RequestPolicy(
         credential_input_kind="credential_name",
         credential_refs=["old", "new"],
+        login_intent=True,
     )
 
     await _resolve_direct(
@@ -1323,7 +1361,7 @@ async def test_credential_grammar_word_does_not_preempt_message_url_resolution()
 async def test_replacement_name_discards_superseded_candidate() -> None:
     old = _cred("old-login", "cred_old")
     new = _cred("new-login", "cred_new")
-    policy = RequestPolicy(credential_input_kind="credential_name")
+    policy = RequestPolicy(credential_input_kind="credential_name", credential_refs=["old-login", "new-login"])
 
     await _resolve_direct(
         policy,
@@ -1338,7 +1376,7 @@ async def test_replacement_name_discards_superseded_candidate() -> None:
 async def test_postfix_replacement_name_discards_superseded_candidate() -> None:
     old = _cred("old-login", "cred_old")
     new = _cred("new-login", "cred_new")
-    policy = RequestPolicy(credential_input_kind="credential_name")
+    policy = RequestPolicy(credential_input_kind="credential_name", credential_refs=["new-login"])
 
     await _resolve_direct(
         policy,
@@ -1354,7 +1392,9 @@ async def test_chained_replacement_name_uses_final_affirmative_candidate() -> No
     old = _cred("old-login", "cred_old")
     new = _cred("new-login", "cred_new")
     final = _cred("final-login", "cred_final")
-    policy = RequestPolicy(credential_input_kind="credential_name")
+    policy = RequestPolicy(
+        credential_input_kind="credential_name", credential_refs=["old-login", "new-login", "final-login"]
+    )
 
     await _resolve_direct(
         policy,
@@ -1371,7 +1411,7 @@ async def test_chained_replacement_name_uses_final_affirmative_candidate() -> No
 @pytest.mark.asyncio
 async def test_unrelated_switch_preserves_credential_name_authority() -> None:
     credential = _cred("prod-login", "cred_prod")
-    policy = RequestPolicy(credential_input_kind="credential_name")
+    policy = RequestPolicy(credential_input_kind="credential_name", credential_refs=["prod-login"])
 
     await _resolve_direct(
         policy,
@@ -1537,6 +1577,7 @@ async def test_website_kind_explicit_name_wins_over_url_matched_card() -> None:
         ),
         classifier_policy=RequestPolicy(
             credential_input_kind="website_stored_credential",
+            credential_refs=["analytics-login"],
             login_page_urls=["https://portal.example.com/login"],
             login_intent=True,
             classifier_status="success",
@@ -1553,7 +1594,6 @@ async def test_website_kind_explicit_name_wins_over_url_matched_card() -> None:
     )
 
     assert policy.credential_input_kind == "website_stored_credential"
-    assert policy.credential_refs == []
     assert [c.credential_id for c in policy.resolved_credentials] == ["cred_named"]
     assert policy.requires_user_clarification is False
     assert policy.clarification_question is None
@@ -1562,7 +1602,6 @@ async def test_website_kind_explicit_name_wins_over_url_matched_card() -> None:
 @pytest.mark.asyncio
 async def test_success_credential_id_intent_is_not_overridden_by_name_scan() -> None:
     by_ids = AsyncMock(return_value=[_cred("real", "cred_real")])
-    load_mock = AsyncMock(return_value=[_cred("mock-portal-login", "cred_login")])
     policy = await _build_with_forced_classifier(
         user_message="Use cred_real, the saved credential named mock-portal-login.",
         classifier_policy=RequestPolicy(
@@ -1571,13 +1610,11 @@ async def test_success_credential_id_intent_is_not_overridden_by_name_scan() -> 
             classifier_status="success",
         ),
         org_credentials=[],
-        get_credentials=load_mock,
         get_credentials_by_ids=by_ids,
     )
 
     assert policy.credential_input_kind == "credential_id"
     assert [c.credential_id for c in policy.resolved_credentials] == ["cred_real"]
-    load_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1618,7 +1655,9 @@ async def test_success_pre_resolution_clarification_is_preserved() -> None:
 async def test_success_ambiguous_named_credentials_clarify_for_normal_request() -> None:
     policy = await _build_with_forced_classifier(
         user_message="Use the credential named alpha or the credential named beta to sign in.",
-        classifier_policy=RequestPolicy(credential_input_kind="none", classifier_status="success"),
+        classifier_policy=RequestPolicy(
+            credential_input_kind="credential_name", credential_refs=["alpha", "beta"], classifier_status="success"
+        ),
         org_credentials=[_cred("alpha", "cred_alpha"), _cred("beta", "cred_beta")],
     )
 
@@ -1645,39 +1684,35 @@ async def test_success_ambiguous_named_credentials_draft_unbound_for_explicit_dr
 
 @pytest.mark.asyncio
 async def test_success_incidental_quote_out_of_credential_context_is_not_rewritten() -> None:
-    load_mock = AsyncMock(return_value=[_cred("mock-portal-login", "cred_login")])
     policy = await _build_with_forced_classifier(
         user_message='Set the page title to "mock-portal-login" before saving.',
         classifier_policy=RequestPolicy(credential_input_kind="none", classifier_status="success"),
         org_credentials=[],
-        get_credentials=load_mock,
     )
 
     assert policy.credential_input_kind == "none"
     assert policy.resolved_credentials == []
-    load_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_success_quote_after_word_containing_login_substring_is_not_context() -> None:
-    load_mock = AsyncMock(return_value=[_cred("mock-portal-login", "cred_login")])
     policy = await _build_with_forced_classifier(
         user_message='Publish the blog in the section titled "mock-portal-login".',
         classifier_policy=RequestPolicy(credential_input_kind="none", classifier_status="success"),
         org_credentials=[],
-        get_credentials=load_mock,
     )
 
     assert policy.credential_input_kind == "none"
     assert policy.resolved_credentials == []
-    load_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_success_quoted_name_in_credential_context_resolves() -> None:
     policy = await _build_with_forced_classifier(
         user_message='Sign in using the saved credential "mock-portal-login".',
-        classifier_policy=RequestPolicy(credential_input_kind="credential_name", classifier_status="success"),
+        classifier_policy=RequestPolicy(
+            credential_input_kind="credential_name", credential_refs=["mock-portal-login"], classifier_status="success"
+        ),
         org_credentials=[_cred("mock-portal-login", "cred_login")],
     )
 
@@ -1699,7 +1734,7 @@ async def test_success_zero_name_match_falls_through_to_clarification() -> None:
 
 @pytest.mark.asyncio
 async def test_success_raw_secret_blocks_name_scan_before_loading_credentials() -> None:
-    load_mock = AsyncMock(return_value=[_cred("mock-portal-login", "cred_login")])
+    load_mock = AsyncMock(side_effect=AssertionError("a raw-secret turn must not read the credential list"))
     policy = await _build_with_forced_classifier(
         user_message="Sign in with the saved credential named mock-portal-login.",
         classifier_policy=RequestPolicy(
@@ -2040,21 +2075,17 @@ async def test_login_intent_none_kind_bare_host_message_does_not_trigger_url_res
 
 
 @pytest.mark.asyncio
-async def test_login_intent_false_none_kind_never_loads_credentials_for_message_url() -> None:
-    with patch(
-        "skyvern.forge.sdk.copilot.request_policy._load_credentials",
-        new=AsyncMock(side_effect=AssertionError("_load_credentials should not be called")),
-    ):
-        policy = await _build_with_forced_classifier(
-            user_message="Go to http://localhost:8941/analytics_console/ and inspect the page.",
-            classifier_policy=RequestPolicy(
-                login_intent=False,
-                credential_input_kind="none",
-                login_page_urls=[],
-                classifier_status="success",
-            ),
-            org_credentials=[],
-        )
+async def test_login_intent_false_none_kind_binds_nothing_for_a_message_url() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Go to http://localhost:8941/analytics_console/ and inspect the page.",
+        classifier_policy=RequestPolicy(
+            login_intent=False,
+            credential_input_kind="none",
+            login_page_urls=[],
+            classifier_status="success",
+        ),
+        org_credentials=[],
+    )
 
     assert policy.user_response_policy == "proceed"
     assert policy.resolved_credentials == []
@@ -2768,17 +2799,51 @@ def test_a_named_credential_resolves_without_the_word_credential() -> None:
     """ "use skyvern-datadog to login" names the credential outright. The pattern-based candidates
     only fire when the message also says "credential", which left this resolving nothing."""
     credentials = [SimpleNamespace(name="skyvern-datadog"), SimpleNamespace(name="skyvern-posthog")]
+    policy = RequestPolicy(credential_input_kind="credential_name", credential_refs=["skyvern-datadog"])
 
-    assert _saved_credential_names_mentioned("use skyvern-datadog to login.", credentials) == ["skyvern-datadog"]
+    assert _saved_credential_names_mentioned(policy, "use skyvern-datadog to login.", credentials) == [
+        "skyvern-datadog"
+    ]
 
 
-def test_contraction_apostrophe_does_not_open_a_bogus_quoted_name() -> None:
-    """A contraction's apostrophe once paired with a later quote and swallowed the span between them as
-    a credential name (e.g. from "I've connected the credential 'hex'"). It must extract only 'hex'."""
-    candidates = _exact_credential_name_candidates("I've connected the credential 'hex' — continue.")
+@pytest.mark.parametrize(
+    "user_message",
+    [
+        "use the saved credential named prod-account",
+        "use credential prod-account",
+        "use the prod-account credential",
+        "use the credential called prod-account",
+        "log in with prod-account",
+        "sign in using prod-account",
+        "grab the invoice with prod-account",
+        "use `prod-account` to log in",
+        "I've connected the credential 'prod-account' — continue.",
+    ],
+)
+def test_a_saved_name_resolves_however_the_message_phrases_it(user_message: str) -> None:
+    """A saved name is recognised however the sentence is built, including without the word "credential"."""
+    credentials = [SimpleNamespace(name="prod-account"), SimpleNamespace(name="skyvern-posthog")]
+    policy = RequestPolicy(credential_input_kind="credential_name", credential_refs=["prod-account"])
 
-    assert "hex" in candidates
-    assert not any("connected" in candidate for candidate in candidates)
+    assert _saved_credential_names_mentioned(policy, user_message, credentials) == ["prod-account"]
+
+
+@pytest.mark.parametrize(
+    "user_message",
+    [
+        "Use credential ID cred_x for the portal.",
+        "log in with the credential",
+        "use my credential to sign in",
+        "use the saved credential",
+        "just log in please",
+    ],
+)
+def test_prose_around_the_word_credential_is_never_a_candidate(user_message: str) -> None:
+    """Prose around the word "credential" names no credential: a candidate is a saved name or nothing."""
+    credentials = [SimpleNamespace(name="prod-account"), SimpleNamespace(name="skyvern-posthog")]
+    policy = RequestPolicy(credential_input_kind="none")
+
+    assert _saved_credential_names_mentioned(policy, user_message, credentials) == []
 
 
 @pytest.mark.asyncio
@@ -2787,7 +2852,9 @@ async def test_a_named_credential_resolves_when_the_classifier_misses_login_inte
     it alone let the classifier veto a message that says "log in" outright — the very case this
     resolves. The deterministic login phrasing must reach the scan on its own."""
     named = SimpleNamespace(credential_id="cred_datadog", name="skyvern-datadog", credential_type="password")
-    policy = RequestPolicy(credential_input_kind="skyvern_stored_credential", login_intent=False)
+    policy = RequestPolicy(
+        credential_input_kind="skyvern_stored_credential", login_intent=False, credential_refs=["skyvern-datadog"]
+    )
 
     await _resolve_direct(policy, user_message="use skyvern-datadog to login.", org_credentials=[named])
 
@@ -2796,8 +2863,49 @@ async def test_a_named_credential_resolves_when_the_classifier_misses_login_inte
 
 def test_a_negated_saved_name_is_not_treated_as_a_reference() -> None:
     credentials = [SimpleNamespace(name="skyvern-datadog")]
+    policy = RequestPolicy(credential_input_kind="credential_name", credential_refs=["skyvern-datadog"])
 
-    assert _saved_credential_names_mentioned("do not use skyvern-datadog", credentials) == []
+    assert _saved_credential_names_mentioned(policy, "do not use skyvern-datadog", credentials) == []
+
+
+@pytest.mark.parametrize("user_message", ["use hex to log in", "log in with qa"])
+def test_a_short_saved_name_is_still_a_reference(user_message: str) -> None:
+    """Orgs do keep two- and three-character credential names, and naming one is the whole point of
+    saying it out loud; only a model-authored ref needs a distinctiveness floor."""
+    credentials = [SimpleNamespace(name="hex"), SimpleNamespace(name="qa")]
+    policy = RequestPolicy(credential_input_kind="credential_name", credential_refs=["hex", "qa"])
+
+    assert _saved_credential_names_mentioned(policy, user_message, credentials) != []
+
+
+def test_a_short_saved_name_holds_off_the_clarification_question() -> None:
+    """A name the org actually has must reach resolution whatever its length; asking instead sends
+    the user back to retype the name they already gave."""
+    policy = RequestPolicy(
+        credential_input_kind="credential_name",
+        credential_refs=["qa"],
+        requires_user_clarification=True,
+        clarification_reason="credential_name_unresolved",
+    )
+
+    assert _has_resolvable_credential_scope(policy, "log in with qa") is True
+
+
+@pytest.mark.asyncio
+async def test_saved_names_differing_only_in_case_reach_the_picker() -> None:
+    """Credential names carry no unique index, so `Prod` and `prod` are two credentials and the turn
+    has to ask which is meant instead of binding whichever the org saved last."""
+    policy = RequestPolicy(credential_input_kind="credential_name", credential_refs=["Prod"], login_intent=True)
+
+    await _resolve_direct(
+        policy,
+        user_message="Use the saved credential Prod.",
+        org_credentials=[_cred("Prod", "cred_upper"), _cred("prod", "cred_lower")],
+    )
+
+    assert policy.resolved_credentials == []
+    assert policy.requires_user_clarification is True
+    assert policy.clarification_reason == "credential_name_unresolved"
 
 
 async def _admit(
@@ -3272,30 +3380,30 @@ async def test_a_credential_labelled_turn_looks_a_written_name_up_by_name(kind: 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["none", "placeholder"])
-async def test_a_turn_the_classifier_never_called_a_credential_request_does_not_scan(kind: str) -> None:
+@pytest.mark.parametrize("kind", ["none", "placeholder", "credential_name"])
+async def test_a_ref_the_message_never_states_resolves_nothing(kind: str) -> None:
+    """What keeps an unrelated turn away from the credential list is the ref being absent from the
+    message, not which label the classifier chose — it labels a bare name a credential request."""
     policy = RequestPolicy(credential_input_kind=kind, credential_refs=["analytics-login"])
-    load_mock, _ = await _resolve_direct(
+    _, _ = await _resolve_direct(
         policy,
-        user_message="Use analytics-login here.",
+        user_message="Continue with the workflow.",
         org_credentials=[_cred("analytics-login", "cred_analytics")],
-        get_credentials=AsyncMock(side_effect=AssertionError("a non-credential turn must not scan")),
     )
 
     assert policy.resolved_credentials == []
-    load_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_a_degraded_classifier_never_enumerates_saved_credentials(kind: str = "credential_name") -> None:
-    policy = RequestPolicy(
-        credential_input_kind=kind, credential_refs=["analytics-login"], classifier_status="fallback"
-    )
+async def test_a_degraded_classifier_never_enumerates_saved_credentials() -> None:
+    """A turn the classifier could not read reports no name, and a turn with no name to look up
+    never reads the org's credentials (GOTCHAS 23)."""
+    policy = RequestPolicy(credential_input_kind="none", classifier_status="fallback")
     load_mock, _ = await _resolve_direct(
         policy,
         user_message="Use analytics-login here.",
         org_credentials=[_cred("analytics-login", "cred_analytics")],
-        get_credentials=AsyncMock(side_effect=AssertionError("a degraded turn must not scan")),
+        get_credentials=AsyncMock(side_effect=AssertionError("a degraded turn must not enumerate credentials")),
     )
 
     assert policy.resolved_credentials == []
@@ -3305,15 +3413,13 @@ async def test_a_degraded_classifier_never_enumerates_saved_credentials(kind: st
 @pytest.mark.asyncio
 async def test_a_stale_ref_absent_from_the_message_still_authorizes_nothing() -> None:
     policy = RequestPolicy(credential_input_kind="website_stored_credential", credential_refs=["analytics-login"])
-    load_mock, by_ids_mock = await _resolve_direct(
+    _, by_ids_mock = await _resolve_direct(
         policy,
         user_message="Continue with the workflow.",
         org_credentials=[_cred("analytics-login", "cred_analytics")],
-        get_credentials=AsyncMock(side_effect=AssertionError("a stale ref must not scan credentials")),
     )
 
     assert policy.resolved_credentials == []
-    load_mock.assert_not_awaited()
 
 
 def _passwordless_email_policy() -> RequestPolicy:
@@ -3401,7 +3507,7 @@ async def test_session_reuse_language_grants_no_authority_at_either_seam() -> No
     (SKY-10131) — and the live-page seam must not convert it into authority either, because
     the tool gate, not the wording, is what reaches admission."""
     policy = RequestPolicy(login_intent=False, credential_input_kind="none")
-    load_mock, _ = await _resolve_direct(
+    _, _ = await _resolve_direct(
         policy,
         user_message="Use the tab where I'm signed in at https://analytics.example.com/web and read the visitor count.",
         org_credentials=[_cred("analytics", "cred_analytics", "https://analytics.example.com/login")],

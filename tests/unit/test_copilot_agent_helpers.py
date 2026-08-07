@@ -4214,7 +4214,12 @@ workflow_definition:
         monkeypatch.setattr(
             policy_module.app,
             "DATABASE",
-            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[]))),
+            SimpleNamespace(
+                credentials=SimpleNamespace(
+                    get_credentials_by_ids=AsyncMock(return_value=[]),
+                    get_credentials=AsyncMock(return_value=[]),
+                )
+            ),
         )
 
         captured: dict[str, str] = {}
@@ -4452,12 +4457,12 @@ workflow_definition:
             handler=handler,
         )
 
+        # Names are read by the model, so a turn with no classifier resolves none; the turn still
+        # proceeds and the credential stays reachable by ID or from the Credentials UI.
         assert policy.classifier_status == "fallback"
         assert policy.classifier_failure_kind == "provider_error"
         assert policy.completion_contract_status == "present"
-        assert policy.credential_input_kind == "credential_name"
-        assert policy.credential_refs == ["mock-portal-login"]
-        assert policy.resolved_credentials == [credential]
+        assert policy.resolved_credentials == []
 
     @pytest.mark.asyncio
     async def test_fallback_policy_does_not_substring_match_saved_credential_name(self, monkeypatch) -> None:
@@ -4484,7 +4489,7 @@ workflow_definition:
         assert policy.completion_contract_status == "present"
         assert policy.credential_input_kind == "none"
         assert policy.credential_refs == []
-        credentials.get_credentials.assert_not_called()
+        assert policy.resolved_credentials == []
 
     @pytest.mark.asyncio
     async def test_request_policy_url_matching_and_skip_draft(self, monkeypatch) -> None:
