@@ -31,6 +31,7 @@ from skyvern.constants import (
     BROWSER_DOWNLOADING_SUFFIX,
     DROPDOWN_MENU_MAX_DISTANCE,
     SKYVERN_ID_ATTR,
+    TEXT_PRESS_MAX_LENGTH,
 )
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
 from skyvern.errors.errors import TOTPExpiredError, UserDefinedError, filter_to_user_defined_codes
@@ -152,6 +153,7 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
+from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_factory import initialize_download_dir, resolve_artifact_path
 from skyvern.webeye.browser_state import BrowserState
@@ -958,13 +960,22 @@ async def _save_adopted_session_download(
     download_dir: Path,
     workflow_run_id: str | None = None,
     eager_blob_bytes: bytes | None = None,
+    download_binding: DownloadBinding = DownloadBinding.RUN_DIR,
 ) -> Path | None:
     """Land an adopted-session download's bytes into download_dir, returning the file path or None.
 
-    Eager save_as is the only protection against the worker pod tearing the shared browser down before a
-    deferred save_as runs.
+    A provider-owned remote non-blob event is signal-only and returns None; blob and default behavior
+    are unchanged.
     """
     download_target = _download_target_path(download_dir, download.suggested_filename)
+    if download_binding == DownloadBinding.SESSION_DIR and not download.url.startswith("blob:"):
+        # Signal-only for a provider-owned remote binding: the run connection holds no bytes to save_as
+        # and a URL replay would run through the wrong identity, so defer to the provider destination.
+        LOG.info(
+            "Provider-owned remote download: suppressing local save/replay, deferring to provider destination",
+            workflow_run_id=workflow_run_id,
+        )
+        return None
     # Non-empty bytes captured at download-event time (blob owner still alive) win outright: skip
     # save_as, which returns empty for blobs anyway. A zero-byte eager capture is indistinguishable
     # from an unreadable one and would be a false success, so fall through to save_as + fan-out
@@ -2411,6 +2422,104 @@ async def _fill_secret_with_readback(
     return ActionFailure(SecretInputMismatch())
 
 
+_TRUNCATION_HEAL_TAGS = frozenset({"input", "textarea"})
+
+
+def _is_prefix_loss_truncation(*, intended: str, rendered: str | None) -> bool:
+    # input_sequentially sets intended[:-TEXT_PRESS_MAX_LENGTH] in one atomic fill, then types the last
+    # TEXT_PRESS_MAX_LENGTH characters individually. A field that resets on the input event can wipe that
+    # leading fill and keep only the per-character tail, so the rendered value is a proper suffix of the
+    # intended text no longer than that tail (SKY-13631). The comparison is case-folded so a field that
+    # transforms case still matches -- which also means a fully-present, only-case-changed value is NOT a
+    # truncation. A longer, equal, or non-suffix value (e.g. an autocomplete expansion) is not a match.
+    if rendered is None:
+        return False
+    intended_cf = intended.casefold()
+    rendered_cf = rendered.casefold()
+    if not rendered_cf or len(rendered_cf) >= len(intended_cf) or len(rendered_cf) > TEXT_PRESS_MAX_LENGTH:
+        return False
+    return intended_cf.endswith(rendered_cf)
+
+
+async def _observe_input_value(
+    *,
+    skyvern_element: SkyvernElement,
+    tag_name: str,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> tuple[bool, str | None]:
+    # Bounded, best-effort read-back for the truncation heal. Re-resolves a stale/re-mounted locator the same
+    # way the neighbouring fill paths do, then caps the read at BROWSER_ACTION_TIMEOUT_MS so a field that
+    # re-mounts on input -- the exact population this heal targets -- cannot stall on Playwright's 30s default
+    # or raise out of an INPUT_TEXT action that already succeeded. Returns (observed, value); observed is
+    # False when the value could not be obtained (stale, timeout, or driver error), and the caller must then
+    # neither heal nor re-fill. Never logs the value.
+    async def _read() -> str | None:
+        await skyvern_element.refresh_locator_if_stale()
+        return await get_input_value(
+            tag_name=tag_name, locator=skyvern_element.get_locator(), engine_selection=engine_selection
+        )
+
+    try:
+        value = await asyncio.wait_for(_read(), timeout=settings.BROWSER_ACTION_TIMEOUT_MS / 1000)
+        return True, value
+    except Exception:
+        LOG.warning(
+            "Free-text truncation read-back could not be obtained; leaving field as typed",
+            element_id=skyvern_element.get_id(),
+            exc_info=True,
+        )
+        return False, None
+
+
+async def _heal_truncated_freetext_input(
+    *,
+    skyvern_element: SkyvernElement,
+    tag_name: str,
+    text: str,
+    is_secret_value: bool = False,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> None:
+    # Generic free-text guard for the fill(prefix)+type(tail) seam: only values longer than the split
+    # boundary can lose a prefix, so shorter values and non-free-text tags are skipped without a read-back.
+    # Secret values are excluded outright -- their exact length must not reach the logs and an unmasked
+    # secret must not be rewritten from this generic path; _fill_secret_with_readback owns that recovery.
+    # On the exact prefix-loss signature, re-enter the value once with a single atomic fill; a matching or
+    # autocomplete-expanded value is left as typed so the normal keystroke/autocomplete behavior is
+    # preserved. Both read-backs are observational only: bounded and best-effort, they never fail or stall an
+    # action that already succeeded, and an unobtainable read-back heals nothing. Logs carry only lengths.
+    if is_secret_value or tag_name not in _TRUNCATION_HEAL_TAGS or len(text) <= TEXT_PRESS_MAX_LENGTH:
+        return
+    observed, rendered = await _observe_input_value(
+        skyvern_element=skyvern_element, tag_name=tag_name, engine_selection=engine_selection
+    )
+    if not observed or not _is_prefix_loss_truncation(intended=text, rendered=rendered):
+        return
+    LOG.warning(
+        "Free-text input lost its leading fill and kept only a trailing suffix; re-entering atomically",
+        element_id=skyvern_element.get_id(),
+        intended_length=len(text),
+        rendered_length=len(rendered or ""),
+    )
+    await skyvern_element.refresh_locator_if_stale()
+    await skyvern_element.input_fill(text=text)
+    # One post-refill read-back for observability only: record whether the single atomic fill produced the
+    # full intended value. No second write and no raised failure -- an unobtainable or non-matching read-back
+    # (a field that legally normalizes a trailing suffix, or resets again) is an explicit residual, not a
+    # claim of a heal. Confirmation requires a full case-folded value match, not merely the absence of the
+    # loss signature, so an empty or unrelated post-refill value is recorded as NON-confirmed. Metadata only.
+    observed_after, confirmed_value = await _observe_input_value(
+        skyvern_element=skyvern_element, tag_name=tag_name, engine_selection=engine_selection
+    )
+    refill_confirmed = observed_after and confirmed_value is not None and confirmed_value.casefold() == text.casefold()
+    LOG.info(
+        "Free-text truncation refill read-back",
+        element_id=skyvern_element.get_id(),
+        intended_length=len(text),
+        rendered_length=len(confirmed_value or ""),
+        refill_confirmed=refill_confirmed,
+    )
+
+
 def _select_option_target_value(option: SelectOption) -> str | None:
     if option.label:
         return option.label
@@ -3404,6 +3513,11 @@ class ActionHandler:
                                 and captured_download is not None
                                 and not download_event_fallback_attempted
                             ):
+                                resolved_download_binding = (
+                                    browser_state.browser_artifacts.download_binding
+                                    if browser_state is not None
+                                    else DownloadBinding.RUN_DIR
+                                )
                                 download_event_fallback_attempted = True
                                 saved_path = await _save_adopted_session_download(
                                     captured_download,
@@ -3416,6 +3530,7 @@ class ActionHandler:
                                             _remaining_download_wait_seconds(),
                                         )
                                     ),
+                                    download_binding=resolved_download_binding,
                                 )
                                 if saved_path is not None:
                                     download_event_fallback_used = True
@@ -3427,12 +3542,24 @@ class ActionHandler:
                                         workflow_run_id=task.workflow_run_id,
                                     )
                                     break
-                                download_event_fallback_failed = True
-                                LOG.warning(
-                                    "Adopted-session download could not be saved or re-fetched; falling through to browser-session folder poll",
-                                    download_dir=download_dir,
-                                    workflow_run_id=task.workflow_run_id,
-                                )
+                                if (
+                                    resolved_download_binding == DownloadBinding.SESSION_DIR
+                                    and not captured_download.url.startswith("blob:")
+                                ):
+                                    # Expected signal-only deferral for a provider-owned remote binding: no
+                                    # save_as/replay was attempted, so this is not a failure. Keep polling.
+                                    LOG.info(
+                                        "Provider-owned remote download deferred to provider-destination observation",
+                                        download_dir=download_dir,
+                                        workflow_run_id=task.workflow_run_id,
+                                    )
+                                else:
+                                    download_event_fallback_failed = True
+                                    LOG.warning(
+                                        "Adopted-session download could not be saved or re-fetched; falling through to browser-session folder poll",
+                                        download_dir=download_dir,
+                                        workflow_run_id=task.workflow_run_id,
+                                    )
                                 # Keep polling: the shared browser may still land the file in the session folder.
                                 if await _drain_and_move_staged_xhr(
                                     xhr_fallback_moved_paths, _remaining_download_wait_seconds()
@@ -5241,6 +5368,13 @@ async def handle_input_text_action(
                     await skyvern_element.input_fill(text)
                 else:
                     await skyvern_element.input_sequentially(text=text)
+                    await _heal_truncated_freetext_input(
+                        skyvern_element=skyvern_element,
+                        tag_name=tag_name,
+                        text=text,
+                        is_secret_value=is_secret_value,
+                        engine_selection=engine_selection,
+                    )
                 if log_tel_fallback_readback:
                     await _log_tel_fallback_fill_digit_counts(
                         skyvern_element=skyvern_element,
