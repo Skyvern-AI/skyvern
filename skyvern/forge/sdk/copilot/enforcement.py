@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     CREDENTIAL_FILL_TOOL_NAME,
     LIVE_SCOUT_CREDENTIAL_FIELDS,
     ONE_TIME_CODE_CREDENTIAL_FIELD,
+    SYNTHESIZED_OFFER_SENTINEL,
     ObligationFinding,
     credential_scout_gap,
     credential_submit_boundary_index,
@@ -1654,9 +1655,31 @@ def _is_nudge_message(item: Any) -> bool:
     return isinstance(content, str) and content.startswith(NUDGE_SENTINEL)
 
 
+def _is_synthesized_offer_message(item: Any) -> bool:
+    if _item_field(item, "role") != "user":
+        return False
+    content = _item_field(item, "content")
+    return isinstance(content, str) and content.startswith(SYNTHESIZED_OFFER_SENTINEL)
+
+
 def is_synthetic_user_message(item: Any) -> bool:
-    """Return True if item is a screenshot or nudge (not a real user turn)."""
-    return is_screenshot_message(item) or _is_nudge_message(item)
+    """Return True if item is a screenshot, nudge, or synthesized-block offer
+    (not a real user turn)."""
+    return is_screenshot_message(item) or _is_nudge_message(item) or _is_synthesized_offer_message(item)
+
+
+def collapse_superseded_synthesized_offers(items: list[Any]) -> list[Any]:
+    """Drop every synthesized-block offer except the newest: a refreshed offer supersedes its
+    predecessors, and offers ride as user messages no other compaction rung touches. Applied on
+    every model-input assembly path before token estimation; the opening item is never dropped.
+    """
+    offer_indices = [i for i, item in enumerate(items) if i > 0 and _is_synthesized_offer_message(item)]
+    if len(offer_indices) <= 1:
+        return items
+    stale = set(offer_indices[:-1])
+    dropped_chars = sum(len(_item_field(items[i], "content") or "") for i in stale)
+    LOG.info("copilot_superseded_offers_dropped", dropped=len(stale), dropped_chars=dropped_chars)
+    return [item for i, item in enumerate(items) if i not in stale]
 
 
 def _truncated_output_fallback(output: str) -> str:
@@ -1796,6 +1819,7 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
     function_call items keep the last KEEP_RECENT_TOOL_OUTPUTS at full size
     (head-truncated); older ones collapse to JSON synopses.
     """
+    items = collapse_superseded_synthesized_offers(items)
     screenshot_indices = [i for i, item in enumerate(items) if is_screenshot_message(item)]
     drop_indices = set(screenshot_indices[:-1])
 

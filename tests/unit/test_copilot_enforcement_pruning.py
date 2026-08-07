@@ -3539,3 +3539,102 @@ class TestUnboundOfferReopen:
         # Without the latch this stays True for the rest of the turn and the whole offer is
         # re-emitted on every prompt build.
         assert synthesized_offer_reopened_for_extraction_plan(ctx, None) is False
+
+
+class TestCollapseSupersededSynthesizedOffers:
+    """Refreshed synthesized-block offers supersede rather than stack: the
+    collapse keeps at most the last offer and drops the superseded ones."""
+
+    @staticmethod
+    def _offer(body: str) -> dict[str, Any]:
+        from skyvern.forge.sdk.copilot.code_block_synthesis import SYNTHESIZED_OFFER_SENTINEL
+
+        return {"role": "user", "content": SYNTHESIZED_OFFER_SENTINEL + " " + body}
+
+    def test_keeps_only_the_last_offer_with_distinct_payloads(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import collapse_superseded_synthesized_offers
+
+        goal = {"role": "user", "content": "build me a login workflow"}
+        # Distinct, non-monotonic payloads: a refresh can fire because the plan
+        # changed or the trajectory was evicted, so the newest body is not a
+        # superset of the older ones. Keep-last must not assume it is.
+        items = [
+            goal,
+            self._offer("await page.goto('https://a.example')"),
+            {"type": "function_call", "call_id": "c1", "name": "evaluate", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": '{"ok": true}'},
+            self._offer("await page.click('#submit')"),
+            {"role": "assistant", "content": "scouting"},
+            self._offer("await page.goto('https://b.example')"),
+        ]
+        result = collapse_superseded_synthesized_offers(items)
+
+        offers = [it for it in result if isinstance(it, dict) and "SYNTHESIZED CODE BLOCK" in str(it.get("content"))]
+        assert len(offers) == 1
+        assert "b.example" in offers[0]["content"]
+        # Everything that is not a superseded offer survives untouched, in order.
+        assert result[0] == goal
+        assert [it.get("call_id") for it in result if isinstance(it, dict) and it.get("call_id")] == ["c1", "c1"]
+
+    def test_idempotent_and_noop_without_stacking(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import collapse_superseded_synthesized_offers
+
+        items = [
+            {"role": "user", "content": "build me a workflow"},
+            {"type": "function_call_output", "call_id": "c1", "output": "{}"},
+            self._offer("await page.goto('https://a.example')"),
+        ]
+        once = collapse_superseded_synthesized_offers(items)
+        assert once == items
+        assert collapse_superseded_synthesized_offers(once) == once
+
+    def test_never_drops_the_opening_item(self) -> None:
+        """A first transcript item that happens to start with the sentinel is the
+        user's goal, not a superseded offer; collapsing it would delete the turn's
+        anchor. It also must not count as the kept offer."""
+        from skyvern.forge.sdk.copilot.enforcement import collapse_superseded_synthesized_offers
+
+        opening = self._offer("verbatim text a user pasted")
+        items = [opening, self._offer("stale"), self._offer("fresh")]
+        result = collapse_superseded_synthesized_offers(items)
+        assert result[0] == opening
+        assert [it["content"] for it in result[1:]] == [items[2]["content"]]
+
+    def test_ignores_non_offer_user_messages_and_list_content(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import collapse_superseded_synthesized_offers
+
+        items = [
+            {"role": "user", "content": "build me a workflow"},
+            {"role": "user", "content": "SYNTHESIZED but not the sentinel"},
+            {"role": "user", "content": [{"type": "input_text", "text": "screenshot-ish"}]},
+            self._offer("stale"),
+            self._offer("fresh"),
+            {"role": "user", "content": "one more real message"},
+        ]
+        result = collapse_superseded_synthesized_offers(items)
+        assert [it.get("content") for it in result] == [
+            "build me a workflow",
+            "SYNTHESIZED but not the sentinel",
+            [{"type": "input_text", "text": "screenshot-ish"}],
+            items[4]["content"],
+            "one more real message",
+        ]
+
+    def test_prune_input_list_collapses_offers(self) -> None:
+        items = [
+            {"role": "user", "content": "build me a workflow"},
+            self._offer("stale one"),
+            {"type": "function_call_output", "call_id": "c1", "output": "{}"},
+            self._offer("stale two"),
+            self._offer("fresh"),
+        ]
+        result = _prune_input_list(items)
+        offers = [it for it in result if isinstance(it, dict) and "SYNTHESIZED CODE BLOCK" in str(it.get("content"))]
+        assert len(offers) == 1
+        assert "fresh" in offers[0]["content"]
+
+    def test_offer_is_a_synthetic_user_message(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import is_synthetic_user_message
+
+        assert is_synthetic_user_message(self._offer("await page.goto('https://a.example')"))
+        assert not is_synthetic_user_message({"role": "user", "content": "build me a workflow"})

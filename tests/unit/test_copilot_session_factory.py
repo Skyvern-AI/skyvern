@@ -265,3 +265,164 @@ class TestModelInputCapture:
         copilot_call_model_input_filter(_mk_input_data(items, context=RunContextWrapper(context=SimpleNamespace())))
 
         assert len(sorted(tmp_path.glob("call-*.json"))) == 2
+
+
+class TestSynthesizedOfferCollapse:
+    """The model-input filter keeps at most one synthesized-block offer, and
+    offers do not count as real user turns for the session callback's
+    recent-turn boundary."""
+
+    @staticmethod
+    def _offer(body: str) -> dict[str, Any]:
+        from skyvern.forge.sdk.copilot.code_block_synthesis import SYNTHESIZED_OFFER_SENTINEL
+
+        return {"role": "user", "content": SYNTHESIZED_OFFER_SENTINEL + " " + body}
+
+    def test_filter_keeps_at_most_one_offer(self) -> None:
+        from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+
+        code = "await page.goto('https://a.example')\n" * 200
+        items: list[dict[str, Any]] = [{"role": "user", "content": "build me a workflow"}]
+        for i in range(6):
+            items.append(self._offer(f"v{i} " + code))
+            items.append({"type": "function_call", "call_id": f"c-{i}", "name": "evaluate", "arguments": "{}"})
+            items.append({"type": "function_call_output", "call_id": f"c-{i}", "output": '{"ok": true}'})
+
+        result = copilot_call_model_input_filter(_mk_input_data(items))
+        offers = [
+            it for it in result.input if isinstance(it, dict) and "SYNTHESIZED CODE BLOCK" in str(it.get("content"))
+        ]
+        assert len(offers) == 1
+        assert offers[0]["content"].startswith("SYNTHESIZED CODE BLOCK")
+        assert "v5 " in offers[0]["content"]
+
+    def test_production_shape_stale_offers_in_history_fresh_offer_in_new_items(self) -> None:
+        """The shape the enforcement loop actually emits: prior offers sit in session
+        history while the refreshed offer arrives beside the screenshot and nudge, and
+        only the refreshed one may reach the model."""
+        from skyvern.forge.sdk.copilot.enforcement import NUDGE_SENTINEL
+        from skyvern.forge.sdk.copilot.session_factory import (
+            copilot_call_model_input_filter,
+            copilot_session_input_callback,
+        )
+
+        history: list[dict[str, Any]] = [
+            {"role": "user", "content": "please build me a workflow"},
+            self._offer("stale one"),
+            {"type": "function_call", "call_id": "c-1", "name": "evaluate", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c-1", "output": '{"ok": true}'},
+            self._offer("stale two"),
+        ]
+        new_items: list[dict[str, Any]] = [
+            self._offer("fresh"),
+            self._screenshot("live frame"),
+            {"role": "user", "content": NUDGE_SENTINEL + "keep going"},
+        ]
+
+        merged = copilot_session_input_callback(history, new_items)
+        result = copilot_call_model_input_filter(_mk_input_data(merged))
+
+        offers = [
+            it for it in result.input if isinstance(it, dict) and "SYNTHESIZED CODE BLOCK" in str(it.get("content"))
+        ]
+        assert len(offers) == 1
+        assert "fresh" in offers[0]["content"]
+
+    def test_offers_do_not_hold_recent_real_turn_slots(self) -> None:
+        """Offers interleaved with the tool chain used to hold the recent-real-turn
+        slots and shield everything after them from middle-region compaction; as
+        synthetic messages the older tool outputs compact while pairing survives."""
+        from skyvern.forge.sdk.copilot.enforcement import KEEP_RECENT_TOOL_OUTPUTS
+        from skyvern.forge.sdk.copilot.session_factory import copilot_session_input_callback
+
+        goal = {"role": "user", "content": "please build me a workflow"}
+
+        def pair(i: int) -> list[dict[str, Any]]:
+            return [
+                {
+                    "type": "function_call",
+                    "call_id": f"c-{i}",
+                    "name": "evaluate",
+                    "arguments": json.dumps({"blob": "z" * 4000}),
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": f"c-{i}",
+                    "output": json.dumps({"ok": True, "data": {"blob": "z" * 4000}}),
+                },
+            ]
+
+        history: list[dict[str, Any]] = [goal, *pair(0), *pair(1), self._offer("stale")]
+        history += [*pair(2), *pair(3), self._offer("fresh"), *pair(4), *pair(5)]
+
+        combined = copilot_session_input_callback(history, [{"role": "user", "content": "[copilot:nudge] finish"}])
+
+        outputs = [it for it in combined if isinstance(it, dict) and it.get("type") == "function_call_output"]
+        assert len(outputs) == 6
+        for older in outputs[:-KEEP_RECENT_TOOL_OUTPUTS]:
+            assert "_summarized" in older["output"]
+        for recent in outputs[-KEEP_RECENT_TOOL_OUTPUTS:]:
+            assert "_summarized" not in recent["output"]
+        # Pairing survives: every retained output still has its call.
+        call_ids = {it["call_id"] for it in combined if isinstance(it, dict) and it.get("type") == "function_call"}
+        assert {out["call_id"] for out in outputs} <= call_ids
+
+    @staticmethod
+    def _screenshot(label: str) -> dict[str, Any]:
+        from skyvern.forge.sdk.copilot.enforcement import SCREENSHOT_SENTINEL
+
+        return {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": SCREENSHOT_SENTINEL + " " + label},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            ],
+        }
+
+    def test_newest_history_screenshot_survives_middle_compaction(self) -> None:
+        """With every injected message synthetic the whole post-goal history is
+        middle, and the newest frame must not collapse to a placeholder."""
+        from skyvern.forge.sdk.copilot.enforcement import is_screenshot_message
+        from skyvern.forge.sdk.copilot.session_factory import copilot_session_input_callback
+
+        history = [
+            {"role": "user", "content": "please build me a workflow"},
+            self._screenshot("old frame"),
+            {"type": "function_call", "call_id": "c-1", "name": "evaluate", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c-1", "output": "{}"},
+            self._screenshot("newest frame"),
+            self._offer("fresh"),
+        ]
+        combined = copilot_session_input_callback(history, [{"role": "user", "content": "[copilot:nudge] finish"}])
+        frames = [it for it in combined if is_screenshot_message(it) and isinstance(it.get("content"), list)]
+        assert len(frames) == 1
+        assert "newest frame" in frames[0]["content"][0]["text"]
+
+    def test_text_only_screenshot_lookalike_cannot_shadow_the_real_frame(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import SCREENSHOT_SENTINEL, is_screenshot_message
+        from skyvern.forge.sdk.copilot.session_factory import copilot_session_input_callback
+
+        history = [
+            {"role": "user", "content": "please build me a workflow"},
+            self._screenshot("real frame"),
+            {"role": "user", "content": SCREENSHOT_SENTINEL + " text-only lookalike"},
+            self._offer("fresh"),
+        ]
+        combined = copilot_session_input_callback(history, [{"role": "user", "content": "[copilot:nudge] finish"}])
+        frames = [it for it in combined if is_screenshot_message(it) and isinstance(it.get("content"), list)]
+        assert len(frames) == 1
+        assert "real frame" in frames[0]["content"][0]["text"]
+
+    def test_history_screenshot_yields_to_newer_frame_in_new_items(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import is_screenshot_message
+        from skyvern.forge.sdk.copilot.session_factory import copilot_session_input_callback
+
+        history = [
+            {"role": "user", "content": "please build me a workflow"},
+            self._screenshot("old frame"),
+            self._offer("fresh"),
+        ]
+        combined = copilot_session_input_callback(history, [self._screenshot("live frame")])
+        list_frames = [it for it in combined if is_screenshot_message(it) and isinstance(it.get("content"), list)]
+        assert len(list_frames) == 1
+        assert "live frame" in list_frames[0]["content"][0]["text"]
