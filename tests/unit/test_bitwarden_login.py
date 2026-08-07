@@ -6,10 +6,18 @@ from skyvern.forge.sdk.schemas.credentials import PasswordCredential
 from skyvern.forge.sdk.services import bitwarden as bitwarden_module
 from skyvern.forge.sdk.services.bitwarden import (
     BITWARDEN_CUSTOM_FIELD_TYPE_HIDDEN,
+    BitwardenItemType,
     BitwardenService,
     RunCommandResult,
     get_list_response_item_from_bitwarden_item,
 )
+
+# The vault server omits `totp` entirely for a login saved without a two-factor secret,
+# and returns it as JSON null for some hand-made items.
+MISSING_TOTP_LOGINS = [
+    pytest.param({"username": "user@example.com", "password": "pw"}, id="totp-absent"),
+    pytest.param({"username": "user@example.com", "password": "pw", "totp": None}, id="totp-null"),
+]
 
 
 @pytest.mark.asyncio
@@ -69,3 +77,39 @@ async def test_server_login_item_round_trips_metadata(monkeypatch: pytest.Monkey
     ]
     assert listed_item.credential.metadata == metadata
     assert fetched_item.credential.metadata == metadata
+
+
+@pytest.mark.parametrize("login", MISSING_TOTP_LOGINS)
+def test_list_response_item_reads_login_without_totp(login: dict) -> None:
+    item = {"id": "item-1", "name": "Login", "type": BitwardenItemType.LOGIN, "login": login}
+
+    listed_item = get_list_response_item_from_bitwarden_item(item)
+
+    assert listed_item.credential.totp == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("login", MISSING_TOTP_LOGINS)
+async def test_get_login_item_by_id_reads_login_without_totp(monkeypatch: pytest.MonkeyPatch, login: dict) -> None:
+    get_json = AsyncMock(return_value={"success": True, "data": {"login": login}})
+    monkeypatch.setattr(bitwarden_module, "aiohttp_get_json", get_json)
+
+    credential = await BitwardenService._get_login_item_by_id_using_server("item-1")
+
+    assert credential.totp == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("login", MISSING_TOTP_LOGINS)
+async def test_get_credential_item_by_id_reads_login_without_totp(monkeypatch: pytest.MonkeyPatch, login: dict) -> None:
+    get_json = AsyncMock(
+        return_value={
+            "success": True,
+            "data": {"id": "item-1", "name": "Login", "type": BitwardenItemType.LOGIN, "login": login},
+        }
+    )
+    monkeypatch.setattr(bitwarden_module, "aiohttp_get_json", get_json)
+
+    fetched_item = await BitwardenService._get_credential_item_by_id_using_server("item-1")
+
+    assert fetched_item.credential.totp == ""
