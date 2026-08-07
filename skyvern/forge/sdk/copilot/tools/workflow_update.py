@@ -7,9 +7,11 @@ import hashlib
 import io
 import json
 import keyword
+import os
 import re
 import textwrap
 import tokenize
+import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -23,6 +25,8 @@ import yaml
 from jinja2 import TemplateSyntaxError
 from pydantic import AliasChoices, BaseModel, Field, ValidationError
 
+from skyvern._version import __version__
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
@@ -8641,7 +8645,63 @@ def _co_computed_metadata_repair_contract(
     )
 
 
+def _dump_imposition_decision(
+    ctx: AgentContext,
+    *,
+    workflow_yaml: str,
+    result: _SynthesizedCodeImpositionResult,
+) -> None:
+    """Serialize the imposition decision for offline replay; both outcomes are captured because a
+    substitution's generated code is the artifact no log holds. The recorded branch inputs let a
+    replay say whether a divergence came from the decision or from state this capture cannot carry."""
+    directory = os.environ.get("COPILOT_DUMP_IMPOSITION_INPUTS")
+    if not directory or settings.ENV != "local":
+        return
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        changed = result.workflow_yaml != workflow_yaml
+        prior_source, prior_yaml = _prior_yaml_source(ctx)
+        payload = {
+            "schema_version": 2,
+            "source_version": __version__,
+            "workflow_yaml": workflow_yaml,
+            "prior_source": prior_source,
+            "prior_yaml": prior_yaml,
+            "scout_trajectory": list(ctx.scout_trajectory),
+            "flow_evidence": ctx.flow_evidence,
+            "block_authoring_policy": str(_copilot_block_authoring_policy(ctx)),
+            "impose_synthesized_code_block": ctx.impose_synthesized_code_block,
+            "update_workflow_called": ctx.update_workflow_called,
+            "turn_origin": str(ctx.turn_origin),
+            "raw_code_artifact_metadata": ctx.raw_code_artifact_metadata,
+            # The branch inputs as the run left them, read from retained state: deriving the plan here
+            # would latch one the decision never latched and change the next evaluation's reach.
+            "reaches_goal": synthesized_trajectory_reaches_goal(ctx),
+            "extraction_plan_present": ctx.last_bound_requested_output_extraction_plan is not None,
+            "outcome": "substituted" if changed else "kept",
+            "violations": list(result.violations),
+            "result_workflow_yaml": result.workflow_yaml,
+        }
+        target = os.path.join(
+            directory, f"imposition-{'substituted' if changed else 'kept'}-{uuid.uuid4().hex[:8]}.json"
+        )
+        with open(os.open(target, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600), "w") as handle:
+            json.dump(payload, handle, default=str)
+    except Exception:
+        LOG.info("copilot_imposition_input_dump_failed", exc_info=True)
+
+
 def _maybe_impose_synthesized_code_block(
+    workflow_yaml: str,
+    ctx: AgentContext,
+    runtime_parameters: Mapping[str, Any] | None = None,
+) -> _SynthesizedCodeImpositionResult:
+    result = _maybe_impose_synthesized_code_block_decision(workflow_yaml, ctx, runtime_parameters)
+    _dump_imposition_decision(ctx, workflow_yaml=workflow_yaml, result=result)
+    return result
+
+
+def _maybe_impose_synthesized_code_block_decision(
     workflow_yaml: str,
     ctx: AgentContext,
     runtime_parameters: Mapping[str, Any] | None = None,
@@ -9167,6 +9227,21 @@ def _maybe_impose_synthesized_code_block(
             block_label=str(code_block.get("label") or ""),
             stage_count=len(durable_stage_codes),
         )
+    # Every author-time check above has run and reported; only the code replacement is withheld. A
+    # submission is replaced solely when the machine has something landed to replace it with — a
+    # goal-reaching trajectory or a bound requested-output plan. With neither, substitution is pure
+    # replay of scout probes, and whether the submission is any good is the test-run's question
+    # (ADR-0022).
+    if submitted_code.strip() and not reaches_goal and extraction_plan is None:
+        LOG.info(
+            "copilot_imposition_kept_submitted_code",
+            carrier_label=_code_block_label(code_block),
+            prior_source=prior_source,
+            reaches_goal=reaches_goal,
+            **_submitted_code_fingerprint(submitted_code),
+        )
+        return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
+
     # A credential fill in the trajectory opens the split on its own: a value-producing subset that
     # carries no credential fill reruns on the scout's authenticated session instead of replaying login.
     should_split_output_owner = (

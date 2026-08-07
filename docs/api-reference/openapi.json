@@ -10185,6 +10185,22 @@
             "description": "Whether the browser session supports VNC streaming",
             "default": false
           },
+          "stream_transport": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stream Transport",
+            "description": "Live-view transport for this session: \"vnc\" or \"cdp\". Resolved on the single-session fetch only; null elsewhere.",
+            "examples": [
+              "vnc",
+              "cdp"
+            ]
+          },
           "download_path": {
             "anyOf": [
               {

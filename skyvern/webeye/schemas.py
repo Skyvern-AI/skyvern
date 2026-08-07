@@ -74,6 +74,11 @@ class BrowserSessionResponse(BaseModel):
         description="Whether this session's browser profile will be saved when it ends so it can become a reusable browser profile.",
     )
     vnc_streaming_supported: bool = Field(False, description="Whether the browser session supports VNC streaming")
+    stream_transport: str | None = Field(
+        None,
+        description='Live-view transport for this session: "vnc" or "cdp". Resolved on the single-session fetch only; null elsewhere.',
+        examples=["vnc", "cdp"],
+    )
     download_path: str | None = Field(None, description="The path where the browser session downloads files")
     downloaded_files: list[FileInfo] | None = Field(
         None, description="The list of files downloaded by the browser session"
@@ -96,6 +101,10 @@ class BrowserSessionResponse(BaseModel):
         # False deliberately preserves the existing permissive timeout behavior for PATCH,
         # active-list, and history responses; the single-session GET opts into strict lookup.
         fail_download_lookup: bool = False,
+        # Resolving the transport costs a per-session infrastructure lookup, and the list
+        # endpoints serialize an unpaginated set concurrently. Only the single-session fetch —
+        # the one live view actually reads — pays for it.
+        include_stream_transport: bool = False,
     ) -> BrowserSessionResponse:
         """
         Creates a BrowserSessionResponse from a PersistentBrowserSession object.
@@ -165,6 +174,18 @@ class BrowserSessionResponse(BaseModel):
             upstream_cdp_url=browser_session.upstream_cdp_url,
         )
 
+        stream_transport: str | None = None
+        if include_stream_transport:
+            # The response contract admits exactly two transport words; anything else a resolver
+            # produces is withheld rather than serialized to clients.
+            stream_transport = await app.AGENT_FUNCTION.resolve_stream_transport(
+                browser_session_id=browser_session.persistent_browser_session_id,
+                organization_id=browser_session.organization_id,
+                ip_address=browser_session.ip_address,
+            )
+            if stream_transport not in ("vnc", "cdp"):
+                stream_transport = None
+
         return cls(
             browser_session_id=browser_session.persistent_browser_session_id,
             organization_id=browser_session.organization_id,
@@ -178,6 +199,7 @@ class BrowserSessionResponse(BaseModel):
                 browser_session.persistent_browser_session_id,
                 ip_address=browser_session.ip_address,
             ),
+            stream_transport=stream_transport,
             app_url=app_url,
             started_at=browser_session.started_at,
             completed_at=browser_session.completed_at,
