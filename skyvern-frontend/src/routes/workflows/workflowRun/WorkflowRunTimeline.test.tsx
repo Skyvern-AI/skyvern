@@ -459,10 +459,10 @@ describe("WorkflowRunTimeline", () => {
 });
 
 describe("timeline header elapsed", () => {
-  function seed() {
+  function seed(totalSteps = 0) {
     mocks.workflowRun = {
       status: Status.Completed,
-      total_steps: 0,
+      total_steps: totalSteps,
       credits_used: 0,
       cached_credits_used: 0,
       workflow: {
@@ -494,6 +494,24 @@ describe("timeline header elapsed", () => {
     renderTimeline(null);
 
     expect(screen.queryByText(/· \d+m/)).toBeNull();
+  });
+
+  // total_steps counts task steps, which a code-first run never produces, so the
+  // chip read "0 steps" beside rows that were visibly executing.
+  it("omits the steps chip when the run reports no steps", () => {
+    seed();
+
+    renderTimeline(null);
+
+    expect(screen.queryByText(/· 0 steps/)).toBeNull();
+  });
+
+  it("still shows the steps chip once the run reports steps", () => {
+    seed(3);
+
+    renderTimeline(null);
+
+    expect(screen.getByText("· 3 steps")).toBeTruthy();
   });
 });
 
