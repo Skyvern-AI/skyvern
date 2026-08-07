@@ -797,7 +797,7 @@ async def test_get_video_artifacts_non_webm_skips_ffmpeg(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_get_video_artifacts_empty_snapshot_path_does_not_warn() -> None:
     """The finalize=False snapshot path runs once per step on browsers that never record
-    locally (vendor/CDP/persistent sessions), where an empty list is the expected state."""
+    locally (remote/CDP/persistent sessions), where an empty list is the expected state."""
     browser_state = MagicMock()
     browser_state.browser_artifacts.video_artifacts = []
 
@@ -1041,7 +1041,7 @@ async def test_cleanup_persists_session_cookies_when_close_deferred_for_streams(
     manager.pages["wfr_streamed"] = browser_state
     manager.pages["tsk_streamed"] = browser_state
     if shared_with_parent:
-        manager.pages["wfr_parent"] = browser_state
+        manager.pages["wr_parent"] = browser_state
 
     persist_mock = AsyncMock()
     defer_mock = MagicMock(return_value=True)
@@ -1321,6 +1321,51 @@ async def test_public_workflow_cleanup_retains_owner_lease_until_release_succeed
 
 
 @pytest.mark.asyncio
+async def test_pbs_cleanup_is_release_only_not_terminal_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PBS lifetime is distributed — owned by runnable_id + generation CAS across Pods, not by this
+    process. Even when the local non-PBS sharing predicate sees no other alias (``shared=False``,
+    i.e. "this process could close it"), a cleanup carrying a browser_session_id must NOT terminal-
+    close the remote browser: it detaches the local driver (``release_driver=False``) and releases
+    occupancy only through the expected-owner CAS (PBS/non-PBS boundary)."""
+    workflow_run_id = "wr_pbs_owner"
+    manager = RealBrowserManager()
+    browser_state = MagicMock()
+    browser_state.browser_artifacts.traces_dir = None
+    browser_state.close = AsyncMock(return_value=False)
+    manager.pages[workflow_run_id] = browser_state
+    lease = _PersistentSessionLease(
+        session_id="pbs_owner",
+        organization_id="org_test",
+        runnable_id=workflow_run_id,
+        browser_state=browser_state,
+    )
+    manager._persistent_session_leases[workflow_run_id] = lease
+    sessions = MagicMock()
+    sessions.release_browser_session = AsyncMock(return_value=True)
+    monkeypatch.setattr(real_browser_manager, "app", MagicMock(PERSISTENT_SESSIONS_MANAGER=sessions))
+
+    await manager.cleanup_for_workflow_run(
+        workflow_run_id,
+        task_ids=[],
+        close_browser_on_completion=False,
+        browser_session_id="pbs_owner",
+        organization_id="org_test",
+    )
+
+    browser_state.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=False)
+    sessions.release_browser_session.assert_awaited_once_with(
+        session_id="pbs_owner",
+        organization_id="org_test",
+        expected_runnable_id=workflow_run_id,
+        expected_runnable_generation_id=None,
+        expected_browser_state=browser_state,
+    )
+    assert workflow_run_id not in manager._persistent_session_leases
+
+
+@pytest.mark.asyncio
 async def test_pbs_adoption_rebinds_download_dir_to_run_id() -> None:
     """Adopting a persistent session must rebind its CDP download dir to the run's id (SKY-11083)."""
     manager = RealBrowserManager()
@@ -1412,8 +1457,8 @@ async def test_public_workflow_adoption_keeps_lease_identity_separate_from_downl
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("has_vendor_interceptor", [True, False])
-async def test_pbs_task_adoption_rebinds_regardless_of_vendor_interceptor(has_vendor_interceptor: bool) -> None:
+@pytest.mark.parametrize("has_remote_interceptor", [True, False])
+async def test_pbs_task_adoption_rebinds_regardless_of_remote_interceptor(has_remote_interceptor: bool) -> None:
     """Own-infra sessions carry no interceptor and are rebound through setDownloadBehavior; skipping
     them would leave their downloads in the session-scoped connect-time dir, which collection
     (get_download_dir(run_id)) never reads."""
@@ -1422,7 +1467,7 @@ async def test_pbs_task_adoption_rebinds_regardless_of_vendor_interceptor(has_ve
     adopted_browser = MagicMock()
     pbs_state = MagicMock()
     pbs_state.browser_context.browser = adopted_browser
-    pbs_state.browser_context._skyvern_cdp_download_interceptor = MagicMock() if has_vendor_interceptor else None
+    pbs_state.browser_context._skyvern_cdp_download_interceptor = MagicMock() if has_remote_interceptor else None
     pbs_state.get_working_page = AsyncMock(return_value=None)
     pbs_state.get_or_create_page = AsyncMock()
 
@@ -1893,3 +1938,124 @@ async def test_repair_forwards_pinned_engine_selection() -> None:
         await state.check_and_fix_state()
 
     assert create_browser_context.await_args.kwargs["engine_selection"] is selection
+
+
+def _fake_cleanup_state() -> MagicMock:
+    state = MagicMock()
+    state.close = AsyncMock(return_value=True)
+    state.browser_context = None
+    state.browser_artifacts.traces_dir = None
+    state.browser_cleanup = object()
+    return state
+
+
+def _close_true_count(state: MagicMock) -> int:
+    return sum(1 for call in state.close.await_args_list if call.kwargs.get("close_browser_on_completion") is True)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_same_run_alias_and_ghost_alias_closes_browser_once() -> None:
+    manager = RealBrowserManager()
+    state = _fake_cleanup_state()
+    manager.pages["wr_1"] = state
+    manager.pages["tsk_1"] = state
+    manager.pages["tsk_ghost"] = state
+
+    result = await manager.cleanup_for_workflow_run("wr_1", ["tsk_1"], close_browser_on_completion=True)
+
+    assert _close_true_count(state) == 1
+    assert result.recording_finalized is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_ghost_only_alias_absent_from_task_list_still_closes() -> None:
+    manager = RealBrowserManager()
+    state = _fake_cleanup_state()
+    manager.pages["wr_1"] = state
+    manager.pages["tsk_ghost"] = state
+
+    result = await manager.cleanup_for_workflow_run("wr_1", [], close_browser_on_completion=True)
+
+    assert _close_true_count(state) == 1
+    assert result.recording_finalized is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_genuine_parent_sharing_does_not_close_early() -> None:
+    manager = RealBrowserManager()
+    state = _fake_cleanup_state()
+    manager.pages["wr_child"] = state
+    manager.pages["tsk_c"] = state
+    manager.pages["wr_parent"] = state
+
+    result = await manager.cleanup_for_workflow_run("wr_child", ["tsk_c"], close_browser_on_completion=True)
+
+    assert _close_true_count(state) == 0
+    assert "wr_parent" in manager.pages
+    assert result.recording_finalized is False
+
+
+@pytest.mark.asyncio
+async def test_cleanup_separate_task_browser_states_each_close_once() -> None:
+    manager = RealBrowserManager()
+    run_state = _fake_cleanup_state()
+    task_state = _fake_cleanup_state()
+    manager.pages["wr_1"] = run_state
+    manager.pages["tsk_other"] = task_state
+    manager.pages["tsk_run"] = run_state
+
+    await manager.cleanup_for_workflow_run("wr_1", ["tsk_other", "tsk_run"], close_browser_on_completion=True)
+
+    assert _close_true_count(run_state) == 1
+    assert _close_true_count(task_state) == 1
+
+
+@pytest.mark.asyncio
+async def test_cleanup_child_workflow_pre_pop_permits_terminal_close() -> None:
+    manager = RealBrowserManager()
+    state = _fake_cleanup_state()
+    manager.pages["wr_1"] = state
+    manager.pages["wr_child"] = state
+
+    await manager.cleanup_for_workflow_run(
+        "wr_1", [], close_browser_on_completion=True, child_workflow_run_ids=["wr_child"]
+    )
+
+    assert _close_true_count(state) == 1
+
+
+@pytest.mark.asyncio
+async def test_cleanup_deferred_streams_ghost_alias_defers_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = RealBrowserManager()
+    state = _fake_cleanup_state()
+    state.browser_artifacts.browser_session_dir = "/tmp/fake_profile"
+    manager.pages["wr_1"] = state
+    manager.pages["tsk_ghost"] = state
+
+    defer_mock = MagicMock(return_value=True)
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.persist_session_cookies", AsyncMock())
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.stream_ref_active", lambda wrid: True)
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.set_deferred_close_params", defer_mock)
+
+    await manager.cleanup_for_workflow_run("wr_1", [], close_browser_on_completion=True)
+
+    defer_mock.assert_called_once_with("wr_1", True, release_driver=None)
+    state.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_task_close_error_is_contained() -> None:
+    manager = RealBrowserManager()
+    run_state = _fake_cleanup_state()
+    bad_state = _fake_cleanup_state()
+    bad_state.close = AsyncMock(side_effect=RuntimeError("already closed"))
+    ok_state = _fake_cleanup_state()
+    manager.pages["wr_1"] = run_state
+    manager.pages["tsk_bad"] = bad_state
+    manager.pages["tsk_ok"] = ok_state
+
+    result = await manager.cleanup_for_workflow_run("wr_1", ["tsk_bad", "tsk_ok"], close_browser_on_completion=True)
+
+    assert _close_true_count(run_state) == 1
+    assert _close_true_count(ok_state) == 1
+    assert result.browser_state is run_state
