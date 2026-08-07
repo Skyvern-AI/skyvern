@@ -393,7 +393,11 @@ def test_run_mcp_logs_sweep_failure_and_continues(monkeypatch, failure_stage: st
         run_commands.run_mcp()
 
     assert events == ["prepare", "run", "cleanup"]
-    assert any(log.get("log_level") == "warning" for log in logs)
+    assert any(
+        log.get("event") == "local_browser_profile_startup_sweep_failed"
+        and (log.get("log_level") or log.get("level")) == "warning"
+        for log in logs
+    )
 
 
 def test_run_mcp_starts_within_sweep_budget_and_stops_blocking_child(tmp_path: Path, monkeypatch) -> None:
