@@ -564,7 +564,7 @@ mcp.tool(tags={"workflow"}, annotations=_mut("Update Workflow"))(skyvern_workflo
 mcp.tool(tags={"workflow"}, annotations=_mut("Move Workflow to Folder"))(skyvern_workflow_update_folder)
 mcp.tool(tags={"workflow"}, annotations=_dest("Delete Workflow"))(skyvern_workflow_delete)
 mcp.tool(tags={"workflow"}, annotations=_web_dest("Run Workflow"))(skyvern_workflow_run)
-mcp.tool(tags={"workflow"}, annotations=_ro("Get Workflow Run Status"))(skyvern_workflow_status)
+mcp.tool(tags={"workflow"}, annotations=_ro("Get Workflow Run Status"))(size_capped(skyvern_workflow_status))
 mcp.tool(tags={"workflow"}, annotations=_web_dest("Retry Workflow Run"))(skyvern_workflow_retry)
 mcp.tool(tags={"workflow"}, annotations=_dest("Cancel Workflow Run"))(skyvern_workflow_cancel)
 
