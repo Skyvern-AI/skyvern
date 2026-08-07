@@ -174,10 +174,8 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 POST_FORMAT_NUDGE = copilot_config_defaults.POST_FORMAT_NUDGE
-POST_INTERMEDIATE_SUCCESS_NUDGE = copilot_config_defaults.POST_INTERMEDIATE_SUCCESS_NUDGE
 
 MAX_POST_UPDATE_NUDGES = 2
-MAX_INTERMEDIATE_NUDGES = 8
 MAX_FAILED_TEST_NUDGES = 2
 # Repair rounds the typed obligation may force past the ordinary nudge budget before a turn is
 # allowed to report an unrepairable failure.
@@ -202,7 +200,6 @@ REPEATED_FRONTIER_STREAK_STOP_AT = 3
 # trips fall through to the repeated-frontier escalation path.
 MAX_PER_TOOL_BUDGET_NUDGES = 2
 _NO_PROGRESS_INTERACTION_REASON_CODES = frozenset({"loop_detected_no_forward_progress_interaction"})
-MIN_BLOCKS_FOR_AUTO_COMPLETE = 10
 TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
 # Floor for the per-iteration ``wait_for`` deadline so an already-spent budget
 # never yields ``wait_for(timeout=0)`` (which raises immediately). Kept as a
@@ -773,7 +770,7 @@ def built_complete_without_evaluated_outcome(ctx: CopilotContext) -> bool:
         and latest_diagnosis_contract_satisfies_goal(ctx)
     ):
         return False
-    return not _verified_goal_likely_needs_more_work(ctx)
+    return True
 
 
 def built_unverified_repair_inert_context(ctx: CopilotContext) -> bool:
@@ -783,7 +780,6 @@ def built_unverified_repair_inert_context(ctx: CopilotContext) -> bool:
         and _outcome_criteria_evaluated(ctx)
         and _latest_diagnosis_contract_selects_no_repair(ctx)
         and _completion_verification_only_structural_abstentions(ctx)
-        and not _verified_goal_likely_needs_more_work(ctx)
     )
 
 
@@ -801,7 +797,7 @@ def gate_decision_trace_fields(ctx: CopilotContext) -> dict[str, bool]:
     Captured wherever the gate is evaluated (including when it returns False, the
     signal that explains why the turn continued) so a single trace shows whether
     the gate failed on the test, the full-workflow run, the diagnosis contract,
-    the absence of outcome verification, or the block-count heuristic.
+    or the absence of outcome verification.
     """
     return {
         "gate_satisfied": verified_goal_satisfied_context(ctx),
@@ -813,18 +809,8 @@ def gate_decision_trace_fields(ctx: CopilotContext) -> dict[str, bool]:
         "gate_diagnosis_contract_satisfies_goal": latest_diagnosis_contract_satisfies_goal(ctx),
         "gate_outcome_criteria_evaluated": _outcome_criteria_evaluated(ctx),
         "gate_artifact_health_blocked": artifact_health_blocked(ctx),
-        "gate_likely_needs_more_work": _verified_goal_likely_needs_more_work(ctx),
         "gate_evaluated_this_turn": True,
     }
-
-
-def _verified_goal_likely_needs_more_work(ctx: CopilotContext) -> bool:
-    block_count = ctx.last_update_block_count
-    if not isinstance(block_count, int):
-        return False
-    user_message = ctx.user_message
-    completion_contract = _request_completion_contract(ctx)
-    return _goal_likely_needs_more_blocks(user_message, block_count, completion_contract)
 
 
 def _mark_copilot_total_timeout(ctx: Any, *, elapsed_seconds: float, iteration: int) -> None:
@@ -926,40 +912,6 @@ def _raise_if_unrecoverable_contract_stop(ctx: Any) -> None:
     source_tool = getattr(getattr(contract, "diagnosis_input", None), "source_tool", None)
     tool_name = source_tool if isinstance(source_tool, str) and source_tool else "unknown"
     raise CopilotUnrecoverableToolError(tool_name, reason)
-
-
-_ACTION_CATEGORIES: list[list[str]] = [
-    ["navigate", "go to", "open", "visit"],
-    ["download", "save", "export"],
-    ["extract", "scrape", "collect", "gather", "get all", "grab", "capture", "retrieve", "pull"],
-    ["login", "log in", "sign in", "authenticate"],
-    ["search", "find", "look for", "look up", "check", "verify"],
-    ["fill", "enter", "type", "submit", "complete the form", "input"],
-    ["click", "select", "choose", "pick"],
-    ["upload", "attach"],
-]
-
-_SEQUENTIAL_CONNECTORS = [" and then ", " then ", " after that ", " next ", " followed by ", " afterward "]
-
-
-def _request_completion_contract(ctx: Any) -> str | None:
-    request_policy = getattr(ctx, "request_policy", None)
-    completion_contract = getattr(request_policy, "completion_contract", None)
-    if isinstance(completion_contract, str) and completion_contract.strip():
-        return completion_contract.strip()
-    return None
-
-
-def _request_completion_contract_status(ctx: Any) -> str:
-    request_policy = getattr(ctx, "request_policy", None)
-    status = getattr(request_policy, "completion_contract_status", None)
-    if status in ("present", "absent", "unknown"):
-        return status
-    return "present" if _request_completion_contract(ctx) else "absent"
-
-
-def _completion_contract_unknown_due_to_policy_fallback(ctx: Any) -> bool:
-    return _request_completion_contract_status(ctx) == "unknown"
 
 
 _AUTHORING_TURN_INTENT_MODES = frozenset({TurnIntentMode.BUILD, TurnIntentMode.EDIT, TurnIntentMode.DRAFT_ONLY})
@@ -1111,23 +1063,6 @@ def _decision(config: CopilotConfig | None, key: str) -> EnforcementDecision:
     return EnforcementDecision(rule=key, message=_nudge(config, key))
 
 
-def _goal_likely_needs_more_blocks(user_message: Any, block_count: int, completion_contract: str | None = None) -> bool:
-    """Return True when the goal likely requires more blocks than currently exist."""
-    if block_count >= MIN_BLOCKS_FOR_AUTO_COMPLETE:
-        return False
-    if not isinstance(user_message, str):
-        return False
-    text = user_message.lower()
-    has_sequential = any(conn in text for conn in _SEQUENTIAL_CONNECTORS)
-    if block_count >= 1 and completion_contract:
-        return has_sequential and block_count < 2
-
-    matched_categories = sum(1 for category in _ACTION_CATEGORIES if any(keyword in text for keyword in category))
-
-    estimated_min_blocks = max(matched_categories, 2) if has_sequential else matched_categories
-    return block_count < estimated_min_blocks
-
-
 def _same_page(left: str | None, right: str | None) -> bool:
     if not left or not right:
         return False
@@ -1232,11 +1167,11 @@ def _post_discovery_entrypoint_url_question_nudge(
     )
 
 
-def _response_coverage_nudge(
+def _response_output_nudge(
     ctx: Any, parsed: dict[str, Any], config: CopilotConfig | None = None
 ) -> EnforcementDecision | None:
-    """Peek at the model's final output and return a decision for coverage gaps
-    or progress-narration format. ASK_QUESTION is let through so the agent
+    """Peek at the model's final output for unsupported delivery claims or
+    progress-narration format. ASK_QUESTION is let through so the agent
     can request missing credentials or disambiguation, except when discovery
     resolved a candidate and the agent has not yet inspected or composed from
     that candidate.
@@ -1268,27 +1203,6 @@ def _response_coverage_nudge(
         if nudge_count < MAX_NO_WORKFLOW_NUDGES:
             ctx.no_workflow_nudge_count = nudge_count + 1
             return _decision(config, "post_no_workflow_delivery")
-
-    workflow_tested_ok = (
-        getattr(ctx, "last_test_ok", None) is True
-        and getattr(ctx, "update_workflow_called", False)
-        and getattr(ctx, "test_after_update_done", False)
-    )
-    if workflow_tested_ok:
-        block_count = getattr(ctx, "last_update_block_count", None)
-        # ctx.user_message is set by the agent orchestrator in a later stack PR
-        # (06c). The getattr default keeps this gate working on partial stacks.
-        user_message = getattr(ctx, "user_message", "")
-        completion_contract = _request_completion_contract(ctx)
-        if (
-            isinstance(block_count, int)
-            and not _completion_contract_unknown_due_to_policy_fallback(ctx)
-            and _goal_likely_needs_more_blocks(user_message, block_count, completion_contract)
-        ):
-            nudge_count = getattr(ctx, "coverage_nudge_count", 0)
-            if nudge_count < MAX_INTERMEDIATE_NUDGES:
-                ctx.coverage_nudge_count = nudge_count + 1
-                return _decision(config, "post_intermediate_success")
 
     if _is_progress_narration(parsed.get("user_response")):
         nudge_count = getattr(ctx, "format_nudge_count", 0)
@@ -1612,14 +1526,14 @@ def enforcement_decision(
         ctx.repair_obligation_nudge_count = _get_int(ctx, "repair_obligation_nudge_count") + 1
         return _decision(config, "post_failed_test")
 
-    # Response-time gate: peek at the model's final output to tell ASK_QUESTION
-    # (always allowed) from a REPLY with a coverage gap or progress-narration.
+    # Response-time gate: peek at the model's final output to catch unsupported
+    # delivery claims or progress narration. ASK_QUESTION remains allowed.
     # Only runs when no state-based nudge fired.
     if result is not None:
         parsed = _parse_normalized_final_response(result)
         if parsed is None:
             return None
-        return _response_coverage_nudge(ctx, parsed, config)
+        return _response_output_nudge(ctx, parsed, config)
 
     return None
 
@@ -1979,7 +1893,6 @@ _NUDGE_TYPE_BY_KEY: dict[str, str] = {
     "post_failed_test": "post_failed_test",
     "post_failed_test_inspect_first": "post_failed_test_inspect_first",
     "screenshot_dropped": "screenshot_dropped_on_recovery",
-    "post_intermediate_success": "intermediate_success",
     "post_format": "format",
     # Self-mapped so the table enumerates every emittable rule; these two carry a
     # hardcoded message and so have no nudge key to shorten.

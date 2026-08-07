@@ -28,7 +28,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.trace import traced
 from skyvern.schemas.runs import ProxyLocationInput
-from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory, resolve_artifact_path
 from skyvern.webeye.browser_state import BrowserState
@@ -199,10 +199,18 @@ class RealBrowserState(BrowserState):
         cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
+        download_binding: DownloadBinding | None = None,
     ) -> None:
         if self.browser_context is None:
             LOG.info("creating browser context")
             context = skyvern_context.current()
+            # When recreation omits a binding, preserve the prior artifacts' binding instead of
+            # downgrading to RUN_DIR.
+            effective_download_binding = download_binding
+            if effective_download_binding is None:
+                effective_download_binding = (
+                    self.browser_artifacts.download_binding if self.browser_artifacts else DownloadBinding.RUN_DIR
+                )
             (
                 browser_context,
                 browser_artifacts,
@@ -222,6 +230,7 @@ class RealBrowserState(BrowserState):
                 browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
                 browser_profile_id=browser_profile_id,
                 engine_selection=self.engine_selection,
+                download_binding=effective_download_binding,
             )
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts
@@ -502,6 +511,12 @@ class RealBrowserState(BrowserState):
         # The old driver pipe is gone, so check_and_fix_state must not reuse self.pw; start a
         # fresh Playwright driver and reconnect to the same (still-alive) remote browser.
         stale_pw = self.pw
+        # check_and_fix_state rebuilds through the factory; forward this session's download binding so the
+        # creator seam preserves the provider-selected destination on reconnect. The binding is carried
+        # forward, never overridden after the fact, so a genuine provider change is not mislabeled.
+        prior_download_binding = (
+            self.browser_artifacts.download_binding if self.browser_artifacts else DownloadBinding.RUN_DIR
+        )
         self.browser_context = None
         await self.set_working_page(None)
         # Reconnect on the SAME engine this state was pinned to at creation; never silently switch
@@ -520,6 +535,7 @@ class RealBrowserState(BrowserState):
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
+                download_binding=prior_download_binding,
             )
         except Exception:
             # The caller abandons this state on failure, so stop the just-started driver too or it leaks.

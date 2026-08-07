@@ -18,6 +18,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db.id import WORKFLOW_RUN_PREFIX
 from skyvern.forge.sdk.routes.streaming.registries import (
     complete_stream_teardown,
     mark_stream_closing,
@@ -27,7 +28,7 @@ from skyvern.forge.sdk.routes.streaming.registries import (
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
-from skyvern.webeye.browser_artifacts import VideoArtifact
+from skyvern.webeye.browser_artifacts import DownloadBinding, VideoArtifact
 from skyvern.webeye.browser_engine import (
     BrowserEngineContext,
     BrowserEngineSelection,
@@ -47,6 +48,8 @@ from skyvern.webeye.session_cookies import persist_session_cookies
 from skyvern.webeye.video_utils import prepare_recording_for_upload
 
 LOG = structlog.get_logger()
+
+_WORKFLOW_RUN_KEY_PREFIX = f"{WORKFLOW_RUN_PREFIX}_"
 
 # Only driver/transport-level CDP drops trigger the cached-PBS evict + reconnect path.
 # Playwright also surfaces page/context-only closes ("Target page, context or browser
@@ -128,6 +131,15 @@ async def _rebind_pbs_download_dir(
     download_run_id: str,
     browser_session_id: str,
 ) -> None:
+    if browser_state.browser_artifacts.download_binding == DownloadBinding.SESSION_DIR:
+        # Provider-owned remote binding: preserve the provider-selected destination. Re-pointing to a
+        # run-scoped dir would overwrite it, so skip the rebind.
+        LOG.info(
+            "Skipping download-dir rebind: preserving provider-selected destination",
+            browser_session_id=browser_session_id,
+            download_run_id=download_run_id,
+        )
+        return
     browser_context = browser_state.browser_context
     if browser_context is None:
         return
@@ -1180,6 +1192,28 @@ class RealBrowserManager(BrowserManager):
 
         return browser_state_to_close
 
+    def _shared_with_another_workflow_run(self, workflow_run_id: str, browser_state_to_close: BrowserState) -> bool:
+        # NON-PBS ONLY. Python-object sharing of an ephemeral BrowserState is process-local, so an
+        # alias may veto the terminal close only when it denotes ANOTHER workflow run that is
+        # currently live in THIS process and legitimately shares this exact state (parent/child
+        # use_parent_browser_session). Three qualifications, all required:
+        #   1. another run's key (wr_ prefix, not our own) — same-run task/script aliases never share;
+        #   2. object identity — it points at the exact state we are about to close;
+        #   3. that run is live here — it still has a workflow-run context. A remote/finished/ghost
+        #      parent whose key was forward-synced into this process, or a never-cleaned
+        #      synthetic-run key, has no context and must not veto the close, or the browser
+        #      would outlive every run in this process.
+        # PBS lifetime is distributed (runnable_id + generation CAS across processes) and is governed
+        # elsewhere: close is force-gated off (close_browser_on_completion=False) and release goes
+        # through the expected-owner CAS. This local-liveness predicate must never decide PBS close.
+        return any(
+            page_id != workflow_run_id
+            and page_id.startswith(_WORKFLOW_RUN_KEY_PREFIX)
+            and browser_state is browser_state_to_close
+            and app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(page_id)
+            for page_id, browser_state in self.pages.items()
+        )
+
     async def cleanup_for_workflow_run(
         self,
         workflow_run_id: str,
@@ -1197,7 +1231,6 @@ class RealBrowserManager(BrowserManager):
         session_lease = self._persistent_session_leases.get(workflow_run_id)
         recording_finalized = False
         finalization_attempted = False
-        cleanup_page_ids = {workflow_run_id, *task_ids, *(child_workflow_run_ids or [])}
 
         # Drop the run's pinned engine — the run is ending, so no further browser resource will be
         # created for it. Covers the run, its inherited children, and its tasks.
@@ -1225,10 +1258,7 @@ class RealBrowserManager(BrowserManager):
             # If another workflow run still references this browser state (e.g. a
             # parent whose in-memory browser was shared via use_parent_browser_session),
             # skip closing the browser so the parent can continue using it.
-            shared = any(
-                page_id != workflow_run_id and browser_state is browser_state_to_close
-                for page_id, browser_state in self.pages.items()
-            )
+            shared = self._shared_with_another_workflow_run(workflow_run_id, browser_state_to_close)
             effective_close = close_browser_on_completion and not shared
             if shared:
                 LOG.info(
@@ -1256,10 +1286,7 @@ class RealBrowserManager(BrowserManager):
                     browser_state_to_close.browser_context,
                     browser_state_to_close.browser_artifacts.browser_session_dir,
                 )
-                shared_after_cleanup = any(
-                    page_id not in cleanup_page_ids and browser_state is browser_state_to_close
-                    for page_id, browser_state in self.pages.items()
-                )
+                shared_after_cleanup = self._shared_with_another_workflow_run(workflow_run_id, browser_state_to_close)
                 deferred_close = close_browser_on_completion and not shared_after_cleanup
                 release_driver = False if (shared_after_cleanup or browser_session_id) else None
                 owner = (
@@ -1318,8 +1345,10 @@ class RealBrowserManager(BrowserManager):
                 continue
             if task_browser_state is browser_state_to_close and finalization_attempted:
                 continue
-            # Same shared-state check for task-level entries
-            shared = any(bs is task_browser_state for bs in self.pages.values())
+            # Same liveness-qualified ownership predicate as the run-level close: a distinct
+            # task-level state must not be held open by a ghost alias, and it must still yield to a
+            # genuinely live cross-run sharer.
+            shared = self._shared_with_another_workflow_run(task_id, task_browser_state)
             effective_close = close_browser_on_completion and not shared
             if shared:
                 LOG.info(

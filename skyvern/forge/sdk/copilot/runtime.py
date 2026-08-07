@@ -309,7 +309,6 @@ class AgentContext:
     update_workflow_called: bool = False
     test_after_update_done: bool = False
     post_update_nudge_count: int = 0
-    coverage_nudge_count: int = 0
     format_nudge_count: int = 0
     copilot_total_timeout_exceeded: bool = False
     failed_test_nudge_count: int = 0
