@@ -123,6 +123,11 @@ MAX_FILE_PARSE_INPUT_TOKENS = 256_000
 MAX_PDF_OCR_PAGES = 50
 # Max concurrent per-page OCR calls when transcribing a scanned PDF.
 PDF_OCR_PAGE_CONCURRENCY = 5
+# Wall-clock ceiling for one blocking file-parse step (validation, text extraction, page
+# rendering). Parse cost tracks document complexity more than raw byte size, so a size cap
+# alone cannot bound it; this keeps a pathological document to one failed block instead of
+# letting it consume the run's whole activity budget.
+FILE_PARSE_STEP_TIMEOUT_SECONDS = 300
 MAX_IMAGE_MESSAGES = 10
 SCROLL_AMOUNT_MULTIPLIER = 100
 EXTRACT_ACTION_SCROLL_AMOUNT = 500  # pixels per scroll action from extract-action prompt
