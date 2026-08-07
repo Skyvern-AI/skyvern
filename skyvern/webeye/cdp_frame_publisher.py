@@ -125,6 +125,17 @@ class CDPFramePublisher:
         """Spawn the background publish loop. Idempotent."""
         if self.is_running:
             return
+        # Written once (never removed) so display capture stays off this key even if this publisher
+        # dies mid-run; a capture tick racing this first write may still publish one stray black frame.
+        try:
+            await asyncio.to_thread(_touch_remote_browser_sentinel, self._organization_id, self._stream_key)
+        except OSError:
+            LOG.warning(
+                "Could not write the remote-browser sentinel; display capture may overwrite frames",
+                stream_key=self._stream_key,
+                organization_id=self._organization_id,
+                exc_info=True,
+            )
         self._stopped.clear()
         self._task = asyncio.create_task(self._run(), name=f"cdp-frame-publisher:{self._stream_key}")
         LOG.info(
@@ -359,6 +370,20 @@ class CDPFramePublisher:
             await session.detach()
         except Exception:
             pass
+
+
+REMOTE_BROWSER_SENTINEL_SUFFIX = ".remote"
+
+
+def remote_browser_sentinel_path(organization_id: str, stream_key: str) -> Path:
+    """Marks the stream key as fed by a remote browser, so display-capture workers skip it."""
+    return Path(get_skyvern_temp_dir()) / organization_id / f"{stream_key}{REMOTE_BROWSER_SENTINEL_SUFFIX}"
+
+
+def _touch_remote_browser_sentinel(organization_id: str, stream_key: str) -> None:
+    path = remote_browser_sentinel_path(organization_id, stream_key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
 
 
 def stream_key_for_workflow_run(workflow_run_id: str) -> str:
