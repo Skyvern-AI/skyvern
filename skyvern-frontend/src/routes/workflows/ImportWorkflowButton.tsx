@@ -13,8 +13,10 @@ import { UploadIcon } from "@radix-ui/react-icons";
 import { useQueryClient } from "@tanstack/react-query";
 import { useId, useRef, useState } from "react";
 import {
+  ArchiveEntry,
   expandFileToWorkflowYamls,
   extractTitleFromYaml,
+  unzipArchive,
 } from "./importWorkflowYaml";
 import { WorkflowApiResponse } from "./types/workflowTypes";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -184,11 +186,42 @@ function ImportWorkflowButton({
     }
   };
 
+  const prepareDocument = async (
+    fileName: string,
+    id: string,
+    yaml: string,
+  ): Promise<PreparedYamlImport> => {
+    const title = extractTitleFromYaml(yaml);
+    let duplicateReason: DuplicateReason | null = null;
+    if (title) {
+      try {
+        const existing = await findExistingWorkflowTitle(title);
+        if (existing) {
+          duplicateReason = { kind: "existing", existingTitle: existing };
+        }
+      } catch {
+        duplicateReason = { kind: "check-failed" };
+      }
+    }
+    return { id, fileName, yaml, title, duplicateReason };
+  };
+
+  const expandToDocuments = (text: string): string[] => {
+    try {
+      return expandFileToWorkflowYamls(text);
+    } catch {
+      return [text];
+    }
+  };
+
   const handleFiles = async (fileList: FileList) => {
     const files = Array.from(fileList);
     const pdfFiles = files.filter((f) => f.name.toLowerCase().endsWith(".pdf"));
+    const zipFiles = files.filter((f) => f.name.toLowerCase().endsWith(".zip"));
     const yamlLikeFiles = files.filter(
-      (f) => !f.name.toLowerCase().endsWith(".pdf"),
+      (f) =>
+        !f.name.toLowerCase().endsWith(".pdf") &&
+        !f.name.toLowerCase().endsWith(".zip"),
     );
 
     let anyPdfStarted = false;
@@ -208,42 +241,46 @@ function ImportWorkflowButton({
 
     const preparedPerFile = await Promise.all(
       yamlLikeFiles.map(async (file) => {
-        const text = await file.text();
-        let documents: string[];
-        try {
-          documents = expandFileToWorkflowYamls(text);
-        } catch {
-          documents = [text];
-        }
+        const documents = expandToDocuments(await file.text());
         return Promise.all(
-          documents.map(async (yaml, index) => {
-            const title = extractTitleFromYaml(yaml);
-            let duplicateReason: DuplicateReason | null = null;
-            if (title) {
-              try {
-                const existing = await findExistingWorkflowTitle(title);
-                if (existing) {
-                  duplicateReason = {
-                    kind: "existing",
-                    existingTitle: existing,
-                  };
-                }
-              } catch {
-                duplicateReason = { kind: "check-failed" };
-              }
-            }
-            return {
-              id: `${file.name}#${index}`,
-              fileName: file.name,
-              yaml,
-              title,
-              duplicateReason,
-            };
-          }),
+          documents.map((yaml, index) =>
+            prepareDocument(file.name, `${file.name}#${index}`, yaml),
+          ),
         );
       }),
     );
-    const prepared: PreparedYamlImport[] = preparedPerFile.flat();
+
+    const preparedPerZip = await Promise.all(
+      zipFiles.map(async (file) => {
+        let entries: ArchiveEntry[];
+        try {
+          entries = unzipArchive(new Uint8Array(await file.arrayBuffer()));
+        } catch (error) {
+          toast({
+            variant: "destructive",
+            title: `Error reading ${file.name}`,
+            description: getErrorMessage(error, "Failed to read zip archive"),
+          });
+          return [];
+        }
+        const preparedPerEntry = await Promise.all(
+          entries.map(async ({ name, text }) => {
+            const documents = expandToDocuments(text);
+            return Promise.all(
+              documents.map((yaml, index) =>
+                prepareDocument(name, `${file.name}#${name}#${index}`, yaml),
+              ),
+            );
+          }),
+        );
+        return preparedPerEntry.flat();
+      }),
+    );
+
+    const prepared: PreparedYamlImport[] = [
+      ...preparedPerFile.flat(),
+      ...preparedPerZip.flat(),
+    ];
 
     const titleCounts = new Map<string, number>();
     for (const p of prepared) {
@@ -331,7 +368,7 @@ function ImportWorkflowButton({
                 ref={inputRef}
                 id={inputId}
                 type="file"
-                accept=".yaml,.yml,.json,.pdf"
+                accept=".yaml,.yml,.json,.zip,.pdf"
                 multiple
                 className="hidden"
                 disabled={isBusy}
@@ -364,7 +401,7 @@ function ImportWorkflowButton({
             </Label>
           </TooltipTrigger>
           <TooltipContent>
-            Import one or more agents from YAML, JSON, or PDF files
+            Import one or more agents from YAML, JSON, ZIP, or PDF files
           </TooltipContent>
         </Tooltip>
       </TooltipProvider>
