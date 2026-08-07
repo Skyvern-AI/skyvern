@@ -4,6 +4,11 @@ import { TurnNarrativeState } from "../narrativeState";
 
 // eslint-disable-next-line react-refresh/only-export-components
 export function shouldShowFixCard(turn: TurnNarrativeState): boolean {
+  // Never offer to diagnose a run the user deliberately stopped; a cancel also
+  // lands on terminal "error".
+  if (turn.cancelled) {
+    return false;
+  }
   return (
     turn.terminal === "error" || turn.blocks.some((b) => b.state === "failed")
   );
