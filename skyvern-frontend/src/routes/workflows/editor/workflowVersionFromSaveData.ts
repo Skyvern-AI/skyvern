@@ -1,3 +1,5 @@
+import { stringify as convertToYAML } from "yaml";
+
 import type { WorkflowSaveData } from "@/store/WorkflowHasChangesStore";
 
 import type { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
@@ -72,5 +74,38 @@ export function workflowVersionFromSaveData(
     sequential_key: settings.sequentialKey,
     folder_id: workflow.folder_id ?? null,
     import_error: workflow.import_error ?? null,
+  };
+}
+
+// A pasted "Export as YAML" document (WorkflowCreateYAMLRequest) nests the
+// definition under workflow_definition. The pane edits only the definition, so
+// unwrap it; top-level export settings are ignored, matching enterYamlMode.
+function unwrapWorkflowDefinition<T>(parsed: T): T {
+  const doc = parsed as
+    | { blocks?: unknown; workflow_definition?: unknown }
+    | null
+    | undefined;
+  const nested = doc?.workflow_definition;
+  return doc?.blocks == null &&
+    typeof nested === "object" &&
+    nested !== null &&
+    !Array.isArray(nested)
+    ? (nested as T)
+    : parsed;
+}
+
+// The pane edits the workflow definition, but a user can paste a full "Export
+// as YAML" document; a definition-only draft is POSTed as the user's raw text
+// so their formatting and comments survive the round trip.
+export function yamlCommitInputs<T>(
+  parsed: T,
+  draft: string,
+): { definition: T; definitionYaml: string } {
+  const definition = unwrapWorkflowDefinition(parsed);
+  return {
+    definition,
+    definitionYaml: Object.is(definition, parsed)
+      ? draft
+      : convertToYAML(definition),
   };
 }
