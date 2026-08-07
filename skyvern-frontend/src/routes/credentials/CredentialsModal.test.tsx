@@ -157,6 +157,7 @@ const editingPasswordCredential: CredentialApiResponse = {
     totp_identifier: null,
   },
   browser_profile_id: "existing-profile-id",
+  auto_profile_disabled: false,
   tested_url: "https://example.com/login",
   user_context: null,
   save_browser_session_intent: true,
@@ -732,7 +733,7 @@ describe("CredentialsModal browser-memory profile section (flag on)", () => {
     useFeatureFlagMock.mockImplementation(() => false);
   });
 
-  it("create mode shows the auto-save caption and no profile picker", async () => {
+  it("create mode shows the auto-save caption and a collapsed Advanced section", async () => {
     renderPasswordCredentialsModal();
     await waitFor(() => {
       expect(screen.getByDisplayValue("credentials")).toBeTruthy();
@@ -740,11 +741,35 @@ describe("CredentialsModal browser-memory profile section (flag on)", () => {
     expect(
       screen.getByText(/Skyvern saves this login.s browser state/i),
     ).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /advanced/i })).toBeNull();
+    const advanced = screen.getByRole("button", { name: "Advanced" });
+    // Both browser-memory controls live behind the disclosure.
+    expect(
+      screen.queryByRole("checkbox", {
+        name: "Don't automatically save or reuse a browser profile for this credential",
+      }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("checkbox", {
+        name: "Keep the same IP for this credential",
+      }),
+    ).toBeNull();
+    fireEvent.click(advanced);
+    expect(
+      screen.getByRole("checkbox", {
+        name: "Keep the same IP for this credential",
+      }),
+    ).toBeTruthy();
+    expect(
+      screen
+        .getByRole("checkbox", {
+          name: "Don't automatically save or reuse a browser profile for this credential",
+        })
+        .getAttribute("data-state"),
+    ).toBe("unchecked");
     expect(screen.queryByText("Browser profile")).toBeNull();
   });
 
-  it("create mode submits browser_profile_id null and the IP-pin choice", async () => {
+  it("create mode submits the IP pin and automatic-profile opt-out", async () => {
     postMock.mockResolvedValueOnce({
       data: { credential_id: "c1", name: "credentials" },
     });
@@ -765,7 +790,17 @@ describe("CredentialsModal browser-memory profile section (flag on)", () => {
       document.querySelector('input[type="password"]') as HTMLInputElement,
       { target: { value: "password" } },
     );
-    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "Keep the same IP for this credential",
+      }),
+    );
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "Don't automatically save or reuse a browser profile for this credential",
+      }),
+    );
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => {
       expect(postMock).toHaveBeenCalledWith(
@@ -773,12 +808,13 @@ describe("CredentialsModal browser-memory profile section (flag on)", () => {
         expect.objectContaining({
           browser_profile_id: null,
           pin_saved_session_ip: true,
+          auto_profile_disabled: true,
         }),
       );
     });
   }, 10_000);
 
-  it("edit mode shows the Browser profile select inline — no Advanced gate, no create caption", async () => {
+  it("edit mode shows the Browser profile select and Advanced section", async () => {
     getMock.mockImplementation((url: string) =>
       url.includes("/browser_profiles/")
         ? Promise.resolve({
@@ -796,10 +832,57 @@ describe("CredentialsModal browser-memory profile section (flag on)", () => {
       expect(screen.getByText("Browser profile")).toBeTruthy();
     });
     expect(screen.getByRole("combobox")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /advanced/i })).toBeNull();
+    expect(screen.getByRole("button", { name: "Advanced" })).toBeTruthy();
     expect(
       screen.queryByText(/Skyvern saves this login.s browser state/i),
     ).toBeNull();
+  });
+
+  it("edit mode persists opting back in without unlinking the profile", async () => {
+    patchMock.mockResolvedValueOnce({
+      data: {
+        ...editingPasswordCredential,
+        auto_profile_disabled: false,
+      },
+    });
+    const view = renderEditPasswordCredentialsModal({
+      ...editingPasswordCredential,
+      auto_profile_disabled: true,
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Advanced" })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    const optOut = screen.getByRole("checkbox", {
+      name: "Don't automatically save or reuse a browser profile for this credential",
+    });
+    expect(optOut.getAttribute("data-state")).toBe("checked");
+    fireEvent.click(optOut);
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id",
+        expect.objectContaining({
+          auto_profile_disabled: false,
+          browser_profile_id: "existing-profile-id",
+        }),
+      );
+    });
+
+    view.unmount();
+    renderEditPasswordCredentialsModal({
+      ...editingPasswordCredential,
+      auto_profile_disabled: false,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    expect(
+      screen
+        .getByRole("checkbox", {
+          name: "Don't automatically save or reuse a browser profile for this credential",
+        })
+        .getAttribute("data-state"),
+    ).toBe("unchecked");
   });
 
   it("keeps the proxy IP-pin UI for card credentials under the flag", async () => {
@@ -876,8 +959,16 @@ describe("CredentialsModal browser-memory profile section (flag on)", () => {
     );
   }
 
+  async function openAdvanced() {
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Advanced" })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+  }
+
   it("shows the IP session identity and Rotate when the credential is pinned", async () => {
     renderEditModalFor(pinnedEditCredential);
+    await openAdvanced();
     await waitFor(() => {
       expect(screen.getByText(/psi_9f8a7b/)).toBeTruthy();
     });
@@ -886,6 +977,7 @@ describe("CredentialsModal browser-memory profile section (flag on)", () => {
 
   it("hides the IP session identity and Rotate when no session is pinned", async () => {
     renderEditModalFor(pinnedNoSessionCredential);
+    await openAdvanced();
     await waitFor(() => {
       expect(
         screen.getByText("Keep the same IP for this credential"),
@@ -900,6 +992,7 @@ describe("CredentialsModal browser-memory profile section (flag on)", () => {
       data: { credential_id: "real-cred-id", name: "Acme Login" },
     });
     renderEditModalFor(pinnedEditCredential);
+    await openAdvanced();
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Rotate" })).toBeTruthy();
     });
