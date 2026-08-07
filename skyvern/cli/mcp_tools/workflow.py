@@ -666,28 +666,6 @@ def _inject_missing_top_level_defaults(definition: str, fmt: str, defaults: dict
     return _dump_definition_dict(raw, parsed_format) if changed else definition
 
 
-def _inject_code_v2_defaults(definition: str, fmt: str) -> str:
-    """Inject Code 2.0 defaults (code_version=2, run_with=agent) when not explicitly set.
-
-    Only modifies JSON definitions (or auto-detected JSON). YAML is returned unchanged.
-    """
-    if fmt == "yaml":
-        return definition
-
-    try:
-        raw = json.loads(definition)
-    except (json.JSONDecodeError, TypeError):
-        return definition  # let _parse_definition handle the error
-
-    changed = False
-    for key, value in _CODE_V2_DEFAULTS.items():
-        if key not in raw:
-            raw[key] = value
-            changed = True
-
-    return json.dumps(raw) if changed else definition
-
-
 def _collect_code_block_labels(blocks: Any) -> frozenset[str]:
     if not isinstance(blocks, list):
         return frozenset()
@@ -1720,8 +1698,8 @@ async def skyvern_workflow_create(
     One block per step: "navigation" for actions, "extraction" for data. Do NOT use deprecated "task" type.
     Omit `code_only` or pass null to use this server's default; organization policy may enforce code-only, making rejection intentional.
     Call skyvern_block_schema() for block types and schemas. Use {{parameter_key}} for input references.
-    Defaults to AI agent execution (run_with="agent"). For JSON definitions, code_version=2 is also
-    injected (YAML definitions go through the backend schema, which currently leaves code_version unset).
+    When omitted, run_with defaults to "agent" and code_version defaults to 2 for both JSON and YAML
+    definitions.
     Pass run_with="code" to opt into cached script execution. Blocks share a browser session automatically.
     Give every code block a `prompt`: its plain-language goal, shown as the block's Goal in the
     editor. Code blocks that omit `prompt` are defaulted to prompt="" so they render the current
@@ -1750,13 +1728,12 @@ async def skyvern_workflow_create(
 
     # Default MCP-created workflows to the same editor defaults while preserving
     # any explicit user-supplied values.
-    definition = _inject_code_v2_defaults(definition, format)
     definition = _inject_code_block_prompt_defaults(definition, format, existing_code_labels=frozenset())
     definition = _inject_code_block_derived_steps(definition, format)
     definition = _inject_missing_top_level_defaults(
         definition,
         format,
-        {"proxy_location": _DEFAULT_MCP_PROXY_LOCATION},
+        {**_CODE_V2_DEFAULTS, "proxy_location": _DEFAULT_MCP_PROXY_LOCATION},
     )
 
     json_def, yaml_def, parse_err = _parse_definition(definition, format)
