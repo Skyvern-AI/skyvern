@@ -2352,7 +2352,6 @@ workflow_definition:
         assert json.loads(result)["ok"] is True
         assert captured["workflow_yaml"] == clean_yaml
         assert captured["run_called"] is True
-        assert ctx.coverage_nudge_count == 0
         assert "Achieve the following mini goal" not in captured["workflow_yaml"]
 
 

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
+from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState, ReconcileDecision
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.result_evidence import loaded_result_source_producible
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import scouting
@@ -109,6 +112,9 @@ def _single_max_structural_loaded_result_packet() -> dict:
 def _ctx() -> AgentContext:
     ctx = AgentContext.__new__(AgentContext)
     ctx.scout_trajectory = []
+    ctx.completion_criteria_turn_state = None
+    ctx.request_policy = None
+    ctx.completion_verification_result = None
     return ctx
 
 
@@ -1099,3 +1105,96 @@ async def test_auto_act_front_runs_the_third_evaluate(monkeypatch) -> None:
     detect_tool_loop(tripping, "evaluate")
     detect_tool_loop(tripping, "evaluate")
     assert detect_tool_loop(tripping, "evaluate") is not None
+
+
+def _ctx_with_unmet_download_goal() -> AgentContext:
+    ctx = _ctx()
+    criterion = CompletionCriterion(
+        id="c0",
+        outcome="the invoice for July is downloaded",
+        deliverable_kind="registered_download",
+    )
+    ctx.completion_criteria_turn_state = CompletionCriteriaTurnState(
+        decision=ReconcileDecision(action="create", reason="first", epoch=1, criteria=(criterion,))
+    )
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_result_table_with_unmet_download_goal_keeps_actionable_targets(monkeypatch) -> None:
+    """A page can be both a results table and the place a download must be earned. While a
+    registered-download criterion is unmet, the composition steer must not hide the click
+    affordances the goal still needs."""
+
+    async def fake_evidence(ctx, *, url):
+        return _result_table_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake_evidence)
+    ctx = _ctx_with_unmet_download_goal()
+    ctx.last_evaluate_actionable_signature = "stale"
+    ctx.last_evaluate_actionable_url = "https://example.com/previous"
+    result = {
+        "ok": True,
+        "data": {
+            "url": "https://example.com/results",
+            "actionable_targets": [{"selector": "#details", "text": "Details"}],
+        },
+    }
+
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://example.com/results")
+
+    assert result["data"].get("next_action") != "compose_extraction"
+    assert "actionable_targets" in result["data"]
+    assert "composition_targets" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_result_table_with_satisfied_download_goal_still_composes(monkeypatch) -> None:
+    async def fake_evidence(ctx, *, url):
+        return _result_table_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake_evidence)
+    ctx = _ctx_with_unmet_download_goal()
+    ctx.completion_verification_result = SimpleNamespace(verdicts=[SimpleNamespace(criterion_id="c0", satisfied=True)])
+    ctx.last_evaluate_actionable_signature = "stale"
+    ctx.last_evaluate_actionable_url = "https://example.com/previous"
+    result = {
+        "ok": True,
+        "data": {
+            "url": "https://example.com/results",
+            "actionable_targets": [{"selector": "#details", "text": "Details"}],
+        },
+    }
+
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://example.com/results")
+
+    assert result["data"].get("next_action") == "compose_extraction"
+    assert "actionable_targets" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_result_table_composes_again_once_download_target_is_reached(monkeypatch) -> None:
+    from skyvern.forge.sdk.copilot.reached_download_target import derive_from_observed_render
+
+    async def fake_evidence(ctx, *, url):
+        return _result_table_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake_evidence)
+    ctx = _ctx_with_unmet_download_goal()
+    ctx.reached_download_target = derive_from_observed_render(
+        selector="a.bill", rendered_url="https://example.com/bill-image"
+    )
+    ctx.last_evaluate_actionable_signature = "stale"
+    ctx.last_evaluate_actionable_url = "https://example.com/previous"
+    result = {
+        "ok": True,
+        "data": {
+            "url": "https://example.com/results",
+            "actionable_targets": [{"selector": "#details", "text": "Details"}],
+        },
+    }
+
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://example.com/results")
+
+    assert result["data"].get("next_action") == "compose_extraction"
+    assert "actionable_targets" not in result["data"]

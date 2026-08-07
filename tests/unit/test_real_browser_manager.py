@@ -22,7 +22,11 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.routes.streaming import registries
 from skyvern.webeye import real_browser_manager
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding, VideoArtifact
-from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
+from skyvern.webeye.browser_engine import (
+    BrowserEngineBootstrapError,
+    BrowserEngineMetadata,
+    BrowserEngineSelection,
+)
 from skyvern.webeye.browser_factory import set_popup_video_listener
 from skyvern.webeye.real_browser_manager import RealBrowserManager, _PersistentSessionLease
 from skyvern.webeye.real_browser_state import RealBrowserState
@@ -2005,6 +2009,156 @@ async def test_repair_forwards_pinned_engine_selection() -> None:
         await state.check_and_fix_state()
 
     assert create_browser_context.await_args.kwargs["engine_selection"] is selection
+
+
+class _EngE(Exception):
+    pass
+
+
+class _EngT(_EngE):
+    pass
+
+
+def _engine_sel(
+    name: str,
+    *,
+    boot_fallback: BrowserEngineSelection | None = None,
+    start=None,
+) -> BrowserEngineSelection:
+    async def _ok_start() -> MagicMock:
+        driver = MagicMock()
+        driver.stop = AsyncMock()
+        return driver
+
+    return BrowserEngineSelection(
+        name=name,
+        start_driver=start or _ok_start,
+        error_type=_EngE,
+        timeout_error_type=_EngT,
+        metadata=BrowserEngineMetadata(name=name, version=None),
+        selection_reason="test",
+        boot_fallback_selection=boot_fallback,
+    )
+
+
+def _install_owner(manager: RealBrowserManager, run_key: str, selection: BrowserEngineSelection):
+    resolved = asyncio.get_event_loop().create_future()
+    resolved.set_result(selection)
+    owner = real_browser_manager._EngineSelectionOwner(resolved)
+    manager._engine_owners[run_key] = owner
+    return owner
+
+
+def _failing_start(message: str):
+    async def _boom():
+        raise RuntimeError(message)
+
+    return _boom
+
+
+@pytest.mark.asyncio
+async def test_boot_fallback_driver_start_failure_falls_back_once_and_repins() -> None:
+    manager = RealBrowserManager()
+    classical = _engine_sel("playwright")
+    rustwright = _engine_sel("rustwright", boot_fallback=classical, start=_failing_start("start boom"))
+    _install_owner(manager, "wr_1", rustwright)
+    with (
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=rustwright)),
+        patch.object(
+            real_browser_manager.BrowserContextFactory,
+            "create_browser_context",
+            AsyncMock(return_value=(MagicMock(), BrowserArtifacts(), None)),
+        ),
+    ):
+        state = await manager._create_browser_state(workflow_run_id="wr_1", engine_run_key="wr_1")
+    assert state.engine_selection.name == "playwright"
+    pinned = manager._engine_owners["wr_1"].task.result()
+    assert pinned.name == "playwright"
+    assert pinned.boot_fallback_selection is None  # classical fallback carries no further fallback
+
+
+@pytest.mark.asyncio
+async def test_boot_fallback_context_bootstrap_error_falls_back_once() -> None:
+    manager = RealBrowserManager()
+    classical = _engine_sel("playwright")
+    rustwright = _engine_sel("rustwright", boot_fallback=classical)
+    _install_owner(manager, "wr_1", rustwright)
+
+    calls: list[str] = []
+
+    async def _create(pw, **kwargs):
+        calls.append(kwargs["engine_selection"].name)
+        if kwargs["engine_selection"].name == "rustwright":
+            raise BrowserEngineBootstrapError("rustwright launch failed")
+        return (MagicMock(), BrowserArtifacts(), None)
+
+    with (
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=rustwright)),
+        patch.object(real_browser_manager.BrowserContextFactory, "create_browser_context", _create),
+    ):
+        state = await manager._create_browser_state(workflow_run_id="wr_1", engine_run_key="wr_1")
+    assert state.engine_selection.name == "playwright"
+    assert calls == ["rustwright", "playwright"]  # one hop only
+
+
+@pytest.mark.asyncio
+async def test_boot_fallback_stripped_on_successful_rustwright_commit() -> None:
+    manager = RealBrowserManager()
+    classical = _engine_sel("playwright")
+    rustwright = _engine_sel("rustwright", boot_fallback=classical)
+    _install_owner(manager, "wr_1", rustwright)
+    with (
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=rustwright)),
+        patch.object(
+            real_browser_manager.BrowserContextFactory,
+            "create_browser_context",
+            AsyncMock(return_value=(MagicMock(), BrowserArtifacts(), None)),
+        ),
+    ):
+        state = await manager._create_browser_state(workflow_run_id="wr_1", engine_run_key="wr_1")
+    assert state.engine_selection.name == "rustwright"
+    # Commit-strip: a later same-run recreation reuses rustwright but can no longer fall back.
+    pinned = manager._engine_owners["wr_1"].task.result()
+    assert pinned.name == "rustwright"
+    assert pinned.boot_fallback_selection is None
+
+
+@pytest.mark.asyncio
+async def test_classical_fallback_failure_propagates_with_no_second_hop() -> None:
+    manager = RealBrowserManager()
+    classical = _engine_sel("playwright", start=_failing_start("classical boom"))
+    rustwright = _engine_sel("rustwright", boot_fallback=classical, start=_failing_start("rustwright boom"))
+    _install_owner(manager, "wr_1", rustwright)
+    with patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=rustwright)):
+        with pytest.raises(RuntimeError, match="classical boom"):
+            await manager._create_browser_state(workflow_run_id="wr_1", engine_run_key="wr_1")
+
+
+@pytest.mark.asyncio
+async def test_non_fallback_driver_start_failure_propagates_unchanged() -> None:
+    # Default path preserved: a selection with no boot fallback that fails to start propagates as before.
+    manager = RealBrowserManager()
+    plain = _engine_sel("playwright", start=_failing_start("start boom"))
+    _install_owner(manager, "wr_1", plain)
+    with patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=plain)):
+        with pytest.raises(RuntimeError, match="start boom"):
+            await manager._create_browser_state(workflow_run_id="wr_1", engine_run_key="wr_1")
+
+
+@pytest.mark.asyncio
+async def test_repin_engine_selection_is_guarded_against_resurrection() -> None:
+    manager = RealBrowserManager()
+    # Missing owner: repin must not create one.
+    manager._repin_engine_selection("absent", _engine_sel("playwright"))
+    assert "absent" not in manager._engine_owners
+    # Terminal owner: repin must not replace its task (no resurrection of a torn-down run).
+    owner = _install_owner(manager, "wr_t", _engine_sel("rustwright"))
+    owner.terminal = True
+    original_task = owner.task
+    manager._repin_engine_selection("wr_t", _engine_sel("playwright"))
+    assert manager._engine_owners["wr_t"].task is original_task
+    # Ephemeral resource (run_key None): no-op, no error.
+    manager._repin_engine_selection(None, _engine_sel("playwright"))
 
 
 def _fake_cleanup_state() -> MagicMock:
