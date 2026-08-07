@@ -182,6 +182,7 @@ from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_P
 from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     ReachedDownloadTarget,
+    can_deliver_registered_download,
     code_is_download_intent,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -5879,7 +5880,12 @@ def _submitted_code_block_changed(block: Mapping[str, Any], prior_yaml: str | No
 def _should_impose_after_update_attempt(ctx: AgentContext, *, repeated_identical_omission: bool = False) -> bool:
     target = ctx.reached_download_target
     return (
-        (isinstance(target, ReachedDownloadTarget) and not target.already_registered and bool(target.selector.strip()))
+        (
+            isinstance(target, ReachedDownloadTarget)
+            and can_deliver_registered_download(target)
+            and not target.already_registered
+            and bool(target.selector.strip())
+        )
         or synthesized_persistence_reopened_after_failed_run(ctx)
         or ctx.synthesized_block_reopened_for_credential_scout
         or repeated_identical_omission
