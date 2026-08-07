@@ -113,6 +113,10 @@ from skyvern.webeye.actions.actions import Action, DecisiveAction
 from skyvern.webeye.cdp_download_interceptor import download_filename_from_suffix
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
 
+# Fire-and-forget artifact writes. The loop only holds weak references to tasks,
+# so they are kept here until they complete.
+_STORE_ARTIFACT_TASKS: set[asyncio.Task] = set()
+
 LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
 
@@ -264,7 +268,11 @@ async def build_file_tree(
                     artifact = await app.DATABASE.artifacts.get_artifact_by_id(script_file.artifact_id, organization_id)
                     if artifact:
                         # override the actual file in the storage
-                        asyncio.create_task(app.STORAGE.store_artifact(artifact, content_bytes))
+                        # The event loop only keeps weak references to tasks, so a
+                        # discarded store can be collected before the write lands.
+                        _store_task = asyncio.create_task(app.STORAGE.store_artifact(artifact, content_bytes))
+                        _STORE_ARTIFACT_TASKS.add(_store_task)
+                        _store_task.add_done_callback(_STORE_ARTIFACT_TASKS.discard)
                     else:
                         artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
                             organization_id=organization_id,
