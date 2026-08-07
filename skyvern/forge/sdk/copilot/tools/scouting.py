@@ -60,7 +60,6 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import FillCarry
 from skyvern.forge.sdk.copilot.enforcement import (
-    _RECENT_TOOL_OUTPUT_CHAR_CAP,
     mint_scout_observation_contract_for_ctx,
     record_reached_terminal_action_observation,
     record_scouted_output_coverage,
@@ -91,7 +90,12 @@ from skyvern.forge.sdk.copilot.runtime import (
     resolve_browser_state_for_context,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
-from skyvern.forge.sdk.workflow.models.block import CodeBlockCaptchaError, _code_block_solve_captcha_builtin
+from skyvern.forge.sdk.workflow.models.block import (
+    CodeBlockCaptchaError,
+    _bounded_code_block_recaptcha_token_populated,
+    _code_block_recaptcha_response_field_present,
+    _code_block_solve_captcha_builtin,
+)
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
@@ -103,6 +107,14 @@ from ._shared import (
 from .banned_blocks import _copilot_block_authoring_policy
 
 LOG = structlog.get_logger()
+
+# Emission budget for scout/evaluate tool results: bounds how much live page content
+# a result may carry into the authoring context, so it must not follow the transcript
+# recent-window cap.
+_SCOUT_RESULT_CHAR_CAP = 2000
+# Reconnaissance evaluates keep the raw page payload by design, so they get a larger
+# budget than the steer results; this is the hard ceiling on that channel, not a target.
+_SCOUT_RECON_RESULT_CHAR_CAP = 20_000
 
 _FILL_CARRY_RETRYABLE_VALIDATION_FAILURES = frozenset({"page_mismatch", "selector_absent_from_page_evidence"})
 
@@ -792,6 +804,10 @@ def _record_scouted_interaction(
 
 
 _MAX_CHALLENGE_SOLVE_ATTEMPTS = 3
+# Measured: a healthy turn re-enters the ladder 4-5 times for one widget, because a token
+# expires long before a turn ends. Sized well clear of that so it bounds a page rotating its
+# identity to outspend us, without cutting a legitimate turn short.
+_MAX_CHALLENGE_SOLVE_ATTEMPTS_PER_TURN = 12
 
 
 def _challenge_identity(evidence: dict[str, Any]) -> str:
@@ -840,7 +856,7 @@ async def solve_challenge_when_evidence_settles(
     url: str | None,
     observed_after_interaction: bool,
 ) -> bool:
-    """Try the shared solve routes on a challenge in just-settled evidence; True if it passed.
+    """Try the shared solve routes on a challenge in just-settled evidence; True when one landed.
 
     Call from a capture exit, never a tool hook: a settled packet describes the page as it now
     is, and ``observed_after_interaction`` follows from the seam — the act-observe capture runs
@@ -865,6 +881,16 @@ async def solve_challenge_when_evidence_settles(
     attempts = ctx.challenge_solve_attempts.get(identity, 0)
     if attempts >= _MAX_CHALLENGE_SOLVE_ATTEMPTS:
         return False
+    # Every input to the identity is page-controlled, so a widget that rotates its sitekey or id
+    # mints a fresh one on each observation and never reaches the per-identity cap. The solver
+    # costs real money on a platform-wide account, so the turn needs a bound the page cannot move.
+    if sum(ctx.challenge_solve_attempts.values()) >= _MAX_CHALLENGE_SOLVE_ATTEMPTS_PER_TURN:
+        LOG.info(
+            "copilot_scout_captcha_turn_budget_spent",
+            url=url,
+            organization_id=ctx.organization_id,
+        )
+        return False
     ctx.challenge_solve_attempts[identity] = attempts + 1
 
     # Read once so the handlers below report a failure without touching the context again.
@@ -878,8 +904,19 @@ async def solve_challenge_when_evidence_settles(
         page = await browser_state.get_working_page()
         if page is None:
             return False
+        # Crediting a token that was already there would let an unrelated widget's response pass
+        # this challenge off as solved, so the transition is what counts. An unreadable baseline
+        # withholds that credit rather than failing the solve that has not happened yet.
+        try:
+            token_before = await _bounded_code_block_recaptcha_token_populated(page)
+        except Exception:
+            token_before = None
         # In-DOM checkbox, then the Turnstile extension, then the reCAPTCHA token route.
-        await _code_block_solve_captcha_builtin(page, organization_id=organization_id)
+        arm_passed = await _code_block_solve_captcha_builtin(
+            page,
+            organization_id=organization_id,
+            browser_session_id=ctx.browser_session_id,
+        )
     except CodeBlockCaptchaError:
         LOG.info(
             "copilot_scout_captcha_solve_failed",
@@ -898,16 +935,29 @@ async def solve_challenge_when_evidence_settles(
         )
         return False
 
-    # "attempted", not "solved": the routes return normally when their probes match nothing, so a
-    # carrier asserted by challenge_state alone can complete here without anything being solved.
+    # A reCAPTCHA widget stays rendered after it is satisfied, so its continued presence says
+    # nothing; the response token going from absent to present is what the platform treats as the
+    # authoritative solve signal. An unreadable read withholds the credit rather than inventing it.
+    try:
+        token_after = await _bounded_code_block_recaptcha_token_populated(page)
+        judged_by_token = await _code_block_recaptcha_response_field_present(page)
+    except Exception:
+        token_after = None
+        judged_by_token = False
+    # Turnstile and plain checkbox challenges carry no response field, so an arm passing is all
+    # there is to go on; where a field exists, the transition is what separates this solve from a
+    # response some other widget left behind.
+    solved = arm_passed and (token_before is False and token_after is True if judged_by_token else True)
+
     if observed_after_interaction:
-        _record_challenge_encounter(ctx, carrier, outcome="attempted")
+        _record_challenge_encounter(ctx, carrier, outcome="solved" if solved else "attempted")
     LOG.info(
-        "copilot_scout_captcha_solved",
+        "copilot_scout_captcha_solve_attempted",
         url=url,
         organization_id=organization_id,
+        solved=solved,
     )
-    return True
+    return solved
 
 
 def _page_evidence_has_selector(value: Any, selector: str) -> bool:
@@ -1381,7 +1431,7 @@ def _shed_scout_page_summary_section(summary: dict[str, Any]) -> bool:
 
 def _attach_scout_page_summary(result: dict[str, Any], page_evidence: dict[str, Any]) -> None:
     """Attach a compact page summary at result["data"]["page"], keeping the whole
-    serialized result under the recent-output pruner cap by shedding sections —
+    serialized result under the scout result budget by shedding sections —
     never by slicing the serialized JSON."""
     data = result.get("data")
     if not isinstance(data, dict):
@@ -1389,7 +1439,7 @@ def _attach_scout_page_summary(result: dict[str, Any], page_evidence: dict[str, 
     try:
         summary = _build_scout_page_summary(page_evidence)
         data["page"] = summary
-        while len(json.dumps(result)) > _RECENT_TOOL_OUTPUT_CHAR_CAP:
+        while len(json.dumps(result)) > _SCOUT_RESULT_CHAR_CAP:
             if not _shed_scout_page_summary_section(summary):
                 data.pop("page", None)
                 return
@@ -1633,18 +1683,33 @@ def _fit_evaluate_steer_under_cap(
     *,
     keep_raw_page_payload: bool,
 ) -> None:
-    """Keep the serialized result under the recent-output cap without ever head-slicing it.
+    """Keep the serialized result under the scout result budget without ever head-slicing it.
 
     Reconnaissance output needs the raw page payload available to the model; imperative steers have
     enough structured evidence to shed bulky non-essential payload while always preserving the action."""
 
+    def over(limit: int) -> bool:
+        return len(json.dumps(result, default=str)) > limit
+
     def over_cap() -> bool:
-        return len(json.dumps(result, default=str)) > _RECENT_TOOL_OUTPUT_CHAR_CAP
+        return over(_SCOUT_RESULT_CHAR_CAP)
 
     if not over_cap():
         return
     if keep_raw_page_payload:
         data.pop("actionable_targets", None)
+        nested = data.get("result")
+        if isinstance(nested, dict):
+            for key in _EVALUATE_STEER_NESTED_BULKY_KEYS:
+                if not over(_SCOUT_RECON_RESULT_CHAR_CAP):
+                    return
+                if key in nested and nested[key] != _EVALUATE_STEER_SHED_MARKER:
+                    nested[key] = _EVALUATE_STEER_SHED_MARKER
+        while over(_SCOUT_RECON_RESULT_CHAR_CAP):
+            largest_key = _largest_non_essential_data_key(data)
+            if largest_key is None:
+                break
+            data[largest_key] = _EVALUATE_STEER_SHED_MARKER
         return
     nested = data.get("result")
     if isinstance(nested, dict):
@@ -1724,7 +1789,7 @@ async def _auto_act_on_repeat(ctx: AgentContext, result: dict[str, Any], *, url:
     else:
         data["page"] = _build_scout_page_summary(post_evidence)
     essential = _auto_act_essential_keys()
-    while len(json.dumps(result, default=str)) > _RECENT_TOOL_OUTPUT_CHAR_CAP:
+    while len(json.dumps(result, default=str)) > _SCOUT_RESULT_CHAR_CAP:
         largest = max(
             (
                 (key, _serialized_len(value))

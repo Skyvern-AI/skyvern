@@ -736,6 +736,7 @@ class Block(BaseModel, abc.ABC):
         *,
         force_include_secrets: bool = False,
         env: SandboxedEnvironment | None = None,
+        skip_missing_variable_preflight: bool = False,
     ) -> str:
         """
         Format a template string using the workflow run context.
@@ -844,7 +845,9 @@ class Block(BaseModel, abc.ABC):
         template_data["workflow_run_outputs"] = workflow_run_context.workflow_run_outputs
         template_data["workflow_run_summary"] = workflow_run_context.build_workflow_run_summary()
 
-        if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
+        # A caller whose environment decides for itself what an absent binding means renders instead of
+        # failing here, so `| default(...)` still reaches an undefined the preflight would reject.
+        if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict" and not skip_missing_variable_preflight:
             if missing_variables := get_missing_variables(potential_template, template_data):
                 raise MissingJinjaVariables(
                     template=potential_template,
@@ -1503,18 +1506,30 @@ class BaseTaskBlock(Block):
                     # so that cookie-based authentication can redirect or restore the session
                     # BEFORE the agent starts interacting with the page.
                     if workflow_run.browser_profile_id:
-                        LOG.info(
-                            "Browser profile loaded — waiting for page to settle before agent acts",
-                            browser_profile_id=workflow_run.browser_profile_id,
-                            workflow_run_id=workflow_run.workflow_run_id,
-                        )
-                        try:
-                            await working_page.wait_for_load_state("networkidle", timeout=10000)
-                        except Exception:
-                            LOG.debug(
-                                "networkidle timeout after browser profile load (non-fatal)",
+                        applied_profile_id = browser_state.browser_artifacts.applied_browser_profile_id
+                        if applied_profile_id != workflow_run.browser_profile_id and not browser_session_id:
+                            LOG.warning(
+                                "Stamped browser profile was not applied to this browser — continuing without saved state",
+                                browser_profile_id=workflow_run.browser_profile_id,
+                                applied_browser_profile_id=applied_profile_id,
                                 workflow_run_id=workflow_run.workflow_run_id,
                             )
+                        else:
+                            # A persistent session loads its profile session-side, invisible to these
+                            # artifacts — keep the settle wait so cookie redirects finish either way.
+                            LOG.info(
+                                "Browser profile loaded — waiting for page to settle before agent acts",
+                                browser_profile_id=workflow_run.browser_profile_id,
+                                applied_browser_profile_id=applied_profile_id,
+                                workflow_run_id=workflow_run.workflow_run_id,
+                            )
+                            try:
+                                await working_page.wait_for_load_state("networkidle", timeout=10000)
+                            except Exception:
+                                LOG.debug(
+                                    "networkidle timeout after browser profile load (non-fatal)",
+                                    workflow_run_id=workflow_run.workflow_run_id,
+                                )
 
                 except Exception as e:
                     LOG.exception(
@@ -3783,6 +3798,10 @@ _CODE_BLOCK_RECAPTCHA_ANCHOR_PATHS = ("/recaptcha/api2/anchor", "/recaptcha/ente
 _CODE_BLOCK_RECAPTCHA_ANCHOR_ARM_TIMEOUT_SECONDS = 5
 # The extension arm polls a solver over the network; the scout caller has no enclosing bound.
 _CODE_BLOCK_EXTENSION_ARM_TIMEOUT_SECONDS = 12
+# Same reason, sized from measured solves: a correct solver task returns in ~25s, so this covers one
+# with headroom while cutting the losing task of the pair, which only ends at its own 180s timeout.
+_CODE_BLOCK_TOKEN_ARM_TIMEOUT_SECONDS = 90
+_CODE_BLOCK_WIDGET_RESET_TIMEOUT_SECONDS = 3
 # Google's widget flips aria-checked after its own animation; a shorter wait reads as unsolved.
 _CODE_BLOCK_RECAPTCHA_ANCHOR_SETTLE_MS = 2_000
 _CODE_BLOCK_CAPTCHA_CONTINUE_SELECTOR = ", ".join(
@@ -3832,23 +3851,34 @@ async def _bounded_code_block_recaptcha_token_populated(scope: Frame | Page | Re
     return False
 
 
+async def _code_block_recaptcha_response_field_present(scope: Page | RecordingPage) -> bool:
+    """Whether the page carries a reCAPTCHA response field at all.
+
+    Turnstile and plain checkbox challenges have none, so a token transition cannot judge whether
+    they were solved.
+    """
+    return await _bounded_code_block_locator_count(scope.locator(_CODE_BLOCK_RECAPTCHA_RESPONSE_SELECTOR)) > 0
+
+
 async def _code_block_solve_captcha_builtin(
     page: Page | RecordingPage,
     *,
     organization_id: str | None = None,
     workflow_run_id: str | None = None,
-) -> None:
-    """Solve a detected challenge through the bounded platform ladder.
+    browser_session_id: str | None = None,
+) -> bool:
+    """Solve a detected challenge through the bounded platform ladder; True when an arm passed.
 
     The initial structural probes are intentionally cheap. Solver routes are never
-    called when neither a challenge control nor vendor marker is present.
+    called when neither a challenge control nor vendor marker is present, and False
+    distinguishes that no-op from a solve so callers do not re-perceive a page nothing touched.
     """
     checkbox = page.locator(_CODE_BLOCK_CAPTCHA_CHECKBOX_SELECTOR)
     checkbox_count = await _bounded_code_block_locator_count(checkbox)
     marker = page.locator(_CODE_BLOCK_CAPTCHA_MARKER_SELECTOR)
     marker_count = await _bounded_code_block_locator_count(marker)
     if checkbox_count == 0 and marker_count == 0:
-        return
+        return False
 
     if checkbox_count == 1:
         candidate = checkbox.first
@@ -3864,14 +3894,16 @@ async def _code_block_solve_captcha_builtin(
                             await continuation_candidate.click()
                             await page.wait_for_timeout(100)
                             if await _bounded_code_block_locator_count(checkbox) == 0:
-                                return
+                                return True
                     else:
                         # Checkbox challenges commonly complete on the checkbox
                         # interaction itself and expose no associated continuation.
-                        return
+                        return True
         except Exception:
             LOG.info("code block CAPTCHA checkbox arm did not solve", arm="dom_checkbox")
 
+    anchor_clicked = False
+    anchor_left_token = False
     # A page-level locator cannot cross into reCAPTCHA's anchor iframe. Click the checkbox in-frame.
     try:
         async with asyncio.timeout(_CODE_BLOCK_RECAPTCHA_ANCHOR_ARM_TIMEOUT_SECONDS):
@@ -3894,11 +3926,12 @@ async def _code_block_solve_captcha_builtin(
                     break
                 page_url_before_click = urlparse(page.url)._replace(fragment="").geturl()
                 await candidate.click()
+                anchor_clicked = True
                 LOG.info("code block CAPTCHA anchor frame clicked", arm="recaptcha_anchor_frame")
                 await page.wait_for_timeout(_CODE_BLOCK_RECAPTCHA_ANCHOR_SETTLE_MS)
                 if frame.is_detached() and urlparse(page.url)._replace(fragment="").geturl() != page_url_before_click:
                     LOG.info("code block CAPTCHA anchor frame solved after navigation", arm="recaptcha_anchor_frame")
-                    return
+                    return True
                 token_is_populated = await _bounded_code_block_recaptcha_token_populated(token_scope)
                 if (
                     await candidate.get_attribute("aria-checked") == "true"
@@ -3906,27 +3939,51 @@ async def _code_block_solve_captcha_builtin(
                     and token_is_populated is True
                 ):
                     LOG.info("code block CAPTCHA anchor frame solved", arm="recaptcha_anchor_frame")
-                    return
+                    return True
+                # An inconclusive baseline fails the test above even when the click earned a token,
+                # so read the widget rather than the verdict before deciding a reset is free.
+                anchor_left_token = token_is_populated is True
                 break
     except Exception:
         LOG.info("code block CAPTCHA anchor frame arm did not solve", arm="recaptcha_anchor_frame")
 
+    # Clicking the anchor escalates to an image challenge whose overlay covers the page and
+    # outlives the arm, so every later click lands on it instead of the form. Resetting is the only
+    # thing that closes it (Escape does not), and it is skipped when the click left a token behind,
+    # because a reset discards one.
+    if anchor_clicked and not anchor_left_token:
+        # The settle window is approximate and the reset is destructive, so look once more: a solve
+        # that landed just past it would otherwise be discarded and escalated all over again.
+        anchor_left_token = await _bounded_code_block_recaptcha_token_populated(page) is True
+    if anchor_clicked and not anchor_left_token:
+        try:
+            async with asyncio.timeout(_CODE_BLOCK_WIDGET_RESET_TIMEOUT_SECONDS):
+                await page.evaluate(
+                    "() => { const g = window.grecaptcha;"
+                    " const api = g && g.enterprise && g.enterprise.reset ? g.enterprise : g;"
+                    " if (api && api.reset) api.reset(); }"
+                )
+        except Exception:
+            LOG.info("code block CAPTCHA widget reset did not run", arm="recaptcha_anchor_frame")
+
     try:
         async with asyncio.timeout(_CODE_BLOCK_EXTENSION_ARM_TIMEOUT_SECONDS):
             if await app.AGENT_FUNCTION.auto_solve_captchas(page):
-                return
+                return True
     except Exception:
         LOG.info("code block CAPTCHA extension arm did not solve", arm="extension")
 
     recaptcha = page.locator(_CODE_BLOCK_RECAPTCHA_MARKER_SELECTOR)
     if await _bounded_code_block_locator_count(recaptcha) > 0:
         try:
-            if await app.AGENT_FUNCTION.solve_recaptcha_token(
-                page,
-                organization_id=organization_id,
-                workflow_run_id=workflow_run_id,
-            ):
-                return
+            async with asyncio.timeout(_CODE_BLOCK_TOKEN_ARM_TIMEOUT_SECONDS):
+                if await app.AGENT_FUNCTION.solve_recaptcha_token(
+                    page,
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    browser_session_id=browser_session_id,
+                ):
+                    return True
         except Exception:
             LOG.info("code block CAPTCHA token arm did not solve", arm="token")
 

@@ -30,6 +30,7 @@ import {
   TokensIcon,
 } from "@radix-ui/react-icons";
 import { useQueryClient } from "@tanstack/react-query";
+import { strToU8, zipSync } from "fflate";
 import { stringify as convertToYAML } from "yaml";
 import { convert } from "../editor/workflowEditorUtils";
 import { Tag, TagKey } from "../types/tagTypes";
@@ -52,8 +53,12 @@ type Props = {
 };
 
 // Blob URLs avoid the ~2MB data-URI cap that truncates large workflow exports.
-function downloadFile(fileName: string, contents: string) {
-  const blob = new Blob([contents], { type: "text/plain;charset=utf-8" });
+function downloadFile(
+  fileName: string,
+  contents: BlobPart,
+  mimeType = "text/plain;charset=utf-8",
+) {
+  const blob = new Blob([contents], { type: mimeType });
   const url = URL.createObjectURL(blob);
   const element = document.createElement("a");
   element.href = url;
@@ -64,6 +69,22 @@ function downloadFile(fileName: string, contents: string) {
   document.body.removeChild(element);
   // Deferred so a still-starting download cannot lose its blob.
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+function sanitizeFileName(name: string): string {
+  return name.replace(/[/\\:*?"<>|]/g, "_");
+}
+
+// Two selected agents can share a title; number repeats so every archive
+// entry name stays unique.
+function uniqueFileName(used: Set<string>, title: string, ext: string): string {
+  const base = sanitizeFileName(title);
+  let candidate = `${base}.${ext}`;
+  for (let suffix = 2; used.has(candidate); suffix++) {
+    candidate = `${base}-${suffix}.${ext}`;
+  }
+  used.add(candidate);
+  return candidate;
 }
 
 function BulkActionBar({
@@ -225,7 +246,7 @@ function BulkActionBar({
   function handleBulkExport(type: "json" | "yaml") {
     if (selectedWorkflows.length === 1) {
       const workflow = selectedWorkflows[0]!;
-      const safeTitle = workflow.title.replace(/[/\\:*?"<>|]/g, "_");
+      const safeTitle = sanitizeFileName(workflow.title);
       const contents =
         type === "json"
           ? JSON.stringify(convert(workflow), null, 2)
@@ -233,16 +254,24 @@ function BulkActionBar({
       downloadFile(`${safeTitle}.${type}`, contents);
       return;
     }
-    // One bundled file; per-agent downloads trip the browser's
-    // multiple-downloads permission prompt.
-    const converted = selectedWorkflows.map((workflow) => convert(workflow));
-    const contents =
-      type === "json"
-        ? JSON.stringify(converted, null, 2)
-        : converted
-            .map((definition) => convertToYAML(definition))
-            .join("---\n");
-    downloadFile(`agents-export-${selectedWorkflows.length}.${type}`, contents);
+    // A ZIP with one file per agent triggers a single download. N sequential
+    // downloadFile() calls would trip the browser's multiple-downloads
+    // permission prompt instead.
+    const usedNames = new Set<string>();
+    const entries: Record<string, Uint8Array> = {};
+    for (const workflow of selectedWorkflows) {
+      const contents =
+        type === "json"
+          ? JSON.stringify(convert(workflow), null, 2)
+          : convertToYAML(convert(workflow));
+      entries[uniqueFileName(usedNames, workflow.title, type)] =
+        strToU8(contents);
+    }
+    downloadFile(
+      `agents-export-${selectedWorkflows.length}.zip`,
+      new Uint8Array(zipSync(entries)),
+      "application/zip",
+    );
   }
 
   const agentNoun = count === 1 ? "agent" : "agents";

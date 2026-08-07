@@ -25,9 +25,11 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import time
 from functools import lru_cache
-from urllib.parse import urlencode
+from typing import NamedTuple
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from pydantic import BaseModel, model_validator
 
@@ -69,6 +71,44 @@ ARTIFACT_URL_EXPIRY_SECONDS_MIN = 60 * 60  # 1 hour
 ARTIFACT_URL_EXPIRY_SECONDS_MAX = 7 * 24 * 60 * 60  # 7 days
 
 _ARTIFACT_CONTENT_PATH_TEMPLATE = "/v1/artifacts/{artifact_id}/content"
+_ARTIFACT_CONTENT_PATH_RE = re.compile(r"^/v1/artifacts/(?P<artifact_id>[^/]+)/content$")
+
+
+class ParsedArtifactContentUrl(NamedTuple):
+    artifact_id: str
+    expiry: str | None
+    kid: str | None
+    sig: str | None
+
+
+def parse_artifact_content_url(url: str, base_url: str) -> ParsedArtifactContentUrl | None:
+    """Return the artifact id and signing params when ``url`` addresses ``base_url``'s own
+    artifact content endpoint; None for every other URL.
+
+    Scheme, host and any path prefix must match ``base_url`` exactly, so a customer-supplied
+    look-alike URL is never mistaken for a first-party one.
+    """
+    try:
+        parts = urlsplit(url)
+        base_parts = urlsplit(base_url.rstrip("/"))
+    except ValueError:
+        return None
+    if not base_parts.scheme or not base_parts.netloc:
+        return None
+    if (parts.scheme, parts.netloc) != (base_parts.scheme, base_parts.netloc):
+        return None
+    if not parts.path.startswith(base_parts.path):
+        return None
+    match = _ARTIFACT_CONTENT_PATH_RE.match(parts.path[len(base_parts.path) :])
+    if not match:
+        return None
+    query = dict(parse_qsl(parts.query))
+    return ParsedArtifactContentUrl(
+        artifact_id=match.group("artifact_id"),
+        expiry=query.get("expiry"),
+        kid=query.get("kid"),
+        sig=query.get("sig"),
+    )
 
 
 def effective_artifact_url_expiry_seconds(per_org_value: int | None) -> int:

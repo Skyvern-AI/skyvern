@@ -7,7 +7,12 @@ import os
 import structlog
 from playwright.async_api import BrowserContext
 
-from skyvern.webeye.profile_cookie_merge import _ALLOWED_COOKIE_KEYS, BANKED_COOKIES_FILENAME
+from skyvern.webeye.profile_cookie_merge import (
+    _ALLOWED_COOKIE_KEYS,
+    BANKED_COOKIES_FILENAME,
+    clear_banked_cookies,
+    union_cookies_into_profile_dir,
+)
 
 LOG = structlog.get_logger()
 
@@ -143,3 +148,24 @@ async def restore_banked_cookies(browser_context: BrowserContext | None, user_da
         await _add_cookies_with_fallback(browser_context, sanitized, "banked")
     except Exception:
         LOG.warning("Failed to restore banked cookies", exc_info=True)
+
+
+async def refresh_banked_cookies(browser_context: BrowserContext | None, user_data_dir: str | None) -> None:
+    """Replace the banked-cookies sidecar in ``user_data_dir`` with the live context's cookie jar.
+
+    Chromium commits its Cookies database on a ~30s timer, so a directory archived from a running browser
+    can hold a database that predates the last sign-in and the sidecar carries what it is missing. Without
+    a live context the sidecar is only dropped: the browser has flushed its database, and a sidecar
+    inherited from the seed archive would otherwise replay stale cookies over fresher state at every boot.
+    """
+    if not user_data_dir or not os.path.isdir(user_data_dir):
+        return
+    cookies: list[dict] = []
+    if browser_context is not None:
+        try:
+            cookies = await browser_context.cookies()
+        except Exception as exc:
+            LOG.info("Live cookie jar unavailable; dropping the banked cookies", error_type=type(exc).__name__)
+    clear_banked_cookies(user_data_dir)
+    if cookies:
+        union_cookies_into_profile_dir(cookies, user_data_dir)

@@ -577,6 +577,50 @@ def test_run_mcp_browser_extension_flag_starts_and_stops_runtime(monkeypatch: py
     runtime.shutdown.assert_awaited_once_with()
 
 
+@pytest.mark.asyncio
+async def test_run_mcp_with_cleanup_serves_when_extension_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = "browser extension bridge unavailable"
+    get_or_start = AsyncMock(side_effect=BrowserExtensionError(message))
+    run_async = AsyncMock()
+    cleanup = AsyncMock()
+    warning = MagicMock()
+    instance = MagicMock(return_value=None)
+    monkeypatch.setattr(BrowserExtensionRuntime, "get_or_start", get_or_start)
+    monkeypatch.setattr(BrowserExtensionRuntime, "instance", instance)
+    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", cleanup)
+    monkeypatch.setattr(run_commands.LOG, "warning", warning)
+
+    await run_commands._run_mcp_with_cleanup(run_async, browser_extension=True, transport="stdio")
+
+    get_or_start.assert_awaited_once_with()
+    run_async.assert_awaited_once_with(transport="stdio")
+    cleanup.assert_awaited_once_with()
+    instance.assert_called_once_with()
+    assert warning.call_count == 1
+    assert warning.call_args.kwargs["error"] == message
+
+
+@pytest.mark.asyncio
+async def test_run_mcp_with_cleanup_propagates_unexpected_extension_start_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    get_or_start = AsyncMock(side_effect=RuntimeError("unexpected startup failure"))
+    run_async = AsyncMock()
+    cleanup = AsyncMock()
+    monkeypatch.setattr(BrowserExtensionRuntime, "get_or_start", get_or_start)
+    monkeypatch.setattr(BrowserExtensionRuntime, "instance", MagicMock(return_value=None))
+    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", cleanup)
+
+    with pytest.raises(RuntimeError, match="unexpected startup failure"):
+        await run_commands._run_mcp_with_cleanup(run_async, browser_extension=True)
+
+    get_or_start.assert_awaited_once_with()
+    run_async.assert_not_awaited()
+    cleanup.assert_awaited_once_with()
+
+
 @pytest.mark.parametrize("transport", ["sse", "streamable-http"])
 def test_run_mcp_rejects_browser_extension_with_http_transport(
     monkeypatch: pytest.MonkeyPatch,

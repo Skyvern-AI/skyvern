@@ -934,6 +934,7 @@ class RealBrowserManager(BrowserManager):
                 "Creating browser state for workflow run",
                 sampling=True,
                 workflow_run_id=workflow_run.workflow_run_id,
+                browser_profile_id=browser_profile_id or "none",
             )
             if browser_session_id and workflow_run.organization_id:
                 session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
@@ -1026,7 +1027,11 @@ class RealBrowserManager(BrowserManager):
         finalize: bool = True,
     ) -> list[VideoArtifact]:
         if len(browser_state.browser_artifacts.video_artifacts) == 0:
-            LOG.warning(
+            # Empty is the expected state on browsers with no local Playwright recording
+            # (vendor/CDP/persistent sessions) until finalize time, when vendor recordings
+            # have been attached and a still-empty list means the recording is missing.
+            log = LOG.warning if finalize else LOG.debug
+            log(
                 "Video data not found for task",
                 task_id=task_id,
                 workflow_id=workflow_id,

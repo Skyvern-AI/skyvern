@@ -1952,6 +1952,27 @@ def test_connected_resume_never_binds_an_origin_from_prose() -> None:
     assert policy.live_page_admitted_urls == {}
 
 
+def test_connected_resume_names_the_picked_credential_superseding_an_earlier_mention() -> None:
+    """The fill seam's which-credential check is set equality, so a card answer must replace an
+    earlier prose mention, not join it."""
+    policy = _card_answerable_policy()
+    policy.current_turn_named_credential_ids = {"cred_earlier"}
+
+    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
+
+    assert policy.current_turn_named_credential_ids == {"cred_1"}
+
+
+def test_connected_resume_does_not_duplicate_an_already_resolved_credential() -> None:
+    policy = _card_answerable_policy()
+    credential = _make_credential()
+    policy.resolved_credentials = [credential]
+
+    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, credential)
+
+    assert [resolved.credential_id for resolved in policy.resolved_credentials] == ["cred_1"]
+
+
 def test_a_card_connected_credential_keeps_its_durable_cross_turn_approval() -> None:
     ctx = make_copilot_context()
     policy = _card_answerable_policy()
