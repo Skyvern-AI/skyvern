@@ -1193,13 +1193,24 @@ class RealBrowserManager(BrowserManager):
         return browser_state_to_close
 
     def _shared_with_another_workflow_run(self, workflow_run_id: str, browser_state_to_close: BrowserState) -> bool:
-        # Cross-run sharing is only ever registered under another run's workflow_run_id
-        # (parent/child inheritance via use_parent_browser_session). Same-run task, script, or
-        # ghost aliases must not suppress the terminal close — the browser would outlive the run.
+        # NON-PBS ONLY. Python-object sharing of an ephemeral BrowserState is process-local, so an
+        # alias may veto the terminal close only when it denotes ANOTHER workflow run that is
+        # currently live in THIS process and legitimately shares this exact state (parent/child
+        # use_parent_browser_session). Three qualifications, all required:
+        #   1. another run's key (wr_ prefix, not our own) — same-run task/script aliases never share;
+        #   2. object identity — it points at the exact state we are about to close;
+        #   3. that run is live here — it still has a workflow-run context. A remote/finished/ghost
+        #      parent whose key was forward-synced into this process, or a never-cleaned
+        #      synthetic-run key, has no context and must not veto the close, or the browser
+        #      would outlive every run in this process.
+        # PBS lifetime is distributed (runnable_id + generation CAS across processes) and is governed
+        # elsewhere: close is force-gated off (close_browser_on_completion=False) and release goes
+        # through the expected-owner CAS. This local-liveness predicate must never decide PBS close.
         return any(
             page_id != workflow_run_id
             and page_id.startswith(_WORKFLOW_RUN_KEY_PREFIX)
             and browser_state is browser_state_to_close
+            and app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(page_id)
             for page_id, browser_state in self.pages.items()
         )
 
@@ -1334,8 +1345,10 @@ class RealBrowserManager(BrowserManager):
                 continue
             if task_browser_state is browser_state_to_close and finalization_attempted:
                 continue
-            # Same shared-state check for task-level entries
-            shared = any(bs is task_browser_state for bs in self.pages.values())
+            # Same liveness-qualified ownership predicate as the run-level close: a distinct
+            # task-level state must not be held open by a ghost alias, and it must still yield to a
+            # genuinely live cross-run sharer.
+            shared = self._shared_with_another_workflow_run(task_id, task_browser_state)
             effective_close = close_browser_on_completion and not shared
             if shared:
                 LOG.info(

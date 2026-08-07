@@ -7,12 +7,15 @@ on every call and re-invoke navigate_to_url() on every step.
 """
 
 import asyncio
+from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.exceptions import MissingBrowserStateForBrowserSession
+from skyvern.exceptions import BrowserSessionAlreadyOccupiedError, MissingBrowserStateForBrowserSession
+from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.artifact.storage.recording_test_helpers import fake_prepared_recording
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -1049,11 +1052,13 @@ async def test_cleanup_persists_session_cookies_when_close_deferred_for_streams(
     monkeypatch.setattr("skyvern.webeye.real_browser_manager.stream_ref_active", lambda wrid: True)
     monkeypatch.setattr("skyvern.webeye.real_browser_manager.set_deferred_close_params", defer_mock)
 
-    result = await manager.cleanup_for_workflow_run(
-        "wfr_streamed",
-        task_ids=["tsk_streamed"],
-        close_browser_on_completion=True,
-    )
+    # The parent alias only suppresses the close when it is a genuinely live run in this process.
+    with _live_workflow_run_contexts("wr_parent"):
+        result = await manager.cleanup_for_workflow_run(
+            "wfr_streamed",
+            task_ids=["tsk_streamed"],
+            close_browser_on_completion=True,
+        )
 
     persist_mock.assert_awaited_once_with(browser_state.browser_context, "/tmp/fake_profile")
     defer_mock.assert_called_once_with(
@@ -2015,6 +2020,21 @@ def _close_true_count(state: MagicMock) -> int:
     return sum(1 for call in state.close.await_args_list if call.kwargs.get("close_browser_on_completion") is True)
 
 
+@contextmanager
+def _live_workflow_run_contexts(*run_ids: str) -> Iterator[None]:
+    """Control the process-local run-liveness signal the non-PBS sharing predicate consults: only
+    the given run ids read as live, every other wr_ alias is treated as a ghost. Backs the C1 fix —
+    a forward-synced parent key whose run is not live here must not veto the terminal close."""
+    wcm = forge_app.WORKFLOW_CONTEXT_MANAGER
+    live = set(run_ids)
+    original = wcm.has_workflow_run_context
+    wcm.has_workflow_run_context = lambda workflow_run_id: workflow_run_id in live
+    try:
+        yield
+    finally:
+        wcm.has_workflow_run_context = original
+
+
 @pytest.mark.asyncio
 async def test_cleanup_same_run_alias_and_ghost_alias_closes_browser_once() -> None:
     manager = RealBrowserManager()
@@ -2043,18 +2063,77 @@ async def test_cleanup_ghost_only_alias_absent_from_task_list_still_closes() -> 
 
 
 @pytest.mark.asyncio
-async def test_cleanup_genuine_parent_sharing_does_not_close_early() -> None:
+async def test_cleanup_genuine_live_parent_sharing_does_not_close_early() -> None:
+    # A use_parent_browser_session parent that is genuinely live in THIS process shares the exact
+    # BrowserState; the child's terminal cleanup must not close it out from under the live parent.
     manager = RealBrowserManager()
     state = _fake_cleanup_state()
     manager.pages["wr_child"] = state
     manager.pages["tsk_c"] = state
     manager.pages["wr_parent"] = state
 
-    result = await manager.cleanup_for_workflow_run("wr_child", ["tsk_c"], close_browser_on_completion=True)
+    with _live_workflow_run_contexts("wr_child", "wr_parent"):
+        result = await manager.cleanup_for_workflow_run("wr_child", ["tsk_c"], close_browser_on_completion=True)
 
     assert _close_true_count(state) == 0
     assert "wr_parent" in manager.pages
     assert result.recording_finalized is False
+
+
+@pytest.mark.asyncio
+async def test_cleanup_ghost_parent_alias_without_live_context_closes_once() -> None:
+    # A ghost parent: a child whose parent ran in another process creates a fresh
+    # state and forward-syncs pages[wr_parent] = state. The parent is NOT live in this process, so
+    # its ghost alias must not veto the child's terminal close — otherwise the browser leaks.
+    manager = RealBrowserManager()
+    state = _fake_cleanup_state()
+    manager.pages["wr_child"] = state
+    manager.pages["tsk_c"] = state
+    manager.pages["wr_parent"] = state  # forward-synced ghost; parent lives in another process
+
+    with _live_workflow_run_contexts("wr_child"):  # only the child is live here
+        result = await manager.cleanup_for_workflow_run("wr_child", ["tsk_c"], close_browser_on_completion=True)
+        # The ghost parent key is not a live run, so it does not veto the close.
+        assert manager._shared_with_another_workflow_run("wr_child", state) is False
+
+    # The browser is closed exactly once instead of leaking behind the ghost parent veto.
+    assert _close_true_count(state) == 1
+    assert result.recording_finalized is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_synthetic_ghost_wr_alias_does_not_suppress_close() -> None:
+    # A never-cleaned synthetic-run wr_ key (SDK action ghost) aliasing this state has no live
+    # context and must not suppress the terminal close.
+    manager = RealBrowserManager()
+    state = _fake_cleanup_state()
+    manager.pages["wr_1"] = state
+    manager.pages["wr_synthetic_ghost"] = state
+
+    with _live_workflow_run_contexts("wr_1"):
+        result = await manager.cleanup_for_workflow_run("wr_1", [], close_browser_on_completion=True)
+
+    assert _close_true_count(state) == 1
+    assert result.recording_finalized is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_task_state_ghost_alias_still_closes_uniformly() -> None:
+    # Task-loop uniformity: a distinct task-level state aliased only by a ghost tsk_ key (not a live
+    # wr_ run) must still close exactly once — the task-loop predicate is the same liveness-qualified
+    # ownership check as the run-level close.
+    manager = RealBrowserManager()
+    run_state = _fake_cleanup_state()
+    task_state = _fake_cleanup_state()
+    manager.pages["wr_1"] = run_state
+    manager.pages["tsk_a"] = task_state
+    manager.pages["tsk_ghost"] = task_state  # ghost alias of the distinct task state
+
+    with _live_workflow_run_contexts("wr_1"):
+        await manager.cleanup_for_workflow_run("wr_1", ["tsk_a"], close_browser_on_completion=True)
+
+    assert _close_true_count(run_state) == 1
+    assert _close_true_count(task_state) == 1
 
 
 @pytest.mark.asyncio
@@ -2121,3 +2200,186 @@ async def test_cleanup_task_close_error_is_contained() -> None:
     assert _close_true_count(run_state) == 1
     assert _close_true_count(ok_state) == 1
     assert result.browser_state is run_state
+
+
+@pytest.mark.asyncio
+async def test_pbs_cleanup_release_only_even_with_zero_local_contexts(monkeypatch: pytest.MonkeyPatch) -> None:
+    # PBS/non-PBS boundary: with NO live workflow context anywhere and a ghost wr_ alias present, a
+    # PBS cleanup must still be release-only. The local-liveness predicate can never drive a PBS
+    # terminal close — PBS lifetime is distributed, not decided by this process.
+    workflow_run_id = "wr_pbs_zero_ctx"
+    manager = RealBrowserManager()
+    state = MagicMock()
+    state.browser_artifacts.traces_dir = None
+    state.close = AsyncMock(return_value=False)
+    manager.pages[workflow_run_id] = state
+    manager.pages["wr_ghost_local"] = state  # a wr_ alias; irrelevant under the PBS regime
+    manager._persistent_session_leases[workflow_run_id] = _PersistentSessionLease(
+        session_id="pbs_zero", organization_id="org_test", runnable_id=workflow_run_id, browser_state=state
+    )
+    sessions = MagicMock()
+    sessions.release_browser_session = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        real_browser_manager,
+        "app",
+        MagicMock(
+            PERSISTENT_SESSIONS_MANAGER=sessions,
+            WORKFLOW_CONTEXT_MANAGER=MagicMock(has_workflow_run_context=MagicMock(return_value=False)),
+        ),
+    )
+
+    await manager.cleanup_for_workflow_run(
+        workflow_run_id,
+        task_ids=[],
+        close_browser_on_completion=False,
+        browser_session_id="pbs_zero",
+        organization_id="org_test",
+    )
+
+    state.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=False)
+    sessions.release_browser_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pbs_cross_process_stale_cleanup_is_release_cas_noop_and_never_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Two processes, one PBS. Ownership has moved to process B (generation gen2, wrapper_b); process A
+    # is stale (gen1, wrapper_a). Process A's cleanup must (a) never terminal-close the remote browser
+    # and (b) release only through the expected-owner CAS, which rejects its stale identity — so
+    # process B's live ownership is untouched (PBS distributed ownership).
+    session_id = "pbs_shared"
+    wrapper_b = object()
+    current_owner = {"runnable_id": "wr_podB", "generation": "gen2", "wrapper": wrapper_b}
+
+    async def release_cas(
+        *,
+        session_id: str,
+        organization_id: str,
+        expected_runnable_id: str | None,
+        expected_runnable_generation_id: str | None,
+        expected_browser_state: object,
+    ) -> bool:
+        return (
+            expected_runnable_id == current_owner["runnable_id"]
+            and expected_runnable_generation_id == current_owner["generation"]
+            and expected_browser_state is current_owner["wrapper"]
+        )
+
+    sessions = MagicMock()
+    sessions.release_browser_session = AsyncMock(side_effect=release_cas)
+    monkeypatch.setattr(real_browser_manager, "app", MagicMock(PERSISTENT_SESSIONS_MANAGER=sessions))
+
+    mgr_a = RealBrowserManager()
+    wrapper_a = MagicMock()
+    wrapper_a.browser_artifacts.traces_dir = None
+    wrapper_a.close = AsyncMock(return_value=False)
+    mgr_a.pages["wr_podA"] = wrapper_a
+    mgr_a._persistent_session_leases["wr_podA"] = _PersistentSessionLease(
+        session_id=session_id,
+        organization_id="org_test",
+        runnable_id="wr_podA",
+        runnable_generation_id="gen1",
+        browser_state=wrapper_a,
+    )
+
+    await mgr_a.cleanup_for_workflow_run(
+        "wr_podA",
+        task_ids=[],
+        close_browser_on_completion=False,
+        browser_session_id=session_id,
+        organization_id="org_test",
+    )
+
+    # The stale Pod never terminal-closes the remote browser.
+    wrapper_a.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=False)
+    # It releases with its OWN stale expected-owner tuple, which the CAS rejects.
+    release_call = sessions.release_browser_session.await_args
+    assert release_call.kwargs["expected_runnable_id"] == "wr_podA"
+    assert release_call.kwargs["expected_runnable_generation_id"] == "gen1"
+    assert release_call.kwargs["expected_browser_state"] is wrapper_a
+    assert (
+        await release_cas(
+            session_id=session_id,
+            organization_id="org_test",
+            expected_runnable_id="wr_podA",
+            expected_runnable_generation_id="gen1",
+            expected_browser_state=wrapper_a,
+        )
+        is False
+    )
+    # The live owner (Pod B, gen2, wrapper_b) is still accepted — ownership genuinely moved and holds.
+    assert (
+        await release_cas(
+            session_id=session_id,
+            organization_id="org_test",
+            expected_runnable_id="wr_podB",
+            expected_runnable_generation_id="gen2",
+            expected_browser_state=wrapper_b,
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_pbs_second_occupancy_rejected_leaves_no_local_lease() -> None:
+    # A second concurrent runnable attempting to occupy a PBS already held by another runnable is
+    # rejected by begin_session's occupancy CAS; the manager propagates and leaves no local lease.
+    manager = RealBrowserManager()
+    task = make_task("tsk_second", workflow_run_id=None)
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock(
+            side_effect=BrowserSessionAlreadyOccupiedError("pbs_busy", "wr_first_owner")
+        )
+        with pytest.raises(BrowserSessionAlreadyOccupiedError):
+            await manager.get_or_create_for_task(task=task, browser_session_id="pbs_busy")
+
+    assert manager.live_session_runnable_ids() == set()
+
+
+@pytest.mark.asyncio
+async def test_address_only_cleanup_preserves_remote_and_defers_local_driver_with_zero_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Broad PBS, remote-address form: a caller-provided remote browser has no DB session lease, so the
+    # service gate hands cleanup close_browser_on_completion=False. Even with a ghost wr_ alias and NO
+    # live workflow context anywhere, the manager must keep the remote browser alive — close(False) —
+    # and pass release_driver=None so the state stops only its own per-run local driver via
+    # release_driver_on_close. Local liveness must never terminal-close the durable remote browser.
+    manager = RealBrowserManager()
+    state = _fake_cleanup_state()
+    manager.pages["wr_addr"] = state
+    manager.pages["wr_ghost_local"] = state  # ghost wr_ alias; not a live run
+    monkeypatch.setattr(
+        real_browser_manager,
+        "app",
+        MagicMock(WORKFLOW_CONTEXT_MANAGER=MagicMock(has_workflow_run_context=MagicMock(return_value=False))),
+    )
+
+    await manager.cleanup_for_workflow_run("wr_addr", [], close_browser_on_completion=False)
+
+    state.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=None)
+    assert _close_true_count(state) == 0
+
+
+@pytest.mark.asyncio
+async def test_address_only_cross_pod_stale_cleanup_never_terminal_closes_durable_browser() -> None:
+    # Two Pods hold different local wrappers for the same durable remote browser reached by
+    # browser_address (no session id, no lease). Pod A's cleanup must never terminal-close the durable
+    # browser and must not touch Pod B's wrapper — the remote browser is owned by neither process.
+    mgr_a = RealBrowserManager()
+    wrapper_a = _fake_cleanup_state()
+    mgr_a.pages["wr_podA"] = wrapper_a
+
+    wrapper_b = _fake_cleanup_state()  # Pod B's independent wrapper for the same remote browser
+
+    with _live_workflow_run_contexts():  # nothing is live in Pod A's process
+        await mgr_a.cleanup_for_workflow_run("wr_podA", [], close_browser_on_completion=False)
+
+    # The durable remote browser is preserved: close(False), never a terminal close.
+    wrapper_a.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=None)
+    assert _close_true_count(wrapper_a) == 0
+    # Pod B's wrapper is entirely untouched by Pod A's cleanup.
+    wrapper_b.close.assert_not_awaited()
