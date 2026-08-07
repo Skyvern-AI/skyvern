@@ -34,6 +34,7 @@ from pydantic import ValidationError
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot import llm_config
+from skyvern.forge.sdk.copilot.agent_naming import name_agent_and_publish
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
@@ -5068,6 +5069,15 @@ async def _run_copilot_turn_impl(
         await emit_turn_start(stream, ctx)
     except Exception as emit_err:
         LOG.warning("copilot_narrative_turn_start_emit_failed", error=str(emit_err))
+    # Name the agent before the build starts. Runs here because intent is resolved and the
+    # stream is live, but no tool has authored anything yet — the title is a consequence of
+    # the classification, not of whenever the model first happens to emit YAML.
+    _, safe_workflow_yaml = await name_agent_and_publish(
+        ctx,
+        chat_request,
+        safe_workflow_yaml,
+        classifier_result=ctx.turn_intent_classifier_result,
+    )
     request_policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
     if request_policy is not None:
         _store_turn_context_packet_on_context(
@@ -5084,6 +5094,23 @@ async def _run_copilot_turn_impl(
             preflight_resolution = await preflight_credential_pause(ctx, stream, copilot_config)
             if preflight_resolution is not None:
                 await _resume_turn_intent_after_preflight_credential(ctx, request_policy, policy_inputs)
+                # The turn had no usable intent when naming first ran; it does now.
+                resumed_title, safe_workflow_yaml = await name_agent_and_publish(
+                    ctx,
+                    chat_request,
+                    safe_workflow_yaml,
+                    classifier_result=ctx.turn_intent_classifier_result,
+                )
+                if resumed_title:
+                    # The packet was assembled from the pre-naming YAML.
+                    _store_turn_context_packet_on_context(
+                        ctx,
+                        request_policy=request_policy,
+                        chat_request=chat_request,
+                        chat_history=chat_history,
+                        debug_run_info_text=debug_run_info_text,
+                        prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
+                    )
         if preflight_resolution is None:
             return _build_request_policy_clarification_result(
                 request_policy,

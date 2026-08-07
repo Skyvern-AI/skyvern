@@ -169,7 +169,7 @@ def get_bitwarden_item_type_code(item_type: BitwardenItemType) -> int:
 def get_list_response_item_from_bitwarden_item(item: dict) -> CredentialItem:
     if item["type"] == BitwardenItemType.LOGIN:
         login = item["login"]
-        totp = BitwardenService.normalize_totp_config(login.get("totp", ""))
+        totp = BitwardenService.normalize_totp_config(login.get("totp") or "")
         return CredentialItem(
             item_id=item["id"],
             credential=PasswordCredential(
@@ -1099,7 +1099,7 @@ class BitwardenService:
             raise BitwardenGetItemError(f"Failed to get login item by ID: {item_id}")
 
         login = response["data"]["login"]
-        totp = BitwardenService.normalize_totp_config(login.get("totp", ""))
+        totp = BitwardenService.normalize_totp_config(login.get("totp") or "")
         if not login:
             raise BitwardenGetItemError(f"Item with ID: {item_id} is not a login item")
 
@@ -1412,7 +1412,7 @@ class BitwardenService:
                 credential=PasswordCredential(
                     username=login_item["username"] or "",
                     password=login_item["password"] or "",
-                    totp=login_item["totp"],
+                    totp=BitwardenService.normalize_totp_config(login_item.get("totp") or ""),
                     metadata=_password_metadata_from_bitwarden_item(response["data"]),
                 ),
                 login_uris=_whole_site_login_uris(login_item),

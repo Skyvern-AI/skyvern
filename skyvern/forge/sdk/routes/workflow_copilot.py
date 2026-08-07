@@ -18,6 +18,7 @@ from sse_starlette import EventSourceResponse
 
 from skyvern import analytics
 from skyvern.config import settings
+from skyvern.constants import DEFAULT_WORKFLOW_TITLES
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
@@ -77,6 +78,7 @@ from skyvern.forge.sdk.copilot.turn_outcome import (
 from skyvern.forge.sdk.copilot.workflow_yaml import _normalize_copilot_yaml as _normalize_copilot_yaml
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _process_workflow_yaml
 from skyvern.forge.sdk.copilot.workflow_yaml import _repair_next_block_label_chain as _repair_next_block_label_chain
+from skyvern.forge.sdk.copilot.workflow_yaml import with_workflow_yaml_title
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.event_source_stream import EventSourceStream, FastAPIEventSourceStream
 from skyvern.forge.sdk.routes.routers import base_router
@@ -711,7 +713,9 @@ async def _persist_completion_criteria_state(chat: Any, agent_result: AgentResul
 def _build_proposed_workflow_data(updated_workflow: Workflow, agent_result: AgentResult) -> dict[str, Any]:
     proposed_data = dict(updated_workflow.model_dump(mode="json"))
     if agent_result.workflow_yaml:
-        proposed_data["_copilot_yaml"] = agent_result.workflow_yaml
+        # Accept reparses this YAML and never passes through _process_workflow_yaml, so the
+        # title it carries has to be the effective one rather than whatever the model typed.
+        proposed_data["_copilot_yaml"] = with_workflow_yaml_title(agent_result.workflow_yaml, updated_workflow.title)
     code_artifact_metadata = getattr(agent_result, "code_artifact_metadata", None)
     if code_artifact_metadata:
         proposed_data["_copilot_code_artifact_metadata"] = code_artifact_metadata
@@ -1253,10 +1257,26 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
     """
     if not original_workflow:
         return
+    # Rolling a canvas back must not un-name the agent: naming is a separate, one-shot
+    # write that only ever fires on a placeholder, so restoring the pre-turn placeholder
+    # over a name would leave the user watching their agent revert to "New Agent".
+    restored_title = original_workflow.title
+    if restored_title in DEFAULT_WORKFLOW_TITLES:
+        # Best-effort: preserving a name must never be the reason a rollback fails, and this
+        # lookup raises rather than returning None when the workflow is gone.
+        try:
+            current = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+                workflow_permanent_id=original_workflow.workflow_permanent_id,
+                organization_id=organization_id,
+            )
+        except Exception:
+            current = None
+        if current is not None and current.title not in DEFAULT_WORKFLOW_TITLES:
+            restored_title = current.title
     await app.WORKFLOW_SERVICE.update_workflow_definition(
         workflow_id=original_workflow.workflow_id,
         organization_id=organization_id,
-        title=original_workflow.title,
+        title=restored_title,
         description=original_workflow.description,
         workflow_definition=original_workflow.workflow_definition,
         proxy_location=original_workflow.proxy_location,
@@ -2530,7 +2550,9 @@ async def workflow_copilot_chat_post(
                 # _copilot_yaml is what /apply-proposed-workflow re-parses into
                 # WorkflowCreateYAMLRequest. Without it, Accept 400s.
                 if updated_workflow_yaml:
-                    proposed_data["_copilot_yaml"] = updated_workflow_yaml
+                    proposed_data["_copilot_yaml"] = with_workflow_yaml_title(
+                        updated_workflow_yaml, updated_workflow.title
+                    )
                 await app.DATABASE.workflow_params.update_workflow_copilot_chat(
                     organization_id=chat.organization_id,
                     workflow_copilot_chat_id=chat.workflow_copilot_chat_id,

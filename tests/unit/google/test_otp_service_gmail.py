@@ -58,6 +58,45 @@ async def test_gmail_source_filters_seen_candidates_for_current_credential(monke
         )
 
     assert [candidate.message_id for candidate in results] == ["unseen"]
+    assert search_messages.await_args is not None
+    assert search_messages.await_args.kwargs["excluded_message_ids"] == {"seen"}
+
+
+@pytest.mark.asyncio
+async def test_gmail_source_withholds_hydration_failed_candidate_then_degrades(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = otp_email.GmailOTPSource(AsyncMock(return_value=SimpleNamespace(token="AT")))
+    flagged = google_gmail_service.GmailMessageCandidate(
+        message_id="msg_flaky",
+        content="Subject: Sign in\nSnippet: Continue signing in",
+        internal_date=datetime.now(timezone.utc),
+        hydration_failed=True,
+    )
+    monkeypatch.setattr(
+        otp_email.google_gmail_service,
+        "search_recent_otp_messages",
+        AsyncMock(return_value=[flagged]),
+    )
+    context = EmailOTPVerificationContext().for_source("gmail")
+
+    async def search() -> list[otp_email.EmailOTPCandidate]:
+        async with httpx.AsyncClient() as client:
+            return await source.search_recent_otp_messages(
+                organization_id="org_1",
+                credential_id="goac_1",
+                totp_identifier="user@example.test",
+                created_after=None,
+                max_results=5,
+                context=context,
+                client=client,
+            )
+
+    withheld_rounds = [await search() for _ in range(otp_email.MAX_HYDRATION_FAILURE_WITHHOLDS)]
+    degraded = await search()
+
+    assert withheld_rounds == [[], []]
+    assert [candidate.message_id for candidate in degraded] == ["msg_flaky"]
 
 
 @pytest.mark.asyncio

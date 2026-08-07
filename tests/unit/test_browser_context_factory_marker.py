@@ -104,3 +104,105 @@ async def test_ordinary_local_creator_leaves_marker_false(monkeypatch: pytest.Mo
     _, artifacts, _ = await BrowserContextFactory.create_browser_context(playwright=object())
 
     assert artifacts.needs_cdp_frame_publisher is False
+
+
+def _factory_harness(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(factory_module, "restore_session_cookies", AsyncMock())
+    monkeypatch.setattr(factory_module, "restore_banked_cookies", AsyncMock())
+    monkeypatch.setattr(factory_module, "set_browser_console_log", lambda **_: None)
+    monkeypatch.setattr(factory_module, "set_popup_video_listener", lambda **_: None)
+    monkeypatch.setattr(factory_module, "set_download_file_listener", lambda **_: None)
+    monkeypatch.setattr(factory_module, "set_dialog_handler", lambda **_: None)
+
+    class _FakeAgentFunction:
+        async def setup_browser_context_extensions(self, **_: Any) -> None:
+            return None
+
+        async def should_apply_banked_cookies(self, organization_id: str | None) -> bool:
+            return False
+
+    class _FakeApp:
+        AGENT_FUNCTION = _FakeAgentFunction()
+
+    monkeypatch.setattr(factory_module, "app", _FakeApp())
+
+
+@pytest.mark.asyncio
+async def test_factory_warns_when_requested_profile_not_applied(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.webeye.browser_artifacts import BrowserArtifacts
+    from skyvern.webeye.browser_factory import BrowserContextFactory
+
+    async def _profile_blind_creator(playwright: Any, **kwargs: Any) -> tuple[Any, BrowserArtifacts, None]:
+        # Mirrors remote/vendor creators: accepts browser_profile_id but never applies it.
+        return object(), BrowserArtifacts(), None
+
+    _factory_harness(monkeypatch)
+    log = MagicMock()
+    monkeypatch.setattr(factory_module, "LOG", log)
+
+    BrowserContextFactory.register_type("test-profile-blind", _profile_blind_creator)
+    monkeypatch.setattr(factory_module.settings, "BROWSER_TYPE", "test-profile-blind")
+
+    await BrowserContextFactory.create_browser_context(
+        playwright=object(), browser_profile_id="bp_x", organization_id="o_x"
+    )
+
+    assert any("not applied" in str(call.args[0]) for call in log.warning.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_factory_stays_quiet_when_requested_profile_applied(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.webeye.browser_artifacts import BrowserArtifacts
+    from skyvern.webeye.browser_factory import BrowserContextFactory
+
+    async def _profile_applying_creator(playwright: Any, **kwargs: Any) -> tuple[Any, BrowserArtifacts, None]:
+        return object(), BrowserArtifacts(applied_browser_profile_id=str(kwargs.get("browser_profile_id"))), None
+
+    _factory_harness(monkeypatch)
+    log = MagicMock()
+    monkeypatch.setattr(factory_module, "LOG", log)
+
+    BrowserContextFactory.register_type("test-profile-applying", _profile_applying_creator)
+    monkeypatch.setattr(factory_module.settings, "BROWSER_TYPE", "test-profile-applying")
+
+    await BrowserContextFactory.create_browser_context(
+        playwright=object(), browser_profile_id="bp_x", organization_id="o_x"
+    )
+
+    assert not any("not applied" in str(call.args[0]) for call in log.warning.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_headless_chromium_stamps_applied_browser_profile_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    from skyvern.forge import app
+    from skyvern.webeye.browser_factory import BrowserContextFactory
+
+    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", AsyncMock(return_value=str(tmp_path / "profile")))
+    monkeypatch.setattr(BrowserContextFactory, "update_chromium_browser_preferences", MagicMock())
+    monkeypatch.setattr(
+        BrowserContextFactory,
+        "build_browser_args",
+        MagicMock(return_value={"record_har_path": str(tmp_path / "h.har")}),
+    )
+    monkeypatch.setattr(factory_module, "initialize_download_dir", lambda: str(tmp_path / "downloads"))
+    playwright = MagicMock()
+    playwright.chromium.launch_persistent_context = AsyncMock(return_value=MagicMock())
+
+    _, artifacts, _ = await factory_module._create_headless_chromium(
+        playwright,
+        browser_profile_id="bp_test",
+        organization_id="o_test",
+    )
+    assert artifacts.applied_browser_profile_id == "bp_test"
+
+    # Storage miss: the creator falls back to a temp dir and the field stays None.
+    monkeypatch.setattr(app.STORAGE, "retrieve_browser_profile", AsyncMock(return_value=None))
+    monkeypatch.setattr(factory_module, "make_temp_directory", lambda **_: str(tmp_path / "fresh"))
+    _, artifacts_no_profile, _ = await factory_module._create_headless_chromium(
+        playwright,
+        browser_profile_id="bp_test",
+        organization_id="o_test",
+    )
+    assert artifacts_no_profile.applied_browser_profile_id is None

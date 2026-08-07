@@ -340,7 +340,6 @@ class AgentContext:
     last_scout_act_observe_packet: dict[str, Any] | None = None
     last_scout_act_observe_recapture_attempted: bool = False
     last_scout_act_observe_recapture_result: str = ""
-    ambiguous_bare_selector_rescout_context_key: str | None = None
     pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     challenge_gated_proxy_retry_count: int = 0
