@@ -22,6 +22,7 @@ from skyvern.webeye.actions.handler import (
     _read_adopted_session_blob_bytes,
     _save_adopted_session_download,
 )
+from skyvern.webeye.browser_artifacts import DownloadBinding
 
 PDF_BODY = b"%PDF-1.4\n" + b"x" * 830
 
@@ -72,6 +73,45 @@ async def test_happy_path_eager_save_writes_bytes(tmp_path) -> None:
     page = _page_with_refetch()
 
     saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+
+    assert saved is not None and saved.exists()
+    assert saved.read_bytes() == PDF_BODY
+    page.context.request.get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_session_dir_non_blob_suppresses_worker_replay(tmp_path) -> None:
+    # A provider-owned remote binding delivers the file through the provider destination, so the run
+    # connection has no bytes and a URL replay would run through the wrong identity. The helper must NOT
+    # save_as or replay; it returns None (signal only) so the loop keeps polling.
+    download = _download()
+    page = _page_with_refetch()
+
+    saved = await _save_adopted_session_download(
+        download, page, tmp_path, workflow_run_id="wr", download_binding=DownloadBinding.SESSION_DIR
+    )
+
+    assert saved is None
+    page.context.request.get.assert_not_awaited()
+    download.save_as.assert_not_awaited()
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_session_dir_blob_still_recovers_in_page(tmp_path) -> None:
+    # A blob download on a SESSION_DIR session is identity-safe via the in-page read (the bytes live in
+    # the page, not on any network), so it is still delivered — the suppression is non-blob only.
+    download = _download(url="blob:https://example.com/abc")
+    page = _page_with_refetch()
+
+    saved = await _save_adopted_session_download(
+        download,
+        page,
+        tmp_path,
+        workflow_run_id="wr",
+        download_binding=DownloadBinding.SESSION_DIR,
+        eager_blob_bytes=PDF_BODY,
+    )
 
     assert saved is not None and saved.exists()
     assert saved.read_bytes() == PDF_BODY
