@@ -27,7 +27,7 @@ from skyvern.forge.sdk.routes.streaming.registries import (
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
-from skyvern.webeye.browser_artifacts import VideoArtifact
+from skyvern.webeye.browser_artifacts import DownloadBinding, VideoArtifact
 from skyvern.webeye.browser_engine import (
     BrowserEngineContext,
     BrowserEngineSelection,
@@ -128,6 +128,15 @@ async def _rebind_pbs_download_dir(
     download_run_id: str,
     browser_session_id: str,
 ) -> None:
+    if browser_state.browser_artifacts.download_binding == DownloadBinding.SESSION_DIR:
+        # Provider-owned remote binding: preserve the provider-selected destination. Re-pointing to a
+        # run-scoped dir would overwrite it, so skip the rebind.
+        LOG.info(
+            "Skipping download-dir rebind: preserving provider-selected destination",
+            browser_session_id=browser_session_id,
+            download_run_id=download_run_id,
+        )
+        return
     browser_context = browser_state.browser_context
     if browser_context is None:
         return

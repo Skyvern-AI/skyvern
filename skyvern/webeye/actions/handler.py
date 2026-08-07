@@ -152,6 +152,7 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
+from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_factory import initialize_download_dir, resolve_artifact_path
 from skyvern.webeye.browser_state import BrowserState
@@ -958,13 +959,22 @@ async def _save_adopted_session_download(
     download_dir: Path,
     workflow_run_id: str | None = None,
     eager_blob_bytes: bytes | None = None,
+    download_binding: DownloadBinding = DownloadBinding.RUN_DIR,
 ) -> Path | None:
     """Land an adopted-session download's bytes into download_dir, returning the file path or None.
 
-    Eager save_as is the only protection against the worker pod tearing the shared browser down before a
-    deferred save_as runs.
+    A provider-owned remote non-blob event is signal-only and returns None; blob and default behavior
+    are unchanged.
     """
     download_target = _download_target_path(download_dir, download.suggested_filename)
+    if download_binding == DownloadBinding.SESSION_DIR and not download.url.startswith("blob:"):
+        # Signal-only for a provider-owned remote binding: the run connection holds no bytes to save_as
+        # and a URL replay would run through the wrong identity, so defer to the provider destination.
+        LOG.info(
+            "Provider-owned remote download: suppressing local save/replay, deferring to provider destination",
+            workflow_run_id=workflow_run_id,
+        )
+        return None
     # Non-empty bytes captured at download-event time (blob owner still alive) win outright: skip
     # save_as, which returns empty for blobs anyway. A zero-byte eager capture is indistinguishable
     # from an unreadable one and would be a false success, so fall through to save_as + fan-out
@@ -3404,6 +3414,11 @@ class ActionHandler:
                                 and captured_download is not None
                                 and not download_event_fallback_attempted
                             ):
+                                resolved_download_binding = (
+                                    browser_state.browser_artifacts.download_binding
+                                    if browser_state is not None
+                                    else DownloadBinding.RUN_DIR
+                                )
                                 download_event_fallback_attempted = True
                                 saved_path = await _save_adopted_session_download(
                                     captured_download,
@@ -3416,6 +3431,7 @@ class ActionHandler:
                                             _remaining_download_wait_seconds(),
                                         )
                                     ),
+                                    download_binding=resolved_download_binding,
                                 )
                                 if saved_path is not None:
                                     download_event_fallback_used = True
@@ -3427,12 +3443,24 @@ class ActionHandler:
                                         workflow_run_id=task.workflow_run_id,
                                     )
                                     break
-                                download_event_fallback_failed = True
-                                LOG.warning(
-                                    "Adopted-session download could not be saved or re-fetched; falling through to browser-session folder poll",
-                                    download_dir=download_dir,
-                                    workflow_run_id=task.workflow_run_id,
-                                )
+                                if (
+                                    resolved_download_binding == DownloadBinding.SESSION_DIR
+                                    and not captured_download.url.startswith("blob:")
+                                ):
+                                    # Expected signal-only deferral for a provider-owned remote binding: no
+                                    # save_as/replay was attempted, so this is not a failure. Keep polling.
+                                    LOG.info(
+                                        "Provider-owned remote download deferred to provider-destination observation",
+                                        download_dir=download_dir,
+                                        workflow_run_id=task.workflow_run_id,
+                                    )
+                                else:
+                                    download_event_fallback_failed = True
+                                    LOG.warning(
+                                        "Adopted-session download could not be saved or re-fetched; falling through to browser-session folder poll",
+                                        download_dir=download_dir,
+                                        workflow_run_id=task.workflow_run_id,
+                                    )
                                 # Keep polling: the shared browser may still land the file in the session folder.
                                 if await _drain_and_move_staged_xhr(
                                     xhr_fallback_moved_paths, _remaining_download_wait_seconds()
