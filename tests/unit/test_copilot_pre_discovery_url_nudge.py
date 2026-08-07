@@ -717,7 +717,7 @@ def test_deliverable_permission_ask_bounces_after_genuine_attempt() -> None:
     ctx = _mid_build_ctx(_deliverable_contract_policy())
     assert ctx.has_genuine_workflow_attempt()
 
-    nudge = _response_coverage_nudge(ctx, _deliverable_ask("deliverable_permission"))
+    nudge = _response_output_nudge(ctx, _deliverable_ask("deliverable_permission"))
 
     assert nudge is not None
     assert nudge.rule == "deliverable_permission_ask_retry"
@@ -731,14 +731,14 @@ def test_deliverable_permission_ask_bounces_after_genuine_attempt() -> None:
 def test_disambiguation_ask_still_reaches_user_after_genuine_attempt() -> None:
     ctx = _mid_build_ctx(_deliverable_contract_policy())
 
-    assert _response_coverage_nudge(ctx, _deliverable_ask("disambiguation")) is None
+    assert _response_output_nudge(ctx, _deliverable_ask("disambiguation")) is None
 
 
 def test_deliverable_permission_ask_reaches_user_once_criterion_satisfied() -> None:
     ctx = _mid_build_ctx(_deliverable_contract_policy())
     ctx.completion_verification_result = SimpleNamespace(verdicts=[SimpleNamespace(criterion_id="dl", satisfied=True)])
 
-    assert _response_coverage_nudge(ctx, _deliverable_ask("deliverable_permission")) is None
+    assert _response_output_nudge(ctx, _deliverable_ask("deliverable_permission")) is None
 
 
 def test_deliverable_permission_ask_for_an_unrelated_side_effect_reaches_user() -> None:
@@ -752,4 +752,4 @@ def test_deliverable_permission_ask_for_an_unrelated_side_effect_reaches_user() 
         "refs": ["output.payment_confirmation"],
     }
 
-    assert _response_coverage_nudge(ctx, payment_ask) is None
+    assert _response_output_nudge(ctx, payment_ask) is None
