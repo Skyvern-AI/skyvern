@@ -299,7 +299,7 @@ async def execution_for_message_channel(
     # Imports kept local to avoid a circular import (this module is imported by message.py,
     # and the persistent sessions manager pulls in app/cloud bootstrapping).
     from skyvern.forge import app
-    from skyvern.forge.sdk.routes.streaming.screencast import wait_for_browser_state
+    from skyvern.forge.sdk.routes.streaming.screencast import release_browser_state, wait_for_browser_state
 
     if message_channel.browser_session is None:
         raise RuntimeError("execution_for_message_channel: no browser session on message channel")
@@ -321,11 +321,14 @@ async def execution_for_message_channel(
     if browser_state is None:
         raise RuntimeError(f"execution_for_message_channel: browser state timeout for {browser_session_id}")
 
-    page = await browser_state.get_working_page()
-    if page is None:
-        raise RuntimeError(f"execution_for_message_channel: no working page for {browser_session_id}")
+    try:
+        page = await browser_state.get_working_page()
+        if page is None:
+            raise RuntimeError(f"execution_for_message_channel: no working page for {browser_session_id}")
 
-    yield LocalExecutionChannel(page=page)
+        yield LocalExecutionChannel(page=page)
+    finally:
+        await release_browser_state(browser_state, "browser_session", browser_session_id)
 
 
 @asynccontextmanager

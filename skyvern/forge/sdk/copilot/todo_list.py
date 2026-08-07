@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from collections.abc import Set as AbstractSet
 from typing import Any
 
 import structlog
@@ -119,6 +121,36 @@ def _interactions_line(ctx: AgentContext) -> str | None:
     if ctx.scout_trajectory or ctx.prior_fill_carry or _interaction_reached_page_keys(ctx):
         return None
     return "The site has not been acted on yet (0 interactions recorded)"
+
+
+def _inapplicable_criterion_ids(ctx: AgentContext) -> set[str]:
+    """Criteria that no longer need action: satisfied, or structurally unfired because their
+    antecedent condition did not hold (a conditional download on a branch the run did not take)."""
+    result = ctx.completion_verification_result
+    if result is None:
+        return set()
+    ids = {verdict.criterion_id for verdict in result.verdicts if verdict.satisfied}
+    ids |= set(getattr(result, "structural_unfired_criterion_ids", ()) or ())
+    return ids
+
+
+def unmet_action_deliverable_criteria_from(
+    criteria: Sequence[CompletionCriterion], inapplicable_ids: AbstractSet[str]
+) -> list[CompletionCriterion]:
+    """Run-plane criteria whose deliverable needs an action on the page (today: a registered
+    browser download) and which no verification verdict has satisfied yet. Pure over its inputs
+    so offline replay runs the same decision the live gate ran."""
+    return [
+        criterion
+        for criterion in criteria
+        if "registered_download" in (criterion.deliverable_kind, criterion.declared_deliverable_kind)
+        and criterion.level == "run"
+        and criterion.id not in inapplicable_ids
+    ]
+
+
+def unmet_action_deliverable_criteria(ctx: AgentContext) -> list[CompletionCriterion]:
+    return unmet_action_deliverable_criteria_from(_minted_criteria(ctx), _inapplicable_criterion_ids(ctx))
 
 
 def render_todo_list(ctx: AgentContext) -> str | None:

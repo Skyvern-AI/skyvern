@@ -11,7 +11,7 @@ import textwrap
 import time
 import uuid
 from collections import deque
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -220,6 +220,7 @@ from skyvern.services.webhook_delivery import (
     deliver_webhook_with_retries,
     describe_delivery_error,
 )
+from skyvern.services.workflow_script_service import BLOCK_TYPES_THAT_SHOULD_BE_CACHED
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.secret_headers import merge_masked_headers
 from skyvern.utils.secret_redaction import redact_console_log_bytes, redact_har_bytes
@@ -227,6 +228,7 @@ from skyvern.utils.strings import is_uuid
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
 from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.profile_cookie_merge import cookie_delta, seed_cookie_values, union_cookies_into_profile_dir
 from skyvern.webeye.session_cookies import (
@@ -286,6 +288,442 @@ CODE_BLOCK_SESSION_STARTUP_BUDGET_SECONDS = 90.0
 DEBUG_SESSION_PROFILE_INCOMPATIBLE_CODE = "debug_session_profile_incompatible"
 DEBUG_SESSION_PROFILE_REASON_NO_PROFILE = "pbs_no_profile"
 DEBUG_SESSION_PROFILE_REASON_DIFFERENT = "pbs_different_profile"
+
+# Per-value cap for run-detail API responses (SKY-13015). One block output — a sheet or
+# file read — is echoed verbatim into every run-detail read (app run page, MCP get_run,
+# run timeline); observed values reach 78MB, which wedges the browser's JSON view and
+# overruns MCP's result limits. OUTPUT_PARAMETER_MAX_VALUE_BYTES stays the storage-side
+# net; this is the far lower bound a synchronous JSON response can actually carry.
+RUN_RESPONSE_MAX_VALUE_BYTES = 2 * 1024 * 1024
+
+# Each level of sibling-preserving trim re-serializes its whole subtree, so unbounded
+# recursion costs O(depth x size): a 2.5MB value nested 400 deep serializes 1.27GB and
+# blocks the event loop for ~2s. Real block outputs need one or two levels; past this
+# the whole value is marked instead of descending further.
+RUN_RESPONSE_MAX_TRIM_DEPTH = 4
+
+LOOP_VALUE_TRUNCATED_PLACEHOLDER = "[truncated]"
+
+
+def _response_value_size_bytes(value: Any, log_context: dict[str, Any]) -> int | None:
+    """Serialized size as FastAPI would put it on the wire, or None if it can't be measured."""
+    try:
+        # Mirrors FastAPI's JSONResponse.render. ensure_ascii=False because the default
+        # escapes non-ASCII to \uXXXX (double-counting CJK); the compact separators because
+        # the defaults add ", " and ": ", ~12% on a wide row-array.
+        return len(json.dumps(value, default=str, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    except Exception:
+        LOG.warning("Failed to measure run response value size; passing through", exc_info=True, **log_context)
+        return None
+
+
+# Room reserved so the trailing marker still fits inside the cap alongside kept entries.
+_TRUNCATION_MARKER_RESERVE_BYTES = 512
+
+TRUNCATION_MARKER_KEY = "_truncated"
+
+
+def _truncation_marker(
+    size_bytes: int,
+    *,
+    limit_bytes: int | None = None,
+    original_count: int | None = None,
+    kept_count: int | None = None,
+) -> dict:
+    effective_limit = RUN_RESPONSE_MAX_VALUE_BYTES if limit_bytes is None else limit_bytes
+    marker = {
+        "truncated": True,
+        "reason": "exceeded_max_run_response_value_size",
+        "original_size_bytes": size_bytes,
+        "limit_bytes": effective_limit,
+    }
+    if original_count is not None:
+        marker["original_count"] = original_count
+        marker["kept_count"] = kept_count
+    return marker
+
+
+def _string_wire_size(value: str) -> int:
+    """Serialized size of a string including JSON quoting and escapes."""
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+
+def capped_task_v2(task_v2: Any) -> Any:
+    """Cap the output on an embedded TaskV2, which rides the workflow run response."""
+    if task_v2 is None:
+        return task_v2
+    capped_output = truncate_oversized_response_value(
+        task_v2.output, task_v2_id=getattr(task_v2, "observer_cruise_id", None), field="output"
+    )
+    if capped_output is task_v2.output:
+        return task_v2
+    return task_v2.model_copy(update={"output": capped_output})
+
+
+def capped_task_v1_response(task_response: Any) -> Any:
+    """Cap the per-value task-v1 fields returned to the interactive run-detail page."""
+    capped_extracted_information = truncate_oversized_response_value(
+        task_response.extracted_information,
+        task_id=task_response.task_id,
+        field="extracted_information",
+    )
+    capped_failure_reason = truncate_oversized_response_text(task_response.failure_reason)
+    if (
+        capped_extracted_information is task_response.extracted_information
+        and capped_failure_reason is task_response.failure_reason
+    ):
+        return task_response
+    return task_response.model_copy(
+        update={
+            "extracted_information": capped_extracted_information,
+            "failure_reason": capped_failure_reason,
+        }
+    )
+
+
+ACTION_TEXT_FIELDS = ("response", "value", "text", "reasoning", "intention", "file_url")
+
+
+def _cap_action_payloads(action: Action, **log_context: Any) -> None:
+    """Cap the unbounded fields an action carries into a timeline block, in place."""
+    for text_field in ACTION_TEXT_FIELDS:
+        if hasattr(action, text_field):
+            setattr(action, text_field, truncate_oversized_response_text(getattr(action, text_field)))
+    for action_field in ("output", "skyvern_element_data"):
+        setattr(
+            action,
+            action_field,
+            truncate_oversized_response_value(getattr(action, action_field), field=action_field, **log_context),
+        )
+
+
+# Every WorkflowRunBlock field that can hold unbounded model- or user-supplied content.
+# Enumerated rather than extended one reviewer comment at a time; test_timeline_block_field
+# _coverage fails if a new field on the model is neither capped here nor explicitly exempt.
+UNBOUNDED_BLOCK_JSON_FIELDS = (
+    "output",
+    "navigation_payload",
+    "data_schema",
+)
+
+# Typed list[str]: the JSON trim would replace an oversized element with a marker dict and
+# break the declared type, so these cap element-wise and keep every element a string.
+UNBOUNDED_BLOCK_TEXT_LIST_FIELDS = (
+    "recipients",
+    "attachments",
+)
+
+UNBOUNDED_BLOCK_TEXT_FIELDS = (
+    "description",
+    "failure_reason",
+    "navigation_goal",
+    "data_extraction_goal",
+    "terminate_criterion",
+    "complete_criterion",
+    "subject",
+    "body",
+    "prompt",
+    "instructions",
+    "positive_descriptor",
+    "negative_descriptor",
+    "executed_branch_expression",
+    "url",
+    "current_value",
+    "final_url",
+)
+
+
+@overload
+def truncate_oversized_response_text(current_value: None, *, limit_bytes: int | None = None) -> None: ...
+
+
+@overload
+def truncate_oversized_response_text(current_value: str, *, limit_bytes: int | None = None) -> str: ...
+
+
+def truncate_oversized_response_text(current_value: str | None, *, limit_bytes: int | None = None) -> str | None:
+    """Cap one unbounded text field on a timeline block.
+
+    Prompts, email bodies, rendered branch expressions and ``str(loop_over_value)`` are all
+    persisted without a size guard. Stays a string, since every one of these is typed
+    ``str | None``, keeping a readable prefix in the same shape as the DecisionBlock cap.
+    """
+    if current_value is None:
+        return current_value
+    effective_limit = RUN_RESPONSE_MAX_VALUE_BYTES if limit_bytes is None else limit_bytes
+    if _string_wire_size(current_value) <= effective_limit:
+        return current_value
+    # JSON escaping inflates quotes, backslashes and control characters — up to 6x for a
+    # control character — so a raw byte count understates the serialized size by as much as
+    # half. Shrink until the encoded form actually fits rather than trusting len().
+    keep = min(len(current_value), effective_limit)
+    while keep > 0:
+        candidate = f"{current_value[:keep]}...[truncated {len(current_value) - keep} chars]"
+        if _string_wire_size(candidate) <= effective_limit:
+            return candidate
+        keep //= 2
+    return "...[truncated]"
+
+
+def _capped_text_list(values: list[str] | None, **log_context: Any) -> list[str] | None:
+    """Cap a ``list[str]`` without inserting a JSON marker object into it."""
+    if not values:
+        return values
+    size_bytes = _response_value_size_bytes(values, log_context)
+    if size_bytes is None or size_bytes <= RUN_RESPONSE_MAX_VALUE_BYTES:
+        return values
+
+    kept: list[str] = []
+    running_size = 2
+    for value in values:
+        values_after_current = len(values) - len(kept) - 1
+        if values_after_current == 0:
+            item_separator = 1 if kept else 0
+            available_for_item = RUN_RESPONSE_MAX_VALUE_BYTES - running_size - item_separator
+            capped_value = truncate_oversized_response_text(value, limit_bytes=available_for_item)
+            item_size = _string_wire_size(capped_value)
+            if running_size + item_separator + item_size <= RUN_RESPONSE_MAX_VALUE_BYTES:
+                kept.append(capped_value)
+            break
+
+        remaining_count = len(values) - len(kept)
+        marker = f"...[truncated {remaining_count} values]"
+        marker_size = _string_wire_size(marker)
+        item_separator = 1 if kept else 0
+        available_for_item = RUN_RESPONSE_MAX_VALUE_BYTES - running_size - item_separator - marker_size - 1
+        if available_for_item <= _string_wire_size("...[truncated]"):
+            break
+        capped_value = truncate_oversized_response_text(value, limit_bytes=available_for_item)
+        item_size = _string_wire_size(capped_value)
+        if running_size + item_separator + item_size + 1 + marker_size > RUN_RESPONSE_MAX_VALUE_BYTES:
+            break
+        kept.append(capped_value)
+        running_size += item_separator + item_size
+
+    if len(kept) == len(values):
+        return kept
+
+    marker = f"...[truncated {len(values) - len(kept)} values]"
+    LOG.warning(
+        "Trimming oversized run response string list",
+        original_size_bytes=size_bytes,
+        kept_count=len(kept),
+        original_count=len(values),
+        **log_context,
+    )
+    return [*kept, marker]
+
+
+def _capped_loop_values(loop_values: list[Any] | None, **log_context: Any) -> list[Any] | None:
+    """Cap ``loop_values`` without changing how many iterations it reports.
+
+    The run-detail page reads the iteration count off ``loop_values.length`` and resolves a
+    selected iteration by index, so collapsing the list would render a finished 200-iteration
+    loop as 200/1 and strand every selection past the first.
+    """
+    if not loop_values:
+        return loop_values
+
+    capped = truncate_oversized_response_value(loop_values, field="loop_values", **log_context)
+    # A same-length list means every iteration survived (some trimmed in place). A shorter
+    # one is the partial-plus-marker shape, which would misreport the iteration count here.
+    if isinstance(capped, list) and len(capped) == len(loop_values):
+        return capped
+    # Per-element trimming could not fit either. Repeat a compact placeholder so the count
+    # and index lookups still line up; repeating the full marker would re-exceed the cap on
+    # a long list. The sizes are on the warning the call above already emitted.
+    placeholders = [LOOP_VALUE_TRUNCATED_PLACEHOLDER] * len(loop_values)
+    placeholder_size = _response_value_size_bytes(placeholders, log_context)
+    if placeholder_size is not None and placeholder_size <= RUN_RESPONSE_MAX_VALUE_BYTES:
+        return placeholders
+    # Even one placeholder per iteration overruns the cap (~150k entries). The count has to
+    # move into bounded metadata rather than stay encoded as list length.
+    size_bytes = _response_value_size_bytes(loop_values, log_context) or 0
+    return [_truncation_marker(size_bytes, original_count=len(loop_values), kept_count=0)]
+
+
+def truncate_oversized_response_value(
+    value: Any,
+    _remaining_trim_depth: int | None = None,
+    _loop_payload_budget_granted: bool = False,
+    _limit_bytes: int | None = None,
+    **log_context: Any,
+) -> Any:
+    """Fail-open cap for one value echoed into a run-detail API response (SKY-13015).
+
+    A dict or list keeps every element that fits; only oversized ones are replaced, so
+    structure the UI reads survives alongside the one huge field — a block's
+    ``downloaded_file_urls``, a trigger block's ``workflow_run_id``, and the per-iteration
+    entries of a for-loop's ``list[list[dict]]`` output. A replaced element becomes an
+    opaque marker rather than a partial value: a truncated list is indistinguishable from
+    a complete one to an SDK caller.
+    """
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+
+    effective_limit = RUN_RESPONSE_MAX_VALUE_BYTES if _limit_bytes is None else _limit_bytes
+    remaining_trim_depth = RUN_RESPONSE_MAX_TRIM_DEPTH if _remaining_trim_depth is None else _remaining_trim_depth
+    size_bytes = _response_value_size_bytes(value, log_context)
+    if size_bytes is None or size_bytes <= effective_limit:
+        return value
+
+    if isinstance(value, (dict, list)) and remaining_trim_depth > 0:
+        is_loop_output_envelope = (
+            isinstance(value, dict)
+            and "output_value" in value
+            and ("output_parameter" in value or "loop_value" in value)
+        )
+        if is_loop_output_envelope and isinstance(value, dict):
+            # The transport wrapper is cheap and the UI needs all of it. Reserve its
+            # encoded bytes, then trim only output_value to what remains; otherwise a
+            # marginally oversized entry can keep loop metadata and drop the payload.
+            trimmed_envelope = {
+                key: truncate_oversized_response_value(
+                    entry,
+                    _remaining_trim_depth=remaining_trim_depth - 1,
+                    _loop_payload_budget_granted=_loop_payload_budget_granted,
+                    _limit_bytes=effective_limit,
+                    **log_context,
+                )
+                for key, entry in value.items()
+                if key != "output_value"
+            }
+            envelope_size = _response_value_size_bytes(trimmed_envelope, log_context)
+            output_key_size = _response_value_size_bytes("output_value", log_context)
+            if envelope_size is not None and output_key_size is not None:
+                output_overhead = (1 if trimmed_envelope else 0) + output_key_size + 1
+                output_limit = effective_limit - envelope_size - output_overhead
+                if output_limit > 0:
+                    grants_loop_payload_budget = not _loop_payload_budget_granted
+                    trimmed_output = truncate_oversized_response_value(
+                        value["output_value"],
+                        _remaining_trim_depth=(
+                            RUN_RESPONSE_MAX_TRIM_DEPTH if grants_loop_payload_budget else remaining_trim_depth - 1
+                        ),
+                        _loop_payload_budget_granted=True,
+                        _limit_bytes=output_limit,
+                        **log_context,
+                    )
+                    candidate = {
+                        key: trimmed_output if key == "output_value" else trimmed_envelope[key] for key in value
+                    }
+                    candidate_size = _response_value_size_bytes(candidate, log_context)
+                    if candidate_size is not None and candidate_size <= effective_limit:
+                        return candidate
+
+        # Reserve the encoded size of every sibling before trimming one child. Without this,
+        # a trimmable child can consume nearly the entire parent budget, after which the
+        # parent falls back to one bare marker and drops UI metadata such as screenshot URLs.
+        # This mirrors the loop-envelope allocation above, but applies to ordinary dicts
+        # and lists too. The direct formula is the child size that would make the original
+        # collection fit: cap - original collection size + original child size. Attempt it
+        # lazily while accumulating: pre-scanning a many-row list would reintroduce the
+        # synchronous breadth work this cap is meant to avoid.
+        items: Iterable[tuple[Any, Any]]
+        if isinstance(value, dict):
+            items = value.items()
+            is_dict = True
+        else:
+            items = enumerate(value)
+            is_dict = False
+
+        # Accumulate as we go and stop once the kept elements fill the cap. Entries that
+        # fit are kept and a trailing marker records what was dropped, so a table 1% over
+        # the limit still renders instead of vanishing. The marker is what keeps this from
+        # being a silent truncation — a bare prefix would be indistinguishable from the
+        # whole value to an SDK caller.
+        # Start at the enclosing braces/brackets and charge each entry its separators —
+        # and, for a dict, its quoted key. Summing child values alone under-counts a
+        # key-heavy dict by roughly half, which would let a payload through at ~2x the cap.
+        running_size = 2
+        trimmed_pairs: list[tuple[Any, Any]] = []
+        dropped_any = False
+        # The loop's list/list/entry wrappers are transport structure, not payload depth.
+        # Give output_value one fresh, bounded trim budget so nested extracted data and
+        # links survive while the one heavy sub-value is replaced. The grant flag prevents
+        # nested or model-produced envelopes from resetting the budget repeatedly.
+        for key, entry in items:
+            raw_entry_size = _response_value_size_bytes(entry, log_context)
+            entry_limit = effective_limit - size_bytes + raw_entry_size if raw_entry_size is not None else 0
+            grants_loop_payload_budget = (
+                is_loop_output_envelope and key == "output_value" and not _loop_payload_budget_granted
+            )
+            child_remaining_trim_depth = (
+                RUN_RESPONSE_MAX_TRIM_DEPTH if grants_loop_payload_budget else remaining_trim_depth - 1
+            )
+            if raw_entry_size is not None and 0 < entry_limit < raw_entry_size:
+                sibling_reserved_entry = truncate_oversized_response_value(
+                    entry,
+                    _remaining_trim_depth=child_remaining_trim_depth,
+                    _loop_payload_budget_granted=_loop_payload_budget_granted or grants_loop_payload_budget,
+                    _limit_bytes=entry_limit,
+                    **log_context,
+                )
+                sibling_candidate: dict[Any, Any] | list[Any]
+                if isinstance(value, dict):
+                    sibling_candidate = {**value, key: sibling_reserved_entry}
+                else:
+                    sibling_candidate = list(value)
+                    sibling_candidate[key] = sibling_reserved_entry
+                candidate_size = _response_value_size_bytes(sibling_candidate, log_context)
+                if candidate_size is not None and candidate_size <= effective_limit:
+                    return sibling_candidate
+            trimmed_entry = truncate_oversized_response_value(
+                entry,
+                _remaining_trim_depth=child_remaining_trim_depth,
+                _loop_payload_budget_granted=_loop_payload_budget_granted or grants_loop_payload_budget,
+                _limit_bytes=effective_limit,
+                **log_context,
+            )
+            entry_size = _response_value_size_bytes(trimmed_entry, log_context)
+            if entry_size is None:
+                dropped_any = True
+                break
+            # +1 for the comma; for a dict also the serialized key and its colon.
+            running_size += entry_size + 1
+            if is_dict:
+                key_size = _response_value_size_bytes(key, log_context)
+                if key_size is None:
+                    dropped_any = True
+                    break
+                running_size += key_size + 1
+            if running_size > effective_limit - _TRUNCATION_MARKER_RESERVE_BYTES:
+                dropped_any = True
+                break
+            trimmed_pairs.append((key, trimmed_entry))
+        # `dropped_any`, not the running total: the loop stops a marker's width below the
+        # cap, so a size check here would call a partial result complete and drop entries
+        # with nothing recording it.
+        if not dropped_any:
+            if is_dict:
+                return dict(trimmed_pairs)
+            return [entry for _, entry in trimmed_pairs]
+        if trimmed_pairs:
+            marker = _truncation_marker(
+                size_bytes,
+                limit_bytes=effective_limit,
+                original_count=len(value),
+                kept_count=len(trimmed_pairs),
+            )
+            LOG.warning(
+                "Trimming oversized run response collection",
+                original_size_bytes=size_bytes,
+                kept_count=len(trimmed_pairs),
+                original_count=len(value),
+                **log_context,
+            )
+            if is_dict:
+                return {**dict(trimmed_pairs), TRUNCATION_MARKER_KEY: marker}
+            return [*(entry for _, entry in trimmed_pairs), marker]
+        # Nothing fit at all — fall through to replacing the whole value.
+
+    LOG.warning(
+        "Truncating oversized run response value",
+        original_size_bytes=size_bytes,
+        limit_bytes=effective_limit,
+        **log_context,
+    )
+    return _truncation_marker(size_bytes, limit_bytes=effective_limit)
 
 
 @dataclass(frozen=True)
@@ -390,17 +828,6 @@ def _select_recording_urls_in_window(
 
 
 CacheInvalidationReason = Literal["updated_block", "new_block", "removed_block"]
-BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
-    BlockType.TASK,
-    BlockType.TaskV2,
-    BlockType.ACTION,
-    BlockType.NAVIGATION,
-    BlockType.EXTRACTION,
-    BlockType.LOGIN,
-    BlockType.FILE_DOWNLOAD,
-    BlockType.FOR_LOOP,
-    BlockType.WHILE_LOOP,
-}
 
 
 def _collect_uncached_loop_children(
@@ -4573,6 +5000,14 @@ class WorkflowService:
         if context.is_static_script:
             return
 
+        # Per-block mints exist to cache block functions incrementally. A workflow
+        # with no cacheable block types has nothing block-level to cache — its
+        # script is fully derivable at end of run, so mint once there (SKY-13659).
+        if not any(
+            block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED for block in workflow.workflow_definition.blocks
+        ):
+            return
+
         disable_script_generation = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
             "DISABLE_GENERATE_SCRIPT_AFTER_BLOCK",
             workflow_run.workflow_run_id,
@@ -7713,15 +8148,31 @@ class WorkflowService:
         ai_fallback: bool | None = None,
         failure_category: list[dict] | None = None,
     ) -> WorkflowRun:
-        workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
-            workflow_run_id=workflow_run_id,
-            status=status,
-            failure_reason=failure_reason,
-            run_with=run_with,
-            ai_fallback=ai_fallback,
-            failure_category=failure_category,
-        )
-        await self._after_workflow_run_status_write(workflow_run, status)
+        # Final transitions are claimed conditionally so run-minutes emit exactly once
+        # per run even when a cancel and the run's own finalizer race; the loser still
+        # performs the unconditional overwrite the finalizer has always done, silently.
+        flipped_to_final = False
+        workflow_run: WorkflowRun | None = None
+        if status.is_final():
+            workflow_run = await app.DATABASE.workflow_runs.update_workflow_run_if_not_final(
+                workflow_run_id=workflow_run_id,
+                status=status,
+                failure_reason=failure_reason,
+                run_with=run_with,
+                ai_fallback=ai_fallback,
+                failure_category=failure_category,
+            )
+            flipped_to_final = workflow_run is not None
+        if workflow_run is None:
+            workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
+                workflow_run_id=workflow_run_id,
+                status=status,
+                failure_reason=failure_reason,
+                run_with=run_with,
+                ai_fallback=ai_fallback,
+                failure_category=failure_category,
+            )
+        await self._after_workflow_run_status_write(workflow_run, status, emit_run_minutes=flipped_to_final)
         return workflow_run
 
     async def _update_workflow_run_status_if_not_final(
@@ -7766,7 +8217,9 @@ class WorkflowService:
         await self._after_workflow_run_status_write(workflow_run, WorkflowRunStatus.timed_out)
         return workflow_run
 
-    async def _after_workflow_run_status_write(self, workflow_run: WorkflowRun, status: WorkflowRunStatus) -> None:
+    async def _after_workflow_run_status_write(
+        self, workflow_run: WorkflowRun, status: WorkflowRunStatus, emit_run_minutes: bool = True
+    ) -> None:
         workflow_run_id = workflow_run.workflow_run_id
         if status.is_final():
             # Free extraction-cache entries for this run.
@@ -7791,6 +8244,14 @@ class WorkflowService:
                 trigger_type=workflow_run.trigger_type,
                 workflow_schedule_id=workflow_run.workflow_schedule_id,
             )
+            if emit_run_minutes and workflow_run.parent_workflow_run_id is None:
+                await app.AGENT_FUNCTION.record_run_duration(
+                    run_type="workflow_run",
+                    status=str(status),
+                    duration_seconds=duration_seconds,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=workflow_run.organization_id,
+                )
             await self._apply_completion_run_tags_best_effort(workflow_run)
             self._schedule_workflow_run_terminal_hooks(
                 workflow_run_id=workflow_run_id,
@@ -8268,6 +8729,14 @@ class WorkflowService:
             trigger_type=updated.trigger_type,
             workflow_schedule_id=updated.workflow_schedule_id,
         )
+        if updated.parent_workflow_run_id is None:
+            await app.AGENT_FUNCTION.record_run_duration(
+                run_type="workflow_run",
+                status=str(WorkflowRunStatus.canceled),
+                duration_seconds=duration_seconds,
+                workflow_run_id=workflow_run_id,
+                organization_id=updated.organization_id,
+            )
         await self._apply_completion_run_tags_best_effort(updated)
 
         self._schedule_workflow_run_terminal_hooks(
@@ -8650,6 +9119,7 @@ class WorkflowService:
         organization_id: str | None = None,
         include_cost: bool = False,
         include_step_count: bool = False,
+        cap_output_values: bool = False,
     ) -> WorkflowRunResponseBase:
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         if workflow_run is None:
@@ -8662,6 +9132,7 @@ class WorkflowService:
             organization_id=organization_id,
             include_cost=include_cost,
             include_step_count=include_step_count,
+            cap_output_values=cap_output_values,
         )
 
     async def _fetch_recording_urls(
@@ -8788,7 +9259,12 @@ class WorkflowService:
         include_cost: bool = False,
         include_step_count: bool = False,
         allow_deleted: bool = False,
+        cap_output_values: bool = False,
     ) -> WorkflowRunResponseBase:
+        # ``cap_output_values`` defaults off so webhook delivery and replay keep full
+        # fidelity; only the interactive read surfaces that must fit in one JSON
+        # response opt in. See RUN_RESPONSE_MAX_VALUE_BYTES.
+        #
         # ``allow_deleted=True`` is used by the cleanup/webhook path after a
         # long-running run completes: the workflow row may have been
         # soft-deleted (e.g. eval harness teardown fired while the orphan
@@ -8857,16 +9333,36 @@ class WorkflowService:
         outputs = None
         EXTRACTED_INFORMATION_KEY = "extracted_information"
         if output_parameter_tuples:
-            outputs = {output_parameter.key: output.value for output_parameter, output in output_parameter_tuples}
+
+            def _cap(value: Any, output_key: str) -> Any:
+                if not cap_output_values:
+                    return value
+                return truncate_oversized_response_value(value, workflow_run_id=workflow_run_id, output_key=output_key)
+
+            # Collect from the raw values, not the capped ones: a loop output whose entries
+            # are individually small but collectively over the cap still has every
+            # iteration's extracted_information, and only the collected list gets capped.
             extracted_information: list[Any] = []
             for _, output in output_parameter_tuples:
                 if output.value is not None:
                     extracted_information.extend(WorkflowService._collect_extracted_information(output.value))
-            outputs[EXTRACTED_INFORMATION_KEY] = extracted_information
+
+            outputs = {
+                output_parameter.key: _cap(output.value, output_parameter.key)
+                for output_parameter, output in output_parameter_tuples
+            }
+            outputs[EXTRACTED_INFORMATION_KEY] = _cap(extracted_information, EXTRACTED_INFORMATION_KEY)
             # Refresh any expired presigned screenshot URLs in the outputs
             outputs = await self._refresh_output_urls(
                 outputs, organization_id=organization_id, workflow_run_id=workflow_run_id
             )
+            # The refresh expands artifact IDs into presigned URLs and FileInfo objects —
+            # ~25x on an ID-dense value — so a value that fit before it can exceed the cap
+            # after. Gating this on artifact IDs is not safe: the legacy `has_old_format`
+            # branch rewrites task/workflow screenshots from a `task_id` alone, with no IDs
+            # to detect. The pre-refresh pass above still stands: it bounds the refresh walk.
+            if cap_output_values:
+                outputs = {key: _cap(value, key) for key, value in outputs.items()}
 
         errors: list[dict[str, Any]] = []
         for task in workflow_run_tasks:
@@ -8907,7 +9403,11 @@ class WorkflowService:
             workflow_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run_id,
             status=workflow_run.status,
-            failure_reason=workflow_run.failure_reason,
+            failure_reason=(
+                truncate_oversized_response_text(workflow_run.failure_reason)
+                if cap_output_values
+                else workflow_run.failure_reason
+            ),
             failure_category=workflow_run.failure_category,
             retried_from_workflow_run_id=workflow_run.retried_from_workflow_run_id,
             retried_by_workflow_run_id=retried_by_workflow_run_id,
@@ -8940,7 +9440,7 @@ class WorkflowService:
             browser_profile_id=workflow_run.browser_profile_id,
             browser_seed_source=workflow_run.browser_seed_source,
             max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
-            task_v2=task_v2,
+            task_v2=capped_task_v2(task_v2) if cap_output_values else task_v2,
             browser_address=workflow_run.browser_address,
             run_with=workflow_run.run_with,
             script_run=workflow_run.script_run,
@@ -10350,6 +10850,7 @@ class WorkflowService:
         self,
         workflow_run_id: str,
         organization_id: str | None = None,
+        cap_output_values: bool = False,
     ) -> list[WorkflowRunTimeline]:
         """
         build the tree structure of the workflow run timeline
@@ -10358,6 +10859,38 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )
+        if cap_output_values:
+            for block in workflow_run_blocks:
+                # The jsonb write guard covers only `output`, so every other unbounded jsonb
+                # field on the block reaches this response uncapped.
+                for block_field in UNBOUNDED_BLOCK_JSON_FIELDS:
+                    setattr(
+                        block,
+                        block_field,
+                        truncate_oversized_response_value(
+                            getattr(block, block_field),
+                            workflow_run_id=workflow_run_id,
+                            workflow_run_block_id=block.workflow_run_block_id,
+                            field=block_field,
+                        ),
+                    )
+                for text_field in UNBOUNDED_BLOCK_TEXT_FIELDS:
+                    setattr(block, text_field, truncate_oversized_response_text(getattr(block, text_field)))
+                for list_field in UNBOUNDED_BLOCK_TEXT_LIST_FIELDS:
+                    setattr(
+                        block,
+                        list_field,
+                        _capped_text_list(
+                            getattr(block, list_field),
+                            workflow_run_id=workflow_run_id,
+                            field=list_field,
+                        ),
+                    )
+                block.loop_values = _capped_loop_values(
+                    block.loop_values,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=block.workflow_run_block_id,
+                )
         # get all the actions for all workflow run blocks
         task_ids = [block.task_id for block in workflow_run_blocks if block.task_id]
         task_id_to_block: dict[str, WorkflowRunBlock] = {
@@ -10367,6 +10900,10 @@ class WorkflowService:
         for action in actions:
             if not action.task_id:
                 continue
+            # Actions ride the block they hydrate, and a completion/extraction action can
+            # carry a multi-megabyte response or output of its own.
+            if cap_output_values:
+                _cap_action_payloads(action, workflow_run_id=workflow_run_id)
             task_block = task_id_to_block[action.task_id]
             task_block.actions.append(action)
 
@@ -10721,17 +11258,64 @@ class WorkflowService:
             blocks_to_update_count=len(blocks_to_update),
         )
 
-        created_script = await app.DATABASE.scripts.create_script(
+        # The published lookup above cannot see the pending script this run's
+        # per-block mints created. Reuse it (regenerate + promote) instead of
+        # minting a duplicate script with identical content (SKY-13659). The
+        # regeneration also closes the race with the fire-and-forget last
+        # per-block mint, which may still be in flight.
+        pending_script = None
+        pending_workflow_script = await app.DATABASE.scripts.get_workflow_script(
             organization_id=workflow.organization_id,
-            run_id=workflow_run.workflow_run_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            statuses=[ScriptStatus.pending],
         )
+        if pending_workflow_script:
+            pending_script = await app.DATABASE.scripts.get_script(
+                script_id=pending_workflow_script.script_id,
+                organization_id=workflow.organization_id,
+            )
+
+        if pending_script:
+            # Mint a NEW revision under the pending script_id rather than writing
+            # into the pending revision itself: script_files is unique on
+            # (script_revision_id, file_path) and create_script_file conflict-noops,
+            # so regenerating in place would keep the stale pending main.py — which
+            # the still-in-flight per-block mint can overwrite. A fresh revision
+            # persists the final source and wins the cache lookup (latest version).
+            version_stats = await app.DATABASE.scripts.get_script_version_stats(
+                organization_id=workflow.organization_id,
+                script_ids=[pending_script.script_id],
+            )
+            latest_version, _ = version_stats.get(pending_script.script_id, (pending_script.version, 0))
+            created_script = await app.DATABASE.scripts.create_script(
+                organization_id=workflow.organization_id,
+                run_id=workflow_run.workflow_run_id,
+                script_id=pending_script.script_id,
+                version=latest_version + 1,
+            )
+            LOG.info(
+                "Reusing run's pending script id for final mint instead of creating a new script",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                script_id=created_script.script_id,
+                pending_revision_id=pending_script.script_revision_id,
+                new_revision_id=created_script.script_revision_id,
+                new_version=created_script.version,
+                cache_key_value=rendered_cache_key_value,
+            )
+        else:
+            created_script = await app.DATABASE.scripts.create_script(
+                organization_id=workflow.organization_id,
+                run_id=workflow_run.workflow_run_id,
+            )
 
         await workflow_script_service.generate_workflow_script(
             workflow_run=workflow_run,
             workflow=workflow,
             script=created_script,
             rendered_cache_key_value=rendered_cache_key_value,
-            cached_script=None,
+            cached_script=pending_script,
             updated_block_labels=None,
         )
 
