@@ -1,3 +1,4 @@
+import ast
 import base64
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -357,6 +358,202 @@ async def run(parameters):
     assert response.cacheable_block_count == 1
     assert response.skipped_block_labels == ["check"]
     assert [block.label for block in response.blocks] == ["step_a", "check"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "escape",
+    [
+        "page.page.context.pages[0]",
+        "page.context.pages[0]",
+        "page.locator('#target').click()",
+        "await page.fill_form({})",
+        "await page.fill_from_mapping([], {}, data={})",
+        "await page.get_totp_digit(context, 'totp_code', 0)",
+        "context.page.context.pages[0]",
+    ],
+)
+async def test_unsafe_cached_page_capabilities_force_agent_fallback(escape: str) -> None:
+    source = f"""\
+import skyvern
+
+@skyvern.cached(cache_key="step_a")
+async def cached_step(page, context):
+    return {escape}
+
+async def run(parameters):
+    await skyvern.run_task(prompt="...", label="step_a", cache_key="step_a")
+"""
+
+    response = await cached_script_deploy_service.deploy_cached_script(
+        organization_id="org_test",
+        workflow_permanent_id="wpid_test",
+        request=_request(source, requires_agent_overrides={"step_a": False}),
+    )
+
+    step = next(block for block in response.blocks if block.label == "step_a")
+    assert step.requires_agent is True
+    assert response.warnings == ["Cached block 'step_a' uses an unmediated browser capability; agent fallback required"]
+
+
+@pytest.mark.asyncio
+async def test_private_attribute_capability_escape_is_rejected_outright() -> None:
+    # `page._ai` used to be classified by the visitor above and softened to an agent-fallback
+    # warning. Since the mint-time `is_safe_script_code` gate (ADR-0012) now runs first and rejects
+    # ANY private-attribute access file-wide, this specific escape can no longer reach that
+    # classifier at all — it fails closed with a 400 instead of degrading. Flagged for review: this
+    # narrows PR #13656's original fallback behavior for this one pattern; confirm this is the
+    # intended precedence between the two gates rather than an accidental strictness regression.
+    source = """\
+import skyvern
+
+@skyvern.cached(cache_key="step_a")
+async def cached_step(page, context):
+    return page._ai.page.request
+
+async def run(parameters):
+    await skyvern.run_task(prompt="...", label="step_a", cache_key="step_a")
+"""
+
+    with pytest.raises(HTTPException) as exc_info:
+        await cached_script_deploy_service.deploy_cached_script(
+            organization_id="org_test",
+            workflow_permanent_id="wpid_test",
+            request=_request(source, requires_agent_overrides={"step_a": False}),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "not allowed" in str(exc_info.value.detail).lower()
+
+
+@pytest.mark.asyncio
+async def test_positional_cached_key_cannot_bypass_agent_fallback() -> None:
+    source = """\
+import skyvern
+
+@skyvern.cached("step_a")
+async def cached_step(page, context):
+    return page.page.context.pages[0]
+
+async def run(parameters):
+    await skyvern.run_task(prompt="...", label="step_a", cache_key="step_a")
+"""
+
+    response = await cached_script_deploy_service.deploy_cached_script(
+        organization_id="org_test",
+        workflow_permanent_id="wpid_test",
+        request=_request(source, requires_agent_overrides={"step_a": False}),
+    )
+
+    step = next(block for block in response.blocks if block.label == "step_a")
+    assert step.requires_agent is True
+
+
+def test_duplicate_function_names_preserve_each_unsafe_cached_registration() -> None:
+    source = """\
+import skyvern
+
+@skyvern.cached(cache_key="unsafe_first")
+async def repeated(page, context):
+    return page.page.context.pages[0]
+
+@skyvern.cached(cache_key="safe_last")
+async def repeated(page, context):
+    await page.click(selector="#target")
+"""
+
+    assert cached_script_deploy_service._unsafe_cached_block_labels(source) == {"unsafe_first"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsafe_helper_body",
+    [
+        "return page.page.context.pages[0]",
+        "return await page.fill_form({})",
+        "return await page.fill_from_mapping([], {}, data={})",
+        "return await page.get_totp_digit(context, 'totp_code', 0)",
+    ],
+)
+async def test_transitive_unsafe_cached_helpers_force_agent_fallback(unsafe_helper_body: str) -> None:
+    source = f"""\
+import skyvern
+
+async def unsafe_helper(page, context):
+    {unsafe_helper_body}
+
+async def generated_bridge(page, context):
+    return await unsafe_helper(page, context)
+
+@skyvern.cached(cache_key="step_a")
+async def cached_step(page, context):
+    return await generated_bridge(page, context)
+
+async def run(parameters):
+    await skyvern.run_task(prompt="...", label="step_a", cache_key="step_a")
+"""
+
+    response = await cached_script_deploy_service.deploy_cached_script(
+        organization_id="org_test",
+        workflow_permanent_id="wpid_test",
+        request=_request(source, requires_agent_overrides={"step_a": False}),
+    )
+
+    step = next(block for block in response.blocks if block.label == "step_a")
+    assert step.requires_agent is True
+    assert response.warnings == ["Cached block 'step_a' uses an unmediated browser capability; agent fallback required"]
+
+
+@pytest.mark.asyncio
+async def test_safe_cached_helper_preserves_explicit_agent_override() -> None:
+    source = """\
+import skyvern
+
+async def safe_helper(page):
+    await page.click(selector="#target")
+
+@skyvern.cached(cache_key="step_a")
+async def cached_step(page, context):
+    await safe_helper(page)
+
+async def run(parameters):
+    await skyvern.run_task(prompt="...", label="step_a", cache_key="step_a")
+"""
+
+    response = await cached_script_deploy_service.deploy_cached_script(
+        organization_id="org_test",
+        workflow_permanent_id="wpid_test",
+        request=_request(source, requires_agent_overrides={"step_a": False}),
+    )
+
+    step = next(block for block in response.blocks if block.label == "step_a")
+    assert step.requires_agent is False
+    assert response.warnings == []
+
+
+def test_transitive_analysis_scans_a_long_helper_chain_linearly() -> None:
+    class CountingVisitors(dict[str, cached_script_deploy_service._CachedCapabilityVisitor]):
+        scans = 0
+
+        def items(self):
+            self.scans += 1
+            return super().items()
+
+    root = ast.parse("async def helper(): pass").body[0]
+    assert isinstance(root, ast.AsyncFunctionDef)
+    visitors = CountingVisitors()
+    helper_count = 2_000
+    for index in range(helper_count):
+        visitor = cached_script_deploy_service._CachedCapabilityVisitor(root)
+        visitor.directly_unsafe = index == helper_count - 1
+        if index < helper_count - 1:
+            visitor.local_calls.add(f"helper_{index + 1}")
+        visitors[f"helper_{index}"] = visitor
+
+    unsafe = cached_script_deploy_service._transitively_unsafe_function_names(visitors)
+
+    assert unsafe == set(visitors)
+    assert visitors.scans <= 2
 
 
 @pytest.mark.asyncio
