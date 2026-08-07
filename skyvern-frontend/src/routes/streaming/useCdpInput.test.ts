@@ -47,6 +47,13 @@ class MockWebSocket {
       listener(event);
     }
   }
+
+  emitMessage(data: string) {
+    const event = new MessageEvent("message", { data });
+    for (const listener of this.listeners.message ?? []) {
+      listener(event);
+    }
+  }
 }
 
 async function renderInputHook() {
@@ -295,5 +302,150 @@ describe("useCdpInput key handling", () => {
         windowsVirtualKeyCode: 46,
       }),
     );
+  });
+});
+
+describe("useCdpInput navigate", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    MockWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", MockWebSocket);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("does not send a navigateEvent when the user has not taken control", async () => {
+    const { result } = renderHook(() =>
+      useCdpInput({
+        inputWsUrl: "wss://input.test",
+        interactive: true,
+        viewportWidth: 1280,
+        viewportHeight: 720,
+      }),
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const socket = MockWebSocket.instances[0]!;
+    socket.send.mockClear();
+
+    act(() => {
+      result.current.navigate("https://example.com");
+    });
+
+    expect(socket.send).not.toHaveBeenCalled();
+  });
+
+  it("sends a navigateEvent over the existing input socket once controlling", async () => {
+    const { result } = renderHook(() =>
+      useCdpInput({
+        inputWsUrl: "wss://input.test",
+        interactive: true,
+        viewportWidth: 1280,
+        viewportHeight: 720,
+      }),
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    act(() => {
+      result.current.setUserIsControlling(true);
+    });
+    const socket = MockWebSocket.instances[0]!;
+    socket.send.mockClear();
+
+    act(() => {
+      result.current.navigate("https://example.com");
+    });
+
+    expect(socket.send).toHaveBeenCalledWith(
+      JSON.stringify({ type: "navigateEvent", url: "https://example.com" }),
+    );
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it("surfaces a navigate-error message the server sends back", async () => {
+    const { result } = renderHook(() =>
+      useCdpInput({
+        inputWsUrl: "wss://input.test",
+        interactive: true,
+        viewportWidth: 1280,
+        viewportHeight: 720,
+      }),
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(result.current.navigateError).toBeNull();
+
+    const socket = MockWebSocket.instances[0]!;
+    act(() => {
+      socket.emitMessage(
+        JSON.stringify({ kind: "navigate-error", reason: "blocked" }),
+      );
+    });
+
+    expect(result.current.navigateError).toBeTruthy();
+  });
+
+  it("clears a stale navigateError when control is ceded", async () => {
+    const { result } = renderHook(() =>
+      useCdpInput({
+        inputWsUrl: "wss://input.test",
+        interactive: true,
+        viewportWidth: 1280,
+        viewportHeight: 720,
+      }),
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    act(() => {
+      result.current.setUserIsControlling(true);
+    });
+    const socket = MockWebSocket.instances[0]!;
+    act(() => {
+      socket.emitMessage(
+        JSON.stringify({ kind: "navigate-error", reason: "blocked" }),
+      );
+    });
+    expect(result.current.navigateError).toBeTruthy();
+
+    act(() => {
+      result.current.setUserIsControlling(false);
+    });
+
+    expect(result.current.navigateError).toBeNull();
+  });
+
+  it("clears a stale navigateError on reconnect (fresh ready message)", async () => {
+    const { result } = renderHook(() =>
+      useCdpInput({
+        inputWsUrl: "wss://input.test",
+        interactive: true,
+        viewportWidth: 1280,
+        viewportHeight: 720,
+      }),
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const socket = MockWebSocket.instances[0]!;
+    act(() => {
+      socket.emitMessage(
+        JSON.stringify({ kind: "navigate-error", reason: "blocked" }),
+      );
+    });
+    expect(result.current.navigateError).toBeTruthy();
+
+    act(() => {
+      socket.emitMessage(JSON.stringify({ kind: "ready" }));
+    });
+
+    expect(result.current.navigateError).toBeNull();
   });
 });
