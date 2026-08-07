@@ -29,6 +29,7 @@ PINNED_CLIENT_FIELDS = frozenset(
         "browser_profile_id",
         "generate_browser_profile",
         "vnc_streaming_supported",
+        "stream_transport",
         "download_path",
         "downloaded_files",
         "recordings",
@@ -336,3 +337,73 @@ async def test_base_agent_function_preserves_the_existing_browser_session_addres
     )
 
     assert resolved_address == direct_address
+
+
+@pytest.mark.asyncio
+async def test_browser_session_response_carries_per_session_stream_transport() -> None:
+    now = datetime.now(timezone.utc)
+    session = PersistentBrowserSession(
+        persistent_browser_session_id="pbs_123",
+        organization_id="org_123",
+        status="active",
+        created_at=now,
+        modified_at=now,
+    )
+
+    with (
+        patch.object(app.AGENT_FUNCTION, "resolve_browser_session_connect_url", AsyncMock(return_value=None)),
+        patch.object(
+            app.AGENT_FUNCTION, "resolve_stream_transport", AsyncMock(return_value="cdp")
+        ) as transport_resolver,
+    ):
+        response = await BrowserSessionResponse.from_browser_session(session, include_stream_transport=True)
+
+    assert response.stream_transport == "cdp"
+    transport_resolver.assert_awaited_once_with(
+        browser_session_id="pbs_123", organization_id="org_123", ip_address=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_browser_session_response_leaves_the_transport_unresolved_by_default() -> None:
+    """The list endpoints serialize an unpaginated set concurrently, so they must not each pay a
+    per-session infrastructure lookup — nor publish which sessions are hosted elsewhere."""
+    now = datetime.now(timezone.utc)
+    session = PersistentBrowserSession(
+        persistent_browser_session_id="pbs_123",
+        organization_id="org_123",
+        status="active",
+        created_at=now,
+        modified_at=now,
+    )
+
+    with (
+        patch.object(app.AGENT_FUNCTION, "resolve_browser_session_connect_url", AsyncMock(return_value=None)),
+        patch.object(
+            app.AGENT_FUNCTION, "resolve_stream_transport", AsyncMock(return_value="cdp")
+        ) as transport_resolver,
+    ):
+        response = await BrowserSessionResponse.from_browser_session(session)
+
+    assert response.stream_transport is None
+    transport_resolver.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_browser_session_response_withholds_a_transport_outside_the_contract() -> None:
+    now = datetime.now(timezone.utc)
+    session = PersistentBrowserSession(
+        persistent_browser_session_id="pbs_123",
+        organization_id="org_123",
+        status="active",
+        created_at=now,
+        modified_at=now,
+    )
+
+    with (
+        patch.object(app.AGENT_FUNCTION, "resolve_browser_session_connect_url", AsyncMock(return_value=None)),
+        patch.object(app.AGENT_FUNCTION, "resolve_stream_transport", AsyncMock(return_value="webrtc")),
+    ):
+        response = await BrowserSessionResponse.from_browser_session(session, include_stream_transport=True)
+
+    assert response.stream_transport is None
