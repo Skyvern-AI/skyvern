@@ -20,6 +20,7 @@ from playwright.async_api import ElementHandle, Frame, Locator, Page
 
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
 from skyvern.exceptions import FailedToTakeScreenshot, ScreenshotTargetClosed, SkyvernPageAnalysisTimeout
+from skyvern.forge import app
 from skyvern.forge.sdk.browser_action_preflight import policy_observation_enabled, record_observed_tabs
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -147,7 +148,9 @@ async def build_open_tabs_context(
         if title:
             entry += f" ({title})"
         lines.append(entry)
-    return "\n".join(lines)
+    tabs_context = "\n".join(lines)
+    await app.AGENT_FUNCTION.inspect_browser_observation(tabs_context, [], semantic_text=tabs_context)
+    return tabs_context
 
 
 async def capture_open_tab_screenshots(

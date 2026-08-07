@@ -504,8 +504,8 @@ const MessageItem = memo(
                 <button
                   type="button"
                   onClick={queuedStatus.onCancel}
-                  title="Cancel queued message"
-                  aria-label="Cancel queued message"
+                  title="Edit queued message"
+                  aria-label="Edit queued message"
                   className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
                 >
                   <Cross2Icon className="h-3 w-3" />
@@ -770,6 +770,9 @@ export function WorkflowCopilotChat({
   const [inputValue, setInputValue] = useState("");
   const dismissPasteSkillHint = usePasteSkillHintStore((s) => s.dismiss);
   const [isLoading, setIsLoading] = useState(false);
+  // A stop is a round trip to the backend; without this the control stays
+  // live-looking and users press it repeatedly.
+  const [isStopping, setIsStopping] = useState(false);
   useTurnActivityChange(isLoading, onTurnActivityChange);
   const [queuedPrompt, setQueuedPrompt] = useState<QueuedPrompt | null>(null);
   const [narrative, setNarrative] =
@@ -1309,7 +1312,9 @@ export function WorkflowCopilotChat({
   } = useSpeechToTextField({
     value: inputValue,
     onChange: setInputValue,
-    enabled: isOpen && !queuedPrompt,
+    // Dictation follows the textarea: it stays live while a prompt is parked,
+    // because that text is now editable and replaceable rather than frozen.
+    enabled: isOpen,
   });
 
   const updateQueuedPrompt = useCallback((next: QueuedPrompt | null) => {
@@ -1795,14 +1800,55 @@ export function WorkflowCopilotChat({
     applyHistoryResponse,
   ]);
 
+  // Set by a block's "Generate" arm step so the next send scopes regeneration to that block.
+  const blockBuildTargetLabelRef = useRef<string | null>(null);
+  const fixOriginPendingRef = useRef(false);
+  // True only while a block-build turn is actually in flight (not a turn it queued behind).
+  const blockGenInFlightRef = useRef(false);
+
+  // The only disposal path for a queued prompt: its text goes back to the
+  // composer as an editable draft. Reads the synchronous ref, not state, so a
+  // stop can clear the queue before isLoading flips and the drain effect runs.
+  const restoreQueuedPromptToComposer = useCallback(() => {
+    const queued = queuedPromptRef.current;
+    if (!queued) {
+      return;
+    }
+
+    updateQueuedPrompt(null);
+    // Drop the queued block-build target so it doesn't leak into the next message.
+    // The fix-origin signal rode on the discarded prompt; clear the ref too in case
+    // a future path set it without queuing.
+    blockBuildTargetLabelRef.current = null;
+    fixOriginPendingRef.current = false;
+    setMessages((prev) => prev.filter((message) => message.id !== queued.id));
+    // Text already in the composer is the newer intent — the user was part way
+    // through replacing the queued message — so it wins over what comes back.
+    setInputValue((current) => (current.trim() ? current : queued.content));
+    window.requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+      adjustTextareaHeight();
+    });
+  }, [adjustTextareaHeight, updateQueuedPrompt]);
+
   const cancelSend = useCallback(async () => {
+    // A stop must never let a queued message auto-fire. Hand its text back to
+    // the composer synchronously, before isLoading flips and the drain effect
+    // would otherwise send it as a fresh turn.
+    restoreQueuedPromptToComposer();
+
     // Capture upfront so the 15s timer below can't latch onto a next turn's controller.
     const controllerAtCancel = streamingAbortController.current;
     if (!controllerAtCancel) return;
 
     const cancelToken = pendingCancelToken.current;
     pendingCancelToken.current = null;
+    // After the token check, not before: a turn that already finished has no
+    // token, and claiming "Stopping…" for a cancel that never goes out would
+    // rely on the isLoading reset as its only way back.
     if (!cancelToken) return;
+
+    setIsStopping(true);
 
     cancelInFlightController.current = controllerAtCancel;
 
@@ -1844,28 +1890,15 @@ export function WorkflowCopilotChat({
       controllerAtCancel.abort();
       appendCancelledBubble();
     }
-  }, [credentialGetter]);
+  }, [credentialGetter, restoreQueuedPromptToComposer]);
 
-  const cancelQueuedPrompt = useCallback(() => {
-    if (!queuedPrompt) {
-      return;
+  // The turn ending is the one signal that a stop actually landed — it covers
+  // the normal path, the 15s safety-timer abort, and the failed-POST abort.
+  useEffect(() => {
+    if (!isLoading) {
+      setIsStopping(false);
     }
-
-    updateQueuedPrompt(null);
-    // Drop the queued block-build target so it doesn't leak into the next message.
-    // The fix-origin signal rode on the discarded prompt; clear the ref too in case
-    // a future path set it without queuing.
-    blockBuildTargetLabelRef.current = null;
-    fixOriginPendingRef.current = false;
-    setMessages((prev) =>
-      prev.filter((message) => message.id !== queuedPrompt.id),
-    );
-    setInputValue(queuedPrompt.content);
-    window.requestAnimationFrame(() => {
-      textareaRef.current?.focus();
-      adjustTextareaHeight();
-    });
-  }, [adjustTextareaHeight, queuedPrompt, updateQueuedPrompt]);
+  }, [isLoading]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1873,7 +1906,7 @@ export function WorkflowCopilotChat({
         return;
       }
       if (queuedPrompt) {
-        cancelQueuedPrompt();
+        restoreQueuedPromptToComposer();
         return;
       }
       if (isLoading) {
@@ -1885,13 +1918,13 @@ export function WorkflowCopilotChat({
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [cancelQueuedPrompt, cancelSend, isLoading, isOpen, queuedPrompt]);
-
-  // Set by a block's "Generate" arm step so the next send scopes regeneration to that block.
-  const blockBuildTargetLabelRef = useRef<string | null>(null);
-  const fixOriginPendingRef = useRef(false);
-  // True only while a block-build turn is actually in flight (not a turn it queued behind).
-  const blockGenInFlightRef = useRef(false);
+  }, [
+    restoreQueuedPromptToComposer,
+    cancelSend,
+    isLoading,
+    isOpen,
+    queuedPrompt,
+  ]);
 
   const handleSend = useCallback(
     async (messageOverride?: string, options: SendOptions = {}) => {
@@ -1924,6 +1957,35 @@ export function WorkflowCopilotChat({
           messageAudioBlob = await stopSpeech();
         }
         messageAudioBlob = messageAudioBlob ?? takeSpeechAudioBlob();
+      }
+
+      if (action === "replace_queued") {
+        const queued = queuedPromptRef.current;
+        if (!queued) {
+          return;
+        }
+        // New text, so the old prompt's framing must not ride along: the
+        // fix-origin flag and the block-build scope both belonged to the
+        // message being replaced.
+        blockBuildTargetLabelRef.current = null;
+        fixOriginPendingRef.current = false;
+        updateQueuedPrompt({
+          ...queued,
+          content: candidate,
+          audioBlob: messageAudioBlob,
+          fixOrigin: false,
+        });
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === queued.id
+              ? { ...message, content: candidate }
+              : message,
+          ),
+        );
+        if (messageOverride === undefined) {
+          setInputValue("");
+        }
+        return;
       }
 
       if (action === "queue_working" || action === "queue_live_browser") {
@@ -2861,9 +2923,6 @@ export function WorkflowCopilotChat({
     return null;
   }
 
-  // Input stays usable while Copilot works; only a parked queued prompt
-  // disables it (the message is already captured).
-  const inputDisabled = Boolean(queuedPrompt);
   const queuedPromptWaitingStatus =
     queuedPrompt?.reason === "working"
       ? "Queued — sends when this turn finishes."
@@ -2897,10 +2956,11 @@ export function WorkflowCopilotChat({
   const gateActionable =
     Boolean(proposedWorkflow) && !isLoading && !isLoadingHistory;
   const hasComposerText = inputValue.trim().length > 0;
-  // A live_browser-reason queued prompt parks with no active turn to stop and
-  // a disabled, emptied textarea — the morph button would otherwise render as
-  // a live "Send" that's a guaranteed no-op; only the Queued chip's ✕ acts.
-  const waitingOnQueueOnly = queuedPrompt?.reason === "live_browser";
+  // A live_browser-reason queued prompt parks with no active turn to stop, so
+  // an empty composer's morph button would render as a guaranteed no-op "Send".
+  // With text typed it does act — it rewrites the parked prompt.
+  const waitingOnQueueOnly =
+    queuedPrompt?.reason === "live_browser" && !hasComposerText;
   // When the initial history load drops the queued bubble, the composer chip
   // takes over its live_browser status/Cancel (footer-else-chip).
   const queuedBubbleOrphaned = Boolean(
@@ -2908,13 +2968,17 @@ export function WorkflowCopilotChat({
     queuedPrompt.reason === "live_browser" &&
     !messages.some((message) => message.id === queuedPrompt.id),
   );
-  const morphButtonLabel = waitingOnQueueOnly
-    ? "Send disabled — waiting for live browser"
-    : !isLoading
-      ? "Send"
-      : hasComposerText
-        ? "Queue for next turn"
-        : "Stop";
+  const morphButtonLabel = isStopping
+    ? "Stopping…"
+    : waitingOnQueueOnly
+      ? "Send disabled — waiting for live browser"
+      : queuedPrompt && hasComposerText
+        ? "Replace queued message"
+        : !isLoading
+          ? "Send"
+          : hasComposerText
+            ? "Queue for next turn"
+            : "Stop";
   // Shared between the legacy fused split-button and the S4 mode pill so the
   // three options never drift between the two composer treatments.
   const modeMenuItems = (
@@ -3372,7 +3436,7 @@ export function WorkflowCopilotChat({
                     queuedPrompt.id === message.id
                       ? {
                           text: queuedPromptWaitingStatus,
-                          onCancel: cancelQueuedPrompt,
+                          onCancel: restoreQueuedPromptToComposer,
                         }
                       : null
                   }
@@ -3588,9 +3652,9 @@ export function WorkflowCopilotChat({
             <span className="flex-1 truncate">{queuedPromptWaitingStatus}</span>
             <button
               type="button"
-              onClick={cancelQueuedPrompt}
-              title="Cancel queued message"
-              aria-label="Cancel queued message"
+              onClick={restoreQueuedPromptToComposer}
+              title="Edit queued message"
+              aria-label="Edit queued message"
               className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
             >
               <Cross2Icon className="h-3 w-3" />
@@ -3617,7 +3681,6 @@ export function WorkflowCopilotChat({
               isSupported={isSpeechSupported}
               isListening={isSpeechListening}
               isHearingSpeech={isSpeechHearing}
-              disabled={inputDisabled}
               onToggle={toggleSpeech}
               className="h-10 w-10 rounded-lg"
             />
@@ -3626,7 +3689,7 @@ export function WorkflowCopilotChat({
             ref={setTextareaRef}
             placeholder={
               queuedPrompt
-                ? "Prompt queued..."
+                ? "Type to replace the queued message…"
                 : isLoading
                   ? "Type a message to send next…"
                   : isWaitingForLiveBrowser
@@ -3639,7 +3702,6 @@ export function WorkflowCopilotChat({
             onChange={(e) => setInputValue(e.target.value)}
             onPaste={() => dismissPasteSkillHint()}
             onKeyDown={handleKeyPress}
-            disabled={inputDisabled}
             rows={1}
             className={
               copilotUxV1Enabled && copilotV2Enabled
@@ -3657,7 +3719,6 @@ export function WorkflowCopilotChat({
               isSupported={isSpeechSupported}
               isListening={isSpeechListening}
               isHearingSpeech={isSpeechHearing}
-              disabled={inputDisabled}
               onToggle={toggleSpeech}
               className="h-8 w-8 rounded-full border-0 bg-transparent"
               iconClassName="h-3.5 w-3.5"
@@ -3671,19 +3732,22 @@ export function WorkflowCopilotChat({
               >
                 <button
                   type="button"
-                  disabled={waitingOnQueueOnly}
+                  disabled={waitingOnQueueOnly || isStopping}
+                  aria-busy={isStopping}
                   onClick={() =>
                     isLoading && !hasComposerText ? cancelSend() : handleSend()
                   }
                   aria-label={morphButtonLabel}
                   className={cn(
                     "flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
-                    isLoading && !hasComposerText
+                    isStopping || (isLoading && !hasComposerText)
                       ? "bg-slate-elevation4 text-foreground hover:bg-slate-elevation3"
                       : "bg-cta text-cta-foreground hover:bg-cta-hover",
                   )}
                 >
-                  {isLoading && !hasComposerText ? (
+                  {isStopping ? (
+                    <ReloadIcon className="h-3.5 w-3.5 animate-spin" />
+                  ) : isLoading && !hasComposerText ? (
                     <StopIcon className="h-3 w-3" />
                   ) : (
                     <ArrowUpIcon className="h-4 w-4" />
@@ -3694,7 +3758,7 @@ export function WorkflowCopilotChat({
           ) : isLoading && queuedPrompt ? (
             <>
               <button
-                onClick={cancelQueuedPrompt}
+                onClick={restoreQueuedPromptToComposer}
                 title="Edit queued message"
                 className="flex h-10 items-center justify-center rounded-lg border border-border px-3 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
               >
@@ -3702,10 +3766,12 @@ export function WorkflowCopilotChat({
               </button>
               <button
                 onClick={cancelSend}
-                title="Cancel run"
-                className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
+                disabled={isStopping}
+                aria-busy={isStopping}
+                title={isStopping ? "Stopping…" : "Cancel run"}
+                className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
               >
-                Cancel run
+                {isStopping ? "Stopping…" : "Cancel run"}
               </button>
             </>
           ) : isLoading ? (
@@ -3721,19 +3787,21 @@ export function WorkflowCopilotChat({
               <button
                 type="button"
                 onClick={cancelSend}
-                title="Cancel run"
-                className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
+                disabled={isStopping}
+                aria-busy={isStopping}
+                title={isStopping ? "Stopping…" : "Cancel run"}
+                className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
               >
-                Cancel run
+                {isStopping ? "Stopping…" : "Cancel run"}
               </button>
             </>
           ) : queuedPrompt ? (
             <button
-              onClick={cancelQueuedPrompt}
+              onClick={restoreQueuedPromptToComposer}
               title="Edit queued prompt"
-              className="flex h-10 items-center justify-center rounded-lg bg-destructive px-4 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
+              className="flex h-10 items-center justify-center rounded-lg border border-border px-4 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
             >
-              Cancel
+              Edit queued
             </button>
           ) : !copilotV2Enabled ? (
             <button

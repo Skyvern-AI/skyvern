@@ -21,6 +21,7 @@ from skyvern.exceptions import (
     UnknownElementTreeFormat,
 )
 from skyvern.experimentation.wait_utils import empty_page_retry_wait
+from skyvern.forge import app
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.browser_action_preflight import advance_observation_epoch
 from skyvern.forge.sdk.core import skyvern_context
@@ -49,6 +50,15 @@ if TYPE_CHECKING:
     from skyvern.webeye.browser_engine import BrowserEngineSelection
 
 LOG = structlog.get_logger()
+
+
+async def _inspect_browser_observation(
+    inner_text: str,
+    element_tree: list[dict],
+    *,
+    semantic_text: str | None = None,
+) -> None:
+    await app.AGENT_FUNCTION.inspect_browser_observation(inner_text, element_tree, semantic_text)
 
 
 async def build_scraping_failed_reason(
@@ -337,6 +347,7 @@ async def get_frame_text(iframe: Frame, scrape_exclude: ScrapeExcludeFunc | None
             "failed to get text from iframe",
             exc_info=True,
         )
+        app.AGENT_FUNCTION.record_browser_observation_failure("inner_text_extraction_error")
         return ""
 
     for child_frame in iframe.child_frames:
@@ -354,6 +365,7 @@ async def get_frame_text(iframe: Frame, scrape_exclude: ScrapeExcludeFunc | None
                 "Unable to get child_frame_element",
                 exc_info=True,
             )
+            app.AGENT_FUNCTION.record_browser_observation_failure("child_frame_text_extraction_error")
             continue
 
         # it will get stuck when we `frame.evaluate()` on an invisible iframe
@@ -589,7 +601,13 @@ async def scrape_web_unsafe(
     if not elements and not support_empty_page:
         raise NoElementFound()
 
+    app.AGENT_FUNCTION.begin_browser_observation()
     text_content = await get_frame_text(page.main_frame, scrape_exclude)
+    await _inspect_browser_observation(
+        f"{page.url}\n{text_content}",
+        element_tree_trimmed,
+        semantic_text=text_content,
+    )
 
     html = ""
     window_dimension = None
@@ -828,6 +846,13 @@ class IncrementalScrapePage(ElementTreeBuilder):
         self,
         cleanup_element_tree: CleanupElementTreeFunc,
     ) -> list[dict]:
+        try:
+            return await self._get_incremental_element_tree(cleanup_element_tree)
+        except Exception:
+            app.AGENT_FUNCTION.record_browser_observation_failure("incremental_scrape_error")
+            raise
+
+    async def _get_incremental_element_tree(self, cleanup_element_tree: CleanupElementTreeFunc) -> list[dict]:
         frame = self.skyvern_frame.get_frame()
 
         try:
@@ -854,6 +879,12 @@ class IncrementalScrapePage(ElementTreeBuilder):
 
         self.element_tree = incremental_tree
         self.element_tree_trimmed = trimmed_element_tree
+        semantic_text = await get_frame_text(frame) if app.AGENT_FUNCTION.needs_browser_observation_text() else None
+        await _inspect_browser_observation(
+            frame.url,
+            trimmed_element_tree,
+            semantic_text=semantic_text,
+        )
 
         return self.element_tree_trimmed
 
