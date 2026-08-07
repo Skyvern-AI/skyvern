@@ -60,17 +60,6 @@ POST_NAVIGATE_NUDGE = (
     "to inspect the page before responding. Do NOT answer from memory."
 )
 
-POST_INTERMEDIATE_SUCCESS_NUDGE = (
-    "STOP — do NOT respond to the user yet. "
-    "Your workflow only covers a subset of what the user asked for. "
-    "You MUST add the next block now: call update_and_run_blocks with the complete "
-    "workflow YAML, but pass only the next 1-2 unverified block labels when the "
-    "workflow has several page-changing stages. Keep later blocks in the YAML; "
-    "shrink only the block_labels test frontier. "
-    "Only respond to the user when every distinct action they requested is covered "
-    "by a workflow block, or you have clear evidence that continuing is infeasible."
-)
-
 POST_FAILED_TEST_NUDGE = (
     "STOP — your last test run FAILED. Do NOT respond to the user yet.\n"
     "1. First, call get_run_results — pass the workflow_run_id from the prior "
@@ -308,7 +297,6 @@ DEFAULT_ENFORCEMENT_NUDGES: dict[str, str] = {
     "screenshot_dropped": SCREENSHOT_DROPPED_NUDGE,
     "post_update": POST_UPDATE_NUDGE,
     "post_navigate": POST_NAVIGATE_NUDGE,
-    "post_intermediate_success": POST_INTERMEDIATE_SUCCESS_NUDGE,
     "post_failed_test": POST_FAILED_TEST_NUDGE,
     "post_failed_test_inspect_first": POST_FAILED_TEST_INSPECT_FIRST_NUDGE,
     "post_explore_without_workflow": POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE,

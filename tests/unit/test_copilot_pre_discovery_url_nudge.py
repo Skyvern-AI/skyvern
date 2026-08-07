@@ -25,7 +25,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     MAX_PRE_DISCOVERY_URL_QUESTION_NUDGES,
     PRESENT_COMPLETION_CONTRACT_ASK_RETRY,
     _pre_discovery_url_question_nudge,
-    _response_coverage_nudge,
+    _response_output_nudge,
     enforcement_decision,
 )
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
@@ -41,12 +41,11 @@ class _Ctx:
         self.discovery_calls_this_turn = 0
         self.pre_discovery_url_question_nudge_count = 0
         self.request_policy = None
-        # Fields the post-discovery sibling reads when _response_coverage_nudge runs.
+        # Fields the post-discovery sibling reads when _response_output_nudge runs.
         self.resolved_discovery_entrypoint_url = None
         self.resolved_discovery_failure_reason = None
         self.update_workflow_called = False
         self.no_workflow_nudge_count = 0
-        self.coverage_nudge_count = 0
         self.format_nudge_count = 0
         self.test_after_update_done = False
         self.workflow_persisted = False
@@ -56,6 +55,8 @@ class _Ctx:
         self.last_run_blocks_workflow_run_id = None
         self.last_successful_run_blocks_workflow_run_id = None
         self.last_outcome_gate_workflow_run_id = None
+        self.completion_criteria_turn_state = None
+        self.completion_verification_result = None
 
     def has_genuine_workflow_attempt(self) -> bool:
         return CopilotContext.has_genuine_workflow_attempt(self)  # type: ignore[arg-type]
@@ -118,7 +119,7 @@ def test_pre_discovery_url_ask_in_initial_phase_steers_to_discovery() -> None:
 
 def test_pre_discovery_url_ask_fires_through_response_coverage_gate() -> None:
     ctx = _Ctx()
-    assert _response_coverage_nudge(ctx, _URL_ASK).rule == "pre_discovery_url_question"
+    assert _response_output_nudge(ctx, _URL_ASK).rule == "pre_discovery_url_question"
 
 
 def test_pre_discovery_url_ask_in_discovering_phase_steers_to_discovery() -> None:
@@ -225,14 +226,14 @@ def test_pre_discovery_nudge_is_bounded() -> None:
 def test_present_completion_contract_ask_returns_internal_retry() -> None:
     ctx = _present_contract_ctx()
 
-    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK).rule == "present_completion_contract_ask_retry"
+    assert _response_output_nudge(ctx, _OUTPUT_CONFIRMATION_ASK).rule == "present_completion_contract_ask_retry"
 
 
 def test_present_completion_contract_ask_has_no_per_rule_cap() -> None:
     ctx = _present_contract_ctx()
 
-    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK).rule == "present_completion_contract_ask_retry"
-    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK).rule == "present_completion_contract_ask_retry"
+    assert _response_output_nudge(ctx, _OUTPUT_CONFIRMATION_ASK).rule == "present_completion_contract_ask_retry"
+    assert _response_output_nudge(ctx, _OUTPUT_CONFIRMATION_ASK).rule == "present_completion_contract_ask_retry"
 
 
 @pytest.mark.parametrize(
@@ -270,7 +271,7 @@ def test_present_completion_contract_ask_has_no_per_rule_cap() -> None:
 def test_present_completion_contract_ask_allows_clarification(overrides: dict[str, object]) -> None:
     ctx = _present_contract_ctx(**overrides)
 
-    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) is None
+    assert _response_output_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) is None
 
 
 @pytest.mark.parametrize(
@@ -290,7 +291,7 @@ def test_present_completion_contract_ask_suppressed_by_genuine_attempt(marker: d
     ctx = _present_contract_ctx(**marker)
 
     assert ctx.has_genuine_workflow_attempt() is True
-    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) is None
+    assert _response_output_nudge(ctx, _OUTPUT_CONFIRMATION_ASK) is None
 
 
 _REQUESTED_OUTPUT_PATHS = ("output.number_of_new_signups", "output.number_of_website_visitors")
@@ -345,7 +346,7 @@ def test_output_schema_ask_auto_answers_when_the_contract_only_holds_anonymous_s
     ctx = _mid_build_ctx(_anonymous_slot_contract_policy())
 
     with capture_logs() as logs:
-        nudge = _response_coverage_nudge(ctx, _output_schema_ask(["output.azure_error_count"]))
+        nudge = _response_output_nudge(ctx, _output_schema_ask(["output.azure_error_count"]))
 
     assert nudge is not None
     assert nudge != PRESENT_COMPLETION_CONTRACT_ASK_RETRY
@@ -362,7 +363,7 @@ def test_output_schema_ask_with_covered_refs_routes_to_the_declaring_read() -> N
     ctx = _mid_build_ctx(_output_path_contract_policy())
 
     with capture_logs() as logs:
-        nudge = _response_coverage_nudge(ctx, _output_schema_ask([_REQUESTED_OUTPUT_PATHS[1]]))
+        nudge = _response_output_nudge(ctx, _output_schema_ask([_REQUESTED_OUTPUT_PATHS[1]]))
 
     assert nudge is not None
     assert nudge != PRESENT_COMPLETION_CONTRACT_ASK_RETRY
@@ -388,7 +389,7 @@ def test_output_schema_ask_passes_through_when_any_requested_path_is_nameable() 
     ctx = _mid_build_ctx(policy)
 
     with capture_logs() as logs:
-        nudge = _response_coverage_nudge(ctx, _output_schema_ask(["output.unknown_field"]))
+        nudge = _response_output_nudge(ctx, _output_schema_ask(["output.unknown_field"]))
 
     assert nudge is None
     assert not [entry for entry in logs if entry["event"] == "copilot_ask_subject_auto_answered"]
@@ -398,7 +399,7 @@ def test_output_schema_ask_with_covering_refs_auto_answers() -> None:
     ctx = _present_contract_ctx(request_policy=_output_path_contract_policy())
 
     with capture_logs() as logs:
-        nudge = _response_coverage_nudge(ctx, _output_schema_ask(list(_REQUESTED_OUTPUT_PATHS)))
+        nudge = _response_output_nudge(ctx, _output_schema_ask(list(_REQUESTED_OUTPUT_PATHS)))
 
     assert nudge is not None
     assert nudge != PRESENT_COMPLETION_CONTRACT_ASK_RETRY
@@ -422,7 +423,7 @@ def test_output_schema_ask_without_full_coverage_passes_through(refs: list[str])
     ctx = _mid_build_ctx(_output_path_contract_policy())
 
     with capture_logs() as logs:
-        nudge = _response_coverage_nudge(ctx, _output_schema_ask(refs))
+        nudge = _response_output_nudge(ctx, _output_schema_ask(refs))
 
     assert nudge is None
     assert not [entry for entry in logs if entry["event"] == "copilot_ask_subject_auto_answered"]
@@ -438,7 +439,7 @@ _CREDENTIALS_ASK = {
 def test_non_output_schema_subject_ask_passes_through() -> None:
     ctx = _mid_build_ctx(_output_path_contract_policy())
 
-    assert _response_coverage_nudge(ctx, _CREDENTIALS_ASK) is None
+    assert _response_output_nudge(ctx, _CREDENTIALS_ASK) is None
 
 
 @pytest.mark.parametrize(
@@ -454,7 +455,7 @@ def test_typed_subject_ask_before_a_genuine_attempt_keeps_the_legacy_retry(ask: 
     build-first retry; only a resolved auto-answer skips it."""
     ctx = _present_contract_ctx(request_policy=_output_path_contract_policy())
 
-    assert _response_coverage_nudge(ctx, ask).rule == "present_completion_contract_ask_retry"
+    assert _response_output_nudge(ctx, ask).rule == "present_completion_contract_ask_retry"
 
 
 @pytest.mark.parametrize(
@@ -474,7 +475,7 @@ def test_typed_subject_ask_before_a_genuine_attempt_keeps_the_legacy_retry(ask: 
 )
 def test_unresolved_typed_ask_logs_which_outcome_it_got(ctx_factory: Callable[[], _Ctx], expected_outcome: str) -> None:
     with capture_logs() as logs:
-        _response_coverage_nudge(ctx_factory(), _CREDENTIALS_ASK)
+        _response_output_nudge(ctx_factory(), _CREDENTIALS_ASK)
 
     events = [entry for entry in logs if entry["event"] == "copilot_ask_subject_passed_through"]
     assert len(events) == 1
@@ -484,7 +485,7 @@ def test_unresolved_typed_ask_logs_which_outcome_it_got(ctx_factory: Callable[[]
 def test_absent_subject_present_contract_ask_keeps_legacy_retry() -> None:
     ctx = _present_contract_ctx(request_policy=_output_path_contract_policy())
 
-    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK).rule == "present_completion_contract_ask_retry"
+    assert _response_output_nudge(ctx, _OUTPUT_CONFIRMATION_ASK).rule == "present_completion_contract_ask_retry"
 
 
 def test_definition_level_output_path_does_not_count_as_coverage() -> None:
@@ -503,14 +504,14 @@ def test_definition_level_output_path_does_not_count_as_coverage() -> None:
     )
     ctx = _mid_build_ctx(policy)
 
-    assert _response_coverage_nudge(ctx, _output_schema_ask(["output.number_of_website_visitors"])) is None
+    assert _response_output_nudge(ctx, _output_schema_ask(["output.number_of_website_visitors"])) is None
 
 
 def test_present_completion_contract_ask_admits_after_scout_only_marker() -> None:
     ctx = _present_contract_ctx(test_after_update_done=True)
 
     assert ctx.has_genuine_workflow_attempt() is False
-    assert _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK).rule == "present_completion_contract_ask_retry"
+    assert _response_output_nudge(ctx, _OUTPUT_CONFIRMATION_ASK).rule == "present_completion_contract_ask_retry"
 
 
 _PARITY_MARKER_STATES = [
@@ -530,7 +531,7 @@ _PARITY_MARKER_STATES = [
 def test_recycle_admission_is_superset_of_backstop_block(marker: dict[str, object]) -> None:
     ctx = _present_contract_ctx(**marker)
     workflow_attempted = ctx.has_genuine_workflow_attempt()
-    recycle_decision = _response_coverage_nudge(ctx, _OUTPUT_CONFIRMATION_ASK)
+    recycle_decision = _response_output_nudge(ctx, _OUTPUT_CONFIRMATION_ASK)
     recycle_admits = recycle_decision is not None and recycle_decision.rule == "present_completion_contract_ask_retry"
 
     backstop_would_fire = not workflow_attempted
@@ -573,7 +574,7 @@ def _mid_build_ctx(policy: RequestPolicy) -> _Ctx:
 def test_output_schema_ask_auto_answers_after_genuine_attempt() -> None:
     ctx = _mid_build_ctx(_output_path_contract_policy())
 
-    nudge = _response_coverage_nudge(ctx, _output_schema_ask(list(_REQUESTED_OUTPUT_PATHS)))
+    nudge = _response_output_nudge(ctx, _output_schema_ask(list(_REQUESTED_OUTPUT_PATHS)))
 
     assert nudge is not None
     assert nudge != PRESENT_COMPLETION_CONTRACT_ASK_RETRY
@@ -585,7 +586,7 @@ def test_floor_rekeyed_contract_covers_output_schema_ask() -> None:
     ctx = _mid_build_ctx(_rekeyed_contract_policy())
 
     with capture_logs() as logs:
-        nudge = _response_coverage_nudge(ctx, _output_schema_ask(list(_REQUESTED_OUTPUT_PATHS)))
+        nudge = _response_output_nudge(ctx, _output_schema_ask(list(_REQUESTED_OUTPUT_PATHS)))
 
     assert nudge is not None
     events = [entry for entry in logs if entry["event"] == "copilot_ask_subject_auto_answered"]
@@ -609,14 +610,14 @@ def test_credentials_ask_after_genuine_attempt_passes_through() -> None:
         "ask_subject": "credentials",
     }
 
-    assert _response_coverage_nudge(ctx, ask) is None
+    assert _response_output_nudge(ctx, ask) is None
 
 
 def test_uncovered_output_schema_ask_after_genuine_attempt_passes_through() -> None:
     ctx = _mid_build_ctx(_rekeyed_contract_policy())
 
     with capture_logs() as logs:
-        nudge = _response_coverage_nudge(ctx, _output_schema_ask(["output.unknown_field"]))
+        nudge = _response_output_nudge(ctx, _output_schema_ask(["output.unknown_field"]))
 
     assert nudge is None
     assert not [entry for entry in logs if entry["event"] == "copilot_ask_subject_auto_answered"]
@@ -635,13 +636,13 @@ def test_definition_level_rekeyed_path_does_not_count_as_coverage() -> None:
     )
     ctx = _mid_build_ctx(policy)
 
-    assert _response_coverage_nudge(ctx, _output_schema_ask([_REQUESTED_OUTPUT_PATHS[1]])) is None
+    assert _response_output_nudge(ctx, _output_schema_ask([_REQUESTED_OUTPUT_PATHS[1]])) is None
 
 
 def test_clarification_reason_keeps_output_schema_ask_with_the_user() -> None:
     ctx = _mid_build_ctx(_rekeyed_contract_policy(clarification_reason="credentials"))
 
-    assert _response_coverage_nudge(ctx, _output_schema_ask(list(_REQUESTED_OUTPUT_PATHS))) is None
+    assert _response_output_nudge(ctx, _output_schema_ask(list(_REQUESTED_OUTPUT_PATHS))) is None
 
 
 def _enforcement_ctx(policy: RequestPolicy) -> CopilotContext:
@@ -686,3 +687,69 @@ def test_definition_level_rekeyed_path_stays_out_of_the_prompt_summary() -> None
     )
 
     assert "requested_output_paths:" not in policy.prompt_summary()
+
+
+def _deliverable_contract_policy() -> RequestPolicy:
+    return _output_path_contract_policy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="dl",
+                outcome="the invoice for July is downloaded",
+                deliverable_kind="registered_download",
+                output_path="output.downloaded_files",
+            ),
+        ],
+    )
+
+
+def _deliverable_ask(subject: str, refs: list[str] | None = None) -> dict[str, object]:
+    return {
+        "type": "ASK_QUESTION",
+        "user_response": "Should I download that July 2025 invoice?",
+        "ask_subject": subject,
+        "refs": refs if refs is not None else ["output.downloaded_files"],
+    }
+
+
+def test_deliverable_permission_ask_bounces_after_genuine_attempt() -> None:
+    # The contract already orders the download, so permission to produce it is not a
+    # question the user owes an answer to — even after a genuine build attempt.
+    ctx = _mid_build_ctx(_deliverable_contract_policy())
+    assert ctx.has_genuine_workflow_attempt()
+
+    nudge = _response_output_nudge(ctx, _deliverable_ask("deliverable_permission"))
+
+    assert nudge is not None
+    assert nudge.rule == "deliverable_permission_ask_retry"
+    assert "the invoice for July is downloaded" in nudge.message
+    # Bouncing a permission question must not silence what it would have told the user: the
+    # reply owes the pick and any fact the user could not have known.
+    assert "produce it and verify it" in nudge.message
+    assert "which you took and anything about it the user could not have known" in nudge.message
+
+
+def test_disambiguation_ask_still_reaches_user_after_genuine_attempt() -> None:
+    ctx = _mid_build_ctx(_deliverable_contract_policy())
+
+    assert _response_output_nudge(ctx, _deliverable_ask("disambiguation")) is None
+
+
+def test_deliverable_permission_ask_reaches_user_once_criterion_satisfied() -> None:
+    ctx = _mid_build_ctx(_deliverable_contract_policy())
+    ctx.completion_verification_result = SimpleNamespace(verdicts=[SimpleNamespace(criterion_id="dl", satisfied=True)])
+
+    assert _response_output_nudge(ctx, _deliverable_ask("deliverable_permission")) is None
+
+
+def test_deliverable_permission_ask_for_an_unrelated_side_effect_reaches_user() -> None:
+    # The subject label is model-chosen. A payment confirmation on a request that also downloads
+    # a receipt must never be answered by the download's authority, however it is labeled.
+    ctx = _mid_build_ctx(_deliverable_contract_policy())
+    payment_ask = {
+        "type": "ASK_QUESTION",
+        "user_response": "Should I submit this $4,812 payment?",
+        "ask_subject": "deliverable_permission",
+        "refs": ["output.payment_confirmation"],
+    }
+
+    assert _response_output_nudge(ctx, payment_ask) is None

@@ -99,7 +99,10 @@ from skyvern.forge.sdk.routes.code_samples import (
     UPDATE_WORKFLOW_CODE_SAMPLE_TS,
 )
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
-from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
+from skyvern.forge.sdk.routes.trigger_type import (
+    caps_run_response_values,
+    workflow_run_trigger_type_from_user_agent,
+)
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
 from skyvern.forge.sdk.schemas.organizations import (
     GetOrganizationAPIKeysResponse,
@@ -141,6 +144,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowRunWithWorkflowResponse,
 )
+from skyvern.forge.sdk.workflow.service import capped_task_v1_response, capped_task_v2
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
 from skyvern.schemas.runs import (
@@ -665,8 +669,13 @@ async def get_run(
         ..., description="The id of the task run or the workflow run.", examples=["tsk_123", "tsk_v2_123", "wr_123"]
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> RunResponse:
-    run_response = await run_service.get_run_response(run_id, organization_id=current_org.organization_id)
+    run_response = await run_service.get_run_response(
+        run_id,
+        organization_id=current_org.organization_id,
+        cap_output_values=caps_run_response_values(x_user_agent),
+    )
     if not run_response:
         raise HTTPException(
             status_code=http_status.HTTP_404_NOT_FOUND,
@@ -3253,11 +3262,16 @@ async def get_run_timeline(
         ..., description="The id of the workflow run or task_v2 run.", examples=["wr_123", "tsk_v2_123"]
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> list[WorkflowRunTimeline]:
     analytics.capture("skyvern-oss-run-timeline-get")
+    cap_output_values = caps_run_response_values(x_user_agent)
 
-    # Check if the run exists
-    run_response = await run_service.get_run_response(run_id, organization_id=current_org.organization_id)
+    # Check if the run exists. Capped even though the response is discarded: building it
+    # uncapped walks and URL-refreshes the full output for nothing.
+    run_response = await run_service.get_run_response(
+        run_id, organization_id=current_org.organization_id, cap_output_values=cap_output_values
+    )
     if not run_response:
         raise HTTPException(
             status_code=http_status.HTTP_404_NOT_FOUND,
@@ -3266,7 +3280,9 @@ async def get_run_timeline(
 
     # Handle workflow runs directly
     if run_response.run_type == RunType.workflow_run:
-        return await _flatten_workflow_run_timeline(current_org.organization_id, run_id)
+        return await _flatten_workflow_run_timeline(
+            current_org.organization_id, run_id, cap_output_values=cap_output_values
+        )
 
     # Handle task_v2 runs by getting their associated workflow_run_id
     if run_response.run_type == RunType.task_v2:
@@ -3285,7 +3301,9 @@ async def get_run_timeline(
                 detail=f"Task v2 {run_id} has no associated workflow run",
             )
 
-        return await _flatten_workflow_run_timeline(current_org.organization_id, task_v2.workflow_run_id)
+        return await _flatten_workflow_run_timeline(
+            current_org.organization_id, task_v2.workflow_run_id, cap_output_values=cap_output_values
+        )
 
     # Timeline not available for other run types
     raise HTTPException(
@@ -3536,9 +3554,15 @@ async def run_task_v1(
 async def get_task_v1(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> TaskResponse:
     analytics.capture("skyvern-oss-agent-task-get")
-    return await task_v1_service.get_task_v1_response(task_id=task_id, organization_id=current_org.organization_id)
+    task_response = await task_v1_service.get_task_v1_response(
+        task_id=task_id, organization_id=current_org.organization_id
+    )
+    if caps_run_response_values(x_user_agent):
+        return capped_task_v1_response(task_response)
+    return task_response
 
 
 @legacy_base_router.post(
@@ -4692,6 +4716,7 @@ async def get_workflow_run_with_workflow_id(
     workflow_id: str,
     workflow_run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> dict[str, Any]:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
     workflow_run_status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
@@ -4699,6 +4724,7 @@ async def get_workflow_run_with_workflow_id(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
         include_cost=True,
+        cap_output_values=caps_run_response_values(x_user_agent),
     )
     return_dict = workflow_run_status_response.model_dump(by_alias=True)
 
@@ -4725,6 +4751,7 @@ async def get_workflow_run_with_workflow_id(
 async def get_workflow_and_run_from_workflow_run_id(
     workflow_run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> WorkflowRunWithWorkflowResponse:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
     workflow = await app.WORKFLOW_SERVICE.get_workflow_by_workflow_run_id(
@@ -4739,6 +4766,7 @@ async def get_workflow_and_run_from_workflow_run_id(
         organization_id=current_org.organization_id,
         include_cost=True,
         allow_deleted=True,
+        cap_output_values=caps_run_response_values(x_user_agent),
     )
     workflow_run_status_api_response = workflow_run_status_response.model_dump(by_alias=True)
 
@@ -4774,8 +4802,11 @@ async def get_workflow_run_timeline(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> list[WorkflowRunTimeline]:
-    return await _flatten_workflow_run_timeline(current_org.organization_id, workflow_run_id)
+    return await _flatten_workflow_run_timeline(
+        current_org.organization_id, workflow_run_id, cap_output_values=caps_run_response_values(x_user_agent)
+    )
 
 
 @legacy_base_router.get(
@@ -4794,11 +4825,13 @@ async def get_workflow_run_timeline(
 async def get_workflow_run(
     workflow_run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> WorkflowRunResponseBase:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
     return await app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
+        cap_output_values=caps_run_response_values(x_user_agent),
     )
 
 
@@ -5515,16 +5548,22 @@ async def run_task_v2(
 async def get_task_v2(
     task_id: str,
     organization: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> dict[str, Any]:
     task_v2 = await task_v2_service.get_task_v2(task_id, organization.organization_id)
     if not task_v2:
         raise HTTPException(status_code=404, detail=f"Task v2 {task_id} not found")
+    # RunRouter resolves a tsk_v2_* URL through this endpoint before redirecting, so an
+    # uncapped output freezes the tab on exactly the payloads the run-detail reads bound.
+    if caps_run_response_values(x_user_agent):
+        task_v2 = capped_task_v2(task_v2)
     return task_v2.model_dump(by_alias=True)
 
 
 async def _flatten_workflow_run_timeline_recursive(
     timeline: WorkflowRunTimeline,
     organization_id: str,
+    cap_output_values: bool = False,
 ) -> list[WorkflowRunTimeline]:
     """
     Recursively flatten a timeline item and its children, handling TaskV2 blocks.
@@ -5541,6 +5580,7 @@ async def _flatten_workflow_run_timeline_recursive(
             nested_timeline = await _flatten_workflow_run_timeline(
                 organization_id=organization_id,
                 workflow_run_id=timeline.block.block_workflow_run_id,
+                cap_output_values=cap_output_values,
             )
             result.extend(nested_timeline)
         else:
@@ -5558,6 +5598,7 @@ async def _flatten_workflow_run_timeline_recursive(
                 child_results = await _flatten_workflow_run_timeline_recursive(
                     timeline=child,
                     organization_id=organization_id,
+                    cap_output_values=cap_output_values,
                 )
                 new_children.extend(child_results)
 
@@ -5575,7 +5616,9 @@ async def _flatten_workflow_run_timeline_recursive(
     return result
 
 
-async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: str) -> list[WorkflowRunTimeline]:
+async def _flatten_workflow_run_timeline(
+    organization_id: str, workflow_run_id: str, cap_output_values: bool = False
+) -> list[WorkflowRunTimeline]:
     """
     Get the timeline workflow runs including the nested workflow runs in a flattened list
     """
@@ -5589,6 +5632,7 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
     workflow_run_block_timeline = await app.WORKFLOW_SERVICE.get_workflow_run_timeline(
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
+        cap_output_values=cap_output_values,
     )
 
     # Recursively flatten the timeline, handling TaskV2 blocks at any nesting level
@@ -5600,6 +5644,7 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
         flattened = await _flatten_workflow_run_timeline_recursive(
             timeline=timeline,
             organization_id=organization_id,
+            cap_output_values=cap_output_values,
         )
         final_workflow_run_block_timeline.extend(flattened)
 
@@ -5607,6 +5652,7 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
         thought_timeline = await task_v2_service.get_thought_timelines(
             task_v2_id=task_v2_obj.observer_cruise_id,
             organization_id=organization_id,
+            cap_output_values=cap_output_values,
         )
         final_workflow_run_block_timeline.extend(thought_timeline)
     final_workflow_run_block_timeline.sort(key=lambda x: x.created_at, reverse=True)
