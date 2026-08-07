@@ -21,7 +21,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.routes.streaming import registries
 from skyvern.webeye import real_browser_manager
-from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
+from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding, VideoArtifact
 from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.browser_factory import set_popup_video_listener
 from skyvern.webeye.real_browser_manager import RealBrowserManager, _PersistentSessionLease
@@ -1409,7 +1409,8 @@ async def test_pbs_adoption_rebinds_download_dir_without_an_interceptor() -> Non
     SimpleNamespace, not MagicMock: the latter auto-creates the interceptor attribute."""
     adopted_browser = MagicMock()
     browser_context = SimpleNamespace(browser=adopted_browser)
-    pbs_state = SimpleNamespace(browser_context=browser_context)
+    # A real BrowserState always carries browser_artifacts; default RUN_DIR keeps today's rebind path.
+    pbs_state = SimpleNamespace(browser_context=browser_context, browser_artifacts=BrowserArtifacts())
 
     with patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind:
         await real_browser_manager._rebind_pbs_download_dir(pbs_state, "wfr_own_infra", "bs_own_infra")
@@ -1575,6 +1576,67 @@ async def test_non_pbs_workflow_run_does_not_rebind() -> None:
 
     assert result is parent_state
     mock_rebind.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pbs_adoption_skips_rebind_when_session_dir_binding() -> None:
+    """A provider-owned remote binding must preserve the provider-selected destination: the run-dir
+    rebind must be skipped."""
+    manager = RealBrowserManager()
+    workflow_run = make_workflow_run("wfr_session")
+
+    adopted_browser = MagicMock()
+    pbs_state = MagicMock()
+    pbs_state.browser_context.browser = adopted_browser
+    pbs_state.browser_artifacts.download_binding = DownloadBinding.SESSION_DIR
+    pbs_state.get_working_page = AsyncMock(return_value=None)
+    pbs_state.get_or_create_page = AsyncMock()
+
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind,
+    ):
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url=None,
+            browser_session_id="bs_session",
+        )
+
+    mock_rebind.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pbs_adoption_rebinds_when_run_dir_binding() -> None:
+    """A RUN_DIR (local/OSS) adopted session keeps today's rebind: it is the only delivery path there."""
+    manager = RealBrowserManager()
+    workflow_run = make_workflow_run("wfr_run_dir")
+
+    adopted_browser = MagicMock()
+    pbs_state = MagicMock()
+    pbs_state.browser_context.browser = adopted_browser
+    pbs_state.browser_artifacts.download_binding = DownloadBinding.RUN_DIR
+    pbs_state.get_working_page = AsyncMock(return_value=None)
+    pbs_state.get_or_create_page = AsyncMock()
+
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind,
+    ):
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url=None,
+            browser_session_id="bs_run_dir",
+        )
+
+    mock_rebind.assert_awaited_once_with(adopted_browser, run_id="wfr_run_dir")
 
 
 def _stale_pbs_browser_state(*, navigate_exc: Exception) -> MagicMock:
