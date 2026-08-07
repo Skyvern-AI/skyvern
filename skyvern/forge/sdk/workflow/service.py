@@ -86,7 +86,7 @@ from skyvern.forge.sdk.experimentation.transient_ui_capture import resolve_trans
 from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
-from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.schemas.credentials import Credential, credential_auto_profile_disabled
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
@@ -3100,6 +3100,10 @@ class WorkflowService:
                 )
                 if not (db_cred and db_cred.browser_profile_id):
                     continue
+                # An opt-out makes this credential seed like one with no linked profile, so a sibling
+                # credential in the same pool still resolves normally.
+                if credential_auto_profile_disabled(db_cred):
+                    continue
                 # Verify the profile still exists (mirrors the mid-run resolver). Best-effort: a
                 # transient repository failure degrades to a fresh seed rather than failing setup.
                 profile = await app.DATABASE.browser_sessions.get_browser_profile(
@@ -6058,6 +6062,7 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             workflow_permanent_id=workflow_run.workflow_permanent_id,
+            workflow_run=workflow_run,
         )
         # Save the original navigation goal before any mutation so
         # retries don't stack the browser-session prefix repeatedly.
@@ -6271,6 +6276,7 @@ class WorkflowService:
         workflow_run_id: str | None,
         organization_id: str | None,
         workflow_permanent_id: str | None,
+        workflow_run: WorkflowRun | None = None,
     ) -> str | None:
         """Inspect the block-level parameters and return the browser_profile_id
         from the credential parameter bound to this specific block."""
@@ -6294,6 +6300,14 @@ class WorkflowService:
                     organization_id=organization_id,
                 )
                 if db_cred and db_cred.browser_profile_id:
+                    if workflow_run is not None:
+                        engine_enabled = await app.AGENT_FUNCTION.is_browser_memory_engine_enabled(workflow_run)
+                    else:
+                        engine_enabled = await app.AGENT_FUNCTION.is_browser_memory_engine_enabled_for_org(
+                            organization_id
+                        )
+                    if engine_enabled and credential_auto_profile_disabled(db_cred):
+                        continue
                     # Verify the browser profile still exists before using it
                     profile = await app.DATABASE.browser_sessions.get_browser_profile(
                         profile_id=db_cred.browser_profile_id,
