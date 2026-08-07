@@ -1557,6 +1557,7 @@ class CredentialModel(Base):
     card_brand = Column(String, nullable=True)
     secret_label = Column(String, nullable=True)
     browser_profile_id = Column(String, nullable=True)
+    auto_profile_disabled = Column(Boolean, nullable=True, default=False)
     tested_url = Column(String, nullable=True)
     user_context = Column(String(1000), nullable=True)
     save_browser_session_intent = Column(Boolean, nullable=True, default=False)
