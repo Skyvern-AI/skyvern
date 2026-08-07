@@ -680,6 +680,17 @@ class BrowserContextFactory:
             if not creator:
                 raise UnknownBrowserType(browser_type)
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **creator_kwargs)
+            requested_profile_id = cast(str | None, kwargs.get("browser_profile_id"))
+            if requested_profile_id and browser_artifacts.applied_browser_profile_id != requested_profile_id:
+                LOG.warning(
+                    "Browser profile was requested but not applied by the chosen browser creator — "
+                    "run continues without the saved profile",
+                    browser_profile_id=requested_profile_id,
+                    browser_type=browser_type,
+                    workflow_run_id=kwargs.get("workflow_run_id"),
+                    task_id=kwargs.get("task_id"),
+                    organization_id=kwargs.get("organization_id"),
+                )
             await restore_session_cookies(browser_context, browser_artifacts.browser_session_dir)
             # After session cookies so a verified-login heal (banked by the credential living-profile
             # engine) wins over the profile's own older session cookies on a key clash. Gated on the
@@ -878,6 +889,8 @@ async def _create_headless_chromium(
         har_path=browser_args["record_har_path"],
         browser_session_dir=user_data_dir,
     )
+    if loaded_from_saved_profile:
+        browser_artifacts.applied_browser_profile_id = browser_profile_id
     try:
         browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
     except Exception as launch_error:
@@ -971,6 +984,8 @@ async def _create_headful_chromium(
         har_path=browser_args["record_har_path"],
         browser_session_dir=user_data_dir,
     )
+    if loaded_from_saved_profile:
+        browser_artifacts.applied_browser_profile_id = browser_profile_id
     try:
         browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
     except Exception as launch_error:

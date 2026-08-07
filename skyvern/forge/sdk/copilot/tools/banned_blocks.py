@@ -280,8 +280,9 @@ Runtime facts:
   with challenge controls directly.
 - After challenge handling, wait for either the observed one-time-code field or
   a real authenticated-page anchor. If an OTP field appears, fill it with
-  `await <credential_key>.otp()`, submit the observed Next/Verify control, and
-  then wait for the authenticated anchor. Do not treat disappearance of the
+  `await <credential_key>.otp()`, submit it with the exact control the scout
+  demonstrated (its recorded selector and label, never a guessed one), and then
+  wait for the authenticated anchor. Do not treat disappearance of the
   login fields as proof of authentication.
 - Return JSON-safe structured data plus visible evidence text for records, totals,
   confirmations, and identifiers.
