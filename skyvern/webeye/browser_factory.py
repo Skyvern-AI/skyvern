@@ -8,7 +8,6 @@ import re
 import shutil
 import socket
 import subprocess
-import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
@@ -1084,7 +1083,7 @@ async def _create_cdp_connection_browser(
                 stderr=subprocess.PIPE,
             )
             # Add small delay to allow browser to start
-            time.sleep(1)
+            await asyncio.sleep(1)
             if browser_process.poll() is not None:
                 raise Exception(f"Failed to open browser. browser_path: {browser_path}")
         else:
