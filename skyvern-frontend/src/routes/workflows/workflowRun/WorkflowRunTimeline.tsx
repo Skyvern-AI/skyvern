@@ -422,10 +422,14 @@ function WorkflowRunTimeline({
             · {numberOfActions} {numberOfActions === 1 ? "action" : "actions"}
           </span>
         )}
-        <span className="text-muted-foreground dark:text-slate-500">
-          · {workflowRun.total_steps ?? 0}{" "}
-          {(workflowRun.total_steps ?? 0) === 1 ? "step" : "steps"}
-        </span>
+        {/* total_steps counts task steps only, so a code-first run has none however many
+            actions it fires; a literal "0 steps" beside live rows reads as "nothing ran". */}
+        {(workflowRun.total_steps ?? 0) > 0 && (
+          <span className="text-muted-foreground dark:text-slate-500">
+            · {workflowRun.total_steps}{" "}
+            {workflowRun.total_steps === 1 ? "step" : "steps"}
+          </span>
+        )}
         <span
           className="text-muted-foreground dark:text-slate-500"
           title="Credits consumed by this run (live + cached)"
