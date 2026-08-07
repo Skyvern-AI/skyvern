@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import signal
@@ -368,7 +369,7 @@ def test_run_mcp_prepares_cloud_env_before_starting_mcp(tmp_path, monkeypatch) -
 
 
 @pytest.mark.parametrize("failure_stage", ["import", "call"])
-def test_run_mcp_logs_sweep_failure_and_continues(monkeypatch, failure_stage: str) -> None:
+def test_run_mcp_logs_sweep_failure_and_continues(monkeypatch, caplog, failure_stage: str) -> None:
     events: list[str] = []
     run_commands = _patch_minimal_run_mcp_dependencies(monkeypatch, events, lambda: events.append("run"))
 
@@ -389,15 +390,20 @@ def test_run_mcp_logs_sweep_failure_and_continues(monkeypatch, failure_stage: st
         fake_local_browser_profile.sweep_local_browser_profiles_with_budget = failing_sweep
     monkeypatch.setitem(sys.modules, "skyvern.library.local_browser_profile", fake_local_browser_profile)
 
-    with capture_logs() as logs:
+    with capture_logs() as logs, caplog.at_level(logging.WARNING, logger="skyvern.cli.run_commands"):
         run_commands.run_mcp()
 
     assert events == ["prepare", "run", "cleanup"]
-    assert any(
+    structlog_warning = any(
         log.get("event") == "local_browser_profile_startup_sweep_failed"
         and (log.get("log_level") or log.get("level")) == "warning"
         for log in logs
     )
+    stdlib_warning = any(
+        record.levelno == logging.WARNING and "local_browser_profile_startup_sweep_failed" in record.getMessage()
+        for record in caplog.records
+    )
+    assert structlog_warning or stdlib_warning
 
 
 def test_run_mcp_starts_within_sweep_budget_and_stops_blocking_child(tmp_path: Path, monkeypatch) -> None:
