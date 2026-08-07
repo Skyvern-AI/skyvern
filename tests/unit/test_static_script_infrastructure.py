@@ -7,6 +7,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from skyvern.core.script_generations.skyvern_page import SkyvernPage, _SkyvernPageBase
+
+
+def _make_skyvern_page(page: MagicMock) -> SkyvernPage:
+    wrapper = SkyvernPage.__new__(SkyvernPage)
+    _SkyvernPageBase.__init__(wrapper, page=page, ai=MagicMock())
+    return wrapper
+
+
 # ---------------------------------------------------------------------------
 # nativeSel (JavaScript helper) — test via a Python reimplementation
 # ---------------------------------------------------------------------------
@@ -168,33 +177,24 @@ class TestModeDirectClick:
 
     @pytest.mark.asyncio
     async def test_direct_click_requires_selector(self) -> None:
-        from skyvern.core.script_generations.skyvern_page import SkyvernPage
-
         page = MagicMock()
-        skyvern_page = SkyvernPage.__new__(SkyvernPage)
-        skyvern_page.page = page
+        skyvern_page = _make_skyvern_page(page)
 
         with pytest.raises(ValueError, match="mode='direct' requires a selector"):
             await skyvern_page.click(mode="direct")
 
     @pytest.mark.asyncio
     async def test_direct_fill_requires_selector(self) -> None:
-        from skyvern.core.script_generations.skyvern_page import SkyvernPage
-
         page = MagicMock()
-        skyvern_page = SkyvernPage.__new__(SkyvernPage)
-        skyvern_page.page = page
+        skyvern_page = _make_skyvern_page(page)
 
         with pytest.raises(ValueError, match="mode='direct' requires a selector"):
             await skyvern_page.fill(value="test", mode="direct")
 
     @pytest.mark.asyncio
     async def test_direct_fill_requires_value(self) -> None:
-        from skyvern.core.script_generations.skyvern_page import SkyvernPage
-
         page = MagicMock()
-        skyvern_page = SkyvernPage.__new__(SkyvernPage)
-        skyvern_page.page = page
+        skyvern_page = _make_skyvern_page(page)
 
         with pytest.raises(ValueError, match="mode='direct' requires a value"):
             await skyvern_page.fill(selector="input", mode="direct")

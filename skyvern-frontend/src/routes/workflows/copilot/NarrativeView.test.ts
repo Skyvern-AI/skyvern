@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 
+import { shouldShowFixCard } from "./cards/FixCard";
+import { derivePhases } from "./copilotPhases";
 import {
   ActivityEntry,
   BlockState,
@@ -11,6 +13,7 @@ import {
   effectiveMode,
   hydrateHistoryNarrative,
   hydrateNarrativeFromPayload,
+  mapBlockStatus,
 } from "./narrativeState";
 import {
   WorkflowCopilotBlockProgressUpdate,
@@ -291,7 +294,7 @@ describe("applyNarrativeEvent — block_progress", () => {
     ["failed", "failed"],
     ["terminated", "failed"],
     ["timed_out", "failed"],
-    ["canceled", "failed"],
+    ["canceled", "stopped"],
     ["skipped", "skipped"],
     ["queued", "queued"],
     ["something_new", "queued"],
@@ -1646,5 +1649,169 @@ describe("applyNarrativeEvent — terminal adjudication on live frames", () => {
     const s = applyNarrativeEvent(EMPTY_NARRATIVE, response());
     expect(s.responseKind).toBeNull();
     expect(s.verifiedSuccess).toBeNull();
+  });
+});
+
+describe("a user stop renders as stopped, never as a failure", () => {
+  it("maps a canceled block to stopped, keeping the other halt states failed", () => {
+    expect(mapBlockStatus("canceled")).toBe("stopped");
+    expect(mapBlockStatus("failed")).toBe("failed");
+    expect(mapBlockStatus("terminated")).toBe("failed");
+    expect(mapBlockStatus("timed_out")).toBe("failed");
+  });
+
+  it("records a canceled block as a terminal state so its elapsed pill freezes", () => {
+    let s = applyNarrativeEvent(EMPTY_NARRATIVE, turnStart());
+    s = applyNarrativeEvent(
+      s,
+      blockProgress({ block_label: "login", status: "running" }),
+    );
+    s = applyNarrativeEvent(
+      s,
+      blockProgress({ block_label: "login", status: "canceled" }),
+    );
+
+    const block = s.blocks.find((b) => b.label === "login");
+    expect(block?.state).toBe("stopped");
+    expect(block?.endedAt).not.toBeNull();
+  });
+
+  it("does not treat a stopped block as a failure in the turn summary", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        cancelled: true,
+        blocks: [
+          {
+            workflowRunBlockId: "wrb_1",
+            label: "login",
+            blockType: "task",
+            state: "stopped",
+            lastSeenIteration: 0,
+            activity: [],
+            startedAt: "2026-05-25T00:00:01Z",
+            endedAt: "2026-05-25T00:00:04Z",
+          } as BlockState,
+        ],
+      }),
+    );
+
+    expect(summary.isFail).toBe(false);
+    expect(summary.isStopped).toBe(true);
+    expect(summary.headline).toBe("Stopped");
+    expect(summary.accent).not.toBe("fail");
+    expect(summary.stats).toContain("1 stopped");
+  });
+
+  it("keeps a stopped block through hydration so a reload does not downgrade it", () => {
+    const turn = hydrateNarrativeFromPayload({
+      turnId: "turn-1",
+      turnIndex: 0,
+      mode: "build",
+      designStarted: true,
+      designEnded: true,
+      draft: null,
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_1",
+          label: "login",
+          blockType: "task",
+          state: "stopped",
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: "2026-05-25T00:00:01Z",
+          endedAt: "2026-05-25T00:00:04Z",
+        },
+      ],
+      terminal: "response",
+      terminalMessage: "Stopped.",
+      narrativeSummary: null,
+      priorBlockCount: null,
+      designActivity: [],
+      startedAt: "2026-05-25T00:00:00Z",
+      endedAt: "2026-05-25T00:00:05Z",
+    });
+
+    expect(turn?.blocks[0]?.state).toBe("stopped");
+  });
+});
+
+// The backend stamps a canceled block "failed" and a canceled turn's terminal
+// "error" (_BLOCK_STATUS_TO_UI_STATE, agent.py), so these payloads are the
+// shape a real cancel actually delivers — not the "stopped" shape the live
+// block_progress frames produce.
+describe("a real cancel's backend payload still renders neutrally", () => {
+  const cancelledPayload = () => ({
+    turnId: "turn-1",
+    turnIndex: 0,
+    mode: "build",
+    designStarted: true,
+    designEnded: true,
+    draft: null,
+    blocks: [
+      {
+        workflowRunBlockId: "wrb_1",
+        label: "log_in",
+        blockType: "task",
+        state: "failed",
+        lastSeenIteration: 0,
+        activity: [],
+        startedAt: "2026-05-25T00:00:01Z",
+        endedAt: "2026-05-25T00:00:04Z",
+      },
+    ],
+    terminal: "error",
+    terminalMessage: "Cancelled by user.",
+    narrativeSummary: null,
+    cancelled: true,
+    priorBlockCount: null,
+    designActivity: [],
+    startedAt: "2026-05-25T00:00:00Z",
+    endedAt: "2026-05-25T00:00:05Z",
+  });
+
+  it("re-reads a backend-failed block on a cancelled turn as stopped", () => {
+    const turn = hydrateNarrativeFromPayload(cancelledPayload());
+    expect(turn?.blocks[0]?.state).toBe("stopped");
+  });
+
+  it("does not brand the settled cancel a failure", () => {
+    const turn = hydrateNarrativeFromPayload(cancelledPayload())!;
+    const summary = computeTurnSummary(turn);
+
+    expect(summary.isFail).toBe(false);
+    expect(summary.headline).not.toBe("Run halted");
+    expect(summary.accent).not.toBe("fail");
+  });
+
+  it("does not offer to fix a run the user stopped, or redden the rail", () => {
+    const turn = hydrateNarrativeFromPayload(cancelledPayload())!;
+    expect(shouldShowFixCard(turn)).toBe(false);
+    const phases = derivePhases(turn);
+    const byId = Object.fromEntries(phases.map((p) => [p.id, p.status]));
+    expect(byId.done).toBe("stopped");
+    expect(byId.test).toBe("stopped");
+  });
+
+  // Stop pressed during the thinking phase, or on a QA turn: nothing to key a
+  // block state off, so only the turn's own cancelled flag can tell the truth.
+  it("does not read a blockless cancel as a clean success", () => {
+    const summary = computeTurnSummary(
+      buildTurn({ cancelled: true, blocks: [], draft: null }),
+    );
+
+    expect(summary.headline).toBe("Stopped");
+    expect(summary.headline).not.toBe("Completed the run");
+    expect(summary.glyph).not.toBe("✓");
+    expect(summary.accent).not.toBe("ok");
+  });
+
+  it("still renders a genuine error turn as a failure", () => {
+    const turn = hydrateNarrativeFromPayload({
+      ...cancelledPayload(),
+      cancelled: false,
+    })!;
+    expect(turn.blocks[0]?.state).toBe("failed");
+    expect(computeTurnSummary(turn).isFail).toBe(true);
+    expect(shouldShowFixCard(turn)).toBe(true);
   });
 });
