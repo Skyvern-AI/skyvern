@@ -6,10 +6,11 @@ import importlib.util
 import json
 import os
 import uuid
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Sequence, cast
+from typing import Any, AsyncGenerator, Callable, Protocol, Sequence, cast
 
 import libcst as cst
 import structlog
@@ -24,9 +25,15 @@ from skyvern.constants import (
 )
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.core.script_generations.generate_script import _build_block_fn, create_or_update_script_block
-from skyvern.core.script_generations.script_skyvern_page import script_run_context_manager
+from skyvern.core.script_generations.script_skyvern_page import (
+    _get_scraped_page,
+    _set_scraped_page,
+    script_run_context_manager,
+)
+from skyvern.core.script_generations.skyvern_page import CACHED_SCRIPT_PAGE_API
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
+    ActionPolicyBlocked,
     CachedDownloadError,
     CodeBlockRunnerSelectionError,
     IllegitCompleteScriptTermination,
@@ -90,6 +97,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ValidationBlock,
     WhileLoopBlock,
     WorkflowTriggerBlock,
+    get_all_blocks,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, is_adaptive_caching
@@ -115,6 +123,79 @@ from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
 
 LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
+
+_CACHED_SCRIPT_PAGE_METHODS = CACHED_SCRIPT_PAGE_API - {"url"}
+_CACHED_SCRIPT_CONTEXT_VALUES = frozenset({"extracted_params", "loop_value", "parameters", "prompt"})
+_CACHED_SCRIPT_CONTEXT_METHODS = frozenset({"credential_totp_identifier", "loop_item_selector"})
+
+
+class _CachedPageTarget(Protocol):
+    @property
+    def url(self) -> str: ...
+
+
+_CACHED_PAGE_TARGETS: weakref.WeakKeyDictionary[object, tuple[_CachedPageTarget, list[bool]]] = (
+    weakref.WeakKeyDictionary()
+)
+_CACHED_CONTEXT_TARGETS: weakref.WeakKeyDictionary[object, tuple[object, list[bool]]] = weakref.WeakKeyDictionary()
+
+
+def _ensure_cached_view_active(denied: list[bool]) -> None:
+    if denied[0]:
+        raise AttributeError("Cached page unavailable after denied capability access")
+
+
+class _CachedScriptPageView:
+    __slots__ = ("__weakref__",)
+
+    def __init__(self, target: _CachedPageTarget, denied: list[bool] | None = None) -> None:
+        _CACHED_PAGE_TARGETS[self] = (target, denied if denied is not None else [False])
+
+    @property
+    def url(self) -> str:
+        value = _CACHED_PAGE_TARGETS[self][0].url
+        return value if isinstance(value, str) else ""
+
+    def __getattr__(self, name: str) -> Callable:
+        target, denied = _CACHED_PAGE_TARGETS[self]
+        _ensure_cached_view_active(denied)
+        if name not in _CACHED_SCRIPT_PAGE_METHODS:
+            denied[0] = True
+            raise AttributeError(f"Cached page capability {name!r} is unavailable")
+
+        # Close over the view and the name only, never `target`/`denied`: script code can read
+        # `page.click.__closure__` and would otherwise lift the privileged page past this allowlist.
+        async def invoke(*args: Any, **kwargs: Any) -> Any:
+            bound_target, bound_denied = _CACHED_PAGE_TARGETS[self]
+            _ensure_cached_view_active(bound_denied)
+            result = await getattr(bound_target, name)(*args, **kwargs)
+            return (args[1] if len(args) > 1 else kwargs.get("value")) if name.startswith(("fill", "type")) else result
+
+        return invoke
+
+
+class _CachedScriptContextView:
+    __slots__ = ("__weakref__",)
+
+    def __init__(self, target: object, denied: list[bool] | None = None) -> None:
+        _CACHED_CONTEXT_TARGETS[self] = (target, denied if denied is not None else [False])
+
+    def __getattr__(self, name: str) -> Any:
+        target, denied = _CACHED_CONTEXT_TARGETS[self]
+        _ensure_cached_view_active(denied)
+        if name in _CACHED_SCRIPT_CONTEXT_VALUES:
+            return getattr(target, name)
+        if name not in _CACHED_SCRIPT_CONTEXT_METHODS:
+            denied[0] = True
+            raise AttributeError(f"Cached context capability {name!r} is unavailable")
+
+        def invoke(*args: Any, **kwargs: Any) -> Any:
+            bound_target, bound_denied = _CACHED_CONTEXT_TARGETS[self]
+            _ensure_cached_view_active(bound_denied)
+            return getattr(bound_target, name)(*args, **kwargs)
+
+        return invoke
+
 
 # Synthetic failure_reason recorded on a fallback episode when the AI fallback
 # ended `completed` with zero actions taken — i.e. the AI's complete-verify
@@ -969,7 +1050,18 @@ async def _update_workflow_block(
 
 async def _run_cached_function(cached_fn: Callable) -> Any:
     run_context = script_run_context_manager.ensure_run_context()
-    return await cached_fn(page=run_context.page, context=run_context)
+    try:
+        app.AGENT_FUNCTION.enforce_cached_browser_script_policy()
+        denied = [False]
+        page = _CachedScriptPageView(run_context.page, denied)
+        result = await cached_fn(page=page, context=_CachedScriptContextView(run_context, denied))
+        _ensure_cached_view_active(denied)
+        return result
+    except ActionPolicyBlocked as e:
+        # Backstop only: callers already drop `cached_fn` when cached browser scripts are disabled,
+        # so this normally cannot fire. It keeps a future call site that forgets that from raising a
+        # BaseException past the ScriptTerminationException termination path.
+        raise ScriptTerminationException(e.message) from e
 
 
 def _append_to_loop_output(
@@ -1195,8 +1287,8 @@ async def _detect_user_defined_errors(
     try:
         run_context = script_run_context_manager.ensure_run_context()
         skyvern_page = run_context.page
-        scraped_page = await skyvern_page.scraped_page.refresh()
-        skyvern_page.scraped_page = scraped_page
+        scraped_page = await _get_scraped_page(skyvern_page).refresh()
+        _set_scraped_page(skyvern_page, scraped_page)
         current_url = scraped_page.url
 
         # Build element tree
@@ -1984,7 +2076,11 @@ async def run_task(
     error_code_mapping: dict[str, str] | None = None,
 ) -> dict[str, Any] | list | str | None:
     cache_key = cache_key or label
-    cached_fn = script_run_context_manager.get_cached_fn(cache_key)
+    cached_fn = (
+        script_run_context_manager.get_cached_fn(cache_key)
+        if app.AGENT_FUNCTION.should_use_cached_browser_scripts()
+        else None
+    )
 
     context: skyvern_context.SkyvernContext | None = None
     if cache_key and cached_fn:
@@ -2176,7 +2272,11 @@ async def download(
         "path": path,
         "continue_on_empty": continue_on_empty if continue_on_empty is not None else False,
     }
-    cached_fn = script_run_context_manager.get_cached_fn(cache_key)
+    cached_fn = (
+        script_run_context_manager.get_cached_fn(cache_key)
+        if app.AGENT_FUNCTION.should_use_cached_browser_scripts()
+        else None
+    )
     context: skyvern_context.SkyvernContext | None
     if cache_key and cached_fn:
         # Auto-create workflow block run and task if workflow_run_id is available
@@ -2671,7 +2771,11 @@ async def action(
 ) -> None:
     context: skyvern_context.SkyvernContext | None
     cache_key = cache_key or label
-    cached_fn = script_run_context_manager.get_cached_fn(cache_key)
+    cached_fn = (
+        script_run_context_manager.get_cached_fn(cache_key)
+        if app.AGENT_FUNCTION.should_use_cached_browser_scripts()
+        else None
+    )
     if cache_key and cached_fn:
         # Auto-create workflow block run and task if workflow_run_id is available
         workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
@@ -2759,7 +2863,11 @@ async def login(
 ) -> None:
     context: skyvern_context.SkyvernContext | None
     cache_key = cache_key or label
-    cached_fn = script_run_context_manager.get_cached_fn(cache_key)
+    cached_fn = (
+        script_run_context_manager.get_cached_fn(cache_key)
+        if app.AGENT_FUNCTION.should_use_cached_browser_scripts()
+        else None
+    )
     if cache_key and cached_fn:
         # Auto-create workflow block run and task if workflow_run_id is available
         # render template with label
@@ -2849,7 +2957,11 @@ async def extract(
 
     context: skyvern_context.SkyvernContext | None
     cache_key = cache_key or label
-    cached_fn = script_run_context_manager.get_cached_fn(cache_key)
+    cached_fn = (
+        script_run_context_manager.get_cached_fn(cache_key)
+        if app.AGENT_FUNCTION.should_use_cached_browser_scripts()
+        else None
+    )
     if cache_key and cached_fn:
         # Auto-create workflow block run and task if workflow_run_id is available
         workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
@@ -2930,6 +3042,31 @@ async def conditional(
     in pure Python and returns {"next_block_label": "...", "branch_index": N}.
     """
     cached_fn = script_run_context_manager.get_cached_fn(label)
+    if not app.AGENT_FUNCTION.should_use_cached_browser_scripts():
+        block_validation_output = await _validate_and_get_output_parameter(label)
+        matching_block = next(
+            (
+                block
+                for block in get_all_blocks(block_validation_output.workflow.workflow_definition.blocks)
+                if block.label == label
+            ),
+            None,
+        )
+        if matching_block is None or matching_block.block_type != BlockType.CONDITIONAL:
+            raise Exception(f"Conditional block '{label}' could not be found in workflow definition.")
+
+        block_result = await matching_block.execute_safe(
+            workflow_run_id=block_validation_output.workflow_run_id,
+            parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
+            organization_id=block_validation_output.organization_id,
+            browser_session_id=block_validation_output.browser_session_id,
+        )
+
+        if not isinstance(block_result.output_parameter_value, dict):
+            raise Exception(f"Conditional block '{label}' did not produce a branch decision payload.")
+
+        return block_result.output_parameter_value
+
     if not cached_fn:
         raise Exception(f"No cached function for conditional block '{label}'")
 
@@ -2950,7 +3087,7 @@ async def conditional(
                 run_context.parameters[key] = value
 
     try:
-        result = await cached_fn(page=run_context.page, context=run_context)
+        result = await _run_cached_function(cached_fn)
         if not isinstance(result, dict) or "next_block_label" not in result:
             raise Exception(f"Conditional function '{label}' must return dict with 'next_block_label', got: {result}")
 
@@ -2970,6 +3107,8 @@ async def conditional(
             )
         return branch_metadata
 
+    except ScriptTerminationException:
+        raise
     except Exception:
         if workflow_run_block_id:
             await _update_workflow_block(

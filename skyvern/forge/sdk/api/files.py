@@ -6,9 +6,10 @@ import re
 import shutil
 import tempfile
 import zipfile
+from dataclasses import dataclass
 from http import HTTPStatus
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 from urllib.parse import parse_qsl, unquote, urlparse
 
 import aiohttp
@@ -23,16 +24,24 @@ from skyvern.exceptions import (
     BlockedHost,
     DownloadFileMaxSizeExceeded,
     DownloadFileMaxWaitingTime,
+    HttpException,
     SkyvernHTTPException,
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.signing import parse_artifact_content_url
+from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.core.aiohttp_helper import (
     SSRFGuardedResolver,
+    _url_origin,
     ssrf_guarded_tcp_connector,
     strip_cross_origin_redirect_credentials,
     validate_and_pin_fetch_url,
     validate_and_pin_redirect_url,
+)
+from skyvern.forge.sdk.core.http_request_authorization import (
+    RedirectHopAuthorization,
+    RedirectHopAuthorizer,
+    authorize_request_hop_once,
 )
 from skyvern.utils.url_validators import (
     MAX_SAFE_REDIRECTS,
@@ -136,6 +145,108 @@ def _raise_download_response_for_status(response: aiohttp.ClientResponse) -> Non
     )
 
 
+@dataclass(frozen=True, slots=True)
+class GuardedFileRedirect:
+    """Internal hop result surfaced only through the authorization dispatcher."""
+
+    location: str
+
+
+@dataclass(frozen=True, slots=True)
+class GuardedFileResponse:
+    """Bounded response returned by :func:`fetch_file_bytes` to a trusted adapter."""
+
+    body: bytes
+    content_type: str
+    filename: str
+
+
+GuardedFileFetchHopResult: TypeAlias = GuardedFileRedirect | GuardedFileResponse
+
+
+async def fetch_file_bytes(
+    url: str,
+    *,
+    max_size_mb: int = 100,
+    headers: dict[str, str] | None = None,
+    filename: str | None = None,
+    allowed_redirect_origin: str | None = None,
+    authorize_request_hop: RedirectHopAuthorizer[GuardedFileFetchHopResult],
+) -> GuardedFileResponse:
+    """Fetch a bounded HTTP file through the validated, pinned, per-hop authorization seam.
+
+    This helper accepts HTTP(S) only. It validates and pins each target before invoking
+    ``authorize_request_hop``; validation failures therefore consume no approval and perform no
+    network request. The body is intentionally bounded because it is returned in memory.
+    """
+    if not url or not url.strip():
+        raise ValueError("Download URL is empty — no file download was triggered by the browser")
+    if max_size_mb <= 0:
+        raise ValueError("max_size_mb must be greater than zero")
+
+    resolver = SSRFGuardedResolver()
+    current_url = await validate_and_pin_fetch_url(url, resolver)
+    if canonicalize_origin(current_url) is None:
+        raise HttpException(400, "[redacted]", "URL has no browser-canonicalizable HTTP origin")
+    if allowed_redirect_origin is not None and _url_origin(current_url) != _url_origin(allowed_redirect_origin):
+        raise HttpException(400, "[redacted]", "Cross-origin redirect blocked by policy")
+
+    request_headers = dict(headers or {})
+    source_url: str | None = None
+    max_size_bytes = max_size_mb * 1024 * 1024
+    async with aiohttp.ClientSession(connector=ssrf_guarded_tcp_connector(resolver)) as session:
+        for _ in range(MAX_SAFE_REDIRECTS + 1):
+            encoded_url = encode_url(current_url)
+
+            async def dispatch(_resolved_values: tuple[str, ...]) -> GuardedFileFetchHopResult:
+                async with session.get(
+                    URL(encoded_url, encoded=True), headers=request_headers, allow_redirects=False
+                ) as response:
+                    location = response.headers.get("Location")
+                    if response.status in SAFE_REDIRECT_STATUS_CODES and location:
+                        return GuardedFileRedirect(location=location)
+
+                    _raise_download_response_for_status(response)
+                    if response.content_length and response.content_length > max_size_bytes:
+                        raise DownloadFileMaxSizeExceeded(max_size_mb)
+
+                    body = bytearray()
+                    async for chunk in response.content.iter_chunked(1024):
+                        body.extend(chunk)
+                        if len(body) > max_size_bytes:
+                            raise DownloadFileMaxSizeExceeded(max_size_mb)
+
+                    return GuardedFileResponse(
+                        body=bytes(body),
+                        content_type=response.headers.get("Content-Type", ""),
+                        filename=_determine_download_filename(filename, response.headers, current_url),
+                    )
+
+            result = await authorize_request_hop_once(
+                authorize_request_hop,
+                RedirectHopAuthorization(source_url=source_url, target_url=current_url, method="GET"),
+                dispatch,
+            )
+            if isinstance(result, GuardedFileResponse):
+                return result
+
+            next_url = await validate_and_pin_redirect_url(current_url, result.location, resolver)
+            if canonicalize_origin(next_url) is None:
+                raise HttpException(400, "[redacted]", "Redirect has no browser-canonicalizable HTTP origin")
+            if allowed_redirect_origin is not None and _url_origin(next_url) != _url_origin(allowed_redirect_origin):
+                raise HttpException(400, "[redacted]", "Cross-origin redirect blocked by policy")
+            request_headers, _ = strip_cross_origin_redirect_credentials(
+                request_headers,
+                None,
+                current_url,
+                next_url,
+                strip_cross_origin_credentials=True,
+            )
+            source_url, current_url = current_url, next_url
+
+    raise HttpException(400, "[redacted]", "Too many redirects while downloading file")
+
+
 def validate_download_url(url: str, organization_id: str | None = None) -> bool:
     """Validate if a URL is supported for downloading.
 
@@ -196,6 +307,8 @@ async def download_file(
     output_dir: str | None = None,
     filename: str | None = None,
     organization_id: str | None = None,
+    allowed_redirect_origin: str | None = None,
+    authorize_request_hop: RedirectHopAuthorizer[str | GuardedFileRedirect] | None = None,
 ) -> str:
     if not url or not url.strip():
         raise ValueError("Download URL is empty — no file download was triggered by the browser")
@@ -243,81 +356,103 @@ async def download_file(
 
         resolver = SSRFGuardedResolver()
         current_url = await validate_and_pin_fetch_url(url, resolver)
+        if canonicalize_origin(current_url) is None:
+            raise HttpException(400, "[redacted]", "URL has no browser-canonicalizable HTTP origin")
+        if allowed_redirect_origin is not None and _url_origin(current_url) != _url_origin(allowed_redirect_origin):
+            raise HttpException(400, "[redacted]", "Cross-origin redirect blocked by policy")
         request_headers = dict(headers or {})
+        source_url: str | None = None
         async with aiohttp.ClientSession(connector=ssrf_guarded_tcp_connector(resolver)) as session:
-            LOG.info("Starting to download file", url=url)
+            LOG.info("Starting guarded file download")
             for _ in range(MAX_SAFE_REDIRECTS + 1):
                 encoded_url = encode_url(current_url)
-                async with session.get(
-                    URL(encoded_url, encoded=True), headers=request_headers, allow_redirects=False
-                ) as response:
-                    if response.status in SAFE_REDIRECT_STATUS_CODES and response.headers.get("Location"):
-                        next_url = await validate_and_pin_redirect_url(
-                            current_url, response.headers["Location"], resolver
-                        )
-                        request_headers, _ = strip_cross_origin_redirect_credentials(
-                            request_headers, None, current_url, next_url
-                        )
-                        current_url = next_url
-                        continue
 
-                    _raise_download_response_for_status(response)
+                async def dispatch(_resolved_values: tuple[str, ...]) -> str | GuardedFileRedirect:
+                    async with session.get(
+                        URL(encoded_url, encoded=True), headers=request_headers, allow_redirects=False
+                    ) as response:
+                        location = response.headers.get("Location")
+                        if response.status in SAFE_REDIRECT_STATUS_CODES and location:
+                            return GuardedFileRedirect(location=location)
 
-                    # Check the content length if available
-                    if max_size_mb and response.content_length and response.content_length > max_size_mb * 1024 * 1024:
-                        # todo: move to root exception.py
-                        raise DownloadFileMaxSizeExceeded(max_size_mb)
+                        _raise_download_response_for_status(response)
+                        if (
+                            max_size_mb
+                            and response.content_length
+                            and response.content_length > max_size_mb * 1024 * 1024
+                        ):
+                            raise DownloadFileMaxSizeExceeded(max_size_mb)
 
-                    # Get the file name
-                    if output_dir:
-                        download_dir_path = Path(output_dir)
-                        download_dir_path.mkdir(parents=True, exist_ok=True)
-                    else:
-                        download_dir_path = Path(make_temp_directory(prefix="skyvern_downloads_"))
+                        if output_dir:
+                            download_dir_path = Path(output_dir)
+                            download_dir_path.mkdir(parents=True, exist_ok=True)
+                        else:
+                            download_dir_path = Path(make_temp_directory(prefix="skyvern_downloads_"))
 
-                    download_dir_resolved = download_dir_path.resolve()
-                    # response.headers stays a CIMultiDictProxy: dict() would make header
-                    # lookups case-sensitive and miss lowercase wire headers.
-                    file_name = _determine_download_filename(filename, response.headers, url)
-                    allowed_dir = os.path.realpath(download_dir_resolved)
-                    resolved_final_path = os.path.realpath(os.path.join(allowed_dir, file_name))
-                    # sanitize_filename strips separators but keeps dots, so a dots-only name can
-                    # still resolve outside the download dir; require a direct child. Checked
-                    # before streaming so a rejected name downloads zero bytes.
-                    if (
-                        resolved_final_path == allowed_dir
-                        or not resolved_final_path.startswith(allowed_dir + os.sep)
-                        or os.path.dirname(resolved_final_path) != allowed_dir
-                    ):
-                        raise ValueError(f"Unsafe filename derived from download: {file_name!r}")
-                    final_path = Path(resolved_final_path)
+                        download_dir_resolved = download_dir_path.resolve()
+                        file_name = _determine_download_filename(filename, response.headers, url)
+                        allowed_dir = os.path.realpath(download_dir_resolved)
+                        resolved_final_path = os.path.realpath(os.path.join(allowed_dir, file_name))
+                        if (
+                            resolved_final_path == allowed_dir
+                            or not resolved_final_path.startswith(allowed_dir + os.sep)
+                            or os.path.dirname(resolved_final_path) != allowed_dir
+                        ):
+                            raise ValueError(f"Unsafe filename derived from download: {file_name!r}")
+                        final_path = Path(resolved_final_path)
 
-                    temp_file = tempfile.NamedTemporaryFile(mode="wb", dir=download_dir_resolved, delete=False)
-                    file_path = Path(temp_file.name).resolve()
-                    if file_path != download_dir_resolved and not file_path.is_relative_to(download_dir_resolved):
-                        temp_file.close()
-                        raise ValueError("Unsafe temporary file path created for download")
+                        temp_file = tempfile.NamedTemporaryFile(mode="wb", dir=download_dir_resolved, delete=False)
+                        file_path = Path(temp_file.name).resolve()
+                        if file_path != download_dir_resolved and not file_path.is_relative_to(download_dir_resolved):
+                            temp_file.close()
+                            raise ValueError("Unsafe temporary file path created for download")
 
-                    LOG.info("Downloading file to temporary path", file_path=str(file_path))
-                    try:
-                        with temp_file as f:
-                            # Write the content of the request into the file
-                            total_bytes_downloaded = 0
-                            async for chunk in response.content.iter_chunked(1024):
-                                f.write(chunk)
-                                total_bytes_downloaded += len(chunk)
-                                if max_size_mb and total_bytes_downloaded > max_size_mb * 1024 * 1024:
-                                    raise DownloadFileMaxSizeExceeded(max_size_mb)
+                        LOG.info("Downloading file to temporary path", file_path=str(file_path))
+                        try:
+                            with temp_file as f:
+                                total_bytes_downloaded = 0
+                                async for chunk in response.content.iter_chunked(1024):
+                                    f.write(chunk)
+                                    total_bytes_downloaded += len(chunk)
+                                    if max_size_mb and total_bytes_downloaded > max_size_mb * 1024 * 1024:
+                                        raise DownloadFileMaxSizeExceeded(max_size_mb)
 
-                        file_path.replace(final_path)
-                    except BaseException:
-                        # An orphaned temp file in a run download dir would get synced to storage
-                        # under the tmpXXXX name; drop it on any failure (incl. cancellation).
-                        file_path.unlink(missing_ok=True)
-                        raise
+                            file_path.replace(final_path)
+                        except BaseException:
+                            file_path.unlink(missing_ok=True)
+                            raise
 
-                    LOG.info(f"File downloaded successfully to {final_path}")
-                    return str(final_path)
+                        LOG.info(f"File downloaded successfully to {final_path}")
+                        return str(final_path)
+
+                authorization = RedirectHopAuthorization(
+                    source_url=source_url,
+                    target_url=current_url,
+                    method="GET",
+                )
+                result = (
+                    await authorize_request_hop_once(authorize_request_hop, authorization, dispatch)
+                    if authorize_request_hop is not None
+                    else await dispatch(())
+                )
+                if isinstance(result, str):
+                    return result
+
+                next_url = await validate_and_pin_redirect_url(current_url, result.location, resolver)
+                if canonicalize_origin(next_url) is None:
+                    raise HttpException(400, "[redacted]", "Redirect has no browser-canonicalizable HTTP origin")
+                if allowed_redirect_origin is not None and _url_origin(next_url) != _url_origin(
+                    allowed_redirect_origin
+                ):
+                    raise HttpException(400, "[redacted]", "Cross-origin redirect blocked by policy")
+                request_headers, _ = strip_cross_origin_redirect_credentials(
+                    request_headers,
+                    None,
+                    current_url,
+                    next_url,
+                    strip_cross_origin_credentials=True,
+                )
+                source_url, current_url = current_url, next_url
             raise SkyvernHTTPException(
                 message=f"Too many redirects while downloading file: {current_url}",
                 status_code=HTTPStatus.BAD_REQUEST,
