@@ -562,6 +562,11 @@ async def skyvern_block_validate(
             warnings.append(
                 f"'{block.block_type}' block type is deprecated. Use 'navigation' for actions and 'extraction' for data extraction."
             )
+        if raw.get("block_type") == "code" and "prompt" not in raw:
+            warnings.append(
+                "Code block omits 'prompt'. Workflow create, or workflow update when adding this code block under a "
+                'new label, will inject the missing default `prompt: ""`; existing code block labels are not migrated.'
+            )
         return make_result(
             action,
             data={
