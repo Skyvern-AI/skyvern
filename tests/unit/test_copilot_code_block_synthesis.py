@@ -51,6 +51,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     LOCATOR_WITNESS_PARAM_SOURCE,
     SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE,
     SCOUTED_SPINE_TRUNCATED_REASON_CODE,
+    SYNTHESIZED_OFFER_SENTINEL,
     TRUNCATED_FINDING,
     UNFORGIVEN_DROP_FINDING,
     ProducedStaticReturnEnvelope,
@@ -2555,7 +2556,7 @@ class TestRenderSynthesizedOfferText:
         )
         assert synthesized is not None
         text = render_synthesized_offer_text(synthesized)
-        assert text.startswith("SYNTHESIZED CODE BLOCK (offered once).")
+        assert text.startswith(SYNTHESIZED_OFFER_SENTINEL)
         assert _SYNTHESIZED_BLOCK_LABEL in text
         assert "```python" in text
         assert 'await page.locator("#searcher_s").fill(str(search))' in text

@@ -736,6 +736,7 @@ class Block(BaseModel, abc.ABC):
         *,
         force_include_secrets: bool = False,
         env: SandboxedEnvironment | None = None,
+        skip_missing_variable_preflight: bool = False,
     ) -> str:
         """
         Format a template string using the workflow run context.
@@ -844,7 +845,9 @@ class Block(BaseModel, abc.ABC):
         template_data["workflow_run_outputs"] = workflow_run_context.workflow_run_outputs
         template_data["workflow_run_summary"] = workflow_run_context.build_workflow_run_summary()
 
-        if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
+        # A caller whose environment decides for itself what an absent binding means renders instead of
+        # failing here, so `| default(...)` still reaches an undefined the preflight would reject.
+        if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict" and not skip_missing_variable_preflight:
             if missing_variables := get_missing_variables(potential_template, template_data):
                 raise MissingJinjaVariables(
                     template=potential_template,
@@ -1503,18 +1506,30 @@ class BaseTaskBlock(Block):
                     # so that cookie-based authentication can redirect or restore the session
                     # BEFORE the agent starts interacting with the page.
                     if workflow_run.browser_profile_id:
-                        LOG.info(
-                            "Browser profile loaded — waiting for page to settle before agent acts",
-                            browser_profile_id=workflow_run.browser_profile_id,
-                            workflow_run_id=workflow_run.workflow_run_id,
-                        )
-                        try:
-                            await working_page.wait_for_load_state("networkidle", timeout=10000)
-                        except Exception:
-                            LOG.debug(
-                                "networkidle timeout after browser profile load (non-fatal)",
+                        applied_profile_id = browser_state.browser_artifacts.applied_browser_profile_id
+                        if applied_profile_id != workflow_run.browser_profile_id and not browser_session_id:
+                            LOG.warning(
+                                "Stamped browser profile was not applied to this browser — continuing without saved state",
+                                browser_profile_id=workflow_run.browser_profile_id,
+                                applied_browser_profile_id=applied_profile_id,
                                 workflow_run_id=workflow_run.workflow_run_id,
                             )
+                        else:
+                            # A persistent session loads its profile session-side, invisible to these
+                            # artifacts — keep the settle wait so cookie redirects finish either way.
+                            LOG.info(
+                                "Browser profile loaded — waiting for page to settle before agent acts",
+                                browser_profile_id=workflow_run.browser_profile_id,
+                                applied_browser_profile_id=applied_profile_id,
+                                workflow_run_id=workflow_run.workflow_run_id,
+                            )
+                            try:
+                                await working_page.wait_for_load_state("networkidle", timeout=10000)
+                            except Exception:
+                                LOG.debug(
+                                    "networkidle timeout after browser profile load (non-fatal)",
+                                    workflow_run_id=workflow_run.workflow_run_id,
+                                )
 
                 except Exception as e:
                     LOG.exception(

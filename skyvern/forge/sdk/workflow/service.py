@@ -45,6 +45,7 @@ from skyvern.exceptions import (
     BlockedHost,
     BlockNotFound,
     BrowserActionPolicyNotEnforceable,
+    BrowserProfileNotApplied,
     BrowserProfileNotFound,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
@@ -228,7 +229,11 @@ from skyvern.utils.url_validators import validate_url as validate_url_with_block
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.profile_cookie_merge import cookie_delta, seed_cookie_values, union_cookies_into_profile_dir
-from skyvern.webeye.session_cookies import persist_session_cookies, read_persisted_session_cookies
+from skyvern.webeye.session_cookies import (
+    persist_session_cookies,
+    read_persisted_session_cookies,
+    refresh_banked_cookies,
+)
 
 LOG = structlog.get_logger()
 
@@ -5672,14 +5677,28 @@ class WorkflowService:
                     url=login_url,
                 )
                 # A prior block may already have opened this run's browser; get_or_create_for_workflow_run
-                # then returns that cached context and ignores browser_profile_id, so the credential
-                # profile never loads. Stamping the run credential-seeded in that case would let the
-                # healthy-run bank whole-dir the unrelated context into the shared credential profile.
-                # Only credential-seed when we will actually load the profile into a fresh browser;
-                # otherwise degrade to fresh — the credential seed holds only when its
-                # profile loaded.
-                browser_already_open = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id) is not None
-                if browser_already_open:
+                # then returns that cached context and ignores browser_profile_id. Stamping the run
+                # credential-seeded when that context did NOT boot from this profile would let the
+                # healthy-run bank whole-dir an unrelated context into the shared credential profile.
+                # Credential-seed only when the profile is genuinely in the browser: either we load it
+                # into a fresh browser below, or the open browser already booted from it.
+                browser_state_open = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+                browser_already_open = browser_state_open is not None
+                # A script/setup boot applies the setup-stamped seed itself; when the open browser was
+                # booted from exactly the resolved profile, the credential seed is genuinely loaded.
+                open_browser_booted_this_profile = (
+                    browser_state_open is not None
+                    and browser_state_open.browser_artifacts.applied_browser_profile_id == resolved_browser_profile_id
+                )
+                if browser_already_open and open_browser_booted_this_profile:
+                    LOG.info(
+                        "Credential login block reached with a browser already booted from the resolved "
+                        "profile — keeping the credential seed",
+                        workflow_run_id=workflow_run_id,
+                        block_label=block.label,
+                        browser_profile_id=resolved_browser_profile_id,
+                    )
+                if browser_already_open and not open_browser_booted_this_profile:
                     LOG.warning(
                         "Credential login block reached with a browser already open; running fresh login "
                         "instead of credential-seeding to avoid banking an unrelated context",
@@ -5721,7 +5740,7 @@ class WorkflowService:
 
                 # Create the browser with the saved profile and navigate to the login block's URL. The
                 # user enters the post-login target URL; the saved cookies authenticate once it loads.
-                profile_loaded = bool(login_url) and not browser_already_open
+                profile_loaded = open_browser_booted_this_profile or (bool(login_url) and not browser_already_open)
                 if login_url and not browser_already_open:
                     try:
                         browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
@@ -5730,6 +5749,14 @@ class WorkflowService:
                             browser_profile_id=resolved_browser_profile_id,
                             browser_session_id=decision.attach_browser_session_id,
                         )
+                        if (
+                            not decision.attach_browser_session_id
+                            and browser_state.browser_artifacts.applied_browser_profile_id
+                            != resolved_browser_profile_id
+                        ):
+                            # The chosen browser creator (e.g. a remote/vendor browser) accepted the
+                            # profile id but never loaded it; the run must not stay credential-stamped.
+                            raise BrowserProfileNotApplied(resolved_browser_profile_id)
                         working_page = await browser_state.get_working_page()
                         if working_page and working_page.url == "about:blank":
                             await browser_state.navigate_to_url(page=working_page, url=login_url)
@@ -6434,7 +6461,7 @@ class WorkflowService:
                 ]
                 if patched_branches != block.branch_conditions:
                     block = block.model_copy(update={"branch_conditions": patched_branches})
-            elif block.next_block_label == finally_block_label:
+            if block.next_block_label == finally_block_label:
                 block = block.model_copy(update={"next_block_label": None})
             result.append(block)
         return result
@@ -7686,15 +7713,31 @@ class WorkflowService:
         ai_fallback: bool | None = None,
         failure_category: list[dict] | None = None,
     ) -> WorkflowRun:
-        workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
-            workflow_run_id=workflow_run_id,
-            status=status,
-            failure_reason=failure_reason,
-            run_with=run_with,
-            ai_fallback=ai_fallback,
-            failure_category=failure_category,
-        )
-        await self._after_workflow_run_status_write(workflow_run, status)
+        # Final transitions are claimed conditionally so run-minutes emit exactly once
+        # per run even when a cancel and the run's own finalizer race; the loser still
+        # performs the unconditional overwrite the finalizer has always done, silently.
+        flipped_to_final = False
+        workflow_run: WorkflowRun | None = None
+        if status.is_final():
+            workflow_run = await app.DATABASE.workflow_runs.update_workflow_run_if_not_final(
+                workflow_run_id=workflow_run_id,
+                status=status,
+                failure_reason=failure_reason,
+                run_with=run_with,
+                ai_fallback=ai_fallback,
+                failure_category=failure_category,
+            )
+            flipped_to_final = workflow_run is not None
+        if workflow_run is None:
+            workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
+                workflow_run_id=workflow_run_id,
+                status=status,
+                failure_reason=failure_reason,
+                run_with=run_with,
+                ai_fallback=ai_fallback,
+                failure_category=failure_category,
+            )
+        await self._after_workflow_run_status_write(workflow_run, status, emit_run_minutes=flipped_to_final)
         return workflow_run
 
     async def _update_workflow_run_status_if_not_final(
@@ -7739,7 +7782,9 @@ class WorkflowService:
         await self._after_workflow_run_status_write(workflow_run, WorkflowRunStatus.timed_out)
         return workflow_run
 
-    async def _after_workflow_run_status_write(self, workflow_run: WorkflowRun, status: WorkflowRunStatus) -> None:
+    async def _after_workflow_run_status_write(
+        self, workflow_run: WorkflowRun, status: WorkflowRunStatus, emit_run_minutes: bool = True
+    ) -> None:
         workflow_run_id = workflow_run.workflow_run_id
         if status.is_final():
             # Free extraction-cache entries for this run.
@@ -7764,6 +7809,14 @@ class WorkflowService:
                 trigger_type=workflow_run.trigger_type,
                 workflow_schedule_id=workflow_run.workflow_schedule_id,
             )
+            if emit_run_minutes and workflow_run.parent_workflow_run_id is None:
+                await app.AGENT_FUNCTION.record_run_duration(
+                    run_type="workflow_run",
+                    status=str(status),
+                    duration_seconds=duration_seconds,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=workflow_run.organization_id,
+                )
             await self._apply_completion_run_tags_best_effort(workflow_run)
             self._schedule_workflow_run_terminal_hooks(
                 workflow_run_id=workflow_run_id,
@@ -8241,6 +8294,14 @@ class WorkflowService:
             trigger_type=updated.trigger_type,
             workflow_schedule_id=updated.workflow_schedule_id,
         )
+        if updated.parent_workflow_run_id is None:
+            await app.AGENT_FUNCTION.record_run_duration(
+                run_type="workflow_run",
+                status=str(WorkflowRunStatus.canceled),
+                duration_seconds=duration_seconds,
+                workflow_run_id=workflow_run_id,
+                organization_id=updated.organization_id,
+            )
         await self._apply_completion_run_tags_best_effort(updated)
 
         self._schedule_workflow_run_terminal_hooks(
@@ -9119,6 +9180,20 @@ class WorkflowService:
                 browser_profile_id=sink_profile_id,
             )
             return
+        if (
+            workflow_run.browser_profile_id
+            and browser_state.browser_artifacts.applied_browser_profile_id != workflow_run.browser_profile_id
+        ):
+            # The stamped seed was never applied (e.g. a vendor-routed boot) — this directory does not
+            # extend the sink's accumulated state, so writing it back would erase the saved archive.
+            # Seedless accumulate rows (browser_profile_id None, sink set) still write by design.
+            LOG.warning(
+                "Skipped persisting sink browser profile — stamped seed profile was not applied to this browser",
+                workflow_run_id=workflow_run.workflow_run_id,
+                browser_profile_id=sink_profile_id,
+                seed_browser_profile_id=workflow_run.browser_profile_id,
+            )
+            return
         if effective_workflow_run_status != WorkflowRunStatus.completed:
             LOG.info(
                 "Skipped persisting browser sink profile for non-completed workflow run",
@@ -9176,6 +9251,20 @@ class WorkflowService:
                 browser_profile_id=sink_profile_id,
             )
             return
+        try:
+            # The seed archive's banked-cookie sidecar rides this directory into the write; refresh it
+            # from the live jar, or drop it, so a later boot can't replay seed-era cookies over fresher.
+            await refresh_banked_cookies(
+                None if close_browser_on_completion else browser_state.browser_context,
+                browser_state.browser_artifacts.browser_session_dir,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to refresh the banked-cookies sidecar before the sink write-back",
+                workflow_run_id=workflow_run.workflow_run_id,
+                browser_profile_id=sink_profile_id,
+                exc_info=True,
+            )
         await app.STORAGE.store_browser_profile(
             workflow_run.organization_id,
             profile_id=sink_profile_id,
