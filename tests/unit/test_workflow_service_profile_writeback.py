@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.forge import app
+from skyvern.forge.sdk.schemas.credentials import credential_auto_profile_disabled
 from skyvern.forge.sdk.workflow.browser_profile_key import build_workflow_browser_session_storage_key
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -59,6 +60,12 @@ def _make_browser_state(applied_browser_profile_id: str | None = None) -> MagicM
     bs.browser_artifacts._seed_capture_failed = False
     bs.browser_artifacts.applied_browser_profile_id = applied_browser_profile_id
     return bs
+
+
+def test_auto_profile_opt_out_predicate_is_explicit_true_only() -> None:
+    assert credential_auto_profile_disabled(SimpleNamespace(auto_profile_disabled=True)) is True
+    assert credential_auto_profile_disabled(SimpleNamespace(auto_profile_disabled=False)) is False
+    assert credential_auto_profile_disabled(SimpleNamespace(auto_profile_disabled=None)) is False
 
 
 def _patch_clean_up_deps(monkeypatch: pytest.MonkeyPatch, browser_state: MagicMock) -> AsyncMock:
