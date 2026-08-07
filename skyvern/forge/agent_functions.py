@@ -921,6 +921,16 @@ class AgentFunction:
         """
         return True
 
+    async def resolve_stream_transport(
+        self, *, browser_session_id: str | None, organization_id: str | None, ip_address: str | None = None
+    ) -> str:
+        """Which live-view transport serves this session: "vnc" or "cdp".
+
+        A self-hosted deployment streams every browser the same way, so the
+        deployment-wide setting decides.
+        """
+        return settings.BROWSER_STREAMING_MODE
+
     async def select_browser_session_recordings(
         self,
         *,
@@ -1076,6 +1086,22 @@ class AgentFunction:
         session, so a run that has a CodeBlock but no caller-supplied session needs one created
         for it before block execution. OSS has no runner and returns False; cloud overrides to
         consult the same env/flag gate as should_use_codeblock_runner.
+        """
+        return False
+
+    async def should_route_to_secure_runner_pool(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str | None,
+        workflow_permanent_id: str | None = None,
+        workflow_id: str | None = None,
+    ) -> bool:
+        """Whether this run must be dispatched to a worker pool that has the runner sidecar.
+
+        Answered at dispatch, before a queue is chosen, so it is run-level: no block context
+        exists yet. OSS has no runner and returns False; cloud overrides to consult the same
+        gate as should_use_codeblock_runner.
         """
         return False
 

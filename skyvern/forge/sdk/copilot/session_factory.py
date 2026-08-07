@@ -33,12 +33,22 @@ from skyvern.forge.sdk.copilot.enforcement import (
     estimate_tokens,
     is_screenshot_message,
     is_synthetic_user_message,
+    log_recent_tool_output_truncation,
 )
 
 LOG = structlog.get_logger()
 
 RECENT_REAL_TURNS = 2
+TOOL_OUTPUT_TRUNCATE_SOFT = 2000
 TOOL_OUTPUT_TRUNCATE_EMERGENCY = 300
+
+
+def _emergency_truncate_all(items: list[Any], cap: int) -> list[Any]:
+    truncated_items = [_truncate_tool_output(item, cap) for item in items]
+    truncated_count = sum(1 for old, new in zip(items, truncated_items) if new is not old)
+    if truncated_count:
+        LOG.warning("copilot_tool_output_emergency_truncated", truncated_count=truncated_count, cap=cap)
+    return truncated_items
 
 
 def create_copilot_session(chat_id: str) -> SQLiteSession:
@@ -54,6 +64,7 @@ def _compact_tool_items(items: list[Any]) -> list[Any]:
         summarize_tool_output=_summarize_tool_output,
         summarize_tool_arguments=_summarize_tool_arguments,
         tool_output_truncation_suffix=_TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX,
+        on_recent_truncation=log_recent_tool_output_truncation,
     )
 
 
@@ -169,7 +180,8 @@ def _filter_to_budget(data: CallModelData[Any], *, token_budget: int) -> ModelIn
     1. Compact older tool outputs + function-call arguments using the
        KEEP_RECENT_TOOL_OUTPUTS rule (mirrors ``enforcement._prune_input_list``).
     2. If still over budget: drop all screenshots except the most recent.
-    3. If still over budget: truncate ALL tool outputs to 300 chars.
+    3. If still over budget: truncate ALL tool outputs — first to 2000 chars,
+       then to 300 only if the softer pass was not enough.
     4. If still over budget: aggressive prune as last resort.
     """
     model_data = data.model_data
@@ -207,8 +219,17 @@ def _filter_to_budget(data: CallModelData[Any], *, token_budget: int) -> ModelIn
         LOG.info("Within budget after screenshot drop", tokens=est)
         return ModelInputData(input=items, instructions=model_data.instructions)
 
-    # Layer 3: Truncate ALL tool outputs to 300 chars
-    items = [_truncate_tool_output(item, TOOL_OUTPUT_TRUNCATE_EMERGENCY) for item in items]
+    # Layer 3a: bring every tool output down to the pre-raise bound before resorting
+    # to the harsher pass, so a code-bearing recent output degrades gracefully.
+    items = _emergency_truncate_all(items, TOOL_OUTPUT_TRUNCATE_SOFT)
+
+    est = estimate_tokens(items)
+    if est <= token_budget:
+        LOG.info("Within budget after soft emergency truncation", tokens=est)
+        return ModelInputData(input=items, instructions=model_data.instructions)
+
+    # Layer 3b: Truncate ALL tool outputs to 300 chars
+    items = _emergency_truncate_all(items, TOOL_OUTPUT_TRUNCATE_EMERGENCY)
 
     est = estimate_tokens(items)
     if est <= token_budget:

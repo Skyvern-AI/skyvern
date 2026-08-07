@@ -60,7 +60,6 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import FillCarry
 from skyvern.forge.sdk.copilot.enforcement import (
-    _RECENT_TOOL_OUTPUT_CHAR_CAP,
     mint_scout_observation_contract_for_ctx,
     record_reached_terminal_action_observation,
     record_scouted_output_coverage,
@@ -108,6 +107,14 @@ from ._shared import (
 from .banned_blocks import _copilot_block_authoring_policy
 
 LOG = structlog.get_logger()
+
+# Emission budget for scout/evaluate tool results: bounds how much live page content
+# a result may carry into the authoring context, so it must not follow the transcript
+# recent-window cap.
+_SCOUT_RESULT_CHAR_CAP = 2000
+# Reconnaissance evaluates keep the raw page payload by design, so they get a larger
+# budget than the steer results; this is the hard ceiling on that channel, not a target.
+_SCOUT_RECON_RESULT_CHAR_CAP = 20_000
 
 _FILL_CARRY_RETRYABLE_VALIDATION_FAILURES = frozenset({"page_mismatch", "selector_absent_from_page_evidence"})
 
@@ -1424,7 +1431,7 @@ def _shed_scout_page_summary_section(summary: dict[str, Any]) -> bool:
 
 def _attach_scout_page_summary(result: dict[str, Any], page_evidence: dict[str, Any]) -> None:
     """Attach a compact page summary at result["data"]["page"], keeping the whole
-    serialized result under the recent-output pruner cap by shedding sections —
+    serialized result under the scout result budget by shedding sections —
     never by slicing the serialized JSON."""
     data = result.get("data")
     if not isinstance(data, dict):
@@ -1432,7 +1439,7 @@ def _attach_scout_page_summary(result: dict[str, Any], page_evidence: dict[str, 
     try:
         summary = _build_scout_page_summary(page_evidence)
         data["page"] = summary
-        while len(json.dumps(result)) > _RECENT_TOOL_OUTPUT_CHAR_CAP:
+        while len(json.dumps(result)) > _SCOUT_RESULT_CHAR_CAP:
             if not _shed_scout_page_summary_section(summary):
                 data.pop("page", None)
                 return
@@ -1676,18 +1683,33 @@ def _fit_evaluate_steer_under_cap(
     *,
     keep_raw_page_payload: bool,
 ) -> None:
-    """Keep the serialized result under the recent-output cap without ever head-slicing it.
+    """Keep the serialized result under the scout result budget without ever head-slicing it.
 
     Reconnaissance output needs the raw page payload available to the model; imperative steers have
     enough structured evidence to shed bulky non-essential payload while always preserving the action."""
 
+    def over(limit: int) -> bool:
+        return len(json.dumps(result, default=str)) > limit
+
     def over_cap() -> bool:
-        return len(json.dumps(result, default=str)) > _RECENT_TOOL_OUTPUT_CHAR_CAP
+        return over(_SCOUT_RESULT_CHAR_CAP)
 
     if not over_cap():
         return
     if keep_raw_page_payload:
         data.pop("actionable_targets", None)
+        nested = data.get("result")
+        if isinstance(nested, dict):
+            for key in _EVALUATE_STEER_NESTED_BULKY_KEYS:
+                if not over(_SCOUT_RECON_RESULT_CHAR_CAP):
+                    return
+                if key in nested and nested[key] != _EVALUATE_STEER_SHED_MARKER:
+                    nested[key] = _EVALUATE_STEER_SHED_MARKER
+        while over(_SCOUT_RECON_RESULT_CHAR_CAP):
+            largest_key = _largest_non_essential_data_key(data)
+            if largest_key is None:
+                break
+            data[largest_key] = _EVALUATE_STEER_SHED_MARKER
         return
     nested = data.get("result")
     if isinstance(nested, dict):
@@ -1767,7 +1789,7 @@ async def _auto_act_on_repeat(ctx: AgentContext, result: dict[str, Any], *, url:
     else:
         data["page"] = _build_scout_page_summary(post_evidence)
     essential = _auto_act_essential_keys()
-    while len(json.dumps(result, default=str)) > _RECENT_TOOL_OUTPUT_CHAR_CAP:
+    while len(json.dumps(result, default=str)) > _SCOUT_RESULT_CHAR_CAP:
         largest = max(
             (
                 (key, _serialized_len(value))
