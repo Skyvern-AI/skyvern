@@ -21,9 +21,20 @@ describe("resolveSendAction", () => {
     expect(resolveSendAction(sendInput({ candidate: "   " }))).toBe("noop");
   });
 
-  it("returns noop when a prompt is already queued and this is not a drain", () => {
+  // A parked turn (awaiting the user) never ends, so a swallowed second send
+  // left the composer permanently dead. Rewriting the parked prompt keeps the
+  // one-queued-prompt invariant without the dead end.
+  it("rewrites the parked prompt when a second send arrives", () => {
     expect(
       resolveSendAction(sendInput({ hasQueuedPrompt: true, isDrain: false })),
+    ).toBe("replace_queued");
+  });
+
+  it("still returns noop for an empty candidate while a prompt is queued", () => {
+    expect(
+      resolveSendAction(
+        sendInput({ hasQueuedPrompt: true, isDrain: false, candidate: "  " }),
+      ),
     ).toBe("noop");
   });
 

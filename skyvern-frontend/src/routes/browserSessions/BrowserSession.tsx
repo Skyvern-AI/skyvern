@@ -242,6 +242,7 @@ function BrowserSession() {
                 browserSessionId={browserSessionId}
                 interactive={true}
                 showControlButtons={true}
+                enableUrlInput={true}
               />
             )}
             {!isCdpMode &&
