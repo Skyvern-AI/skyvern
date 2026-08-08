@@ -23,8 +23,9 @@ import typer
 
 from skyvern._cli_bootstrap import prepare_cli_runtime
 from skyvern.browser_extension.auth import load_or_create_pairing_token
+from skyvern.browser_extension.broker.protocol import BROKER_HEALTH_PATH
 from skyvern.browser_extension.errors import BrowserExtensionError
-from skyvern.browser_extension.runtime import BrowserExtensionRuntime
+from skyvern.browser_extension.runtime import BrowserExtensionRuntime, broker_enabled
 from skyvern.cli.commands._output import (
     console,
 )
@@ -281,6 +282,26 @@ def _bridge_is_listening(port: int) -> bool:
     return True
 
 
+def _bridge_mode(port: int) -> Literal["broker", "legacy", "none"]:
+    """Tell a shared broker daemon apart from a pre-broker single-owner MCP session."""
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1.0)
+    try:
+        connection.request("GET", BROKER_HEALTH_PATH)
+        response = connection.getresponse()
+        body = response.read(4096)
+    except OSError:
+        return "none"
+    finally:
+        connection.close()
+    if response.status != 200:
+        return "legacy"
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return "legacy"
+    return "broker" if isinstance(payload, dict) and payload.get("broker") is True else "legacy"
+
+
 def _request_pairing_nonce(port: int, token: str) -> str:
     proof = hmac.new(token.encode("utf-8"), b"skyvern-pair-begin-v1", hashlib.sha256).hexdigest()
     body = json.dumps({"v": 1, "proof": proof}, separators=(",", ":"))
@@ -368,10 +389,16 @@ def extension_status() -> None:
         console.print(f"bridge configuration invalid ({exc})")
         return
 
-    if not _bridge_is_listening(port):
+    console.print(f"shared broker: {'enabled' if broker_enabled() else 'disabled (SKYVERN_BROWSER_EXTENSION_BROKER)'}")
+
+    mode = _bridge_mode(port)
+    if mode == "none":
         console.print("bridge not running (start your MCP server with --browser-extension)")
+    elif mode == "broker":
+        console.print(f"bridge listening on {port} (shared broker daemon)")
     else:
-        console.print(f"bridge listening on {port}")
+        console.print(f"bridge listening on {port} (single-owner session)")
+        console.print("restart that session on this version so every agent can share the bridge")
 
 
 @browser_app.command("extension-pair")

@@ -539,6 +539,12 @@ class ExtensionRelayServer:
         self.bound_port = port
         self.scoped_tabs: list[dict] = []
 
+    def add_route(self, path: str, handler: Callable[[web.Request], Awaitable[web.StreamResponse]]) -> None:
+        """Share the relay's loopback listener with another GET endpoint. Must precede start()."""
+        if self._runner is not None:
+            raise BrowserExtensionError("Routes must be registered before the relay starts")
+        self._app.router.add_get(path, handler)
+
     def create_pairing_nonce(self) -> str:
         nonce = secrets.token_urlsafe(32)
         self._pairing_nonce = nonce
@@ -551,6 +557,9 @@ class ExtensionRelayServer:
         if nonce is not None and created_at is not None and time.monotonic() - created_at < _PAIRING_NONCE_TTL_SECONDS:
             return nonce
         return self.create_pairing_nonce()
+
+    async def acquire_pairing_nonce(self) -> str:
+        return self.get_or_create_pairing_nonce()
 
     def _is_interactive_pairing_request(self, request: web.Request) -> bool:
         try:
