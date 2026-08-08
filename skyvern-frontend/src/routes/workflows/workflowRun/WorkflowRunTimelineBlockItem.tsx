@@ -32,7 +32,12 @@ import {
   WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
 import { type CodeBlockStep, WorkflowBlockTypes } from "../types/workflowTypes";
-import { findCodeStepForLine } from "../workflowBlockUtils";
+import {
+  describeRecordedAction,
+  findCodeStepForLine,
+  isRecorderCallText,
+  normalizeInlineText,
+} from "../workflowBlockUtils";
 import {
   ActionItem,
   WorkflowRunOverviewActiveElement,
@@ -146,11 +151,6 @@ function StatusDot({
   );
 }
 
-function normalizeInlineText(value: string | null | undefined): string | null {
-  const normalized = value?.replace(/\s+/g, " ").trim();
-  return normalized ? normalized : null;
-}
-
 function getActionSummary(action: ActionsApiResponse): string | null {
   return (
     normalizeInlineText(action.reasoning) ??
@@ -187,6 +187,8 @@ type ActionRowPresentation = {
   icon: ReactNode;
   label: string;
   summary: string | null;
+  // Raw recorder text (a Playwright selector); shown on hover, never as the primary line.
+  detail: string | null;
   tone: "default" | "error";
 };
 
@@ -214,15 +216,13 @@ function getCodeActionRowPresentation(
     timelineActionIcons[action.action_type]
   );
   const { codeLine, durationMs } = getRecordedActionMeta(action);
-  const stepText =
-    !isCodeError && matchedStep
-      ? (normalizeInlineText(matchedStep.title) ??
-        normalizeInlineText(matchedStep.description))
-      : null;
   const parts = [
-    stepText ??
-      getActionSummary(action) ??
-      normalizeInlineText(action.description),
+    // This row hides its label from sighted users, so it falls back to the readable type
+    // where the chat, which always shows the label, prints nothing.
+    isCodeError
+      ? getActionSummary(action)
+      : (describeRecordedAction(action, matchedStep) ??
+        getReadableActionType(action.action_type, { nullActionLabel: "Step" })),
     codeLine !== null ? `line ${codeLine}` : null,
     durationMs !== null ? formatActionDurationMs(durationMs) : null,
   ].filter((part): part is string => part !== null);
@@ -230,6 +230,10 @@ function getCodeActionRowPresentation(
     icon,
     label,
     summary: parts.length > 0 ? parts.join(" · ") : null,
+    detail:
+      !isCodeError && isRecorderCallText(action.description)
+        ? normalizeInlineText(action.description)
+        : null,
     tone: isCodeError ? "error" : "default",
   };
 }
@@ -511,7 +515,7 @@ function TimelineActionRows({
         const isActive =
           isAction(activeItem) && activeItem.action_id === action.action_id;
         const displayIndex = index + 1;
-        const { icon, label, summary, tone } = isCodeBlock
+        const { icon, label, summary, detail, tone } = isCodeBlock
           ? getCodeActionRowPresentation(
               action,
               findCodeStepForLine(
@@ -523,6 +527,7 @@ function TimelineActionRows({
               icon: timelineActionIcons[action.action_type],
               label: getReadableActionType(action.action_type),
               summary: getActionSummary(action),
+              detail: null,
               tone: "default" as const,
             };
 
@@ -548,6 +553,7 @@ function TimelineActionRows({
                   onActionClick({ block, action });
                 }}
                 aria-pressed={isActive}
+                title={detail ?? undefined}
                 className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-foreground/40"
               >
                 <StatusDot
