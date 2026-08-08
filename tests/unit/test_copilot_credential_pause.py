@@ -2062,9 +2062,7 @@ async def test_preflight_connect_re_derives_run_authority_onto_the_turn_intent(
             TurnIntentClassification(mode=TurnIntentMode.BUILD, confidence=0.95)
         )
     )
-    materialize = AsyncMock()
     monkeypatch.setattr(agent_module, "classify_turn_intent", classify)
-    monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize)
     config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
 
     resolution = await preflight_credential_pause(ctx, _make_stream(), config)
@@ -2076,7 +2074,6 @@ async def test_preflight_connect_re_derives_run_authority_onto_the_turn_intent(
     assert ctx.turn_intent.authority.may_update_workflow is True
     assert ctx.turn_intent.authority.may_run_blocks is True
     classify.assert_awaited_once()
-    materialize.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -2098,15 +2095,11 @@ async def test_preflight_resume_unknown_does_not_inherit_connected_policy_author
             )
         ),
     )
-    materialize = AsyncMock()
-    monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize)
-
     await agent_module._resume_turn_intent_after_preflight_credential(ctx, policy, _preflight_policy_inputs())
 
     assert ctx.turn_intent.mode is TurnIntentMode.UNKNOWN
     assert ctx.turn_intent.authority.may_update_workflow is False
     assert ctx.turn_intent.authority.may_run_blocks is False
-    materialize.assert_not_awaited()
 
 
 @pytest.mark.asyncio

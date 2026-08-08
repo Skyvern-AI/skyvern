@@ -11,6 +11,7 @@ import {
   getReadableActionType,
   type ActionsApiResponse,
 } from "@/api/types";
+import { isRecorderCallText } from "@/routes/workflows/workflowBlockUtils";
 import { CopyButton } from "@/components/CopyButton";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -425,6 +426,11 @@ function getActionSummaryFields(
   );
   pushField(fields, "Reasoning", action.reasoning);
   pushField(fields, "Intention", action.intention);
+  // The row demotes this to a hover title, which keyboard and screen-reader users never get;
+  // this panel is the reachable home for it.
+  if (isRecorderCallText(action.description)) {
+    pushField(fields, "Recorded call", action.description);
+  }
   return fields;
 }
 

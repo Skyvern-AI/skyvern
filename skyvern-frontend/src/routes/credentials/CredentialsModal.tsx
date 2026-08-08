@@ -51,6 +51,12 @@ import {
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from "@/components/ui/accordion";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { useBrowserProfileQuery } from "@/routes/browserProfiles/hooks/useBrowserProfileQuery";
 import { useBrowserProfileUsageQuery } from "@/routes/browserProfiles/hooks/useBrowserProfileUsageQuery";
@@ -414,6 +420,7 @@ function CredentialsModal({
   const browserMemoryEnabled = useFeatureFlag("browser_memory_v1");
   // Quick-win: optional browser profile + per-credential IP pin (flag-on).
   const [browserProfileId, setBrowserProfileId] = useState<string | null>(null);
+  const [autoProfileDisabled, setAutoProfileDisabled] = useState(false);
   const [pinIp, setPinIp] = useState(false);
   const [runSequentially, setRunSequentially] = useState(false);
   // The inline profile Select has no scroll pagination, so pull a large first
@@ -633,6 +640,7 @@ function CredentialsModal({
         setTestAndSave(true);
       }
       setBrowserProfileId(editingCredential.browser_profile_id ?? null);
+      setAutoProfileDisabled(editingCredential.auto_profile_disabled ?? false);
       setPinIp(editingCredential.pin_saved_session_ip ?? false);
       setRunSequentially(editingCredential.run_sequentially ?? false);
       if (editingCredential.user_context) {
@@ -706,6 +714,7 @@ function CredentialsModal({
     setRemovalConfirmationMessage(null);
     removalConfirmedRef.current = false;
     setBrowserProfileId(null);
+    setAutoProfileDisabled(false);
     setPinIp(false);
     setRunSequentially(false);
     setTestAndSave(false);
@@ -1068,6 +1077,7 @@ function CredentialsModal({
               ...(includesBrowserMemoryFields
                 ? {
                     browser_profile_id: browserProfileId,
+                    auto_profile_disabled: autoProfileDisabled,
                     pin_saved_session_ip: pinIp,
                   }
                 : {}),
@@ -1148,6 +1158,7 @@ function CredentialsModal({
       proxy_session_id,
       rotate_proxy_session_id,
       browser_profile_id,
+      auto_profile_disabled,
       pin_saved_session_ip,
       run_sequentially,
     }: {
@@ -1160,6 +1171,7 @@ function CredentialsModal({
       proxy_session_id?: string | null;
       rotate_proxy_session_id?: boolean;
       browser_profile_id?: string | null;
+      auto_profile_disabled?: boolean;
       pin_saved_session_ip?: boolean;
       run_sequentially?: boolean;
     }) => {
@@ -1187,6 +1199,9 @@ function CredentialsModal({
       }
       if (browser_profile_id !== undefined) {
         body.browser_profile_id = browser_profile_id;
+      }
+      if (auto_profile_disabled !== undefined) {
+        body.auto_profile_disabled = auto_profile_disabled;
       }
       if (pin_saved_session_ip !== undefined) {
         body.pin_saved_session_ip = pin_saved_session_ip;
@@ -1253,9 +1268,15 @@ function CredentialsModal({
     const bmChanged =
       browserMemoryFields &&
       (browserProfileId !== (editingCredential?.browser_profile_id ?? null) ||
+        autoProfileDisabled !==
+          (editingCredential?.auto_profile_disabled ?? false) ||
         pinIp !== (editingCredential?.pin_saved_session_ip ?? false));
     const bmPatch = browserMemoryFields
-      ? { browser_profile_id: browserProfileId, pin_saved_session_ip: pinIp }
+      ? {
+          browser_profile_id: browserProfileId,
+          auto_profile_disabled: autoProfileDisabled,
+          pin_saved_session_ip: pinIp,
+        }
       : {};
 
     const runSequentiallyChanged =
@@ -1456,6 +1477,7 @@ function CredentialsModal({
         ...(browserMemoryEnabled
           ? {
               browser_profile_id: browserProfileId,
+              auto_profile_disabled: autoProfileDisabled,
               pin_saved_session_ip: pinIp,
             }
           : {}),
@@ -1732,64 +1754,9 @@ function CredentialsModal({
     <div className="space-y-3">
       {!isEditMode && (
         <p className="text-xs text-muted-foreground">
-          Skyvern saves this login’s browser state after the first successful
-          sign-in and keeps it fresh automatically.
+          Skyvern saves this login’s browser state after the first sign-in and
+          keeps it fresh automatically. You can opt out in Advanced below.
         </p>
-      )}
-      <label className="flex cursor-pointer items-center gap-2 text-sm">
-        <Checkbox
-          checked={pinIp}
-          onCheckedChange={(checked) => setPinIp(checked === true)}
-        />
-        <TooltipProvider>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span
-                tabIndex={0}
-                className="rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                Keep the same IP for this credential
-              </span>
-            </TooltipTrigger>
-            <TooltipContent className="max-w-[260px]">
-              Sign-ins with this credential use one dedicated IP, so the saved
-              session stays valid on sites that check for network changes.
-            </TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
-      </label>
-      <p className="ml-6 text-xs text-muted-foreground">
-        Helps avoid extra 2FA, captchas, and temporary locks on sites that check
-        for network changes.
-      </p>
-      {pinIp && existingSessionPrefix && (
-        <div className="ml-6 space-y-2">
-          <div className="flex items-center gap-2">
-            <p className="text-xs text-muted-foreground">
-              IP session:{" "}
-              <span className="font-mono text-foreground">
-                {existingSessionPrefix}
-              </span>
-            </p>
-            <HelpTooltip content="This credential reuses one saved network identity so logins stay valid. Rotate to force a fresh one on the next sign-in." />
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Button
-              type="button"
-              variant="secondary"
-              size="sm"
-              onClick={() => setRotateProxyPin(true)}
-              disabled={rotateProxyPin}
-            >
-              Rotate
-            </Button>
-            {rotateProxyPin && (
-              <span className="text-xs text-muted-foreground">
-                A new IP session is created when you save.
-              </span>
-            )}
-          </div>
-        </div>
       )}
       {isEditMode && (
         <div className="space-y-1.5">
@@ -1824,6 +1791,86 @@ function CredentialsModal({
           )}
         </div>
       )}
+      <Accordion type="single" collapsible>
+        <AccordionItem value="advanced" className="border-b-0">
+          <AccordionTrigger className="py-2">Advanced</AccordionTrigger>
+          <AccordionContent className="space-y-3">
+            <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <Checkbox
+                checked={pinIp}
+                onCheckedChange={(checked) => setPinIp(checked === true)}
+              />
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span
+                      tabIndex={0}
+                      className="rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      Keep the same IP for this credential
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-[260px]">
+                    Sign-ins with this credential use one dedicated IP, so the
+                    saved session stays valid on sites that check for network
+                    changes.
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            </label>
+            <p className="ml-6 text-xs text-muted-foreground">
+              Helps avoid extra 2FA, captchas, and temporary locks on sites that
+              check for network changes.
+            </p>
+            {pinIp && existingSessionPrefix && (
+              <div className="ml-6 space-y-2">
+                <div className="flex items-center gap-2">
+                  <p className="text-xs text-muted-foreground">
+                    IP session:{" "}
+                    <span className="font-mono text-foreground">
+                      {existingSessionPrefix}
+                    </span>
+                  </p>
+                  <HelpTooltip content="This credential reuses one saved network identity so logins stay valid. Rotate to force a fresh one on the next sign-in." />
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => setRotateProxyPin(true)}
+                    disabled={rotateProxyPin}
+                  >
+                    Rotate
+                  </Button>
+                  {rotateProxyPin && (
+                    <span className="text-xs text-muted-foreground">
+                      A new IP session is created when you save.
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+            <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <Checkbox
+                id="auto-profile-disabled"
+                checked={autoProfileDisabled}
+                onCheckedChange={(checked) =>
+                  setAutoProfileDisabled(checked === true)
+                }
+              />
+              <span>
+                Don't automatically save or reuse a browser profile for this
+                credential
+              </span>
+            </label>
+            <p className="ml-6 text-xs text-muted-foreground">
+              A profile already linked to this credential stays linked — it just
+              stops being used or updated automatically.
+            </p>
+          </AccordionContent>
+        </AccordionItem>
+      </Accordion>
     </div>
   );
 
@@ -1855,10 +1902,11 @@ function CredentialsModal({
           totpError={authenticatorKeyError}
           authenticatorSaveError={authenticatorSaveError}
           beforeCredentialFields={customVaultCheckbox}
+          afterPassword={
+            browserMemoryEnabled ? browserProfileModalSection : null
+          }
           afterUrl={
-            browserMemoryEnabled ? (
-              browserProfileModalSection
-            ) : (
+            browserMemoryEnabled ? null : (
               <div className="space-y-3">
                 <div className="flex items-center gap-3">
                   <Checkbox

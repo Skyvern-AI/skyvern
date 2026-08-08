@@ -683,11 +683,21 @@ async def test_self_heal_success_finalizes_seat_completed(monkeypatch: pytest.Mo
         AsyncMock(return_value=1),
     )
     monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(return_value=None))
-    # Stub the heal to a success result; this tests execute()'s seat-finalization wiring, not the heal itself.
+    # Stub the heal to a success result; this tests execute()'s seat-finalization wiring, not the
+    # heal itself. The stub carries the full BlockResult surface the finalizer reads — heal
+    # finalization rebuilds the result when download binding changes its output.
     monkeypatch.setattr(
         CodeBlock,
         "_attempt_self_heal",
-        AsyncMock(return_value=SimpleNamespace(success=True, output_parameter_value=None, failure_reason=None)),
+        AsyncMock(
+            return_value=SimpleNamespace(
+                success=True,
+                output_parameter_value=None,
+                failure_reason=None,
+                status=BlockStatus.completed,
+                error_codes=[],
+            )
+        ),
     )
 
     block = _make_code_block("await page.locator('#x').click()", goal="go")
