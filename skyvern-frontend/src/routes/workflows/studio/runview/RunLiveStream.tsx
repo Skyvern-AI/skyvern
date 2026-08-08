@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { BrowserStream } from "@/components/BrowserStream";
-import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
+import { useStreamTransport } from "@/hooks/useRuntimeConfig";
 
 import { WorkflowRunStream } from "../../workflowRun/WorkflowRunStream";
 
@@ -23,7 +23,7 @@ export function RunLiveStream({
   interactive,
   onUrlChange,
 }: RunLiveStreamProps) {
-  const { browserStreamingMode } = useBrowserStreamingMode();
+  const { streamTransport } = useStreamTransport(browserSessionId);
   const [vncFailed, setVncFailed] = useState(false);
 
   useEffect(() => {
@@ -31,7 +31,13 @@ export function RunLiveStream({
   }, [browserSessionId]);
 
   const useVnc =
-    Boolean(browserSessionId) && browserStreamingMode !== "cdp" && !vncFailed;
+    Boolean(browserSessionId) && streamTransport !== "cdp" && !vncFailed;
+
+  if (browserSessionId && !streamTransport) {
+    // Defaulting to VNC here opens a socket an externally hosted session cannot serve, and the
+    // failure is what swaps the transport — a visible drop rather than a first paint.
+    return null;
+  }
 
   if (useVnc && browserSessionId) {
     return (

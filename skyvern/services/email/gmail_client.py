@@ -6,11 +6,13 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
+import structlog
 
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
 _RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 _MAX_ATTEMPTS = 3
 _MAX_BACKOFF_SECONDS = 5.0
+LOG = structlog.get_logger()
 
 
 class GmailAPIError(RuntimeError):
@@ -92,10 +94,18 @@ async def get_json(
 def decode(data: str | None) -> str:
     if not data:
         return ""
+    exception_type: str | None = None
     try:
-        return base64.urlsafe_b64decode(f"{data}{'=' * (-len(data) % 4)}").decode("utf-8", errors="replace")
-    except (binascii.Error, UnicodeDecodeError, ValueError):
-        return ""
+        decoded = base64.urlsafe_b64decode(f"{data}{'=' * (-len(data) % 4)}").decode("utf-8", errors="replace")
+    except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+        decoded = ""
+        exception_type = type(exc).__name__
+    if not decoded:
+        log_fields: dict[str, int | str] = {"encoded_length": len(data)}
+        if exception_type:
+            log_fields["exception_type"] = exception_type
+        LOG.warning("Gmail body data decoded to empty content", **log_fields)
+    return decoded
 
 
 def payload_text(payload: dict[str, Any]) -> list[str]:

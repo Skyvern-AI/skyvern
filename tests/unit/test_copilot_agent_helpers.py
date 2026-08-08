@@ -14,10 +14,8 @@ from agents import GuardrailFunctionOutput, InputGuardrail
 from agents.run_context import RunContextWrapper
 from structlog.testing import capture_logs
 
-from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
-from skyvern.forge.sdk.copilot import request_policy as request_policy_module
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
     _VERIFIED_WORKFLOW_SUCCESS_REPLY,
@@ -37,9 +35,6 @@ from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NA
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSet,
     StoredCriteriaSnapshot,
-    build_turn_state,
-    plan_persistence,
-    reconcile_completion_criteria,
 )
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
@@ -72,27 +67,19 @@ from skyvern.forge.sdk.copilot.output_policy import (
 )
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
 from skyvern.forge.sdk.copilot.request_policy import (
-    _MAX_COMPLETION_CRITERIA,
     _REDACTED_REFUSED_SECRET_TURN,
     TRANSCRIPT_ANCHOR_CHAR_CAP,
     CompletionCriterion,
-    JudgmentTruthCondition,
     RequestPolicy,
-    _classifier_fallback_policy,
-    _classify_request,
-    _classify_request_trust_floor,
     build_classifier_fallback_floor,
     build_transcript_context,
-    is_defer_authoring_durable_fill_criterion,
     is_fallback_floor_criterion,
-    materialize_request_policy_authoring,
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOTS_PROMPT_NAME
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools.completion import (
     _authored_output_contract_criteria,
-    _carry_degraded_ids,
     _completion_verification_criteria,
     _maybe_run_completion_verification,
 )
@@ -111,6 +98,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     TurnIntentAuthority,
     TurnIntentClassification,
     TurnIntentClassifierResult,
+    TurnIntentDeliverableKind,
     TurnIntentMode,
     TurnIntentReasonCode,
 )
@@ -118,7 +106,6 @@ from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.routes.workflow_copilot import CHAT_HISTORY_CONTEXT_MESSAGES
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
-from skyvern.forge.sdk.schemas.credentials import CredentialType
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
@@ -1422,8 +1409,6 @@ class TestRequestPolicyInputGuardrail:
                 )
             ),
         )
-        materialize = AsyncMock()
-        monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize)
         ctx = _ctx()
         policy_inputs = agent_module.RequestPolicyGuardrailInputs(
             user_message="How do I make a workflow with a google sheet step?",
@@ -1444,7 +1429,6 @@ class TestRequestPolicyInputGuardrail:
         )[0]
         await guardrail.run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
 
-        materialize.assert_not_awaited()
         assert ctx.turn_intent is not None
         assert ctx.turn_intent.mode is TurnIntentMode.ANSWER
         assert policy.completion_criteria == []
@@ -1467,8 +1451,6 @@ class TestRequestPolicyInputGuardrail:
                 )
             ),
         )
-        materialize = AsyncMock()
-        monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize)
         ctx = _ctx()
         policy_inputs = agent_module.RequestPolicyGuardrailInputs(
             user_message="Why did the last run fail?",
@@ -1490,13 +1472,12 @@ class TestRequestPolicyInputGuardrail:
         )[0]
         await guardrail.run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
 
-        materialize.assert_not_awaited()
         assert ctx.turn_intent is not None
         assert ctx.turn_intent.mode is TurnIntentMode.DIAGNOSE
         assert ctx.turn_intent.authority.may_run_blocks is False
 
     @pytest.mark.asyncio
-    async def test_diagnose_retest_authority_materializes_completion_criteria(
+    async def test_diagnose_retest_authority_comes_from_turn_intent_without_policy_enrichment(
         self,
         monkeypatch,
     ) -> None:
@@ -1525,13 +1506,6 @@ class TestRequestPolicyInputGuardrail:
             ),
         )
 
-        async def materialize(target: RequestPolicy, **_kwargs) -> RequestPolicy:
-            target.completion_criteria = list(stored.criteria)
-            target._authoring_pending = False
-            return target
-
-        materialize_mock = AsyncMock(side_effect=materialize)
-        monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize_mock)
         ctx = _ctx()
         policy_inputs = agent_module.RequestPolicyGuardrailInputs(
             user_message="Run it again and verify the requested value",
@@ -1553,14 +1527,12 @@ class TestRequestPolicyInputGuardrail:
         )[0]
         await guardrail.run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
 
-        materialize_mock.assert_awaited_once()
-        assert materialize_mock.await_args.kwargs["active_criteria"] == list(stored.criteria)
         assert ctx.turn_intent is not None
         assert ctx.turn_intent.mode is TurnIntentMode.DIAGNOSE
         assert ctx.turn_intent.authority.may_update_workflow is True
         assert ctx.turn_intent.authority.may_run_blocks is True
-        assert policy.completion_criteria == list(stored.criteria)
-        assert ctx.completion_criteria_turn_state is not None
+        assert policy.completion_criteria == []
+        assert ctx.completion_criteria_turn_state is None
 
     @pytest.mark.asyncio
     async def test_unknown_turn_skips_authoring_enrichment(self, monkeypatch) -> None:
@@ -1575,8 +1547,6 @@ class TestRequestPolicyInputGuardrail:
                 )
             ),
         )
-        materialize = AsyncMock()
-        monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize)
         ctx = _ctx()
         policy_inputs = agent_module.RequestPolicyGuardrailInputs(
             user_message="Insufficient signal for a requested effect",
@@ -1596,16 +1566,13 @@ class TestRequestPolicyInputGuardrail:
         )[0]
         await guardrail.run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
 
-        materialize.assert_not_awaited()
         assert ctx.turn_intent is not None
         assert ctx.turn_intent.mode is TurnIntentMode.UNKNOWN
         assert ctx.turn_intent.authority.may_update_workflow is False
         assert ctx.turn_intent.authority.may_run_blocks is False
 
     @pytest.mark.asyncio
-    async def test_authoring_enriches_once_and_rebuilds_authority_from_same_classifier_result(
-        self, monkeypatch
-    ) -> None:
+    async def test_build_authority_comes_from_turn_intent_without_policy_enrichment(self, monkeypatch) -> None:
         policy = RequestPolicy(_authoring_pending=True)
         classifier_result = TurnIntentClassifierResult.success(
             TurnIntentClassification(mode=TurnIntentMode.BUILD, confidence=0.95)
@@ -1618,15 +1585,6 @@ class TestRequestPolicyInputGuardrail:
         classify = AsyncMock(return_value=classifier_result)
         monkeypatch.setattr(agent_module, "classify_turn_intent", classify)
 
-        async def materialize(target: RequestPolicy, **_kwargs) -> RequestPolicy:
-            target.allow_update_workflow = False
-            target.allow_run_blocks = False
-            target.completion_criteria = [CompletionCriterion(id="c0", outcome="Draft exists")]
-            target._authoring_pending = False
-            return target
-
-        materialize_mock = AsyncMock(side_effect=materialize)
-        monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize_mock)
         ctx = _ctx()
         policy_inputs = agent_module.RequestPolicyGuardrailInputs(
             user_message="Add a Google Sheets write step to this workflow",
@@ -1647,147 +1605,11 @@ class TestRequestPolicyInputGuardrail:
         await guardrail.run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
 
         classify.assert_awaited_once()
-        materialize_mock.assert_awaited_once()
         assert ctx.turn_intent is not None
         assert ctx.turn_intent.mode is TurnIntentMode.BUILD
-        assert ctx.turn_intent.authority.may_update_workflow is False
-        assert ctx.turn_intent.authority.may_run_blocks is False
-
-    @pytest.mark.asyncio
-    async def test_request_policy_trust_floor_defers_completion_producers(self, monkeypatch) -> None:
-        prompts: list[str] = []
-
-        async def handler(*, prompt: str, **_kwargs: object) -> dict[str, object]:
-            prompts.append(prompt)
-            return {
-                "testing_intent": "require_test",
-                "credential_input_kind": "none",
-                "credential_refs": [],
-                "login_page_urls": [],
-                "login_intent": False,
-                "email_signin_intent": False,
-                "signin_email_candidates": [],
-                "requires_user_clarification": False,
-                "raw_secret_handling": "none",
-                "clarification_reason": "none",
-            }
-
-        produce_request_slots = AsyncMock()
-        monkeypatch.setattr(request_policy_module, "produce_request_slots", produce_request_slots)
-
-        policy = await _classify_request_trust_floor(
-            "Build and test a workflow",
-            "",
-            [],
-            "",
-            handler,
-        )
-
-        produce_request_slots.assert_not_awaited()
-        assert policy.authoring_intent == "pending"
-        assert policy.completion_contract is None
+        assert ctx.turn_intent.authority.may_update_workflow is True
+        assert ctx.turn_intent.authority.may_run_blocks is True
         assert policy.completion_criteria == []
-        assert policy._authoring_pending is True
-        assert len(prompts) == 1
-        assert "completion_contract" not in prompts[0]
-        assert "completion_criteria" not in prompts[0]
-        assert "REQUEST SLOT SOURCES" not in prompts[0]
-
-    @pytest.mark.asyncio
-    async def test_request_policy_trust_floor_defers_fallback_criteria_until_authoring(self) -> None:
-        policy = await _classify_request_trust_floor(
-            "Build a workflow that extracts the page title",
-            "",
-            [],
-            "",
-            None,
-        )
-
-        assert policy.completion_criteria == []
-        assert policy._authoring_pending is True
-
-        await materialize_request_policy_authoring(
-            policy,
-            user_message="Build a workflow that extracts the page title",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            handler=None,
-        )
-
-        assert policy.completion_criteria
-        assert policy.authoring_intent == "author_now"
-        assert policy._authoring_pending is False
-
-    @pytest.mark.asyncio
-    async def test_authoring_materialization_preserves_trust_floor_fields(self, monkeypatch) -> None:
-        policy = RequestPolicy(
-            testing_intent="require_test",
-            credential_input_kind="credential_name",
-            credential_refs=["saved-login"],
-            allow_update_workflow=False,
-            allow_run_blocks=False,
-            _authoring_pending=True,
-        )
-        enriched = RequestPolicy(
-            testing_intent="skip_test",
-            authoring_intent="author_now",
-            credential_input_kind="none",
-            allow_update_workflow=True,
-            allow_run_blocks=True,
-            completion_contract="The draft exists",
-            completion_criteria=[CompletionCriterion(id="c0", outcome="The draft exists")],
-            completion_contract_status="present",
-        )
-        classify = AsyncMock(return_value=enriched)
-        monkeypatch.setattr(request_policy_module, "_classify_request", classify)
-
-        await materialize_request_policy_authoring(
-            policy,
-            user_message="Build and test the workflow with saved-login",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            handler=object(),
-        )
-
-        classify.assert_awaited_once()
-        assert policy.testing_intent == "require_test"
-        assert policy.credential_input_kind == "credential_name"
-        assert policy.credential_refs == ["saved-login"]
-        assert policy.allow_update_workflow is False
-        assert policy.allow_run_blocks is False
-        assert policy.completion_criteria == enriched.completion_criteria
-        assert policy._authoring_pending is False
-
-    @pytest.mark.asyncio
-    async def test_authoring_materialization_preserves_explicit_defer_authoring_authority(self, monkeypatch) -> None:
-        policy = RequestPolicy(
-            allow_update_workflow=True,
-            allow_run_blocks=True,
-            _authoring_pending=True,
-        )
-        enriched = RequestPolicy(
-            authoring_intent="defer_authoring",
-            allow_update_workflow=True,
-            allow_run_blocks=True,
-        )
-        monkeypatch.setattr(request_policy_module, "_classify_request", AsyncMock(return_value=enriched))
-
-        await materialize_request_policy_authoring(
-            policy,
-            user_message="Fill the live form, but do not create a workflow yet",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            handler=object(),
-        )
-
-        assert policy.authoring_intent == "defer_authoring"
-        assert policy.allow_update_workflow is False
-        assert policy.allow_run_blocks is False
-        assert any(is_defer_authoring_durable_fill_criterion(item) for item in policy.completion_criteria)
-        assert policy._authoring_pending is False
 
     @pytest.mark.asyncio
     async def test_sdk_input_guardrail_computes_and_stores_request_policy(self, monkeypatch) -> None:
@@ -1873,16 +1695,14 @@ class TestRequestPolicyInputGuardrail:
         assert classify_turn_intent.await_args.kwargs["handler"] is turn_intent_handler
 
     @pytest.mark.asyncio
-    async def test_sdk_input_guardrail_defers_stored_active_criteria_until_authoring(self, monkeypatch) -> None:
+    async def test_sdk_input_guardrail_ignores_stored_interactive_criteria(self, monkeypatch) -> None:
         stored = StoredCriteriaSet(
             set_id="wccs_1",
             goal_epoch=1,
             criteria=(CompletionCriterion(id="c0", outcome="The main heading is extracted into the run output"),),
         )
         build_request_policy = AsyncMock(return_value=RequestPolicy(_authoring_pending=True))
-        materialize = AsyncMock()
         monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", build_request_policy)
-        monkeypatch.setattr(agent_module, "materialize_request_policy_authoring", materialize)
         monkeypatch.setattr(
             agent_module,
             "classify_turn_intent",
@@ -1912,8 +1732,6 @@ class TestRequestPolicyInputGuardrail:
 
         assert build_request_policy.await_args is not None
         assert "active_criteria" not in build_request_policy.await_args.kwargs
-        assert materialize.await_args is not None
-        assert materialize.await_args.kwargs["active_criteria"] == list(stored.criteria)
 
     @pytest.mark.asyncio
     async def test_sdk_input_guardrail_trips_after_computing_blocked_policy(self, monkeypatch) -> None:
@@ -1927,6 +1745,15 @@ class TestRequestPolicyInputGuardrail:
             clarification_question="Do not paste raw credentials.",
         )
         monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", AsyncMock(return_value=policy))
+        monkeypatch.setattr(
+            agent_module,
+            "classify_turn_intent",
+            AsyncMock(
+                return_value=TurnIntentClassifierResult.success(
+                    TurnIntentClassification(mode=TurnIntentMode.BUILD, confidence=0.95)
+                )
+            ),
+        )
         ctx = _ctx()
         guardrails = agent_module._build_copilot_input_guardrails(
             InputGuardrail,
@@ -1959,6 +1786,15 @@ class TestRequestPolicyInputGuardrail:
             user_response_policy="proceed",
         )
         monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", AsyncMock(return_value=policy))
+        monkeypatch.setattr(
+            agent_module,
+            "classify_turn_intent",
+            AsyncMock(
+                return_value=TurnIntentClassifierResult.success(
+                    TurnIntentClassification(mode=TurnIntentMode.BUILD, confidence=0.95)
+                )
+            ),
+        )
         ctx = _ctx()
         guardrails = agent_module._build_copilot_input_guardrails(
             InputGuardrail,
@@ -1998,6 +1834,15 @@ class TestRequestPolicyInputGuardrail:
             user_response_policy="proceed",
         )
         monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", AsyncMock(return_value=policy))
+        monkeypatch.setattr(
+            agent_module,
+            "classify_turn_intent",
+            AsyncMock(
+                return_value=TurnIntentClassifierResult.success(
+                    TurnIntentClassification(mode=TurnIntentMode.BUILD, confidence=0.95)
+                )
+            ),
+        )
         ctx = _ctx()
         guardrails = agent_module._build_copilot_input_guardrails(
             InputGuardrail,
@@ -2037,8 +1882,19 @@ class TestRequestPolicyInputGuardrail:
             raw_secret_handling="redacted_draft",
             allow_run_blocks=False,
             allow_missing_credentials_in_draft=True,
+            canonical_user_message=redact_raw_secrets_for_prompt(raw_message),
         )
         monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", AsyncMock(return_value=policy))
+        turn_intent_classifier = AsyncMock(
+            return_value=TurnIntentClassifierResult.success(
+                TurnIntentClassification(mode=TurnIntentMode.DRAFT_ONLY, confidence=0.95)
+            )
+        )
+        monkeypatch.setattr(
+            agent_module,
+            "classify_turn_intent",
+            turn_intent_classifier,
+        )
         ctx = _ctx()
         guardrails = agent_module._build_copilot_input_guardrails(
             InputGuardrail,
@@ -2063,6 +1919,89 @@ class TestRequestPolicyInputGuardrail:
         assert ctx.user_message == redact_raw_secrets_for_prompt(raw_message)
         assert "[REDACTED_SECRET]" in ctx.user_message
         assert ctx.allow_untested_workflow_draft is True
+        classified_message = turn_intent_classifier.await_args.kwargs["user_message"]
+        assert classified_message == policy.canonical_user_message
+        assert "sk-abcdefghijklmnopqrstuvwxyz1234567890" not in classified_message
+
+    @pytest.mark.asyncio
+    async def test_invalid_raw_secret_safety_state_blocks_before_turn_intent(self, monkeypatch) -> None:
+        policy = RequestPolicy(
+            user_response_policy="ask_clarification",
+            requires_user_clarification=True,
+            clarification_reason="raw_secret",
+            raw_secret_handling="block",
+            raw_secret_safety_status="blocked",
+            raw_secret_safety_failure_kind="invalid_citation",
+            allow_update_workflow=False,
+            allow_run_blocks=False,
+            canonical_user_message="[INPUT_BLOCKED_BY_SECRET_SAFETY]",
+        )
+        monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", AsyncMock(return_value=policy))
+        turn_intent_classifier = AsyncMock()
+        monkeypatch.setattr(agent_module, "classify_turn_intent", turn_intent_classifier)
+        ctx = _ctx()
+        guardrail = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=agent_module.RequestPolicyGuardrailInputs(
+                user_message="The password is Hunter2Portal!",
+                workflow_yaml="",
+                chat_history_text="",
+                chat_history_messages=[],
+                global_llm_context="",
+                organization_id="org-1",
+                request_policy_handler=object(),
+                turn_intent_handler=object(),
+            ),
+        )[0]
+
+        result = await guardrail.run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        assert result.output.tripwire_triggered is True
+        turn_intent_classifier.assert_not_awaited()
+        assert ctx.user_message == "[INPUT_BLOCKED_BY_SECRET_SAFETY]"
+
+    @pytest.mark.asyncio
+    async def test_raw_secret_non_draft_intent_is_blocked_after_redacted_classification(self, monkeypatch) -> None:
+        raw_message = "Use api_key='sk-abcdefghijklmnopqrstuvwxyz1234567890' to run this workflow"
+        policy = RequestPolicy(
+            credential_input_kind="raw_secret",
+            raw_secret_detected=True,
+            raw_secret_handling="redacted_draft",
+        )
+        monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", AsyncMock(return_value=policy))
+        monkeypatch.setattr(
+            agent_module,
+            "classify_turn_intent",
+            AsyncMock(
+                return_value=TurnIntentClassifierResult.success(
+                    TurnIntentClassification(mode=TurnIntentMode.BUILD, confidence=0.95)
+                )
+            ),
+        )
+        ctx = _ctx()
+        guardrail = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=agent_module.RequestPolicyGuardrailInputs(
+                user_message=raw_message,
+                workflow_yaml="",
+                chat_history_text="",
+                chat_history_messages=[],
+                global_llm_context="",
+                organization_id="org-1",
+                request_policy_handler=None,
+                turn_intent_handler=object(),
+            ),
+        )[0]
+
+        result = await guardrail.run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        assert result.output.tripwire_triggered is True
+        assert policy.raw_secret_handling == "block"
+        assert "sk-abcdefghijklmnopqrstuvwxyz1234567890" not in ctx.user_message
+        assert ctx.turn_intent is not None
+        assert ctx.turn_intent.mode is TurnIntentMode.REFUSE
 
 
 class TestShouldRestorePersistedWorkflow:
@@ -2352,7 +2291,6 @@ workflow_definition:
         assert json.loads(result)["ok"] is True
         assert captured["workflow_yaml"] == clean_yaml
         assert captured["run_called"] is True
-        assert ctx.coverage_nudge_count == 0
         assert "Achieve the following mini goal" not in captured["workflow_yaml"]
 
 
@@ -3576,6 +3514,26 @@ class TestCredentialRefusalReachesAgent:
             assert f"`{unavailable_name}`" not in prompt
             assert f"**{unavailable_name}**" not in prompt
 
+    def test_registered_download_effect_renders_canonical_output_ref_without_policy_criteria(self) -> None:
+        config = CopilotConfig()
+        ctx = _ctx(
+            copilot_config=config,
+            request_policy=RequestPolicy(completion_criteria=[]),
+            turn_intent=TurnIntent(
+                mode=TurnIntentMode.BUILD,
+                authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+                deliverable_kind=TurnIntentDeliverableKind.REGISTERED_DOWNLOAD,
+            ),
+        )
+        instructions = agent_module._build_dynamic_system_prompt(tool_usage_guide="", config=config)
+
+        prompt = instructions(SimpleNamespace(context=ctx), object())
+
+        assert "ordered_deliverables:" in prompt
+        assert "kind: registered_download" in prompt
+        assert "requested_output_paths:\n- output.downloaded_files" in prompt
+        assert ctx.request_policy.completion_criteria == []
+
     @pytest.mark.asyncio
     async def test_run_copilot_agent_logs_resolved_block_authoring_policy(
         self, monkeypatch: pytest.MonkeyPatch
@@ -3628,6 +3586,9 @@ class TestCredentialRefusalReachesAgent:
                 global_llm_context=None,
                 debug_run_info_text="",
                 llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+                raw_secret_safety_handler=AsyncMock(
+                    return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+                ),
                 api_key="sk-test",
                 config=CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER),
                 turn_id="turn-1",
@@ -3706,1495 +3667,6 @@ class TestNativeToolSurface:
         )
 
         assert [tool.name for tool in filtered] == ["update_workflow", "update_and_run_blocks"]
-
-
-class TestRequestPolicyCredentialResolution:
-    @pytest.mark.asyncio
-    async def test_request_policy_classifier_uses_configured_default_timeout_budget(self, monkeypatch) -> None:
-        from skyvern.config import Settings, settings
-        from skyvern.forge.sdk.copilot import request_policy as rp
-
-        default_timeout = Settings.model_fields["COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS"].default
-        assert default_timeout == 12.0
-
-        observed_timeouts: list[float | None] = []
-        real_wait_for = rp.asyncio.wait_for
-
-        async def recording_wait_for(awaitable, timeout=None):
-            observed_timeouts.append(timeout)
-            return await real_wait_for(awaitable, timeout=timeout)
-
-        monkeypatch.setattr(settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", default_timeout)
-        monkeypatch.setattr(rp.time, "monotonic", lambda: 1000.0)
-        monkeypatch.setattr(rp.asyncio, "wait_for", recording_wait_for)
-
-        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
-            return {
-                "credential_input_kind": "none",
-                "completion_contract": "complete when the account page is visible",
-            }
-
-        policy = await _classify_request(
-            user_message=(
-                "Build a workflow for https://example.com/account. complete when the account page is visible"
-            ),
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            handler=_with_empty_request_slots(handler),
-        )
-
-        assert policy.classifier_status == "success"
-        # The primary policy classifier uses the configured budget. The independent
-        # request-slot producer then performs its two matching deterministic reads.
-        assert observed_timeouts == [default_timeout, 30.0, 30.0]
-
-    @pytest.mark.asyncio
-    async def test_request_policy_classifier_timeout_does_not_retry(self, monkeypatch) -> None:
-        from skyvern.config import settings
-
-        monkeypatch.setattr(settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", 0.05)
-        calls = 0
-
-        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
-            nonlocal calls
-            calls += 1
-            await asyncio.sleep(0.5)
-            return {"credential_input_kind": "none", "completion_contract": None}
-
-        policy = await _classify_request(
-            user_message="Build a workflow for https://example.com.",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            handler=_with_empty_request_slots(handler),
-        )
-
-        assert calls == 1
-        assert policy.classifier_status == "fallback"
-        assert policy.classifier_failure_kind == "timeout"
-        assert policy.classifier_retry_count == 0
-        assert policy.completion_contract_status == "present"
-
-    @pytest.mark.asyncio
-    async def test_request_policy_classifier_slow_but_within_budget_returns_real_policy(self, monkeypatch) -> None:
-        from skyvern.config import settings
-
-        monkeypatch.setattr(settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", 0.5)
-        calls = 0
-
-        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
-            nonlocal calls
-            calls += 1
-            await asyncio.sleep(0.05)
-            return {
-                "credential_input_kind": "none",
-                "completion_contract": "complete when the account page is visible",
-            }
-
-        policy = await _classify_request(
-            user_message=(
-                "Build a workflow for https://example.com/account. complete when the account page is visible"
-            ),
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            handler=_with_empty_request_slots(handler),
-        )
-
-        assert calls == 1
-        assert policy.classifier_status == "success"
-        assert policy.classifier_retry_count == 0
-        assert policy.completion_contract_status == "present"
-        assert policy.completion_contract
-
-    @pytest.mark.asyncio
-    async def test_request_policy_classifier_malformed_payload_falls_back_without_retry(self) -> None:
-        calls = 0
-
-        async def handler(*, prompt: str, prompt_name: str) -> str:
-            nonlocal calls
-            calls += 1
-            return "I can build that workflow."
-
-        policy = await _classify_request(
-            user_message="Build a workflow for https://example.com.",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            handler=handler,
-        )
-
-        assert calls == 1
-        assert policy.classifier_status == "fallback"
-        assert policy.classifier_failure_kind == "provider_error"
-        assert policy.classifier_retry_count == 0
-        assert policy.completion_contract_status == "present"
-
-    @pytest.mark.asyncio
-    async def test_request_policy_classifier_malformed_payload_preserves_timeout_failure(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        async def malformed_after_timeout(*_args: object, **_kwargs: object) -> tuple[str, str, int]:
-            return "not-json", "timeout", 1
-
-        monkeypatch.setattr(request_policy_module, "_run_request_policy_classifier", malformed_after_timeout)
-
-        policy = await _classify_request(
-            user_message="Build a workflow for https://example.com.",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            handler=AsyncMock(),
-        )
-
-        assert policy.classifier_status == "fallback"
-        assert policy.classifier_failure_kind == "timeout"
-        assert policy.classifier_retry_count == 1
-        assert policy.completion_contract_status == "present"
-
-    @pytest.mark.asyncio
-    async def test_request_policy_classifier_retries_transient_error_then_succeeds(self) -> None:
-        class RateLimitError(Exception):
-            __module__ = "openai"
-
-        calls = 0
-
-        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                raise RateLimitError("rate limit")
-            return {
-                "credential_input_kind": "none",
-                "completion_contract": "complete when the account page is visible",
-            }
-
-        policy = await _classify_request(
-            user_message=(
-                "Build a workflow for https://example.com/account. complete when the account page is visible"
-            ),
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            handler=_with_empty_request_slots(handler),
-        )
-
-        assert calls == 2
-        assert policy.classifier_status == "success"
-        assert policy.classifier_retry_count == 1
-        assert policy.completion_contract_status == "present"
-
-    @pytest.mark.asyncio
-    async def test_request_policy_classifier_retries_transient_error_then_falls_back(self) -> None:
-        class RateLimitError(Exception):
-            __module__ = "openai"
-
-        calls = 0
-
-        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
-            nonlocal calls
-            calls += 1
-            raise RateLimitError("rate limit")
-
-        policy = await _classify_request(
-            user_message="Build a workflow for https://example.com/account.",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            handler=handler,
-        )
-
-        assert calls == 2
-        assert policy.classifier_status == "fallback"
-        assert policy.classifier_failure_kind == "provider_error"
-        assert policy.classifier_retry_count == 1
-        assert policy.completion_contract_status == "present"
-
-    @pytest.mark.asyncio
-    async def test_request_policy_classifier_non_retriable_error_does_not_retry(self) -> None:
-        calls = 0
-
-        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
-            nonlocal calls
-            calls += 1
-            raise ValueError("bad request")
-
-        policy = await _classify_request(
-            user_message="Build a workflow for https://example.com/account.",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            handler=handler,
-        )
-
-        assert calls == 1
-        assert policy.classifier_status == "fallback"
-        assert policy.classifier_failure_kind == "provider_error"
-        assert policy.classifier_retry_count == 0
-        assert policy.completion_contract_status == "present"
-
-    @pytest.mark.asyncio
-    async def test_request_policy_classifier_transient_error_exhausting_budget_labels_transient(
-        self, monkeypatch
-    ) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as rp
-
-        class RateLimitError(Exception):
-            __module__ = "openai"
-
-        # deadline calc, then iteration-1 remaining; every later call reads past the deadline so the
-        # retry never starts and the budget-exhaustion path labels the prior retriable error.
-        clock = iter([1000.0, 1000.0])
-        monkeypatch.setattr(rp.time, "monotonic", lambda: next(clock, 1_000_000.0))
-        calls = 0
-
-        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
-            nonlocal calls
-            calls += 1
-            raise RateLimitError("rate limit")
-
-        policy = await _classify_request(
-            user_message="Build a workflow for https://example.com/account.",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            handler=handler,
-        )
-
-        assert calls == 1
-        assert policy.classifier_status == "fallback"
-        assert policy.classifier_failure_kind == "transient_error"
-        assert policy.classifier_retry_count == 1
-        assert policy.completion_contract_status == "present"
-
-    @pytest.mark.asyncio
-    async def test_missing_user_supplied_credential_id_rides_along_when_another_resolves(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        get_credentials_by_ids = AsyncMock(return_value=[SimpleNamespace(credential_id="cred_valid")])
-        monkeypatch.setattr(
-            policy_module.app,
-            "DATABASE",
-            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
-        )
-
-        policy = await build_request_policy(
-            user_message="Please build it with cred_valid and cred_missing.",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=None,
-        )
-
-        assert policy.credential_input_kind == "credential_id"
-        assert policy.credential_refs == ["cred_valid", "cred_missing"]
-        assert policy.invalid_credential_ids == ["cred_missing"]
-        # A stated ID that resolved carries the turn; the unresolvable one rides along as a
-        # recorded finding instead of walling the request (SKY-13552).
-        assert [credential.credential_id for credential in policy.resolved_credentials] == ["cred_valid"]
-        assert policy.user_response_policy != "ask_clarification"
-        assert policy.allow_update_workflow is True
-        assert policy.allow_run_blocks is True
-        get_credentials_by_ids.assert_awaited_once_with(["cred_valid", "cred_missing"], organization_id="org-1")
-
-    @pytest.mark.asyncio
-    async def test_skip_test_allows_missing_user_supplied_credential_ids_in_draft(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        get_credentials_by_ids = AsyncMock(return_value=[])
-        monkeypatch.setattr(
-            policy_module.app,
-            "DATABASE",
-            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
-        )
-
-        async def handler(**kwargs):
-            return {
-                "testing_intent": "skip_test",
-                "credential_input_kind": "credential_id",
-                "credential_refs": ["cred_missing"],
-            }
-
-        policy = await build_request_policy(
-            user_message="Build an untested draft with cred_missing.",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert policy.testing_intent == "skip_test"
-        assert policy.invalid_credential_ids == ["cred_missing"]
-        assert policy.user_response_policy == "proceed"
-        assert policy.allow_update_workflow is True
-        assert policy.allow_run_blocks is False
-        assert policy.allow_missing_credentials_in_draft is True
-        get_credentials_by_ids.assert_awaited_once_with(["cred_missing"], organization_id="org-1")
-
-    @pytest.mark.asyncio
-    async def test_valid_user_supplied_credential_ids_continue_normally(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        credential = SimpleNamespace(credential_id="cred_valid")
-        get_credentials_by_ids = AsyncMock(return_value=[credential])
-        monkeypatch.setattr(
-            policy_module.app,
-            "DATABASE",
-            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
-        )
-
-        policy = await build_request_policy(
-            user_message="Please build it with cred_valid.",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=None,
-        )
-
-        assert policy.credential_refs == ["cred_valid"]
-        assert policy.resolved_credentials == [credential]
-        assert policy.invalid_credential_ids == []
-        assert policy.user_response_policy == "proceed"
-        assert policy.allow_run_blocks is True
-        get_credentials_by_ids.assert_awaited_once_with(["cred_valid"], organization_id="org-1")
-
-    @pytest.mark.asyncio
-    async def test_existing_workflow_credential_ids_ignore_yaml_comments(self) -> None:
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        async def handler(**kwargs):
-            return {"testing_intent": "unspecified", "credential_input_kind": "none"}
-
-        policy = await build_request_policy(
-            user_message="Please update the navigation goal.",
-            workflow_yaml="""
-workflow_definition:
-  # cred_comment should not be treated as a workflow credential.
-  parameters:
-    - parameter_type: workflow
-      workflow_parameter_type: credential_id
-      key: login_credentials
-      default_value: cred_safe
-  blocks:
-    - block_type: navigation
-      label: open_site
-      url: https://login.example.test
-      parameter_keys:
-        - login_credentials
-""",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert policy.existing_workflow_credential_ids == ["cred_safe"]
-        assert "cred_comment" not in policy.existing_workflow_credential_ids
-
-    @pytest.mark.asyncio
-    async def test_existing_workflow_credential_ids_include_inline_conditional_branch_blocks(self) -> None:
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        async def handler(**kwargs):
-            return {"testing_intent": "unspecified", "credential_input_kind": "none"}
-
-        policy = await build_request_policy(
-            user_message="Please update the navigation goal.",
-            workflow_yaml="""
-workflow_definition:
-  parameters:
-    - parameter_type: workflow
-      workflow_parameter_type: credential_id
-      key: login_credentials
-      default_value: cred_branch
-  blocks:
-    - block_type: conditional
-      label: route_login
-      branch_conditions:
-        - is_default: true
-          blocks:
-            - block_type: login
-              label: login
-              url: https://login.example.test
-              parameter_keys:
-                - login_credentials
-""",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert policy.existing_workflow_credential_ids == ["cred_branch"]
-        assert policy.existing_workflow_credential_origins == {"cred_branch": ["https://login.example.test"]}
-
-    @pytest.mark.asyncio
-    async def test_raw_secret_with_invalid_conditional_surfaces_both_clarifications(self) -> None:
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        async def handler(**kwargs):
-            return {
-                "testing_intent": "unspecified",
-                "credential_input_kind": "raw_secret",
-                "raw_secret_handling": "block",
-            }
-
-        policy = await build_request_policy(
-            user_message="password=hunter2, then move my loop block into the conditional blocks",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert policy.clarification_reason == "raw_secret"
-        assert policy.clarification_question is not None
-        assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in policy.clarification_question
-        assert "Conditional blocks route to other blocks" in policy.clarification_question
-
-    @pytest.mark.asyncio
-    async def test_raw_inline_secret_refuses_after_redacted_classification(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        get_credentials_by_ids = AsyncMock()
-        monkeypatch.setattr(
-            policy_module.app,
-            "DATABASE",
-            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
-        )
-        handler = AsyncMock(
-            return_value={
-                "testing_intent": "unspecified",
-                "credential_input_kind": "raw_secret",
-                "credential_refs": [],
-                "login_page_urls": [],
-                "requires_user_clarification": True,
-                "clarification_reason": "raw_secret",
-                "completion_contract": None,
-                "raw_secret_handling": "block",
-            }
-        )
-
-        policy = await build_request_policy(
-            user_message="Use username test@example.com and password=s3cr3tValue991! to log in.",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=_with_empty_request_slots(handler),
-        )
-
-        assert policy.raw_secret_detected is True
-        assert policy.credential_input_kind == "raw_secret"
-        assert policy.user_response_policy == "ask_clarification"
-        assert policy.allow_update_workflow is False
-        assert policy.allow_run_blocks is False
-        assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in (policy.clarification_question or "")
-        assert "s3cr3tValue991" not in (policy.clarification_question or "")
-        handler.assert_awaited_once()
-        assert "s3cr3tValue991" not in handler.await_args.kwargs["prompt"]
-        get_credentials_by_ids.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_prior_turn_raw_password_does_not_leak_into_classifier_prompt(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        monkeypatch.setattr(
-            policy_module.app,
-            "DATABASE",
-            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[]))),
-        )
-
-        captured: dict[str, str] = {}
-
-        async def handler(*, prompt: str, prompt_name: str) -> str:
-            captured["prompt"] = prompt
-            return json.dumps(
-                {
-                    "testing_intent": "unspecified",
-                    "credential_input_kind": "credential_name",
-                    "credential_refs": [],
-                    "login_page_urls": [],
-                    "requires_user_clarification": True,
-                    "clarification_reason": "credential_name_unresolved",
-                    "completion_contract": None,
-                }
-            )
-
-        chat_history = _history(
-            ("user", "wait."),
-            ("ai", "What is the URL of the web browser game?"),
-            ("user", "https://example.com/"),
-            ("ai", "The URL redirected to https://www.poki.com/. Confirm?"),
-            ("user", "Now, log in to account demo, password ac3O4/30"),
-            ("ai", "DO NOT PROVIDE RAW LOGIN/PASSWORD."),
-        )
-
-        policy = await build_request_policy(
-            user_message="Navigate to https://example.com and login with the given credentials.",
-            workflow_yaml="",
-            chat_history=chat_history,
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert "ac3O4/30" not in captured["prompt"]
-        assert policy.raw_secret_detected is False
-        assert policy.credential_input_kind == "credential_name"
-        assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" not in (policy.clarification_question or "")
-        assert policy.clarification_question and "Which saved credential" in policy.clarification_question
-
-    @pytest.mark.asyncio
-    async def test_bulk_colon_delimited_credentials_refuse_after_redacted_classification(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        get_credentials_by_ids = AsyncMock()
-        monkeypatch.setattr(
-            policy_module.app,
-            "DATABASE",
-            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
-        )
-        handler = AsyncMock(
-            return_value={
-                "testing_intent": "unspecified",
-                "credential_input_kind": "raw_secret",
-                "credential_refs": [],
-                "login_page_urls": [],
-                "requires_user_clarification": True,
-                "clarification_reason": "raw_secret",
-                "completion_contract": None,
-                "raw_secret_handling": "block",
-            }
-        )
-
-        policy = await build_request_policy(
-            user_message=(
-                "Use these accounts:\nalpha@example.test:FakePass123!\nbeta@example.test:AnotherFakePass456!"
-            ),
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=_with_empty_request_slots(handler),
-        )
-
-        assert policy.raw_secret_detected is True
-        assert policy.credential_input_kind == "raw_secret"
-        assert policy.user_response_policy == "ask_clarification"
-        assert policy.allow_update_workflow is False
-        assert policy.allow_run_blocks is False
-        assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in (policy.clarification_question or "")
-        assert "FakePass123" not in repr(policy.to_trace_data())
-        handler.assert_awaited_once()
-        assert "FakePass123" not in handler.await_args.kwargs["prompt"]
-        get_credentials_by_ids.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_raw_secret_code_conversion_proceeds_as_redacted_draft(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        monkeypatch.setattr(
-            policy_module.app,
-            "DATABASE",
-            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock())),
-        )
-        captured: dict[str, str] = {}
-
-        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
-            captured["prompt"] = prompt
-            return {
-                "testing_intent": "require_test",
-                "credential_input_kind": "placeholder",
-                "credential_refs": [],
-                "login_page_urls": [],
-                "requires_user_clarification": False,
-                "clarification_reason": "none",
-                "completion_contract": None,
-                "raw_secret_handling": "redacted_draft",
-            }
-
-        policy = await build_request_policy(
-            user_message=(
-                "Convert this SDK snippet into a workflow:\n"
-                "client = DemoClient(api_key='sk-abcdefghijklmnopqrstuvwxyz1234567890')"
-            ),
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert "sk-abcdefghijklmnopqrstuvwxyz1234567890" not in captured["prompt"]
-        assert policy.raw_secret_detected is True
-        assert policy.raw_secret_handling == "redacted_draft"
-        assert policy.user_response_policy == "proceed"
-        assert policy.testing_intent == "skip_test"
-        assert policy.allow_update_workflow is True
-        assert policy.allow_run_blocks is False
-        assert policy.allow_missing_credentials_in_draft is True
-        assert policy.requires_user_clarification is False
-
-    @pytest.mark.asyncio
-    async def test_raw_secret_login_request_still_blocks_after_redacted_classifier(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        monkeypatch.setattr(
-            policy_module.app,
-            "DATABASE",
-            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock())),
-        )
-
-        async def handler(**kwargs):
-            return {
-                "testing_intent": "unspecified",
-                "credential_input_kind": "raw_secret",
-                "credential_refs": [],
-                "login_page_urls": [],
-                "requires_user_clarification": True,
-                "clarification_reason": "raw_secret",
-                "completion_contract": None,
-                "raw_secret_handling": "block",
-            }
-
-        policy = await build_request_policy(
-            user_message="Use username test@example.com and password=s3cr3tValue991! to log in.",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert policy.raw_secret_detected is True
-        assert policy.raw_secret_handling == "block"
-        assert policy.user_response_policy == "ask_clarification"
-        assert policy.allow_update_workflow is False
-        assert policy.allow_run_blocks is False
-
-    @pytest.mark.asyncio
-    async def test_repeated_unresolved_saved_credential_name_defers_to_draft(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[]))
-        monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
-
-        async def handler(**kwargs):
-            return {
-                "testing_intent": "unspecified",
-                "credential_input_kind": "credential_name",
-                "credential_refs": ["missing_login"],
-                "login_page_urls": [],
-                "requires_user_clarification": False,
-                "clarification_reason": "none",
-                "completion_contract": None,
-            }
-
-        policy = await build_request_policy(
-            user_message="missing_login",
-            workflow_yaml="",
-            chat_history=_history(
-                (
-                    "ai",
-                    "Which saved credential should I use? Please provide the exact credential name or a credential ID beginning with cred_.",
-                ),
-            ),
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert policy.user_response_policy == "proceed"
-        assert policy.allow_update_workflow is True
-        assert policy.allow_run_blocks is False
-        assert policy.allow_missing_credentials_in_draft is True
-        assert policy.requires_user_clarification is False
-
-    @pytest.mark.asyncio
-    async def test_fallback_policy_resolves_explicit_saved_credential_name(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        credential = SimpleNamespace(
-            credential_id="cred_portal",
-            name="mock-portal-login",
-            tested_url="https://portal.example/login",
-        )
-        credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[credential]))
-        monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
-
-        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
-            raise ValueError("classifier unavailable")
-
-        policy = await build_request_policy(
-            user_message='Log into the portal with saved credential named "mock-portal-login".',
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert policy.classifier_status == "fallback"
-        assert policy.classifier_failure_kind == "provider_error"
-        assert policy.completion_contract_status == "present"
-        assert policy.credential_input_kind == "credential_name"
-        assert policy.credential_refs == ["mock-portal-login"]
-        assert policy.resolved_credentials == [credential]
-
-    @pytest.mark.asyncio
-    async def test_fallback_policy_does_not_substring_match_saved_credential_name(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        credential = SimpleNamespace(credential_id="cred_login", name="login", tested_url=None)
-        credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[credential]))
-        monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
-
-        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
-            raise ValueError("classifier unavailable")
-
-        policy = await build_request_policy(
-            user_message="Log in to the portal using my saved credential.",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert policy.classifier_status == "fallback"
-        assert policy.completion_contract_status == "present"
-        assert policy.credential_input_kind == "none"
-        assert policy.credential_refs == []
-        credentials.get_credentials.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_request_policy_url_matching_and_skip_draft(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        credential = SimpleNamespace(
-            credential_id="cred_bank",
-            name="Bank",
-            tested_url="https://bank.example/login",
-            credential_type=CredentialType.PASSWORD,
-        )
-        credentials = SimpleNamespace(
-            get_credentials=AsyncMock(return_value=[credential]),
-            get_credentials_by_ids=AsyncMock(return_value=[credential]),
-        )
-        monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
-
-        async def handler(**kwargs):
-            return handler.response
-
-        args = dict(workflow_yaml="", global_llm_context="", organization_id="org-1", handler=handler)
-        handler.response = {
-            "credential_input_kind": "credential_name",
-            "credential_refs": ["Bank"],
-        }
-        name_policy = await build_request_policy(user_message="use my saved Bank credential", chat_history=[], **args)
-        assert name_policy.user_response_policy == "proceed"
-        assert name_policy.resolved_credentials == [credential]
-
-        handler.response = {
-            "credential_input_kind": "website_stored_credential",
-            "login_page_urls": ["https://bank.example/login"],
-        }
-        site_policy = await build_request_policy(user_message="use the saved login", chat_history=[], **args)
-        assert site_policy.user_response_policy == "proceed"
-        assert site_policy.resolved_credentials == [credential]
-
-        handler.response = {
-            "credential_input_kind": "website_stored_credential",
-            "login_page_urls": ["https://evil.example/login"],
-        }
-        url_policy = await build_request_policy(user_message="use the saved login", chat_history=[], **args)
-        assert url_policy.user_response_policy == "ask_clarification" and not url_policy.resolved_credentials
-
-        handler.response = {
-            "testing_intent": "require_test",
-            "credential_input_kind": "website_stored_credential",
-            "login_page_urls": ["https://bank.example/login"],
-            "requires_user_clarification": False,
-            "clarification_reason": "none",
-        }
-        exact_url_policy = await build_request_policy(
-            user_message=(
-                "Build and test a workflow that logs into https://bank.example/login "
-                "using the saved credential for that site."
-            ),
-            chat_history=[],
-            **args,
-        )
-        assert exact_url_policy.user_response_policy == "proceed"
-        assert exact_url_policy.testing_intent == "require_test"
-        assert exact_url_policy.credential_input_kind == "website_stored_credential"
-        assert exact_url_policy.resolved_credentials == [credential]
-        assert exact_url_policy.allow_update_workflow and exact_url_policy.allow_run_blocks
-
-        handler.response = {
-            "credential_input_kind": "website_stored_credential",
-            "login_page_urls": ["https://evil.example/login"],
-        }
-        no_suffix_policy = await build_request_policy(
-            user_message="Use the stored credential for https://evil.example/login.",
-            chat_history=[],
-            **args,
-        )
-        assert no_suffix_policy.user_response_policy == "ask_clarification"
-        assert not no_suffix_policy.resolved_credentials
-        assert "could not find a stored credential" in (no_suffix_policy.clarification_question or "")
-
-        handler.response = {
-            "credential_input_kind": "website_stored_credential",
-            "requires_user_clarification": True,
-            "clarification_reason": "missing_target_context",
-        }
-        missing_url_policy = await build_request_policy(
-            user_message="use my saved login for this site",
-            chat_history=[],
-            **args,
-        )
-        assert missing_url_policy.user_response_policy == "ask_clarification"
-        assert "stored credential" in (missing_url_policy.clarification_question or "")
-
-        handler.response = {
-            "testing_intent": "skip_test",
-            "credential_input_kind": "none",
-            "requires_user_clarification": True,
-            "clarification_reason": "credential_name_unresolved",
-        }
-        vague_skip_policy = await build_request_policy(
-            user_message="use my saved login for this site and finish the workflow",
-            chat_history=_history(("user", "create a login workflow")),
-            **args,
-        )
-        assert vague_skip_policy.user_response_policy == "ask_clarification"
-        assert not vague_skip_policy.allow_update_workflow
-        assert not vague_skip_policy.allow_run_blocks
-        assert "saved credential" in (vague_skip_policy.clarification_question or "")
-
-        prior_clarification_context = (
-            '{"decisions_made":["request-policy clarification required: credential_name/credential_name_unresolved"]}'
-        )
-        saved_credential_question = (
-            "Which saved credential should I use? "
-            "Please provide the exact credential name or a credential ID beginning with cred_."
-        )
-        history_refs_from_context = await build_request_policy(
-            user_message="Just draft a workflow without testing it.",
-            workflow_yaml="",
-            chat_history=_history(
-                ("user", "login using the 'azure_credentials' and get the code from the 'mfa_email'")
-            ),
-            global_llm_context=prior_clarification_context,
-            organization_id="org-1",
-            handler=handler,
-        )
-        assert history_refs_from_context.user_response_policy == "proceed"
-        assert history_refs_from_context.allow_update_workflow and not history_refs_from_context.allow_run_blocks
-        assert history_refs_from_context.allow_missing_credentials_in_draft
-
-        handler.response = {
-            "testing_intent": "skip_test",
-            "credential_input_kind": "credential_name",
-            "requires_user_clarification": True,
-            "clarification_reason": "credential_name_unresolved",
-        }
-        first_turn_missing_name_policy = await build_request_policy(
-            user_message="Draft but do not test using my saved credential.",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-        assert first_turn_missing_name_policy.user_response_policy == "ask_clarification"
-        assert not first_turn_missing_name_policy.allow_update_workflow
-
-        follow_up_missing_name_policy = await build_request_policy(
-            user_message="Just draft a workflow without testing it.",
-            workflow_yaml="",
-            chat_history=_history(("user", "login using azure_credentials")),
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-        assert follow_up_missing_name_policy.user_response_policy == "ask_clarification"
-        assert not follow_up_missing_name_policy.allow_update_workflow
-        assert not follow_up_missing_name_policy.allow_run_blocks
-
-        handler.response = {
-            "testing_intent": "require_test",
-            "credential_input_kind": "none",
-            "requires_user_clarification": True,
-            "clarification_reason": "credential_name_unresolved",
-        }
-        prior_clarification_follow_up_policy = await build_request_policy(
-            user_message="let me help logging in",
-            workflow_yaml="",
-            chat_history=_history(
-                ("user", "log in via eduID"),
-                ("ai", saved_credential_question),
-            ),
-            global_llm_context=prior_clarification_context,
-            organization_id="org-1",
-            handler=handler,
-        )
-        assert prior_clarification_follow_up_policy.user_response_policy == "proceed"
-        assert prior_clarification_follow_up_policy.allow_update_workflow
-        assert not prior_clarification_follow_up_policy.allow_run_blocks
-        assert prior_clarification_follow_up_policy.allow_missing_credentials_in_draft
-        assert prior_clarification_follow_up_policy.clarification_question is None
-
-        handler.response = {
-            "testing_intent": "skip_test",
-            "credential_input_kind": "credential_name",
-            "requires_user_clarification": True,
-            "clarification_reason": "credential_name_unresolved",
-        }
-        deferred_after_question_policy = await build_request_policy(
-            user_message="i will do them later",
-            workflow_yaml="",
-            chat_history=_history(
-                ("user", "login using the 'azure_credentials' and get the code from the 'mfa_email'"),
-                ("ai", saved_credential_question),
-            ),
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-        assert deferred_after_question_policy.user_response_policy == "proceed"
-        assert deferred_after_question_policy.testing_intent == "skip_test"
-        assert deferred_after_question_policy.clarification_reason == "credential_name_unresolved"
-        assert deferred_after_question_policy.allow_update_workflow
-        assert not deferred_after_question_policy.allow_run_blocks
-        assert deferred_after_question_policy.allow_missing_credentials_in_draft
-
-        stored_credential_site_question = "Which website or login page should I use to look up the stored credential?"
-        deferred_after_site_question_policy = await build_request_policy(
-            user_message="i will do them later",
-            workflow_yaml="",
-            chat_history=_history(
-                ("user", "login using the 'azure_credentials' and get the code from the 'mfa_email'"),
-                ("ai", stored_credential_site_question),
-            ),
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-        assert deferred_after_site_question_policy.user_response_policy == "proceed"
-        assert deferred_after_site_question_policy.testing_intent == "skip_test"
-        assert deferred_after_site_question_policy.clarification_reason == "credential_name_unresolved"
-        assert deferred_after_site_question_policy.allow_update_workflow
-        assert not deferred_after_site_question_policy.allow_run_blocks
-        assert deferred_after_site_question_policy.allow_missing_credentials_in_draft
-
-        handler.response = {
-            "testing_intent": "require_test",
-            "credential_input_kind": "credential_name",
-            "requires_user_clarification": True,
-            "clarification_reason": "credential_name_unresolved",
-        }
-        prior_clarification_name_policy = await build_request_policy(
-            user_message="let me help logging in",
-            workflow_yaml="",
-            chat_history=_history(
-                ("user", "log in via eduID"),
-                ("ai", saved_credential_question),
-            ),
-            global_llm_context=prior_clarification_context,
-            organization_id="org-1",
-            handler=handler,
-        )
-        assert prior_clarification_name_policy.user_response_policy == "proceed"
-        assert prior_clarification_name_policy.allow_update_workflow
-        assert not prior_clarification_name_policy.allow_run_blocks
-        assert prior_clarification_name_policy.allow_missing_credentials_in_draft
-        assert prior_clarification_name_policy.clarification_question is None
-
-        handler.response = {
-            "testing_intent": "require_test",
-            "credential_input_kind": "none",
-            "requires_user_clarification": True,
-            "clarification_reason": "credential_name_unresolved",
-        }
-        stale_clarification_policy = await build_request_policy(
-            user_message="log into this other site",
-            workflow_yaml="",
-            chat_history=_history(
-                ("user", "log in via eduID"),
-                ("ai", saved_credential_question),
-                ("user", "never mind"),
-                ("ai", "Which page or URL should the workflow go to?"),
-            ),
-            global_llm_context=prior_clarification_context,
-            organization_id="org-1",
-            handler=handler,
-        )
-        assert stale_clarification_policy.user_response_policy == "ask_clarification"
-        assert not stale_clarification_policy.allow_update_workflow
-        assert not stale_clarification_policy.allow_run_blocks
-
-        handler.response = {
-            "testing_intent": "skip_test",
-            "credential_input_kind": "credential_name",
-            "credential_refs": ["azure_credentials", "mfa_email"],
-            "requires_user_clarification": True,
-            "clarification_reason": "credential_name_unresolved",
-        }
-        history_refs = await build_request_policy(
-            user_message="Just draft a workflow without testing it.",
-            chat_history=_history(
-                ("user", "login using the 'azure_credentials' and get the code from the 'mfa_email'")
-            ),
-            **args,
-        )
-        assert history_refs.user_response_policy == "proceed"
-        assert history_refs.credential_input_kind == "credential_name"
-        assert history_refs.credential_refs == ["azure_credentials", "mfa_email"]
-        assert history_refs.allow_update_workflow and not history_refs.allow_run_blocks
-        assert history_refs.allow_missing_credentials_in_draft
-
-        handler.response = {
-            "testing_intent": "unspecified",
-            "credential_input_kind": "credential_name",
-            "credential_refs": ["azure_credentials", "mfa_email"],
-            "requires_user_clarification": True,
-            "clarification_reason": "missing_conditional_condition",
-        }
-        credential_priority_policy = await build_request_policy(
-            user_message="Log in using the 'azure_credentials' and use 'mfa_email' for MFA. If no account is provided, search by account number.",
-            chat_history=[],
-            **args,
-        )
-        assert credential_priority_policy.user_response_policy == "ask_clarification"
-        assert credential_priority_policy.clarification_reason == "credential_name_unresolved"
-        assert "azure_credentials" in (credential_priority_policy.clarification_question or "")
-        assert "condition" not in (credential_priority_policy.clarification_question or "").lower()
-
-        handler.response = {
-            "testing_intent": "skip_test",
-            "credential_input_kind": "credential_name",
-            "credential_refs": ["azure_credentials", "mfa_email"],
-            "requires_user_clarification": True,
-            "clarification_reason": "missing_conditional_condition",
-        }
-        history_refs_with_noncredential_reason = await build_request_policy(
-            user_message="Just draft a workflow without testing it.",
-            chat_history=_history(
-                ("user", "login using the 'azure_credentials' and get the code from the 'mfa_email'")
-            ),
-            **args,
-        )
-        assert history_refs_with_noncredential_reason.user_response_policy == "proceed"
-        assert history_refs_with_noncredential_reason.clarification_reason == "credential_name_unresolved"
-        assert history_refs_with_noncredential_reason.credential_refs == ["azure_credentials", "mfa_email"]
-        assert history_refs_with_noncredential_reason.allow_update_workflow
-        assert not history_refs_with_noncredential_reason.allow_run_blocks
-
-        handler.response = {
-            "testing_intent": "skip_test",
-            "credential_input_kind": "credential_name",
-            "credential_refs": ["azure_credentials"],
-            "requires_user_clarification": True,
-            "clarification_reason": "credential_name_unresolved",
-        }
-        bare_name_skip_policy = await build_request_policy(
-            user_message=(
-                "Draft but do not test a workflow that logs into https://example.com/login "
-                "using azure_credentials and goes to Billing & Payment Activity."
-            ),
-            chat_history=[],
-            **args,
-        )
-        assert bare_name_skip_policy.user_response_policy == "proceed"
-        assert bare_name_skip_policy.credential_refs == ["azure_credentials"]
-        assert bare_name_skip_policy.allow_update_workflow and not bare_name_skip_policy.allow_run_blocks
-
-        handler.response = {
-            "testing_intent": "skip_test",
-            "credential_input_kind": "credential_name",
-            "credential_refs": ["azure_credentials"],
-            "requires_user_clarification": True,
-        }
-        skip_policy = await build_request_policy(
-            user_message="just draft without testing", chat_history=_history(("user", "use azure_credentials")), **args
-        )
-        assert skip_policy.user_response_policy == "proceed"
-        assert skip_policy.allow_update_workflow and not skip_policy.allow_run_blocks
-        assert skip_policy.allow_missing_credentials_in_draft
-
-        handler.response = {
-            "testing_intent": "skip_test",
-            "completion_contract": "complete when the page says your message has been sent",
-        }
-        completion_not_skip_policy = await build_request_policy(
-            user_message=(
-                "Fill out the contact form and submit it. "
-                "Your goal is complete when the page says your message has been sent."
-            ),
-            chat_history=[],
-            **args,
-        )
-        assert completion_not_skip_policy.testing_intent == "unspecified"
-        assert completion_not_skip_policy.allow_run_blocks
-        assert (
-            completion_not_skip_policy.completion_contract == "complete when the page says your message has been sent"
-        )
-
-        handler.response = {
-            "credential_input_kind": "website_stored_credential",
-            "login_page_urls": ["https://bank.example/login"],
-        }
-        stored_credential_with_id_policy = await build_request_policy(
-            user_message="use the saved login for https://bank.example/login, credential id cred_bank",
-            chat_history=[],
-            **args,
-        )
-        assert stored_credential_with_id_policy.credential_input_kind == "website_stored_credential"
-        assert stored_credential_with_id_policy.credential_refs == ["cred_bank"]
-        assert stored_credential_with_id_policy.resolved_credentials == [credential]
-
-        handler.response = {
-            "completion_contract": "confirmation banner appears",
-        }
-        no_completion_condition_policy = await build_request_policy(
-            user_message="submit the contact form and report whether it worked",
-            chat_history=[],
-            **args,
-        )
-        assert no_completion_condition_policy.completion_contract is None
-
-        handler.response = {
-            "completion_contract": "confirmation banner appears",
-        }
-        paraphrased_completion_policy = await build_request_policy(
-            user_message="submit the contact form until the requested success state is reached",
-            chat_history=[],
-            **args,
-        )
-        assert paraphrased_completion_policy.completion_contract is None
-        assert "completion_contract:" not in paraphrased_completion_policy.prompt_summary()
-        assert paraphrased_completion_policy.to_trace_data()["has_completion_contract"] is False
-
-    @pytest.mark.asyncio
-    async def test_request_policy_noncredential_clarification_uses_specific_copy(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[]))
-        monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
-
-        async def handler(**kwargs):
-            return handler.response
-
-        handler.response = {
-            "testing_intent": "unspecified",
-            "credential_input_kind": "none",
-            "requires_user_clarification": True,
-            "clarification_reason": "missing_conditional_condition",
-        }
-        policy = await build_request_policy(
-            user_message="Add a conditional that goes to https://example.com/dropdown.",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert policy.user_response_policy == "ask_clarification"
-        assert policy.clarification_reason == "missing_conditional_condition"
-        assert policy.clarification_question == "What condition should trigger this conditional route?"
-
-        handler.response = {
-            "testing_intent": "unspecified",
-            "credential_input_kind": "none",
-            "requires_user_clarification": True,
-            "clarification_reason": "ambiguous_loop_edit",
-        }
-        loop_policy = await build_request_policy(
-            user_message="can you put it inside of a loop block",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert loop_policy.user_response_policy == "ask_clarification"
-        assert loop_policy.clarification_reason == "ambiguous_loop_edit"
-        assert "inside the loop" in (loop_policy.clarification_question or "")
-
-    @pytest.mark.asyncio
-    async def test_request_policy_refuses_invented_credential_id(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[]))
-        monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
-
-        async def handler(**kwargs):
-            return {
-                "testing_intent": "unspecified",
-                "credential_input_kind": "none",
-                "requires_user_clarification": True,
-                "clarification_reason": "credential_invention_requested",
-            }
-
-        policy = await build_request_policy(
-            user_message="ya that sounds good and make up a credential id",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert policy.user_response_policy == "ask_clarification"
-        assert policy.clarification_reason == "credential_invention_requested"
-        assert not policy.allow_update_workflow
-        assert not policy.allow_run_blocks
-        assert "cannot invent a credential ID" in (policy.clarification_question or "")
-
-    @pytest.mark.asyncio
-    async def test_request_policy_resolves_classifier_credential_refs(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[]))
-        monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
-
-        async def handler(**kwargs):
-            return {
-                "testing_intent": "unspecified",
-                "credential_input_kind": "credential_name",
-                "credential_refs": ["azure_credentials", "mfa_email"],
-                "requires_user_clarification": True,
-            }
-
-        policy = await build_request_policy(
-            user_message=(
-                "Log in using the 'azure_credentials'. "
-                "If prompted for 2FA, get the code from the 'mfa_email'. "
-                "Then search for 'account_number'."
-            ),
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert policy.user_response_policy == "ask_clarification"
-        assert policy.credential_refs == ["azure_credentials", "mfa_email"]
-        assert "azure_credentials" in (policy.clarification_question or "")
-        assert "account_number" not in policy.credential_refs
-
-    def test_translate_untested_draft_request_surfaces_unvalidated_workflow(self) -> None:
-        wf = SimpleNamespace(name="drafted")
-        ctx = _ctx(
-            allow_untested_workflow_draft=True,
-            last_workflow=wf,
-            last_workflow_yaml="title: drafted",
-            last_update_block_count=4,
-            last_test_ok=None,
-        )
-        result = _fake_run_result({"type": "REPLY", "user_response": "Done."})
-
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert agent_result.updated_workflow is wf
-        assert agent_result.workflow_yaml == "title: drafted"
-        assert agent_result.proposal_disposition == "review_untested"
-        assert "without testing it, as requested" in agent_result.user_response
-
-    @pytest.mark.asyncio
-    async def test_malformed_then_corrected_credential_id_resolves_when_valid(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        credential = SimpleNamespace(credential_id="cred_530299673029518520")
-        get_credentials_by_ids = AsyncMock(return_value=[credential])
-        monkeypatch.setattr(
-            policy_module.app,
-            "DATABASE",
-            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
-        )
-
-        malformed = await build_request_policy(
-            user_message="Build it with cred 530299673029518520.",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=None,
-        )
-        assert malformed.credential_input_kind == "credential_id"
-        assert malformed.resolved_credentials == [credential]
-        assert malformed.invalid_credential_ids == []
-        assert malformed.requires_user_clarification is False
-
-        corrected = await build_request_policy(
-            user_message="cred_530299673029518520",
-            workflow_yaml="",
-            chat_history=_history(
-                ("user", "Build it with cred 530299673029518520."),
-                ("ai", "The credential ID `530299673029518520` appears to be invalid."),
-            ),
-            global_llm_context="",
-            organization_id="org-1",
-            handler=None,
-        )
-        assert corrected.credential_input_kind == "credential_id"
-        assert corrected.resolved_credentials == [credential]
-        assert corrected.invalid_credential_ids == []
-        assert corrected.requires_user_clarification is False
-
-    @pytest.mark.asyncio
-    async def test_malformed_then_corrected_credential_id_blocks_authoritatively_when_invalid(
-        self, monkeypatch
-    ) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        get_credentials_by_ids = AsyncMock(return_value=[])
-        monkeypatch.setattr(
-            policy_module.app,
-            "DATABASE",
-            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
-        )
-
-        for user_message, history in (
-            ("Build it with cred 530299673029518520.", []),
-            (
-                "cred_530299673029518520",
-                _history(
-                    ("user", "Build it with cred 530299673029518520."),
-                    ("ai", "The credential ID `530299673029518520` appears to be invalid."),
-                ),
-            ),
-        ):
-            policy = await build_request_policy(
-                user_message=user_message,
-                workflow_yaml="",
-                chat_history=history,
-                global_llm_context="",
-                organization_id="org-1",
-                handler=None,
-            )
-            assert policy.credential_input_kind == "credential_id"
-            assert policy.invalid_credential_ids == ["cred_530299673029518520"]
-            assert "not found in this organization" in (policy.clarification_question or "")
-            assert "previously identified" not in (policy.clarification_question or "")
-
-    @pytest.mark.asyncio
-    async def test_malformed_id_promotes_over_non_id_kind_without_competing_scope(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        credential = SimpleNamespace(credential_id="cred_530299673029518520")
-
-        for classifier_body in (
-            {"credential_input_kind": "credential_name", "credential_refs": []},
-            {"credential_input_kind": "website_stored_credential", "login_page_urls": []},
-        ):
-            get_credentials_by_ids = AsyncMock(return_value=[credential])
-            monkeypatch.setattr(
-                policy_module.app,
-                "DATABASE",
-                SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
-            )
-
-            async def handler(*, prompt: str, prompt_name: str, _body=classifier_body) -> dict:
-                return {"testing_intent": "unspecified", **_body}
-
-            policy = await build_request_policy(
-                user_message="Build it with cred 530299673029518520.",
-                workflow_yaml="",
-                chat_history=[],
-                global_llm_context="",
-                organization_id="org-1",
-                handler=handler,
-            )
-            assert policy.credential_input_kind == "credential_id", classifier_body
-            assert policy.resolved_credentials == [credential], classifier_body
-            get_credentials_by_ids.assert_awaited_once_with(["cred_530299673029518520"], organization_id="org-1")
-
-    @pytest.mark.asyncio
-    async def test_contextual_credential_id_does_not_override_classifier_target(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        bank = SimpleNamespace(
-            credential_id="cred_bank",
-            name="Bank",
-            tested_url="https://bank.example/login",
-            credential_type=CredentialType.PASSWORD,
-        )
-        monkeypatch.setattr(
-            policy_module.app,
-            "DATABASE",
-            SimpleNamespace(
-                credentials=SimpleNamespace(
-                    get_credentials=AsyncMock(return_value=[bank]),
-                    get_credentials_by_ids=AsyncMock(side_effect=AssertionError("contextual id must not be resolved")),
-                )
-            ),
-        )
-
-        async def name_handler(*, prompt: str, prompt_name: str) -> dict:
-            return {"credential_input_kind": "credential_name", "credential_refs": ["Bank"]}
-
-        name_policy = await build_request_policy(
-            user_message="Replace cred_530299673029518520 with my saved credential named Bank.",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=name_handler,
-        )
-        assert name_policy.credential_input_kind == "credential_name"
-        assert name_policy.resolved_credentials == [bank]
-
-        async def url_handler(*, prompt: str, prompt_name: str) -> dict:
-            return {
-                "credential_input_kind": "website_stored_credential",
-                "login_page_urls": ["https://bank.example/login"],
-            }
-
-        url_policy = await build_request_policy(
-            user_message="Use the saved login for https://bank.example/login instead of cred_530299673029518520.",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=url_handler,
-        )
-        assert url_policy.credential_input_kind == "website_stored_credential"
-        assert url_policy.resolved_credentials == [bank]
 
 
 class TestNativeToolCredentialIdValidation:
@@ -5718,6 +4190,9 @@ class TestCopilotConfig:
             global_llm_context=None,
             debug_run_info_text="",
             llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+            raw_secret_safety_handler=AsyncMock(
+                return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+            ),
             api_key="sk-test",
             config=CopilotConfig(fallback_llm_key="SECONDARY"),
         )
@@ -5925,335 +4400,6 @@ class TestRequestPolicyTranscriptContext:
         assert len(transcript.retained_history) <= 400
 
 
-class TestRequestPolicyPromptRendering:
-    @pytest.mark.asyncio
-    async def test_classifier_prompt_renders_sentinel_for_empty_slots(self) -> None:
-        captured: dict[str, str] = {}
-
-        async def handler(prompt: str, prompt_name: str) -> dict[str, str]:
-            captured["prompt"] = prompt
-            return {"credential_input_kind": "none", "testing_intent": "unspecified"}
-
-        await _classify_request(
-            user_message="hello",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            handler=_with_empty_request_slots(handler),
-        )
-
-        prompt = captured["prompt"]
-        assert "Earliest retained user turn" in prompt
-        assert "Latest prior user turn" in prompt
-        assert "Latest assistant turn" in prompt
-        assert "Retained recent history" in prompt
-        # Empty slots must render the (none) sentinel so no header is silent.
-        assert prompt.count("(none)") >= 4
-
-
-class TestCredentialClarificationIncludesUiDirections:
-    """SKY-9934: every credential-context canned clarification names where the Credentials UI lives."""
-
-    _DIRECTIONS_PHRASE = "/credentials"
-
-    @pytest.mark.asyncio
-    async def test_credential_name_unresolved_includes_directions(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        monkeypatch.setattr(
-            policy_module.app,
-            "DATABASE",
-            SimpleNamespace(
-                credentials=SimpleNamespace(
-                    get_credentials=AsyncMock(return_value=[]),
-                    get_credentials_by_ids=AsyncMock(return_value=[]),
-                )
-            ),
-        )
-
-        async def handler(**kwargs):
-            return {
-                "testing_intent": "unspecified",
-                "credential_input_kind": "credential_name",
-                "credential_refs": [],
-                "requires_user_clarification": True,
-                "clarification_reason": "credential_name_unresolved",
-            }
-
-        policy = await build_request_policy(
-            user_message="where ??",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert policy.requires_user_clarification is True
-        assert policy.clarification_question is not None
-        assert self._DIRECTIONS_PHRASE in policy.clarification_question
-
-    @pytest.mark.asyncio
-    async def test_credential_invention_requested_includes_directions(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        monkeypatch.setattr(
-            policy_module.app,
-            "DATABASE",
-            SimpleNamespace(
-                credentials=SimpleNamespace(
-                    get_credentials=AsyncMock(return_value=[]),
-                    get_credentials_by_ids=AsyncMock(return_value=[]),
-                )
-            ),
-        )
-
-        async def handler(**kwargs):
-            return {
-                "testing_intent": "unspecified",
-                "credential_input_kind": "none",
-                "credential_refs": [],
-                "requires_user_clarification": True,
-                "clarification_reason": "credential_invention_requested",
-            }
-
-        policy = await build_request_policy(
-            user_message="use random",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert policy.requires_user_clarification is True
-        assert policy.clarification_question is not None
-        assert self._DIRECTIONS_PHRASE in policy.clarification_question
-
-    @pytest.mark.asyncio
-    async def test_raw_secret_question_includes_directions(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        monkeypatch.setattr(
-            policy_module.app,
-            "DATABASE",
-            SimpleNamespace(
-                credentials=SimpleNamespace(
-                    get_credentials=AsyncMock(return_value=[]),
-                    get_credentials_by_ids=AsyncMock(return_value=[]),
-                )
-            ),
-        )
-
-        policy = await build_request_policy(
-            user_message="email: a@example.com password: hunter2",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=AsyncMock(),
-        )
-
-        assert policy.raw_secret_detected is True
-        assert policy.clarification_question is not None
-        assert self._DIRECTIONS_PHRASE in policy.clarification_question
-
-    @pytest.mark.asyncio
-    async def test_generic_fallback_after_prior_credential_turn_routes_to_credential_help(self, monkeypatch) -> None:
-        import json as _json
-
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        monkeypatch.setattr(
-            policy_module.app,
-            "DATABASE",
-            SimpleNamespace(
-                credentials=SimpleNamespace(
-                    get_credentials=AsyncMock(return_value=[]),
-                    get_credentials_by_ids=AsyncMock(return_value=[]),
-                )
-            ),
-        )
-
-        async def handler(**kwargs):
-            return {
-                "testing_intent": "unspecified",
-                "credential_input_kind": "none",
-                "credential_refs": [],
-                "requires_user_clarification": True,
-                "clarification_reason": "none",
-            }
-
-        prior_context = _json.dumps(
-            {
-                "decisions_made": [
-                    "request-policy clarification required: none/credential_invention_requested",
-                ],
-            }
-        )
-
-        policy = await build_request_policy(
-            user_message="where ??",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context=prior_context,
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert policy.requires_user_clarification is True
-        assert policy.clarification_question is not None
-        assert self._DIRECTIONS_PHRASE in policy.clarification_question
-        assert (
-            policy.clarification_question != "I need one more detail before I can build and test this workflow safely."
-        )
-
-    @pytest.mark.asyncio
-    async def test_workflow_credential_inputs_unbound_includes_directions(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        monkeypatch.setattr(
-            policy_module.app,
-            "DATABASE",
-            SimpleNamespace(
-                credentials=SimpleNamespace(
-                    get_credentials=AsyncMock(return_value=[]),
-                    get_credentials_by_ids=AsyncMock(return_value=[]),
-                )
-            ),
-        )
-
-        workflow_yaml_with_unbound_creds = (
-            "workflow_definition:\n"
-            "  parameters:\n"
-            "    - parameter_type: workflow\n"
-            "      key: login_user\n"
-            "      default_value: null\n"
-            "  blocks:\n"
-            "    - label: sign_in\n"
-            "      block_type: login\n"
-            "      parameters:\n"
-            "        - parameter_type: credential\n"
-            "          key: signin_creds\n"
-            "          username_key: ''\n"
-            "          password_key: ''\n"
-        )
-
-        async def handler(**kwargs):
-            return {
-                "testing_intent": "unspecified",
-                "credential_input_kind": "none",
-                "credential_refs": [],
-                "requires_user_clarification": True,
-                "clarification_reason": "none",
-            }
-
-        policy = await build_request_policy(
-            user_message="run it",
-            workflow_yaml=workflow_yaml_with_unbound_creds,
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert policy.clarification_reason == "workflow_credential_inputs_unbound"
-        assert policy.clarification_question is not None
-        assert self._DIRECTIONS_PHRASE in policy.clarification_question
-
-    @pytest.mark.asyncio
-    async def test_generic_fallback_stale_credential_clarification_does_not_misroute(self, monkeypatch) -> None:
-        import json as _json
-
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        monkeypatch.setattr(
-            policy_module.app,
-            "DATABASE",
-            SimpleNamespace(
-                credentials=SimpleNamespace(
-                    get_credentials=AsyncMock(return_value=[]),
-                    get_credentials_by_ids=AsyncMock(return_value=[]),
-                )
-            ),
-        )
-
-        async def handler(**kwargs):
-            return {
-                "testing_intent": "unspecified",
-                "credential_input_kind": "none",
-                "credential_refs": [],
-                "requires_user_clarification": True,
-                "clarification_reason": "none",
-            }
-
-        prior_context = _json.dumps(
-            {
-                "decisions_made": [
-                    "request-policy clarification required: none/credential_invention_requested",
-                    "request-policy clarification required: none/ambiguous_loop_edit",
-                ],
-            }
-        )
-
-        policy = await build_request_policy(
-            user_message="where ??",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context=prior_context,
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert (
-            policy.clarification_question == "I need one more detail before I can build and test this workflow safely."
-        )
-
-    @pytest.mark.asyncio
-    async def test_generic_fallback_without_prior_credential_turn_unchanged(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import request_policy as policy_module
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
-
-        monkeypatch.setattr(
-            policy_module.app,
-            "DATABASE",
-            SimpleNamespace(
-                credentials=SimpleNamespace(
-                    get_credentials=AsyncMock(return_value=[]),
-                    get_credentials_by_ids=AsyncMock(return_value=[]),
-                )
-            ),
-        )
-
-        async def handler(**kwargs):
-            return {
-                "testing_intent": "unspecified",
-                "credential_input_kind": "none",
-                "credential_refs": [],
-                "requires_user_clarification": True,
-                "clarification_reason": "none",
-            }
-
-        policy = await build_request_policy(
-            user_message="where ??",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="org-1",
-            handler=handler,
-        )
-
-        assert (
-            policy.clarification_question == "I need one more detail before I can build and test this workflow safely."
-        )
-
-
 class TestStructuralInfeasibilityQuestion:
     def _intent(
         self,
@@ -6310,206 +4456,6 @@ class TestStructuralInfeasibilityQuestion:
 
     def test_returns_none_for_non_turn_intent(self) -> None:
         assert agent_module._structural_infeasibility_question(None) is None
-
-
-class TestClassifierFallbackCompletionFloor:
-    @pytest.mark.asyncio
-    async def test_timeout_fallback_emits_gradeable_run_floor(self, monkeypatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", 0.05)
-
-        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
-            await asyncio.sleep(0.5)
-            return {"credential_input_kind": "none", "completion_contract": None}
-
-        policy = await _classify_request(
-            user_message="Build a workflow for https://example.com.",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            handler=handler,
-        )
-
-        assert policy.classifier_status == "fallback"
-        assert policy.classifier_failure_kind == "timeout"
-        assert policy.completion_criteria
-        assert all(c.level == "run" for c in policy.completion_criteria)
-        assert all(c.implicit for c in policy.completion_criteria)
-        assert policy.completion_criteria[0].method_mandated is False
-        assert all(is_fallback_floor_criterion(c) for c in policy.completion_criteria)
-        assert policy.completion_contract is None
-        assert policy.completion_contract_status == "present"
-
-        trace = policy.to_trace_data()
-        assert trace["completion_criteria_count"] == 1
-        assert trace["completion_criteria_method_mandated_count"] == len(policy.completion_criteria) - 1
-        assert trace["has_completion_contract"] is False
-
-    def test_floor_base_reaches_judge_satisfaction_set(self) -> None:
-        policy = _classifier_fallback_policy([], raw_secret_present=False, failure_kind="timeout")
-        ctx = SimpleNamespace(request_policy=policy)
-
-        assert policy.completion_criteria
-        assert _completion_verification_criteria(ctx) == [policy.completion_criteria[0]]
-
-    def test_degraded_judgment_does_not_hide_contradictory_required_outputs(self) -> None:
-        reached = CompletionCriterion(id="c0", outcome="the requested page is reached")
-        degraded_judgment = CompletionCriterion(
-            id="public_form_exists",
-            outcome="the public-form judgment is returned",
-            mint_degrade="undecidable_judgment",
-        )
-        required_output = CompletionCriterion(id="visible_page_path_label", outcome="the visible path is returned")
-        contradiction = "evidence_contradicts"
-        verification = CompletionVerificationResult(
-            status="evaluated",
-            criterion_ids=[reached.id, required_output.id],
-            verdicts=[
-                CriterionVerdict(criterion_id=reached.id, state="satisfied", reason_code="evidence_confirms"),
-                CriterionVerdict(criterion_id=required_output.id, state="unsatisfied", reason_code=contradiction),
-            ],
-        )
-
-        carried = _carry_degraded_ids(
-            SimpleNamespace(
-                request_policy=RequestPolicy(completion_criteria=[reached, degraded_judgment, required_output])
-            ),
-            verification,
-        )
-        assert carried.degraded_criterion_ids == [degraded_judgment.id]
-        assert carried.is_fully_satisfied() is False
-
-        judgment_only = _carry_degraded_ids(
-            SimpleNamespace(request_policy=RequestPolicy(completion_criteria=[reached, degraded_judgment])),
-            CompletionVerificationResult(
-                status="evaluated", criterion_ids=[reached.id], verdicts=verification.verdicts[:1]
-            ),
-        )
-        assert judgment_only.degraded_criterion_ids == [degraded_judgment.id]
-        assert judgment_only.is_fully_satisfied() is True
-
-    def test_p9_degraded_judgments_suppress_their_generic_corroborator(self) -> None:
-        reached = CompletionCriterion(id="c2", outcome="the visible page path label is returned")
-        degraded = [
-            CompletionCriterion(
-                id=criterion_id,
-                outcome=outcome,
-                kind="validation_classification",
-                classification_output_key=output_key,
-                judgment_truth_condition=truth_condition,
-                mint_degrade="undecidable_judgment",
-                mint_disposition="degraded",
-            )
-            for criterion_id, outcome, output_key, truth_condition in (
-                ("c0", "whether a public form exists", "public_form_exists", None),
-                (
-                    "c1",
-                    "whether the path is login-only",
-                    "login_only",
-                    JudgmentTruthCondition(predicate="login_gate_blocks_target", polarity_when_holds=True),
-                ),
-            )
-        ]
-        judgment_corroborator = CompletionCriterion(
-            id="c3",
-            outcome="the recommended next action is returned",
-            requested_output_evidence_source="independent_run_evidence",
-            requested_output_corroborator=True,
-        )
-        policy = RequestPolicy(completion_criteria=[*degraded, reached, judgment_corroborator])
-        ctx = SimpleNamespace(request_policy=policy)
-
-        assert _completion_verification_criteria(ctx) == [reached]
-
-        carried = _carry_degraded_ids(
-            ctx,
-            CompletionVerificationResult(
-                status="evaluated",
-                criterion_ids=[reached.id],
-                verdicts=[
-                    CriterionVerdict(criterion_id=reached.id, state="satisfied", reason_code="evidence_confirms"),
-                ],
-            ),
-        )
-
-        assert carried.degraded_criterion_ids == ["c0", "c1"]
-        assert carried.is_fully_satisfied() is True
-
-    def test_credential_aware_floor_adds_one_run_plane_criterion(self) -> None:
-        base = build_classifier_fallback_floor([])
-        credentialed = build_classifier_fallback_floor(["cred_1"])
-
-        assert len(credentialed) == len(base) + 1
-        assert all(c.level == "run" for c in credentialed)
-        assert all(c.implicit for c in credentialed)
-        assert credentialed[0].method_mandated is False
-        assert credentialed[1].method_mandated is True
-        assert len({c.id for c in credentialed}) == len(credentialed)
-
-    def test_floor_respects_max_criteria_cap(self) -> None:
-        floor = build_classifier_fallback_floor([f"cred_{i}" for i in range(50)])
-
-        assert len(floor) <= _MAX_COMPLETION_CRITERIA
-
-    def test_raw_secret_fallback_still_blocks_with_empty_criteria(self) -> None:
-        policy = _classifier_fallback_policy(["cred_1"], raw_secret_present=True, failure_kind="timeout")
-
-        assert policy.raw_secret_handling == "block"
-        assert policy.completion_criteria == []
-        assert policy.completion_contract_status == "unknown"
-
-    def test_reconcile_all_floor_fresh_with_no_stored_set_does_not_create(self) -> None:
-        snapshot = StoredCriteriaSnapshot(active=None, next_epoch=1)
-        floor = build_classifier_fallback_floor(["cred_1"])
-
-        decision = reconcile_completion_criteria(snapshot, list(floor), actionable=True)
-
-        assert decision.action == "none"
-        assert decision.reason == "no_criteria"
-        assert decision.criteria == ()
-
-        turn_state = build_turn_state(snapshot, decision)
-        plan = plan_persistence(turn_state)
-
-        assert plan is None or plan.create_epoch is None
-
-    def test_reconcile_all_floor_fresh_keeps_stored_real_epoch(self) -> None:
-        stored = StoredCriteriaSet(
-            set_id="wccs_real",
-            goal_epoch=3,
-            criteria=(CompletionCriterion(id="c0", outcome="The confirmation number is captured"),),
-        )
-        snapshot = StoredCriteriaSnapshot(active=stored, next_epoch=4)
-        floor = build_classifier_fallback_floor(["cred_1"])
-
-        decision = reconcile_completion_criteria(snapshot, list(floor), actionable=True)
-
-        assert decision.action == "adopt_stored"
-        assert decision.reason == "empty_fresh"
-        assert decision.superseded_set_id is None
-        assert decision.criteria == stored.criteria
-
-    def test_reconcile_real_all_implicit_set_still_supersedes(self) -> None:
-        stored = StoredCriteriaSet(
-            set_id="wccs_old",
-            goal_epoch=1,
-            criteria=(CompletionCriterion(id="c0", outcome="The old goal is reached", implicit=True),),
-        )
-        snapshot = StoredCriteriaSnapshot(active=stored, next_epoch=2)
-        real_fresh = [CompletionCriterion(id="c0", outcome="A different goal is reached", implicit=True)]
-
-        decision = reconcile_completion_criteria(snapshot, real_fresh, actionable=True)
-
-        assert decision.action == "create"
-        assert decision.reason == "not_subset"
-        assert decision.superseded_set_id == "wccs_old"
-
-    def test_successful_classifier_turn_keeps_full_criteria_without_sentinel(self) -> None:
-        criteria = [
-            CompletionCriterion(id="c0", outcome="The account page is visible"),
-            CompletionCriterion(id="c1", outcome="The confirmation number is captured"),
-        ]
-
-        assert not any(is_fallback_floor_criterion(c) for c in criteria)
 
 
 class TestDeclaredEqualsGradedCompletionCriteria:
@@ -7187,3 +5133,25 @@ def test_rewrite_names_the_sandbox_outage_when_the_runner_was_unreachable() -> N
         "I created a draft workflow with 1 block and tested it, but the test failed. "
         "Failure: Secure CodeBlock runner is unavailable. Please retry.."
     )
+
+
+@pytest.mark.asyncio
+async def test_turn_intent_credential_candidates_are_exact_server_grounded_references(monkeypatch) -> None:
+    monkeypatch.setattr(
+        agent_module,
+        "load_credentials",
+        AsyncMock(
+            return_value=[
+                SimpleNamespace(name="posthog", credential_id="cred_short"),
+                SimpleNamespace(name="skyvern-posthog", credential_id="cred_target"),
+                SimpleNamespace(name="skyvern-google", credential_id="cred_decoy"),
+            ]
+        ),
+    )
+
+    candidates = await agent_module._credential_reference_candidates(
+        "org-1",
+        "Sign in with my skyvern-posthog credential, not an approximation.",
+    )
+
+    assert candidates == ["skyvern-posthog"]

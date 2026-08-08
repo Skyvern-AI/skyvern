@@ -11,7 +11,7 @@ import json
 import os
 import re
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,7 +33,7 @@ from pydantic import ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.copilot import llm_config
+from skyvern.forge.sdk.copilot.agent_naming import name_agent_and_publish
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
@@ -77,6 +77,7 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
 )
 from skyvern.forge.sdk.copilot.completion_verification import only_structural_requested_output_abstentions
 from skyvern.forge.sdk.copilot.config import (
+    DEFAULT_MAX_TURNS,
     SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD,
     BlockAuthoringPolicy,
     CopilotConfig,
@@ -110,8 +111,10 @@ from skyvern.forge.sdk.copilot.credential_literal_rebind import (
     scouted_credential_targets,
 )
 from skyvern.forge.sdk.copilot.credential_pause import credential_pause_reason, preflight_credential_pause
+from skyvern.forge.sdk.copilot.credential_resolution import grounded_credential_references, load_credentials
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
+    _elapsed_run_seconds,
     artifact_health_blocked,
     dump_derivation_inputs,
     log_scouted_spine_unresolved_at_turn_halt,
@@ -175,14 +178,15 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
     merge_failure_into_context,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
+    RAW_SECRET_QUESTION,
     RAW_SECRET_REFUSAL_SENTINEL,
     CompletionCriterion,
     RequestPolicy,
     build_request_policy_trust_floor,
     credential_prompt_reason,
     is_defer_authoring_durable_fill_criterion,
-    materialize_request_policy_authoring,
     redact_raw_secrets_for_prompt,
+    redact_refused_secret_turns,
 )
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, run_outcome_display_reason
 from skyvern.forge.sdk.copilot.runtime import (
@@ -214,6 +218,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
 )
 from skyvern.forge.sdk.copilot.turn_intent import (
     NO_MUTATION_TURN_INTENT_MODES,
+    REGISTERED_DOWNLOAD_OUTPUT_PATH,
     RequiredContextKey,
     TurnIntent,
     TurnIntentClassifierResult,
@@ -222,6 +227,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     TurnIntentReasonCode,
     build_turn_intent,
     classify_turn_intent,
+    turn_intent_declares_registered_download,
     turn_intent_defers_authoring_live_fill,
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
@@ -249,7 +255,6 @@ WORKFLOW_KNOWLEDGE_BASE_PATH = (
 )
 
 _COPILOT_TURN_SPAN_NAME = "copilot.turn"
-_USER_MESSAGE_PREVIEW_MAX_CHARS = 40
 
 
 def _render_code_only_browser_authoring_prompt() -> str:
@@ -272,14 +277,6 @@ def _render_code_only_browser_authoring_prompt() -> str:
 @runtime_checkable
 class _AgentInstructionsContext(Protocol):
     context: object
-
-
-def _build_user_message_preview(message: str) -> str:
-    flattened = (message or "").replace("\r", " ").replace("\n", " ").strip()
-    redacted = redact_raw_secrets_for_prompt(flattened)
-    if len(redacted) <= _USER_MESSAGE_PREVIEW_MAX_CHARS:
-        return redacted
-    return redacted[: _USER_MESSAGE_PREVIEW_MAX_CHARS - 1] + "…"
 
 
 def _derive_turn_index(
@@ -308,29 +305,13 @@ def _copilot_turn_span(
         span.set_attribute("copilot.turn_index", _derive_turn_index(chat_history, turn_index))
         if turn_id is not None:
             span.set_attribute("copilot.turn_id", turn_id)
-        preview = _build_user_message_preview(chat_request.message)
-        if preview:
-            span.set_attribute("copilot.user_message_preview", preview)
+        span.set_attribute("copilot.user_message_length", len(chat_request.message or ""))
         if chat_request.workflow_copilot_chat_id:
             span.set_attribute("copilot.session_id", chat_request.workflow_copilot_chat_id)
         if chat_request.workflow_permanent_id:
             span.set_attribute("workflow_permanent_id", chat_request.workflow_permanent_id)
         apply_context_attrs(span)
         yield span
-
-
-async def _resolve_request_policy_handler(
-    llm_api_handler: LLMAPIHandler | None, workflow_permanent_id: str | None, organization_id: str | None
-) -> Any:
-    lite_handler = await llm_config.resolve_lite_copilot_handler(workflow_permanent_id, organization_id)
-    if lite_handler is not None:
-        return lite_handler
-    LOG.warning(
-        "copilot request policy lite handler unavailable, falling back to main handler",
-        workflow_permanent_id=workflow_permanent_id,
-        organization_id=organization_id,
-    )
-    return llm_api_handler
 
 
 @dataclass(frozen=True)
@@ -341,7 +322,7 @@ class RequestPolicyGuardrailInputs:
     chat_history_messages: list[WorkflowCopilotChatHistoryMessage]
     global_llm_context: str
     organization_id: str
-    request_policy_handler: Any
+    request_policy_handler: LLMAPIHandler | None
     turn_intent_handler: LLMAPIHandler | None
     previous_user_message: str | None = None
     workflow_id: str | None = None
@@ -469,16 +450,20 @@ def _request_policy_agent_inputs(
     chat_history_text: str,
     previous_user_message: str | None,
 ) -> tuple[str, str]:
+    canonical_user_message = policy.canonical_user_message or redact_raw_secrets_for_prompt(user_message)
     if policy.raw_secret_detected:
-        # Raw-secret turns use redacted latest content before skip-test follow-up reuse.
-        return redact_raw_secrets_for_prompt(user_message), chat_history_text
+        return canonical_user_message, chat_history_text
     if policy.testing_intent == "skip_test" and len(user_message) < 160 and previous_user_message:
         return (
-            f"{user_message}\n\nDraft the workflow requested earlier:\n"
+            f"{canonical_user_message}\n\nDraft the workflow requested earlier:\n"
             f"{redact_raw_secrets_for_prompt(previous_user_message)}",
             "",
         )
-    return user_message, chat_history_text
+    return canonical_user_message, chat_history_text
+
+
+def _canonical_policy_user_message(policy: RequestPolicy, raw_user_message: str) -> str:
+    return policy.canonical_user_message or redact_raw_secrets_for_prompt(raw_user_message)
 
 
 def _stored_active_completion_criteria(
@@ -558,6 +543,7 @@ def _store_request_policy_on_context(
     )
     ctx.turn_intent_classifier_result = turn_intent_classifier_result
     _derive_turn_intent_on_context(ctx, policy, policy_inputs)
+    _project_turn_intent_authority_to_policy(ctx, policy, policy_inputs)
     if reconcile_completion_criteria:
         _reconcile_completion_criteria_on_context(ctx, policy, policy_inputs)
     ctx.request_policy = policy
@@ -568,6 +554,44 @@ def _store_request_policy_on_context(
         chat_history_text=policy_chat_history_text,
         global_llm_context=policy_inputs.global_llm_context,
     )
+
+
+def _project_turn_intent_authority_to_policy(
+    ctx: CopilotContext,
+    policy: RequestPolicy,
+    policy_inputs: RequestPolicyGuardrailInputs,
+) -> None:
+    intent = ctx.turn_intent
+    if not isinstance(intent, TurnIntent):
+        policy.allow_update_workflow = False
+        policy.allow_run_blocks = False
+        return
+
+    classifier_succeeded = (
+        ctx.turn_intent_classifier_result is not None and ctx.turn_intent_classifier_result.is_success
+    )
+    if policy.raw_secret_detected:
+        if classifier_succeeded and intent.mode is TurnIntentMode.DRAFT_ONLY:
+            policy.raw_secret_handling = "redacted_draft"
+            policy.testing_intent = "skip_test"
+            policy.allow_missing_credentials_in_draft = True
+            policy.credential_draft_deferred_explicitly = True
+        else:
+            policy.raw_secret_handling = "block"
+            policy.user_response_policy = "ask_clarification"
+            policy.requires_user_clarification = True
+            policy.clarification_reason = "raw_secret"
+            policy.clarification_question = RAW_SECRET_QUESTION
+            policy.allow_missing_credentials_in_draft = False
+            policy.credential_draft_deferred_explicitly = False
+            _derive_turn_intent_on_context(ctx, policy, policy_inputs)
+            intent = ctx.turn_intent
+
+    if isinstance(intent, TurnIntent):
+        policy.allow_update_workflow = intent.authority.may_update_workflow
+        policy.allow_run_blocks = intent.authority.may_run_blocks
+    if policy.raw_secret_detected:
+        policy.allow_run_blocks = False
 
 
 def _derive_turn_intent_on_context(
@@ -582,7 +606,7 @@ def _derive_turn_intent_on_context(
     turn keeps clarify-shaped authority.
     """
     ctx.turn_intent = build_turn_intent(
-        user_message=policy_inputs.user_message,
+        user_message=_canonical_policy_user_message(policy, policy_inputs.user_message),
         workflow_yaml=policy_inputs.workflow_yaml,
         chat_history=policy_inputs.chat_history_messages,
         global_llm_context=policy_inputs.global_llm_context,
@@ -596,31 +620,6 @@ def _derive_turn_intent_on_context(
     )
 
 
-async def _materialize_authoring_for_resolved_intent(
-    ctx: CopilotContext,
-    policy: RequestPolicy,
-    policy_inputs: RequestPolicyGuardrailInputs,
-) -> None:
-    """Fill authoring policy only after the resolved effect earns it."""
-    turn_intent = ctx.turn_intent
-    if not isinstance(turn_intent, TurnIntent) or not (
-        turn_intent.authority.may_update_workflow or turn_intent.authority.may_run_blocks
-    ):
-        return
-    await materialize_request_policy_authoring(
-        policy,
-        user_message=policy_inputs.user_message,
-        workflow_yaml=policy_inputs.workflow_yaml,
-        chat_history=policy_inputs.chat_history_messages,
-        global_llm_context=policy_inputs.global_llm_context,
-        handler=policy_inputs.request_policy_handler,
-        active_criteria=_stored_active_completion_criteria(policy_inputs),
-        config=ctx.copilot_config,
-    )
-    _reconcile_completion_criteria_on_context(ctx, policy, policy_inputs)
-    _derive_turn_intent_on_context(ctx, policy, policy_inputs)
-
-
 async def _resume_turn_intent_after_preflight_credential(
     ctx: CopilotContext,
     policy: RequestPolicy,
@@ -628,16 +627,34 @@ async def _resume_turn_intent_after_preflight_credential(
 ) -> None:
     """Resume the staged intent pipeline after a credential pause lifts its policy block."""
     if ctx.turn_intent_classifier_result is None:
+        canonical_message = _canonical_policy_user_message(policy, policy_inputs.user_message)
         ctx.turn_intent_classifier_result = await classify_turn_intent(
-            user_message=policy_inputs.user_message,
+            user_message=canonical_message,
             workflow_yaml=policy_inputs.workflow_yaml,
             chat_history=policy_inputs.chat_history_messages,
             global_llm_context=policy_inputs.global_llm_context,
             request_policy=policy,
             handler=policy_inputs.turn_intent_handler,
+            credential_reference_candidates=await _credential_reference_candidates(
+                policy_inputs.organization_id,
+                canonical_message,
+            ),
         )
     _derive_turn_intent_on_context(ctx, policy, policy_inputs)
-    await _materialize_authoring_for_resolved_intent(ctx, policy, policy_inputs)
+
+
+async def _credential_reference_candidates(organization_id: str, canonical_user_message: str) -> list[str]:
+    """Ground exact saved references for semantic affirmation classification without granting authority."""
+    try:
+        credentials = await load_credentials(organization_id)
+    except Exception as exc:
+        LOG.warning(
+            "turn-intent credential reference grounding failed",
+            organization_id=organization_id,
+            exception_type=type(exc).__name__,
+        )
+        return []
+    return sorted(grounded_credential_references(canonical_user_message, credentials))
 
 
 def _turn_intent_log_fields(intent: TurnIntent | None) -> dict[str, Any]:
@@ -1344,6 +1361,14 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
         answer_only = isinstance(ctx.turn_intent, TurnIntent) and ctx.turn_intent.is_inline_only
         selected_system_prompt = answer_only_system_prompt if answer_only else base_system_prompt
         summary = policy.trust_floor_summary() if answer_only else policy.prompt_summary()
+        if not answer_only and turn_intent_declares_registered_download(ctx.turn_intent):
+            summary += (
+                "\nordered_deliverables:\n"
+                "- kind: registered_download\n"
+                f"  output_path: {REGISTERED_DOWNLOAD_OUTPUT_PATH}\n"
+                "requested_output_paths:\n"
+                f"- {REGISTERED_DOWNLOAD_OUTPUT_PATH}"
+            )
         policy_summary = escape_code_fences(redact_raw_secrets_for_prompt(summary))
         if answer_only:
             dynamic_context = (
@@ -1917,6 +1942,15 @@ def _attempted_summary(narrative_summary: object, narrative_payload: object) -> 
     return None
 
 
+def _terminal_cause_for_context(ctx: CopilotContext) -> TerminalCause | None:
+    # The deadline owns capacity, so it wins if both capacity latches are set.
+    if ctx.copilot_total_timeout_exceeded is True:
+        return "deadline_expired"
+    if ctx.copilot_max_turns_exceeded is True:
+        return "max_turns_exceeded"
+    return None
+
+
 def _assemble_terminal_envelope_safe(
     *,
     response_type: str,
@@ -2079,7 +2113,7 @@ def _make_agent_result(
             workflow_mutated=bool(kwargs.get("workflow_was_persisted")) or kwargs.get("updated_workflow") is not None,
             turn_outcome_response_kind=turn_outcome_response_kind,
             final_message=str(kwargs.get("user_response") or ""),
-            terminal_cause="deadline_expired" if ctx.copilot_total_timeout_exceeded is True else None,
+            terminal_cause=_terminal_cause_for_context(ctx),
         )
     kwargs["terminal_envelope"] = terminal_envelope
     result = AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
@@ -3335,6 +3369,19 @@ def _build_max_turns_exit_result(ctx: CopilotContext, global_llm_context: str | 
     )
 
 
+def _handle_max_turns_exceeded(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+    ctx.copilot_max_turns_exceeded = True
+    start_monotonic = ctx.copilot_run_start_monotonic
+    LOG.warning(
+        "copilot_max_turns_exceeded",
+        limit=ctx.copilot_config.max_turns if ctx.copilot_config is not None else DEFAULT_MAX_TURNS,
+        iteration=ctx.enforcement_pass_count,
+        elapsed_seconds=round(_elapsed_run_seconds(ctx, start_monotonic), 3) if start_monotonic is not None else 0.0,
+        model_call_count=ctx.model_calls_this_turn,
+    )
+    return _build_max_turns_exit_result(ctx, global_llm_context)
+
+
 def _build_unexpected_error_exit_result(
     ctx: CopilotContext,
     global_llm_context: str | None,
@@ -4432,13 +4479,18 @@ def _build_copilot_input_guardrails(
             if isinstance(ctx, CopilotContext):
                 turn_intent_classifier_result = None
                 if policy.user_response_policy != "ask_clarification" or policy.raw_secret_handling == "redacted_draft":
+                    canonical_message = _canonical_policy_user_message(policy, policy_inputs.user_message)
                     turn_intent_classifier_result = await classify_turn_intent(
-                        user_message=policy_inputs.user_message,
+                        user_message=canonical_message,
                         workflow_yaml=policy_inputs.workflow_yaml,
                         chat_history=policy_inputs.chat_history_messages,
                         global_llm_context=policy_inputs.global_llm_context,
                         request_policy=policy,
                         handler=policy_inputs.turn_intent_handler,
+                        credential_reference_candidates=await _credential_reference_candidates(
+                            policy_inputs.organization_id,
+                            canonical_message,
+                        ),
                     )
                 _store_request_policy_on_context(
                     ctx,
@@ -4447,7 +4499,6 @@ def _build_copilot_input_guardrails(
                     turn_intent_classifier_result=turn_intent_classifier_result,
                     reconcile_completion_criteria=False,
                 )
-                await _materialize_authoring_for_resolved_intent(ctx, policy, policy_inputs)
         blocked = isinstance(policy, RequestPolicy) and policy.user_response_policy == "ask_clarification"
         if isinstance(policy, RequestPolicy):
             turn_intent = ctx.turn_intent if isinstance(ctx, CopilotContext) else None
@@ -4805,6 +4856,7 @@ async def run_copilot_agent(
     global_llm_context: str | None,
     debug_run_info_text: str,
     llm_api_handler: LLMAPIHandler | None,
+    raw_secret_safety_handler: LLMAPIHandler | None = None,
     api_key: str | None = None,
     security_rules: str = "",
     config: CopilotConfig | None = None,
@@ -4815,6 +4867,7 @@ async def run_copilot_agent(
     prior_block_count: int | None = None,
     stored_completion_criteria: StoredCriteriaSnapshot | None = None,
     prior_turn_outcome: TurnOutcome | None = None,
+    persist_canonical_user_message: Callable[[str], Awaitable[None]] | None = None,
 ) -> AgentResult:
     # One id per turn — passed to every downstream AgentResult and
     # CopilotContext so the envelope and terminal frames correlate. The
@@ -4843,6 +4896,7 @@ async def run_copilot_agent(
                     global_llm_context=global_llm_context,
                     debug_run_info_text=debug_run_info_text,
                     llm_api_handler=llm_api_handler,
+                    raw_secret_safety_handler=raw_secret_safety_handler,
                     api_key=api_key,
                     security_rules=security_rules,
                     config=config,
@@ -4854,6 +4908,7 @@ async def run_copilot_agent(
                     ctx_sink=ctx_sink,
                     stored_completion_criteria=stored_completion_criteria,
                     prior_turn_outcome=prior_turn_outcome,
+                    persist_canonical_user_message=persist_canonical_user_message,
                 )
                 return _reconcile_turn_end_ownership(ctx_sink[0] if ctx_sink else None, result)
             except Exception as exc:
@@ -4923,6 +4978,7 @@ async def _run_copilot_turn_impl(
     global_llm_context: str | None,
     debug_run_info_text: str,
     llm_api_handler: LLMAPIHandler | None,
+    raw_secret_safety_handler: LLMAPIHandler | None,
     api_key: str | None,
     security_rules: str,
     config: CopilotConfig | None,
@@ -4934,15 +4990,21 @@ async def _run_copilot_turn_impl(
     ctx_sink: list[CopilotContext] | None = None,
     stored_completion_criteria: StoredCriteriaSnapshot | None = None,
     prior_turn_outcome: TurnOutcome | None = None,
+    persist_canonical_user_message: Callable[[str], Awaitable[None]] | None = None,
 ) -> AgentResult:
     copilot_config = config or CopilotConfig(security_rules=security_rules)
-    chat_history_text = _format_chat_history(chat_history)
+    # Protect historical rows created before canonical safe-turn persistence existed. A semantic
+    # secret may evade deterministic patterns, but an adjacent raw-secret refusal is durable
+    # server-owned evidence that the corresponding user turn must never re-enter a model prompt.
+    safe_chat_history_messages = redact_refused_secret_turns(chat_history)
+    safe_prior_user_messages = redact_refused_secret_turns(list(prior_user_messages))
+    chat_history_text = _format_chat_history(safe_chat_history_messages)
     safe_chat_history_text = redact_raw_secrets_for_prompt(chat_history_text)
     safe_workflow_yaml = redact_raw_secrets_for_prompt(chat_request.workflow_yaml or "")
     safe_global_llm_context = sanitize_global_llm_context_for_prompt(
         redact_raw_secrets_for_prompt(global_llm_context or "")
     )
-    previous_user_messages = [msg.content for msg in chat_history if msg.sender == "user"]
+    previous_user_messages = [msg.content for msg in safe_chat_history_messages if msg.sender == "user"]
     previous_user_message = previous_user_messages[-1] if previous_user_messages else None
 
     try:
@@ -5028,15 +5090,11 @@ async def _run_copilot_turn_impl(
         user_message=chat_request.message,
         workflow_yaml=safe_workflow_yaml,
         chat_history_text=safe_chat_history_text,
-        chat_history_messages=list(chat_history),
-        prior_user_messages=list(prior_user_messages),
+        chat_history_messages=safe_chat_history_messages,
+        prior_user_messages=safe_prior_user_messages,
         global_llm_context=safe_global_llm_context,
         organization_id=organization_id,
-        request_policy_handler=await _resolve_request_policy_handler(
-            llm_api_handler,
-            chat_request.workflow_permanent_id,
-            organization_id,
-        ),
+        request_policy_handler=raw_secret_safety_handler,
         turn_intent_handler=llm_api_handler,
         previous_user_message=previous_user_message,
         workflow_id=chat_request.workflow_id,
@@ -5056,10 +5114,19 @@ async def _run_copilot_turn_impl(
     # Do not also attach it to the main Agent; the SDK would invoke it again and
     # duplicate policy telemetry.
     request_policy_guardrail_result = await request_policy_guardrails[0].run(
-        Agent(name="workflow-copilot-request-policy", instructions=""),
+        Agent(name="workflow-copilot-input-guardrail", instructions=""),
         chat_request.message,
         RunContextWrapper(context=ctx),
     )
+    request_policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
+    if request_policy is not None and request_policy.canonical_user_message:
+        # From this boundary onward every consumer observes one canonical safe turn.
+        chat_request.message = request_policy.canonical_user_message
+        if persist_canonical_user_message is not None:
+            # Cross the durable safety boundary before any acting-model, browser/session,
+            # or tool work. Shield the database write so cancellation cannot strand the
+            # pending placeholder after the safety classifier has completed.
+            await asyncio.shield(persist_canonical_user_message(request_policy.canonical_user_message))
     # Emit TURN_START after the guardrail runs so the envelope carries an
     # accurate ``mode`` when ``ctx.turn_intent`` is populated, and falls back
     # to ``UNKNOWN`` defensively otherwise. Best-effort — an emission failure
@@ -5068,7 +5135,15 @@ async def _run_copilot_turn_impl(
         await emit_turn_start(stream, ctx)
     except Exception as emit_err:
         LOG.warning("copilot_narrative_turn_start_emit_failed", error=str(emit_err))
-    request_policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
+    # Name the agent before the build starts. Runs here because intent is resolved and the
+    # stream is live, but no tool has authored anything yet — the title is a consequence of
+    # the classification, not of whenever the model first happens to emit YAML.
+    _, safe_workflow_yaml = await name_agent_and_publish(
+        ctx,
+        chat_request,
+        safe_workflow_yaml,
+        classifier_result=ctx.turn_intent_classifier_result,
+    )
     if request_policy is not None:
         _store_turn_context_packet_on_context(
             ctx,
@@ -5084,6 +5159,23 @@ async def _run_copilot_turn_impl(
             preflight_resolution = await preflight_credential_pause(ctx, stream, copilot_config)
             if preflight_resolution is not None:
                 await _resume_turn_intent_after_preflight_credential(ctx, request_policy, policy_inputs)
+                # The turn had no usable intent when naming first ran; it does now.
+                resumed_title, safe_workflow_yaml = await name_agent_and_publish(
+                    ctx,
+                    chat_request,
+                    safe_workflow_yaml,
+                    classifier_result=ctx.turn_intent_classifier_result,
+                )
+                if resumed_title:
+                    # The packet was assembled from the pre-naming YAML.
+                    _store_turn_context_packet_on_context(
+                        ctx,
+                        request_policy=request_policy,
+                        chat_request=chat_request,
+                        chat_history=chat_history,
+                        debug_run_info_text=debug_run_info_text,
+                        prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
+                    )
         if preflight_resolution is None:
             return _build_request_policy_clarification_result(
                 request_policy,
@@ -5364,7 +5456,7 @@ async def _run_copilot_turn_impl(
                 )
                 return _build_turn_halt_exit_result(ctx, global_llm_context, exc.halt)
             except MaxTurnsExceeded:
-                return _build_max_turns_exit_result(ctx, global_llm_context)
+                return _handle_max_turns_exceeded(ctx, global_llm_context)
             except CopilotTotalTimeoutError:
                 return _build_timeout_exit_result(ctx, global_llm_context)
             except CopilotUnrecoverableToolError as exc:

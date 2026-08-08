@@ -17,9 +17,9 @@ from skyvern.forge.sdk.api.files import create_named_temporary_file
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_EXPIRY_SECONDS,
+    ParsedArtifactContentUrl,
     artifact_url_expiry_seconds_for_type,
     effective_artifact_url_expiry_seconds,
-    parse_artifact_content_url,
     parse_keyring,
     sign_artifact_url,
     verify_artifact_signature,
@@ -1404,8 +1404,10 @@ class ArtifactManager:
             )
         return await app.STORAGE.get_share_link(artifact)
 
-    async def remint_content_url_if_unverified(self, url: str, organization_id: str | None) -> str | None:
-        """Re-sign a first-party artifact content URL whose signature does not verify.
+    async def remint_content_url_if_unverified(
+        self, parsed: ParsedArtifactContentUrl, organization_id: str | None
+    ) -> str | None:
+        """Re-sign a first-party artifact content URL whose signature is missing or does not verify.
 
         ``sig`` is a 43-character capability token that has to survive the whole workflow
         value plane verbatim; one dropped character turns a readable artifact into a 403
@@ -1413,14 +1415,13 @@ class ArtifactManager:
         fails to verify — corrupted, absent, or expired — and the run's organization owns
         the artifact, hand back a freshly signed URL.
 
-        Returns None when the URL is not ours, still verifies, or names an artifact this
+        Returns None when the signature still verifies or the URL names an artifact this
         organization cannot read; the caller then keeps the URL it already had.
         """
         if not organization_id:
             return None
-        parsed = parse_artifact_content_url(url, settings.SKYVERN_BASE_URL)
-        if parsed is None:
-            return None
+        # With the keyring unset there is nothing to verify against, and the only first-party
+        # content URLs still in circulation are legacy bundled rows — remint those unconditionally.
         if settings.ARTIFACT_CONTENT_HMAC_KEYRING and parsed.expiry and parsed.kid and parsed.sig:
             if verify_artifact_signature(
                 artifact_id=parsed.artifact_id,
@@ -1442,7 +1443,7 @@ class ArtifactManager:
         if reminted is None:
             return None
         LOG.warning(
-            "Re-signed a first-party artifact URL whose signature did not verify",
+            "Re-signed a first-party artifact URL with a missing or unverifiable signature",
             artifact_id=parsed.artifact_id,
             organization_id=organization_id,
             signature_length=len(parsed.sig) if parsed.sig else 0,

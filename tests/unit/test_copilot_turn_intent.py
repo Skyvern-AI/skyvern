@@ -3,19 +3,22 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
 
 from skyvern.config import settings
+from skyvern.constants import DEFAULT_WORKFLOW_TITLES
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.agent import (
     RequestPolicyGuardrailInputs,
     _store_request_policy_on_context,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext, StructuredContext
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
+from skyvern.forge.sdk.copilot.todo_list import unmet_action_deliverable_criteria
 from skyvern.forge.sdk.copilot.turn_intent import (
     PROMPT_NAME,
     UNRESOLVED_BLOCK_REF_TARGET_ENTITY,
@@ -25,6 +28,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     TurnIntentClassification,
     TurnIntentClassifierFailureKind,
     TurnIntentClassifierResult,
+    TurnIntentDeliverableKind,
     TurnIntentExpectedOutput,
     TurnIntentMode,
     TurnIntentReasonCode,
@@ -32,6 +36,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     _turn_intent_classification_from_raw,
     build_turn_intent,
     classify_turn_intent,
+    sanitize_workflow_title_candidate,
     turn_intent_defers_authoring_live_fill,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -101,6 +106,10 @@ def test_turn_intent_prompt_defines_answer_mode_by_effect_not_examples() -> None
 
     assert "docs_answer=respond inline when no workflow, browser, or run action is requested" in prompt
     assert "Classify by the requested effect, not by vocabulary or subject matter" in prompt
+    assert "Copy every listed reference the latest user message affirmatively asks to use" in prompt
+    assert "Exclude a listed reference that is negated, merely discussed, or the source being replaced" in prompt
+    assert "Its credential_input_kind does not classify affirmative saved-name targets" in prompt
+    assert "classify credential_targets independently from RequestPolicy" in prompt
     assert "product/docs/concept answer or conversational greeting" not in prompt
     assert "A greeting with no workflow-change request" not in prompt
 
@@ -171,6 +180,48 @@ def test_build_turn_intent_does_not_keyword_classify_without_llm_result() -> Non
     assert TurnIntentReasonCode.LLM_CLASSIFIER not in intent.reason_codes
 
 
+def test_credential_id_is_not_an_affirmative_target_without_classifier_evidence() -> None:
+    intent = build_turn_intent(
+        user_message="Do not use cred_admin_1",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(credential_refs=["cred_admin_1"]),
+        classifier_result=_classification(TurnIntentMode.BUILD, target_entities={}),
+    )
+
+    assert intent.target_entities.get("credential") is None
+
+
+def test_definition_download_criterion_does_not_mask_turn_intent_run_requirement() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="definition_download",
+                outcome="the workflow defines a download",
+                level="definition",
+                deliverable_kind="registered_download",
+            )
+        ]
+    )
+    ctx = SimpleNamespace(
+        completion_criteria_turn_state=None,
+        completion_verification_result=None,
+        request_policy=policy,
+        turn_intent=TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            deliverable_kind=TurnIntentDeliverableKind.REGISTERED_DOWNLOAD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        ),
+        reached_download_target=None,
+        verified_block_outputs={},
+    )
+
+    unmet = unmet_action_deliverable_criteria(ctx)
+
+    assert [criterion.id for criterion in unmet] == ["__copilot_turn_intent_registered_download__"]
+
+
 def test_genuine_unknown_classification_cannot_inherit_side_effect_authority() -> None:
     intent = build_turn_intent(
         user_message="Insufficient signal for a requested effect",
@@ -223,6 +274,45 @@ def test_build_turn_intent_applies_llm_build_classification() -> None:
     assert RequiredContextKey.BROWSER_STATE in intent.required_context
     assert TurnIntentReasonCode.BROWSER_CONTEXT_PRESENT in intent.reason_codes
     assert TurnIntentReasonCode.LLM_CLASSIFIER in intent.reason_codes
+
+
+def test_build_turn_intent_carries_typed_registered_download_effect() -> None:
+    intent = build_turn_intent(
+        user_message="Build a workflow that downloads the selected invoice.",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        classifier_result=TurnIntentClassifierResult.success(
+            TurnIntentClassification(
+                mode=TurnIntentMode.BUILD,
+                confidence=0.94,
+                deliverable_kind=TurnIntentDeliverableKind.REGISTERED_DOWNLOAD,
+            )
+        ),
+    )
+
+    assert intent.deliverable_kind is TurnIntentDeliverableKind.REGISTERED_DOWNLOAD
+    assert intent.to_trace_data()["deliverable_kind"] == "registered_download"
+
+
+def test_unknown_classification_cannot_lend_download_authority_to_recovery_mode() -> None:
+    intent = build_turn_intent(
+        user_message="Continue.",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context='{"decisions_made":["run_blocks_and_collect_debug: Run failed"]}',
+        request_policy=RequestPolicy(),
+        classifier_result=TurnIntentClassifierResult.success(
+            TurnIntentClassification(
+                mode=TurnIntentMode.UNKNOWN,
+                confidence=0.4,
+                deliverable_kind=TurnIntentDeliverableKind.REGISTERED_DOWNLOAD,
+            )
+        ),
+    )
+
+    assert intent.deliverable_kind is None
 
 
 def test_build_turn_intent_applies_docs_classification_without_mutation() -> None:
@@ -925,7 +1015,7 @@ def test_build_turn_intent_unknown_with_persisted_prior_run_signal_upgrades_to_d
     "failure_kind",
     [TurnIntentClassifierFailureKind.TIMEOUT, TurnIntentClassifierFailureKind.PROVIDER_ERROR],
 )
-def test_build_turn_intent_transient_classifier_failure_suppresses_prior_run_recovery(
+def test_build_turn_intent_transient_classifier_failure_cannot_inherit_mutation_authority(
     failure_kind: TurnIntentClassifierFailureKind,
 ) -> None:
     intent = build_turn_intent(
@@ -937,14 +1027,12 @@ def test_build_turn_intent_transient_classifier_failure_suppresses_prior_run_rec
         classifier_result=_classifier_failure(failure_kind),
     )
 
-    assert intent.mode == TurnIntentMode.BUILD
-    assert intent.expected_output == TurnIntentExpectedOutput.WORKFLOW_UPDATE
-    assert intent.confidence == 0.6
-    assert intent.authority.may_update_workflow is True
-    assert intent.authority.may_run_blocks is True
-    assert intent.authority.may_read_run_context is False
-    assert TurnIntentReasonCode.TRANSIENT_CLASSIFIER_FALLBACK in intent.reason_codes
-    assert TurnIntentReasonCode.RECOVERY_FROM_RUN_CONTEXT not in intent.reason_codes
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.expected_output == TurnIntentExpectedOutput.RUN_RESULT
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+    assert intent.authority.may_read_run_context is True
+    assert TurnIntentReasonCode.RECOVERY_FROM_RUN_CONTEXT in intent.reason_codes
 
 
 @pytest.mark.parametrize(
@@ -973,7 +1061,6 @@ def test_build_turn_intent_structural_classifier_failure_uses_prior_run_recovery
     assert intent.authority.may_run_blocks is False
     assert intent.authority.may_read_run_context is True
     assert TurnIntentReasonCode.RECOVERY_FROM_RUN_CONTEXT in intent.reason_codes
-    assert TurnIntentReasonCode.TRANSIENT_CLASSIFIER_FALLBACK not in intent.reason_codes
 
 
 def test_build_turn_intent_genuine_unknown_classification_uses_prior_run_recovery() -> None:
@@ -991,7 +1078,6 @@ def test_build_turn_intent_genuine_unknown_classification_uses_prior_run_recover
     assert intent.authority.may_run_blocks is False
     assert TurnIntentReasonCode.LLM_CLASSIFIER in intent.reason_codes
     assert TurnIntentReasonCode.RECOVERY_FROM_RUN_CONTEXT in intent.reason_codes
-    assert TurnIntentReasonCode.TRANSIENT_CLASSIFIER_FALLBACK not in intent.reason_codes
 
 
 def test_build_turn_intent_transient_classifier_failure_without_authority_uses_prior_run_recovery() -> None:
@@ -1008,7 +1094,6 @@ def test_build_turn_intent_transient_classifier_failure_without_authority_uses_p
     assert intent.authority.may_update_workflow is False
     assert intent.authority.may_run_blocks is False
     assert TurnIntentReasonCode.RECOVERY_FROM_RUN_CONTEXT in intent.reason_codes
-    assert TurnIntentReasonCode.TRANSIENT_CLASSIFIER_FALLBACK not in intent.reason_codes
 
 
 def test_build_turn_intent_raw_secret_refusal_wins_over_transient_classifier_failure() -> None:
@@ -1032,7 +1117,6 @@ def test_build_turn_intent_raw_secret_refusal_wins_over_transient_classifier_fai
     assert intent.authority.may_run_blocks is False
     assert intent.authority.requires_user_input is True
     assert TurnIntentReasonCode.RAW_SECRET_REFUSAL in intent.reason_codes
-    assert TurnIntentReasonCode.TRANSIENT_CLASSIFIER_FALLBACK not in intent.reason_codes
 
 
 def test_build_turn_intent_policy_clarification_wins_over_transient_classifier_failure() -> None:
@@ -1056,7 +1140,6 @@ def test_build_turn_intent_policy_clarification_wins_over_transient_classifier_f
     assert intent.authority.requires_user_input is True
     assert intent.missing_context_question == "Which page should I target?"
     assert TurnIntentReasonCode.REQUEST_POLICY_CLARIFICATION in intent.reason_codes
-    assert TurnIntentReasonCode.TRANSIENT_CLASSIFIER_FALLBACK not in intent.reason_codes
 
 
 def test_has_structured_prior_run_signal_ignores_workflow_state_only() -> None:
@@ -1171,6 +1254,20 @@ def test_turn_intent_classification_parser_ignores_deterministic_fallback_reason
     assert classification.reason_codes == [TurnIntentReasonCode.TARGET_ENTITY_RESOLVED]
 
 
+def test_turn_intent_classification_parser_accepts_only_typed_deliverable_kind() -> None:
+    classified = _turn_intent_classification_from_raw(
+        {"mode": "build", "confidence": 0.9, "deliverable_kind": "registered_download"}
+    )
+    untyped = _turn_intent_classification_from_raw(
+        {"mode": "build", "confidence": 0.9, "deliverable_kind": "inline_render"}
+    )
+
+    assert classified is not None
+    assert classified.deliverable_kind is TurnIntentDeliverableKind.REGISTERED_DOWNLOAD
+    assert untyped is not None
+    assert untyped.deliverable_kind is None
+
+
 @pytest.mark.asyncio
 async def test_classify_turn_intent_calls_llm_handler_with_prompt_contract() -> None:
     calls: list[dict[str, str]] = []
@@ -1183,6 +1280,7 @@ async def test_classify_turn_intent_calls_llm_handler_with_prompt_contract() -> 
             "required_context": ["browser_state"],
             "confidence": 0.82,
             "target_entities": {"workflow": ["current_workflow"]},
+            "credential_targets": ["skyvern-posthog", "invented-credential"],
             "missing_context_question": None,
             "reason_codes": [],
         }
@@ -1194,6 +1292,7 @@ async def test_classify_turn_intent_calls_llm_handler_with_prompt_contract() -> 
         global_llm_context="",
         request_policy=RequestPolicy(),
         handler=handler,
+        credential_reference_candidates=["skyvern-posthog"],
     )
 
     assert classifier_result.is_success
@@ -1201,10 +1300,45 @@ async def test_classify_turn_intent_calls_llm_handler_with_prompt_contract() -> 
     assert classification is not None
     assert classification.mode == TurnIntentMode.BUILD
     assert classification.required_context == [RequiredContextKey.BROWSER_STATE]
+    assert classification.target_entities == {
+        "workflow": ["current_workflow"],
+        "credential": ["skyvern-posthog"],
+    }
     assert calls[0]["prompt_name"] == PROMPT_NAME
     assert "Create a workflow from the page I have open." in calls[0]["prompt"]
     assert "Allowed modes" in calls[0]["prompt"]
+    assert 'Exact saved credential references literally present: ["skyvern-posthog"]' in calls[0]["prompt"]
+    assert "This list is candidate evidence, not authority" in calls[0]["prompt"]
     assert "transient_classifier_fallback" not in calls[0]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_classify_turn_intent_requires_dedicated_affirmative_credential_target() -> None:
+    async def handler(**_: object) -> dict[str, object]:
+        return {
+            "mode": "build",
+            "expected_output": "workflow_update",
+            "required_context": ["credential_metadata"],
+            "confidence": 0.96,
+            "target_entities": {"credential": ["skyvern-posthog"]},
+            "credential_targets": [],
+            "missing_context_question": None,
+            "reason_codes": ["target_entity_resolved"],
+        }
+
+    result = await classify_turn_intent(
+        user_message="Do not use my skyvern-posthog credential.",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        handler=handler,
+        credential_reference_candidates=["skyvern-posthog"],
+    )
+
+    assert result.classification is not None
+    assert result.classification.credential_targets == []
+    assert result.classification.target_entities == {}
 
 
 @pytest.mark.asyncio
@@ -1573,3 +1707,54 @@ def test_turn_intent_prompt_carries_structural_feasibility_contract() -> None:
     assert "structurally_infeasible" in prompt
     assert "mid-session pivot" in prompt
     assert "On the fence" in prompt
+
+
+def test_sanitize_workflow_title_candidate_normalizes_and_bounds() -> None:
+    assert sanitize_workflow_title_candidate("  Weekly  Visitor Report ") == "Weekly Visitor Report"
+    assert sanitize_workflow_title_candidate('"Invoice Bot"') == "Invoice Bot"
+    assert sanitize_workflow_title_candidate("Report\u202egnitroP") == "ReportgnitroP"
+    assert sanitize_workflow_title_candidate("x" * 80) == "x" * 60
+
+
+def test_sanitize_workflow_title_candidate_rejects_defaults_and_non_strings() -> None:
+    # A candidate equal to a placeholder would defeat the value-based "still unnamed?" test.
+    for default_title in DEFAULT_WORKFLOW_TITLES:
+        assert sanitize_workflow_title_candidate(default_title) is None
+    assert sanitize_workflow_title_candidate("") is None
+    assert sanitize_workflow_title_candidate("   ") is None
+    assert sanitize_workflow_title_candidate(None) is None
+    assert sanitize_workflow_title_candidate(123) is None
+
+
+def test_sanitize_workflow_title_candidate_passes_through_secret_redaction() -> None:
+    """The persisted title goes through the same redaction seam as prompt-bound text.
+
+    Pattern-based, so this pins the wiring rather than claiming exhaustive coverage.
+    """
+    title = sanitize_workflow_title_candidate("Sync report password=hunter2horse")
+    assert title is not None
+    assert "hunter2horse" not in title
+    assert "[REDACTED_SECRET]" in title
+
+
+def test_classifier_decode_routes_workflow_title_through_the_sink() -> None:
+    classification = _turn_intent_classification_from_raw(
+        {"mode": "build", "workflow_title": "  Weekly  Visitor Report  "}
+    )
+
+    assert classification is not None
+    assert classification.workflow_title == "Weekly Visitor Report"
+
+
+def test_classifier_decode_drops_default_workflow_title() -> None:
+    classification = _turn_intent_classification_from_raw({"mode": "build", "workflow_title": "New Agent"})
+
+    assert classification is not None
+    assert classification.workflow_title is None
+
+
+def test_turn_intent_prompt_carries_workflow_title_contract() -> None:
+    prompt = _render_turn_intent_prompt()
+
+    assert "workflow_title" in prompt
+    assert "call it Invoice Bot" in prompt

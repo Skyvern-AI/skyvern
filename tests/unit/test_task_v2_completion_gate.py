@@ -7,16 +7,109 @@ from __future__ import annotations
 import hashlib
 from datetime import UTC, datetime, timezone
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from skyvern.config import Settings, settings
+from skyvern.config import Settings
 from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.services import task_v2_service
+from skyvern.services import planner_levers, task_v2_service
 from skyvern.services.task_v2_service import _should_run_post_block_completion_check
+
+
+class _TaskV2WiringObserved(Exception):
+    pass
+
+
+async def _run_task_v2_wiring_case(
+    monkeypatch: pytest.MonkeyPatch,
+    iterations: list[int],
+    *,
+    shared_flag_enabled: bool,
+    planner_response: dict[str, Any] | None = None,
+    max_iterations: int | None = None,
+) -> tuple[list[dict[str, Any]], AsyncMock]:
+    completion_case = len(iterations) == 1
+    organization = SimpleNamespace(organization_id="org_test", max_steps_per_run=None)
+    task_v2 = MagicMock(observer_cruise_id="t", status=TaskV2Status.queued, prompt="goal")
+    task_v2.url, task_v2.workflow_run_id = "https://example.test", "wr_test"
+    queued_run = MagicMock(workflow_run_id="wr_test", workflow_id="wf_test", status=WorkflowRunStatus.queued)
+    running_run = MagicMock(workflow_run_id="wr_test", workflow_id="wf_test", status=WorkflowRunStatus.running)
+    workflow = MagicMock(workflow_id="wf_test", workflow_permanent_id="wp_test", title="Test")
+    block_result = MagicMock(failure_reason=None, output_parameter_value={}, success=completion_case)
+    block = SimpleNamespace(execute_safe=AsyncMock(return_value=block_result))
+    scraped_page = SimpleNamespace(screenshots=[])
+    browser_state = MagicMock(engine_selection=None)
+    browser_state.get_working_page = AsyncMock(return_value=MagicMock())
+    browser_state.validate_browser_context = AsyncMock(return_value=True)
+    browser_state.scrape_website = AsyncMock(return_value=scraped_page)
+    test_app = MagicMock()
+    test_app.scrape_exclude = []
+    test_app.WORKFLOW_SERVICE.get_workflow_run = AsyncMock(side_effect=[queued_run, *[running_run for _ in iterations]])
+    test_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=workflow)
+    test_app.WORKFLOW_SERVICE.mark_workflow_run_as_running = AsyncMock()
+    test_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(return_value=workflow)
+    test_app.BROWSER_MANAGER.get_or_create_for_workflow_run = AsyncMock(return_value=browser_state)
+    test_app.AGENT_FUNCTION.has_code_block_access = AsyncMock(return_value=False)
+    test_app.AGENT_FUNCTION.validate_task_execution = AsyncMock()
+    test_app.AGENT_FUNCTION.cleanup_element_tree_factory = MagicMock(return_value=MagicMock())
+    test_app.DATABASE.observer.update_task_v2 = AsyncMock(return_value=task_v2)
+    test_app.DATABASE.observer.create_thought = AsyncMock(return_value=SimpleNamespace(observer_thought_id="thought"))
+    test_app.DATABASE.observer.update_thought = AsyncMock()
+    test_app.DATABASE.tasks.get_tasks_by_workflow_run_id = AsyncMock(
+        side_effect=_TaskV2WiringObserved if completion_case else None,
+        return_value=[],
+    )
+    test_app.DATABASE.tasks.get_total_unique_step_order_count_by_task_ids = AsyncMock(return_value=0)
+    provider = AsyncMock(return_value=shared_flag_enabled)
+    planner_inputs: list[dict[str, Any]] = []
+    planner_response = planner_response or dict(
+        user_goal_achieved=False, should_terminate=False, plan="continue", task_type="navigate"
+    )
+    llm_handler = AsyncMock(return_value=planner_response)
+
+    def capture_planner_inputs(*_args: object, **kwargs: Any) -> str:
+        planner_inputs.append(kwargs)
+        if not completion_case and len(planner_inputs) == len(iterations):
+            raise _TaskV2WiringObserved
+        return "prompt"
+
+    context = SimpleNamespace(run_id=None, root_workflow_run_id=None, tz_info=timezone.utc)
+    monkeypatch.setattr(task_v2_service, "app", test_app)
+    monkeypatch.setattr(planner_levers.app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", provider)
+    monkeypatch.setattr(planner_levers.settings, "TASK_V2_CONVERGE_PCT", 0)
+    monkeypatch.setattr(planner_levers.settings, "TASK_V2_CARRY_SUBGOALS", False)
+    monkeypatch.setattr(planner_levers.settings, "TASK_V2_SKIP_COMPLETION_CHECK_AFTER_NAVIGATE", False)
+    monkeypatch.setattr(task_v2_service.skyvern_context, "ensure_context", lambda: context)
+    monkeypatch.setattr(task_v2_service, "initialize_task_v2_metadata", AsyncMock(return_value=task_v2))
+    monkeypatch.setattr(task_v2_service, "_set_up_workflow_context", AsyncMock())
+    monkeypatch.setattr(task_v2_service, "_resolve_max_iterations", lambda _override: max_iterations or len(iterations))
+    monkeypatch.setattr(task_v2_service, "range", lambda _max_iterations: iterations, raising=False)
+    monkeypatch.setattr(
+        task_v2_service,
+        "_is_planner_mini_goal_improvements_enabled",
+        AsyncMock(return_value=completion_case),
+    )
+    monkeypatch.setattr(task_v2_service, "build_open_tabs_context", AsyncMock(return_value=None))
+    monkeypatch.setattr(task_v2_service, "load_prompt_with_elements", capture_planner_inputs)
+    monkeypatch.setattr(task_v2_service, "_get_task_v2_llm_api_handler", lambda _task_v2: llm_handler)
+    monkeypatch.setattr(task_v2_service.SkyvernFrame, "get_url", AsyncMock(return_value=task_v2.url))
+    monkeypatch.setattr(task_v2_service, "_generate_navigation_task", AsyncMock(return_value=(block, [], [])))
+    monkeypatch.setattr(task_v2_service, "WorkflowDefinitionYAML", MagicMock())
+    monkeypatch.setattr(task_v2_service, "WorkflowCreateYAMLRequest", MagicMock())
+    monkeypatch.setattr(task_v2_service, "runtime_proxy_location", lambda _location: None)
+    monkeypatch.setattr(task_v2_service, "_get_extracted_data_from_block_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(task_v2_service, "handle_block_result", AsyncMock(return_value=running_run))
+
+    with pytest.raises(_TaskV2WiringObserved):
+        await task_v2_service.run_task_v2_helper(
+            organization, task_v2, max_iterations_override=max_iterations or len(iterations)
+        )
+
+    return planner_inputs, llm_handler
 
 
 def test_skip_after_navigate_ships_off() -> None:
@@ -341,10 +434,40 @@ async def test_planner_mini_goal_improvements_resolver_falls_back_when_provider_
     assert await task_v2_service._is_planner_mini_goal_improvements_enabled("org_test") is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lever_enabled", [True, False])
+async def test_completion_gate_resolver_controls_post_navigate_check(
+    lever_enabled: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, llm_handler = await _run_task_v2_wiring_case(
+        monkeypatch,
+        [0],
+        shared_flag_enabled=lever_enabled,
+        planner_response={
+            "user_goal_achieved": False,
+            "should_terminate": False,
+            "plan": "continue",
+            "task_type": "navigate",
+            "complete_criterion": "the navigation succeeded",
+        },
+    )
+
+    prompt_names = [call.kwargs["prompt_name"] for call in llm_handler.await_args_list]
+    assert ("task_v2_check_completion" in prompt_names) is not lever_enabled
+
+
 @pytest.mark.parametrize("task_type", ["navigate", "extract", "loop"])
-def test_default_off_runs_check_for_every_block_type(task_type: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "TASK_V2_SKIP_COMPLETION_CHECK_AFTER_NAVIGATE", False)
-    assert _should_run_post_block_completion_check(True, task_type, navigate_completion_check_enabled=True) is True
+def test_default_off_runs_check_for_every_block_type(task_type: str) -> None:
+    assert (
+        _should_run_post_block_completion_check(
+            True,
+            task_type,
+            navigate_completion_check_enabled=True,
+            skip_completion_check_after_navigate=False,
+        )
+        is True
+    )
 
 
 @pytest.mark.parametrize(
@@ -360,27 +483,26 @@ def test_flag_on_skips_only_navigate_with_embedded_check(
     task_type: str,
     navigate_completion_check_enabled: bool,
     expected: bool,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "TASK_V2_SKIP_COMPLETION_CHECK_AFTER_NAVIGATE", True)
     assert (
         _should_run_post_block_completion_check(
             True,
             task_type,
             navigate_completion_check_enabled=navigate_completion_check_enabled,
+            skip_completion_check_after_navigate=True,
         )
         is expected
     )
 
 
 @pytest.mark.parametrize("block_success", [False, None])
-def test_no_check_when_block_did_not_succeed(block_success: bool | None, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "TASK_V2_SKIP_COMPLETION_CHECK_AFTER_NAVIGATE", True)
+def test_no_check_when_block_did_not_succeed(block_success: bool | None) -> None:
     assert (
         _should_run_post_block_completion_check(
             block_success,
             "extract",
             navigate_completion_check_enabled=False,
+            skip_completion_check_after_navigate=True,
         )
         is False
     )

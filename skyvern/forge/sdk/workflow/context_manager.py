@@ -1813,6 +1813,13 @@ class WorkflowContextManager:
     def remove_workflow_run_context(self, workflow_run_id: str) -> None:
         self.workflow_run_contexts.pop(workflow_run_id, None)
 
+    def has_workflow_run_context(self, workflow_run_id: str) -> bool:
+        """Whether a run is live in THIS process. Initialized before any browser is acquired and
+        removed in clean_up_workflow, so it is a faithful per-process run-liveness signal — used to
+        decide whether a non-PBS shared-browser alias may veto a terminal close. This is
+        process-local and must never be used to reason about PBS lifetime, which is distributed."""
+        return workflow_run_id in self.workflow_run_contexts
+
     def mask_secrets_enabled_for_run(self, workflow_run_id: str | None) -> bool:
         if workflow_run_id is None:
             return False
