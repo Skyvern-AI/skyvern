@@ -379,36 +379,13 @@ async def test_finalize_counts_session_scoped_downloads_not_yet_claimed(
     assert statuses == [WorkflowRunStatus.completed]
 
 
-@pytest.mark.asyncio
-async def test_both_acceptance_paths_attach_the_same_contract(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The obligation must not depend on whether the user clicked Accept or had auto-accept on."""
-    from skyvern.forge.sdk.copilot.completion_verification import registered_download_completion_criterion
+def test_interactive_copilot_routes_do_not_own_completion_contract_lifecycle() -> None:
     from skyvern.forge.sdk.routes import workflow_copilot as route
 
-    snapshot = SimpleNamespace(active=SimpleNamespace(criteria=[registered_download_completion_criterion()]))
-    monkeypatch.setattr(route, "_load_completion_criteria_snapshot", AsyncMock(return_value=snapshot))
-    chat = SimpleNamespace(workflow_copilot_chat_id="wcc_1", workflow_permanent_id="wpid_1")
-
-    for target in (
-        SimpleNamespace(workflow_definition=SimpleNamespace(completion_contract=None)),  # manual accept
-        SimpleNamespace(workflow_definition=SimpleNamespace(completion_contract=None)),  # auto accept
-    ):
-        await route._attach_requested_completion_contract(chat, target)
-        assert target.workflow_definition.completion_contract["criteria"][0]["kind"] == "registered_download"
-
-
-@pytest.mark.asyncio
-async def test_no_active_criteria_attaches_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
-    from skyvern.forge.sdk.routes import workflow_copilot as route
-
-    monkeypatch.setattr(
-        route, "_load_completion_criteria_snapshot", AsyncMock(return_value=SimpleNamespace(active=None))
-    )
-    target = SimpleNamespace(workflow_definition=SimpleNamespace(completion_contract=None))
-    await route._attach_requested_completion_contract(
-        SimpleNamespace(workflow_copilot_chat_id="c", workflow_permanent_id="w"), target
-    )
-    assert target.workflow_definition.completion_contract is None
+    assert not hasattr(route, "_load_completion_criteria_snapshot")
+    assert not hasattr(route, "_persist_completion_criteria_state")
+    assert not hasattr(route, "_turn_completion_criteria")
+    assert not hasattr(route, "_attach_requested_completion_contract")
 
 
 def test_apply_proposed_workflow_route_is_bound_to_the_route_handler() -> None:
@@ -440,47 +417,3 @@ def test_a_request_criterion_is_recognized_by_its_typed_deliverable_fields() -> 
 def test_output_path_alone_identifies_a_requested_download() -> None:
     by_path = SimpleNamespace(id="c0", deliverable_kind=None, output_path="output.downloaded_files")
     assert contract_from_request_criteria([by_path]) is not None
-
-
-@pytest.mark.asyncio
-async def test_auto_accept_uses_this_turns_criteria_not_the_stored_snapshot(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Auto-accept commits before the turn's criteria are persisted, so a turn that first mints a
-    download criterion must still carry the contract."""
-    from skyvern.forge.sdk.copilot.completion_verification import registered_download_completion_criterion
-    from skyvern.forge.sdk.routes import workflow_copilot as route
-
-    # The stored snapshot is pre-turn and has nothing; this turn's state holds the new criterion.
-    monkeypatch.setattr(
-        route, "_load_completion_criteria_snapshot", AsyncMock(return_value=SimpleNamespace(active=None))
-    )
-    agent_result = SimpleNamespace(
-        completion_criteria_turn_state=SimpleNamespace(
-            decision=SimpleNamespace(criteria=(registered_download_completion_criterion(),))
-        )
-    )
-    target = SimpleNamespace(workflow_definition=SimpleNamespace(completion_contract=None))
-
-    await route._attach_requested_completion_contract(
-        SimpleNamespace(workflow_copilot_chat_id="c", workflow_permanent_id="w"), target, agent_result
-    )
-
-    assert target.workflow_definition.completion_contract is not None
-
-
-@pytest.mark.asyncio
-async def test_manual_accept_still_falls_back_to_the_stored_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Manual accept runs in a later request with no turn state, so the persisted set is the source."""
-    from skyvern.forge.sdk.copilot.completion_verification import registered_download_completion_criterion
-    from skyvern.forge.sdk.routes import workflow_copilot as route
-
-    snapshot = SimpleNamespace(active=SimpleNamespace(criteria=[registered_download_completion_criterion()]))
-    monkeypatch.setattr(route, "_load_completion_criteria_snapshot", AsyncMock(return_value=snapshot))
-    target = SimpleNamespace(workflow_definition=SimpleNamespace(completion_contract=None))
-
-    await route._attach_requested_completion_contract(
-        SimpleNamespace(workflow_copilot_chat_id="c", workflow_permanent_id="w"), target
-    )
-
-    assert target.workflow_definition.completion_contract is not None

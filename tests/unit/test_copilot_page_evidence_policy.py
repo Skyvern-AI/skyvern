@@ -70,6 +70,14 @@ def test_default_loop_budget_allows_inspect_build_run_answer_trajectory() -> Non
     assert DEFAULT_MAX_TURNS == 200
 
 
+def test_run_result_intent_directs_agent_past_redundant_output_schema_confirmation() -> None:
+    rendered = _render_agent_prompt()
+
+    assert "expected_output: run_result" in rendered
+    assert "requires_user_input: false" in rendered
+    assert "instead of asking them to confirm output fields or schema" in rendered
+
+
 def test_block_observation_ref_rejects_negative_steps() -> None:
     with pytest.raises(ValidationError):
         BlockObservationRef(label="add_to_cart", observation_step=-1)
