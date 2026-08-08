@@ -887,3 +887,123 @@ describe("CredentialCard historical (resolvedOutcome) rendering", () => {
     ).toBeTruthy();
   });
 });
+
+describe("CredentialCard auto-bound receipt", () => {
+  it("names the silently-bound credential in the receipt", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="auto-bound"
+        autoBound={{ credentialId: "cred_work", name: "Work login" }}
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Using credential 'Work login'")).toBeTruthy();
+  });
+
+  it("offers a Change picker that routes a pick through onConnect (no third path)", async () => {
+    const onConnect = vi.fn();
+    credsData.current = [
+      { credential_id: "cred_work", name: "Work login" },
+      { credential_id: "cred_personal", name: "Personal login" },
+    ];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="auto-bound"
+        autoBound={{ credentialId: "cred_work", name: "Work login" }}
+        canChange
+        onConnect={onConnect}
+        onSkip={vi.fn()}
+      />,
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Personal login" }),
+    );
+    expect(onConnect).toHaveBeenCalledWith("cred_personal", "Personal login");
+  });
+
+  it("stays read-only (no Change) on a scrollback turn where change is not live", async () => {
+    credsData.current = [
+      { credential_id: "cred_work", name: "Work login" },
+      { credential_id: "cred_personal", name: "Personal login" },
+    ];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="auto-bound"
+        autoBound={{ credentialId: "cred_work", name: "Work login" }}
+        canChange={false}
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    // The receipt still names the credential, but a scrollback turn offers no Change picker — a pick
+    // there would optimistically resolve without an actual continuation behind it.
+    expect(screen.getByText("Using credential 'Work login'")).toBeTruthy();
+    expect(screen.queryByRole("combobox")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Change" })).toBeNull();
+    // And a read-only receipt does not fetch the org list at all (no per-scrollback-receipt fetch).
+    expect(getClientMock).not.toHaveBeenCalled();
+  });
+
+  it("hands off to the existing continuing receipt once a change resolves", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="auto-bound"
+        autoBound={{ credentialId: "cred_work", name: "Work login" }}
+        resolvedOutcome={RESOLVED_OUTCOME_CONNECTED}
+        continued
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Continuing with 'HN login'…")).toBeTruthy();
+    expect(screen.queryByText(/Using credential/)).toBeNull();
+  });
+
+  it("offers an add-credential Change when the bound one is the org's only credential", async () => {
+    const onConnect = vi.fn();
+    // No OTHER credential to pick, but a correction must stay reachable — Change falls back to adding a
+    // new credential (onConnect(undefined) opens the add modal), not a redundant re-pick of the bound one.
+    credsData.current = [{ credential_id: "cred_work", name: "Work login" }];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="auto-bound"
+        autoBound={{ credentialId: "cred_work", name: "Work login" }}
+        canChange
+        onConnect={onConnect}
+        onSkip={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(getClientMock).toHaveBeenCalled());
+    expect(screen.getByText("Using credential 'Work login'")).toBeTruthy();
+    // A fallback button (not the searchable combobox), routing to the add modal.
+    expect(screen.queryByRole("combobox")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Change" }));
+    expect(onConnect).toHaveBeenCalledWith(undefined);
+  });
+
+  it("keeps Change reachable when the credential list fails to load", async () => {
+    const onConnect = vi.fn();
+    // A transient /credentials failure leaves the list null; Change must not vanish (alternates may
+    // exist) — it falls back to the add-credential path so the auto-bound pick stays correctable.
+    credsFail.current = true;
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="auto-bound"
+        autoBound={{ credentialId: "cred_work", name: "Work login" }}
+        canChange
+        onConnect={onConnect}
+        onSkip={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(getClientMock).toHaveBeenCalled());
+    fireEvent.click(await screen.findByRole("button", { name: "Change" }));
+    expect(onConnect).toHaveBeenCalledWith(undefined);
+  });
+});

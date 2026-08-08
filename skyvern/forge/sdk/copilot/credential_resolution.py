@@ -75,11 +75,87 @@ def loggable_origin(url: str) -> str:
     return f"{parsed.scheme.lower()}://{parsed.hostname}{port}"
 
 
+def is_resolved_page_url(url: str) -> bool:
+    """Whether this is an absolute page URL a URL match may be computed against.
+
+    Scheme-less input is not a page. The `https://` normalization these matchers apply would turn
+    any bare token — a prompt sentinel, a tool-argument echo, a placeholder — into a hostname that
+    matches nothing, and the resulting "no match" reads as a fact about the org's saved credentials.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        # A malformed authority (`http://[`) raises here, and callers run this ahead of their own
+        # resolver guard, so raising would abort the observing tool rather than decline its input.
+        return False
+    # Keyed on `hostname` where `url_parts` keys the whole netloc, so `https://a.example@b.example`
+    # passes here and still matches no saved credential there; netloc would not harden this.
+    return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+
+
+def unresolved_page_url_for_log(url: str) -> str:
+    """What a value that is not a page URL points at: its host, else its scheme, else the bare token.
+
+    Userinfo, query, fragment, params and path are the parts a URL carries content in, and content
+    is where a secret rides, so the identity a log may name is only ever the components above them.
+    A value too malformed to parse has no identity to name, and the outcome field carries that.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return ""
+    if parsed.hostname:
+        return f"{parsed.scheme.lower()}://{parsed.hostname}"[:64] if parsed.scheme else f"//{parsed.hostname}"[:64]
+    if parsed.scheme:
+        return f"{parsed.scheme.lower()}:"[:64]
+    return parsed.path[:64]
+
+
 def deduplicate_credentials(credentials: list[Credential]) -> list[Credential]:
     by_id: dict[str, Credential] = {}
     for credential in credentials:
         by_id.setdefault(credential.credential_id, credential)
     return list(by_id.values())
+
+
+def credential_reference_spans(message: str, reference: str) -> list[tuple[int, int]]:
+    """Return structurally delimited occurrences of one exact saved reference."""
+    spans: list[tuple[int, int]] = []
+    start = 0
+    while True:
+        index = message.find(reference, start)
+        if index < 0:
+            return spans
+        end = index + len(reference)
+        before = message[index - 1] if index else ""
+        before_is_boundary = not before or before.isspace() or before in "([{\"'`"
+        cursor = end
+        while cursor < len(message) and message[cursor] in ")]\"}'`":
+            cursor += 1
+        if cursor < len(message) and message[cursor] in ".,;:!?":
+            cursor += 1
+        after_is_boundary = cursor == len(message) or message[cursor].isspace()
+        if before_is_boundary and after_is_boundary:
+            spans.append((index, end))
+        start = index + 1
+
+
+def grounded_credential_references(message: str, credentials: list[Credential]) -> set[str]:
+    """Find complete saved names/IDs in a turn, preferring the longest overlap."""
+    candidates = {value for credential in credentials for value in (credential.name, credential.credential_id) if value}
+    occurrences = [
+        (reference, start, end)
+        for reference in candidates
+        for start, end in credential_reference_spans(message, reference)
+    ]
+    return {
+        reference
+        for reference, start, end in occurrences
+        if not any(
+            other_start <= start and end <= other_end and (other_start, other_end) != (start, end)
+            for _other, other_start, other_end in occurrences
+        )
+    }
 
 
 def _match_by_url_tiered(

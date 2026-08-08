@@ -30,15 +30,26 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _summarize_tool_arguments,
     _summarize_tool_output,
     aggressive_prune,
+    collapse_superseded_synthesized_offers,
     estimate_tokens,
     is_screenshot_message,
     is_synthetic_user_message,
+    log_recent_tool_output_truncation,
 )
 
 LOG = structlog.get_logger()
 
 RECENT_REAL_TURNS = 2
+TOOL_OUTPUT_TRUNCATE_SOFT = 2000
 TOOL_OUTPUT_TRUNCATE_EMERGENCY = 300
+
+
+def _emergency_truncate_all(items: list[Any], cap: int) -> list[Any]:
+    truncated_items = [_truncate_tool_output(item, cap) for item in items]
+    truncated_count = sum(1 for old, new in zip(items, truncated_items) if new is not old)
+    if truncated_count:
+        LOG.warning("copilot_tool_output_emergency_truncated", truncated_count=truncated_count, cap=cap)
+    return truncated_items
 
 
 def create_copilot_session(chat_id: str) -> SQLiteSession:
@@ -54,7 +65,19 @@ def _compact_tool_items(items: list[Any]) -> list[Any]:
         summarize_tool_output=_summarize_tool_output,
         summarize_tool_arguments=_summarize_tool_arguments,
         tool_output_truncation_suffix=_TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX,
+        on_recent_truncation=log_recent_tool_output_truncation,
     )
+
+
+def _screenshot_with_image(item: Any) -> bool:
+    """A sentinel-prefixed item only counts as the keepable frame when it actually
+    carries an image part; text-only lookalikes and placeholders must not shadow it."""
+    if not is_screenshot_message(item):
+        return False
+    content = get_agent_message_field(item, "content")
+    if not isinstance(content, list):
+        return False
+    return any(get_agent_message_field(block, "type") == "input_image" for block in content)
 
 
 def copilot_session_input_callback(
@@ -65,12 +88,12 @@ def copilot_session_input_callback(
     payloads in the middle region.
 
     Keeps the original goal (first item) at full fidelity and preserves the
-    last ``RECENT_REAL_TURNS`` real user turns. Within the remaining middle
-    region, older ``function_call_output`` / ``function_call`` items are
-    compacted using the same ``KEEP_RECENT_TOOL_OUTPUTS`` rule that
-    ``enforcement._prune_input_list`` uses in the non-session path, so
-    first-turn transcripts with a long tool chain get compacted identically
-    regardless of user-turn count.
+    last ``RECENT_REAL_TURNS`` real user turns — in production every injected
+    copilot message is synthetic, so the whole post-goal history is the middle
+    region. Within it, older ``function_call_output`` / ``function_call`` items
+    are compacted using the same ``KEEP_RECENT_TOOL_OUTPUTS`` rule that
+    ``enforcement._prune_input_list`` uses in the non-session path, and the
+    newest screenshot survives unless a newer one rides in recent/new items.
     """
     if not history_items:
         return new_items
@@ -95,9 +118,17 @@ def copilot_session_input_callback(
         recent = []
 
     pruned_middle = _compact_tool_items(middle)
+    # The newest frame must survive the merge: with every injected message classified
+    # synthetic, the whole post-goal history is middle, and blanket-replacing would
+    # blind the agent to the frame it just captured once it rotates into history.
+    middle_screenshots = [i for i, item in enumerate(pruned_middle) if _screenshot_with_image(item)]
+    has_newer_screenshot = any(_screenshot_with_image(item) for item in list(recent) + list(new_items))
+    keep_screenshot = middle_screenshots[-1] if middle_screenshots and not has_newer_screenshot else None
     pruned_middle = [
-        {"role": "user", "content": SCREENSHOT_PLACEHOLDER} if is_screenshot_message(item) else item
-        for item in pruned_middle
+        {"role": "user", "content": SCREENSHOT_PLACEHOLDER}
+        if is_screenshot_message(item) and i != keep_screenshot
+        else item
+        for i, item in enumerate(pruned_middle)
     ]
 
     return [history_items[0]] + pruned_middle + list(recent) + list(new_items)
@@ -165,11 +196,12 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
 def _filter_to_budget(data: CallModelData[Any], *, token_budget: int) -> ModelInputData:
     """Token-budget enforcement applied just before each model call.
 
-    Graduated pruning:
+    Graduated pruning, after dropping superseded synthesized-block offers:
     1. Compact older tool outputs + function-call arguments using the
        KEEP_RECENT_TOOL_OUTPUTS rule (mirrors ``enforcement._prune_input_list``).
     2. If still over budget: drop all screenshots except the most recent.
-    3. If still over budget: truncate ALL tool outputs to 300 chars.
+    3. If still over budget: truncate ALL tool outputs — first to 2000 chars,
+       then to 300 only if the softer pass was not enough.
     4. If still over budget: aggressive prune as last resort.
     """
     model_data = data.model_data
@@ -180,6 +212,11 @@ def _filter_to_budget(data: CallModelData[Any], *, token_budget: int) -> ModelIn
 
     est = estimate_tokens(items)
     LOG.info("Token estimate before filtering", tokens=est)
+
+    # Superseded offers are pure waste, dropped before the budget rungs so the freed
+    # tokens stop triggering emergency truncation. The estimate above deliberately
+    # stays pre-collapse: it is the metric that surfaces a recurrence of the stacking.
+    items = collapse_superseded_synthesized_offers(items)
 
     # Re-run compaction here even though ``copilot_session_input_callback``
     # already compacted on session merge. The KEEP_RECENT_TOOL_OUTPUTS window
@@ -207,8 +244,17 @@ def _filter_to_budget(data: CallModelData[Any], *, token_budget: int) -> ModelIn
         LOG.info("Within budget after screenshot drop", tokens=est)
         return ModelInputData(input=items, instructions=model_data.instructions)
 
-    # Layer 3: Truncate ALL tool outputs to 300 chars
-    items = [_truncate_tool_output(item, TOOL_OUTPUT_TRUNCATE_EMERGENCY) for item in items]
+    # Layer 3a: bring every tool output down to the pre-raise bound before resorting
+    # to the harsher pass, so a code-bearing recent output degrades gracefully.
+    items = _emergency_truncate_all(items, TOOL_OUTPUT_TRUNCATE_SOFT)
+
+    est = estimate_tokens(items)
+    if est <= token_budget:
+        LOG.info("Within budget after soft emergency truncation", tokens=est)
+        return ModelInputData(input=items, instructions=model_data.instructions)
+
+    # Layer 3b: Truncate ALL tool outputs to 300 chars
+    items = _emergency_truncate_all(items, TOOL_OUTPUT_TRUNCATE_EMERGENCY)
 
     est = estimate_tokens(items)
     if est <= token_budget:

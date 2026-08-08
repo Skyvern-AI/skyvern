@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal, cast
 
-DownloadKind = Literal["registered", "attribute", "extension", "observed"]
+DownloadKind = Literal["registered", "attribute", "extension", "observed", "observed_render"]
 
 # ``registered`` (S1) and ``observed`` (S3) are backed by an actual browser download having fired;
 # ``attribute``/``extension`` are S2 predictions from a scouted link's href shape.
@@ -20,6 +20,10 @@ DOWNLOAD_KIND_EXTENSION: DownloadKind = "extension"
 # serving a file via Content-Disposition has no extension and no ``download`` attribute, so the
 # href-shape prediction is blind to it and only the fired download proves the affordance.
 DOWNLOAD_KIND_OBSERVED: DownloadKind = "observed"
+# A document the scout's click opened as an inline render (a bill image in a new tab). No browser
+# download event ever fires for these, so the dir-diff proof above cannot see them; the popup whose
+# document is the file (image content-type, no attachment disposition) is the equivalent proof.
+DOWNLOAD_KIND_OBSERVED_RENDER: DownloadKind = "observed_render"
 
 # S2 may only mint a prediction; ``registered`` is S1-only and must never come from a nav target.
 _PREDICTED_DOWNLOAD_KINDS: frozenset[str] = frozenset({DOWNLOAD_KIND_ATTRIBUTE, DOWNLOAD_KIND_EXTENSION})
@@ -74,6 +78,7 @@ class _SourceStepKind(str, Enum):
     trajectory_recency = "trajectory_recency"
     registered_output = "registered_output"
     observed_download = "observed_download"
+    observed_render = "observed_render"
 
 
 @dataclass(frozen=True)
@@ -86,6 +91,9 @@ class ReachedDownloadTarget:
     # Stored ``trajectory_index`` of the last scouted interaction at the moment the affordance was
     # observed; the synthesizer sequences the download terminal here instead of after the whole trajectory.
     trajectory_anchor: int | None = None
+    # For ``observed_render`` only: the click-proven URL the popup rendered. Provenance is the
+    # scout's own click, never a model guess, which is what licenses saving from it.
+    rendered_url: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -94,6 +102,7 @@ class ReachedDownloadTarget:
             "download_kind": self.download_kind,
             "source_step": self.source_step,
             "already_registered": self.already_registered,
+            "rendered_url": self.rendered_url,
         }
 
 
@@ -172,6 +181,25 @@ def derive_from_observed_download(*, selector: str, affordance_text: str = "") -
     )
 
 
+def derive_from_observed_render(
+    *, selector: str, rendered_url: str, affordance_text: str = ""
+) -> ReachedDownloadTarget | None:
+    """S3 sibling: mint a target from a document the scout's click opened as an inline image render,
+    so the guidance layer can steer the model away from the download idioms that cannot work on it."""
+    selector = _summary_str(selector)
+    rendered_url = _summary_str(rendered_url)
+    if not selector or not rendered_url:
+        return None
+    return ReachedDownloadTarget(
+        selector=selector,
+        affordance_text=_summary_str(affordance_text),
+        download_kind=DOWNLOAD_KIND_OBSERVED_RENDER,
+        source_step=_SourceStepKind.observed_render.value,
+        already_registered=False,
+        rendered_url=rendered_url,
+    )
+
+
 def derive_from_block_outputs(block_outputs_by_label: Any) -> ReachedDownloadTarget | None:
     """S1: confirm a reached download from a browser download already registered into a block output.
 
@@ -206,8 +234,29 @@ _CONFIRMED_DOWNLOAD_GUIDANCE = (
     "URLs in the chat reply."
 )
 
+_OBSERVED_RENDER_GUIDANCE = (
+    "This click opens the document as an inline render in a new tab — no browser download event "
+    "fires here, so do NOT author page.expect_download for this affordance (it waits forever) and "
+    "do not return a downloaded_files entry the platform did not register. If the viewer offers a "
+    "real download/print/export control, exercise that instead; otherwise report plainly that the "
+    "document renders on screen but cannot be registered as a downloaded file yet."
+)
+
+
+def can_deliver_registered_download(target: ReachedDownloadTarget | None) -> bool:
+    """Whether this target can still become a registered download in the generated workflow.
+
+    An ``observed_render`` affordance compiles no terminal (registering its bytes needs the
+    execution layer), so it must never credit a download deliverable as reachable or reached.
+    """
+    if target is None:
+        return False
+    return target.download_kind != DOWNLOAD_KIND_OBSERVED_RENDER
+
 
 def guidance_for(target: ReachedDownloadTarget) -> str:
+    if target.download_kind == DOWNLOAD_KIND_OBSERVED_RENDER:
+        return _OBSERVED_RENDER_GUIDANCE
     return _CONFIRMED_DOWNLOAD_GUIDANCE if target.already_registered else _AUTHOR_DOWNLOAD_GUIDANCE
 
 

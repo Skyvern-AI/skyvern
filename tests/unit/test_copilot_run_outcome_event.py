@@ -191,6 +191,20 @@ def _run_outcome_frames(stream: _FakeStream) -> list[WorkflowCopilotRunOutcomeUp
     return [frame for frame in stream.sent if isinstance(frame, WorkflowCopilotRunOutcomeUpdate)]
 
 
+def test_run_outcome_event_role_defaults_to_adjudicated() -> None:
+    frame = WorkflowCopilotRunOutcomeUpdate.model_validate(
+        {
+            "type": "run_outcome",
+            "workflow_run_id": "wr_test",
+            "verdict": "demonstrated",
+            "iteration": 0,
+            "timestamp": "2026-06-10T00:00:00Z",
+        }
+    )
+
+    assert frame.role == "adjudicated"
+
+
 @pytest.mark.asyncio
 async def test_blocker_run_emits_hold_then_not_demonstrated() -> None:
     result = _blocked_run_result()
@@ -206,6 +220,7 @@ async def test_blocker_run_emits_hold_then_not_demonstrated() -> None:
     assert final.workflow_run_block_ids == ["wrb_open_registry_search", "wrb_search_registry_person"]
     assert final.block_labels == ["open_registry_search", "search_registry_person"]
     assert final.display_reason is not None and "human verification challenge" in final.display_reason
+    assert final.role == "adjudicated"
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_run_outcome == RecordedRunOutcome(
         verdict=final.verdict,
@@ -273,7 +288,9 @@ async def test_empty_data_run_emits_no_meaningful_output() -> None:
     frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
     assert [frame.verdict for frame in frames] == ["evaluating", "not_demonstrated"]
     assert frames[-1].reason_code == "no_meaningful_output"
+    assert frames[-1].role == "adjudicated"
     assert ctx.last_test_suspicious_success is True
+    assert ctx.last_run_outcome is not None and ctx.last_run_outcome.role == "adjudicated"
 
 
 def _terminal_metadata_entry(label: str) -> dict[str, Any]:
@@ -312,9 +329,11 @@ async def test_negative_adjudication_emits_outcome_not_demonstrated(monkeypatch:
     final = frames[-1]
     assert final.reason_code == "outcome_not_demonstrated"
     assert final.display_reason is not None and "did not demonstrate the goal outcome" in final.display_reason
+    assert final.role == "interim_build_test"
     assert ctx.last_test_suspicious_success is True
     assert ctx.last_full_workflow_test_ok is False
     assert ctx.last_run_outcome is not None and ctx.last_run_outcome.verdict == "not_demonstrated"
+    assert ctx.last_run_outcome.role == "interim_build_test"
 
 
 @pytest.mark.asyncio
@@ -348,6 +367,7 @@ async def test_satisfied_adjudication_emits_demonstrated(monkeypatch: pytest.Mon
     frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
     assert [frame.verdict for frame in frames] == ["evaluating", "demonstrated"]
     assert frames[-1].reason_code is None
+    assert frames[-1].role == "adjudicated"
     assert ctx.last_full_workflow_test_ok is True
 
 
@@ -422,6 +442,7 @@ async def test_evaluating_hold_gets_final_frame_when_recording_raises(monkeypatc
 
     frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
     assert [frame.verdict for frame in frames] == ["evaluating", "not_evaluated"]
+    assert frames[-1].role == "adjudicated"
 
 
 def test_failed_rerun_clears_prior_recorded_outcome() -> None:
@@ -589,6 +610,7 @@ def test_narrative_payload_stamps_outcome_on_adjudicated_labels() -> None:
         verdict="not_demonstrated",
         reason_code="blocker_reported",
         display_reason="The search form is gated by a human verification challenge.",
+        role="interim_build_test",
     )
     ctx.last_run_outcome_block_labels = ["open_registry_search", "search_registry_person"]
 
@@ -599,8 +621,10 @@ def test_narrative_payload_stamps_outcome_on_adjudicated_labels() -> None:
         assert by_label[label]["state"] == "completed"
         assert by_label[label]["outcome"] == "not_demonstrated"
         assert by_label[label]["outcomeReason"] == "The search form is gated by a human verification challenge."
+        assert by_label[label]["outcomeRole"] == "interim_build_test"
     assert "outcome" not in by_label["untested_block"]
     assert "outcomeReason" not in by_label["untested_block"]
+    assert "outcomeRole" not in by_label["untested_block"]
 
 
 def test_narrative_payload_without_recorded_outcome_has_no_outcome_keys() -> None:
@@ -611,6 +635,7 @@ def test_narrative_payload_without_recorded_outcome_has_no_outcome_keys() -> Non
     for block in payload["blocks"]:
         assert "outcome" not in block
         assert "outcomeReason" not in block
+        assert "outcomeRole" not in block
 
 
 class TestGenuineAttemptRunStamp:

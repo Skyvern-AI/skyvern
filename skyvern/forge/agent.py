@@ -4364,6 +4364,16 @@ class ForgeAgent:
         )
         extra_action_guidance = await app.AGENT_FUNCTION.get_extra_extract_action_guidance(task)
 
+        # SKY-9983: render per-step-changing sections (action history, dialogs, tabs) after the
+        # element tree so provider prefix caches can hit the tree across steps on the same page.
+        stable_prefix_ordering = False
+        if template == EXTRACT_ACTION_TEMPLATE:
+            stable_prefix_ordering = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "EXTRACT_ACTION_STABLE_PREFIX",
+                task.workflow_run_id if task.workflow_run_id else task.task_id,
+                properties={"task_url": task.url, "organization_id": task.organization_id},
+            )
+
         # Offer PASTE_TEXT (fill a spreadsheet grid with one tab/newline block) only under the umbrella,
         # so grid-fill guidance is scoped to the eval org until proven out.
         planner_mini_goal_improvements = settings.PLANNER_MINI_GOAL_IMPROVEMENTS
@@ -4419,6 +4429,7 @@ class ForgeAgent:
                     "llm_screenshots_enabled": llm_screenshots_enabled,
                     "enriched_tree_enabled": enriched_tree_enabled,
                     "slim_output": slim_output,
+                    "stable_prefix_ordering": stable_prefix_ordering,
                 }
                 cache_variant = self._build_extract_action_cache_variant(
                     verification_code_check=verification_code_check,
@@ -4494,6 +4505,7 @@ class ForgeAgent:
                     task_id=task.task_id,
                     prompt_name=EXTRACT_ACTION_PROMPT_NAME,
                     cache_variant=cache_variant,
+                    stable_prefix_ordering=stable_prefix_ordering,
                 )
                 # Map template to prompt_name for logging/caching guards
                 prompt_name = EXTRACT_ACTION_PROMPT_NAME if template == EXTRACT_ACTION_TEMPLATE else template
@@ -4552,6 +4564,7 @@ class ForgeAgent:
                 llm_screenshots_enabled=llm_screenshots_enabled,
                 enriched_tree_enabled=enriched_tree_enabled,
                 slim_output=slim_output,
+                stable_prefix_ordering=stable_prefix_ordering,
                 lean_compress_long_href=False,
                 lean_compress_image_src=context.enable_lean_element_tree,
                 lean_strip_url_query_strings=context.enable_lean_element_tree,
@@ -4567,6 +4580,7 @@ class ForgeAgent:
         _prompt_build_span.set_attribute("prompt_name", prompt_name)
         _prompt_build_span.set_attribute("prompt_tokens", count_tokens(full_prompt))
         _prompt_build_span.set_attribute("use_caching", bool(use_caching))
+        _prompt_build_span.set_attribute("stable_prefix_ordering", stable_prefix_ordering)
 
         if recent_dialog_messages_str is not None:
             context.clear_recent_dialog_messages()
@@ -4764,6 +4778,22 @@ class ForgeAgent:
         scraped_page: ScrapedPage | None = None,
     ) -> dict[str, Any] | list | str | None:
         final_navigation_payload = task.navigation_payload
+
+        # Represent any plaintext parameter value that exactly equals a stored credential value as
+        # that credential's resolvable placeholder token BEFORE the synthetic values below (the real
+        # verification code and the "123456" TOTP format hint) are injected, so those synthetic
+        # values can never be turned into resolvable credential tokens. Otherwise such a value would
+        # be one-way-redacted to [REDACTED_SECRET] at the LLM boundary and typed verbatim; here the
+        # planner never sees the raw value and the existing input path resolves the token before
+        # browser input.
+        if (
+            task.workflow_run_id is not None
+            and task.workflow_run_id in app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts
+        ):
+            workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
+            final_navigation_payload = workflow_run_context.represent_plaintext_secrets_as_placeholders(
+                final_navigation_payload
+            )
 
         current_context = skyvern_context.ensure_context()
         verification_code = current_context.totp_codes.get(task.task_id)
@@ -5544,11 +5574,11 @@ class ForgeAgent:
             if getattr(task, key) != value
         }
 
+        start_time = task.started_at.replace(tzinfo=UTC) if task.started_at else task.created_at.replace(tzinfo=UTC)
+        duration_seconds = (datetime.now(UTC) - start_time).total_seconds()
         # Track task duration when task is completed, failed, or terminated
         if status in [TaskStatus.completed, TaskStatus.failed, TaskStatus.terminated]:
-            start_time = task.started_at.replace(tzinfo=UTC) if task.started_at else task.created_at.replace(tzinfo=UTC)
             queued_seconds = (start_time - task.created_at.replace(tzinfo=UTC)).total_seconds()
-            duration_seconds = (datetime.now(UTC) - start_time).total_seconds()
             LOG.info(
                 "Task duration metrics",
                 task_id=task.task_id,
@@ -5559,14 +5589,22 @@ class ForgeAgent:
                 organization_id=task.organization_id,
                 failure_reason=failure_reason,
             )
-
         await save_task_logs(task.task_id)
         LOG.info("Updating task in db", task_id=task.task_id, diff=update_comparison, sampling=True)
-        return await app.DATABASE.tasks.update_task(
+        updated_task = await app.DATABASE.tasks.update_task(
             task.task_id,
             organization_id=task.organization_id,
             **updates,
         )
+        # Minutes emit after the terminal write lands and only on the non-final ->
+        # final transition (task holds the pre-write status), so neither a retried
+        # failed write nor a repeated terminal update double-counts the run;
+        # is_final() includes canceled and timed_out, matching the workflow-run gate.
+        if task.workflow_run_id is None and status.is_final() and not task.status.is_final():
+            await app.AGENT_FUNCTION.record_run_duration(
+                run_type="task_v1", status=str(status), duration_seconds=duration_seconds
+            )
+        return updated_task
 
     async def _handle_completed_step_with_parallel_verification(
         self,

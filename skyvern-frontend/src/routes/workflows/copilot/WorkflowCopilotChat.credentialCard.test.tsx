@@ -342,6 +342,29 @@ const terminalPromptResponse = (turnId = "turn-9") => ({
   },
 });
 
+// A turn that silently auto-bound a credential (no ask): carries credentialAutoBound, no prompt/pause.
+const terminalAutoBoundResponse = (turnId = "turn-9") => ({
+  type: "response",
+  workflow_copilot_chat_id: "chat-1",
+  message: "Signing in with your saved credential.",
+  updated_workflow: null,
+  response_time: "2026-07-13T00:00:05Z",
+  proposal_disposition: "no_proposal",
+  turn_id: turnId,
+  narrative_payload: {
+    turnId,
+    turnIndex: 0,
+    mode: "build",
+    responseType: "REPLY",
+    terminal: "response",
+    terminalMessage: "Signing in with your saved credential.",
+    narrativeSummary: "Signing in with your saved credential.",
+    startedAt: "2026-07-13T00:00:00Z",
+    endedAt: "2026-07-13T00:00:05Z",
+    credentialAutoBound: { credentialId: "cred_work", name: "Work login" },
+  },
+});
+
 // A pause that engaged but never sent a frame — no card should render.
 const terminalDeclinedResponse = (turnId = "turn-7") => ({
   type: "response",
@@ -931,6 +954,87 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
     await screen.findByTestId("mock-create-credential");
     expect(modalDefaultTestUrl.current).toBeUndefined();
   });
+
+  it("renders the auto-bind receipt from the credentialAutoBound signal", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    await renderChat();
+    await submit("sign in and grab my dashboard");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalAutoBoundResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    expect(
+      await screen.findByText("Using credential 'Work login'"),
+    ).toBeTruthy();
+  });
+
+  it("Change re-picks through the existing terminal-continue path (no third path)", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    credentialsData.current = [
+      { credential_id: "cred_work", name: "Work login", tested_url: null },
+      {
+        credential_id: "cred_personal",
+        name: "Personal login",
+        tested_url: null,
+      },
+    ];
+    await renderChat();
+    await submit("sign in and grab my dashboard");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalAutoBoundResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    expect(
+      await screen.findByText("Using credential 'Work login'"),
+    ).toBeTruthy();
+    // Open the Change picker and pick a different credential.
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Personal login" }),
+      );
+    });
+    // A fresh turn fires referencing the picked credential by id (the deterministic continue path),
+    // and NOT a typed credential-response POST — the same path a terminal ask pick uses.
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]!.body.message).toContain("cred_personal");
+    expect(streamCalls[1]!.body.message).toContain("continue");
+    expect(credentialResponsePosts()).toHaveLength(0);
+    expect(
+      await screen.findByText("Continuing with 'Personal login'…"),
+    ).toBeTruthy();
+  });
+
+  it("defers the auto-bind receipt to a co-occurring credential ask", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    await renderChat();
+    await submit("sign in to both sites");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    const base = terminalAutoBoundResponse("turn-9");
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage({
+        ...base,
+        narrative_payload: {
+          ...base.narrative_payload,
+          credentialPrompt: { reason: "credential_name_unresolved" },
+        },
+      });
+      streamCalls[0]!.resolve();
+    });
+    // The credential ask owns this turn's credential UI and its credentialResolutions entry; the
+    // auto-bind receipt defers so it can't adopt the ask's resolution.
+    expect(screen.queryByText(/Using credential/)).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Connect credential" }),
+    ).toBeTruthy();
+  });
 });
 
 describe("WorkflowCopilotChat — credential card (flag off parity)", () => {
@@ -946,5 +1050,143 @@ describe("WorkflowCopilotChat — credential card (flag off parity)", () => {
     expect(
       screen.queryByRole("button", { name: "Connect credential" }),
     ).toBeNull();
+  });
+
+  it("renders no auto-bind receipt with the flag off", async () => {
+    await renderChat();
+    await submit("sign in and grab my dashboard");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalAutoBoundResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    expect(screen.queryByText(/Using credential/)).toBeNull();
+  });
+});
+
+describe("WorkflowCopilotChat — auto-bound receipt chronology", () => {
+  const autoBoundResponse = (
+    turnId: string,
+    turnIndex: number,
+    message: string,
+  ) => {
+    const response = terminalAutoBoundResponse(turnId);
+    return {
+      ...response,
+      message,
+      narrative_payload: {
+        ...response.narrative_payload,
+        turnIndex,
+        terminalMessage: message,
+        narrativeSummary: message,
+        credentialAutoBound: {
+          credentialId: "cred_acme_test",
+          name: "acme-test",
+        },
+      },
+    };
+  };
+
+  const historyMessage = (
+    turnId: string,
+    turnIndex: number,
+    message: string,
+  ) => {
+    const response = autoBoundResponse(turnId, turnIndex, message);
+    return {
+      sender: "ai" as const,
+      content: message,
+      created_at: response.response_time,
+      narrative_payload: response.narrative_payload,
+      turn_outcome: null,
+    };
+  };
+
+  async function completeAutoBoundTurn(
+    callIndex: number,
+    turnId: string,
+    message: string,
+  ) {
+    await submit(`prompt ${callIndex + 1}`);
+    await waitFor(() =>
+      expect(postStreaming).toHaveBeenCalledTimes(callIndex + 1),
+    );
+    await act(async () => {
+      streamCalls[callIndex]!.onMessage(turnStart(turnId));
+      streamCalls[callIndex]!.onMessage(
+        autoBoundResponse(turnId, callIndex, message),
+      );
+      streamCalls[callIndex]!.resolve();
+    });
+  }
+
+  it("keeps a repeated live receipt on the first turn", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    await renderChat();
+    await completeAutoBoundTurn(0, "turn-chronology-1", "First turn complete.");
+    await completeAutoBoundTurn(
+      1,
+      "turn-chronology-2",
+      "Second turn complete.",
+    );
+
+    const receipts = screen.getAllByText("Using credential 'acme-test'");
+    expect(receipts).toHaveLength(1);
+    expect(
+      screen
+        .getByText("First turn complete.")
+        .closest('[role="status"]')
+        ?.contains(receipts[0]!),
+    ).toBe(true);
+    expect(
+      screen
+        .getByText("Second turn complete.")
+        .closest('[role="status"]')
+        ?.contains(receipts[0]!),
+    ).toBe(false);
+  });
+
+  it("keeps the surviving scrollback receipt read-only", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    await renderChat();
+    await completeAutoBoundTurn(0, "turn-readonly-1", "First turn complete.");
+    expect(await screen.findByRole("button", { name: "Change" })).toBeTruthy();
+
+    await completeAutoBoundTurn(1, "turn-readonly-2", "Second turn complete.");
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Change" })).toBeNull(),
+    );
+  });
+
+  it("hydrates one receipt at the first persisted position", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    historyResponse.data.chat_history = [
+      historyMessage("turn-history-1", 0, "First persisted turn."),
+      historyMessage("turn-history-2", 1, "Second persisted turn."),
+    ];
+
+    await renderChat();
+    await waitFor(() =>
+      expect(
+        screen.queryAllByText("Using credential 'acme-test'"),
+      ).toHaveLength(1),
+    );
+
+    const receipt = screen.getByText("Using credential 'acme-test'");
+    expect(
+      screen
+        .getByText("First persisted turn.")
+        .closest('[role="status"]')
+        ?.contains(receipt),
+    ).toBe(true);
+    expect(
+      screen
+        .getByText("Second persisted turn.")
+        .closest('[role="status"]')
+        ?.contains(receipt),
+    ).toBe(false);
+    expect(screen.queryByRole("button", { name: "Change" })).toBeNull();
+    expect(credentialsGets()).toHaveLength(0);
   });
 });

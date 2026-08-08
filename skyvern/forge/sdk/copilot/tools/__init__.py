@@ -10,7 +10,6 @@ from typing import Any
 import structlog
 from agents import function_tool
 from agents.run_context import RunContextWrapper
-from typing_extensions import TypedDict
 
 from skyvern.forge import app as app
 from skyvern.forge.sdk.copilot.build_phase import (
@@ -26,6 +25,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 from skyvern.forge.sdk.copilot.composition_evidence import workflow_target_url as workflow_target_url
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
+from skyvern.forge.sdk.copilot.output_designation_resolution import RequestedOutputRead
 from skyvern.forge.sdk.copilot.output_extraction_plan import value_designation_probe_expression
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY as _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
@@ -180,6 +180,9 @@ from .mcp_hooks import _select_option_post_hook as _select_option_post_hook
 from .mcp_hooks import _type_text_post_hook as _type_text_post_hook
 from .mcp_hooks import _verify_scout_type_landed as _verify_scout_type_landed
 from .mcp_hooks import get_skyvern_mcp_alias_map as get_skyvern_mcp_alias_map
+from .mcp_hooks import (
+    resolve_requested_output_designation_from_page_evidence,
+)
 from .page_observation import _record_composition_page_observation as _record_composition_page_observation
 from .page_observation import _resolve_url_title as _resolve_url_title
 from .run_execution import RUN_BLOCKS_STAGNATION_WINDOW_SECONDS as RUN_BLOCKS_STAGNATION_WINDOW_SECONDS
@@ -473,12 +476,6 @@ _MAX_REQUESTED_OUTPUT_READS = 8
 _DESIGNATION_ERRORS_THAT_SAW_THE_VALUE = frozenset({"text-ambiguous", "path-unstable"})
 
 
-class RequestedOutputRead(TypedDict, total=False):
-    output_path: str
-    value_text: str
-    label: str
-
-
 async def _validate_requested_output_reads(
     copilot_ctx: AgentContext, reads: list[RequestedOutputRead]
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
@@ -550,6 +547,35 @@ async def _validate_requested_output_reads(
     return validated, rejected
 
 
+async def _accept_requested_output_reads(
+    copilot_ctx: AgentContext, reads: list[RequestedOutputRead], *, offered_by: str
+) -> list[dict[str, str]]:
+    """Pin the values the model read off the page, keeping what earlier offers already pinned.
+
+    The offer is reachable from every page inspection, so a path designated while one page was
+    loaded has to survive an offer made later for a different path (SKY-13485).
+    """
+    from skyvern.forge.sdk.copilot.enforcement import requested_output_extraction_plan
+
+    validated, rejected = await _validate_requested_output_reads(copilot_ctx, reads)
+    designated = {str(entry.get("output_path") or ""): entry for entry in copilot_ctx.requested_output_designations}
+    designated.update({str(entry["output_path"]): entry for entry in validated})
+    copilot_ctx.requested_output_designations = list(designated.values())
+    if validated:
+        # Bind at the observation that designated it, whoever supplied it: reach, completeness and
+        # ownership read the retained plan, so a designation that never derives one leaves the turn
+        # unable to land the read it just pinned.
+        requested_output_extraction_plan(copilot_ctx)
+    LOG.info(
+        "copilot_requested_output_designations",
+        offered_by=offered_by,
+        pinned=[{"output_path": d["output_path"], "text": d["text"][:40]} for d in validated if d["selector"]],
+        value_only=[{"output_path": d["output_path"], "text": d["text"][:40]} for d in validated if not d["selector"]],
+        rejected=rejected,
+    )
+    return rejected
+
+
 @function_tool(name_override="synthesize_demonstrated_block")
 async def synthesize_demonstrated_block_tool(
     ctx: RunContextWrapper,
@@ -573,15 +599,8 @@ async def synthesize_demonstrated_block_tool(
         return json.dumps({"ok": False, "error": loop_error})
     rejected: list[dict[str, str]] = []
     if requested_output_reads:
-        validated, rejected = await _validate_requested_output_reads(copilot_ctx, requested_output_reads)
-        copilot_ctx.requested_output_designations = validated
-        LOG.info(
-            "copilot_requested_output_designations",
-            pinned=[{"output_path": d["output_path"], "text": d["text"][:40]} for d in validated if d["selector"]],
-            value_only=[
-                {"output_path": d["output_path"], "text": d["text"][:40]} for d in validated if not d["selector"]
-            ],
-            rejected=rejected,
+        rejected = await _accept_requested_output_reads(
+            copilot_ctx, requested_output_reads, offered_by="synthesize_demonstrated_block"
         )
     source = _demonstrated_step_sources(copilot_ctx)
     if not source:
@@ -603,17 +622,23 @@ async def list_credentials_tool(
     ctx: RunContextWrapper,
     page: int = 1,
     page_size: int = 10,
+    exact_reference: str | None = None,
 ) -> str:
     """List stored credentials (metadata only — never passwords or secrets).
     Use this to find credential IDs for login blocks.
 
-    Paginated. `page_size` caps at 50. The response includes `has_more`;
+    For a saved name or credential ID stated exactly in the latest user turn, pass it as
+    `exact_reference`. Exact mode resolves organization-wide cardinality and atomically binds
+    the single match into server-owned request authority. It never falls back to fuzzy search,
+    discovery, or pagination. Zero or multiple exact matches grant no authority.
+
+    Without `exact_reference`, this is metadata-only discovery. Paginated. `page_size` caps at 50. The response includes `has_more`;
     before concluding no credential exists, keep incrementing `page` until
     `has_more` is `false` — otherwise you risk telling the user to create
     a credential they have already stored on a later page.
     """
     copilot_ctx = ctx.context
-    arguments = {"page": page, "page_size": page_size}
+    arguments = {"page": page, "page_size": page_size, "exact_reference": exact_reference}
     loop_error = _tool_loop_error(copilot_ctx, "list_credentials", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
@@ -1094,6 +1119,7 @@ async def discover_workflow_entrypoint_tool(
 async def inspect_page_for_composition_tool(
     ctx: RunContextWrapper,
     target_url: str,
+    requested_output_reads: list[RequestedOutputRead] | None = None,
 ) -> str:
     """Inspect a known page before composing form/search workflow blocks.
 
@@ -1120,8 +1146,22 @@ async def inspect_page_for_composition_tool(
     latest inspected evidence says it is disabled. If a later test still leaves
     that submit/search control disabled after a challenge-resolution attempt,
     report the observed anti-bot blocker rather than retrying the same flow.
+
+    Whenever this inspection shows a value the request asked the workflow to return, pass
+    requested_output_reads: `value_text` exactly as rendered ("1.42K", not 1420), `label` the
+    heading it sits under. The page resolves each to its element and pins the read, so the value the
+    workflow returns comes from the tile you are looking at rather than from a guessed locator.
     """
     result = await _inspect_page_for_composition_impl(ctx.context, target_url)
+    if requested_output_reads:
+        rejected = await _accept_requested_output_reads(
+            ctx.context, requested_output_reads, offered_by="inspect_page_for_composition"
+        )
+        if rejected and isinstance(result.get("data"), dict):
+            result["data"]["rejected_output_reads"] = rejected
+    # This tool's own probe runs through call_internal_tool, which bypasses the evaluate post-hook,
+    # so the packet it just captured would otherwise never reach the resolver.
+    await resolve_requested_output_designation_from_page_evidence(ctx.context)
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 

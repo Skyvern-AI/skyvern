@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import pytest
@@ -10,6 +11,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     clear_terminal_evidence_on_workflow_edit,
 )
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.terminal_envelope import (
     TerminalOutcomeEnvelope,
@@ -103,6 +105,53 @@ def test_anchor_supersession_divergence_is_logged() -> None:
     with structlog.testing.capture_logs() as logs:
         _assemble(run_outcomes=[_run_outcome("not_demonstrated", "No later run.")])
     assert not any("anchored a not_demonstrated verdict" in log["event"] for log in logs)
+
+
+def _interim_outcome(verdict: str, display_reason: str | None = None) -> RecordedRunOutcome:
+    return RecordedRunOutcome(verdict=verdict, display_reason=display_reason, role="interim_build_test")
+
+
+def test_run_anchor_ignores_interim_not_demonstrated_when_adjudicated_run_follows() -> None:
+    # Happy turn: an interim scout test run goes not_demonstrated mid-build, then the
+    # completed workflow demonstrates the goal. The envelope must not resurface the
+    # interim amber over the later adjudicated success.
+    envelope = _assemble(
+        run_outcomes=[
+            _interim_outcome("not_demonstrated", "The scout has not produced the goal yet."),
+            _run_outcome("demonstrated", "The extraction returned the value."),
+        ]
+    )
+
+    assert envelope.run_verdict == "demonstrated"
+    assert envelope.run_display_reason == "The extraction returned the value."
+
+
+def test_run_anchor_keeps_interim_amber_when_no_adjudicated_outcome() -> None:
+    # Repair ceiling: the loop stops after a suspicious-success run without ever
+    # producing an adjudicated outcome, so the interim not_demonstrated is the turn's
+    # honest terminal verdict and must still anchor amber.
+    envelope = _assemble(
+        run_outcomes=[
+            _interim_outcome("not_demonstrated", "The run completed but did not demonstrate the goal."),
+        ]
+    )
+
+    assert envelope.run_verdict == "not_demonstrated"
+    assert envelope.run_display_reason == "The run completed but did not demonstrate the goal."
+
+
+def test_run_anchor_prefers_adjudicated_not_demonstrated_over_earlier_interim() -> None:
+    # A genuine adjudicated failure on the completed workflow anchors amber even when an
+    # earlier interim run also went not_demonstrated.
+    envelope = _assemble(
+        run_outcomes=[
+            _interim_outcome("not_demonstrated", "Interim scout, still building."),
+            _run_outcome("not_demonstrated", "The extraction returned no value."),
+        ]
+    )
+
+    assert envelope.run_verdict == "not_demonstrated"
+    assert envelope.run_display_reason == "The extraction returned no value."
 
 
 @pytest.mark.parametrize(
@@ -567,6 +616,62 @@ def test_envelope_has_no_cause_when_deadline_did_not_expire() -> None:
     ctx.copilot_total_timeout_exceeded = False
 
     result = agent_module._build_timeout_exit_result(ctx, global_llm_context=None)
+
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["terminal_cause"] is None
+
+
+def test_max_turns_exit_types_the_cause_and_logs_the_backstop_fields() -> None:
+    ctx = make_copilot_ctx()
+    ctx.copilot_config = CopilotConfig()
+    ctx.copilot_run_start_monotonic = time.monotonic() - 12.0
+    ctx.enforcement_pass_count = 3
+    ctx.model_calls_this_turn = 12
+
+    with structlog.testing.capture_logs() as logs:
+        result = agent_module._handle_max_turns_exceeded(ctx, global_llm_context=None)
+
+    assert ctx.copilot_max_turns_exceeded is True
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["terminal_cause"] == "max_turns_exceeded"
+
+    backstop_logs = [entry for entry in logs if entry.get("event") == "copilot_max_turns_exceeded"]
+    assert len(backstop_logs) == 1
+    assert backstop_logs[0]["limit"] == 200
+    assert backstop_logs[0]["iteration"] == 3
+    assert backstop_logs[0]["model_call_count"] == 12
+    assert backstop_logs[0]["elapsed_seconds"] == pytest.approx(12.0, abs=1.0)
+
+
+def test_max_turns_exit_without_deadline_is_not_an_untyped_stop() -> None:
+    ctx = make_copilot_ctx()
+    ctx.copilot_total_timeout_exceeded = False
+    ctx.copilot_max_turns_exceeded = True
+
+    result = agent_module._build_max_turns_exit_result(ctx, global_llm_context=None)
+
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["terminal_cause"] is not None
+    assert result.terminal_envelope["terminal_cause"] == "max_turns_exceeded"
+
+
+def test_deadline_wins_when_both_capacity_latches_are_set() -> None:
+    ctx = make_copilot_ctx()
+    ctx.copilot_total_timeout_exceeded = True
+    ctx.copilot_max_turns_exceeded = True
+
+    result = agent_module._build_max_turns_exit_result(ctx, global_llm_context=None)
+
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["terminal_cause"] == "deadline_expired"
+
+
+def test_max_turns_exit_has_no_cause_when_neither_latch_is_set() -> None:
+    ctx = make_copilot_ctx()
+    ctx.copilot_total_timeout_exceeded = False
+    ctx.copilot_max_turns_exceeded = False
+
+    result = agent_module._build_max_turns_exit_result(ctx, global_llm_context=None)
 
     assert result.terminal_envelope is not None
     assert result.terminal_envelope["terminal_cause"] is None

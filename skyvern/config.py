@@ -1,10 +1,11 @@
 import logging
 import os
 import platform
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
@@ -70,6 +71,12 @@ _DEFAULT_ENV_FILES = tuple(
 
 
 LOG = logging.getLogger(__name__)
+
+
+class CodeBlockMode(StrEnum):
+    enabled = "enabled"
+    entitlement = "entitlement"
+    disabled = "disabled"
 
 
 class Settings(BaseSettings):
@@ -204,9 +211,10 @@ class Settings(BaseSettings):
     # this a no-op: an empty org list samples nothing and rate 1.0 keeps all.
     LOG_SAMPLING_RATE: float = 1.0
     LOG_SAMPLING_ORG_IDS: list[str] = []
-    COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
+    COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS: float = 12.0
     COPILOT_TURN_INTENT_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
     COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
+    COPILOT_OUTPUT_DESIGNATION_TIMEOUT_SECONDS: float = 12.0
     # A capture that runs out of time yields no page evidence at all, so the scout falls back to
     # dumping the page. Measured attaches on a live dashboard reach 8.6s; the former 4s bound cut the
     # tail off and a third of captures returned nothing.
@@ -269,6 +277,7 @@ class Settings(BaseSettings):
     # Algorithm used to sign the JWT
     SIGNATURE_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # one week
+    UI_SESSION_TOKEN_TTL_MINUTES: int = Field(default=60, gt=0)
 
     # Artifact storage settings
     ARTIFACT_STORAGE_PATH: str = f"{SKYVERN_DIR}/artifacts"
@@ -689,9 +698,9 @@ class Settings(BaseSettings):
     ENABLE_LOG_ARTIFACTS: bool = False
     ENABLE_SECRET_ARTIFACT_REDACTION: bool = True
     ENABLE_SECRET_VISUAL_MASKING: bool = True
-    # Deployment-level fail-closed override; takes precedence over all CodeBlock entitlements.
-    DISABLE_CODE_BLOCK_EXECUTION: bool = False
-    ENABLE_CODE_BLOCK: bool = True
+    CODE_BLOCK_MODE: CodeBlockMode = CodeBlockMode.enabled
+    DISABLE_CODE_BLOCK_EXECUTION: bool | None = None
+    ENABLE_CODE_BLOCK: bool | None = None
 
     TASK_BLOCKED_SITE_FALLBACK_URL: str = "https://www.google.com"
 
@@ -826,6 +835,10 @@ class Settings(BaseSettings):
     OTEL_SERVICE_NAME: str = "skyvern"
     OTEL_EXPORTER_OTLP_ENDPOINT: str = ""
     OTEL_METRICS_ENABLED: bool = True
+    # Comma-separated instrument-name globs allowed to export; everything else is
+    # dropped at the SDK so accidental instrumentation cannot inflate metrics cost.
+    # Empty disables the allowlist (export everything).
+    OTEL_METRICS_ALLOWLIST: str = "skyvern.*,persistent_browsers.*,redis.connection_pool.*,db.connection_pool.*,api.event_loop.*,webeye.browser_factory.*,analytics.*"
     OTEL_LOGS_ENABLED: bool = True
     OTEL_EXPORTER_INSECURE: bool = True
     # Log level for the OTLP gRPC exporter's own logger. Raise above WARNING (e.g.
@@ -851,6 +864,39 @@ class Settings(BaseSettings):
 
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"
+
+    @model_validator(mode="after")
+    def _resolve_legacy_code_block_settings(self) -> "Settings":
+        # Must be captured before CODE_BLOCK_MODE is assigned below: pydantic adds an assigned
+        # field to model_fields_set immediately, so reading it after would mark every mode explicit.
+        explicit_code_block_mode = "CODE_BLOCK_MODE" in self.model_fields_set
+        if not explicit_code_block_mode:
+            if self.DISABLE_CODE_BLOCK_EXECUTION is True:
+                self.CODE_BLOCK_MODE = CodeBlockMode.disabled
+            elif self.ENABLE_CODE_BLOCK is False:
+                self.CODE_BLOCK_MODE = CodeBlockMode.entitlement
+            elif self.ENABLE_CODE_BLOCK is True:
+                self.CODE_BLOCK_MODE = CodeBlockMode.enabled
+
+        for legacy_name in ("DISABLE_CODE_BLOCK_EXECUTION", "ENABLE_CODE_BLOCK"):
+            if legacy_name not in self.model_fields_set:
+                continue
+            if explicit_code_block_mode:
+                LOG.warning(
+                    "%s=%r is deprecated and ignored; using CODE_BLOCK_MODE=%s",
+                    legacy_name,
+                    getattr(self, legacy_name),
+                    self.CODE_BLOCK_MODE.value,
+                )
+            else:
+                LOG.warning(
+                    "%s=%r is deprecated; using CODE_BLOCK_MODE=%s",
+                    legacy_name,
+                    getattr(self, legacy_name),
+                    self.CODE_BLOCK_MODE.value,
+                )
+
+        return self
 
     @field_validator("WORKER_STALL_DUMP_SECONDS", mode="before")
     @classmethod

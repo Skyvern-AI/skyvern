@@ -56,6 +56,10 @@ class SkyvernException(Exception):
         # so the concrete name stays in logs/monitoring but never reaches end users.
         return type(self).__name__
 
+    @property
+    def message_is_user_facing(self) -> bool:
+        return False
+
 
 class SkyvernPageAnalysisTimeout(SkyvernException):
     pass
@@ -358,6 +362,12 @@ class MissingBrowserStatePage(SkyvernException):
         super().__init__(f"Browser state page is missing. {task_str} {workflow_run_str}")
 
 
+class BrowserProfileNotApplied(SkyvernException):
+    def __init__(self, browser_profile_id: str) -> None:
+        self.browser_profile_id = browser_profile_id
+        super().__init__(f"Browser profile {browser_profile_id} was not applied by the created browser")
+
+
 class MissingWorkflowRunBrowserState(SkyvernException):
     def __init__(self, workflow_run_id: str, task_id: str) -> None:
         super().__init__(f"Browser state for workflow run {workflow_run_id} and task {task_id} is missing.")
@@ -643,6 +653,9 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
 
     @staticmethod
     def _get_detail(exception: Exception) -> str:
+        if isinstance(exception, SkyvernException) and exception.message_is_user_facing:
+            return exception.message or "Unexpected browser creation failure."
+
         if isinstance(exception, CdpConnectionConfigurationError):
             return exception.message or str(exception)
 
@@ -1374,6 +1387,14 @@ class LLMCallerNotFoundError(SkyvernException):
 class BrowserSessionAlreadyOccupiedError(SkyvernHTTPException):
     def __init__(self, browser_session_id: str, runnable_id: str) -> None:
         super().__init__(f"Browser session {browser_session_id} is already occupied by {runnable_id}")
+
+
+class BrowserSessionOwnershipConflict(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(
+            f"Persistent browser session {browser_session_id} is owned by a different runnable",
+            status_code=HTTPStatus.CONFLICT,
+        )
 
 
 class BrowserSessionNotRenewable(SkyvernException):

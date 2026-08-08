@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
+import os
 import re
 import time
+import uuid
+from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
 import structlog
+from playwright.async_api import Page, Response
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -60,7 +65,6 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import FillCarry
 from skyvern.forge.sdk.copilot.enforcement import (
-    _RECENT_TOOL_OUTPUT_CHAR_CAP,
     mint_scout_observation_contract_for_ctx,
     record_reached_terminal_action_observation,
     record_scouted_output_coverage,
@@ -69,6 +73,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.reached_download_target import (
     DOWNLOAD_KIND_OBSERVED,
+    DOWNLOAD_KIND_OBSERVED_RENDER,
     ReachedDownloadTarget,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import (
@@ -76,8 +81,10 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
 )
 from skyvern.forge.sdk.copilot.reached_download_target import (
     derive_from_observed_download,
+    derive_from_observed_render,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import guidance_for as _reached_download_guidance_for
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.result_evidence import (
     LoadedResultCompositionEvidence,
     loaded_result_composition_evidence_from_page,
@@ -91,7 +98,18 @@ from skyvern.forge.sdk.copilot.runtime import (
     resolve_browser_state_for_context,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
-from skyvern.forge.sdk.workflow.models.block import CodeBlockCaptchaError, _code_block_solve_captcha_builtin
+from skyvern.forge.sdk.copilot.todo_list import (
+    _inapplicable_criterion_ids,
+    _minted_criteria,
+    _satisfied_output_paths,
+    unmet_action_deliverable_criteria,
+)
+from skyvern.forge.sdk.workflow.models.block import (
+    CodeBlockCaptchaError,
+    _bounded_code_block_recaptcha_token_populated,
+    _code_block_recaptcha_response_field_present,
+    _code_block_solve_captcha_builtin,
+)
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
@@ -103,6 +121,14 @@ from ._shared import (
 from .banned_blocks import _copilot_block_authoring_policy
 
 LOG = structlog.get_logger()
+
+# Emission budget for scout/evaluate tool results: bounds how much live page content
+# a result may carry into the authoring context, so it must not follow the transcript
+# recent-window cap.
+_SCOUT_RESULT_CHAR_CAP = 2000
+# Reconnaissance evaluates keep the raw page payload by design, so they get a larger
+# budget than the steer results; this is the hard ceiling on that channel, not a target.
+_SCOUT_RECON_RESULT_CHAR_CAP = 20_000
 
 _FILL_CARRY_RETRYABLE_VALIDATION_FAILURES = frozenset({"page_mismatch", "selector_absent_from_page_evidence"})
 
@@ -792,6 +818,10 @@ def _record_scouted_interaction(
 
 
 _MAX_CHALLENGE_SOLVE_ATTEMPTS = 3
+# Measured: a healthy turn re-enters the ladder 4-5 times for one widget, because a token
+# expires long before a turn ends. Sized well clear of that so it bounds a page rotating its
+# identity to outspend us, without cutting a legitimate turn short.
+_MAX_CHALLENGE_SOLVE_ATTEMPTS_PER_TURN = 12
 
 
 def _challenge_identity(evidence: dict[str, Any]) -> str:
@@ -840,7 +870,7 @@ async def solve_challenge_when_evidence_settles(
     url: str | None,
     observed_after_interaction: bool,
 ) -> bool:
-    """Try the shared solve routes on a challenge in just-settled evidence; True if it passed.
+    """Try the shared solve routes on a challenge in just-settled evidence; True when one landed.
 
     Call from a capture exit, never a tool hook: a settled packet describes the page as it now
     is, and ``observed_after_interaction`` follows from the seam — the act-observe capture runs
@@ -865,6 +895,16 @@ async def solve_challenge_when_evidence_settles(
     attempts = ctx.challenge_solve_attempts.get(identity, 0)
     if attempts >= _MAX_CHALLENGE_SOLVE_ATTEMPTS:
         return False
+    # Every input to the identity is page-controlled, so a widget that rotates its sitekey or id
+    # mints a fresh one on each observation and never reaches the per-identity cap. The solver
+    # costs real money on a platform-wide account, so the turn needs a bound the page cannot move.
+    if sum(ctx.challenge_solve_attempts.values()) >= _MAX_CHALLENGE_SOLVE_ATTEMPTS_PER_TURN:
+        LOG.info(
+            "copilot_scout_captcha_turn_budget_spent",
+            url=url,
+            organization_id=ctx.organization_id,
+        )
+        return False
     ctx.challenge_solve_attempts[identity] = attempts + 1
 
     # Read once so the handlers below report a failure without touching the context again.
@@ -878,8 +918,19 @@ async def solve_challenge_when_evidence_settles(
         page = await browser_state.get_working_page()
         if page is None:
             return False
+        # Crediting a token that was already there would let an unrelated widget's response pass
+        # this challenge off as solved, so the transition is what counts. An unreadable baseline
+        # withholds that credit rather than failing the solve that has not happened yet.
+        try:
+            token_before = await _bounded_code_block_recaptcha_token_populated(page)
+        except Exception:
+            token_before = None
         # In-DOM checkbox, then the Turnstile extension, then the reCAPTCHA token route.
-        await _code_block_solve_captcha_builtin(page, organization_id=organization_id)
+        arm_passed = await _code_block_solve_captcha_builtin(
+            page,
+            organization_id=organization_id,
+            browser_session_id=ctx.browser_session_id,
+        )
     except CodeBlockCaptchaError:
         LOG.info(
             "copilot_scout_captcha_solve_failed",
@@ -898,16 +949,29 @@ async def solve_challenge_when_evidence_settles(
         )
         return False
 
-    # "attempted", not "solved": the routes return normally when their probes match nothing, so a
-    # carrier asserted by challenge_state alone can complete here without anything being solved.
+    # A reCAPTCHA widget stays rendered after it is satisfied, so its continued presence says
+    # nothing; the response token going from absent to present is what the platform treats as the
+    # authoritative solve signal. An unreadable read withholds the credit rather than inventing it.
+    try:
+        token_after = await _bounded_code_block_recaptcha_token_populated(page)
+        judged_by_token = await _code_block_recaptcha_response_field_present(page)
+    except Exception:
+        token_after = None
+        judged_by_token = False
+    # Turnstile and plain checkbox challenges carry no response field, so an arm passing is all
+    # there is to go on; where a field exists, the transition is what separates this solve from a
+    # response some other widget left behind.
+    solved = arm_passed and (token_before is False and token_after is True if judged_by_token else True)
+
     if observed_after_interaction:
-        _record_challenge_encounter(ctx, carrier, outcome="attempted")
+        _record_challenge_encounter(ctx, carrier, outcome="solved" if solved else "attempted")
     LOG.info(
-        "copilot_scout_captcha_solved",
+        "copilot_scout_captcha_solve_attempted",
         url=url,
         organization_id=organization_id,
+        solved=solved,
     )
-    return True
+    return solved
 
 
 def _page_evidence_has_selector(value: Any, selector: str) -> bool:
@@ -1381,7 +1445,7 @@ def _shed_scout_page_summary_section(summary: dict[str, Any]) -> bool:
 
 def _attach_scout_page_summary(result: dict[str, Any], page_evidence: dict[str, Any]) -> None:
     """Attach a compact page summary at result["data"]["page"], keeping the whole
-    serialized result under the recent-output pruner cap by shedding sections —
+    serialized result under the scout result budget by shedding sections —
     never by slicing the serialized JSON."""
     data = result.get("data")
     if not isinstance(data, dict):
@@ -1389,7 +1453,7 @@ def _attach_scout_page_summary(result: dict[str, Any], page_evidence: dict[str, 
     try:
         summary = _build_scout_page_summary(page_evidence)
         data["page"] = summary
-        while len(json.dumps(result)) > _RECENT_TOOL_OUTPUT_CHAR_CAP:
+        while len(json.dumps(result)) > _SCOUT_RESULT_CHAR_CAP:
             if not _shed_scout_page_summary_section(summary):
                 data.pop("page", None)
                 return
@@ -1406,7 +1470,7 @@ _EVALUATE_ACTIONABLE_ACT_INSTRUCTION = (
 _EVALUATE_RESULT_COMPOSITION_INSTRUCTION = (
     "Loaded results are already visible on the current page; inspect this page for composition or author an "
     "extraction/validation block from the loaded results instead of re-reading it. For each requested output "
-    "value you can see, pass it to synthesize_demonstrated_block's requested_output_reads as the value exactly "
+    "value you can see, pass it to inspect_page_for_composition's requested_output_reads as the value exactly "
     "as rendered plus the label above it, and the page will pin the read for you."
 )
 
@@ -1633,18 +1697,33 @@ def _fit_evaluate_steer_under_cap(
     *,
     keep_raw_page_payload: bool,
 ) -> None:
-    """Keep the serialized result under the recent-output cap without ever head-slicing it.
+    """Keep the serialized result under the scout result budget without ever head-slicing it.
 
     Reconnaissance output needs the raw page payload available to the model; imperative steers have
     enough structured evidence to shed bulky non-essential payload while always preserving the action."""
 
+    def over(limit: int) -> bool:
+        return len(json.dumps(result, default=str)) > limit
+
     def over_cap() -> bool:
-        return len(json.dumps(result, default=str)) > _RECENT_TOOL_OUTPUT_CHAR_CAP
+        return over(_SCOUT_RESULT_CHAR_CAP)
 
     if not over_cap():
         return
     if keep_raw_page_payload:
         data.pop("actionable_targets", None)
+        nested = data.get("result")
+        if isinstance(nested, dict):
+            for key in _EVALUATE_STEER_NESTED_BULKY_KEYS:
+                if not over(_SCOUT_RECON_RESULT_CHAR_CAP):
+                    return
+                if key in nested and nested[key] != _EVALUATE_STEER_SHED_MARKER:
+                    nested[key] = _EVALUATE_STEER_SHED_MARKER
+        while over(_SCOUT_RECON_RESULT_CHAR_CAP):
+            largest_key = _largest_non_essential_data_key(data)
+            if largest_key is None:
+                break
+            data[largest_key] = _EVALUATE_STEER_SHED_MARKER
         return
     nested = data.get("result")
     if isinstance(nested, dict):
@@ -1724,7 +1803,7 @@ async def _auto_act_on_repeat(ctx: AgentContext, result: dict[str, Any], *, url:
     else:
         data["page"] = _build_scout_page_summary(post_evidence)
     essential = _auto_act_essential_keys()
-    while len(json.dumps(result, default=str)) > _RECENT_TOOL_OUTPUT_CHAR_CAP:
+    while len(json.dumps(result, default=str)) > _SCOUT_RESULT_CHAR_CAP:
         largest = max(
             (
                 (key, _serialized_len(value))
@@ -1779,6 +1858,42 @@ def _record_scout_page_observation(ctx: AgentContext, page_evidence: dict[str, A
     ctx.last_scout_observation_has_password_control = _page_evidence_has_password_control(page_evidence)
 
 
+def composition_steer_bypassed_for_action_goal(
+    unmet_criteria: Sequence[CompletionCriterion], parsed: dict[str, Any], *, download_target_reached: bool
+) -> bool:
+    """Pure decision shared by the live steer and offline replay: while an action deliverable is
+    unmet and its affordance is not yet click-proven, actionable targets stay visible."""
+    return bool(unmet_criteria) and not download_target_reached and bool(_actionable_target_identities(parsed))
+
+
+def _dump_steer_decision(ctx: AgentContext, parsed: dict[str, Any], *, url: str, outcome: str) -> None:
+    """Write the evaluate-steer decision and its inputs when a local run asks for them, so a
+    steering change replays offline against real captures instead of costing a live turn each.
+    The evidence carries page text, so writing requires the explicit path plus a local environment."""
+    directory = os.environ.get("COPILOT_DUMP_STEER_INPUTS")
+    if not directory or settings.ENV != "local":
+        return
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        payload = {
+            "outcome": outcome,
+            "url": url,
+            "page_evidence": parsed,
+            "criteria": [dataclasses.asdict(criterion) for criterion in _minted_criteria(ctx)],
+            "satisfied_output_paths": sorted(_satisfied_output_paths(ctx)),
+            "satisfied_criterion_ids": sorted(_inapplicable_criterion_ids(ctx)),
+            "download_target_reached": ctx.reached_download_target is not None,
+            "reached_download_target": ctx.reached_download_target.to_dict() if ctx.reached_download_target else None,
+            "last_evaluate_actionable_signature": ctx.last_evaluate_actionable_signature,
+            "last_evaluate_actionable_url": ctx.last_evaluate_actionable_url,
+        }
+        target = os.path.join(directory, f"steer-{outcome}-{uuid.uuid4().hex[:8]}.json")
+        with open(os.open(target, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600), "w") as handle:
+            json.dump(payload, handle, default=str)
+    except Exception:
+        LOG.info("copilot_steer_input_dump_failed", exc_info=True)
+
+
 async def _maybe_steer_evaluate_to_action(
     ctx: AgentContext,
     result: dict[str, Any],
@@ -1814,13 +1929,31 @@ async def _maybe_steer_evaluate_to_action(
         overlay_only = packet_describes_a_clearable_overlay(parsed)
         if overlay_only:
             LOG.info("copilot_evaluate_result_composition_deferred_to_obstruction", url=url)
+        # An unmet action deliverable outranks reading the page it must be earned on: composing an
+        # extraction here would hide the very affordances the goal still needs clicked, and no
+        # extraction can satisfy a registered-download criterion (SKY incident: the July-invoice
+        # billing table read; see reached_download_target.py for why only a click can prove these).
+        unmet_action_criteria = unmet_action_deliverable_criteria(ctx)
+        preserve_targets_for_goal = composition_steer_bypassed_for_action_goal(
+            unmet_action_criteria, parsed, download_target_reached=ctx.reached_download_target is not None
+        )
+        if preserve_targets_for_goal:
+            LOG.info(
+                "copilot_evaluate_composition_steer_bypassed_for_unmet_action_goal",
+                url=url,
+                criterion_ids=[criterion.id for criterion in unmet_action_criteria],
+            )
         # Recording an observation is independent of whether it steers. A page whose relations do not
         # mint a loaded result is steered as actionable instead, and appending only on the composition
         # branch discarded those packets outright: the log page carrying the requested count was
         # observed, steered as actionable, and never reached the binder at all (SKY-13226).
         if has_bounded_page_schema(parsed):
             _append_flow_evidence(ctx, parsed, reached_via="current_page")
-        loaded_results = None if overlay_only else _mint_current_loaded_result_source(ctx, parsed, url=url)
+        loaded_results = (
+            None
+            if (overlay_only or preserve_targets_for_goal)
+            else _mint_current_loaded_result_source(ctx, parsed, url=url)
+        )
         if loaded_results is not None:
             _reset_evaluate_tracker(ctx)
             ctx.latest_evaluate_result_composition_steer = loaded_results
@@ -1837,6 +1970,7 @@ async def _maybe_steer_evaluate_to_action(
                 result_container_count=loaded_results.result_container_count,
                 table_result_container_count=loaded_results.table_result_container_count,
             )
+            _dump_steer_decision(ctx, parsed, url=url, outcome="composition_steer")
             # The result is patched in-place; returning False keeps the normal tool-loop guard active.
             return False
         ctx.latest_evaluate_result_composition_steer = None
@@ -1875,6 +2009,7 @@ async def _maybe_steer_evaluate_to_action(
             is_repeat=is_repeat,
             steered=is_repeat and bool(targets),
         )
+        _dump_steer_decision(ctx, parsed, url=url, outcome="actionable_path")
     except Exception:
         data.pop("actionable_targets", None)
         data.pop("composition_targets", None)
@@ -1941,6 +2076,108 @@ async def _scout_session_download_names(ctx: AgentContext) -> frozenset[str] | N
     return frozenset(str(name) for name in files or ())
 
 
+def _record_popup_navigation_headers(ctx: AgentContext, response: Response) -> None:
+    """Record the popup's own document content type as the browser received it.
+
+    Re-requesting the URL to read headers would send the context's cookies to an address the page
+    chose, replaying one-click confirm links and sign-in redirects, and many document endpoints
+    answer HEAD differently or refuse it. The navigation response the browser already made costs
+    nothing and, unlike `document.contentType`, cannot be shadowed by page script.
+    """
+    try:
+        if ctx.pending_scout_popup_content_type is None and response.request.is_navigation_request():
+            ctx.pending_scout_popup_content_type = str(response.headers.get("content-type", ""))
+    except Exception:
+        LOG.debug("copilot_popup_navigation_headers_unreadable", exc_info=True)
+
+
+async def _arm_scout_popup_listener(ctx: AgentContext) -> None:
+    """Arm a one-shot popup listener before a click dispatches.
+
+    Playwright reports the popup the click opened by identity, so nothing polls and an ordinary
+    click costs nothing; a URL-set diff would both stall every click and mistake a same-tab
+    navigation for a new tab."""
+    ctx.pending_scout_popup = None
+    ctx.pending_scout_popup_content_type = None
+    try:
+        browser_state = await resolve_browser_state_for_context(ctx)
+        if browser_state is None:
+            return
+        page = await browser_state.get_or_create_page()
+
+        def _capture(popup: Page) -> None:
+            ctx.pending_scout_popup = popup
+            popup.on("response", lambda response: _record_popup_navigation_headers(ctx, response))
+
+        page.once("popup", _capture)
+    except Exception:
+        LOG.warning("copilot_scout_popup_listener_failed", exc_info=True)
+
+
+# Bounded so a page that stalls the probe cannot spend the turn budget one click at a time.
+_RENDER_PROBE_TIMEOUT_MS = 5000.0
+
+
+def _attach_reached_download_target(
+    ctx: AgentContext, data: dict[str, Any], target: ReachedDownloadTarget, *, url: str
+) -> None:
+    data["reached_download_target"] = target.to_dict()
+    data["reached_download_guidance"] = _reached_download_guidance_for(target)
+    ctx.reached_download_target = _with_trajectory_anchor(ctx, target)
+    if ctx.synthesized_block_offered and not ctx.update_workflow_called:
+        ctx.synthesized_block_offered = False
+        ctx.synthesized_block_offered_goal_complete = False
+    _register_reached_download_scout_interaction(ctx, target, url=url)
+    LOG.info(
+        "copilot_reached_download_target_steer",
+        url=url,
+        download_kind=target.download_kind,
+        already_registered=target.already_registered,
+    )
+
+
+async def _maybe_attach_observed_render_target(
+    ctx: AgentContext,
+    result: dict[str, Any],
+    *,
+    selector: str,
+    url: str,
+) -> None:
+    """S3 sibling: pin the clicked affordance when the click opened a new tab that renders the
+    document inline — the proof class the download-dir diff above can never see."""
+    if ctx.reached_download_target is not None and _is_click_proven_download_target(ctx.reached_download_target):
+        return
+    data = result.get("data")
+    if not isinstance(data, dict) or not selector:
+        return
+    popup = ctx.pending_scout_popup
+    ctx.pending_scout_popup = None
+    if popup is None:
+        return
+    try:
+        await popup.wait_for_load_state("domcontentloaded", timeout=_RENDER_PROBE_TIMEOUT_MS)
+        popup_url = str(popup.url)
+        content_type = ctx.pending_scout_popup_content_type or ""
+        ctx.pending_scout_popup_content_type = None
+        if not content_type:
+            # The popup's navigation response is often already dispatched before the handler
+            # attaches. document.contentType is page-scriptable, but this target only drives
+            # guidance now (it compiles nothing and credits no download), so a spoofed value
+            # costs a missing download step rather than a false one.
+            content_type = str(await popup.evaluate("document.contentType") or "")
+        if not content_type.lower().startswith("image/"):
+            LOG.debug("copilot_observed_render_declined", reason="not_image_render", url=url, content_type=content_type)
+            return
+        target = derive_from_observed_render(
+            selector=selector, rendered_url=popup_url, affordance_text=_scout_click_text(result)
+        )
+        if target is None:
+            return
+        _attach_reached_download_target(ctx, data, target, url=url)
+    except Exception:
+        LOG.warning("copilot_observed_render_target_attach_failed", exc_info=True)
+
+
 async def _maybe_attach_observed_download_target(
     ctx: AgentContext,
     result: dict[str, Any],
@@ -1966,19 +2203,7 @@ async def _maybe_attach_observed_download_target(
         target = derive_from_observed_download(selector=selector, affordance_text=_scout_click_text(result))
         if target is None:
             return
-        data["reached_download_target"] = target.to_dict()
-        data["reached_download_guidance"] = _reached_download_guidance_for(target)
-        ctx.reached_download_target = _with_trajectory_anchor(ctx, target)
-        if ctx.synthesized_block_offered and not ctx.update_workflow_called:
-            ctx.synthesized_block_offered = False
-            ctx.synthesized_block_offered_goal_complete = False
-        _register_reached_download_scout_interaction(ctx, target, url=url)
-        LOG.info(
-            "copilot_reached_download_target_steer",
-            url=url,
-            download_kind=target.download_kind,
-            already_registered=target.already_registered,
-        )
+        _attach_reached_download_target(ctx, data, target, url=url)
     except Exception:
         LOG.warning("copilot_observed_download_target_attach_failed", exc_info=True)
 
@@ -1991,8 +2216,10 @@ def _scout_click_text(result: dict[str, Any]) -> str:
     return text if isinstance(text, str) else ""
 
 
-def _is_observed_download_target(target: object) -> bool:
-    return getattr(target, "download_kind", None) == DOWNLOAD_KIND_OBSERVED
+def _is_click_proven_download_target(target: ReachedDownloadTarget | None) -> bool:
+    # Both kinds carry proof from the scout's own click, so neither may be repointed by a
+    # shape prediction nothing has exercised.
+    return target is not None and target.download_kind in (DOWNLOAD_KIND_OBSERVED, DOWNLOAD_KIND_OBSERVED_RENDER)
 
 
 async def _maybe_attach_reached_download_target(
@@ -2022,9 +2249,9 @@ async def _maybe_attach_reached_download_target(
         target = _derive_reached_download_from_nav_targets(parsed.get("navigation_targets"))
         if target is None:
             return
-        if _is_observed_download_target(ctx.reached_download_target):
-            # A download that actually fired outranks a prediction from link shape; without this the
-            # later writer would repoint the target at an affordance nothing has exercised.
+        if _is_click_proven_download_target(ctx.reached_download_target):
+            # A download or render that actually happened outranks a prediction from link shape;
+            # without this the later writer would repoint the target at an unexercised affordance.
             LOG.info("copilot_reached_download_target_prediction_yielded_to_observed", url=url)
             return
         data["reached_download_target"] = target.to_dict()

@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.services.local_org_auth_token_service import fingerprint_token
-from skyvern.forge.sdk.services.org_auth_service import resolve_org_from_api_key
+from skyvern.forge.sdk.services.org_auth_service import credential_route_token_types, resolve_org_from_api_key
 
 router = APIRouter(prefix="/internal/auth", tags=["internal"])
 LOG = structlog.get_logger()
@@ -73,7 +73,11 @@ async def _evaluate_local_api_key(token: str) -> DiagnosticsResult:
         )
 
     try:
-        validation = await resolve_org_from_api_key(token_candidate, app.DATABASE)
+        validation = await resolve_org_from_api_key(
+            token_candidate,
+            app.DATABASE,
+            token_types=credential_route_token_types(),
+        )
     except HTTPException as exc:
         if exc.status_code == status.HTTP_404_NOT_FOUND:
             return DiagnosticsResult(status=AuthStatus.not_found, detail=None, token=None, validation=None)

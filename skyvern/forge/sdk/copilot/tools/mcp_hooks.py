@@ -9,6 +9,7 @@ from typing import Any
 import structlog
 
 from skyvern.config import settings
+from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.build_phase import (
     BuildPhase,
@@ -21,10 +22,27 @@ from skyvern.forge.sdk.copilot.config import (
     download_scout_act_required_for_policy,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.credential_resolution import load_credentials
-from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
+from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url, load_credentials
+from skyvern.forge.sdk.copilot.enforcement import (
+    _requested_output_labels_by_path,
+    requested_output_extraction_plan,
+    requested_output_paths_for_derivation,
+    unbound_requested_output_paths_for_designation,
+)
+from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, resolve_credential_for_live_page
+from skyvern.forge.sdk.copilot.output_designation_resolution import (
+    RESOLUTION_PROMPT_TEMPLATE,
+    coerce_resolution,
+    designation_opportunity,
+    render_candidates,
+    render_requested_paths,
+)
+from skyvern.forge.sdk.copilot.request_policy import (
+    RequestPolicy,
+    live_page_credentials_admissible,
+    resolve_credential_for_live_page,
+)
 from skyvern.forge.sdk.copilot.request_slots import is_canonical_request_slot_path
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
@@ -32,7 +50,11 @@ from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values
 from skyvern.forge.sdk.copilot.typed_value_policy import safe_typed_default_value, should_reject_type_text_value
 from skyvern.forge.sdk.schemas.credentials import Credential
 
-from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS, _composition_get_structured_evidence
+from ._shared import (
+    _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+    _composition_get_structured_evidence,
+    _fallback_page_info,
+)
 from .banned_blocks import (
     _CODE_ONLY_SELECTOR_ACTION_TOOLS,
     _CODE_ONLY_TARGET_EVIDENCE_KEYS,
@@ -53,6 +75,7 @@ from .page_observation import (
 from .scouting import (
     _PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS,
     _actionable_targets_for_result,
+    _arm_scout_popup_listener,
     _attach_scout_page_summary,
     _capture_post_interaction_screenshot,
     _capture_scout_ambiguity,
@@ -65,6 +88,7 @@ from .scouting import (
     _mark_page_inspected,
     _mark_pending_browser_interaction_observation,
     _maybe_attach_observed_download_target,
+    _maybe_attach_observed_render_target,
     _maybe_attach_reached_download_target,
     _prenav_ambiguity_for_selector,
     _prenav_dynamic_row_for_selector,
@@ -358,6 +382,8 @@ async def _click_pre_hook(
     ctx.pending_scout_ambiguous = None
     ctx.pending_scout_dynamic_row = None
     ctx.pending_scout_download_snapshot = None
+    ctx.pending_scout_popup = None
+    ctx.pending_scout_popup_content_type = None
     await _capture_scout_source_url(ctx)
     deterministic_result = _strip_intent_for_code_only_selector_action(params, ctx, tool_name="click")
     if deterministic_result is not None:
@@ -385,6 +411,7 @@ async def _click_pre_hook(
     if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         await _capture_scout_dynamic_row(ctx, selector)
         ctx.pending_scout_download_snapshot = await _scout_session_download_names(ctx)
+        await _arm_scout_popup_listener(ctx)
     return None
 
 
@@ -453,9 +480,15 @@ async def _bind_login_credential_for_observed_url(ctx: AgentContext, url: str, r
         return
 
     policy = ctx.request_policy
-    if not isinstance(policy, RequestPolicy):
+    if not isinstance(policy, RequestPolicy) or not live_page_credentials_admissible(policy):
         return
     organization_id = ctx.organization_id
+
+    if not is_resolved_page_url(url):
+        # A `current_page` inspection stamps its placeholder when the URL read raced the capture.
+        # The match is against the page the browser actually reached, so read it again rather than
+        # hand over a token no page vouches for.
+        url, _ = await _fallback_page_info(ctx)
 
     async def load_once() -> list[Credential]:
         if ctx.org_credentials_for_turn is None:
@@ -482,6 +515,9 @@ async def _bind_login_credential_for_observed_url(ctx: AgentContext, url: str, r
         credential = record.candidates[0]
         result["resolved_login_credential_id"] = credential.credential_id
         result["resolved_login_credential_name"] = credential.name
+        # The observation may name a placeholder while the match ran against the page read after it,
+        # so the page the credential was matched on is reported rather than left to be inferred.
+        result["resolved_login_page_url"] = url
     elif record.verdict == "ambiguous":
         result["candidate_login_credentials"] = [
             {"credential_id": candidate.credential_id, "name": candidate.name} for candidate in record.candidates
@@ -592,6 +628,7 @@ async def _click_post_hook(
             # A download this click produced is proof the affordance works, so it outranks the
             # href-shape prediction — and is the only source that sees a command-URL download.
             await _maybe_attach_observed_download_target(ctx, result, selector=selector, url=url)
+            await _maybe_attach_observed_render_target(ctx, result, selector=selector, url=url)
         if page_evidence is not None:
             _attach_scout_page_summary(result, page_evidence)
             if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
@@ -1072,6 +1109,69 @@ def _unread_requested_output_paths(ctx: AgentContext) -> list[str]:
     return sorted(requested - claimed)
 
 
+async def resolve_requested_output_designation_from_page_evidence(ctx: AgentContext) -> None:
+    """Decide which value this packet shows for a requested output nothing has bound yet.
+
+    Fires on the page evidence rather than on an authoring step, a tool the model chose to call, or
+    a question it happened to ask — all of which can precede the value's render and none of which
+    re-fire after it (SKY-13485). Selecting nothing is a first-class answer: no write is refused and
+    a structurally different packet can offer the decision again.
+    """
+    # tools/__init__ imports this module, so the acceptance helper cannot be imported at top level.
+    from skyvern.forge.sdk.copilot.tools import _accept_requested_output_reads
+
+    if not requested_output_paths_for_derivation(ctx):
+        return
+    opportunity = designation_opportunity(
+        unbound_paths=unbound_requested_output_paths_for_designation(ctx),
+        flow_evidence=ctx.flow_evidence,
+        resolved_fingerprints=ctx.resolved_designation_fingerprints,
+    )
+    if opportunity is None:
+        return
+    handler = await resolve_main_copilot_handler(ctx.workflow_permanent_id, ctx.organization_id)
+    if handler is None:
+        return
+    prompt = prompt_engine.load_prompt(
+        template=RESOLUTION_PROMPT_TEMPLATE,
+        requested_paths=render_requested_paths(opportunity, _requested_output_labels_by_path(ctx)),
+        candidates=render_candidates(opportunity),
+        page_context=opportunity.page_context,
+    )
+    try:
+        raw = await asyncio.wait_for(
+            handler(prompt=prompt, prompt_name=RESOLUTION_PROMPT_TEMPLATE),
+            timeout=settings.COPILOT_OUTPUT_DESIGNATION_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        # Deliberately leaves the fingerprint unrecorded: a judge that timed out decided nothing, and
+        # this page is the only one that can answer for this path.
+        LOG.info("copilot_requested_output_designation_resolution", decision="unavailable", exc_info=True)
+        return
+    reads = coerce_resolution(raw, opportunity)
+    LOG.info(
+        "copilot_requested_output_designation_resolution",
+        decision="selected" if reads else "none",
+        requested_paths=list(opportunity.unbound_paths),
+        candidate_labels=[candidate.label for candidate in opportunity.candidates],
+        selected=[{"output_path": read["output_path"], "candidate_label": read["label"]} for read in reads],
+    )
+    if not reads:
+        # A judged abstention is a decision; the same offer should not be re-asked.
+        ctx.resolved_designation_fingerprints.add(opportunity.fingerprint)
+        return
+    rejected = await _accept_requested_output_reads(ctx, reads, offered_by="page_evidence_resolution")
+    if len(rejected) < len(reads):
+        # Only a designation the live page actually pinned settles this offer. A probe that missed
+        # because the metric ticked between capture and probe left the path unbound, and the
+        # fingerprint excludes values, so recording it here would suppress the tile forever.
+        ctx.resolved_designation_fingerprints.add(opportunity.fingerprint)
+    # Bind now, at the observation that resolved it: reach, completeness and ownership all read the
+    # retained plan, and deriving it later inside imposition let the same trajectory be unowned on
+    # one attempt and owned on the next.
+    requested_output_extraction_plan(ctx)
+
+
 async def _evaluate_post_hook(
     result: dict[str, Any],
     raw: dict[str, Any],
@@ -1136,13 +1236,17 @@ async def _evaluate_post_hook(
             data["claimed_output_read_hint"] = (
                 f"That expression gathered candidates rather than evaluating to one value, so nothing "
                 f"records what {claimed_path} is. Read the single value on its own — an expression whose "
-                f"result is just that value — and pass output_path={claimed_path} on that call."
+                f"result is just that value — and pass output_path={claimed_path} on that call. If you can "
+                f"see the value but not author an expression that returns just it, call "
+                f'inspect_page_for_composition(target_url="current_page") with requested_output_reads naming '
+                f"{claimed_path} and the value as rendered, and the page will pin it."
             )
             LOG.info(
                 "copilot_scouted_read_claimed_output_without_value",
                 read_output_path=claimed_path,
                 read_result_shape=recorded.get("read_result_shape"),
             )
+    await resolve_requested_output_designation_from_page_evidence(ctx)
     unread_requested = _unread_requested_output_paths(ctx)
     if unread_requested:
         data["requested_outputs_still_unread"] = unread_requested

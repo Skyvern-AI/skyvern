@@ -22,11 +22,14 @@ The `skyvern` CLI gives you direct access to browser automation, agent managemen
 pip install skyvern
 ```
 
-Set your API key:
+Set your API key and target:
 
 ```bash
 export SKYVERN_API_KEY="YOUR_KEY"  # get one at https://app.skyvern.com
+export SKYVERN_BASE_URL="https://api.skyvern.com"  # or your staging / self-hosted URL
 ```
+
+With an API key present, the CLI refuses to fall back to the production URL silently — `SKYVERN_BASE_URL` must name your target explicitly.
 
 Optionally run the interactive setup wizard to configure your environment:
 

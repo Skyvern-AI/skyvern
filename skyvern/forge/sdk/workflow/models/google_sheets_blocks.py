@@ -4,10 +4,14 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 import structlog
+from jinja2 import UndefinedError
 
 from skyvern.forge import app
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.models._jinja import jinja_json_finalize_env
+from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter
+from skyvern.forge.sdk.workflow.models._jinja import (
+    jinja_json_finalize_required_binding_env,
+)
 from skyvern.forge.sdk.workflow.models.block import Block
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 from skyvern.schemas.google_sheets import (
@@ -413,11 +417,35 @@ class GoogleSheetsWriteBlock(Block):
                 self.credential_id, workflow_run_context
             )
         if self.values:
-            self.values = self.format_block_parameter_template_from_workflow_run_context(
-                self.values, workflow_run_context, env=jinja_json_finalize_env
-            )
+            self.values = self._render_values_or_raise(workflow_run_context)
 
-    def _coerce_values(self, raw: Any, *, column_offset: int = 0) -> list[list[Any]]:
+    def _render_values_or_raise(self, workflow_run_context: WorkflowRunContext) -> str:
+        """A reference no upstream block answered would otherwise render as "" and be appended as a
+        blank cell the Sheets API reports as a successful write. `| default(...)` passes an empty."""
+        try:
+            return self.format_block_parameter_template_from_workflow_run_context(
+                self.values,
+                workflow_run_context,
+                env=jinja_json_finalize_required_binding_env,
+                skip_missing_variable_preflight=True,
+            )
+        except FailedToFormatJinjaStyleParameter as exc:
+            if not isinstance(exc.__cause__, UndefinedError):
+                raise
+            raise ValueError(
+                f"block `{self.label}` field `values` references a value no upstream block produced: "
+                f"{exc.__cause__}. Return that key from the producing block, or write an explicit "
+                "default (e.g. {{ block_label.field | default('') }}) if an empty cell is intended."
+            ) from exc
+
+    def _coerce_values(self, raw: Any, *, column_offset: int = 0, absolute_columns: bool = False) -> list[list[Any]]:
+        """Rows for the write payload.
+
+        ``absolute_columns`` selects who the row's index 0 addresses: ``values.append`` writes from
+        the first column of the table it finds — not from the range's start column — so an append
+        addresses column A and a pinned range has to be padded for, while ``values.update`` writes
+        from its own start cell and addresses columns relative to it.
+        """
         if isinstance(raw, dict):
             if isinstance(raw.get("values"), list) and isinstance(raw.get("rows"), list):
                 LOG.warning("Google Sheets write payload has both 'values' and 'rows'; using 'values'")
@@ -434,7 +462,10 @@ class GoogleSheetsWriteBlock(Block):
         if not raw:
             return []
         if all(isinstance(row, list) for row in raw):
-            return cast(list[list[Any]], raw)
+            rows = cast(list[list[Any]], raw)
+            if absolute_columns and column_offset:
+                return [[None] * column_offset + row for row in rows]
+            return rows
         if all(isinstance(row, dict) for row in raw):
             if not self.column_mapping:
                 raise ValueError("column_mapping is required when writing a list of objects to Google Sheets")
@@ -451,7 +482,7 @@ class GoogleSheetsWriteBlock(Block):
                     raise ValueError(f"column_mapping target {target!r} exceeds the Google Sheets column limit (ZZZ)")
                 if col_index in seen_columns:
                     raise ValueError(f"column_mapping has duplicate destination column: {target!r}")
-                pos = col_index - column_offset
+                pos = col_index if absolute_columns else col_index - column_offset
                 if pos < 0:
                     raise ValueError(
                         f"column_mapping target {target!r} falls before the range start column; "
@@ -646,7 +677,11 @@ class GoogleSheetsWriteBlock(Block):
             )
 
         try:
-            rows = self._coerce_values(parsed_values, column_offset=leading_column_offset(a1))
+            rows = self._coerce_values(
+                parsed_values,
+                column_offset=leading_column_offset(a1),
+                absolute_columns=self.write_mode == "append",
+            )
         except ValueError as e:
             snippet = self.values[:200] if self.values else ""
             return await self.build_block_result(

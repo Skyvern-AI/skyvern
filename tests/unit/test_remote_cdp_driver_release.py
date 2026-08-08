@@ -14,11 +14,14 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import contextmanager
+from typing import Iterator
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
 from skyvern.exceptions import MissingBrowserStateForBrowserSession, MissingOrganizationForBrowserSession
+from skyvern.forge import app as forge_app
 from skyvern.webeye import browser_engine
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_engine import (
@@ -123,7 +126,15 @@ async def test_close_timeout_bounds_interceptor_drain_and_cleans_suspended_task(
 ) -> None:
     pw = _pw_stub()
     context = _context_stub()
-    interceptor = CDPDownloadInterceptor()
+    inert_monitor = MagicMock(name="inert_network_egress_monitor")
+    inert_authorizer = AsyncMock(
+        name="inert_redirect_hop_authorizer",
+        side_effect=AssertionError("unexpected direct HTTP request"),
+    )
+    interceptor = CDPDownloadInterceptor(
+        network_egress_monitor=inert_monitor,
+        redirect_hop_authorizer=inert_authorizer,
+    )
     interceptor._accepting_browser_downloads = True
     context._skyvern_cdp_download_interceptor = interceptor
     started = asyncio.Event()
@@ -198,10 +209,10 @@ async def test_close_true_still_stops_driver_and_context() -> None:
 
 
 @pytest.mark.asyncio
-async def test_close_true_cancellation_resistant_interceptor_disable_still_runs_provider_cleanup(
+async def test_close_true_cancellation_resistant_interceptor_disable_still_runs_remote_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The paid-provider cleanup must still be attempted exactly once even when disabling the
+    # The remote browser cleanup must still be attempted exactly once even when disabling the
     # download interceptor is cancellation-resistant (ignores the cancel it receives when its
     # budget is exhausted). close() must return within an outer watchdog, and the stuck drain
     # must stay owned (its eventual exception retrieved) rather than orphaned.
@@ -237,7 +248,7 @@ async def test_close_true_cancellation_resistant_interceptor_disable_still_runs_
         elapsed = time.monotonic() - start
 
         assert elapsed < 1.0
-        cleanup.assert_awaited_once()  # provider cleanup ran despite the stuck drain
+        cleanup.assert_awaited_once()  # remote cleanup ran despite the stuck drain
         context.close.assert_awaited_once()
         pw.stop.assert_awaited_once()
 
@@ -302,10 +313,10 @@ async def test_close_true_detached_teardown_task_is_strongly_held_until_completi
 
 
 @pytest.mark.asyncio
-async def test_close_true_context_close_hang_does_not_suppress_provider_cleanup(
+async def test_close_true_context_close_hang_does_not_suppress_remote_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A hung context close must not starve the paid-provider cleanup: the context-teardown phase is
+    # A hung context close must not starve the remote browser cleanup: the context-teardown phase is
     # bounded independently, so cleanup still runs exactly once after the teardown budget elapses.
     monkeypatch.setattr("skyvern.webeye.real_browser_state.BROWSER_CLOSE_TIMEOUT", 0.05)
     pw = _pw_stub()
@@ -327,7 +338,7 @@ async def test_close_true_context_close_hang_does_not_suppress_provider_cleanup(
 
 
 @pytest.mark.asyncio
-async def test_close_true_persist_cookies_failure_does_not_suppress_provider_cleanup(
+async def test_close_true_persist_cookies_failure_does_not_suppress_remote_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A raising cookie-persistence step (an "earlier teardown callback raises") must not suppress cleanup.
@@ -353,7 +364,7 @@ async def test_close_true_persist_cookies_failure_does_not_suppress_provider_cle
 
 @pytest.mark.asyncio
 async def test_close_true_browser_cleanup_exception_is_handled_not_leaked() -> None:
-    # A raising provider cleanup must be caught (best-effort teardown) and must not leak or block driver stop.
+    # A raising remote cleanup must be caught (best-effort teardown) and must not leak or block driver stop.
     pw = _pw_stub()
     context = _context_stub()
     context.cookies = AsyncMock(return_value=[])
@@ -408,8 +419,8 @@ async def test_close_false_preserves_reuse_and_does_not_invoke_cleanup() -> None
 
 
 @pytest.mark.asyncio
-async def test_close_true_runs_provider_cleanup_exactly_once_across_reentry() -> None:
-    # Re-entrant close() must not stop/delete the paid provider a second time (avoid double-cleanup).
+async def test_close_true_runs_remote_cleanup_exactly_once_across_reentry() -> None:
+    # Re-entrant close() must not stop/delete the remote browser a second time (avoid double-cleanup).
     pw = _pw_stub()
     context = _context_stub()
     context.cookies = AsyncMock(return_value=[])
@@ -553,6 +564,20 @@ def _fake_browser_state() -> MagicMock:
     return state
 
 
+@contextmanager
+def _live_workflow_run_contexts(*run_ids: str) -> Iterator[None]:
+    """Mark the given workflow runs as live in this process so a shared wr_ alias legitimately
+    suppresses the terminal close (non-PBS ownership signal)."""
+    wcm = forge_app.WORKFLOW_CONTEXT_MANAGER
+    live = set(run_ids)
+    original = wcm.has_workflow_run_context
+    wcm.has_workflow_run_context = lambda workflow_run_id: workflow_run_id in live
+    try:
+        yield
+    finally:
+        wcm.has_workflow_run_context = original
+
+
 @pytest.mark.asyncio
 async def test_cleanup_for_task_keeps_driver_for_persistent_session() -> None:
     manager = RealBrowserManager()
@@ -588,11 +613,12 @@ async def test_cleanup_for_workflow_run_keeps_driver_while_shared() -> None:
     manager.pages["tsk_1"] = state
     manager.pages["wr_parent"] = state
 
-    await manager.cleanup_for_workflow_run(
-        "wr_child",
-        ["tsk_1"],
-        close_browser_on_completion=True,
-    )
+    with _live_workflow_run_contexts("wr_child", "wr_parent"):
+        await manager.cleanup_for_workflow_run(
+            "wr_child",
+            ["tsk_1"],
+            close_browser_on_completion=True,
+        )
 
     # Both the workflow-run-level close and the task-level close observe the
     # parent's surviving reference and must not release the shared driver.
@@ -608,11 +634,12 @@ async def test_cleanup_for_workflow_run_reports_recording_not_finalized_while_sh
     manager.pages["wr_child"] = state
     manager.pages["wr_parent"] = state
 
-    result = await manager.cleanup_for_workflow_run(
-        "wr_child",
-        [],
-        close_browser_on_completion=True,
-    )
+    with _live_workflow_run_contexts("wr_child", "wr_parent"):
+        result = await manager.cleanup_for_workflow_run(
+            "wr_child",
+            [],
+            close_browser_on_completion=True,
+        )
 
     assert result.browser_state is state
     assert result.recording_finalized is False

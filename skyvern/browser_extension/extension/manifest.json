@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "Skyvern Agent",
+  "version": "0.1.0",
+  "description": "Connects explicitly shared Chrome tabs to a local Skyvern browser session.",
+  "minimum_chrome_version": "125",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwePOj+WEmgtKAfyF3PkP6UHuWMvHhJgt0K+53fM9I/WNgu2N4YwCqYjD0h5fr4wCZfwiElUfgwxjDBHwX/Re/Y4G7WlSEG4lDTFNSRGQczHYQnerh8NHR3Gtpq59WKtRxzbbl/e1sVxab6ZyvKjiPZlbmjL44455SldRDPBNJ/5XiSflRkgV1hJ/OOdsVT4ghzjRTJsFhFTK8X0LeMupnYbjgcLb6he0ox+dX/eeDlRt3Sq5uu9+QfJg93/yOo55c0NAa7AW+1+r37GfAtezbqk3fNSraNFfhH+GQhnA6d/KPKTC7Ut2SH1Y8NYHh1yDkyYVr2bq4T6Twr/H0YgL/wIDAQAB",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "tabGroups",
+    "storage",
+    "alarms"
+  ],
+  "background": {
+    "service_worker": "service_worker.js",
+    "type": "module"
+  },
+  "externally_connectable": {
+    "matches": ["http://127.0.0.1/*", "http://localhost/*"]
+  },
+  "action": {
+    "default_title": "Skyvern Agent",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

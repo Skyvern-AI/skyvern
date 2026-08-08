@@ -302,6 +302,7 @@ class WorkflowRunsRepository(BaseRepository):
         ai_fallback: bool | None = None,
         depends_on_workflow_run_id: str | None = None,
         browser_session_id: str | None = None,
+        browser_runtime: str | None = None,
         waiting_for_verification_code: bool | None = None,
         verification_code_identifier: str | None = None,
         verification_code_polling_started_at: datetime | None = None,
@@ -399,6 +400,8 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.depends_on_workflow_run_id = depends_on_workflow_run_id
                 if browser_session_id:
                     workflow_run.browser_session_id = browser_session_id
+                if browser_runtime is not None:
+                    workflow_run.browser_runtime = browser_runtime
                 if browser_address:
                     workflow_run.browser_address = browser_address
                 if extra_http_headers is not None:
@@ -475,6 +478,7 @@ class WorkflowRunsRepository(BaseRepository):
         status: WorkflowRunStatus,
         failure_reason: str | None = None,
         run_with: str | None = None,
+        ai_fallback: bool | None = None,
         failure_category: list[dict[str, Any]] | None = None,
     ) -> WorkflowRun | None:
         """Transition a workflow run to ``status`` only if it is not already in a
@@ -499,6 +503,8 @@ class WorkflowRunsRepository(BaseRepository):
             values["failure_reason"] = failure_reason
         if run_with is not None:
             values["run_with"] = run_with
+        if ai_fallback is not None:
+            values["ai_fallback"] = ai_fallback
         if failure_category is not None:
             values["failure_category"] = failure_category
 
@@ -917,6 +923,83 @@ class WorkflowRunsRepository(BaseRepository):
     async def get_run(self, run_id: str, organization_id: str | None = None) -> WorkflowRun | None:
         """Alias satisfying the RunReader protocol."""
         return await self.get_workflow_run(run_id, organization_id=organization_id)
+
+    @db_operation("get_queued_runs_sharing_sequential_lanes")
+    async def get_queued_runs_sharing_sequential_lanes(
+        self,
+        workflow_run_id: str,
+        limit: int = 2,
+    ) -> list[WorkflowRun]:
+        """Earliest queued runs a just-finished run may have been blocking: same credential,
+        browser session, browser address, (workflow, sequential_key), or run_sequentially
+        whole-workflow lane, queued after it, ordered by the gate's (queued_at, workflow_run_id)
+        ticket. Recall-oriented: a woken run re-runs the full gate scan itself, so lanes only
+        need to cover, not decide — the blocker's self_forced/debug exclusions are deliberately
+        not replicated (an over-woken waiter just re-scans once). One index-eligible query per
+        lane, mirroring get_blocking_sequential_workflow_run's no-de-indexing-OR shape. The
+        result is bounded at lanes x limit, never truncated across lanes: a dropped lane head
+        has no depends_on edge and would sleep until the fallback poll.
+        """
+        async with self.Session() as session:
+            run = (await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))).first()
+            if run is None:
+                return []
+
+            lane_filters: list[ColumnElement[bool]] = []
+            if run.sequential_credential_id:
+                lane_filters.append(WorkflowRunModel.sequential_credential_id == run.sequential_credential_id)
+            if run.browser_session_id:
+                lane_filters.append(WorkflowRunModel.browser_session_id == run.browser_session_id)
+            if run.browser_address:
+                lane_filters.append(WorkflowRunModel.browser_address == run.browser_address)
+            if run.sequential_key:
+                lane_filters.append(
+                    and_(
+                        WorkflowRunModel.workflow_permanent_id == run.workflow_permanent_id,
+                        WorkflowRunModel.sequential_key == run.sequential_key,
+                    )
+                )
+            if run.workflow_id:
+                run_workflow = await session.get(WorkflowModel, run.workflow_id)
+                if run_workflow and run_workflow.run_sequentially:
+                    lane_filters.append(
+                        and_(
+                            WorkflowRunModel.workflow_permanent_id == run.workflow_permanent_id,
+                            or_(
+                                WorkflowRunModel.browser_session_id.is_(None),
+                                WorkflowRunModel.sequential_credential_id.isnot(None),
+                            ),
+                        )
+                    )
+            if not lane_filters:
+                return []
+
+            self_queued_at = run.queued_at if run.queued_at is not None else run.created_at
+            candidates: dict[str, WorkflowRunModel] = {}
+            for lane_filter in lane_filters:
+                lane_query = (
+                    select(WorkflowRunModel)
+                    .filter_by(organization_id=run.organization_id, status=WorkflowRunStatus.queued)
+                    .filter(WorkflowRunModel.workflow_run_id != run.workflow_run_id)
+                    .filter(lane_filter)
+                    .filter(WorkflowRunModel.queued_at.isnot(None))
+                    .filter(
+                        or_(
+                            WorkflowRunModel.queued_at > self_queued_at,
+                            and_(
+                                WorkflowRunModel.queued_at == self_queued_at,
+                                WorkflowRunModel.workflow_run_id > run.workflow_run_id,
+                            ),
+                        )
+                    )
+                    .order_by(WorkflowRunModel.queued_at.asc(), WorkflowRunModel.workflow_run_id.asc())
+                    .limit(limit)
+                )
+                for candidate in (await session.scalars(lane_query)).all():
+                    candidates.setdefault(candidate.workflow_run_id, candidate)
+
+            ordered = sorted(candidates.values(), key=lambda r: (r.queued_at, r.workflow_run_id))
+            return [convert_to_workflow_run(candidate) for candidate in ordered]
 
     @db_operation("get_last_queued_workflow_run")
     async def get_last_queued_workflow_run(

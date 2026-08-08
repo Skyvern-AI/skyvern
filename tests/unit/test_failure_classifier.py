@@ -300,6 +300,85 @@ def test_inactivity_timeout_is_not_infrastructure() -> None:
     assert "PAGE_LOAD_TIMEOUT" in categories
 
 
+def test_secure_codeblock_runner_unavailable_classifies_as_infrastructure() -> None:
+    reason = "code block failed. failure reason: Secure CodeBlock runner is unavailable. Please retry."
+    categories = _categories_for(reason, fallback_to_unknown=True)
+
+    assert categories[0] == "INFRASTRUCTURE_ERROR"
+    assert "UNKNOWN" not in categories
+
+
+def test_secure_codeblock_runner_unavailable_carries_a_reason_code() -> None:
+    reason = "code block failed. failure reason: Secure CodeBlock runner is unavailable. Please retry."
+    result = _classify(reason, fallback_to_unknown=True)
+
+    infra = [entry for entry in result if entry["category"] == "INFRASTRUCTURE_ERROR"]
+    assert len(infra) == 1
+    assert infra[0]["reason_code"] == "secure_codeblock_runner_unavailable"
+
+
+def test_ordinary_user_code_failure_is_not_infrastructure() -> None:
+    # A block that reached the sandbox and raised is a user-code fault, not a deploy fault.
+    reason = "code block failed. failure reason: CodeBlock failed while running user code."
+    categories = _categories_for(reason, fallback_to_unknown=True)
+
+    assert "INFRASTRUCTURE_ERROR" not in categories
+
+
+def test_secure_codeblock_runner_internal_failure_classifies_as_infrastructure() -> None:
+    reason = "code block failed. failure reason: Secure CodeBlock runner failed before completing. Please retry."
+    result = _classify(reason, fallback_to_unknown=True)
+
+    assert result[0]["category"] == "INFRASTRUCTURE_ERROR"
+    assert result[0]["reason_code"] == "secure_codeblock_runner_internal"
+    assert "UNKNOWN" not in [entry["category"] for entry in result]
+
+
+def test_secure_codeblock_sandbox_exited_carries_its_own_reason_code() -> None:
+    reason = (
+        "code block failed. failure reason: Secure CodeBlock sandbox process exited before completing. Please retry."
+    )
+    result = _classify(reason, fallback_to_unknown=True)
+
+    infra = [entry for entry in result if entry["category"] == "INFRASTRUCTURE_ERROR"]
+    assert len(infra) == 1
+    assert infra[0]["reason_code"] == "secure_codeblock_sandbox_exited"
+
+
+def test_secure_codeblock_sandbox_exited_ranks_below_the_unambiguous_runner_arms() -> None:
+    # child_exited can also be user code self-terminating, so its confidence must stay
+    # strictly below the runner-internal arm's.
+    exited = _classify(
+        "code block failed. failure reason: Secure CodeBlock sandbox process exited before completing. Please retry.",
+        fallback_to_unknown=True,
+    )
+    internal = _classify(
+        "code block failed. failure reason: Secure CodeBlock runner failed before completing. Please retry.",
+        fallback_to_unknown=True,
+    )
+
+    assert exited[0]["confidence_float"] < internal[0]["confidence_float"]
+
+
+def test_secure_codeblock_runner_busy_classifies_as_infrastructure() -> None:
+    reason = "code block failed. failure reason: CodeBlock runner is already executing another CodeBlock. Please retry."
+    result = _classify(reason, fallback_to_unknown=True)
+
+    assert result[0]["category"] == "INFRASTRUCTURE_ERROR"
+    assert result[0]["reason_code"] == "secure_codeblock_runner_busy"
+
+
+def test_user_code_crash_mentioning_process_exit_is_not_infrastructure() -> None:
+    # User-code detail prose can echo the words of the sandbox-exit message; only the
+    # runner-authored literal may classify as infrastructure.
+    reason = (
+        "code block failed. failure reason: CodeBlock failed with RuntimeError at line 3: process exited with code 1."
+    )
+    categories = _categories_for(reason, fallback_to_unknown=True)
+
+    assert "INFRASTRUCTURE_ERROR" not in categories
+
+
 @pytest.mark.asyncio
 async def test_page_analysis_timeout_reason_ranks_page_load_timeout() -> None:
     browser_state = MagicMock()

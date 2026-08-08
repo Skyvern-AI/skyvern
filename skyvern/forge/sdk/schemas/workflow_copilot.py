@@ -6,7 +6,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from skyvern.forge.sdk.copilot.context import ProposalDisposition, ResponseType, TurnNarrativePayload
-from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeVerdict
+from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeRole, RunOutcomeVerdict
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 
 
@@ -262,6 +262,7 @@ class WorkflowCopilotStreamMessageType(StrEnum):
     WORKFLOW_DRAFT = "workflow_draft"
     CREDENTIAL_REQUIRED = "credential_required"
     CODEGEN_PROGRESS = "codegen_progress"
+    TITLE_UPDATE = "title_update"
 
 
 class WorkflowCopilotProcessingUpdate(BaseModel):
@@ -431,6 +432,7 @@ class WorkflowCopilotRunOutcomeUpdate(BaseModel):
         default_factory=list, description="Block labels of the adjudicated run; key the persisted narrative payload"
     )
     verdict: RunOutcomeVerdict = Field(..., description="Recorded outcome verdict for the run")
+    role: RunOutcomeRole = Field("adjudicated", description="Display scope of the recorded run verdict")
     reason_code: RunOutcomeReasonCode | None = Field(
         None, description="Machine-readable cause for a not_demonstrated verdict"
     )
@@ -479,6 +481,16 @@ class WorkflowCopilotWorkflowDraftUpdate(BaseModel):
         None,
         description="Staged workflow API response (same shape as terminal RESPONSE.updated_workflow). Drives mid-turn canvas updates.",
     )
+
+
+class WorkflowCopilotTitleUpdate(BaseModel):
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.TITLE_UPDATE, description="Message type"
+    )
+    turn_id: str = Field(..., description="UUID for the turn that named the agent")
+    workflow_permanent_id: str = Field(..., description="The agent that was named")
+    title: str = Field(..., description="The persisted title; only ever emitted after the write succeeded")
+    timestamp: datetime = Field(..., description="Server timestamp")
 
 
 class WorkflowCopilotCredentialRequiredUpdate(BaseModel):

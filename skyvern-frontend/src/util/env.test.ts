@@ -1,6 +1,3 @@
-import { readFile } from "node:fs/promises";
-import path from "node:path";
-
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 async function loadEnv(apiKey: string | null = null, streamingMode = "") {
@@ -22,10 +19,13 @@ describe("getCredentialParam", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     vi.resetModules();
+    window.sessionStorage.clear();
   });
 
   it("includes the runtime API key even when a token getter returns a token", async () => {
-    const { getCredentialParam } = await loadEnv("local+api/key");
+    const { getCredentialParam, persistRuntimeApiKey } =
+      await loadEnv("ignored-build-key");
+    persistRuntimeApiKey("local+api/key");
 
     const params = new URLSearchParams(
       await getCredentialParam(async () => "clerk token"),
@@ -48,49 +48,70 @@ describe("getCredentialParam", () => {
 });
 
 describe("getRuntimeApiKey", () => {
-  // Built via join so this test file never contains the sentinel verbatim
-  // either — entrypoint-skyvernui.sh sed-replaces every occurrence in built
-  // assets, and the source guard below must stay meaningful.
-  const dockerSentinel = ["__SKYVERN_API_KEY", "_PLACEHOLDER__"].join("");
-
   afterEach(() => {
     vi.unstubAllEnvs();
     vi.resetModules();
     window.sessionStorage.clear();
   });
 
-  it("returns the build-time API key", async () => {
-    const { getRuntimeApiKey } = await loadEnv("eyJhbGciOiJIUzI1NiJ9.real.key");
-
-    expect(getRuntimeApiKey()).toBe("eyJhbGciOiJIUzI1NiJ9.real.key");
-  });
-
-  it("treats the .env.example placeholder as missing", async () => {
-    const { getRuntimeApiKey } = await loadEnv("YOUR_API_KEY");
+  it("ignores the build-time API key", async () => {
+    const { getRuntimeApiKey } = await loadEnv("ignored-build-key-canary");
 
     expect(getRuntimeApiKey()).toBe(null);
+    expect(window.sessionStorage.getItem("skyvern.apiKey")).toBe(null);
   });
 
-  it("treats an un-replaced docker placeholder as missing", async () => {
-    const { getRuntimeApiKey } = await loadEnv(dockerSentinel);
+  it("does not expose the server-side API key to the browser", async () => {
+    vi.stubEnv("SKYVERN_API_KEY", "server-only-key-canary");
+    const { getRuntimeApiKey } = await loadEnv();
 
     expect(getRuntimeApiKey()).toBe(null);
+    expect(window.sessionStorage.getItem("skyvern.apiKey")).toBe(null);
   });
 
-  // Regression guard for the v1.0.34–v1.0.40 docker auth outage:
-  // entrypoint-skyvernui.sh sed-replaces EVERY occurrence of the docker
-  // sentinel in the built bundle with the real API key. When the full
-  // sentinel appeared verbatim in this module (inside the placeholder
-  // deny-list), the real key replaced it there too, so the key became a
-  // member of its own deny-list and the UI sent no x-api-key header at all
-  // (403 "Invalid credentials" on every request).
-  it("never spells out the full docker placeholder sentinel in module source", async () => {
-    const source = await readFile(
-      path.join(process.cwd(), "src/util/env.ts"),
-      "utf-8",
+  it("does not expose the build-time API key through credential params", async () => {
+    const { getCredentialParam } = await loadEnv(
+      "build-time-key-must-stay-server-side",
     );
 
-    expect(source.includes(dockerSentinel)).toBe(false);
+    const params = new URLSearchParams(await getCredentialParam(null));
+
+    expect(params.has("apikey")).toBe(false);
+  });
+
+  it("persists and clears a runtime API key and expiry in sessionStorage", async () => {
+    const {
+      clearRuntimeApiKey,
+      getRuntimeApiKey,
+      getRuntimeApiKeyExpiresAt,
+      persistRuntimeApiKey,
+    } = await loadEnv();
+
+    persistRuntimeApiKey("runtime-key-canary", 1_893_456_789);
+    expect(getRuntimeApiKey()).toBe("runtime-key-canary");
+    expect(getRuntimeApiKeyExpiresAt()).toBe(1_893_456_789);
+    expect(window.sessionStorage.getItem("skyvern.apiKey")).toBe(
+      "runtime-key-canary",
+    );
+    expect(window.sessionStorage.getItem("skyvern.apiKeyExpiresAt")).toBe(
+      "1893456789",
+    );
+
+    clearRuntimeApiKey();
+    expect(getRuntimeApiKey()).toBe(null);
+    expect(getRuntimeApiKeyExpiresAt()).toBe(null);
+    expect(window.sessionStorage.getItem("skyvern.apiKey")).toBe(null);
+    expect(window.sessionStorage.getItem("skyvern.apiKeyExpiresAt")).toBe(null);
+  });
+
+  it("clears a persisted expiry when replacing a session token without one", async () => {
+    const { getRuntimeApiKeyExpiresAt, persistRuntimeApiKey } = await loadEnv();
+
+    persistRuntimeApiKey("ui-session-canary", 1_893_456_789);
+    persistRuntimeApiKey("api-key-canary");
+
+    expect(getRuntimeApiKeyExpiresAt()).toBe(null);
+    expect(window.sessionStorage.getItem("skyvern.apiKeyExpiresAt")).toBe(null);
   });
 });
 

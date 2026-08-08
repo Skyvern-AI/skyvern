@@ -666,28 +666,6 @@ def _inject_missing_top_level_defaults(definition: str, fmt: str, defaults: dict
     return _dump_definition_dict(raw, parsed_format) if changed else definition
 
 
-def _inject_code_v2_defaults(definition: str, fmt: str) -> str:
-    """Inject Code 2.0 defaults (code_version=2, run_with=agent) when not explicitly set.
-
-    Only modifies JSON definitions (or auto-detected JSON). YAML is returned unchanged.
-    """
-    if fmt == "yaml":
-        return definition
-
-    try:
-        raw = json.loads(definition)
-    except (json.JSONDecodeError, TypeError):
-        return definition  # let _parse_definition handle the error
-
-    changed = False
-    for key, value in _CODE_V2_DEFAULTS.items():
-        if key not in raw:
-            raw[key] = value
-            changed = True
-
-    return json.dumps(raw) if changed else definition
-
-
 def _collect_code_block_labels(blocks: Any) -> frozenset[str]:
     if not isinstance(blocks, list):
         return frozenset()
@@ -1720,8 +1698,8 @@ async def skyvern_workflow_create(
     One block per step: "navigation" for actions, "extraction" for data. Do NOT use deprecated "task" type.
     Omit `code_only` or pass null to use this server's default; organization policy may enforce code-only, making rejection intentional.
     Call skyvern_block_schema() for block types and schemas. Use {{parameter_key}} for input references.
-    Defaults to AI agent execution (run_with="agent"). For JSON definitions, code_version=2 is also
-    injected (YAML definitions go through the backend schema, which currently leaves code_version unset).
+    When omitted, run_with defaults to "agent" and code_version defaults to 2 for both JSON and YAML
+    definitions.
     Pass run_with="code" to opt into cached script execution. Blocks share a browser session automatically.
     Give every code block a `prompt`: its plain-language goal, shown as the block's Goal in the
     editor. Code blocks that omit `prompt` are defaulted to prompt="" so they render the current
@@ -1750,13 +1728,12 @@ async def skyvern_workflow_create(
 
     # Default MCP-created workflows to the same editor defaults while preserving
     # any explicit user-supplied values.
-    definition = _inject_code_v2_defaults(definition, format)
     definition = _inject_code_block_prompt_defaults(definition, format, existing_code_labels=frozenset())
     definition = _inject_code_block_derived_steps(definition, format)
     definition = _inject_missing_top_level_defaults(
         definition,
         format,
-        {"proxy_location": _DEFAULT_MCP_PROXY_LOCATION},
+        {**_CODE_V2_DEFAULTS, "proxy_location": _DEFAULT_MCP_PROXY_LOCATION},
     )
 
     json_def, yaml_def, parse_err = _parse_definition(definition, format)
@@ -2233,15 +2210,54 @@ async def skyvern_workflow_status(
                 error=make_error(ErrorCode.API_ERROR, str(e), "Check the run ID and your API key"),
             )
 
-    data = _serialize_run_full(run) if verbosity == "full" else _serialize_run_summary(run)
+    def _payload_for(selected_verbosity: str) -> dict[str, Any]:
+        payload = _serialize_run_full(run) if selected_verbosity == "full" else _serialize_run_summary(run)
+        if run_id.startswith("wr_"):
+            payload["sdk_equivalent"] = (
+                f"await skyvern_workflow_status(run_id={run_id!r}, verbosity={selected_verbosity!r})"
+            )
+        else:
+            verbosity_arg = "" if selected_verbosity == "summary" else f", verbosity={selected_verbosity!r}"
+            payload["sdk_equivalent"] = (
+                f"await skyvern.get_run({run_id!r})  # or skyvern_workflow_status(run_id={run_id!r}{verbosity_arg})"
+            )
+        return payload
+
+    result = make_result("skyvern_workflow_status", data=_payload_for(verbosity), timing_ms=timer.timing_ms)
+    if _response_size(result) <= MCP_MAX_RESPONSE_CHARS:
+        return result
+
+    # The generic size cap preserves only top-level `ok`/`error`/`*_id`, and this result
+    # nests the run under `data` — so it would strip run_id and status and leave a polling
+    # caller nothing to act on. Degrade to the compact payload instead; the full output is
+    # still retrievable over the HTTP API, which is not capped.
+    oversized_warning = (
+        f"Full output exceeded the {MCP_MAX_RESPONSE_CHARS}-char MCP response limit; "
+        f"returning a reduced payload. Fetch the full run over the HTTP API at /v1/runs/{run_id}."
+    )
+    summary_result = make_result(
+        "skyvern_workflow_status",
+        data=_payload_for("summary"),
+        timing_ms=timer.timing_ms,
+        warnings=[oversized_warning],
+    )
+    if _response_size(summary_result) <= MCP_MAX_RESPONSE_CHARS:
+        return summary_result
+
+    # The summary is itself unbounded — it copies fields like failure_reason verbatim. Fall
+    # back to the identifiers a poller needs so it never lands in the stripped envelope.
+    summary_data = _payload_for("summary")
+    minimal: dict[str, Any] = {"run_id": run_id, "status": summary_data.get("status")}
     if run_id.startswith("wr_"):
-        data["sdk_equivalent"] = f"await skyvern_workflow_status(run_id={run_id!r}, verbosity={verbosity!r})"
+        minimal["sdk_equivalent"] = f"await skyvern_workflow_status(run_id={run_id!r}, verbosity='summary')"
     else:
-        verbosity_arg = "" if verbosity == "summary" else f", verbosity={verbosity!r}"
-        data["sdk_equivalent"] = (
-            f"await skyvern.get_run({run_id!r})  # or skyvern_workflow_status(run_id={run_id!r}{verbosity_arg})"
-        )
-    return make_result("skyvern_workflow_status", data=data, timing_ms=timer.timing_ms)
+        minimal["sdk_equivalent"] = f"await skyvern.get_run({run_id!r})"
+    return make_result(
+        "skyvern_workflow_status",
+        data=minimal,
+        timing_ms=timer.timing_ms,
+        warnings=[oversized_warning],
+    )
 
 
 async def skyvern_workflow_cancel(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import signal
@@ -9,8 +10,10 @@ import sys
 import time
 import types
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
+import structlog
 from structlog.testing import capture_logs
 from typer.testing import CliRunner
 
@@ -25,6 +28,25 @@ from skyvern.utils.env_paths import (
     load_backend_env_files,
     resolve_backend_env_path,
 )
+
+
+@pytest.fixture(autouse=True)
+def _structlog_config_capture_can_see(monkeypatch: pytest.MonkeyPatch) -> None:
+    # capture_logs() swaps processors but keeps the configured wrapper_class, so a
+    # filtering wrapper above WARNING or a logger cached under an earlier config makes
+    # this module's warning assertions silently fail depending on shard order.
+    saved = structlog.get_config()
+    structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=False,
+    )
+    from skyvern.cli import run_commands
+
+    monkeypatch.setattr(run_commands.LOG, "_logger", None, raising=False)
+    yield
+    structlog.configure(**saved)
+
 
 _BLOCKING_SWEEP_WITH_DESCENDANT = """
 import subprocess
@@ -389,11 +411,15 @@ def test_run_mcp_logs_sweep_failure_and_continues(monkeypatch, failure_stage: st
         fake_local_browser_profile.sweep_local_browser_profiles_with_budget = failing_sweep
     monkeypatch.setitem(sys.modules, "skyvern.library.local_browser_profile", fake_local_browser_profile)
 
-    with capture_logs() as logs:
-        run_commands.run_mcp()
+    # Assert on the logger call itself rather than capture_logs: capture depends on
+    # process-global structlog state that other tests in the shard can leave behind.
+    recording_logger = MagicMock()
+    monkeypatch.setattr(run_commands, "LOG", recording_logger)
+    run_commands.run_mcp()
 
     assert events == ["prepare", "run", "cleanup"]
-    assert any(log.get("log_level") == "warning" for log in logs)
+    warned_events = [call.args[0] for call in recording_logger.warning.call_args_list if call.args]
+    assert "local_browser_profile_startup_sweep_failed" in warned_events
 
 
 def test_run_mcp_starts_within_sweep_budget_and_stops_blocking_child(tmp_path: Path, monkeypatch) -> None:

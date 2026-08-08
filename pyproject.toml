@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.47"
+version = "1.0.48"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
@@ -203,6 +203,7 @@ cloud = [
     "opentelemetry-instrumentation-urllib3>=0.60b1,<1",
 ]
 dev = [
+    "grpcio-tools==1.80.0",
     "isort>=5.13.2",
     "mypy>=1.18.2,<2",
     "types-requests>=2.31.0.2,<3",
@@ -240,7 +241,7 @@ dev = [
 # install sets. `uv export --no-default-groups --group rustwright` is an isolation probe;
 # the shared worker image resolves it via `uv export --extra server --group cloud --group rustwright --no-dev`.
 rustwright = [
-    "rustwright==0.1.1",
+    "rustwright==0.2.0",
 ]
 
 [tool.hatch.build]
@@ -339,6 +340,7 @@ exclude = [
     "cloud/extensions",
     "skyvern-frontend",
     "skyvern/client",
+    "codeblock/proto",
     "notebooks",
     "internal",
 ]

@@ -18,7 +18,9 @@ import {
   condenseActivityEntries,
   effectiveMode,
   formatElapsed,
+  humanizeJudgeText,
   isBlockOk,
+  isInterimOutcome,
   latestBlocksByLabel,
   notConfirmedOutcome,
   parseUtcIsoMs,
@@ -36,7 +38,9 @@ function normalizeOutcomeReason(
   reason: string | null | undefined,
 ): string | null {
   const trimmed = reason?.trim();
-  return trimmed && trimmed.length > 0 ? trimmed : null;
+  if (!trimmed) return null;
+  const humanized = humanizeJudgeText(trimmed);
+  return humanized.length > 0 ? humanized : null;
 }
 
 function normalizeOutcomeReasonSearchText(
@@ -353,13 +357,21 @@ function FBlockRun({
   const isRunning = block.state === "running";
   const isCompleted = block.state === "completed";
   const isEvaluating = isCompleted && block.outcome === "evaluating";
+  const isInterimNotDemonstrated =
+    isCompleted &&
+    block.outcome === "not_demonstrated" &&
+    isInterimOutcome(block.outcomeRole);
   // A row stuck in `evaluating` at turn end (dropped stream) renders the
   // neutral "ran" treatment — never the live verifying beat, never green.
   const isVerifying = isEvaluating && !turnEnded;
-  const isRanNeutral = isEvaluating && turnEnded;
-  const isOutcomeNotShown = isCompleted && block.outcome === "not_demonstrated";
+  const isRanNeutral = (isEvaluating && turnEnded) || isInterimNotDemonstrated;
+  const isOutcomeNotShown =
+    isCompleted &&
+    block.outcome === "not_demonstrated" &&
+    !isInterimNotDemonstrated;
   const isOk = isBlockOk(block);
   const isFail = block.state === "failed";
+  const isStopped = block.state === "stopped";
   const isDraft = block.state === "drafted";
 
   const accentBorder = isRunning
@@ -424,7 +436,10 @@ function FBlockRun({
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const defaultOpen = isRunning || isFail || (hasActions && !turnEnded);
   const open = userOpen === null ? defaultOpen : userOpen;
-  const toggleable = isOk || isOutcomeNotShown || isVerifying || isRanNeutral;
+  // A stop stays inspectable but not self-opening: the user knows why it
+  // stopped, so it should not demand attention the way a failure does.
+  const toggleable =
+    isOk || isOutcomeNotShown || isVerifying || isRanNeutral || isStopped;
   useTick(isRunning);
   useTick(hasActions && (replayingAction || elapsedReveal < totalMs), 150);
   const elapsed = formatElapsed(block.startedAt, block.endedAt);
@@ -439,9 +454,11 @@ function FBlockRun({
           ? `ran${elapsed ? ` · ${elapsed}` : ""}`
           : isFail
             ? "halted"
-            : isDraft
-              ? "drafted"
-              : "queued";
+            : isStopped
+              ? `stopped${elapsed ? ` · ${elapsed}` : ""}`
+              : isDraft
+                ? "drafted"
+                : "queued";
   const collapsedOutcomeReason = isOutcomeNotShown
     ? normalizeOutcomeReason(block.outcomeReason ?? outcomeReasonFallback)
     : null;
@@ -473,6 +490,8 @@ function FBlockRun({
             "…"
           ) : isFail ? (
             "✕"
+          ) : isStopped ? (
+            "■"
           ) : isRunning ? (
             <Spinner />
           ) : (
@@ -579,7 +598,7 @@ function FBlockRun({
                 !
               </span>
               <div className="text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/90">
-                {block.outcomeReason ??
+                {normalizeOutcomeReason(block.outcomeReason) ??
                   "The step ran, but the run did not demonstrate the goal was met."}
               </div>
             </div>
@@ -698,6 +717,8 @@ function phaseGlyph(status: PhaseStatus): ReactNode {
       return "✓";
     case "fail":
       return "✕";
+    case "stopped":
+      return "■";
     case "active":
       return <Spinner />;
     default:
@@ -713,6 +734,8 @@ function phasePuckClasses(status: PhaseStatus): string {
       return "border-rose-400/60 bg-rose-500/15 text-rose-700 dark:text-rose-300";
     case "active":
       return "border-blue-400/60 bg-blue-500/15 text-blue-700 dark:text-blue-300";
+    case "stopped":
+      return "border-slate-400/60 bg-slate-elevation4 text-muted-foreground";
     default:
       return "border-slate-500/60 bg-slate-elevation3 text-slate-600";
   }
@@ -761,7 +784,8 @@ function DraftPlaceholderNote({ turn }: { turn: TurnNarrativeState }) {
     turn.lastRunOutcome?.verdict === "not_evaluated";
   const text = priorFailedVerdict
     ? `Draft v${turn.authoringCount + 1} — revising after failed verify: ${
-        turn.lastRunOutcome?.displayReason ?? "outcome not confirmed"
+        normalizeOutcomeReason(turn.lastRunOutcome?.displayReason) ??
+        "outcome not confirmed"
       }`
     : "Writing the workflow code…";
   return (
@@ -1086,8 +1110,11 @@ function RollupCard({
   onBlockSelect,
   uxV1,
 }: RollupCardProps) {
-  const closing =
-    turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "";
+  // The backend appends the judge's verdict to the closing message, so it needs the
+  // same display-layer rewrite the outcome reason gets.
+  const closing = humanizeJudgeText(
+    turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "",
+  );
   const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
   const truncatedOutcomeReason = collapsedOutcomeReason
     ? truncateOutcomeReason(collapsedOutcomeReason)
@@ -1109,6 +1136,7 @@ function RollupCard({
   const rollupBlocks = latestBlocksByLabel(turn.blocks);
   const completed = rollupBlocks.filter((b) => isBlockOk(b));
   const failed = rollupBlocks.filter((b) => b.state === "failed");
+  const stopped = rollupBlocks.filter((b) => b.state === "stopped");
   const showCommit = !summary.isQA && completed.length > 0;
   const showChecklist = Boolean(uxV1) && showPhaseChecklist(turn);
   // Expand only earns a chevron when DetailView adds content beyond the head's
@@ -1223,6 +1251,39 @@ function RollupCard({
           </ul>
         </div>
       ) : null}
+
+      {stopped.length > 0 ? (
+        <div className="border-t border-white/5 pb-3 pl-[52px] pr-3.5 pt-2.5">
+          <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[.06em] text-muted-foreground">
+            Stopped
+          </div>
+          <ul className="m-0 flex list-none flex-col gap-1 p-0">
+            {stopped.map((b) => (
+              <li
+                key={b.label}
+                className="flex items-baseline gap-1.5 text-[12px] leading-[1.5] text-tertiary-foreground"
+              >
+                <span
+                  className="w-3.5 shrink-0 text-center text-[11px] font-bold text-muted-foreground"
+                  aria-hidden="true"
+                >
+                  ■
+                </span>
+                <span
+                  className={
+                    uxV1
+                      ? "text-[11px] text-muted-foreground"
+                      : "font-mono text-[11px] text-muted-foreground"
+                  }
+                  title={uxV1 ? b.label : undefined}
+                >
+                  {uxV1 ? humanizeBlockLabel(b.label) : b.label}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1320,7 +1381,9 @@ function DetailView({
 
       {turn.terminal && (turn.narrativeSummary || turn.terminalMessage) ? (
         <div className="whitespace-pre-wrap pl-9 pr-8 text-[13px] leading-[1.55] text-foreground dark:text-slate-200">
-          {turn.narrativeSummary?.trim() || turn.terminalMessage?.trim()}
+          {humanizeJudgeText(
+            turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "",
+          )}
         </div>
       ) : null}
     </div>

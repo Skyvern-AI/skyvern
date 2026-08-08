@@ -9,8 +9,8 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
-    _check_enforcement,
     _maybe_stash_terminal_challenge_halt,
+    enforcement_decision,
     terminal_challenge_blocker_signal_from_current_page_evidence,
     terminal_challenge_blocker_signal_from_page_evidence,
 )
@@ -125,7 +125,7 @@ def test_enforcement_backstop_converts_existing_terminal_blocker_signal() -> Non
     stash_blocker_signal(ctx, signal)
 
     with pytest.raises(CopilotTurnHalt) as exc_info:
-        _check_enforcement(ctx)
+        enforcement_decision(ctx)
 
     assert ctx.turn_halt is exc_info.value.halt
     assert exc_info.value.halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
@@ -195,9 +195,248 @@ def test_page_challenge_signal_records_explicit_terminal_blocker() -> None:
     assert signal.blocked_tool == "update_and_run_blocks"
 
 
+_TOTP_URL = "https://portal.example.com/account/login/totp?next=%2Freports"
+_LOGIN_URL = "https://portal.example.com/account/login?next=%2Freports"
+_OTHER_TOTP_URL = "https://other.example.com/account/login/totp"
+
+
+def _vision_challenge_packet() -> dict[str, object]:
+    """A vision-stamped verification verdict on the one-time-code page."""
+    return {
+        "current_url": _TOTP_URL,
+        "inspected_url": _TOTP_URL,
+        "observed_after_workflow_run": True,
+        "challenge_state": {
+            "detected": True,
+            "kind": "other",
+            "requires_human_verification": True,
+            "evidence_source": "vision",
+        },
+    }
+
+
+def _captcha_widget_packet() -> dict[str, object]:
+    """A rendered challenge widget on the same page: a control the copilot must actually solve."""
+    return {
+        "current_url": _TOTP_URL,
+        "inspected_url": _TOTP_URL,
+        "observed_after_workflow_run": True,
+        "challenge_controls": [{"kind": "recaptcha", "selector": "iframe[title='reCAPTCHA']", "visible": True}],
+    }
+
+
+def _captcha_kind_packet() -> dict[str, object]:
+    """A vision-confirmed CAPTCHA carrying no parsed DOM control — named by kind alone."""
+    packet = _vision_challenge_packet()
+    challenge_state = packet["challenge_state"]
+    assert isinstance(challenge_state, dict)
+    challenge_state["kind"] = "captcha"
+    return packet
+
+
+def _unknown_kind_packet() -> dict[str, object]:
+    """The DOM detector's verdict for an anti-bot vendor it has no name for."""
+    packet = _vision_challenge_packet()
+    challenge_state = packet["challenge_state"]
+    assert isinstance(challenge_state, dict)
+    challenge_state["kind"] = "unknown"
+    return packet
+
+
+def _interaction_packet(
+    tool: str, selector: str, *, landed_url: str = _TOTP_URL, acted_url: str = _TOTP_URL
+) -> dict[str, object]:
+    return {
+        "current_url": landed_url,
+        "inspected_url": landed_url,
+        "source_tool": "scout_interaction",
+        "interaction_tool": tool,
+        "interaction_selector": selector,
+        "interaction_source_url": acted_url,
+    }
+
+
+def _interaction_challenge_packet(tool: str, selector: str) -> dict[str, object]:
+    """A click's own post-action observation, which merges the parsed page evidence."""
+    return {**_vision_challenge_packet(), **_interaction_packet(tool, selector)}
+
+
+def _credential_login_ctx(
+    *,
+    code_filled: bool,
+    code_submitted: bool = False,
+    challenge_reobserved_before_submit: bool = False,
+    challenge_reobserved_after_submit: bool = False,
+    challenge_packet: dict[str, object] | None = None,
+    intervening_click: bool = False,
+    submit_navigated: bool = False,
+    enter_submitted: bool = False,
+    fill_on_another_page: bool = False,
+    fill_acted_elsewhere: bool = False,
+) -> SimpleNamespace:
+    trajectory: list[dict[str, object]] = [
+        {
+            "tool_name": "fill_credential_field",
+            "selector": "#username",
+            "source_url": _LOGIN_URL,
+            "credential_field": "username",
+        },
+        {
+            "tool_name": "fill_credential_field",
+            "selector": "#password",
+            "source_url": _LOGIN_URL,
+            "credential_field": "password",
+        },
+        {"tool_name": "click", "selector": 'button[aria-label="Log in"]', "source_url": _LOGIN_URL},
+    ]
+    flow_evidence: list[dict[str, object]] = [{"evidence": challenge_packet or _vision_challenge_packet()}]
+    if code_filled:
+        fill_page = _OTHER_TOTP_URL if fill_on_another_page else _TOTP_URL
+        trajectory.append(
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#totp",
+                "source_url": fill_page,
+                "credential_field": "totp",
+            }
+        )
+        # A packet whose recorded source is elsewhere must not be credited to the challenged page,
+        # even though it landed there and its selector matches.
+        acted = _OTHER_TOTP_URL if fill_acted_elsewhere else fill_page
+        flow_evidence.append({"evidence": _interaction_packet("fill_credential_field", "#totp", acted_url=acted)})
+    if challenge_reobserved_before_submit:
+        flow_evidence.append({"evidence": _vision_challenge_packet()})
+    if intervening_click:
+        trajectory.append({"tool_name": "click", "selector": "#cookie-accept", "source_url": _TOTP_URL})
+        flow_evidence.append({"evidence": _interaction_challenge_packet("click", "#cookie-accept")})
+    if code_submitted and enter_submitted:
+        # An Enter keypress commits the code without minting an interaction observation.
+        trajectory.append({"tool_name": "press_key", "key": "Enter", "source_url": _TOTP_URL})
+    elif code_submitted:
+        trajectory.append({"tool_name": "click", "selector": "#totp-submit", "source_url": _TOTP_URL})
+        landed = "https://portal.example.com/reports" if submit_navigated else _TOTP_URL
+        flow_evidence.append({"evidence": _interaction_packet("click", "#totp-submit", landed_url=landed)})
+    if challenge_reobserved_after_submit:
+        flow_evidence.append({"evidence": _vision_challenge_packet()})
+    return SimpleNamespace(
+        flow_evidence=flow_evidence,
+        scout_trajectory=trajectory,
+        last_failure_category_top=None,
+        last_run_blocks_workflow_run_id="wr_000000000000000000",
+    )
+
+
+def _backstop_ctx(*, code_filled: bool) -> SimpleNamespace:
+    login = _credential_login_ctx(code_filled=code_filled)
+    return _halt_ctx(
+        flow_evidence=login.flow_evidence,
+        scout_trajectory=login.scout_trajectory,
+        composition_page_evidence=login.flow_evidence[0]["evidence"],
+        last_run_outcome=None,
+        last_test_ok=False,
+        last_test_anti_bot=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("code_filled", "expect_halt"),
+    [(True, False), (False, True)],
+    ids=["backstop_declines_the_stale_packet_the_code_answered", "backstop_still_halts_without_a_code_fill"],
+)
+def test_finalize_backstop_shares_the_credential_served_decline(code_filled: bool, expect_halt: bool) -> None:
+    ctx = _backstop_ctx(code_filled=code_filled)
+
+    _maybe_stash_terminal_challenge_halt(ctx)
+
+    assert (ctx.turn_halt is not None) is expect_halt
+
+
 @pytest.mark.parametrize(
     ("ctx", "blocked_tool", "expect_signal"),
     [
+        pytest.param(
+            _credential_login_ctx(code_filled=True),
+            "click",
+            False,
+            id="declines_on_a_challenge_seen_before_the_code_was_filled",
+        ),
+        pytest.param(
+            _credential_login_ctx(code_filled=True, code_submitted=True),
+            "evaluate",
+            False,
+            id="stale_challenge_stays_declined_for_the_tool_after_the_submit",
+        ),
+        pytest.param(
+            _credential_login_ctx(code_filled=True, challenge_reobserved_before_submit=True),
+            "click",
+            True,
+            id="halts_on_a_challenge_observed_after_the_fill_even_before_a_submit",
+        ),
+        pytest.param(
+            _credential_login_ctx(code_filled=True, code_submitted=True, enter_submitted=True),
+            "evaluate",
+            False,
+            id="an_enter_submit_cannot_extend_the_decline_past_the_fill",
+        ),
+        pytest.param(
+            _credential_login_ctx(code_filled=True, fill_on_another_page=True),
+            "click",
+            True,
+            id="halts_when_the_code_was_filled_into_a_different_page",
+        ),
+        pytest.param(
+            _credential_login_ctx(code_filled=True, fill_acted_elsewhere=True),
+            "click",
+            True,
+            id="halts_when_the_fill_packet_acted_on_a_different_page_than_it_landed_on",
+        ),
+        pytest.param(
+            _credential_login_ctx(code_filled=True, challenge_packet=_unknown_kind_packet()),
+            "click",
+            True,
+            id="halts_on_an_unnamed_anti_bot_kind_the_dom_detector_could_not_classify",
+        ),
+        pytest.param(
+            _credential_login_ctx(code_filled=True, code_submitted=True, challenge_reobserved_after_submit=True),
+            "click",
+            True,
+            id="halts_when_the_page_still_demands_a_code_after_the_submit",
+        ),
+        pytest.param(
+            _credential_login_ctx(code_filled=True, intervening_click=True),
+            "click",
+            True,
+            id="halts_when_an_intervening_click_reobserves_the_challenge_itself",
+        ),
+        pytest.param(
+            _credential_login_ctx(
+                code_filled=True,
+                code_submitted=True,
+                submit_navigated=True,
+                challenge_reobserved_after_submit=True,
+            ),
+            "click",
+            True,
+            id="halts_after_a_navigating_submit_when_the_page_still_demands_a_code",
+        ),
+        pytest.param(
+            _credential_login_ctx(code_filled=True, challenge_packet=_captcha_widget_packet()),
+            "click",
+            True,
+            id="halts_on_a_rendered_challenge_widget_the_code_cannot_satisfy",
+        ),
+        pytest.param(
+            _credential_login_ctx(code_filled=True, challenge_packet=_captcha_kind_packet()),
+            "click",
+            True,
+            id="halts_on_a_vision_named_captcha_with_no_dom_control",
+        ),
+        pytest.param(
+            _credential_login_ctx(code_filled=False),
+            "click",
+            True,
+            id="halts_when_no_credential_fill_reached_the_challenged_page",
+        ),
         pytest.param(
             SimpleNamespace(
                 last_failure_category_top=None,

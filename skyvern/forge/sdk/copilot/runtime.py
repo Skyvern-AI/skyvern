@@ -301,7 +301,7 @@ class AgentContext:
     workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
 
     # Enforcement state. Set lazily by streaming_adapter, tools, and
-    # failure_tracking; declared here so _check_enforcement can read them on a
+    # failure_tracking; declared here so enforcement_decision can read them on a
     # fresh context without AttributeError.
     navigate_called: bool = False
     observation_after_navigate: bool = False
@@ -309,9 +309,11 @@ class AgentContext:
     update_workflow_called: bool = False
     test_after_update_done: bool = False
     post_update_nudge_count: int = 0
-    coverage_nudge_count: int = 0
     format_nudge_count: int = 0
     copilot_total_timeout_exceeded: bool = False
+    copilot_max_turns_exceeded: bool = False
+    model_calls_this_turn: int = 0
+    enforcement_pass_count: int = 0
     failed_test_nudge_count: int = 0
     explore_without_workflow_nudge_count: int = 0
     last_test_ok: bool | None = None
@@ -340,7 +342,6 @@ class AgentContext:
     last_scout_act_observe_packet: dict[str, Any] | None = None
     last_scout_act_observe_recapture_attempted: bool = False
     last_scout_act_observe_recapture_result: str = ""
-    ambiguous_bare_selector_rescout_context_key: str | None = None
     pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     challenge_gated_proxy_retry_count: int = 0
@@ -396,6 +397,8 @@ class AgentContext:
     # while scouting the goal path, each tagged with how that state was reached.
     # Feeds the per-acted-page composition gate; never persisted into workflow YAML.
     flow_evidence: list[dict[str, Any]] = field(default_factory=list)
+    # Challenge-advisory reasons already surfaced to the model this turn, so the advisory fires once.
+    challenge_advisory_fired_reasons: set[str] = field(default_factory=set)
     pending_browser_interaction_observation: PendingBrowserInteractionObservation | None = None
     # In-turn side channel from workflow mutation calls: block label -> flow_evidence
     # observation step used to ground the newly authored page-acting block.
@@ -496,6 +499,7 @@ class AgentContext:
     synthesized_block_offered_goal_complete: bool = False
     # Probe-validated value elements the model designated, each pinned to the page it was resolved on.
     requested_output_designations: list[dict[str, Any]] = field(default_factory=list)
+    resolved_designation_fingerprints: set[str] = field(default_factory=set)
     requested_output_extraction_candidate: FrozenRequestedOutputExtractionCandidate | None = None
     # Candidate frozen by an imposition that has not been persisted yet; promoted to the committed
     # candidate only once the update it rode in on succeeds.
@@ -518,7 +522,6 @@ class AgentContext:
     # returns. The freehand persist-seam surface leg exempts exactly this label and gates its siblings.
     spine_imposition_carrier_label: str | None = None
     synthesized_block_reopened_after_failed_run: bool = False
-    synthesized_block_reopened_for_credential_scout: bool = False
     # Business inputs proven required by an earlier synthesized-draft rejection stay required for the
     # rest of the turn. A later retry cannot evade the floor by deleting those parameters from its YAML.
     synthesized_business_required_parameter_keys: set[str] = field(default_factory=set)
@@ -527,7 +530,6 @@ class AgentContext:
     # login prefix; releases the is_goal_complete terminal-action gate mirroring reached_download_target.
     scout_observed_terminal_criterion_ids: set[str] = field(default_factory=set)
     scout_observation_contract: ScoutObservationContract | None = None
-    credential_scout_rescout_context_key: str | None = None
     # Which requires-live-scout fields (username/password, non-empty) each scouted credential
     # carries; recorded at credential resolve time and rehydrated from FillCarry across turns.
     scouted_credential_field_inventory_by_credential_id: dict[str, frozenset[str]] = field(default_factory=dict)
@@ -553,6 +555,8 @@ class AgentContext:
     # Browser-session download filenames snapshotted before a scout click, so the post-hook can tell
     # a download this click produced from one an earlier click left behind.
     pending_scout_download_snapshot: frozenset[str] | None = None
+    pending_scout_popup: Page | None = None
+    pending_scout_popup_content_type: str | None = None
     repair_obligation_nudge_count: int = 0
     # (selector, ambiguous) verdict from a pre-dispatch live count probe, applied to the recorded
     # interaction only when the post-action resolved selector matches the probed one.

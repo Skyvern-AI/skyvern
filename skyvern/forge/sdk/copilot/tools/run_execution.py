@@ -102,6 +102,7 @@ from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_USER_FACING_REASON,
     RecordedRunOutcome,
     RunOutcomeReasonCode,
+    RunOutcomeRole,
     RunOutcomeVerdict,
     run_outcome_display_reason,
     trusted_terminal_challenge_category_name,
@@ -134,6 +135,8 @@ from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.runtime_completion import contract_from_request_criteria
+from skyvern.forge.sdk.workflow.service import run_selection_is_partial
 from skyvern.schemas.workflows import BlockType
 from skyvern.utils.files import initialize_skyvern_state_file
 from skyvern.webeye.navigation import is_skip_inner_retry_error
@@ -1053,6 +1056,24 @@ def _selected_code_security_inputs(
     return code_blocks
 
 
+def _requested_completion_contract(
+    ctx: CopilotContext,
+    runtime_workflow: Workflow,
+    labels_to_execute: list[str],
+) -> dict[str, object] | None:
+    """The turn's own deliverable obligation, for a test run that executes the whole workflow.
+
+    The obligation attaches to the workflow only when a proposal is accepted, which is after the
+    test run this grades; a selection that runs only part of the workflow stays ungraded."""
+    if ctx.request_policy is None:
+        return None
+    if not runtime_workflow.workflow_definition.blocks:
+        return None
+    if run_selection_is_partial(runtime_workflow, labels_to_execute):
+        return None
+    return contract_from_request_criteria(ctx.request_policy.graded_completion_criteria())
+
+
 def _selected_blocks_require_sandbox(
     blocks: list[Any],
     *,
@@ -1851,6 +1872,16 @@ async def _run_blocks_and_collect_debug(
     runtime_frontier_starter_url_seeded = seeded_runtime_workflow is not runtime_workflow
     runtime_workflow = seeded_runtime_workflow
 
+    requested_completion_contract = _requested_completion_contract(ctx, runtime_workflow, labels_to_execute)
+    if requested_completion_contract is not None:
+        runtime_workflow = runtime_workflow.model_copy(
+            update={
+                "workflow_definition": runtime_workflow.workflow_definition.model_copy(
+                    update={"completion_contract": requested_completion_contract}
+                )
+            }
+        )
+
     # Snapshot version persisted for a worker-dispatched run or an inline run sourced from an
     # unsaved prior draft. The run is created against its exact workflow_id so prepare_workflow
     # reads parameter rows from the same definition execute_workflow receives. Without the inline
@@ -2003,6 +2034,7 @@ async def _run_blocks_and_collect_debug(
                     block_labels=labels_to_execute,
                     block_outputs=block_outputs_to_seed or None,
                     workflow_override=runtime_workflow,
+                    requested_completion_contract=requested_completion_contract,
                 )
             )
     except BaseException:
@@ -3345,9 +3377,15 @@ def _adjudicated_run_outcome(
     committed = _same_run_committed_demonstrated_outcome(copilot_ctx)
     if committed is not None:
         return committed
+    # last_test_suspicious_success can also mark a turn's de-facto-final run — a repair
+    # ceiling stops the build loop rather than continuing — so this interim tag neutralizes
+    # only the live row; the honest turn-level amber is still surfaced by the terminal
+    # envelope, which anchors interim verdicts when no adjudicated outcome exists in the
+    # turn (test_run_anchor_keeps_interim_amber_when_no_adjudicated_outcome).
     if copilot_ctx.last_test_suspicious_success:
         return RecordedRunOutcome(
             verdict="not_demonstrated",
+            role="interim_build_test",
             reason_code="outcome_not_demonstrated",
             display_reason=run_outcome_display_reason(copilot_ctx.last_test_failure_reason),
         )
@@ -3381,6 +3419,7 @@ async def _send_run_outcome_update(
     verdict: RunOutcomeVerdict,
     reason_code: RunOutcomeReasonCode | None,
     display_reason: str | None,
+    role: RunOutcomeRole = "adjudicated",
 ) -> None:
     stream = getattr(copilot_ctx, "stream", None)
     if stream is None:
@@ -3397,6 +3436,7 @@ async def _send_run_outcome_update(
                 workflow_run_block_ids=list(getattr(copilot_ctx, "last_run_blocks_block_ids", []) or []),
                 block_labels=list(getattr(copilot_ctx, "last_run_blocks_block_labels", []) or []),
                 verdict=verdict,
+                role=role,
                 reason_code=reason_code,
                 display_reason=display_reason,
                 iteration=iteration,
@@ -3449,6 +3489,7 @@ async def _verify_and_record_run_blocks_result(
             copilot_ctx,
             result,
             verdict=final.verdict,
+            role=final.role,
             reason_code=final.reason_code,
             display_reason=final.display_reason,
         )

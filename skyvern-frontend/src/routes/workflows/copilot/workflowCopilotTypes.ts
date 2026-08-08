@@ -111,6 +111,7 @@ export type WorkflowCopilotStreamMessageType =
   | "design_start"
   | "design_end"
   | "workflow_draft"
+  | "title_update"
   | "credential_required";
 
 export interface WorkflowCopilotProcessingUpdate {
@@ -176,6 +177,16 @@ export interface WorkflowCopilotWorkflowDraftUpdate {
   summary: string | null;
   timestamp: string;
   workflow?: WorkflowApiResponse | null;
+}
+
+// Emitted once the backend has persisted a derived agent name, before any block
+// exists. Clients must not treat it as authoritative over a user-chosen title.
+export interface WorkflowCopilotTitleUpdate {
+  type: "title_update";
+  turn_id: string;
+  workflow_permanent_id: string;
+  title: string;
+  timestamp: string;
 }
 
 // Mid-build pause frame: the turn stays open (SSE alive) while the client
@@ -247,12 +258,15 @@ export type WorkflowCopilotRunOutcomeVerdict =
   | "not_demonstrated"
   | "not_evaluated";
 
+export type RunOutcomeRole = "adjudicated" | "interim_build_test";
+
 export interface WorkflowCopilotRunOutcomeUpdate {
   type: "run_outcome";
   workflow_run_id: string;
   workflow_run_block_ids: string[];
   block_labels: string[];
   verdict: WorkflowCopilotRunOutcomeVerdict;
+  role?: RunOutcomeRole;
   reason_code?: string | null;
   display_reason?: string | null;
   iteration: number;
