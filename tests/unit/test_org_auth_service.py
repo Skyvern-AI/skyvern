@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from time import time as current_time
@@ -12,9 +13,8 @@ from freezegun import freeze_time
 from skyvern.config import settings
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.core.security import create_access_token
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.routes.routers import legacy_base_router
-from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
+from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken, OrganizationAuthTokenType
 from skyvern.forge.sdk.services import org_auth_service, org_auth_token_service
 from skyvern.forge.sdk.services.org_auth_service import (
     _get_api_key_debug_fields,
@@ -194,6 +194,144 @@ def _make_org(organization_id: str, name: str = "test-org") -> Organization:
         created_at=now,
         modified_at=now,
     )
+
+
+def _make_auth_token(token: str, *, valid: bool) -> OrganizationAuthToken:
+    now = datetime.utcnow()
+    return OrganizationAuthToken(
+        id="oat_test",
+        organization_id="org-a",
+        token_type=OrganizationAuthTokenType.api,
+        token=token,
+        valid=valid,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+class _RotatingAuthOrganizations:
+    def __init__(self, api_keys: dict[str, bool]) -> None:
+        self.api_keys = api_keys
+        self.organization = _make_org("org-a")
+        self.validate_calls = 0
+
+    async def get_organization(self, organization_id: str) -> Organization | None:
+        return self.organization if organization_id == self.organization.organization_id else None
+
+    async def validate_org_auth_token(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+        token: str,
+        valid: bool | None = True,
+    ) -> OrganizationAuthToken | None:
+        self.validate_calls += 1
+        assert organization_id == "org-a"
+        assert token_type == OrganizationAuthTokenType.api
+        assert valid is None
+        token_valid = self.api_keys.get(token)
+        return _make_auth_token(token, valid=token_valid) if token_valid is not None else None
+
+    def rotate_api_key(self, old_api_key: str, replacement_api_key: str) -> None:
+        self.api_keys[old_api_key] = False
+        self.api_keys[replacement_api_key] = True
+
+
+class _AuthDatabase:
+    def __init__(self, organizations: _RotatingAuthOrganizations) -> None:
+        self.organizations = organizations
+
+
+@pytest.mark.asyncio
+async def test_get_current_org_cached_rejects_rotated_key_after_invalidation() -> None:
+    old_api_key = create_access_token("org-a", expires_delta=timedelta(hours=1))
+    replacement_api_key = create_access_token("org-a", expires_delta=timedelta(hours=2))
+    organizations = _RotatingAuthOrganizations({old_api_key: True})
+    db = _AuthDatabase(organizations)
+
+    original_organization = await org_auth_service.get_current_org_cached(old_api_key, db)
+    organizations.rotate_api_key(old_api_key, replacement_api_key)
+
+    # Control: this establishes the positive cache is active rather than a guard
+    # that always revalidates. Rotation alone does not invalidate this process.
+    cached_organization = await org_auth_service.get_current_org_cached(old_api_key, db)
+    assert cached_organization.organization_id == original_organization.organization_id == "org-a"
+    assert organizations.validate_calls == 1
+
+    org_auth_service.invalidate_cached_org("org-a")
+
+    replacement_organization = await org_auth_service.get_current_org_cached(replacement_api_key, db)
+    assert original_organization.organization_id == replacement_organization.organization_id == "org-a"
+
+    with pytest.raises(HTTPException) as exc_info:
+        await org_auth_service.get_current_org_cached(old_api_key, db)
+
+    assert exc_info.value.status_code == 403
+    assert organizations.validate_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_get_current_org_cached_coalesces_concurrent_cache_misses(monkeypatch) -> None:
+    cache = org_auth_service._current_org_cache
+    cache.clear()
+    organization = _make_org("org-a")
+    validation_started = asyncio.Event()
+    release_validation = asyncio.Event()
+    resolve_calls = 0
+
+    async def resolve_api_key(_api_key: str, _db: object) -> SimpleNamespace:
+        nonlocal resolve_calls
+        resolve_calls += 1
+        validation_started.set()
+        await release_validation.wait()
+        return SimpleNamespace(organization=organization)
+
+    monkeypatch.setattr(org_auth_service, "resolve_org_from_api_key", resolve_api_key)
+    db = object()
+    first_request = asyncio.create_task(org_auth_service.get_current_org_cached("api-key", db))
+    await validation_started.wait()
+    second_request = asyncio.create_task(org_auth_service.get_current_org_cached("api-key", db))
+
+    try:
+        await asyncio.sleep(0)
+        assert resolve_calls == 1
+    finally:
+        release_validation.set()
+        results = await asyncio.gather(first_request, second_request)
+        cache.clear()
+
+    assert results == [organization, organization]
+
+
+@pytest.mark.asyncio
+async def test_get_current_org_cached_does_not_recache_after_invalidation_during_validation(monkeypatch) -> None:
+    cache = org_auth_service._current_org_cache
+    cache.clear()
+    organization = _make_org("org-a")
+    validation_started = asyncio.Event()
+    release_validation = asyncio.Event()
+    resolve_calls = 0
+
+    async def resolve_api_key(_api_key: str, _db: object) -> SimpleNamespace:
+        nonlocal resolve_calls
+        resolve_calls += 1
+        if resolve_calls == 1:
+            validation_started.set()
+            await release_validation.wait()
+        return SimpleNamespace(organization=organization)
+
+    monkeypatch.setattr(org_auth_service, "resolve_org_from_api_key", resolve_api_key)
+    db = object()
+    in_flight_request = asyncio.create_task(org_auth_service.get_current_org_cached("api-key", db))
+    await validation_started.wait()
+    org_auth_service.invalidate_cached_org("org-a")
+    release_validation.set()
+    await in_flight_request
+
+    await org_auth_service.get_current_org_cached("api-key", db)
+
+    assert resolve_calls == 2
+    cache.clear()
 
 
 def test_invalidate_cached_org_drops_only_matching_entries() -> None:
