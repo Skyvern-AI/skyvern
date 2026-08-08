@@ -86,7 +86,7 @@ from skyvern.forge.sdk.experimentation.transient_ui_capture import resolve_trans
 from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
-from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.schemas.credentials import Credential, credential_auto_profile_disabled
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
@@ -766,6 +766,19 @@ def _require_elapsed_timeout_failure_reason(timeout_failure_reason: str | None) 
         LOG.error("timeout_failure_reason missing when workflow elapsed timeout is set")
         return "Workflow run exceeded max elapsed runtime limit."
     return timeout_failure_reason
+
+
+def run_selection_is_partial(workflow: Workflow, block_labels: list[str] | None) -> bool:
+    """Whether the executed selection left any of the workflow's blocks unrun.
+
+    A selection naming every top-level block runs the whole workflow, so it owes the workflow's
+    declared deliverable even though it was dispatched as a block selection. The finally block is
+    excluded because execute_workflow runs it on its own path, so a full selection never names it."""
+    if not block_labels:
+        return False
+    definition = workflow.workflow_definition
+    definition_labels = {block.label for block in definition.blocks} - {definition.finally_block_label}
+    return not definition_labels.issubset(set(block_labels))
 
 
 def _collect_enterprise_gated_workflow_features(
@@ -3100,6 +3113,10 @@ class WorkflowService:
                 )
                 if not (db_cred and db_cred.browser_profile_id):
                     continue
+                # An opt-out makes this credential seed like one with no linked profile, so a sibling
+                # credential in the same pool still resolves normally.
+                if credential_auto_profile_disabled(db_cred):
+                    continue
                 # Verify the profile still exists (mirrors the mid-run resolver). Best-effort: a
                 # transient repository failure degrades to a fresh seed rather than failing setup.
                 profile = await app.DATABASE.browser_sessions.get_browser_profile(
@@ -3738,6 +3755,7 @@ class WorkflowService:
         browser_session_id: str | None = None,
         need_call_webhook: bool = True,
         workflow_override: Workflow | None = None,
+        requested_completion_contract: dict[str, Any] | None = None,
     ) -> WorkflowRun:
         """Execute a workflow.
 
@@ -4416,7 +4434,8 @@ class WorkflowService:
                         self._finalize_workflow_run_status(
                             workflow_run_id=workflow_run_id,
                             workflow_run=workflow_run,
-                            is_partial_run=bool(block_labels),
+                            is_partial_run=run_selection_is_partial(workflow, block_labels),
+                            requested_completion_contract=requested_completion_contract,
                             pre_finally_status=pre_finally_status,
                             pre_finally_failure_reason=pre_finally_failure_reason,
                             pre_finally_failure_category=pre_finally_failure_category,
@@ -6058,6 +6077,7 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             workflow_permanent_id=workflow_run.workflow_permanent_id,
+            workflow_run=workflow_run,
         )
         # Save the original navigation goal before any mutation so
         # retries don't stack the browser-session prefix repeatedly.
@@ -6271,6 +6291,7 @@ class WorkflowService:
         workflow_run_id: str | None,
         organization_id: str | None,
         workflow_permanent_id: str | None,
+        workflow_run: WorkflowRun | None = None,
     ) -> str | None:
         """Inspect the block-level parameters and return the browser_profile_id
         from the credential parameter bound to this specific block."""
@@ -6294,6 +6315,14 @@ class WorkflowService:
                     organization_id=organization_id,
                 )
                 if db_cred and db_cred.browser_profile_id:
+                    if workflow_run is not None:
+                        engine_enabled = await app.AGENT_FUNCTION.is_browser_memory_engine_enabled(workflow_run)
+                    else:
+                        engine_enabled = await app.AGENT_FUNCTION.is_browser_memory_engine_enabled_for_org(
+                            organization_id
+                        )
+                    if engine_enabled and credential_auto_profile_disabled(db_cred):
+                        continue
                     # Verify the browser profile still exists before using it
                     profile = await app.DATABASE.browser_sessions.get_browser_profile(
                         profile_id=db_cred.browser_profile_id,
@@ -7475,6 +7504,16 @@ class WorkflowService:
             workflow_tags=workflow_tags,
         )
 
+    def schedule_workflow_saved_hook(self, *, organization_id: str, edited_by: str | None) -> None:
+        task = asyncio.create_task(
+            app.AGENT_FUNCTION.on_workflow_saved(
+                organization_id=organization_id,
+                edited_by=edited_by,
+            ),
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     async def update_workflow_definition(
         self,
         workflow_id: str,
@@ -7506,6 +7545,7 @@ class WorkflowService:
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
         edited_by: str | None | object = _UNSET,
+        notify_workflow_saved: bool = True,
     ) -> Workflow:
         if workflow_definition is not None:
             if organization_id is not None:
@@ -7580,15 +7620,11 @@ class WorkflowService:
                 edited_by=edited_by,
             )
 
-        _edited_by: str | None = cast("str | None", edited_by) if edited_by is not _UNSET else None
-        task = asyncio.create_task(
-            app.AGENT_FUNCTION.on_workflow_saved(
+        if notify_workflow_saved:
+            self.schedule_workflow_saved_hook(
                 organization_id=updated_workflow.organization_id,
-                edited_by=_edited_by,
-            ),
-        )
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+                edited_by=cast("str | None", edited_by) if edited_by is not _UNSET else None,
+            )
 
         return updated_workflow
 
@@ -8326,6 +8362,7 @@ class WorkflowService:
         pre_finally_failure_reason: str | None,
         pre_finally_failure_category: list[dict] | None = None,
         is_partial_run: bool = False,
+        requested_completion_contract: dict[str, Any] | None = None,
     ) -> WorkflowRun:
         """
         Set final workflow run status based on pre-finally state.
@@ -8342,7 +8379,11 @@ class WorkflowService:
             WorkflowRunStatus.terminated,
             WorkflowRunStatus.timed_out,
         ):
-            contract_verdict = await self._grade_completion_contract(workflow_run, is_partial_run=is_partial_run)
+            contract_verdict = await self._grade_completion_contract(
+                workflow_run,
+                is_partial_run=is_partial_run,
+                requested_completion_contract=requested_completion_contract,
+            )
             if contract_verdict is not None and not contract_verdict.satisfied:
                 updated = await self._update_workflow_run_status_if_not_final(
                     workflow_run_id=workflow_run_id,
@@ -8401,7 +8442,11 @@ class WorkflowService:
             return 0
 
     async def _grade_completion_contract(
-        self, workflow_run: WorkflowRun, *, is_partial_run: bool = False
+        self,
+        workflow_run: WorkflowRun,
+        *,
+        is_partial_run: bool = False,
+        requested_completion_contract: dict[str, Any] | None = None,
     ) -> ContractVerdict | None:
         """Grade the workflow's declared completion contract, or None when it declares nothing.
 
@@ -8420,6 +8465,10 @@ class WorkflowService:
                 organization_id=workflow_run.organization_id,
             )
             criteria = parse_completion_contract(workflow.workflow_definition if workflow else None)
+            if not criteria and requested_completion_contract is not None:
+                # A copilot test run executes a version the request's obligation has not been
+                # written onto yet — it attaches when the proposal is accepted, after this run.
+                criteria = parse_completion_contract({"completion_contract": requested_completion_contract})
             if not criteria:
                 return None
             context = skyvern_context.current()
@@ -10555,18 +10604,11 @@ class WorkflowService:
 
         return workflow_definition
 
-    async def create_workflow_from_request(
+    async def resolve_workflow_creation_title(
         self,
-        organization: Organization,
+        organization_id: str,
         request: WorkflowCreateYAMLRequest,
-        workflow_permanent_id: str | None = None,
-        delete_script: bool = True,
-        created_by: str | None = None,
-        edited_by: str | None = None,
-    ) -> Workflow:
-        organization_id = organization.organization_id
-
-        # Generate meaningful title if using default and has blocks
+    ) -> str:
         title = request.title
         if title in DEFAULT_WORKFLOW_TITLES and request.workflow_definition.blocks:
             generated_title = await generate_workflow_title(
@@ -10580,6 +10622,24 @@ class WorkflowService:
                     organization_id=organization_id,
                     generated_title=title,
                 )
+        return title
+
+    async def create_workflow_from_request(
+        self,
+        organization: Organization,
+        request: WorkflowCreateYAMLRequest,
+        workflow_permanent_id: str | None = None,
+        delete_script: bool = True,
+        created_by: str | None = None,
+        edited_by: str | None = None,
+        new_workflow_permanent_id: str | None = None,
+        notify_workflow_saved: bool = True,
+        resolved_title: str | None = None,
+    ) -> Workflow:
+        organization_id = organization.organization_id
+        title = resolved_title
+        if title is None:
+            title = await self.resolve_workflow_creation_title(organization_id, request)
 
         LOG.info(
             "Creating workflow from request",
@@ -10699,6 +10759,8 @@ class WorkflowService:
                     max_elapsed_time_minutes=request.max_elapsed_time_minutes,
                     extra_http_headers=request.extra_http_headers,
                     cdp_connect_headers=new_cdp_connect_headers,
+                    workflow_permanent_id=new_workflow_permanent_id,
+                    version=1 if new_workflow_permanent_id else None,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
                     run_with=request.run_with,
@@ -10737,6 +10799,7 @@ class WorkflowService:
                 description=request.description,
                 workflow_definition=workflow_definition,
                 edited_by=edited_by,
+                notify_workflow_saved=notify_workflow_saved,
             )
 
             await self.maybe_delete_cached_code(
