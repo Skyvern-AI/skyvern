@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -605,6 +606,7 @@ def test_run_mcp_browser_extension_flag_starts_and_stops_runtime(monkeypatch: py
     async def run_async(**_kwargs: object) -> None:
         assert run_commands.os.environ["BROWSER_TYPE"] == "extension-connect"
         events.append("serve")
+        await asyncio.sleep(0)
 
     async def cleanup() -> None:
         events.append("cleanup")
@@ -624,13 +626,15 @@ def test_run_mcp_browser_extension_flag_starts_and_stops_runtime(monkeypatch: py
     )
     monkeypatch.setattr("skyvern.cli.mcp_tools.mcp.run_async", run_async)
     monkeypatch.setattr(BrowserExtensionRuntime, "get_or_start", AsyncMock(side_effect=get_or_start))
+    monkeypatch.setattr(BrowserExtensionRuntime, "instance", MagicMock(return_value=runtime))
     monkeypatch.setattr(run_commands, "_mcp_cleanup_done", False)
     monkeypatch.setattr(run_commands, "_mcp_cleanup_in_progress", False)
 
     run_commands.run_mcp(browser_extension=True)
 
     assert run_commands.os.environ["BROWSER_TYPE"] == "extension-connect"
-    assert events == ["start", "serve", "cleanup", "shutdown"]
+    # Serving precedes the bridge: `initialize` must not wait on relay startup.
+    assert events == ["serve", "start", "cleanup", "shutdown"]
     runtime.shutdown.assert_awaited_once_with()
 
 
@@ -640,7 +644,12 @@ async def test_run_mcp_with_cleanup_serves_when_extension_start_fails(
 ) -> None:
     message = "browser extension bridge unavailable"
     get_or_start = AsyncMock(side_effect=BrowserExtensionError(message))
-    run_async = AsyncMock()
+    served = MagicMock()
+
+    async def run_async(**kwargs: object) -> None:
+        served(**kwargs)
+        await asyncio.sleep(0)
+
     cleanup = AsyncMock()
     warning = MagicMock()
     instance = MagicMock(return_value=None)
@@ -652,7 +661,7 @@ async def test_run_mcp_with_cleanup_serves_when_extension_start_fails(
     await run_commands._run_mcp_with_cleanup(run_async, browser_extension=True, transport="stdio")
 
     get_or_start.assert_awaited_once_with()
-    run_async.assert_awaited_once_with(transport="stdio")
+    served.assert_called_once_with(transport="stdio")
     cleanup.assert_awaited_once_with()
     instance.assert_called_once_with()
     assert warning.call_count == 1
@@ -660,22 +669,57 @@ async def test_run_mcp_with_cleanup_serves_when_extension_start_fails(
 
 
 @pytest.mark.asyncio
-async def test_run_mcp_with_cleanup_propagates_unexpected_extension_start_error(
+async def test_run_mcp_with_cleanup_serves_on_unexpected_extension_start_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     get_or_start = AsyncMock(side_effect=RuntimeError("unexpected startup failure"))
-    run_async = AsyncMock()
     cleanup = AsyncMock()
+    warning = MagicMock()
+    served = MagicMock()
+
+    async def run_async(**_kwargs: object) -> None:
+        served()
+        await asyncio.sleep(0)
+
     monkeypatch.setattr(BrowserExtensionRuntime, "get_or_start", get_or_start)
     monkeypatch.setattr(BrowserExtensionRuntime, "instance", MagicMock(return_value=None))
     monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", cleanup)
+    monkeypatch.setattr(run_commands.LOG, "warning", warning)
 
-    with pytest.raises(RuntimeError, match="unexpected startup failure"):
-        await run_commands._run_mcp_with_cleanup(run_async, browser_extension=True)
+    await run_commands._run_mcp_with_cleanup(run_async, browser_extension=True)
 
     get_or_start.assert_awaited_once_with()
-    run_async.assert_not_awaited()
+    served.assert_called_once_with()
     cleanup.assert_awaited_once_with()
+    assert warning.call_count == 1
+    assert warning.call_args.kwargs["exc_info"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_mcp_with_cleanup_serves_while_extension_start_hangs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+
+    async def get_or_start() -> object:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("bridge startup must stay pending")
+
+    async def run_async(**_kwargs: object) -> None:
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+    cleanup = AsyncMock()
+    instance = MagicMock(return_value=None)
+    monkeypatch.setattr(BrowserExtensionRuntime, "get_or_start", AsyncMock(side_effect=get_or_start))
+    monkeypatch.setattr(BrowserExtensionRuntime, "instance", instance)
+    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", cleanup)
+
+    await run_commands._run_mcp_with_cleanup(run_async, browser_extension=True)
+
+    cleanup.assert_awaited_once_with()
+    instance.assert_called_once_with()
+    assert [task for task in asyncio.all_tasks() if task is not asyncio.current_task()] == []
 
 
 @pytest.mark.parametrize("transport", ["sse", "streamable-http"])
