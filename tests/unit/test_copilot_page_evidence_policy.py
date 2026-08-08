@@ -67,7 +67,7 @@ def test_structured_page_inspection_is_not_rationed() -> None:
 
 
 def test_default_loop_budget_allows_inspect_build_run_answer_trajectory() -> None:
-    assert DEFAULT_MAX_TURNS >= 35
+    assert DEFAULT_MAX_TURNS == 200
 
 
 def test_block_observation_ref_rejects_negative_steps() -> None:

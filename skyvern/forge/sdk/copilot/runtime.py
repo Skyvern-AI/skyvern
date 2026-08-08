@@ -311,6 +311,9 @@ class AgentContext:
     post_update_nudge_count: int = 0
     format_nudge_count: int = 0
     copilot_total_timeout_exceeded: bool = False
+    copilot_max_turns_exceeded: bool = False
+    model_calls_this_turn: int = 0
+    enforcement_pass_count: int = 0
     failed_test_nudge_count: int = 0
     explore_without_workflow_nudge_count: int = 0
     last_test_ok: bool | None = None
