@@ -56,5 +56,7 @@ async def test_get_workflows_by_organization_id_search_key_matches_workflow_perm
 
     # The search filter must reference the workflow_permanent_id column directly so
     # that pasting a wpid_* into the workflows page search box finds the workflow.
+    # The `_` is autoescaped (`/_`) so it matches literally rather than as a
+    # single-char LIKE wildcard.
     assert "workflows.workflow_permanent_id" in compiled_where
-    assert "wpid_510867674757598984" in compiled_where
+    assert "wpid/_510867674757598984" in compiled_where
