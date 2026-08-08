@@ -136,8 +136,11 @@ def _spawned_recently(lock: _SpawnLock) -> bool:
         stamp = float(lock.read(64) or b"0")
     except (OSError, ValueError):
         return False
+    # _stamp_spawn rounds to milliseconds, so a stamp can read fractionally ahead of now.
+    # A negative elapsed means someone stamped it a moment ago, not that the clock is wrong;
+    # only a jump larger than the cooldown is treated as stale enough to spawn again.
     elapsed = time.time() - stamp
-    return 0 <= elapsed < _SPAWN_COOLDOWN_SECONDS
+    return abs(elapsed) < _SPAWN_COOLDOWN_SECONDS
 
 
 def _stamp_spawn(lock: _SpawnLock) -> None:

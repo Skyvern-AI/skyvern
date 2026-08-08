@@ -52,6 +52,22 @@ def test_a_spawn_storm_collapses_to_a_single_launch(monkeypatch: pytest.MonkeyPa
     assert popen.call_count == 1
 
 
+def test_a_stamp_a_hair_in_the_future_still_blocks_a_second_spawn(
+    monkeypatch: pytest.MonkeyPatch, state_home: Path
+) -> None:
+    """Millisecond rounding can put the stamp marginally ahead of the next read of the clock."""
+    popen = MagicMock()
+    monkeypatch.setattr(daemon_module.subprocess, "Popen", popen)
+    clock = [1_000.0]
+    monkeypatch.setattr(daemon_module.time, "time", lambda: clock[0])
+
+    assert spawn_daemon(19777)
+    clock[0] -= 0.0005
+    assert not spawn_daemon(19777)
+
+    assert popen.call_count == 1
+
+
 def test_a_second_spawn_is_allowed_once_the_cooldown_lapses(monkeypatch: pytest.MonkeyPatch, state_home: Path) -> None:
     popen = MagicMock()
     monkeypatch.setattr(daemon_module.subprocess, "Popen", popen)
