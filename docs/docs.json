@@ -394,7 +394,10 @@
     "options": ["copy", "view", "claude", "chatgpt", "cursor", "vscode", "mcp"]
   },
   "seo": {
-    "indexing": "navigable"
+    "indexing": "navigable",
+    "metatags": {
+      "canonical": "https://www.skyvern.com"
+    }
   },
   "css": "/style.css",
   "api": {
