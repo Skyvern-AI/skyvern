@@ -1477,21 +1477,42 @@ export class WorkflowValidationError extends Error {
   }
 }
 
+function validateNestedLoopBlocks(blocks: Array<WorkflowBlock>): void {
+  for (const block of blocks) {
+    if (isNestedLoopWorkflowBlock(block)) {
+      validateWorkflowBlocks(block.loop_blocks, block.label);
+    }
+  }
+}
+
 export function validateWorkflowBlocks(
   blocks: Array<WorkflowBlock>,
   loopLabel: string | null = null,
+  finallyBlockLabel: string | null = null,
 ): void {
   if (blocks.length === 0) return;
   const labelToBlock = new Map<string, WorkflowBlock>();
+  const seenLabels = new Set<string>();
   const where = loopLabel ? ` inside loop ${loopLabel}` : "";
 
   for (const block of blocks) {
-    if (labelToBlock.has(block.label)) {
+    if (seenLabels.has(block.label)) {
       throw new WorkflowValidationError(
         `Duplicate block label detected${where}: ${block.label}`,
       );
     }
-    labelToBlock.set(block.label, block);
+    seenLabels.add(block.label);
+    // A finally block runs out-of-band, so nothing points at it and it would
+    // read as a second root. Mirrors _strip_finally_block_references on the BE.
+    if (block.label !== finallyBlockLabel) {
+      labelToBlock.set(block.label, block);
+    }
+  }
+  // Only the finally block remained, so there is no graph to check — falling
+  // through would report zero roots as a circular reference.
+  if (labelToBlock.size === 0) {
+    validateNestedLoopBlocks(blocks);
+    return;
   }
 
   const adjacency = new Map<string, Set<string>>();
@@ -1502,7 +1523,7 @@ export function validateWorkflowBlocks(
   }
 
   const addEdge = (source: string, target: string | null | undefined): void => {
-    if (!target) return;
+    if (!target || target === finallyBlockLabel) return;
     if (!labelToBlock.has(target)) {
       throw new WorkflowValidationError(
         `Block ${source} references unknown next_block_label ${target}${where}`,
@@ -1558,11 +1579,7 @@ export function validateWorkflowBlocks(
     );
   }
 
-  for (const block of blocks) {
-    if (isNestedLoopWorkflowBlock(block)) {
-      validateWorkflowBlocks(block.loop_blocks, block.label);
-    }
-  }
+  validateNestedLoopBlocks(blocks);
 }
 
 export function applySequentialDefaulting(
@@ -2089,7 +2106,7 @@ function getElements(
   let validationError: WorkflowValidationError | null = null;
   if (editable) {
     try {
-      validateWorkflowBlocks(blocks);
+      validateWorkflowBlocks(blocks, null, settings.finallyBlockLabel ?? null);
     } catch (err) {
       if (err instanceof WorkflowValidationError) {
         validationError = err;
