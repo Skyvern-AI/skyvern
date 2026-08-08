@@ -10568,6 +10568,20 @@
             "title": "Parameters",
             "default": []
           },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
+          },
           "prompt": {
             "anyOf": [
               {
@@ -10780,6 +10794,20 @@
               }
             ],
             "title": "Parameter Keys"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
           },
           "prompt": {
             "anyOf": [

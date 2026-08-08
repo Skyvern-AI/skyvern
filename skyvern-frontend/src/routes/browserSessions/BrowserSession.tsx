@@ -132,7 +132,7 @@ function BrowserSession() {
   return (
     <div className="h-screen w-full gap-4 p-6">
       <div className="flex h-full w-full flex-col items-start justify-start gap-2">
-        <div className="flex w-full flex-shrink-0 flex-row items-center justify-between rounded-lg border p-4">
+        <div className="flex w-full flex-shrink-0 flex-row items-center justify-between p-4">
           <div className="flex w-full flex-row items-center justify-start gap-2">
             <div className="text-xl">Browser Session</div>
             {activeTab === "stream" && <StreamModeBadge mode={streamMode} />}
