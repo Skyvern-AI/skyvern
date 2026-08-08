@@ -60,14 +60,16 @@ For manual setup:
 
 ## Pair the extension
 
-With your MCP server running, start the recommended one-click flow:
+With your MCP server running, ask your MCP client to create a browser session. If the extension is not paired, Skyvern
+opens a secure pairing tab automatically. You can also start the flow explicitly:
 
 ```bash
 skyvern browser extension-pair
 ```
 
 Click **Approve** in the pairing page, then approve the pairing again in the **Skyvern Agent** confirmation tab that
-opens. The pairing link expires after two minutes and can be used only once; rerun the command if it expires.
+opens. The pairing link expires after two minutes and can be used only once; retry the browser-session request or rerun
+the command if it expires.
 
 As a manual fallback, copy the pairing token to your clipboard:
 

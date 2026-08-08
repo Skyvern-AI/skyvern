@@ -22,16 +22,28 @@ from skyvern.cli.core import session_manager
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import session as mcp_session
 
-_NOT_CONNECTED_GUIDANCE = (
-    "Skyvern browser extension is not connected. Install it: run `skyvern browser extension-path`, open "
-    "chrome://extensions, enable Developer mode, Load unpacked, and select that directory. Then run "
-    "`skyvern browser extension-token`, paste the token into the extension popup, and click Connect. Then retry."
+_PAIRING_OPENED_GUIDANCE = (
+    "Skyvern browser extension is not connected. A secure pairing tab was opened. Approve the connection, approve "
+    "pairing in the Skyvern Agent confirmation tab, and retry."
+)
+_PAIRING_FALLBACK_GUIDANCE = (
+    "Skyvern browser extension is not connected and the pairing tab could not be opened automatically. Run "
+    "`skyvern browser extension-pair`, approve the connection, approve pairing in the Skyvern Agent confirmation "
+    "tab, and retry."
 )
 
 
 @pytest.fixture(autouse=True)
 def _use_stdio_transport(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(session_manager, "_stateless_http_mode", False)
+
+
+@pytest.mark.parametrize("pairing_opened", [True, False])
+def test_extension_not_connected_guidance_omits_manual_token_flow(pairing_opened: bool) -> None:
+    guidance = mcp_session._extension_not_connected_guidance(pairing_opened=pairing_opened)
+
+    assert "extension-token" not in guidance
+    assert "paste the token" not in guidance
 
 
 @pytest.mark.parametrize(
@@ -118,10 +130,19 @@ async def test_session_create_extension_takes_precedence_over_cdp(monkeypatch: p
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pairing_opened", "expected_guidance"),
+    [(True, _PAIRING_OPENED_GUIDANCE), (False, _PAIRING_FALLBACK_GUIDANCE)],
+)
 async def test_session_create_extension_not_connected_returns_pinned_guidance(
     monkeypatch: pytest.MonkeyPatch,
+    pairing_opened: bool,
+    expected_guidance: str,
 ) -> None:
-    runtime = SimpleNamespace(wait_for_extension=AsyncMock(return_value=False))
+    runtime = SimpleNamespace(
+        wait_for_extension=AsyncMock(return_value=False),
+        open_pairing_page=AsyncMock(return_value=pairing_opened),
+    )
     get_or_start = AsyncMock(return_value=runtime)
     resolve_browser = AsyncMock()
     monkeypatch.setenv("BROWSER_TYPE", "extension-connect")
@@ -131,8 +152,11 @@ async def test_session_create_extension_not_connected_returns_pinned_guidance(
     result = await mcp_session.skyvern_browser_session_create()
 
     assert result["ok"] is False
-    assert result["error"]["message"] == _NOT_CONNECTED_GUIDANCE
+    assert result["error"]["message"] == expected_guidance
+    assert "extension-token" not in result["error"]["message"]
+    assert "paste the token" not in result["error"]["message"]
     get_or_start.assert_awaited_once_with()
+    runtime.open_pairing_page.assert_awaited_once_with()
     runtime.wait_for_extension.assert_awaited_once_with(10.0)
     resolve_browser.assert_not_awaited()
 
@@ -207,7 +231,7 @@ async def test_session_create_extension_connection_error_redacts_capability_url(
         session_manager._current_session.reset(current_token)
 
     assert result["ok"] is False
-    assert result["error"]["message"] == _NOT_CONNECTED_GUIDANCE
+    assert result["error"]["message"] == _PAIRING_FALLBACK_GUIDANCE
     assert "/cdp/" not in repr(result)
     assert capability_token not in repr(result)
     connect_over_cdp.assert_awaited_once_with(capability_url)
@@ -324,6 +348,20 @@ async def test_connect_to_browser_extension_uses_runtime_cdp_url_and_context_fal
         browser.new_context.assert_awaited_once_with()
 
 
+def test_pairing_confirmation_recovery_retries_through_mcp_without_cli_command() -> None:
+    extension_dir = BrowserExtensionRuntime.extension_dir()
+    confirmation_html = (extension_dir / "pairing_confirm.html").read_text()
+    confirmation_js = (extension_dir / "pairing_confirm.js").read_text()
+
+    assert "Retry the browser session request in your MCP client" in confirmation_html
+    assert "skyvern browser extension-pair" in confirmation_html
+    assert "Start a new pairing link" not in confirmation_html
+    assert "copy-command" not in confirmation_html
+    assert "expired before approval" in confirmation_js
+    assert "skyvern browser extension-pair" not in confirmation_js
+    assert "openPairingPage" not in confirmation_js
+
+
 def test_browser_extension_path_command_prints_real_absolute_directory() -> None:
     result = CliRunner().invoke(browser_app, ["extension-path"])
 
@@ -389,12 +427,12 @@ def test_browser_extension_status_reports_configuration_without_printing_token(
     token_path = token_dir / "browser_extension_token"
     token_path.write_text(token)
     token_path.chmod(0o600)
-    connection = MagicMock()
-    connect = MagicMock(return_value=connection)
+    probe = MagicMock(return_value="broker")
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("SKYVERN_BROWSER_EXTENSION_PORT", "20123")
     monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_TOKEN", raising=False)
-    monkeypatch.setattr(browser_commands.socket, "create_connection", connect)
+    monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_BROKER", raising=False)
+    monkeypatch.setattr(browser_commands, "_bridge_mode", probe)
 
     result = CliRunner().invoke(browser_app, ["extension-status"])
 
@@ -402,10 +440,27 @@ def test_browser_extension_status_reports_configuration_without_printing_token(
     assert str(BrowserExtensionRuntime.extension_dir().resolve()) in result.stdout
     assert "pairing token: configured (file exists)" in result.stdout
     assert "pairing token file permissions: OK" in result.stdout
-    assert "bridge listening on 20123" in result.stdout
+    assert "shared broker: enabled" in result.stdout
+    assert "bridge listening on 20123 (shared broker daemon)" in result.stdout
     assert token not in result.stdout
-    connect.assert_called_once_with(("127.0.0.1", 20123), timeout=0.5)
-    connection.close.assert_called_once_with()
+    probe.assert_called_once_with(20123)
+
+
+def test_browser_extension_status_flags_a_single_owner_bridge_as_unshareable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SKYVERN_BROWSER_EXTENSION_PORT", "20124")
+    monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_TOKEN", raising=False)
+    monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_BROKER", raising=False)
+    monkeypatch.setattr(browser_commands, "_bridge_mode", MagicMock(return_value="legacy"))
+
+    result = CliRunner().invoke(browser_app, ["extension-status"])
+
+    assert result.exit_code == 0
+    assert "bridge listening on 20124 (single-owner session)" in result.stdout
+    assert "share the bridge" in result.stdout
 
 
 def test_browser_extension_status_is_informational_when_bridge_is_not_running(
@@ -415,12 +470,14 @@ def test_browser_extension_status_is_informational_when_bridge_is_not_running(
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_TOKEN", raising=False)
     monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_PORT", raising=False)
-    monkeypatch.setattr(browser_commands.socket, "create_connection", MagicMock(side_effect=OSError))
+    monkeypatch.setenv("SKYVERN_BROWSER_EXTENSION_BROKER", "0")
+    monkeypatch.setattr(browser_commands, "_bridge_mode", MagicMock(return_value="none"))
 
     result = CliRunner().invoke(browser_app, ["extension-status"])
 
     assert result.exit_code == 0
     assert "pairing token: not configured" in result.stdout
+    assert "shared broker: disabled (SKYVERN_BROWSER_EXTENSION_BROKER)" in result.stdout
     assert "bridge not running (start your MCP server with --browser-extension)" in result.stdout
 
 
