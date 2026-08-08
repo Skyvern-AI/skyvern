@@ -19,7 +19,11 @@ from unittest.mock import AsyncMock
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.exceptions import IllegitCompleteScriptTermination, ScriptTerminationException
+from skyvern.exceptions import (
+    DownloadSaveIncompleteError,
+    IllegitCompleteScriptTermination,
+    ScriptTerminationException,
+)
 from skyvern.forge.sdk.copilot.reached_download_target import (
     block_output_has_registered_download,
     code_is_download_intent,
@@ -136,11 +140,13 @@ def _wire_secure_runner(
     fake_app.AGENT_FUNCTION.execute_code_block_override = AsyncMock(side_effect=_execute_override)
 
 
-def _write_run_download(download_root: str, filename: str = "invoice.pdf") -> None:
+def _write_run_download(
+    download_root: str, filename: str = "invoice.pdf", content: bytes = b"%PDF-1.4 statement"
+) -> None:
     run_dir = os.path.join(download_root, "wr_1")
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, filename), "wb") as handle:
-        handle.write(b"%PDF-1.4 statement")
+        handle.write(content)
 
 
 def _persisted_output() -> object:
@@ -1083,7 +1089,346 @@ async def test_registration_timeout_does_not_fail_a_block_that_downloaded(
 
 def test_unreadable_download_dir_is_an_unknown_snapshot_not_an_empty_one() -> None:
     """An unreadable directory must not read as empty, or pre-existing files look new."""
-    assert block_module.local_download_dir_file_names(None) is None
+    assert block_module.local_download_dir_file_identities(None) is None
+
+
+def test_same_name_overwrite_changes_download_dir_identity(_isolated_download_path: str) -> None:
+    """The snapshot must see a rewrite under an existing name, not just new names."""
+    _write_run_download(_isolated_download_path)
+    before = block_module.local_download_dir_file_identities("wr_1")
+    _write_run_download(_isolated_download_path, content=b"%PDF-1.4 a longer, different statement body")
+    after = block_module.local_download_dir_file_identities("wr_1")
+    assert before != after
+    assert {identity[0] for identity in after} == {"invoice.pdf"}
+
+
+@pytest.mark.asyncio
+async def test_storage_skip_reaches_binder_as_registration_incomplete(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """A per-file storage skip is 'registration could not complete', not proof the code swallowed
+    a download: the block completes and the binder abstains instead of accusing (SKY-13782)."""
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+
+    _fake_storage_app(
+        monkeypatch,
+        save=AsyncMock(side_effect=DownloadSaveIncompleteError(["invoice.pdf"])),
+        get=AsyncMock(return_value=[]),
+    )
+    _wire_block_runtime(monkeypatch)
+
+    async def _download_then_return(*args: object, **kwargs: object) -> object:
+        _write_run_download(_isolated_download_path)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        CodeBlock,
+        "execute_user_function_with_timeout",
+        AsyncMock(side_effect=_download_then_return),
+    )
+
+    block = CodeBlock(
+        label="download_invoice",
+        code="value = 'unused'",
+        output_parameter=_output_parameter("code_out"),
+    )
+    with capture_logs() as logs:
+        result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is True
+    assert result.status == BlockStatus.completed
+    assert result.failure_reason != block_module.DOWNLOAD_BINDING_FAILURE_REASON
+    assert block_module.UNBOUND_DOWNLOAD_OUTPUT_KEY not in (result.output_parameter_value or {})
+    skipped = [log for log in logs if log.get("event") == "codeblock.download_binding_verdict_skipped"]
+    assert skipped
+    assert skipped[0]["reason"] == "registration_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_failing_block_overwriting_existing_download_still_registers_it(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """A failing block that replaces an existing download under the same name still carries the
+    registration evidence out — a name-only snapshot diff would miss the overwrite (SKY-13782)."""
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+    _write_run_download(_isolated_download_path)
+
+    file_info = FileInfo(
+        url="https://api.example.com/v1/artifacts/a_dl_1/content?artifact_name=invoice.pdf",
+        filename="invoice.pdf",
+        checksum="deadbeef",
+        artifact_id="a_dl_1",
+        modified_at=datetime(2026, 6, 14, 12, 0, tzinfo=UTC),
+    )
+    _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(side_effect=[[], [], [file_info]]))
+    _wire_block_runtime(monkeypatch)
+
+    async def _overwrite_then_raise(*args: object, **kwargs: object) -> object:
+        _write_run_download(_isolated_download_path, content=b"%PDF-1.4 a longer, different statement body")
+        raise RuntimeError("boom after overwrite")
+
+    monkeypatch.setattr(
+        CodeBlock,
+        "execute_user_function_with_timeout",
+        AsyncMock(side_effect=_overwrite_then_raise),
+    )
+
+    block = CodeBlock(
+        label="download_invoice",
+        code="value = 'unused'",
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is False
+    assert "boom after overwrite" in (result.failure_reason or "")
+    output = result.output_parameter_value
+    assert output is not None
+    assert output["downloaded_files"] == [file_info.model_dump()]
+    assert output["downloaded_file_urls"] == [file_info.url]
+
+
+@pytest.mark.asyncio
+async def test_loop_re_download_of_registered_file_is_not_accused(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """A later iteration re-downloading a file this run already registered must not fail the block:
+    the identity diff sees the rewrite, but the registration read-back accounts for it (SKY-13782)."""
+    prev_file = FileInfo(
+        url="https://api.example.com/v1/artifacts/a_prev/content?artifact_name=prev.pdf",
+        filename="prev.pdf",
+        checksum="abc",
+        artifact_id="a_prev",
+    )
+    skyvern_context.set(
+        SkyvernContext(
+            organization_id="o_1",
+            workflow_run_id="wr_1",
+            run_id="wr_1",
+            loop_internal_state={
+                "downloaded_file_signatures_before_iteration": [
+                    block_module.to_downloaded_file_signature(prev_file),
+                ],
+            },
+        )
+    )
+    _write_run_download(_isolated_download_path, filename="prev.pdf")
+
+    _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(return_value=[prev_file]))
+    _wire_block_runtime(monkeypatch)
+
+    async def _rewrite_same_file(*args: object, **kwargs: object) -> object:
+        path = os.path.join(_isolated_download_path, "wr_1", "prev.pdf")
+        stat = os.stat(path)
+        _write_run_download(_isolated_download_path, filename="prev.pdf")
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000))
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        CodeBlock,
+        "execute_user_function_with_timeout",
+        AsyncMock(side_effect=_rewrite_same_file),
+    )
+
+    block = CodeBlock(
+        label="code_download",
+        code="value = 'unused'",
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is True
+    assert result.failure_reason != block_module.DOWNLOAD_BINDING_FAILURE_REASON
+    assert block_module.UNBOUND_DOWNLOAD_OUTPUT_KEY not in (result.output_parameter_value or {})
+
+
+@pytest.mark.asyncio
+async def test_partial_storage_skip_still_binds_the_files_that_saved(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """One skipped file strips neither the binding evidence of the files that saved nor the
+    block's success; the verdict abstains instead of accusing (SKY-13782)."""
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+
+    file_info = FileInfo(
+        url="https://api.example.com/v1/artifacts/a_dl_1/content?artifact_name=invoice.pdf",
+        filename="invoice.pdf",
+        checksum="deadbeef",
+        artifact_id="a_dl_1",
+        modified_at=datetime(2026, 6, 14, 12, 0, tzinfo=UTC),
+    )
+    _fake_storage_app(
+        monkeypatch,
+        save=AsyncMock(side_effect=DownloadSaveIncompleteError(["statement.pdf"])),
+        get=AsyncMock(side_effect=[[], [file_info]]),
+    )
+    _wire_block_runtime(monkeypatch)
+
+    async def _download_two_files(*args: object, **kwargs: object) -> object:
+        _write_run_download(_isolated_download_path)
+        _write_run_download(_isolated_download_path, filename="statement.pdf")
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        CodeBlock,
+        "execute_user_function_with_timeout",
+        AsyncMock(side_effect=_download_two_files),
+    )
+
+    block = CodeBlock(
+        label="download_invoice",
+        code="value = 'unused'",
+        output_parameter=_output_parameter("code_out"),
+    )
+    with capture_logs() as logs:
+        result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is True
+    assert result.status == BlockStatus.completed
+    output = result.output_parameter_value
+    assert output["downloaded_files"] == [file_info.model_dump()]
+    assert output["downloaded_file_urls"] == [file_info.url]
+    skipped = [log for log in logs if log.get("event") == "codeblock.download_binding_verdict_skipped"]
+    assert skipped
+    assert skipped[0]["reason"] == "registration_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_failing_block_overwrite_of_registered_name_forces_resave(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """A registration made before the overwrite is stale for the rewritten bytes: the failure path
+    re-saves instead of treating the old row as coverage (SKY-13782)."""
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+    _write_run_download(_isolated_download_path)
+
+    stale = FileInfo(
+        url="https://api.example.com/v1/artifacts/a_dl_1/content?artifact_name=invoice.pdf",
+        filename="invoice.pdf",
+        checksum="stale",
+        artifact_id="a_dl_1",
+    )
+    fresh = FileInfo(
+        url="https://api.example.com/v1/artifacts/a_dl_1/content?artifact_name=invoice.pdf",
+        filename="invoice.pdf",
+        checksum="fresh",
+        artifact_id="a_dl_1",
+        modified_at=datetime(2026, 6, 14, 12, 0, tzinfo=UTC),
+    )
+    save_mock = AsyncMock()
+    _fake_storage_app(monkeypatch, save=save_mock, get=AsyncMock(side_effect=[[stale], [stale], [fresh]]))
+    _wire_block_runtime(monkeypatch)
+
+    async def _overwrite_then_raise(*args: object, **kwargs: object) -> object:
+        _write_run_download(_isolated_download_path, content=b"%PDF-1.4 a longer, different statement body")
+        raise RuntimeError("boom after overwrite")
+
+    monkeypatch.setattr(
+        CodeBlock,
+        "execute_user_function_with_timeout",
+        AsyncMock(side_effect=_overwrite_then_raise),
+    )
+
+    block = CodeBlock(
+        label="download_invoice",
+        code="value = 'unused'",
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is False
+    assert "boom after overwrite" in (result.failure_reason or "")
+    save_mock.assert_awaited()
+    output = result.output_parameter_value
+    assert output is not None
+    assert output["downloaded_files"] == [fresh.model_dump()]
+
+
+@pytest.mark.asyncio
+async def test_unrelated_storage_skip_does_not_disarm_the_swallow_verdict(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """A skip on a file the block never touched must not silence the loud verdict for a download
+    the code genuinely swallowed — the abstention is per skipped name, not global (SKY-13782)."""
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+
+    _fake_storage_app(
+        monkeypatch,
+        save=AsyncMock(side_effect=DownloadSaveIncompleteError(["unrelated_leftover.pdf"])),
+        get=AsyncMock(side_effect=[[], []]),
+    )
+    _wire_block_runtime(monkeypatch)
+
+    async def _download_then_return_none(*args: object, **kwargs: object) -> object:
+        _write_run_download(_isolated_download_path)
+        return None
+
+    monkeypatch.setattr(
+        CodeBlock,
+        "execute_user_function_with_timeout",
+        AsyncMock(side_effect=_download_then_return_none),
+    )
+
+    block = CodeBlock(
+        label="download_invoice",
+        code="value = 'unused'",
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is False
+    assert result.status == BlockStatus.failed
+    assert result.failure_reason == block_module.DOWNLOAD_BINDING_FAILURE_REASON
+    persisted = _persisted_output()
+    assert persisted is not None
+    assert persisted[block_module.UNBOUND_DOWNLOAD_OUTPUT_KEY] is True
+
+
+@pytest.mark.asyncio
+async def test_stale_registration_with_failed_refresh_abstains_loudly(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """When the checksum refresh fails on a same-name overwrite, the file arrives as skipped, so
+    the abstain is logged rather than silently granted by the stale registered name (SKY-13782)."""
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+    _write_run_download(_isolated_download_path)
+
+    stale = FileInfo(
+        url="https://api.example.com/v1/artifacts/a_dl_1/content?artifact_name=invoice.pdf",
+        filename="invoice.pdf",
+        checksum="stale",
+        artifact_id="a_dl_1",
+    )
+    _fake_storage_app(
+        monkeypatch,
+        save=AsyncMock(side_effect=DownloadSaveIncompleteError(["invoice.pdf"])),
+        get=AsyncMock(side_effect=[[stale], [stale]]),
+    )
+    _wire_block_runtime(monkeypatch)
+
+    async def _overwrite_then_return(*args: object, **kwargs: object) -> object:
+        _write_run_download(_isolated_download_path, content=b"%PDF-1.4 a longer, different statement body")
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        CodeBlock,
+        "execute_user_function_with_timeout",
+        AsyncMock(side_effect=_overwrite_then_return),
+    )
+
+    block = CodeBlock(
+        label="download_invoice",
+        code="value = 'unused'",
+        output_parameter=_output_parameter("code_out"),
+    )
+    with capture_logs() as logs:
+        result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is True
+    assert result.failure_reason != block_module.DOWNLOAD_BINDING_FAILURE_REASON
+    skipped = [log for log in logs if log.get("event") == "codeblock.download_binding_verdict_skipped"]
+    assert skipped
+    assert skipped[0]["reason"] == "registration_incomplete"
 
 
 def test_none_valued_registration_fields_are_schema_not_claims() -> None:
@@ -1212,7 +1557,7 @@ async def test_secure_backstop_runs_when_the_directory_snapshot_is_unreadable(
     _fake_storage_app(monkeypatch, save=save_mock, get=AsyncMock(return_value=[earlier]))
     _wire_block_runtime(monkeypatch)
     _wire_secure_runner(monkeypatch, output={"status": "ok"})
-    monkeypatch.setattr(block_module, "local_download_dir_file_names", lambda download_run_id: None)
+    monkeypatch.setattr(block_module, "local_download_dir_file_identities", lambda download_run_id: None)
 
     block = CodeBlock(
         label="download_invoice",

@@ -45,6 +45,7 @@ def test_the_daemon_is_launched_detached_from_the_agent_that_spawned_it(
 def test_a_spawn_storm_collapses_to_a_single_launch(monkeypatch: pytest.MonkeyPatch, state_home: Path) -> None:
     popen = MagicMock()
     monkeypatch.setattr(daemon_module.subprocess, "Popen", popen)
+    monkeypatch.setattr(daemon_module.time, "time", lambda: 1_000.0)
 
     results = [spawn_daemon(19777) for _ in range(12)]
 
