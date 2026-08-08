@@ -829,7 +829,7 @@ def navigate(
             cli_state.frame_name = None
             cli_state.frame_index = None
             save_state(cli_state)
-        return {"url": result.url, "title": result.title}
+        return {"url": result.url, "title": result.title, "load_state": result.load_state}
 
     try:
         data = asyncio.run(_run())
