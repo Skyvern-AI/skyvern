@@ -312,22 +312,7 @@ def _request_pairing_nonce(port: int, token: str) -> str:
 
 
 def _open_pairing_url(url: str) -> bool:
-    command: list[str] | None = None
-    if sys.platform == "darwin":
-        executable = shutil.which("open")
-        if executable:
-            command = [executable, url]
-    elif sys.platform.startswith("linux"):
-        executable = shutil.which("xdg-open")
-        if executable:
-            command = [executable, url]
-    if command is None:
-        return False
-    try:
-        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except (OSError, subprocess.CalledProcessError):
-        return False
-    return True
+    return BrowserExtensionRuntime.open_extension_url(url)
 
 
 def _launch_extension_pairing(port: int) -> None:
@@ -844,7 +829,7 @@ def navigate(
             cli_state.frame_name = None
             cli_state.frame_index = None
             save_state(cli_state)
-        return {"url": result.url, "title": result.title}
+        return {"url": result.url, "title": result.title, "load_state": result.load_state}
 
     try:
         data = asyncio.run(_run())
