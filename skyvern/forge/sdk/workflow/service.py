@@ -7504,6 +7504,16 @@ class WorkflowService:
             workflow_tags=workflow_tags,
         )
 
+    def schedule_workflow_saved_hook(self, *, organization_id: str, edited_by: str | None) -> None:
+        task = asyncio.create_task(
+            app.AGENT_FUNCTION.on_workflow_saved(
+                organization_id=organization_id,
+                edited_by=edited_by,
+            ),
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     async def update_workflow_definition(
         self,
         workflow_id: str,
@@ -7535,6 +7545,7 @@ class WorkflowService:
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
         edited_by: str | None | object = _UNSET,
+        notify_workflow_saved: bool = True,
     ) -> Workflow:
         if workflow_definition is not None:
             if organization_id is not None:
@@ -7609,15 +7620,11 @@ class WorkflowService:
                 edited_by=edited_by,
             )
 
-        _edited_by: str | None = cast("str | None", edited_by) if edited_by is not _UNSET else None
-        task = asyncio.create_task(
-            app.AGENT_FUNCTION.on_workflow_saved(
+        if notify_workflow_saved:
+            self.schedule_workflow_saved_hook(
                 organization_id=updated_workflow.organization_id,
-                edited_by=_edited_by,
-            ),
-        )
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+                edited_by=cast("str | None", edited_by) if edited_by is not _UNSET else None,
+            )
 
         return updated_workflow
 
@@ -10597,18 +10604,11 @@ class WorkflowService:
 
         return workflow_definition
 
-    async def create_workflow_from_request(
+    async def resolve_workflow_creation_title(
         self,
-        organization: Organization,
+        organization_id: str,
         request: WorkflowCreateYAMLRequest,
-        workflow_permanent_id: str | None = None,
-        delete_script: bool = True,
-        created_by: str | None = None,
-        edited_by: str | None = None,
-    ) -> Workflow:
-        organization_id = organization.organization_id
-
-        # Generate meaningful title if using default and has blocks
+    ) -> str:
         title = request.title
         if title in DEFAULT_WORKFLOW_TITLES and request.workflow_definition.blocks:
             generated_title = await generate_workflow_title(
@@ -10622,6 +10622,24 @@ class WorkflowService:
                     organization_id=organization_id,
                     generated_title=title,
                 )
+        return title
+
+    async def create_workflow_from_request(
+        self,
+        organization: Organization,
+        request: WorkflowCreateYAMLRequest,
+        workflow_permanent_id: str | None = None,
+        delete_script: bool = True,
+        created_by: str | None = None,
+        edited_by: str | None = None,
+        new_workflow_permanent_id: str | None = None,
+        notify_workflow_saved: bool = True,
+        resolved_title: str | None = None,
+    ) -> Workflow:
+        organization_id = organization.organization_id
+        title = resolved_title
+        if title is None:
+            title = await self.resolve_workflow_creation_title(organization_id, request)
 
         LOG.info(
             "Creating workflow from request",
@@ -10741,6 +10759,8 @@ class WorkflowService:
                     max_elapsed_time_minutes=request.max_elapsed_time_minutes,
                     extra_http_headers=request.extra_http_headers,
                     cdp_connect_headers=new_cdp_connect_headers,
+                    workflow_permanent_id=new_workflow_permanent_id,
+                    version=1 if new_workflow_permanent_id else None,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
                     run_with=request.run_with,
@@ -10779,6 +10799,7 @@ class WorkflowService:
                 description=request.description,
                 workflow_definition=workflow_definition,
                 edited_by=edited_by,
+                notify_workflow_saved=notify_workflow_saved,
             )
 
             await self.maybe_delete_cached_code(
