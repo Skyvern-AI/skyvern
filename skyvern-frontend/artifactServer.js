@@ -1,8 +1,9 @@
 import express from "express";
 import fs from "fs";
 import cors from "cors";
+import { fileURLToPath } from "url";
 
-const app = express();
+export const app = express();
 
 app.use(cors());
 
@@ -41,7 +42,7 @@ app.get("/artifact/recording", (req, res) => {
     "Content-Range": `bytes ${start}-${end}/${videoSize}`,
     "Accept-Ranges": "bytes",
     "Content-Length": contentLength,
-    "Content-Type": "video/mp4",
+    "Content-Type": "video/webm",
   };
   res.writeHead(206, headers);
   const stream = fs.createReadStream(path, {
@@ -86,8 +87,14 @@ app.use((err, req, res, _next) => {
   res.status(500).send("Internal server error");
 });
 
-app.listen(9090, () => {
-  console.log(
-    `[${new Date().toISOString()}] Artifact server running at http://localhost:9090`,
-  );
-});
+export function startArtifactServer(port = 9090) {
+  return app.listen(port, () => {
+    console.log(
+      `[${new Date().toISOString()}] Artifact server running at http://localhost:${port}`,
+    );
+  });
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  startArtifactServer();
+}
