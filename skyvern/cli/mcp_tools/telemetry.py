@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -33,14 +34,23 @@ def _sanitize_client_info_value(value: str) -> str:
 class MCPRuntimeConfig:
     server_mode: MCPServerMode = "embedded"
     transport: str | None = None
+    boot_ready_callback: Callable[[], None] | None = None
 
 
 _runtime_config = MCPRuntimeConfig()
 
 
-def configure_mcp_telemetry_runtime(server_mode: MCPServerMode, transport: str | None) -> None:
+def configure_mcp_telemetry_runtime(
+    server_mode: MCPServerMode,
+    transport: str | None,
+    boot_ready_callback: Callable[[], None] | None = None,
+) -> None:
     global _runtime_config
-    _runtime_config = MCPRuntimeConfig(server_mode=server_mode, transport=transport)
+    _runtime_config = MCPRuntimeConfig(
+        server_mode=server_mode,
+        transport=transport,
+        boot_ready_callback=boot_ready_callback,
+    )
 
 
 def reset_mcp_telemetry_runtime() -> None:
@@ -216,6 +226,9 @@ class MCPTelemetryMiddleware(Middleware):
             _capture_mcp_event("mcp_request", operation="initialize", context=context, ok=False, error=exc)
             raise
 
+        if _runtime_config.boot_ready_callback is not None:
+            with suppress(Exception):
+                _runtime_config.boot_ready_callback()
         with suppress(Exception):
             client_name, client_version = _resolve_client_info(context)
             LOG.info(
