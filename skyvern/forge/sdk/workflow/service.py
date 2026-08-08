@@ -768,6 +768,19 @@ def _require_elapsed_timeout_failure_reason(timeout_failure_reason: str | None) 
     return timeout_failure_reason
 
 
+def run_selection_is_partial(workflow: Workflow, block_labels: list[str] | None) -> bool:
+    """Whether the executed selection left any of the workflow's blocks unrun.
+
+    A selection naming every top-level block runs the whole workflow, so it owes the workflow's
+    declared deliverable even though it was dispatched as a block selection. The finally block is
+    excluded because execute_workflow runs it on its own path, so a full selection never names it."""
+    if not block_labels:
+        return False
+    definition = workflow.workflow_definition
+    definition_labels = {block.label for block in definition.blocks} - {definition.finally_block_label}
+    return not definition_labels.issubset(set(block_labels))
+
+
 def _collect_enterprise_gated_workflow_features(
     workflow: Workflow,
     *,
@@ -3742,6 +3755,7 @@ class WorkflowService:
         browser_session_id: str | None = None,
         need_call_webhook: bool = True,
         workflow_override: Workflow | None = None,
+        requested_completion_contract: dict[str, Any] | None = None,
     ) -> WorkflowRun:
         """Execute a workflow.
 
@@ -4420,7 +4434,8 @@ class WorkflowService:
                         self._finalize_workflow_run_status(
                             workflow_run_id=workflow_run_id,
                             workflow_run=workflow_run,
-                            is_partial_run=bool(block_labels),
+                            is_partial_run=run_selection_is_partial(workflow, block_labels),
+                            requested_completion_contract=requested_completion_contract,
                             pre_finally_status=pre_finally_status,
                             pre_finally_failure_reason=pre_finally_failure_reason,
                             pre_finally_failure_category=pre_finally_failure_category,
@@ -8340,6 +8355,7 @@ class WorkflowService:
         pre_finally_failure_reason: str | None,
         pre_finally_failure_category: list[dict] | None = None,
         is_partial_run: bool = False,
+        requested_completion_contract: dict[str, Any] | None = None,
     ) -> WorkflowRun:
         """
         Set final workflow run status based on pre-finally state.
@@ -8356,7 +8372,11 @@ class WorkflowService:
             WorkflowRunStatus.terminated,
             WorkflowRunStatus.timed_out,
         ):
-            contract_verdict = await self._grade_completion_contract(workflow_run, is_partial_run=is_partial_run)
+            contract_verdict = await self._grade_completion_contract(
+                workflow_run,
+                is_partial_run=is_partial_run,
+                requested_completion_contract=requested_completion_contract,
+            )
             if contract_verdict is not None and not contract_verdict.satisfied:
                 updated = await self._update_workflow_run_status_if_not_final(
                     workflow_run_id=workflow_run_id,
@@ -8415,7 +8435,11 @@ class WorkflowService:
             return 0
 
     async def _grade_completion_contract(
-        self, workflow_run: WorkflowRun, *, is_partial_run: bool = False
+        self,
+        workflow_run: WorkflowRun,
+        *,
+        is_partial_run: bool = False,
+        requested_completion_contract: dict[str, Any] | None = None,
     ) -> ContractVerdict | None:
         """Grade the workflow's declared completion contract, or None when it declares nothing.
 
@@ -8434,6 +8458,10 @@ class WorkflowService:
                 organization_id=workflow_run.organization_id,
             )
             criteria = parse_completion_contract(workflow.workflow_definition if workflow else None)
+            if not criteria and requested_completion_contract is not None:
+                # A copilot test run executes a version the request's obligation has not been
+                # written onto yet — it attaches when the proposal is accepted, after this run.
+                criteria = parse_completion_contract({"completion_contract": requested_completion_contract})
             if not criteria:
                 return None
             context = skyvern_context.current()
