@@ -4,6 +4,7 @@ import { Outlet, useLocation, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 
 import { getClient } from "@/api/AxiosClient";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -17,7 +18,6 @@ import {
 } from "@/components/ui/dialog";
 import { BrowserStream } from "@/components/BrowserStream";
 import { BrowserIcon } from "@/components/icons/BrowserIcon";
-import { LogoMinimized } from "@/components/LogoMinimized";
 import { SwitchBarNavigation } from "@/components/SwitchBarNavigation";
 import { Toaster } from "@/components/ui/toaster";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -43,6 +43,19 @@ import { BrowserSessionStream } from "./BrowserSessionStream";
 import { BrowserSessionTimeline } from "./BrowserSessionTimeline";
 import { BrowserSessionWorkflowRuns } from "./BrowserSessionWorkflowRuns";
 import { getBrowserSessionTabFromPathname } from "./BrowserSession.utils";
+
+// PersistentBrowserSessionStatus values (skyvern/forge/sdk/schemas/persistent_browser_sessions.py)
+const BROWSER_SESSION_STATUS_BADGE_VARIANT: Record<
+  string,
+  "success" | "warning" | "destructive" | "secondary"
+> = {
+  completed: "success",
+  failed: "destructive",
+  timeout: "destructive",
+  running: "warning",
+  retry: "warning",
+  created: "secondary",
+};
 
 function BrowserSession() {
   const { browserSessionId } = useParams();
@@ -97,9 +110,9 @@ function BrowserSession() {
   if (query.isLoading) {
     return (
       <div className="h-screen w-full gap-4 p-6">
-        <div className="flex h-full w-full items-center justify-center">
-          {/* we need nice artwork here */}
-          Loading...
+        <div className="flex h-full w-full items-center justify-center gap-2 text-muted-foreground">
+          <ReloadIcon className="h-4 w-4 animate-spin" />
+          Loading browser session...
         </div>
       </div>
     );
@@ -121,25 +134,20 @@ function BrowserSession() {
       <div className="flex h-full w-full flex-col items-start justify-start gap-2">
         <div className="flex w-full flex-shrink-0 flex-row items-center justify-between rounded-lg border p-4">
           <div className="flex w-full flex-row items-center justify-start gap-2">
-            <LogoMinimized />
             <div className="text-xl">Browser Session</div>
             {activeTab === "stream" && <StreamModeBadge mode={streamMode} />}
             {browserSession && (
               <div className="ml-auto flex flex-col items-end justify-end overflow-hidden">
                 <div className="flex items-center justify-end gap-2">
-                  <span
-                    className={`rounded px-2 py-0.5 text-xs font-medium ${
-                      browserSession.status === "running"
-                        ? "bg-green-500/20 text-green-500"
-                        : browserSession.status === "completed"
-                          ? "bg-blue-500/20 text-blue-500"
-                          : browserSession.status === "failed"
-                            ? "bg-red-500/20 text-red-500"
-                            : "bg-gray-500/20 text-gray-500"
-                    }`}
+                  <Badge
+                    variant={
+                      BROWSER_SESSION_STATUS_BADGE_VARIANT[
+                        browserSession.status
+                      ] ?? "secondary"
+                    }
                   >
                     {browserSession.status}
-                  </span>
+                  </Badge>
                   <div className="max-w-[20rem] truncate font-mono text-xs opacity-75">
                     {browserSession.browser_session_id}
                   </div>
@@ -192,7 +200,7 @@ function BrowserSession() {
               </Button>
               <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
                 <DialogTrigger asChild>
-                  <Button variant="ghost">
+                  <Button variant="destructive">
                     <StopIcon className="mr-2 h-4 w-4" />
                     Stop
                   </Button>
@@ -242,6 +250,7 @@ function BrowserSession() {
                 browserSessionId={browserSessionId}
                 interactive={true}
                 showControlButtons={true}
+                enableUrlInput={true}
               />
             )}
             {!isCdpMode &&

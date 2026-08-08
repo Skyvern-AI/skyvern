@@ -5,6 +5,11 @@ from pathlib import Path
 import pytest
 
 from skyvern.cli import doctor
+from skyvern.cli.credential_placeholders import (
+    CREDENTIAL_PLACEHOLDERS,
+    is_frontend_api_key_placeholder,
+    is_placeholder_credential_value,
+)
 
 
 def _prepare_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -68,3 +73,54 @@ def test_legacy_streamlit_fix_removes_matching_deprecated_file(tmp_path: Path, m
     assert "deprecated compatibility file" in result.detail
     assert doctor._fix_legacy_streamlit_secrets() is True
     assert not legacy.exists()
+
+
+def test_credential_placeholder_set_is_stable() -> None:
+    assert CREDENTIAL_PLACEHOLDERS == ("", "PLACEHOLDER", "YOUR_API_KEY")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", True),
+        ("PLACEHOLDER", True),
+        ("YOUR_API_KEY", True),
+        ("__SKYVERN_API_KEY_PLACEHOLDER__", True),
+        ("__VITE_API_BASE_URL_PLACEHOLDER__", True),
+        ("real-value", False),
+    ],
+)
+def test_placeholder_credential_value_classification(value: str, expected: bool) -> None:
+    assert is_placeholder_credential_value(value) is expected
+
+
+def test_api_key_consistency_treats_frontend_api_key_sentinel_as_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _prepare_workspace(tmp_path, monkeypatch)
+    (tmp_path / ".env").write_text('SKYVERN_API_KEY="backend-key"\n')
+    (tmp_path / "skyvern-frontend" / ".env").write_text("VITE_SKYVERN_API_KEY=YOUR_API_KEY\n")
+
+    result = doctor._check_api_key_consistency()
+
+    assert result.status == "error"
+    assert result.detail == "VITE_SKYVERN_API_KEY not set in frontend .env"
+
+
+def test_api_key_consistency_treats_frontend_api_key_SENTINEL_PLACEHOLDER_as_value_to_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _prepare_workspace(tmp_path, monkeypatch)
+    (tmp_path / ".env").write_text('SKYVERN_API_KEY="backend-key"\n')
+    (tmp_path / "skyvern-frontend" / ".env").write_text("VITE_SKYVERN_API_KEY=PLACEHOLDER\n")
+
+    result = doctor._check_api_key_consistency()
+
+    assert result.status == "error"
+    assert "frontend .env differs from backend" in result.detail
+
+
+def test_frontend_api_key_placeholder_only_filter_is_consistent() -> None:
+    assert is_frontend_api_key_placeholder("YOUR_API_KEY")
+    assert is_frontend_api_key_placeholder("")
+    assert is_frontend_api_key_placeholder("PLACEHOLDER") is False

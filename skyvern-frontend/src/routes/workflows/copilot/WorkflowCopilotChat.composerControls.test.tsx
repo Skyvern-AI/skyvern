@@ -307,7 +307,7 @@ describe("WorkflowCopilotChat — S4 composer, copilot_ux_v1 on", () => {
     expect((button as HTMLButtonElement).disabled).toBe(true);
 
     const cancel = screen.getByRole("button", {
-      name: "Cancel queued message",
+      name: "Edit queued message",
     });
     await act(async () => {
       fireEvent.click(cancel);
@@ -366,7 +366,7 @@ describe("WorkflowCopilotChat — S4 composer, copilot_ux_v1 off (parity)", () =
     ).toBeTruthy();
     expect(screen.queryByText("Queued")).toBeNull();
     expect(
-      screen.queryByRole("button", { name: "Cancel queued message" }),
+      screen.queryByRole("button", { name: "Edit queued message" }),
     ).toBeNull();
   });
 
