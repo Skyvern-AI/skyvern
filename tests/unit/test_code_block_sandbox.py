@@ -836,7 +836,10 @@ async def wrapper({default_args}):
         assert result.output_parameter_value == {"value": "ok"}
 
     async def _execute_against_tabless_session(
-        self, monkeypatch: pytest.MonkeyPatch, open_page_raises: bool = False
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        open_page_raises: bool = False,
+        open_page_error: Exception | None = None,
     ) -> tuple[object, int, int]:
         """Run a block against a session whose context holds zero pages."""
 
@@ -846,15 +849,17 @@ async def wrapper({default_args}):
                 self.open_attempts = 0
                 self.created_pages = 0
 
-            async def get_working_page(self) -> object | None:
-                return None
-
             async def get_or_create_page(self, *args: object, **kwargs: object) -> object:
                 self.open_attempts += 1
+                if open_page_error is not None:
+                    raise open_page_error
                 if open_page_raises:
                     raise RuntimeError("browser is gone")
                 self.created_pages += 1
                 return object()
+
+            async def get_working_page(self) -> object | None:
+                return None
 
         class FakeWorkflowRunContext:
             values: dict[str, object] = {}
@@ -929,6 +934,22 @@ async def wrapper({default_args}):
         assert result.status == BlockStatus.failed
         assert result.failure_reason == f"{CODE_BLOCK_TAB_OPEN_FAILURE_REASON} (RuntimeError)"
         assert result.failure_reason != "No page found to run the code block"
+
+    @pytest.mark.asyncio
+    async def test_execute_reports_the_driver_error_name_when_the_tab_cannot_open(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Playwright surfaces most driver failures as its base Error class, whose .name carries
+        the real error (parse_error sets it); the class name alone would render as just (Error)."""
+        from playwright.async_api import Error as PlaywrightError
+
+        driver_error = PlaywrightError("BrowserContext.new_page: Cannot read properties of undefined")
+        driver_error._name = "TypeError"
+
+        result, _, _ = await self._execute_against_tabless_session(monkeypatch, open_page_error=driver_error)
+
+        assert result.success is False
+        assert result.failure_reason == f"{CODE_BLOCK_TAB_OPEN_FAILURE_REASON} (TypeError)"
 
     def test_poc_blocked_at_is_safe_code_gate(self) -> None:
         """The PoC payload is rejected before exec() is ever called."""

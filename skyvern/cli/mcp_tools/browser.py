@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import mimetypes
 import os
 import re
@@ -21,7 +22,9 @@ from pydantic import Field
 from skyvern.cli.core.action_log import enqueue_action_event
 from skyvern.cli.core.browser_ops import (
     _ALLOWED_EXECUTE_TOOLS,
+    LOCALHOST_RECOVERY_HINT,
     MAX_EXECUTE_STEPS,
+    TYPE_PASSWORD_REFUSAL_MESSAGE,
     CustomSelectClassifyError,
     CustomSelectMatchError,
     CustomSelectOpenError,
@@ -30,6 +33,7 @@ from skyvern.cli.core.browser_ops import (
     ObserveFrameError,
     ToolStepError,
     do_act,
+    do_click_at,
     do_execute,
     do_extract,
     do_find,
@@ -40,6 +44,7 @@ from skyvern.cli.core.browser_ops import (
     do_observe,
     do_screenshot,
     do_select_option,
+    do_type_at,
     parse_extract_schema,
     ref_map_from_elements,
     ref_to_selector,
@@ -61,11 +66,13 @@ from skyvern.cli.core.session_manager import is_stateless_http_mode
 from skyvern.cli.core.trajectory_store import append_trajectory_entry
 from skyvern.config import settings
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
+from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.copilot.typed_value_policy import typed_text_looks_secret
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.schemas.action_log import ActionLogOutcome, project_action_event
 from skyvern.schemas.run_blocks import CredentialType
+from skyvern.utils.url_validators import validate_fetch_url
 
 from ._common import (
     AI_FALLBACK_DESCRIPTION,
@@ -204,6 +211,9 @@ def _record_trajectory_entry(
     typed_text: str | None = None,
     value: str | None = None,
     key: str | None = None,
+    x: float | None = None,
+    y: float | None = None,
+    sdk_equivalent: str | None = None,
 ) -> None:
     try:
         if ctx.mode != "cloud_session" or not ctx.session_id:
@@ -228,6 +238,9 @@ def _record_trajectory_entry(
             "source_url": projected.source_url,
             "value": value,
             "key": key,
+            "x": x,
+            "y": y,
+            "sdk_equivalent": sdk_equivalent,
         }
         if tool_name == "type_text":
             entry["typed_length"] = len(typed_text or "")
@@ -279,6 +292,27 @@ def _blank_to_none(value: str | None) -> str | None:
     """Treat a blank/whitespace string as omitted: MCP clients serialize an omitted optional
     selector/intent as "", and a "" target would route a deterministic action onto nothing."""
     return value if value is None or value.strip() else None
+
+
+def _coordinate_target(x: float | None, y: float | None, selector: str | None) -> str | None:
+    if (x is None) != (y is None):
+        raise GuardError(
+            "x and y must be provided together",
+            "Provide both viewport coordinates, or omit both and use selector or intent",
+        )
+    if x is None or y is None:
+        return None
+    if selector is not None:
+        raise GuardError(
+            "Coordinates x/y are mutually exclusive with selector",
+            "Use either x and y coordinates or selector, not both",
+        )
+    if isinstance(x, bool) or isinstance(y, bool) or not math.isfinite(x) or not math.isfinite(y) or x < 0 or y < 0:
+        raise GuardError(
+            "Coordinates x and y must be finite numbers greater than or equal to 0",
+            "Use non-negative viewport CSS pixel coordinates",
+        )
+    return f"coordinates ({x}, {y})"
 
 
 def _add_timing_prefix(timing_ms: dict[str, int], elapsed_ms: int) -> dict[str, int]:
@@ -456,18 +490,28 @@ async def skyvern_navigate(
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
-    if _must_reject_localhost_url(ctx, url):
+    can_access_localhost = ctx.can_access_localhost is True
+    is_localhost_destination = is_localhost_url(url)
+    allow_localhost = can_access_localhost and is_localhost_destination
+    try:
+        validated_url = await asyncio.to_thread(validate_fetch_url, url)
+    except BlockedHost as e:
+        if allow_localhost:
+            validated_url = url
+        else:
+            hint = LOCALHOST_RECOVERY_HINT if is_localhost_destination else "Use a public HTTP(S) URL"
+            return action_result(
+                "skyvern_navigate",
+                ok=False,
+                browser_context=ctx,
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), hint),
+            )
+    except SkyvernHTTPException as e:
         return action_result(
             "skyvern_navigate",
             ok=False,
             browser_context=ctx,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                "Cloud browsers cannot reach localhost URLs",
-                "Run `pip install skyvern && skyvern browser serve --tunnel` to bridge "
-                "your local dev server to a cloud browser via ngrok. "
-                "Or use `local=true` in skyvern_browser_session_create for a local browser.",
-            ),
+            error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use a valid public HTTP(S) URL"),
         )
 
     # Any navigation attempt may destroy iframes — clear frame state upfront
@@ -478,7 +522,14 @@ async def skyvern_navigate(
 
     with Timer() as timer:
         try:
-            result = await do_navigate(page, url, timeout=timeout, wait_until=wait_until)
+            result = await do_navigate(
+                page,
+                validated_url,
+                timeout=timeout,
+                wait_until=wait_until,
+                can_access_localhost=can_access_localhost,
+                is_localhost_destination=is_localhost_destination,
+            )
             timer.mark("sdk")
         except GuardError as e:
             return action_result(
@@ -503,10 +554,25 @@ async def skyvern_navigate(
             # second bump can invalidate its snapshot of the old document.
             clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
 
+    requested_load_state = wait_until or "load"
+    warnings = (
+        []
+        if result.load_state == requested_load_state
+        else [
+            f"Navigation succeeded but the page never reached '{requested_load_state}'; "
+            f"it settled at '{result.load_state}'. The page is loaded — retrying the navigation will not help."
+        ]
+    )
     return action_result(
         "skyvern_navigate",
         browser_context=ctx,
-        data={"url": result.url, "title": result.title, "sdk_equivalent": f"await page.goto({url!r})"},
+        data={
+            "url": result.url,
+            "title": result.title,
+            "load_state": result.load_state,
+            "sdk_equivalent": f"await page.goto({url!r})",
+        },
+        warnings=warnings,
         timing_ms=timer.timing_ms,
     )
 
@@ -520,6 +586,20 @@ async def skyvern_click(
             "Use standard CSS: 'button.class', 'a[href*=\"pdf\"]', '#id', ':nth-of-type()'."
         ),
     ] = None,
+    x: Annotated[
+        float | None,
+        Field(
+            description=f"{DIRECT_TARGET_DESCRIPTION} Viewport x-coordinate in CSS pixels from the left edge of "
+            "the web content. Provide with y and without selector."
+        ),
+    ] = None,
+    y: Annotated[
+        float | None,
+        Field(
+            description=f"{DIRECT_TARGET_DESCRIPTION} Viewport y-coordinate in CSS pixels from the top edge of "
+            "the web content. Provide with x and without selector."
+        ),
+    ] = None,
     selector_mode: _SelectorMode = "resilient",
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
@@ -531,7 +611,7 @@ async def skyvern_click(
     click_count: Annotated[int | None, Field(description="Number of clicks (2 for double-click)")] = None,
     intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
 ) -> dict[str, Any]:
-    """Click an element using AI intent, CSS/XPath selector, or both.
+    """Click using viewport coordinates, AI intent, CSS/XPath selector, or a selector with intent fallback.
     For text input use skyvern_type. For dropdowns use skyvern_select_option. For multiple actions prefer skyvern_act.
     """
     if button is not None and button not in ("left", "right", "middle"):
@@ -543,17 +623,28 @@ async def skyvern_click(
 
     selector = _blank_to_none(selector)
     intent = _blank_to_none(intent)
-    ai_mode, err = _resolve_ai_mode(selector, intent)
-    if err:
+    try:
+        coordinate_target = _coordinate_target(x, y, selector)
+    except GuardError as e:
         return make_result(
             "skyvern_click",
             ok=False,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                "Must provide intent, selector, or both",
-                "Use intent='describe what to click' for AI-powered clicking, or selector='#css-selector' for precise targeting",
-            ),
+            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
         )
+    if coordinate_target is None:
+        ai_mode, err = _resolve_ai_mode(selector, intent)
+        if err:
+            return make_result(
+                "skyvern_click",
+                ok=False,
+                error=make_error(
+                    ErrorCode.INVALID_INPUT,
+                    "Must provide intent, selector, or both",
+                    "Use intent='describe what to click' for AI-powered clicking, or selector='#css-selector' for precise targeting",
+                ),
+            )
+    else:
+        ai_mode = None
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
@@ -578,25 +669,51 @@ async def skyvern_click(
             if click_count is not None:
                 kwargs["click_count"] = click_count
 
-            if selector is not None and (deterministic or ai_mode is None or ai_mode == "fallback"):
-                native_option_selection = await select_native_option_if_targeted(page, selector, timeout=action_timeout)
-
-            if native_option_selection is not None:
-                resolved = native_option_selection.select_selector
-            elif deterministic:
-                # selector_mode="direct": pin the selector, no overlay-dismiss or AI re-target, so a
-                # missed target fails fast and the agent re-derives it instead of AI scout-scrolling.
-                resolved = await page.click(selector=selector, mode="direct", **kwargs)
-            elif ai_mode is not None:
-                used_ai_path = True
-                resolved = await page.click(selector=selector, prompt=intent, ai=ai_mode, **kwargs)  # type: ignore[arg-type]
+            if coordinate_target is not None:
+                assert x is not None and y is not None
+                await do_click_at(
+                    page,
+                    x,
+                    y,
+                    button=button or "left",
+                    click_count=click_count if click_count is not None else 1,
+                )
+                resolved = coordinate_target
             else:
-                assert selector is not None
-                if isinstance(page, SkyvernPage):
-                    kwargs["_skip_element_prep"] = skip_element_prep
-                resolved = await page.click(selector=selector, **kwargs)
+                if selector is not None and (deterministic or ai_mode is None or ai_mode == "fallback"):
+                    native_option_selection = await select_native_option_if_targeted(
+                        page,
+                        selector,
+                        timeout=action_timeout,
+                    )
+                if native_option_selection is not None:
+                    resolved = native_option_selection.select_selector
+                elif deterministic:
+                    # selector_mode="direct": pin the selector, no overlay-dismiss or AI re-target, so a
+                    # missed target fails fast and the agent re-derives it instead of AI scout-scrolling.
+                    resolved = await page.click(selector=selector, mode="direct", **kwargs)
+                elif ai_mode is not None:
+                    used_ai_path = True
+                    resolved = await page.click(selector=selector, prompt=intent, ai=ai_mode, **kwargs)  # type: ignore[arg-type]
+                else:
+                    assert selector is not None
+                    if isinstance(page, SkyvernPage):
+                        kwargs["_skip_element_prep"] = skip_element_prep
+                    resolved = await page.click(selector=selector, **kwargs)
             timer.mark("sdk")
         except PlaywrightTimeoutError as e:
+            if coordinate_target is not None:
+                return action_result(
+                    "skyvern_click",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.ACTION_FAILED,
+                        str(e),
+                        "Check that the coordinates are within the current viewport",
+                    ),
+                )
             if direct_action and selector is not None:
                 return await _direct_failure_result("skyvern_click", ctx, timer, page, selector, e, action_timeout)
             return action_result(
@@ -627,7 +744,13 @@ async def skyvern_click(
                 ),
             )
 
-    data: dict[str, Any] = {"selector": selector, "intent": intent, "ai_mode": ai_mode}
+    data: dict[str, Any] = {
+        "selector": selector,
+        "intent": intent,
+        "ai_mode": ai_mode,
+    }
+    if coordinate_target is not None:
+        data.update({"x": x, "y": y, "resolved_target": coordinate_target})
     if native_option_selection is not None:
         data["selected_option"] = {
             "select_selector": native_option_selection.select_selector,
@@ -639,13 +762,20 @@ async def skyvern_click(
             data["selected_option"]["value"] = native_option_selection.value
         if native_option_selection.label is not None:
             data["selected_option"]["label"] = native_option_selection.label
-    if resolved and resolved != selector:
+    if coordinate_target is None and resolved and resolved != selector:
         data["resolved_selector"] = resolved
     # Build sdk_equivalent: prefer hybrid selector+prompt for production scripts.
     # resolved_selector already contains the "xpath=" prefix (e.g. "xpath=//button[@id='x']"),
     # so pass it directly as the selector positional arg.
     resolved_sel = resolved if resolved and resolved != selector else selector
-    if native_option_selection is not None:
+    coordinate_sdk_equivalent: str | None = None
+    if coordinate_target is not None:
+        coordinate_sdk_equivalent = (
+            f"await page.mouse.click({x!r}, {y!r}, button={(button or 'left')!r}, "
+            f"click_count={click_count if click_count is not None else 1})"
+        )
+        data["sdk_equivalent"] = coordinate_sdk_equivalent
+    elif native_option_selection is not None:
         if native_option_selection.selected_by == "label":
             data["sdk_equivalent"] = (
                 f"await page.select_option({native_option_selection.select_selector!r}, "
@@ -679,14 +809,25 @@ async def skyvern_click(
                 value=native_option_selection.value,
             )
     elif button in (None, "left") and click_count in (None, 1):
-        replayable_selector = resolved if used_ai_path else resolved or selector
-        if replayable_selector:
+        if coordinate_target is not None:
             _record_trajectory_entry(
                 ctx,
                 tool_name="click",
-                selector=replayable_selector,
+                selector=None,
                 source_url=source_url,
+                x=x,
+                y=y,
+                sdk_equivalent=coordinate_sdk_equivalent,
             )
+        else:
+            replayable_selector = resolved if used_ai_path else resolved or selector
+            if replayable_selector:
+                _record_trajectory_entry(
+                    ctx,
+                    tool_name="click",
+                    selector=replayable_selector,
+                    source_url=source_url,
+                )
     return action_result(
         "skyvern_click",
         browser_context=ctx,
@@ -1097,6 +1238,20 @@ async def skyvern_type(
     selector: Annotated[
         str | None, Field(description=f"{DIRECT_TARGET_DESCRIPTION} CSS selector or XPath for the input element.")
     ] = None,
+    x: Annotated[
+        float | None,
+        Field(
+            description=f"{DIRECT_TARGET_DESCRIPTION} Viewport x-coordinate in CSS pixels from the left edge of "
+            "the web content. Provide with y and without selector."
+        ),
+    ] = None,
+    y: Annotated[
+        float | None,
+        Field(
+            description=f"{DIRECT_TARGET_DESCRIPTION} Viewport y-coordinate in CSS pixels from the top edge of "
+            "the web content. Provide with x and without selector."
+        ),
+    ] = None,
     selector_mode: _SelectorMode = "resilient",
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
@@ -1107,11 +1262,27 @@ async def skyvern_type(
     clear: Annotated[bool, Field(description="Clear existing content before typing")] = True,
     delay: Annotated[int | None, Field(description="Delay between keystrokes in ms")] = None,
     intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
+    clear_first: Annotated[
+        bool | None,
+        Field(description="Clear existing content before coordinate typing; defaults to clear"),
+    ] = None,
+    press_enter: Annotated[bool, Field(description="Press Enter after typing")] = False,
 ) -> dict[str, Any]:
-    """Type text into an input field using AI intent, CSS/XPath selector, or both. Clears field by default (set clear=false to append).
+    """Type using viewport coordinates, AI intent, CSS/XPath selector, or a selector with intent fallback.
+    Clears field by default (set clear=false to append).
     NEVER use for passwords — use skyvern_login instead. For dropdowns use skyvern_select_option.
     """
-    # Block password entry — redirect to skyvern_login
+    selector = _blank_to_none(selector)
+    intent = _blank_to_none(intent)
+    try:
+        coordinate_target = _coordinate_target(x, y, selector)
+    except GuardError as e:
+        return make_result(
+            "skyvern_type",
+            ok=False,
+            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+        )
+
     target_text = f"{intent or ''} {selector or ''}"
     if PASSWORD_PATTERN.search(target_text):
         return make_result(
@@ -1119,31 +1290,37 @@ async def skyvern_type(
             ok=False,
             error=make_error(
                 ErrorCode.INVALID_INPUT,
-                "Cannot type into password fields — credentials must not be passed through tool calls",
+                TYPE_PASSWORD_REFUSAL_MESSAGE,
                 CREDENTIAL_HINT,
             ),
         )
 
-    selector = _blank_to_none(selector)
-    intent = _blank_to_none(intent)
-    ai_mode, err = _resolve_ai_mode(selector, intent)
-    if err:
-        return make_result(
-            "skyvern_type",
-            ok=False,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                "Must provide intent, selector, or both",
-                "Use intent='describe the input field' for AI-powered targeting, or selector='#css-selector' for precise targeting",
-            ),
-        )
+    if coordinate_target is None:
+        ai_mode, err = _resolve_ai_mode(selector, intent)
+        if err:
+            return make_result(
+                "skyvern_type",
+                ok=False,
+                error=make_error(
+                    ErrorCode.INVALID_INPUT,
+                    "Must provide intent, selector, or both",
+                    "Use intent='describe the input field' for AI-powered targeting, or selector='#css-selector' for precise targeting",
+                ),
+            )
+    else:
+        ai_mode = None
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_type", ok=False, error=no_browser_error())
 
-    action_result = _action_result_factory(ctx=ctx, page=page, selector=selector, typed_text=text)
+    action_result = _action_result_factory(
+        ctx=ctx,
+        page=page,
+        selector=selector,
+        typed_text=text,
+    )
     source_url = _trajectory_source_url(page)
 
     # DOM-level guard: check if the target element is a password field
@@ -1164,11 +1341,12 @@ async def skyvern_type(
                 ok=False,
                 error=make_error(
                     ErrorCode.INVALID_INPUT,
-                    "Cannot type into password fields — credentials must not be passed through tool calls",
+                    TYPE_PASSWORD_REFUSAL_MESSAGE,
                     CREDENTIAL_HINT,
                 ),
             )
 
+    clear_content = clear if clear_first is None else clear_first
     deterministic = selector is not None and selector_mode == "direct"
     direct_action = is_direct_action(selector, ai_mode, deterministic=deterministic)
     action_timeout = resolve_action_timeout_ms(timeout, direct_action=direct_action)
@@ -1179,7 +1357,17 @@ async def skyvern_type(
             # selector_mode="direct" pins the selector with no AI fall-back. Resilient (default) and
             # intent-only calls keep AI; emitted scripts keep the selector+prompt fallback via
             # sdk_equivalent for DOM-drift resilience.
-            if clear:
+            if coordinate_target is not None:
+                assert x is not None and y is not None
+                await do_type_at(
+                    page,
+                    x,
+                    y,
+                    text,
+                    clear_first=clear_content,
+                    press_enter=press_enter,
+                )
+            elif clear_content:
                 if deterministic:
                     assert selector is not None
                     await page.fill(selector, text, mode="direct", timeout=action_timeout)
@@ -1205,8 +1393,31 @@ async def skyvern_type(
                     if isinstance(page, SkyvernPage):
                         kwargs["_skip_element_prep"] = skip_element_prep
                     await page.type(selector, text, **kwargs)
+            if coordinate_target is None and press_enter:
+                raw_page = page.page if hasattr(page, "page") else page
+                await raw_page.keyboard.press("Enter")
             timer.mark("sdk")
+        except GuardError as e:
+            return action_result(
+                "skyvern_type",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+            )
         except PlaywrightTimeoutError as e:
+            if coordinate_target is not None:
+                return action_result(
+                    "skyvern_type",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.ACTION_FAILED,
+                        str(e),
+                        "Check that the coordinates are within the current viewport",
+                    ),
+                )
             if direct_action and selector is not None:
                 return await _direct_failure_result(
                     "skyvern_type", ctx, timer, page, selector, e, action_timeout, typed_text=text
@@ -1245,21 +1456,48 @@ async def skyvern_type(
     # Unlike click(), we cannot return resolved_selector here. SKY-7905 will
     # update the SDK to return element metadata from all action methods.
     data: dict[str, Any] = {"selector": selector, "intent": intent, "ai_mode": ai_mode, "text_length": len(text)}
+    if coordinate_target is not None:
+        data.update({"x": x, "y": y, "resolved_target": coordinate_target})
     # Build sdk_equivalent: prefer hybrid selector+prompt for production scripts
-    if selector and intent:
+    coordinate_sdk_equivalent: str | None = None
+    if coordinate_target is not None:
+        clear_snippet = (
+            "await page.keyboard.press('ControlOrMeta+A'); await page.keyboard.press('Backspace'); "
+            if clear_content
+            else ""
+        )
+        enter_snippet = "; await page.keyboard.press('Enter')" if press_enter else ""
+        coordinate_sdk_equivalent = (
+            f"await page.mouse.click({x!r}, {y!r}); {clear_snippet}await page.keyboard.type({text!r}){enter_snippet}"
+        )
+        data["sdk_equivalent"] = coordinate_sdk_equivalent
+    elif selector and intent:
         data["sdk_equivalent"] = f"await page.fill({selector!r}, {text!r}, prompt={intent!r})"
     elif ai_mode:
         data["sdk_equivalent"] = f"await page.fill(prompt={intent!r}, value={text!r})"
     elif selector:
         data["sdk_equivalent"] = f"await page.fill({selector!r}, {text!r})"
-    if clear and selector is not None and (ai_mode is None or deterministic):
-        _record_trajectory_entry(
-            ctx,
-            tool_name="type_text",
-            selector=selector,
-            source_url=source_url,
-            typed_text=text,
-        )
+    replayable_type = coordinate_target is not None or ai_mode is None or deterministic
+    if clear_content and replayable_type:
+        if coordinate_target is not None:
+            _record_trajectory_entry(
+                ctx,
+                tool_name="type_text",
+                selector=None,
+                source_url=source_url,
+                typed_text=text,
+                x=x,
+                y=y,
+                sdk_equivalent=coordinate_sdk_equivalent,
+            )
+        elif selector is not None:
+            _record_trajectory_entry(
+                ctx,
+                tool_name="type_text",
+                selector=selector,
+                source_url=source_url,
+                typed_text=text,
+            )
     return action_result(
         "skyvern_type",
         browser_context=ctx,
@@ -2277,6 +2515,7 @@ async def _run_paired_capture(
     data: dict[str, Any] = {}
     artifacts: list[dict[str, Any]] = []
     sdk_equivalents: list[str] = []
+    warnings: list[str] = []
     error: dict[str, Any] | None = None
     skip_to_screenshot = False
 
@@ -2284,6 +2523,9 @@ async def _run_paired_capture(
         if skip_to_screenshot and operation != "screenshot":
             continue
         operation_result = await operation_functions[operation](**params, session_id=session_id, cdp_url=cdp_url)
+        operation_warnings = operation_result.get("warnings")
+        if isinstance(operation_warnings, list):
+            warnings.extend(item for item in operation_warnings if isinstance(item, str))
         operation_data = operation_result.get("data")
         if isinstance(operation_data, dict) and isinstance(operation_data.get("sdk_equivalent"), str):
             sdk_equivalents.append(operation_data["sdk_equivalent"])
@@ -2319,6 +2561,7 @@ async def _run_paired_capture(
         ok=error is None,
         browser_context=ctx,
         data=data,
+        warnings=warnings,
         error=error,
         timing_ms={"total": int((time.perf_counter() - started_at) * 1000)},
     )
@@ -2623,9 +2866,7 @@ async def skyvern_run_task(
             error=make_error(
                 ErrorCode.INVALID_INPUT,
                 "Cloud browsers cannot reach localhost URLs",
-                "Run `pip install skyvern && skyvern browser serve --tunnel` to bridge "
-                "your local dev server to a cloud browser via ngrok. "
-                "Or use `local=true` in skyvern_browser_session_create for a local browser.",
+                LOCALHOST_RECOVERY_HINT,
             ),
         )
 
@@ -3305,8 +3546,8 @@ _TOOL_NAME_MAP: dict[str, str] = {
 # Accepted user-facing params for each dispatched tool (excludes session_id/cdp_url).
 _TOOL_ACCEPTED_PARAMS: dict[str, frozenset[str]] = {
     "navigate": frozenset({"url", "timeout", "wait_until"}),
-    "click": frozenset({"intent", "selector", "timeout", "click_count", "button"}),
-    "type": frozenset({"text", "intent", "selector", "clear_first", "press_enter", "timeout"}),
+    "click": frozenset({"intent", "selector", "x", "y", "timeout", "click_count", "button"}),
+    "type": frozenset({"text", "intent", "selector", "x", "y", "clear_first", "press_enter", "timeout"}),
     "press_key": frozenset({"key", "intent", "selector", "timeout"}),
     "select_option": frozenset({"value", "intent", "selector", "timeout", "by_label"}),
     "hover": frozenset({"intent", "selector", "timeout"}),

@@ -12,7 +12,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Awaitable, Callable, List, NamedTuple, TypedDict
+from typing import Any, AsyncIterator, Awaitable, Callable, List, NamedTuple, TypedDict, cast
 
 import structlog
 from cachetools import TTLCache
@@ -31,11 +31,13 @@ from skyvern.constants import (
     BROWSER_DOWNLOADING_SUFFIX,
     DROPDOWN_MENU_MAX_DISTANCE,
     SKYVERN_ID_ATTR,
+    TEXT_PRESS_MAX_LENGTH,
 )
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
 from skyvern.errors.errors import TOTPExpiredError, UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     ActionExecutionTimeout,
+    BlockedHost,
     CaptchaSolveError,
     CardNumberInputMismatch,
     EmptySelect,
@@ -48,6 +50,7 @@ from skyvern.exceptions import (
     FailToSelectByIndex,
     FailToSelectByLabel,
     FailToSelectByValue,
+    HttpException,
     IllegitComplete,
     ImaginaryFileUrl,
     ImaginarySecretValue,
@@ -72,14 +75,18 @@ from skyvern.exceptions import (
     PhoneNumberInputMismatch,
     SecretInputMismatch,
     SkyvernException,
+    SkyvernHTTPException,
     SkyvernPageAnalysisTimeout,
+    UnresolvableHost,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
+    GuardedFileFetchHopResult,
     calculate_sha256_for_file,
     check_downloading_files_and_wait_for_download_to_complete,
+    fetch_file_bytes,
     get_download_dir,
     list_files_in_directory,
     make_temp_directory,
@@ -98,6 +105,7 @@ from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
+from skyvern.forge.sdk.core.http_request_authorization import RedirectHopAuthorizer
 from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener, ensure_context
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
@@ -150,21 +158,21 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
+from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_factory import initialize_download_dir, resolve_artifact_path
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
-    DOWNLOAD_DESTINATION_ERRORS,
     DOWNLOAD_MIME_TYPES,
     MAX_FILE_SIZE_BYTES,
     download_filename_from_suffix,
     extract_filename,
-    fetch_download_through_request_context,
     is_download_response,
     normalize_download_filename,
     settle_browser_downloads_for_context,
 )
 from skyvern.webeye.main_world_eval import evaluate_in_main_world
+from skyvern.webeye.navigation import revalidate_redirect_chain
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -949,19 +957,82 @@ async def _close_eager_capture_then_teardown_retention(
                 LOG.debug("Failed to tear down blob URL retention", workflow_run_id=workflow_run_id)
 
 
+@contextlib.asynccontextmanager
+async def _adopted_session_download_binding(
+    download: Download,
+    active_page: Page,
+) -> AsyncIterator[tuple[Any, "RedirectHopAuthorizer[GuardedFileFetchHopResult]"]]:
+    """Lease the exact context binding that owns an adopted-session download."""
+    download_page = download.page
+    if download_page is None:
+        raise RuntimeError("Adopted-session download has no owning page")
+    download_context = download_page.context
+    if download_context is not active_page.context:
+        raise RuntimeError("Adopted-session download page context does not match the active page context")
+
+    try:
+        bind_lock = download_context._skyvern_cdp_download_interceptor_bind_lock  # type: ignore[attr-defined]
+    except AttributeError as exc:
+        raise RuntimeError("Adopted-session download context has no interceptor ownership lock") from exc
+    if not isinstance(bind_lock, asyncio.Lock):
+        raise RuntimeError("Adopted-session download context has an invalid interceptor ownership lock")
+
+    # Narrow exception to the usual explicit-injection rule: bind_to_context already stores the
+    # constructor-injected interceptor on its owned context. Holding its established bind lock
+    # keeps that exact Page -> BrowserContext -> interceptor association live through the fallback.
+    async with bind_lock:
+        try:
+            download_interceptor = download_context._skyvern_cdp_download_interceptor  # type: ignore[attr-defined]
+        except AttributeError as exc:
+            raise RuntimeError(
+                "Adopted-session download recovery requires the page context's CDP download interceptor"
+            ) from exc
+        try:
+            interceptor_context = download_interceptor._page_context
+        except AttributeError as exc:
+            raise RuntimeError("Bound CDP download interceptor has no page-context ownership binding") from exc
+        if interceptor_context is not download_context:
+            raise RuntimeError("Bound CDP download interceptor does not own the adopted-session download page context")
+        try:
+            authorize_request_hop = download_interceptor._redirect_hop_authorizer
+        except AttributeError as exc:
+            raise RuntimeError("Bound CDP download interceptor has no redirect hop authorizer") from exc
+        if not callable(authorize_request_hop):
+            raise RuntimeError("Bound CDP download interceptor has an invalid redirect hop authorizer")
+        yield (
+            download_interceptor,
+            cast(
+                "RedirectHopAuthorizer[GuardedFileFetchHopResult]",
+                authorize_request_hop,
+            ),
+        )
+
+
 async def _save_adopted_session_download(
     download: Download,
     page: Page,
     download_dir: Path,
+    *,
+    authorize_request_hop: "RedirectHopAuthorizer[GuardedFileFetchHopResult]",
+    request_headers: dict[str, str],
     workflow_run_id: str | None = None,
     eager_blob_bytes: bytes | None = None,
+    download_binding: DownloadBinding = DownloadBinding.RUN_DIR,
 ) -> Path | None:
     """Land an adopted-session download's bytes into download_dir, returning the file path or None.
 
-    Eager save_as is the only protection against the worker pod tearing the shared browser down before a
-    deferred save_as runs.
+    A provider-owned remote non-blob event is signal-only and returns None; blob and default behavior
+    are unchanged.
     """
     download_target = _download_target_path(download_dir, download.suggested_filename)
+    if download_binding == DownloadBinding.SESSION_DIR and not download.url.startswith("blob:"):
+        # Signal-only for a provider-owned remote binding: the run connection holds no bytes to save_as
+        # and a URL replay would run through the wrong identity, so defer to the provider destination.
+        LOG.info(
+            "Provider-owned remote download: suppressing local save/replay, deferring to provider destination",
+            workflow_run_id=workflow_run_id,
+        )
+        return None
     # Non-empty bytes captured at download-event time (blob owner still alive) win outright: skip
     # save_as, which returns empty for blobs anyway. A zero-byte eager capture is indistinguishable
     # from an unreadable one and would be a false success, so fall through to save_as + fan-out
@@ -995,9 +1066,8 @@ async def _save_adopted_session_download(
         )
 
     # Ordering: ``save_as`` above has already run and failed (empty or raised).
-    # ``blob:`` URLs cannot be fetched via APIRequestContext (Playwright rejects
-    # the scheme), so route them through an in-page fetch from the document that
-    # owns the blob. That document may be a different tab than the one clicked, so
+    # ``blob:`` URLs cannot be fetched by the guarded HTTP client, so route them
+    # through an in-page fetch from the document that owns the blob. That document may be a different tab, so
     # probe every open page (owner first) rather than reading from ``page`` alone.
     if download.url.startswith("blob:"):
         blob_bytes = await _read_adopted_session_blob_bytes(download, page, workflow_run_id=workflow_run_id)
@@ -1036,16 +1106,12 @@ async def _save_adopted_session_download(
         return download_target
 
     try:
-        response = await fetch_download_through_request_context(page.context.request, download.url)
-        if response.status != 200:
-            LOG.error(
-                "Adopted-session download url re-fetch returned non-200 status",
-                status=response.status,
-                workflow_run_id=workflow_run_id,
-            )
-            return None
-        # APIResponse.body() has no streaming variant, so a large download peaks at 2x its size in RSS.
-        body = await response.body()
+        response = await fetch_file_bytes(
+            download.url,
+            headers=request_headers,
+            authorize_request_hop=authorize_request_hop,
+        )
+        body = response.body
         if not body:
             LOG.error(
                 "Adopted-session download url re-fetch returned an empty body",
@@ -1054,7 +1120,7 @@ async def _save_adopted_session_download(
             return None
         download_target.write_bytes(body)
         return download_target
-    except DOWNLOAD_DESTINATION_ERRORS as e:
+    except (SkyvernHTTPException, HttpException) as e:
         LOG.error(
             "Adopted-session download destination refused",
             download_dir=str(download_dir),
@@ -2408,6 +2474,104 @@ async def _fill_secret_with_readback(
     return ActionFailure(SecretInputMismatch())
 
 
+_TRUNCATION_HEAL_TAGS = frozenset({"input", "textarea"})
+
+
+def _is_prefix_loss_truncation(*, intended: str, rendered: str | None) -> bool:
+    # input_sequentially sets intended[:-TEXT_PRESS_MAX_LENGTH] in one atomic fill, then types the last
+    # TEXT_PRESS_MAX_LENGTH characters individually. A field that resets on the input event can wipe that
+    # leading fill and keep only the per-character tail, so the rendered value is a proper suffix of the
+    # intended text no longer than that tail (SKY-13631). The comparison is case-folded so a field that
+    # transforms case still matches -- which also means a fully-present, only-case-changed value is NOT a
+    # truncation. A longer, equal, or non-suffix value (e.g. an autocomplete expansion) is not a match.
+    if rendered is None:
+        return False
+    intended_cf = intended.casefold()
+    rendered_cf = rendered.casefold()
+    if not rendered_cf or len(rendered_cf) >= len(intended_cf) or len(rendered_cf) > TEXT_PRESS_MAX_LENGTH:
+        return False
+    return intended_cf.endswith(rendered_cf)
+
+
+async def _observe_input_value(
+    *,
+    skyvern_element: SkyvernElement,
+    tag_name: str,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> tuple[bool, str | None]:
+    # Bounded, best-effort read-back for the truncation heal. Re-resolves a stale/re-mounted locator the same
+    # way the neighbouring fill paths do, then caps the read at BROWSER_ACTION_TIMEOUT_MS so a field that
+    # re-mounts on input -- the exact population this heal targets -- cannot stall on Playwright's 30s default
+    # or raise out of an INPUT_TEXT action that already succeeded. Returns (observed, value); observed is
+    # False when the value could not be obtained (stale, timeout, or driver error), and the caller must then
+    # neither heal nor re-fill. Never logs the value.
+    async def _read() -> str | None:
+        await skyvern_element.refresh_locator_if_stale()
+        return await get_input_value(
+            tag_name=tag_name, locator=skyvern_element.get_locator(), engine_selection=engine_selection
+        )
+
+    try:
+        value = await asyncio.wait_for(_read(), timeout=settings.BROWSER_ACTION_TIMEOUT_MS / 1000)
+        return True, value
+    except Exception:
+        LOG.warning(
+            "Free-text truncation read-back could not be obtained; leaving field as typed",
+            element_id=skyvern_element.get_id(),
+            exc_info=True,
+        )
+        return False, None
+
+
+async def _heal_truncated_freetext_input(
+    *,
+    skyvern_element: SkyvernElement,
+    tag_name: str,
+    text: str,
+    is_secret_value: bool = False,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> None:
+    # Generic free-text guard for the fill(prefix)+type(tail) seam: only values longer than the split
+    # boundary can lose a prefix, so shorter values and non-free-text tags are skipped without a read-back.
+    # Secret values are excluded outright -- their exact length must not reach the logs and an unmasked
+    # secret must not be rewritten from this generic path; _fill_secret_with_readback owns that recovery.
+    # On the exact prefix-loss signature, re-enter the value once with a single atomic fill; a matching or
+    # autocomplete-expanded value is left as typed so the normal keystroke/autocomplete behavior is
+    # preserved. Both read-backs are observational only: bounded and best-effort, they never fail or stall an
+    # action that already succeeded, and an unobtainable read-back heals nothing. Logs carry only lengths.
+    if is_secret_value or tag_name not in _TRUNCATION_HEAL_TAGS or len(text) <= TEXT_PRESS_MAX_LENGTH:
+        return
+    observed, rendered = await _observe_input_value(
+        skyvern_element=skyvern_element, tag_name=tag_name, engine_selection=engine_selection
+    )
+    if not observed or not _is_prefix_loss_truncation(intended=text, rendered=rendered):
+        return
+    LOG.warning(
+        "Free-text input lost its leading fill and kept only a trailing suffix; re-entering atomically",
+        element_id=skyvern_element.get_id(),
+        intended_length=len(text),
+        rendered_length=len(rendered or ""),
+    )
+    await skyvern_element.refresh_locator_if_stale()
+    await skyvern_element.input_fill(text=text)
+    # One post-refill read-back for observability only: record whether the single atomic fill produced the
+    # full intended value. No second write and no raised failure -- an unobtainable or non-matching read-back
+    # (a field that legally normalizes a trailing suffix, or resets again) is an explicit residual, not a
+    # claim of a heal. Confirmation requires a full case-folded value match, not merely the absence of the
+    # loss signature, so an empty or unrelated post-refill value is recorded as NON-confirmed. Metadata only.
+    observed_after, confirmed_value = await _observe_input_value(
+        skyvern_element=skyvern_element, tag_name=tag_name, engine_selection=engine_selection
+    )
+    refill_confirmed = observed_after and confirmed_value is not None and confirmed_value.casefold() == text.casefold()
+    LOG.info(
+        "Free-text truncation refill read-back",
+        element_id=skyvern_element.get_id(),
+        intended_length=len(text),
+        rendered_length=len(confirmed_value or ""),
+        refill_confirmed=refill_confirmed,
+    )
+
+
 def _select_option_target_value(option: SelectOption) -> str | None:
     if option.label:
         return option.label
@@ -3401,19 +3565,36 @@ class ActionHandler:
                                 and captured_download is not None
                                 and not download_event_fallback_attempted
                             ):
-                                download_event_fallback_attempted = True
-                                saved_path = await _save_adopted_session_download(
-                                    captured_download,
-                                    page,
-                                    download_dir,
-                                    workflow_run_id=task.workflow_run_id,
-                                    eager_blob_bytes=await eager_blob_capture.result(
-                                        timeout=min(
-                                            EAGER_BLOB_READ_TIMEOUT_SECONDS,
-                                            _remaining_download_wait_seconds(),
-                                        )
-                                    ),
+                                resolved_download_binding = (
+                                    browser_state.browser_artifacts.download_binding
+                                    if browser_state is not None
+                                    else DownloadBinding.RUN_DIR
                                 )
+                                download_event_fallback_attempted = True
+                                eager_blob_bytes = await eager_blob_capture.result(
+                                    timeout=min(
+                                        EAGER_BLOB_READ_TIMEOUT_SECONDS,
+                                        _remaining_download_wait_seconds(),
+                                    )
+                                )
+                                async with _adopted_session_download_binding(captured_download, page) as (
+                                    download_interceptor,
+                                    authorize_request_hop,
+                                ):
+                                    cookie_header = await download_interceptor._cookie_header_for_url(
+                                        captured_download.url
+                                    )
+                                    request_headers = {"Cookie": cookie_header} if cookie_header else {}
+                                    saved_path = await _save_adopted_session_download(
+                                        captured_download,
+                                        page,
+                                        download_dir,
+                                        authorize_request_hop=authorize_request_hop,
+                                        request_headers=request_headers,
+                                        workflow_run_id=task.workflow_run_id,
+                                        eager_blob_bytes=eager_blob_bytes,
+                                        download_binding=resolved_download_binding,
+                                    )
                                 if saved_path is not None:
                                     download_event_fallback_used = True
                                     download_triggered = True
@@ -3424,12 +3605,24 @@ class ActionHandler:
                                         workflow_run_id=task.workflow_run_id,
                                     )
                                     break
-                                download_event_fallback_failed = True
-                                LOG.warning(
-                                    "Adopted-session download could not be saved or re-fetched; falling through to browser-session folder poll",
-                                    download_dir=download_dir,
-                                    workflow_run_id=task.workflow_run_id,
-                                )
+                                if (
+                                    resolved_download_binding == DownloadBinding.SESSION_DIR
+                                    and not captured_download.url.startswith("blob:")
+                                ):
+                                    # Expected signal-only deferral for a provider-owned remote binding: no
+                                    # save_as/replay was attempted, so this is not a failure. Keep polling.
+                                    LOG.info(
+                                        "Provider-owned remote download deferred to provider-destination observation",
+                                        download_dir=download_dir,
+                                        workflow_run_id=task.workflow_run_id,
+                                    )
+                                else:
+                                    download_event_fallback_failed = True
+                                    LOG.warning(
+                                        "Adopted-session download could not be saved or re-fetched; falling through to browser-session folder poll",
+                                        download_dir=download_dir,
+                                        workflow_run_id=task.workflow_run_id,
+                                    )
                                 # Keep polling: the shared browser may still land the file in the session folder.
                                 if await _drain_and_move_staged_xhr(
                                     xhr_fallback_moved_paths, _remaining_download_wait_seconds()
@@ -5238,6 +5431,13 @@ async def handle_input_text_action(
                     await skyvern_element.input_fill(text)
                 else:
                     await skyvern_element.input_sequentially(text=text)
+                    await _heal_truncated_freetext_input(
+                        skyvern_element=skyvern_element,
+                        tag_name=tag_name,
+                        text=text,
+                        is_secret_value=is_secret_value,
+                        engine_selection=engine_selection,
+                    )
                 if log_tel_fallback_readback:
                     await _log_tel_fallback_fill_digit_counts(
                         skyvern_element=skyvern_element,
@@ -5618,7 +5818,7 @@ async def handle_download_file_action(
             # the URL is usally requiring login credentials/cookides, so we should use browser navigation to access the URL instead of downloading the file directly
             validated_url = await asyncio.to_thread(validate_fetch_url, action.download_url)
             try:
-                await page.goto(validated_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+                response = await page.goto(validated_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
             except Exception as e:
                 error = str(e)
                 # some cases use this method to download a file. but it will be redirected away soon
@@ -5626,6 +5826,8 @@ async def handle_download_file_action(
                 # some cases playwright will raise error like "Page.goto: Download is starting"
                 if "net::ERR_ABORTED" not in error and "Page.goto: Download is starting" not in error:
                     raise e
+            else:
+                await revalidate_redirect_chain(response, validate_fetch_url, page.goto)
 
             LOG.info(
                 "DownloadFileAction: Downloaded file from URL",
@@ -6656,7 +6858,8 @@ async def handle_goto_url_action(
     step: Step,
 ) -> list[ActionResult]:
     validated_url = await asyncio.to_thread(validate_fetch_url, action.url)
-    await page.goto(validated_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    response = await page.goto(validated_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    await revalidate_redirect_chain(response, validate_fetch_url, page.goto)
     # Navigation invalidates the current scraped page's element ids; stop the batch so the
     # next step re-scrapes before any later actions run against the new DOM.
     result = ActionSuccess()
@@ -6958,6 +7161,10 @@ def _get_click_count(action: ClickAction | UploadFileAction) -> int:
     return 1
 
 
+def _is_policy_blocked_host(error: Exception) -> bool:
+    return isinstance(error, BlockedHost) and not isinstance(error, UnresolvableHost)
+
+
 async def _locator_click(
     locator: Locator,
     click_count: int,
@@ -7035,6 +7242,8 @@ async def chain_click(
     action_results: list[ActionResult] = []
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
+            if resolved_href := await skyvern_element.resolve_http_href(page):
+                await asyncio.to_thread(validate_fetch_url, resolved_href)
             if click_count == 1:
                 # Route through the active cursor strategy so alternate profiles can
                 # dispatch their own click sequence (explicit mouse.down/up).
@@ -7056,6 +7265,12 @@ async def chain_click(
                 locator=locator,
             )
             action_results = [ActionSuccess()]
+            return action_results
+
+        # The browser resolves through the run proxy and may reach hosts the worker cannot;
+        # worker resolution failure is not a policy signal.
+        if _is_policy_blocked_host(e):
+            action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
             return action_results
 
         action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
@@ -7207,16 +7422,22 @@ async def chain_click(
                     and action.y is None
                     and skyvern_element.get_tag_name() == InteractiveElement.A
                 ):
-                    navigated_href = await skyvern_element.try_navigate_via_href(page=page)
-                    if navigated_href:
-                        LOG.info(
-                            "Chain click: bypassed coordinate fallback via direct href navigation",
-                            action=action,
-                            element=str(skyvern_element),
-                            href=navigated_href,
-                        )
-                        action_results.append(ActionSuccess())
-                        return action_results
+                    try:
+                        navigated_href = await skyvern_element.try_navigate_via_href(page=page)
+                    except BlockedHost as e:
+                        if _is_policy_blocked_host(e):
+                            action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
+                            return action_results
+                    else:
+                        if navigated_href:
+                            LOG.info(
+                                "Chain click: bypassed coordinate fallback via direct href navigation",
+                                action=action,
+                                element=str(skyvern_element),
+                                href=navigated_href,
+                            )
+                            action_results.append(ActionSuccess())
+                            return action_results
             else:
                 # Element is visible and elementFromPoint returns the target itself,
                 # but Playwright's click still failed (e.g. element transiently

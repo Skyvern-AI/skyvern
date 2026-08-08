@@ -29,6 +29,7 @@ from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.services.credentials import is_unresolved_totp_value
 from skyvern.library.ai_locator import AILocator
 from skyvern.services.script_reviewer_v3.redaction import redact_sensitive_value
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.browser_engine import BrowserEngineSelection
@@ -169,6 +170,7 @@ class SkyvernPage(Page):
         return decorator
 
     async def goto(self, url: str, **kwargs: Any) -> None:
+        url = await asyncio.to_thread(validate_fetch_url, url)
         timeout = kwargs.pop("timeout", settings.BROWSER_LOADING_TIMEOUT_MS)
         await self.page.goto(url, timeout=timeout, **kwargs)
 

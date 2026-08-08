@@ -8,7 +8,7 @@ from typing import Literal
 import structlog
 
 from skyvern.constants import PERMANENT_NAV_ERRORS, SKIP_INNER_NAV_RETRY_ERRORS
-from skyvern.exceptions import BlockedNavigationDestination, FailedToNavigateToUrl, InvalidUrl
+from skyvern.exceptions import BlockedHost, BlockedNavigationDestination, FailedToNavigateToUrl, InvalidUrl
 from skyvern.utils.url_validators import canonical_navigation_host, is_blocked_host
 
 LOG = structlog.get_logger()
@@ -30,9 +30,9 @@ def validate_navigation_destination(url: str) -> None:
     """Fail closed unless ``url`` targets a public http(s) destination.
 
     Rejects local-resource schemes (``file://`` and anything other than http/https) and
-    private, loopback, link-local, metadata, or otherwise-internal hosts. Mirrors the
-    boundary enforced on LLM-chosen GOTO_URL/NEW_TAB targets in parse_actions so every
-    navigation entry point that funnels through navigate_with_retry is guarded identically.
+    private, loopback, link-local, metadata, or otherwise-internal hosts, including
+    public-looking names that resolve to internal addresses. Every navigation entry point
+    that funnels through navigate_with_retry is guarded identically.
     The host comes from the browser's WHATWG canonicalization, not stdlib urlparse, so
     numeric-IP and backslash authority tricks that resolve to an internal host are caught.
     """
@@ -44,7 +44,7 @@ def validate_navigation_destination(url: str) -> None:
     except InvalidUrl as error:
         raise BlockedNavigationDestination(url=url, reason="unsupported scheme or malformed url") from error
 
-    if not host or is_blocked_host(host, resolve_dns=False):
+    if not host or is_blocked_host(host, resolve_dns=True):
         raise BlockedNavigationDestination(url=url, reason="internal, loopback, link-local, or metadata host")
 
 
@@ -64,9 +64,32 @@ def _navigation_hop_urls(response: object) -> list[str]:
     return urls
 
 
-def _revalidate_navigation_response(response: object) -> None:
-    for hop_url in _navigation_hop_urls(response):
-        validate_navigation_destination(hop_url)
+async def revalidate_redirect_chain(
+    response: object,
+    validate: Callable[[str], object],
+    reset_page: NavigateFunc | None = None,
+) -> None:
+    """Re-check every hop the browser followed, plus the final destination.
+
+    ``validate`` must raise the exception family the call site already handles.
+    ``BlockedNavigationDestination`` is NOT a ``BlockedHost`` subclass, so passing the wrong
+    validator silently reroutes a blocked hop into the caller's success or fallback branch.
+    A provided ``reset_page`` is used to clear a refused destination without replacing its error.
+    """
+    try:
+        for hop_url in _navigation_hop_urls(response):
+            await asyncio.to_thread(validate, hop_url)
+    except BlockedHost:
+        if reset_page is not None:
+            try:
+                await reset_page("about:blank")
+            except Exception:
+                LOG.exception("Failed to reset page after redirect refusal")
+        raise
+
+
+async def _revalidate_navigation_response(response: object) -> None:
+    await revalidate_redirect_chain(response, validate_navigation_destination)
 
 
 # Progressive wait_until degradation. Degrading to `domcontentloaded` and
@@ -100,7 +123,7 @@ async def navigate_with_retry(
     degradation = _DEGRADATION_MAP.get(wait_until, [wait_until])
 
     # Fail closed before any request is dispatched so a blocked target never reaches the browser.
-    validate_navigation_destination(url)
+    await asyncio.to_thread(validate_navigation_destination, url)
 
     for attempt in range(retry_times):
         strategy = degradation[min(attempt, len(degradation) - 1)]
@@ -110,7 +133,7 @@ async def navigate_with_retry(
             response = await navigate(strategy)
             # Revalidate the followed redirect chain: page.goto follows redirects at the network
             # layer, so a public entry point can still land on an internal host (SKY-13112).
-            _revalidate_navigation_response(response)
+            await _revalidate_navigation_response(response)
             elapsed = time.monotonic() - start_time
             LOG.info("Page loading time", loading_time=elapsed, url=url, wait_until=strategy)
             await settle()

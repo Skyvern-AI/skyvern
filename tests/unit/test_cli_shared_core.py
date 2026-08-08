@@ -6,7 +6,9 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from skyvern.cli.core import browser_ops
 from skyvern.cli.core.browser_ops import do_act, do_extract, do_navigate, do_screenshot, parse_extract_schema
 from skyvern.cli.core.guards import (
     GuardError,
@@ -20,6 +22,11 @@ from skyvern.cli.core.session_ops import do_session_close, do_session_create, do
 from skyvern.client.types.extensions import Extensions
 
 CAPTCHA_SOLVER_EXTENSION: Extensions = "captcha-solver"
+LOCALHOST_RECOVERY_HINT = (
+    "Run `pip install skyvern && skyvern browser serve --tunnel` to bridge "
+    "your local dev server to a cloud browser via ngrok. "
+    "Or use `local=true` in skyvern_browser_session_create for a local browser."
+)
 
 # ---------------------------------------------------------------------------
 # guards.py
@@ -96,28 +103,167 @@ def test_resolve_ai_mode(selector: str | None, intent: str | None, expected: tup
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_do_navigate_success() -> None:
+def _navigable_page(url: str = "https://example.com/final", title: str = "Example") -> MagicMock:
     page = MagicMock()
     page.goto = AsyncMock()
-    page.url = "https://example.com/final"
-    page.title = AsyncMock(return_value="Example")
+    page.wait_for_load_state = AsyncMock()
+    page.url = url
+    page.title = AsyncMock(return_value=title)
+    return page
+
+
+@pytest.mark.asyncio
+async def test_do_navigate_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _navigable_page()
+    monkeypatch.setattr(browser_ops, "validate_fetch_url", lambda url: url)
 
     result = await do_navigate(page, "https://example.com")
+    assert result.url == "https://example.com/final"
+    assert result.title == "Example"
+    assert result.load_state == "load"
+
+
+@pytest.mark.asyncio
+async def test_do_navigate_commits_before_waiting_for_the_requested_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _navigable_page()
+    monkeypatch.setattr(browser_ops, "validate_fetch_url", lambda url: url)
+
+    await do_navigate(page, "https://example.com", wait_until="networkidle")
+
+    page.goto.assert_awaited_once_with("https://example.com", timeout=30000, wait_until="commit")
+    assert page.wait_for_load_state.await_args.args[0] == "networkidle"
+
+
+@pytest.mark.asyncio
+async def test_do_navigate_skips_the_lifecycle_wait_when_commit_is_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _navigable_page()
+    monkeypatch.setattr(browser_ops, "validate_fetch_url", lambda url: url)
+
+    result = await do_navigate(page, "https://example.com", wait_until="commit")
+
+    assert result.load_state == "commit"
+    page.wait_for_load_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_do_navigate_rejects_invalid_wait_until() -> None:
+    page = _navigable_page()
+
+    with pytest.raises(GuardError):
+        await do_navigate(page, "https://example.com", wait_until="badvalue")
+
+    page.goto.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_do_navigate_reports_the_weaker_state_when_load_never_fires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def only_domcontentloaded_fires(state: str, timeout: int) -> None:
+        if state != "domcontentloaded":
+            raise PlaywrightTimeoutError(f"{state} never fired")
+
+    page = _navigable_page()
+    page.wait_for_load_state = AsyncMock(side_effect=only_domcontentloaded_fires)
+    monkeypatch.setattr(browser_ops, "validate_fetch_url", lambda url: url)
+
+    result = await do_navigate(page, "https://example.com")
+
+    assert result.load_state == "domcontentloaded"
     assert result.url == "https://example.com/final"
     assert result.title == "Example"
 
 
 @pytest.mark.asyncio
-async def test_do_navigate_passes_wait_until_through() -> None:
+async def test_do_navigate_reports_commit_when_no_lifecycle_state_arrives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _navigable_page()
+    page.wait_for_load_state = AsyncMock(side_effect=PlaywrightTimeoutError("nothing fired"))
+    monkeypatch.setattr(browser_ops, "validate_fetch_url", lambda url: url)
+
+    result = await do_navigate(page, "https://example.com")
+
+    assert result.load_state == "commit"
+    assert result.url == "https://example.com/final"
+
+
+@pytest.mark.asyncio
+async def test_do_navigate_still_fails_when_the_document_never_commits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _navigable_page()
+    page.goto = AsyncMock(side_effect=PlaywrightTimeoutError("never committed"))
+    monkeypatch.setattr(browser_ops, "validate_fetch_url", lambda url: url)
+
+    with pytest.raises(PlaywrightTimeoutError):
+        await do_navigate(page, "https://example.com")
+
+    page.wait_for_load_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param("http://169.254.169.254/", id="metadata"),
+        pytest.param("http://10.20.30.40/", id="private"),
+        pytest.param("http://127.0.0.2/", id="alternate-loopback"),
+        pytest.param("http://2130706433/", id="integer-loopback"),
+    ],
+)
+async def test_do_navigate_rejects_unsafe_url(url: str) -> None:
     page = MagicMock()
     page.goto = AsyncMock()
-    page.url = "https://example.com/final"
-    page.title = AsyncMock(return_value="Example")
 
-    result = await do_navigate(page, "https://example.com", wait_until="badvalue")
-    assert result.url == "https://example.com/final"
-    page.goto.assert_awaited_once_with("https://example.com", timeout=30000, wait_until="badvalue")
+    with pytest.raises(GuardError):
+        await do_navigate(page, url)
+
+    page.goto.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", ["http://localhost:3000/", "http://127.0.0.1:8000/"])
+async def test_do_navigate_allows_local_url_when_context_permits(url: str) -> None:
+    page = _navigable_page(url=url, title="Local")
+
+    result = await do_navigate(
+        page,
+        url,
+        can_access_localhost=True,
+        is_localhost_destination=True,
+    )
+
+    assert result.url == url
+    page.goto.assert_awaited_once_with(url, timeout=30000, wait_until="commit")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", ["http://169.254.169.254/", "http://10.20.30.40/"])
+async def test_do_navigate_rejects_non_loopback_internal_url_when_context_permits(url: str) -> None:
+    page = MagicMock()
+    page.goto = AsyncMock()
+
+    with pytest.raises(GuardError):
+        await do_navigate(page, url, can_access_localhost=True)
+
+    page.goto.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_do_navigate_rejects_local_url_when_context_does_not_permit() -> None:
+    page = MagicMock()
+    page.goto = AsyncMock()
+
+    with pytest.raises(GuardError) as exc_info:
+        await do_navigate(page, "http://127.0.0.1:8000/", is_localhost_destination=True)
+
+    assert exc_info.value.hint == LOCALHOST_RECOVERY_HINT
+    page.goto.assert_not_awaited()
 
 
 @pytest.mark.asyncio

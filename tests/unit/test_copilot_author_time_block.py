@@ -242,15 +242,15 @@ async def test_banned_block_type_still_blocks(monkeypatch: pytest.MonkeyPatch) -
 
 
 @pytest.mark.asyncio
-async def test_credential_scout_gate_still_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_credential_reference_validation_still_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_persist(monkeypatch)
     ctx = _ctx()
     ctx.scout_trajectory = []
-    monkeypatch.setattr(
-        workflow_update_module,
-        "_credentialed_code_block_scout_gate_errors",
-        lambda *_a, **_k: ["Scout the login form before authoring a credential fill."],
-    )
+
+    async def _unresolved(*_a: object, **_k: object) -> str:
+        return "Credential `cred_missing` was not found in this organization."
+
+    monkeypatch.setattr(workflow_update_module, "_credential_reference_validation_error", _unresolved)
 
     result = await _update_workflow({"workflow_yaml": _CREDENTIAL_LOGIN_YAML}, ctx)
 
@@ -401,7 +401,6 @@ def test_every_loop_plane_refusal_it_can_emit_is_declared() -> None:
     constants themselves, and fails if a rename moves a value out of the declared set.
     """
     carried = {
-        blocker_signal_module.SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
         blocker_signal_module.DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
         run_outcome_module.TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
         blockers_module._POST_BUDGET_CHALLENGE_RESULT_EVIDENCE_REASON,

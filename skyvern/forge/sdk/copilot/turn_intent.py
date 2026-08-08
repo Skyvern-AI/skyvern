@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
+import unicodedata
 from collections.abc import Mapping
 from difflib import SequenceMatcher
 from enum import StrEnum
@@ -12,6 +14,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from skyvern.config import settings
+from skyvern.constants import DEFAULT_WORKFLOW_TITLES
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.copilot.context import StructuredContext, sanitize_global_llm_context_for_prompt
@@ -52,7 +55,10 @@ class TurnIntentMode(StrEnum):
 
 
 _LOW_CONFIDENCE_MUTATION_THRESHOLD = 0.5
-_MUTATING_CLASSIFIER_MODES = frozenset((TurnIntentMode.BUILD, TurnIntentMode.EDIT, TurnIntentMode.DRAFT_ONLY))
+_TITLE_MAX_CHARS = 60
+# Cc/Cf strip control and bidi-override characters; Cs/Co/Cn drop surrogates and unassigned.
+_TITLE_DISALLOWED_UNICODE_CATEGORIES = frozenset(("Cc", "Cf", "Cs", "Co", "Cn"))
+MUTATING_CLASSIFIER_MODES = frozenset((TurnIntentMode.BUILD, TurnIntentMode.EDIT, TurnIntentMode.DRAFT_ONLY))
 _EDIT_SPECIFIC_TARGET_ENTITY_TYPES = frozenset(
     ("block", "run", "proposed_workflow", "latest_assistant_proposal", "proposal", "workflow_change")
 )
@@ -100,6 +106,13 @@ class TurnIntentExpectedOutput(StrEnum):
     REFUSAL = "refusal"
 
 
+class TurnIntentDeliverableKind(StrEnum):
+    REGISTERED_DOWNLOAD = "registered_download"
+
+
+REGISTERED_DOWNLOAD_OUTPUT_PATH = "output.downloaded_files"
+
+
 class TurnIntentReasonCode(StrEnum):
     DEFAULT_UNKNOWN = "default_unknown"
     REQUEST_POLICY_DERIVED = "request_policy_derived"
@@ -121,7 +134,6 @@ class TurnIntentReasonCode(StrEnum):
     TARGET_ENTITY_RESOLVED = "target_entity_resolved"
     MISSING_EDIT_TARGET = "missing_edit_target"
     STRUCTURALLY_INFEASIBLE = "structurally_infeasible"
-    TRANSIENT_CLASSIFIER_FALLBACK = "transient_classifier_fallback"
 
 
 class TurnIntentClassifierFailureKind(StrEnum):
@@ -135,7 +147,6 @@ class TurnIntentClassifierFailureKind(StrEnum):
 
 _DETERMINISTIC_ONLY_REASON_CODES = frozenset(
     {
-        TurnIntentReasonCode.TRANSIENT_CLASSIFIER_FALLBACK,
         TurnIntentReasonCode.AUTHORING_INTENT_DEFER_AUTHORING,
     }
 )
@@ -176,6 +187,7 @@ class TurnIntent(BaseModel):
     required_context: list[RequiredContextKey] = Field(default_factory=list)
     authority: TurnIntentAuthority = Field(default_factory=TurnIntentAuthority)
     expected_output: TurnIntentExpectedOutput = TurnIntentExpectedOutput.EXPLANATION
+    deliverable_kind: TurnIntentDeliverableKind | None = None
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     reason_codes: list[TurnIntentReasonCode] = Field(default_factory=lambda: [TurnIntentReasonCode.DEFAULT_UNKNOWN])
     missing_context_question: str | None = None
@@ -235,6 +247,8 @@ class TurnIntent(BaseModel):
         }
         if self.target_entities:
             data["target_entity_types"] = sorted(self.target_entities)
+        if self.deliverable_kind is not None:
+            data["deliverable_kind"] = self.deliverable_kind.value
         if self.missing_context_question:
             data["has_missing_context_question"] = True
         return data
@@ -251,11 +265,16 @@ class TurnIntentClassification(BaseModel):
 
     mode: TurnIntentMode = TurnIntentMode.UNKNOWN
     expected_output: TurnIntentExpectedOutput | None = None
+    deliverable_kind: TurnIntentDeliverableKind | None = None
     required_context: list[RequiredContextKey] = Field(default_factory=list)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     target_entities: dict[str, list[str]] = Field(default_factory=dict)
+    credential_targets: list[str] = Field(default_factory=list)
     missing_context_question: str | None = None
     reason_codes: list[TurnIntentReasonCode] = Field(default_factory=list)
+    # A naming candidate only; it never carries rename authority. Consumers must
+    # route it through ``sanitize_workflow_title_candidate``.
+    workflow_title: str | None = None
 
     @field_validator("required_context", mode="after")
     @classmethod
@@ -276,6 +295,11 @@ class TurnIntentClassification(BaseModel):
             if str(entity_type).strip()
         }
 
+    @field_validator("credential_targets", mode="after")
+    @classmethod
+    def _dedupe_credential_targets(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(str(target).strip() for target in value if str(target).strip()))
+
     def expected_output_or_default(self) -> TurnIntentExpectedOutput:
         return self.expected_output or _DEFAULT_EXPECTED_OUTPUT_BY_MODE[self.mode]
 
@@ -289,6 +313,8 @@ class TurnIntentClassification(BaseModel):
         }
         if self.target_entities:
             data["target_entity_types"] = sorted(self.target_entities)
+        if self.deliverable_kind is not None:
+            data["deliverable_kind"] = self.deliverable_kind.value
         if self.missing_context_question:
             data["has_missing_context_question"] = True
         return data
@@ -327,6 +353,26 @@ class TurnIntentClassifierResult(BaseModel):
 
 
 _GOAL_MAX_CHARS = 240
+
+
+def sanitize_workflow_title_candidate(value: object) -> str | None:
+    """The single sink every naming candidate passes through, model-produced or derived.
+
+    Rejects the placeholder titles outright: a candidate equal to a default would defeat
+    the value-based "is it still unnamed?" test every caller relies on.
+    """
+    if not isinstance(value, str):
+        return None
+    text = unicodedata.normalize("NFKC", value)
+    text = "".join(char for char in text if unicodedata.category(char) not in _TITLE_DISALLOWED_UNICODE_CATEGORIES)
+    text = redact_raw_secrets_for_prompt(" ".join(text.split()).strip().strip("\"'").strip())
+    if not text or text in DEFAULT_WORKFLOW_TITLES:
+        return None
+    if len(text) > _TITLE_MAX_CHARS:
+        head = text[:_TITLE_MAX_CHARS]
+        cut = head.rsplit(" ", 1)[0] if " " in head else head
+        text = cut.rstrip(" ,.;:-")
+    return text or None
 
 
 def _normalize_user_goal(user_message: str) -> str:
@@ -463,6 +509,15 @@ def _coerce_expected_output(value: object) -> TurnIntentExpectedOutput | None:
         return None
 
 
+def _coerce_deliverable_kind(value: object) -> TurnIntentDeliverableKind | None:
+    if value is None:
+        return None
+    try:
+        return TurnIntentDeliverableKind(str(value))
+    except ValueError:
+        return None
+
+
 def _coerce_required_context(raw: object) -> list[RequiredContextKey]:
     values = _clean_string_list(raw, max_values=len(RequiredContextKey))
     required_context: list[RequiredContextKey] = []
@@ -520,13 +575,16 @@ def _turn_intent_classification_from_raw(raw: object) -> TurnIntentClassificatio
     return TurnIntentClassification(
         mode=mode,
         expected_output=_coerce_expected_output(payload.get("expected_output")),
+        deliverable_kind=_coerce_deliverable_kind(payload.get("deliverable_kind")),
         required_context=_coerce_required_context(payload.get("required_context")),
         confidence=_coerce_confidence(payload.get("confidence")),
         target_entities=_coerce_target_entities(payload.get("target_entities")),
+        credential_targets=_clean_string_list(payload.get("credential_targets")),
         missing_context_question=missing_context_question.strip()
         if isinstance(missing_context_question, str) and missing_context_question.strip()
         else None,
         reason_codes=_coerce_reason_codes(payload.get("reason_codes")),
+        workflow_title=sanitize_workflow_title_candidate(payload.get("workflow_title")),
     )
 
 
@@ -595,6 +653,7 @@ async def classify_turn_intent(
     global_llm_context: str,
     request_policy: RequestPolicy,
     handler: LLMAPIHandler | None,
+    credential_reference_candidates: list[str] | None = None,
 ) -> TurnIntentClassifierResult:
     if not isinstance(user_message, str) or not user_message.strip():
         LOG.info("turn-intent classifier skipped empty user message")
@@ -613,6 +672,7 @@ async def classify_turn_intent(
             expected_output_values=", ".join(output.value for output in TurnIntentExpectedOutput),
             required_context_values=", ".join(key.value for key in RequiredContextKey),
             reason_code_values=", ".join(reason.value for reason in _CLASSIFIER_REASON_CODES),
+            credential_reference_candidates=json.dumps(credential_reference_candidates or []),
             user_message=escape_code_fences(safe_user_message),
             request_policy_summary=escape_code_fences(request_policy.trust_floor_summary()),
             workflow_yaml=escape_code_fences(
@@ -671,6 +731,19 @@ async def classify_turn_intent(
             failure_kind=TurnIntentClassifierFailureKind.MALFORMED_OUTPUT.value,
         )
         return TurnIntentClassifierResult.failure(TurnIntentClassifierFailureKind.MALFORMED_OUTPUT)
+
+    candidate_set = set(credential_reference_candidates or [])
+    credential_targets = list(
+        dict.fromkeys(target for target in classification.credential_targets if target in candidate_set)
+    )
+    target_entities = {
+        key: values for key, values in classification.target_entities.items() if key != "credential" and values
+    }
+    if credential_targets:
+        target_entities["credential"] = credential_targets
+    classification = classification.model_copy(
+        update={"credential_targets": credential_targets, "target_entities": target_entities}
+    )
 
     with copilot_span("turn_intent_classifier", data=classification.to_trace_data()):
         LOG.info("turn-intent classifier decision", **classification.to_trace_data())
@@ -792,9 +865,6 @@ def build_turn_intent(
         target_entities["workflow"] = workflow_targets or ["current_workflow"]
     if workflow_run_id:
         target_entities["run"] = [workflow_run_id]
-    if request_policy.credential_refs:
-        target_entities["credential"] = list(request_policy.credential_refs)
-
     if has_workflow:
         required_context.append(RequiredContextKey.CURRENT_WORKFLOW)
         reason_codes.append(TurnIntentReasonCode.WORKFLOW_CONTEXT_PRESENT)
@@ -903,7 +973,7 @@ def build_turn_intent(
 
     if (
         classification is not None
-        and mode in _MUTATING_CLASSIFIER_MODES
+        and mode in MUTATING_CLASSIFIER_MODES
         and confidence < _LOW_CONFIDENCE_MUTATION_THRESHOLD
     ):
         mode = TurnIntentMode.CLARIFY
@@ -921,24 +991,7 @@ def build_turn_intent(
     if _user_signals_non_progress(user_message, chat_history):
         reason_codes.append(TurnIntentReasonCode.USER_NON_PROGRESS)
 
-    has_request_policy_update_or_run_authority = authority.may_update_workflow or authority.may_run_blocks
-    suppress_prior_run_recovery = (
-        mode == TurnIntentMode.UNKNOWN
-        and has_prior_run_signal
-        and classifier_result is not None
-        and classifier_result.is_transient_failure
-        and has_request_policy_update_or_run_authority
-    )
-    if suppress_prior_run_recovery:
-        mode = TurnIntentMode.BUILD
-        expected_output = (
-            TurnIntentExpectedOutput.WORKFLOW_UPDATE
-            if has_workflow or has_prior_context or workflow_id or workflow_permanent_id
-            else TurnIntentExpectedOutput.WORKFLOW_DRAFT
-        )
-        confidence = max(confidence, 0.6)
-        reason_codes.append(TurnIntentReasonCode.TRANSIENT_CLASSIFIER_FALLBACK)
-    elif mode == TurnIntentMode.UNKNOWN and has_prior_run_signal:
+    if mode == TurnIntentMode.UNKNOWN and has_prior_run_signal:
         mode = TurnIntentMode.DIAGNOSE
         expected_output = TurnIntentExpectedOutput.RUN_RESULT
         reason_codes.append(TurnIntentReasonCode.RECOVERY_FROM_RUN_CONTEXT)
@@ -963,20 +1016,29 @@ def build_turn_intent(
         authority.may_run_blocks = False
         authority.requires_user_input = True
     elif mode == TurnIntentMode.DIAGNOSE:
-        authority.may_update_workflow = False
-        retest_mandated = (
-            request_policy.testing_intent == "require_test"
-            and request_policy.allow_run_blocks
-            and classification is not None
-            and classification.mode == TurnIntentMode.DIAGNOSE
+        classifier_chose_diagnose = classification is not None and classification.mode == TurnIntentMode.DIAGNOSE
+        # An affirmative, confident diagnose classification says which context the turn needs; it does not
+        # withdraw the authority RequestPolicy granted. Authority is still withheld on the routes that never
+        # asserted the user wants a repair: a declared diagnose-first turn (fix_origin), a DIAGNOSE reached
+        # by recovery from UNKNOWN or a classifier failure, and a low-confidence guess — which must not
+        # out-rank an equally unsure edit, downgraded to CLARIFY above.
+        diagnose_earns_authority = (
+            classifier_chose_diagnose and not fix_origin and confidence >= _LOW_CONFIDENCE_MUTATION_THRESHOLD
         )
-        if retest_mandated:
-            # RequestPolicy owns testing policy; an explicit require_test re-run must not be inverted
-            # by the diagnose classification.
-            authority.may_run_blocks = True
-            reason_codes.append(TurnIntentReasonCode.TESTING_INTENT_RUN_OVERRIDES_DIAGNOSE)
-        else:
-            authority.may_run_blocks = False
+        if not diagnose_earns_authority:
+            authority.may_update_workflow = False
+            retest_mandated = (
+                request_policy.testing_intent == "require_test"
+                and request_policy.allow_run_blocks
+                and classifier_chose_diagnose
+            )
+            if retest_mandated:
+                # RequestPolicy owns testing policy; an explicit require_test re-run must not be inverted
+                # by the diagnose classification.
+                authority.may_run_blocks = True
+                reason_codes.append(TurnIntentReasonCode.TESTING_INTENT_RUN_OVERRIDES_DIAGNOSE)
+            else:
+                authority.may_run_blocks = False
         if RequiredContextKey.LATEST_RUN_RESULT not in required_context:
             required_context.append(RequiredContextKey.LATEST_RUN_RESULT)
 
@@ -989,6 +1051,14 @@ def build_turn_intent(
         required_context=required_context,
         authority=authority,
         expected_output=expected_output,
+        deliverable_kind=(
+            classification.deliverable_kind
+            if classification is not None
+            and classification.mode in MUTATING_CLASSIFIER_MODES
+            and mode in MUTATING_CLASSIFIER_MODES
+            and authority.may_update_workflow
+            else None
+        ),
         confidence=confidence,
         reason_codes=reason_codes,
         missing_context_question=missing_context_question,
@@ -1000,3 +1070,18 @@ def turn_intent_defers_authoring_live_fill(turn_intent: TurnIntent | None) -> bo
         isinstance(turn_intent, TurnIntent)
         and TurnIntentReasonCode.AUTHORING_INTENT_DEFER_AUTHORING in turn_intent.reason_codes
     )
+
+
+def turn_intent_declares_registered_download(turn_intent: TurnIntent | None) -> bool:
+    return (
+        isinstance(turn_intent, TurnIntent)
+        and turn_intent.mode in MUTATING_CLASSIFIER_MODES
+        and turn_intent.authority.may_update_workflow
+        and turn_intent.deliverable_kind is TurnIntentDeliverableKind.REGISTERED_DOWNLOAD
+    )
+
+
+def turn_intent_authorizes_registered_download(turn_intent: TurnIntent | None) -> bool:
+    if not isinstance(turn_intent, TurnIntent) or not turn_intent_declares_registered_download(turn_intent):
+        return False
+    return bool(turn_intent.authority.may_run_blocks)

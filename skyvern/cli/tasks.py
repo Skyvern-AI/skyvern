@@ -8,7 +8,7 @@ import os
 import typer
 from rich.panel import Panel
 
-from skyvern._cli_bootstrap import prepare_cli_runtime
+from skyvern._cli_bootstrap import CLOUD_URL_OPT_IN_MESSAGE, prepare_cli_runtime
 from skyvern.client import Skyvern
 from skyvern.utils.env_paths import EnvIntent
 
@@ -33,17 +33,14 @@ def tasks_callback(
     ctx.obj["api_key"] = api_key
 
 
-def _get_client(api_key: str | None = None) -> Skyvern:
+def _get_client(api_key: str | None = None, *, action: str = "", json_mode: bool = False) -> Skyvern:
     """Instantiate a Skyvern SDK client using environment variables."""
     prepare_cli_runtime(intent=EnvIntent.CLOUD)
     from skyvern.config import settings  # noqa: PLC0415
 
     key = api_key or os.getenv("SKYVERN_API_KEY") or settings.SKYVERN_API_KEY
     if key != "PLACEHOLDER" and not settings.is_skyvern_base_url_explicitly_configured:
-        raise typer.BadParameter(
-            "Refusing to send an API key to the default production URL. "
-            "Set SKYVERN_BASE_URL=https://api.skyvern.com to explicitly opt in."
-        )
+        output_error(CLOUD_URL_OPT_IN_MESSAGE, action=action, json_mode=json_mode)
     return Skyvern(base_url=settings.SKYVERN_BASE_URL, api_key=key)
 
 
@@ -70,7 +67,7 @@ def list_tasks(
       skyvern tasks list --workflow-run-id wr_abc123
       skyvern tasks list --workflow-run-id wr_abc123 --json
     """
-    client = _get_client(ctx.obj.get("api_key") if ctx.obj else None)
+    client = _get_client(ctx.obj.get("api_key") if ctx.obj else None, action="tasks.list", json_mode=json_output)
     try:
         tasks = _list_workflow_tasks(client, workflow_run_id)
     except Exception as e:

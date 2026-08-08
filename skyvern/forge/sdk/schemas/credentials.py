@@ -216,6 +216,10 @@ class CredentialItem(BaseModel):
     credential: PasswordCredential | CreditCardCredential | SecretCredential = Field(
         ..., description="The actual credential data"
     )
+    login_uris: list[str] = Field(
+        default_factory=list,
+        description="Sites the vault item itself names, as saved by the user who stored it",
+    )
 
 
 class CreateCredentialRequest(BaseModel):
@@ -251,6 +255,10 @@ class CreateCredentialRequest(BaseModel):
         description="Optional plain browser profile to link as this credential's saved profile. Must be "
         "an unmanaged profile in your organization that no other credential already owns.",
     )
+    auto_profile_disabled: bool = Field(
+        default=False,
+        description="Disable automatic saving and reuse of this credential's browser profile.",
+    )
     pin_saved_session_ip: bool = Field(
         default=False,
         description="Keep the same IP across sign-ins that reuse this credential's saved profile.",
@@ -282,6 +290,10 @@ class CredentialResponse(BaseModel):
         description="Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom')",
     )
     browser_profile_id: str | None = Field(default=None, description="Browser profile ID linked to this credential")
+    auto_profile_disabled: bool | None = Field(
+        default=None,
+        description="Whether automatic saving and reuse of this credential's browser profile is disabled.",
+    )
     pin_saved_session_ip: bool = Field(
         default=False,
         description="Whether sign-ins reusing this credential's saved profile keep the same IP",
@@ -382,6 +394,10 @@ class Credential(BaseModel):
     card_brand: str | None = Field(..., description="For credit_card credentials: the card brand")
     secret_label: str | None = Field(default=None, description="For secret credentials: optional label")
     browser_profile_id: str | None = Field(default=None, description="Browser profile ID linked to this credential")
+    auto_profile_disabled: bool | None = Field(
+        default=None,
+        description="Whether automatic saving and reuse of this credential's browser profile is disabled.",
+    )
     pin_saved_session_ip: bool = Field(
         default=False,
         description="Whether sign-ins reusing this credential's saved profile keep the same IP",
@@ -424,6 +440,11 @@ class Credential(BaseModel):
         return validate_proxy_session_id(value)
 
 
+def credential_auto_profile_disabled(credential: Credential) -> bool:
+    """Opt-out is explicit-True only; False and legacy NULL keep automatic behavior."""
+    return credential.auto_profile_disabled is True
+
+
 class UpdateCredentialRequest(BaseModel):
     """Request model for updating credential metadata."""
 
@@ -446,6 +467,10 @@ class UpdateCredentialRequest(BaseModel):
     save_browser_session_intent: bool | None = Field(
         default=None,
         description="Whether the user intends to save a browser session, regardless of test outcome",
+    )
+    auto_profile_disabled: bool | None = Field(
+        default=None,
+        description="Disable automatic saving and reuse of this credential's browser profile.",
     )
     run_sequentially: bool | None = Field(
         default=None,

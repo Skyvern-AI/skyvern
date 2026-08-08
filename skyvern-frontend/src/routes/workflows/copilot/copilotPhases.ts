@@ -12,6 +12,7 @@ import {
   TurnNarrativeState,
   condenseActivityEntries,
   formatElapsed,
+  isInterimOutcome,
   latestBlocksByLabel,
   parseUtcIsoMs,
   toolCallIdOf,
@@ -248,11 +249,14 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
           : chainActive;
 
   const isTerminal = turn.terminal !== null;
-  const isError = turn.terminal === "error";
   const isCancelled = turn.cancelled === true;
+  // A cancelled turn also lands on terminal "error" — that error is the stop
+  // itself, so it must not paint the rail red.
+  const isError = turn.terminal === "error" && !isCancelled;
   const anyFailed = latestBlocks.some((b) => b.state === "failed");
+  const anyStopped = latestBlocks.some((b) => b.state === "stopped");
   const anyNotDemonstrated = latestBlocks.some(
-    (b) => b.outcome === "not_demonstrated",
+    (b) => b.outcome === "not_demonstrated" && !isInterimOutcome(b.outcomeRole),
   );
 
   function reached(id: CopilotPhaseId): boolean {
@@ -271,6 +275,11 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
     // phase is still the live-active row (a block is still running/queued).
     if (id === "test" && testReached && anyFailed && id !== liveActive) {
       return "fail";
+    }
+    // A stopped block halted the test without failing it, so the rail must not
+    // fall through to "done" and claim the run finished.
+    if (id === "test" && testReached && anyStopped && id !== liveActive) {
+      return "stopped";
     }
     if (!isTerminal) {
       return id === liveActive ? "active" : reached(id) ? "done" : "pending";

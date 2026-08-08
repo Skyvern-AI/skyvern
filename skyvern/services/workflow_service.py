@@ -11,9 +11,16 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.workflow.exceptions import InvalidTemplateWorkflowPermanentId
 from skyvern.forge.sdk.workflow.models.tags import TagWriteContext
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun
-from skyvern.schemas.runs import RunStatus, RunType, WorkflowRunRequest, WorkflowRunResponse
+from skyvern.schemas.runs import (
+    BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY,
+    RunStatus,
+    RunType,
+    WorkflowRunRequest,
+    WorkflowRunResponse,
+)
 
 LOG = structlog.get_logger(__name__)
+_SERVER_ASSIGNED_BROWSER_ADDRESS_CONTEXT = {BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY: True}
 
 
 def workflow_request_body_from_existing_run(
@@ -21,35 +28,38 @@ def workflow_request_body_from_existing_run(
     parameters: dict[str, t.Any] | None = None,
     run_metadata: dict[str, str] | None = None,
 ) -> WorkflowRequestBody:
-    return WorkflowRequestBody(
-        data=parameters,
-        proxy_location=workflow_run.proxy_location,
-        webhook_callback_url=workflow_run.webhook_callback_url,
-        totp_verification_url=workflow_run.totp_verification_url,
-        totp_identifier=workflow_run.totp_identifier,
-        # A fresh run created under FORCE_BROWSER_SESSION carries a generated PBS on browser_session_id;
-        # replaying it into the retry alongside start_fresh_browser trips the mutually-exclusive validator.
-        # Fresh intent wins — omit the session id so the retry re-resolves a fresh browser.
-        browser_session_id=(None if workflow_run.start_fresh_browser else workflow_run.browser_session_id),
-        # A retry re-resolves the seed instead of pinning a runtime-stamped profile (the old bug: a
-        # credential/own-memory profile stamped at setup would ride into the retry as a fake override,
-        # suppressing re-resolution and write-back). Only a genuine per-run override propagates. Legacy
-        # rows (seed source unknown) keep today's propagate behavior so pre-S retries don't regress.
-        browser_profile_id=(
-            workflow_run.browser_profile_id
-            if workflow_run.browser_seed_source in (None, BrowserSeedSource.override)
-            else None
-        ),
-        # The original request's fresh-browser intent propagates to the retry (re-resolves fresh).
-        start_fresh_browser=bool(workflow_run.start_fresh_browser),
-        max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
-        max_elapsed_time_minutes=workflow_run.max_elapsed_time_minutes,
-        extra_http_headers=workflow_run.extra_http_headers,
-        cdp_connect_headers=workflow_run.cdp_connect_headers,
-        browser_address=workflow_run.browser_address,
-        run_with=workflow_run.run_with,
-        ai_fallback=workflow_run.ai_fallback,
-        run_metadata=run_metadata,
+    return WorkflowRequestBody.model_validate(
+        {
+            "data": parameters,
+            "proxy_location": workflow_run.proxy_location,
+            "webhook_callback_url": workflow_run.webhook_callback_url,
+            "totp_verification_url": workflow_run.totp_verification_url,
+            "totp_identifier": workflow_run.totp_identifier,
+            # A fresh run created under FORCE_BROWSER_SESSION carries a generated PBS on browser_session_id;
+            # replaying it into the retry alongside start_fresh_browser trips the mutually-exclusive validator.
+            # Fresh intent wins — omit the session id so the retry re-resolves a fresh browser.
+            "browser_session_id": None if workflow_run.start_fresh_browser else workflow_run.browser_session_id,
+            # A retry re-resolves the seed instead of pinning a runtime-stamped profile (the old bug: a
+            # credential/own-memory profile stamped at setup would ride into the retry as a fake override,
+            # suppressing re-resolution and write-back). Only a genuine per-run override propagates. Legacy
+            # rows (seed source unknown) keep today's propagate behavior so pre-S retries don't regress.
+            "browser_profile_id": (
+                workflow_run.browser_profile_id
+                if workflow_run.browser_seed_source in (None, BrowserSeedSource.override)
+                else None
+            ),
+            # The original request's fresh-browser intent propagates to the retry (re-resolves fresh).
+            "start_fresh_browser": bool(workflow_run.start_fresh_browser),
+            "max_screenshot_scrolls": workflow_run.max_screenshot_scrolls,
+            "max_elapsed_time_minutes": workflow_run.max_elapsed_time_minutes,
+            "extra_http_headers": workflow_run.extra_http_headers,
+            "cdp_connect_headers": workflow_run.cdp_connect_headers,
+            "browser_address": workflow_run.browser_address,
+            "run_with": workflow_run.run_with,
+            "ai_fallback": workflow_run.ai_fallback,
+            "run_metadata": run_metadata,
+        },
+        context=_SERVER_ASSIGNED_BROWSER_ADDRESS_CONTEXT,
     )
 
 
@@ -191,7 +201,7 @@ async def run_workflow(
 
 
 async def get_workflow_run_response(
-    workflow_run_id: str, organization_id: str | None = None
+    workflow_run_id: str, organization_id: str | None = None, cap_output_values: bool = False
 ) -> WorkflowRunResponse | None:
     workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id, organization_id=organization_id)
     if not workflow_run:
@@ -200,6 +210,7 @@ async def get_workflow_run_response(
         workflow_run_id=workflow_run.workflow_run_id,
         organization_id=organization_id,
         include_step_count=True,
+        cap_output_values=cap_output_values,
     )
     app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}"
     # A fresh run reads/writes no saved memory; its run_request echoes start_fresh_browser and drops the
@@ -229,19 +240,22 @@ async def get_workflow_run_response(
         max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
         script_run=workflow_run.script_run,
         script_id=workflow_run.script_run.script_id if workflow_run.script_run else None,
-        run_request=WorkflowRunRequest(
-            workflow_id=workflow_run.workflow_permanent_id,
-            title=workflow_run_resp.workflow_title,
-            parameters=workflow_run_resp.parameters,
-            proxy_location=workflow_run.proxy_location,
-            webhook_url=workflow_run.webhook_callback_url or None,
-            totp_url=workflow_run.totp_verification_url or None,
-            totp_identifier=workflow_run.totp_identifier,
-            max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
-            browser_address=workflow_run.browser_address,
-            browser_profile_id=None if fresh_browser else workflow_run.browser_profile_id,
-            browser_session_id=None if fresh_browser else workflow_run.browser_session_id,
-            start_fresh_browser=fresh_browser,
+        run_request=WorkflowRunRequest.model_validate(
+            {
+                "workflow_id": workflow_run.workflow_permanent_id,
+                "title": workflow_run_resp.workflow_title,
+                "parameters": workflow_run_resp.parameters,
+                "proxy_location": workflow_run.proxy_location,
+                "webhook_url": workflow_run.webhook_callback_url or None,
+                "totp_url": workflow_run.totp_verification_url or None,
+                "totp_identifier": workflow_run.totp_identifier,
+                "max_screenshot_scrolls": workflow_run.max_screenshot_scrolls,
+                "browser_address": workflow_run.browser_address,
+                "browser_profile_id": None if fresh_browser else workflow_run.browser_profile_id,
+                "browser_session_id": None if fresh_browser else workflow_run.browser_session_id,
+                "start_fresh_browser": fresh_browser,
+            },
+            context=_SERVER_ASSIGNED_BROWSER_ADDRESS_CONTEXT,
         ),
         errors=workflow_run_resp.errors,
         step_count=workflow_run_resp.total_steps,

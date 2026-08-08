@@ -51,6 +51,7 @@ def compact_agent_messages_for_llm(
     summarize_tool_output: Callable[[str], str] | None = None,
     summarize_tool_arguments: Callable[[str], str] | None = None,
     tool_output_truncation_suffix: str = DEFAULT_TRUNCATION_SUFFIX,
+    on_recent_truncation: Callable[[int, int], None] | None = None,
     token_budget: int | None = None,
     estimate_tokens: Callable[[list[Any]], int] | None = None,
     is_synthetic_message: Callable[[Any], bool] | None = None,
@@ -75,6 +76,7 @@ def compact_agent_messages_for_llm(
         summarize_tool_output=summarize_tool_output,
         summarize_tool_arguments=summarize_tool_arguments,
         suffix=tool_output_truncation_suffix,
+        on_recent_truncation=on_recent_truncation,
     )
     if token_budget is None:
         return items
@@ -147,6 +149,7 @@ def _compact_tool_payloads(
     summarize_tool_output: Callable[[str], str] | None,
     summarize_tool_arguments: Callable[[str], str] | None,
     suffix: str,
+    on_recent_truncation: Callable[[int, int], None] | None = None,
 ) -> list[Any]:
     output_indices = [i for i, item in enumerate(items) if _tool_output_field(item) is not None]
     call_indices = [i for i, item in enumerate(items) if get_agent_message_field(item, "type") == "function_call"]
@@ -154,6 +157,8 @@ def _compact_tool_payloads(
     recent_calls = set(call_indices[-keep_recent_tool_outputs:]) if keep_recent_tool_outputs > 0 else set()
 
     compacted: list[Any] = []
+    recent_truncated_count = 0
+    recent_truncated_largest = 0
     for i, item in enumerate(items):
         output_field = _tool_output_field(item)
         if output_field is not None:
@@ -164,6 +169,9 @@ def _compact_tool_payloads(
                     if i in recent_outputs
                     else _summarize_or_truncate(output, summarize_tool_output, max_recent_tool_output_chars, suffix)
                 )
+                if i in recent_outputs and new_output != output:
+                    recent_truncated_count += 1
+                    recent_truncated_largest = max(recent_truncated_largest, len(output))
                 item = replace_agent_message_field(item, output_field, new_output) if new_output != output else item
         elif get_agent_message_field(item, "type") == "function_call" and i not in recent_calls:
             arguments = get_agent_message_field(item, "arguments")
@@ -180,6 +188,8 @@ def _compact_tool_payloads(
                     else item
                 )
         compacted.append(item)
+    if recent_truncated_count and on_recent_truncation is not None:
+        on_recent_truncation(recent_truncated_count, recent_truncated_largest)
     return compacted
 
 

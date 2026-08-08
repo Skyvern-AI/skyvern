@@ -39,6 +39,7 @@ from skyvern.exceptions import (
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time, scroll_into_view_wait
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.dom_inspection import (
@@ -46,6 +47,7 @@ from skyvern.webeye.dom_inspection import (
     read_resolved_anchor_href,
     read_whether_link_or_button,
 )
+from skyvern.webeye.navigation import revalidate_redirect_chain
 from skyvern.webeye.scraper.scraped_page import ScrapedPage, json_to_html
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, trim_element
 from skyvern.webeye.utils.page import SECRET_VISUAL_MASK_SCRIPT, SkyvernFrame
@@ -690,8 +692,8 @@ class SkyvernElement:
         coordinate click would dispatch overlay JS, which can navigate to an
         unintended URL.  Following the href avoids that side effect entirely.
 
-        Returns the resolved URL on success, ``None`` when no safe URL can be
-        derived or when frame navigation raises an unrecoverable error.
+        Returns the resolved URL on success or ``None`` when no HTTP(S) URL can be derived
+        or frame navigation fails. Raises ``SkyvernHTTPException`` for a blocked URL.
         """
         # TODO: share a lower-level href-resolution + goto/download-success
         # helper with ``navigate_to_a_href``.  Keep the entry points separate:
@@ -704,6 +706,8 @@ class SkyvernElement:
         target = await self.get_attr("target", mode="static")
         if target and target.strip().lower() != "_self":
             return None
+
+        resolved = await asyncio.to_thread(validate_fetch_url, resolved)
 
         try:
             frame = self.get_frame()
@@ -723,8 +727,7 @@ class SkyvernElement:
             element_id=self.get_id(),
         )
         try:
-            await frame.goto(resolved, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-            return resolved
+            response = await frame.goto(resolved, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
         except Exception as e:
             error = str(e)
             # Same exceptions ``navigate_to_a_href`` treats as effective
@@ -740,6 +743,11 @@ class SkyvernElement:
                 current_url=page.url,
             )
             return None
+
+        # Outside the except above on purpose: that handler swallows every failure into a
+        # coordinate-click fallback, which would turn a blocked redirect hop into a click.
+        await revalidate_redirect_chain(response, validate_fetch_url, page.goto)
+        return resolved
 
     async def find_blocking_element(
         self, dom: DomUtil, incremental_page: IncrementalScrapePage | None = None
@@ -1463,14 +1471,15 @@ class SkyvernElement:
         if not href:
             return None
 
+        href = await asyncio.to_thread(validate_fetch_url, href)
+
         LOG.info(
             "Trying to navigate to the <a> href link instead of clicking",
             href=href,
             current_url=page.url,
         )
         try:
-            await page.goto(href, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-            return href
+            response = await page.goto(href, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
         except Exception as e:
             # some cases use this method to download a file. but it will be redirected away soon
             # and agent will run into ABORTED error.
@@ -1484,6 +1493,9 @@ class SkyvernElement:
 
             LOG.warning("Failed to navigate to the <a> href link", exc_info=True, href=href, current_url=page.url)
             raise
+
+        await revalidate_redirect_chain(response, validate_fetch_url, page.goto)
+        return href
 
     async def refresh_select_options(self) -> tuple[list, str] | None:
         if self.get_tag_name() != InteractiveElement.SELECT:

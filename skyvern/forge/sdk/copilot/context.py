@@ -20,6 +20,7 @@ from skyvern.forge.sdk.copilot.result_evidence import (
     LoadedResultCompositionEvidence,
     loaded_result_target_structure_signature,
 )
+from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeRole
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -30,7 +31,7 @@ ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
 COPILOT_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
 ProposalDisposition = Literal["no_proposal", "auto_applicable", "review_untested", "review_tested"]
 
-AskSubject = Literal["output_schema", "credentials", "target_url", "disambiguation", "other"]
+AskSubject = Literal["output_schema", "credentials", "target_url", "disambiguation", "deliverable_permission", "other"]
 COPILOT_ASK_SUBJECTS: tuple[AskSubject, ...] = get_args(AskSubject)
 
 
@@ -75,6 +76,7 @@ class NarrativeBlock(TypedDict):
     endedAt: str | None
     outcome: NotRequired[str]
     outcomeReason: NotRequired[str]
+    outcomeRole: NotRequired[RunOutcomeRole]
 
 
 class NarrativeOutcomeAdjudication(TypedDict):
@@ -108,6 +110,9 @@ class TurnNarrativePayload(TypedDict):
     # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ...}, set when a mid-build
     # credential pause (credential_pause.py) resolved during this turn.
     credentialPause: NotRequired[dict[str, str]]
+    # {"credentialId": ..., "name": ...}, set when a credential was bound this turn without an ask
+    # (deterministic auto-bind); the FE renders it as a receipt with a Change affordance.
+    credentialAutoBound: NotRequired[dict[str, str]]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None
@@ -764,10 +769,12 @@ class CopilotContext(AgentContext):
     update_workflow_called: bool = False
     test_after_update_done: bool = False
     post_update_nudge_count: int = 0
-    coverage_nudge_count: int = 0
     format_nudge_count: int = 0
     no_workflow_nudge_count: int = 0
     copilot_total_timeout_exceeded: bool = False
+    copilot_max_turns_exceeded: bool = False
+    model_calls_this_turn: int = 0
+    enforcement_pass_count: int = 0
     user_message: str = ""
     block_goal_main_goal: str = ""
     allow_untested_workflow_draft: bool = False

@@ -56,6 +56,10 @@ class SkyvernException(Exception):
         # so the concrete name stays in logs/monitoring but never reaches end users.
         return type(self).__name__
 
+    @property
+    def message_is_user_facing(self) -> bool:
+        return False
+
 
 class SkyvernPageAnalysisTimeout(SkyvernException):
     pass
@@ -140,6 +144,13 @@ def _is_browser_connection_error(message: str) -> bool:
     return any(pattern in message for pattern in _BROWSER_CONNECTION_PATTERNS)
 
 
+def _is_session_closed_error(message: str) -> bool:
+    # The session router closes with (4410, "session closed") when the session was already closed;
+    # match the reason text, not the bare code — 4410 is reused elsewhere with other reasons.
+    # Message selection only: redaction routing must keep the broad _is_browser_connection_error net.
+    return "session closed" in message.lower()
+
+
 # A raw CDP connect failure (e.g. from playwright.chromium.connect_over_cdp) echoes the
 # endpoint URL, which can carry the remote-browser vendor host, a session-bearing path/query,
 # or credentials embedded as user:pass@host. The devtools socket is always ws/wss, so a ws/wss
@@ -165,6 +176,12 @@ def get_user_facing_exception_message(exception: Exception) -> str:
 
     raw = str(exception)
     if _is_browser_connection_error(raw):
+        if _is_session_closed_error(raw):
+            return (
+                "Failed to connect to the browser session because the session is already closed. "
+                "Start a new browser session to continue. "
+                "If this is unexpected, contact support@skyvern.com."
+            )
         return (
             f"Failed to connect to the browser session. "
             f"This is usually caused by high demand and is transient. {_BROWSER_CONNECTION_GUIDANCE}"
@@ -343,6 +360,12 @@ class MissingBrowserStatePage(SkyvernException):
         task_str = f"task_id={task_id}" if task_id else ""
         workflow_run_str = f"workflow_run_id={workflow_run_id}" if workflow_run_id else ""
         super().__init__(f"Browser state page is missing. {task_str} {workflow_run_str}")
+
+
+class BrowserProfileNotApplied(SkyvernException):
+    def __init__(self, browser_profile_id: str) -> None:
+        self.browser_profile_id = browser_profile_id
+        super().__init__(f"Browser profile {browser_profile_id} was not applied by the created browser")
 
 
 class MissingWorkflowRunBrowserState(SkyvernException):
@@ -630,6 +653,9 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
 
     @staticmethod
     def _get_detail(exception: Exception) -> str:
+        if isinstance(exception, SkyvernException) and exception.message_is_user_facing:
+            return exception.message or "Unexpected browser creation failure."
+
         if isinstance(exception, CdpConnectionConfigurationError):
             return exception.message or str(exception)
 
@@ -1217,6 +1243,10 @@ class BlockedHost(SkyvernHTTPException):
         )
 
 
+class UnresolvableHost(BlockedHost):
+    pass
+
+
 class InvalidWorkflowParameter(SkyvernHTTPException):
     def __init__(self, expected_parameter_type: str, value: str, workflow_permanent_id: str | None = None) -> None:
         message = f"Invalid workflow parameter. Expected parameter type: {expected_parameter_type}. Value: {value}."
@@ -1357,6 +1387,14 @@ class LLMCallerNotFoundError(SkyvernException):
 class BrowserSessionAlreadyOccupiedError(SkyvernHTTPException):
     def __init__(self, browser_session_id: str, runnable_id: str) -> None:
         super().__init__(f"Browser session {browser_session_id} is already occupied by {runnable_id}")
+
+
+class BrowserSessionOwnershipConflict(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(
+            f"Persistent browser session {browser_session_id} is owned by a different runnable",
+            status_code=HTTPStatus.CONFLICT,
+        )
 
 
 class BrowserSessionNotRenewable(SkyvernException):

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from skyvern.forge.agent_functions import CopilotEntrypointCandidate, CopilotSiteOriginAssociation
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _ground_user_provided_sites
 from skyvern.forge.sdk.copilot.runtime import PendingBrowserInteractionObservation
 from skyvern.forge.sdk.copilot.tools import (
     _discovery_walk,
@@ -15,7 +17,11 @@ from skyvern.forge.sdk.copilot.tools import (
     _rank_discovery_entrypoint_candidates,
     _resolve_discovery_entry_url,
 )
-from skyvern.forge.sdk.copilot.tools.discovery import _discovery_build_result
+from skyvern.forge.sdk.copilot.tools.discovery import (
+    _credential_entry_url,
+    _discovery_build_result,
+    _user_provided_entry_url,
+)
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
@@ -790,3 +796,80 @@ async def test_capture_composition_evidence_warns_when_html_sliced_at_cap() -> N
     assert error is None
     assert evidence is not None
     assert "html_sliced_at_cap" in evidence["inspection_warnings"]
+
+
+class TestUserProvidedEntryUrl:
+    """Name lookup asks the world; this asks the conversation, so a URL the user already pasted is
+    not answered with a request for a URL."""
+
+    @staticmethod
+    def _ctx(user_message: str) -> SimpleNamespace:
+        policy = RequestPolicy()
+        _ground_user_provided_sites(policy, user_message, [])
+        return SimpleNamespace(request_policy=policy)
+
+    def test_the_only_site_the_user_gave_is_opened(self) -> None:
+        ctx = self._ctx("go to https://us.example.com/reports and pull the numbers")
+
+        assert _user_provided_entry_url(ctx) == "https://us.example.com/reports"
+
+    def test_several_sites_resolve_nothing(self) -> None:
+        ctx = self._ctx("check https://a.example.com and https://b.example.net")
+
+        assert _user_provided_entry_url(ctx) is None
+
+    def test_nothing_the_user_provided_resolves_nothing(self) -> None:
+        assert _user_provided_entry_url(self._ctx("no addresses here")) is None
+
+
+class TestCredentialEntryUrl:
+    """The org already recorded where a credential signs in, so a site named in words whose
+    credential carries a login page is opened rather than answered with a request for its URL."""
+
+    @staticmethod
+    def _ctx(*tested_urls: str | None) -> SimpleNamespace:
+        policy = RequestPolicy()
+        policy.resolved_credentials = [
+            SimpleNamespace(credential_id=f"cred_{index}", name=f"credential {index}", tested_url=tested_url)
+            for index, tested_url in enumerate(tested_urls)
+        ]
+        return SimpleNamespace(request_policy=policy)
+
+    def test_the_credential_naming_the_requested_site_is_opened(self) -> None:
+        ctx = self._ctx("https://apps.hydroco.example/portal/Login.jsp")
+
+        assert _credential_entry_url(ctx, "hydroco") == "https://apps.hydroco.example/portal/Login.jsp"
+
+    def test_a_multi_word_site_name_resolves_its_credential(self) -> None:
+        ctx = self._ctx("https://apps.guelphhydro.example/portal/Login.jsp")
+
+        assert _credential_entry_url(ctx, "guelph hydro") == "https://apps.guelphhydro.example/portal/Login.jsp"
+
+    def test_the_credential_whose_host_names_the_site_wins_among_several(self) -> None:
+        ctx = self._ctx("https://us5.other.example.net/account/login", "https://us.chosen.example/login")
+
+        assert _credential_entry_url(ctx, "chosen") == "https://us.chosen.example/login"
+
+    def test_a_lone_credential_for_another_site_resolves_nothing(self) -> None:
+        """Approvals persist across turns, so a later request for a different site must not open this one."""
+        ctx = self._ctx("https://payroll.example.net/login")
+
+        assert _credential_entry_url(ctx, "zephyrmart") is None
+
+    def test_a_label_extending_the_requested_name_resolves(self) -> None:
+        ctx = self._ctx("https://us5.metricsdog.example/account/login")
+
+        assert _credential_entry_url(ctx, "metrics") == "https://us5.metricsdog.example/account/login"
+
+    def test_a_name_buried_inside_a_label_resolves_nothing(self) -> None:
+        ctx = self._ctx("https://groupsupport.example.net/login")
+
+        assert _credential_entry_url(ctx, "ups") is None
+
+    def test_several_unrelated_credentials_resolve_nothing(self) -> None:
+        ctx = self._ctx("https://a.example.net/login", "https://b.example.org/login")
+
+        assert _credential_entry_url(ctx, "unrelated") is None
+
+    def test_credentials_without_a_login_page_resolve_nothing(self) -> None:
+        assert _credential_entry_url(self._ctx(None), "example") is None

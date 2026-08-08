@@ -237,93 +237,9 @@ _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL = ToolInputGuardrail(
 )
 
 
-def _request_policy_allows_untested_code_block_draft(ctx: Any) -> bool:
-    policy = getattr(ctx, "request_policy", None)
-    return (
-        getattr(ctx, "allow_untested_workflow_draft", False) is True
-        and isinstance(policy, RequestPolicy)
-        and policy.allow_update_workflow
-        and not policy.allow_run_blocks
-        and policy.testing_intent == "skip_test"
-        and policy.allow_missing_credentials_in_draft
-        and policy.credential_draft_deferred_explicitly
-    )
-
-
 def _request_policy_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
-    policy = getattr(ctx, "request_policy", None)
-    if not isinstance(policy, RequestPolicy):
-        return None
-
-    agent_steering: str | None = None
-    user_facing: str | None = None
-    reason_code: str | None = None
-    recovery_hint: RecoveryHint = "report_blocker_to_user"
-    cleared_by: frozenset[str] = frozenset()
-
-    if tool_name == "update_workflow" and not policy.allow_update_workflow:
-        reason_code = "request_policy_blocks_update_workflow"
-        agent_steering = (
-            "Request policy blocks workflow updates for the latest user message. "
-            "Ask the user for safe stored credential metadata instead."
-        )
-        user_facing = "I need stored credential metadata before I can update this workflow."
-        recovery_hint = "ask_user_clarifying"
-    elif tool_name in BLOCK_RUNNING_TOOLS and not policy.allow_run_blocks:
-        if policy.testing_intent == "skip_test":
-            reason_code = "request_policy_blocks_run_blocks_skip_test"
-            agent_steering = (
-                "Request policy says the latest user message asked for an untested draft. Use update_workflow only."
-            )
-            user_facing = "I'll save this as an untested draft because the request asked me not to run it."
-            recovery_hint = "retry_with_different_tool"
-            cleared_by = frozenset({"update_workflow"})
-        elif policy.clarification_reason == "workflow_credential_inputs_unbound":
-            reason_code = "request_policy_blocks_run_blocks_credential_unbound"
-            agent_steering = (
-                "Skipped test run: the existing workflow references credential parameters "
-                "whose keys point to workflow inputs that are not configured. REPLY to the user "
-                "with: 'I applied your requested change. I couldn't test the modified workflow "
-                "because I couldn't find the required credentials — please add them via the "
-                "Credentials UI, then I can try again.' Keep the unvalidated draft surfaced."
-            )
-            user_facing = (
-                "I applied your requested change. I couldn't test the modified workflow because "
-                "the required credentials aren't set up. Add them in the Credentials UI and ask "
-                "me to test it."
-            )
-            recovery_hint = "report_blocker_to_user"
-        else:
-            reason_code = "request_policy_blocks_run_blocks_generic"
-            agent_steering = (
-                "Request policy blocks block-running tools for the latest user message. "
-                "Ask the user for the required safe credential or clarification before testing."
-            )
-            user_facing = "I need a credential or clarification from you before I can test this workflow."
-            recovery_hint = "ask_user_clarifying"
-
-    if reason_code is None or agent_steering is None or user_facing is None:
-        return None
-
-    LOG.info(
-        "copilot authority gate evaluated tool",
-        authority_gate_layer="request_policy",
-        blocked_tool=tool_name,
-        request_policy_allow_update_workflow=policy.allow_update_workflow,
-        request_policy_allow_run_blocks=policy.allow_run_blocks,
-        request_policy_testing_intent=policy.testing_intent,
-        request_policy_clarification_reason=policy.clarification_reason,
-        safe_reason_code=reason_code,
-    )
-    return CopilotToolBlockerSignal(
-        blocker_kind="authority_denied",
-        agent_steering_text=agent_steering,
-        user_facing_reason=user_facing,
-        recovery_hint=recovery_hint,
-        cleared_by_tools=cleared_by,
-        internal_reason_code=reason_code,
-        blocked_tool=tool_name,
-    )
+    del ctx, tool_name
+    return None
 
 
 def _request_policy_allows_credential_deferred_draft(ctx: AgentContext) -> bool:
@@ -423,9 +339,10 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlo
 
     blocks_update = tool_name in WORKFLOW_MUTATION_TOOLS and not authority.may_update_workflow
     blocks_run = tool_name in BLOCK_RUNNING_TOOLS and not authority.may_run_blocks
-    blocks_page_inspection = tool_name in PAGE_SCHEMA_CONTEXT_TOOLS and (
-        intent.mode in NO_MUTATION_TURN_INTENT_MODES or not authority.may_update_workflow
-    )
+    # Authority, not mode membership: every other NO_MUTATION mode already resolves to
+    # may_update_workflow False, so keying on the mode too only ever blocked a diagnose turn that
+    # had earned write authority — the one case where inspecting the page is the point.
+    blocks_page_inspection = tool_name in PAGE_SCHEMA_CONTEXT_TOOLS and not authority.may_update_workflow
     blocks_credential_metadata = tool_name in CREDENTIAL_METADATA_TOOLS and not (
         authority.may_update_workflow or authority.may_run_blocks
     )

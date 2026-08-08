@@ -9,9 +9,11 @@ from typing import cast
 import pytest
 from playwright.async_api import BrowserContext
 
+from skyvern.webeye.profile_cookie_merge import BANKED_COOKIES_FILENAME
 from skyvern.webeye.session_cookies import (
     SESSION_COOKIES_FILENAME,
     persist_session_cookies,
+    refresh_banked_cookies,
     restore_session_cookies,
 )
 
@@ -120,3 +122,28 @@ async def test_restore_tolerates_corrupt_sidecar(tmp_path: Path) -> None:
     fake = FakeContext()
     await restore_session_cookies(_ctx(fake), str(tmp_path))
     assert fake.added == []
+
+
+def _banked(tmp_path: Path) -> Path:
+    return tmp_path / BANKED_COOKIES_FILENAME
+
+
+@pytest.mark.asyncio
+async def test_refresh_banked_cookies_replaces_the_sidecar_with_the_live_jar(tmp_path: Path) -> None:
+    _banked(tmp_path).write_text(json.dumps([{**_SESSION, "name": "seed_era"}]))
+
+    await refresh_banked_cookies(_ctx(FakeContext([_PERSISTENT])), str(tmp_path))
+
+    assert json.loads(_banked(tmp_path).read_text()) == [_PERSISTENT]
+
+
+@pytest.mark.asyncio
+async def test_refresh_banked_cookies_drops_the_sidecar_without_a_live_context(tmp_path: Path) -> None:
+    # A closed browser has flushed its Cookies database, so a seed-era sidecar must not ride along.
+    _banked(tmp_path).write_text(json.dumps([_PERSISTENT]))
+    await refresh_banked_cookies(None, str(tmp_path))
+    assert not _banked(tmp_path).exists()
+
+    _banked(tmp_path).write_text(json.dumps([_PERSISTENT]))
+    await refresh_banked_cookies(_ctx(RaisingContext()), str(tmp_path))
+    assert not _banked(tmp_path).exists()

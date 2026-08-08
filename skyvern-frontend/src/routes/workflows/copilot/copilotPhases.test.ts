@@ -626,6 +626,7 @@ describe("derivePhases — redraft re-activation (SKY-11970 pin)", () => {
       blocks: [block({ state: "completed" })],
       lastRunOutcome: {
         verdict: "not_demonstrated",
+        role: "interim_build_test",
         displayReason: "outcome not confirmed",
         activitySeqAtVerdict: 2,
       },
@@ -826,12 +827,21 @@ describe("derivePhases — redraft re-activation (SKY-11970 pin)", () => {
 });
 
 describe("derivePhases — test-run count on the not-confirmed stub (SKY-11339)", () => {
-  const notConfirmedTurn = (runToolNames: string[]): TurnNarrativeState =>
+  const notConfirmedTurn = (
+    runToolNames: string[],
+    outcomeRole?: BlockState["outcomeRole"],
+  ): TurnNarrativeState =>
     turn({
       terminal: "response",
       designEnded: true,
       draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
-      blocks: [block({ state: "completed", outcome: "not_demonstrated" })],
+      blocks: [
+        block({
+          state: "completed",
+          outcome: "not_demonstrated",
+          outcomeRole,
+        }),
+      ],
       designActivity: runToolNames.map((toolName, i) =>
         entry({ id: `r${i}`, kind: "tool_call", toolName }),
       ),
@@ -851,5 +861,19 @@ describe("derivePhases — test-run count on the not-confirmed stub (SKY-11339)"
   it("omits the count for a single run, keeping today's look", () => {
     const rows = derivePhases(notConfirmedTurn(["update_and_run_blocks"]));
     expect(phase(rows, "test").stub).toBe("· not confirmed");
+  });
+
+  it("keeps an explicitly adjudicated negative outcome in the alarm stub", () => {
+    const rows = derivePhases(
+      notConfirmedTurn(["update_and_run_blocks"], "adjudicated"),
+    );
+    expect(phase(rows, "test").stub).toBe("· not confirmed");
+  });
+
+  it("suppresses the alarm stub for an interim build test", () => {
+    const rows = derivePhases(
+      notConfirmedTurn(["update_and_run_blocks"], "interim_build_test"),
+    );
+    expect(phase(rows, "test").stub).not.toContain("not confirmed");
   });
 });

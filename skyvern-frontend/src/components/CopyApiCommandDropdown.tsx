@@ -10,6 +10,7 @@ import { toast } from "@/components/ui/use-toast";
 import { copyText } from "@/util/copyText";
 import {
   generateApiCommands,
+  describeCopiedCommand,
   type ApiCommandOptions,
 } from "@/util/apiCommands";
 
@@ -34,8 +35,7 @@ function CopyApiCommandDropdown({ getOptions }: Props) {
               toast({
                 variant: "success",
                 title: "Copied to Clipboard",
-                description:
-                  "The cURL command has been copied to your clipboard.",
+                description: describeCopiedCommand("cURL"),
               });
             });
           }}
@@ -49,8 +49,7 @@ function CopyApiCommandDropdown({ getOptions }: Props) {
               toast({
                 variant: "success",
                 title: "Copied to Clipboard",
-                description:
-                  "The PowerShell command has been copied to your clipboard.",
+                description: describeCopiedCommand("PowerShell"),
               });
             });
           }}

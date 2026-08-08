@@ -86,6 +86,12 @@ class BrowserEngineUnavailable(SkyvernException):
         super().__init__(f"Browser engine {name!r} is registered but its driver package is not installed")
 
 
+class BrowserEngineBootstrapError(SkyvernException):
+    """A selected driver could not launch a usable browser context (a boot failure before any usable
+    context exists). Raised by a launch seam to mark a narrow experiment-engine launch failure that the
+    acquisition boundary may degrade once to the selection's classical boot fallback."""
+
+
 class BrowserSourceNotSupportedByEngine(SkyvernException):
     """Raised when a resolved browser source is outside the selected engine's capability set."""
 
@@ -149,6 +155,12 @@ class BrowserEngineSelection:
     target_closed_error_types: tuple[type[BaseException], ...] = ()
     cdp_connection_error_types: tuple[type[BaseException], ...] = ()
     retryable_error_types: tuple[type[BaseException], ...] = ()
+    # One-shot classical fallback used ONLY if THIS selection's driver fails to boot at the run's
+    # browser-ownership boundary, before any browser/page resource exists (see
+    # ``RealBrowserManager._create_browser_state``). ``None`` (the default, and what ``select()`` always
+    # produces) means no fallback — a boot failure fails the run as before. The fallback itself carries
+    # no further fallback, so the degrade is exactly one hop and never fires after a browser side effect.
+    boot_fallback_selection: BrowserEngineSelection | None = None
     # Derived once from the identities above (which ``select()`` loaded lazily from the driver
     # package), never passed in: the immutable error-family binding that ``classify_error`` uses. The
     # base+timeout pair is the stable public identity every driver exposes; the richer families are

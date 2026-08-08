@@ -17,19 +17,70 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 import structlog
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.utils.page import JS_FUNCTION_DEFS, SkyvernFrame
 
-from .guards import GuardError
+from .guards import CREDENTIAL_HINT, GuardError, validate_wait_until
 
 LOG = structlog.get_logger(__name__)
+
+TYPE_PASSWORD_REFUSAL_MESSAGE = "Cannot type into password fields — credentials must not be passed through tool calls"
+COORDINATE_TYPE_TARGET_REFUSAL_MESSAGE = "could not verify the coordinate target; refusing to type"
+
+_COORDINATE_PASSWORD_TARGET_JS = """
+() => {
+  let element = document.activeElement;
+  while (element) {
+    const tag = (element.tagName || "").toLowerCase();
+    if (tag === "iframe" || tag === "frame") {
+      try {
+        element = element.contentDocument?.activeElement || null;
+      } catch {
+        return null;
+      }
+      if (!element) return null;
+      continue;
+    }
+    const shadowRoot = element.shadowRoot;
+    const shadowActiveElement = shadowRoot?.activeElement;
+    if (shadowActiveElement) {
+      element = shadowActiveElement;
+      continue;
+    }
+    if (tag.includes("-") && !shadowRoot) return null;
+    break;
+  }
+  if (!element || typeof element.getAttribute !== "function") return null;
+  const tag = (element.tagName || "").toLowerCase();
+  const type = (element.getAttribute("type") || "").toLowerCase();
+  const autocomplete = (element.getAttribute("autocomplete") || "").toLowerCase();
+  return tag === "input" && (type === "password" || autocomplete.includes("password"));
+}
+"""
+
+LOCALHOST_RECOVERY_HINT = (
+    "Run `pip install skyvern && skyvern browser serve --tunnel` to bridge "
+    "your local dev server to a cloud browser via ngrok. "
+    "Or use `local=true` in skyvern_browser_session_create for a local browser."
+)
+
+
+# Lifecycle states in ascending strength. A document that has committed is really there even
+# when a later state never arrives, so navigation degrades down this ladder rather than
+# reporting a failure for a page that is already loaded and usable.
+_LOAD_STATE_LADDER = ("commit", "domcontentloaded", "load", "networkidle")
+_WEAKER_LOAD_STATE_TIMEOUT_MS = 1000
 
 
 @dataclass
 class NavigateResult:
     url: str
     title: str
+    load_state: str = "load"
 
 
 @dataclass
@@ -62,14 +113,57 @@ def parse_extract_schema(schema: str | dict[str, Any] | None) -> dict[str, Any] 
         raise GuardError(f"Invalid JSON schema: {e}", "Provide schema as a valid JSON string")
 
 
+async def _reached_load_state(page: Any, requested: str, budget_ms: int) -> str:
+    """Return the strongest lifecycle state the committed document actually reached.
+
+    Anything below ``requested`` is probed briefly: those states have already fired in
+    every healthy navigation, so the short budget only bounds a document that stalled.
+    """
+    weaker_states = _LOAD_STATE_LADDER[1 : _LOAD_STATE_LADDER.index(requested) + 1]
+    for index, state in enumerate(reversed(weaker_states)):
+        try:
+            await page.wait_for_load_state(
+                state,
+                timeout=budget_ms if index == 0 else _WEAKER_LOAD_STATE_TIMEOUT_MS,
+            )
+        except PlaywrightTimeoutError:
+            continue
+        return state
+    return "commit"
+
+
 async def do_navigate(
     page: Any,
     url: str,
     timeout: int = 30000,
     wait_until: str | None = None,
+    *,
+    can_access_localhost: bool = False,
+    is_localhost_destination: bool = False,
 ) -> NavigateResult:
-    await page.goto(url, timeout=timeout, wait_until=wait_until)
-    return NavigateResult(url=page.url, title=await page.title())
+    validate_wait_until(wait_until)
+    try:
+        validated_url = await asyncio.to_thread(validate_fetch_url, url)
+    except BlockedHost as e:
+        if not (can_access_localhost and is_localhost_destination):
+            hint = LOCALHOST_RECOVERY_HINT if is_localhost_destination else "Use a public HTTP(S) URL"
+            raise GuardError(str(e), hint) from e
+        validated_url = url
+    except SkyvernHTTPException as e:
+        raise GuardError(str(e), "Use a valid public HTTP(S) URL") from e
+
+    # Commit first so a navigation that never reaches the document still fails, then wait for
+    # the requested lifecycle state separately: a page whose `load` never fires is navigated,
+    # not failed, and reporting the weaker state beats a false failure on a usable page.
+    started = time.monotonic()
+    await page.goto(validated_url, timeout=timeout, wait_until="commit")
+    requested = wait_until or "load"
+    load_state = "commit"
+    if requested != "commit":
+        # Floor the leftover budget: Playwright reads timeout=0 as "wait forever".
+        remaining_ms = max(timeout - int((time.monotonic() - started) * 1000), _WEAKER_LOAD_STATE_TIMEOUT_MS)
+        load_state = await _reached_load_state(page, requested, remaining_ms)
+    return NavigateResult(url=page.url, title=await page.title(), load_state=load_state)
 
 
 async def do_screenshot(
@@ -116,6 +210,49 @@ async def do_extract(
     parsed_schema = parse_extract_schema(schema)
     extracted = await page.extract(prompt=prompt, schema=parsed_schema, skip_refresh=skip_refresh)
     return ExtractResult(extracted=extracted)
+
+
+async def do_click_at(
+    page: Any,
+    x: float,
+    y: float,
+    button: str = "left",
+    click_count: int = 1,
+) -> None:
+    raw_page = page.page if hasattr(page, "page") else page
+    await raw_page.mouse.click(x, y, button=button, click_count=click_count)
+
+
+async def do_type_at(
+    page: Any,
+    x: float,
+    y: float,
+    text: str,
+    clear_first: bool = False,
+    press_enter: bool = False,
+) -> None:
+    raw_page = page.page if hasattr(page, "page") else page
+    await raw_page.mouse.click(x, y)
+    try:
+        is_password = await raw_page.evaluate(_COORDINATE_PASSWORD_TARGET_JS)
+    except Exception as exc:
+        raise GuardError(
+            COORDINATE_TYPE_TARGET_REFUSAL_MESSAGE,
+            "Use a selector or intent to target a verified non-password input",
+        ) from exc
+    if is_password is True:
+        raise GuardError(TYPE_PASSWORD_REFUSAL_MESSAGE, CREDENTIAL_HINT)
+    if is_password is not False:
+        raise GuardError(
+            COORDINATE_TYPE_TARGET_REFUSAL_MESSAGE,
+            "Use a selector or intent to target a verified non-password input",
+        )
+    if clear_first:
+        await raw_page.keyboard.press("ControlOrMeta+A")
+        await raw_page.keyboard.press("Backspace")
+    await raw_page.keyboard.type(text)
+    if press_enter:
+        await raw_page.keyboard.press("Enter")
 
 
 # -- Semantic locators --
