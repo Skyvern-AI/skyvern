@@ -12,7 +12,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Awaitable, Callable, List, NamedTuple, TypedDict
+from typing import Any, AsyncIterator, Awaitable, Callable, List, NamedTuple, TypedDict, cast
 
 import structlog
 from cachetools import TTLCache
@@ -50,6 +50,7 @@ from skyvern.exceptions import (
     FailToSelectByIndex,
     FailToSelectByLabel,
     FailToSelectByValue,
+    HttpException,
     IllegitComplete,
     ImaginaryFileUrl,
     ImaginarySecretValue,
@@ -74,6 +75,7 @@ from skyvern.exceptions import (
     PhoneNumberInputMismatch,
     SecretInputMismatch,
     SkyvernException,
+    SkyvernHTTPException,
     SkyvernPageAnalysisTimeout,
     UnresolvableHost,
 )
@@ -81,8 +83,10 @@ from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wa
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
+    GuardedFileFetchHopResult,
     calculate_sha256_for_file,
     check_downloading_files_and_wait_for_download_to_complete,
+    fetch_file_bytes,
     get_download_dir,
     list_files_in_directory,
     make_temp_directory,
@@ -101,6 +105,7 @@ from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
+from skyvern.forge.sdk.core.http_request_authorization import RedirectHopAuthorizer
 from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener, ensure_context
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
@@ -153,16 +158,15 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
+from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_factory import initialize_download_dir, resolve_artifact_path
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
-    DOWNLOAD_DESTINATION_ERRORS,
     DOWNLOAD_MIME_TYPES,
     MAX_FILE_SIZE_BYTES,
     download_filename_from_suffix,
     extract_filename,
-    fetch_download_through_request_context,
     is_download_response,
     normalize_download_filename,
     settle_browser_downloads_for_context,
@@ -953,19 +957,82 @@ async def _close_eager_capture_then_teardown_retention(
                 LOG.debug("Failed to tear down blob URL retention", workflow_run_id=workflow_run_id)
 
 
+@contextlib.asynccontextmanager
+async def _adopted_session_download_binding(
+    download: Download,
+    active_page: Page,
+) -> AsyncIterator[tuple[Any, "RedirectHopAuthorizer[GuardedFileFetchHopResult]"]]:
+    """Lease the exact context binding that owns an adopted-session download."""
+    download_page = download.page
+    if download_page is None:
+        raise RuntimeError("Adopted-session download has no owning page")
+    download_context = download_page.context
+    if download_context is not active_page.context:
+        raise RuntimeError("Adopted-session download page context does not match the active page context")
+
+    try:
+        bind_lock = download_context._skyvern_cdp_download_interceptor_bind_lock  # type: ignore[attr-defined]
+    except AttributeError as exc:
+        raise RuntimeError("Adopted-session download context has no interceptor ownership lock") from exc
+    if not isinstance(bind_lock, asyncio.Lock):
+        raise RuntimeError("Adopted-session download context has an invalid interceptor ownership lock")
+
+    # Narrow exception to the usual explicit-injection rule: bind_to_context already stores the
+    # constructor-injected interceptor on its owned context. Holding its established bind lock
+    # keeps that exact Page -> BrowserContext -> interceptor association live through the fallback.
+    async with bind_lock:
+        try:
+            download_interceptor = download_context._skyvern_cdp_download_interceptor  # type: ignore[attr-defined]
+        except AttributeError as exc:
+            raise RuntimeError(
+                "Adopted-session download recovery requires the page context's CDP download interceptor"
+            ) from exc
+        try:
+            interceptor_context = download_interceptor._page_context
+        except AttributeError as exc:
+            raise RuntimeError("Bound CDP download interceptor has no page-context ownership binding") from exc
+        if interceptor_context is not download_context:
+            raise RuntimeError("Bound CDP download interceptor does not own the adopted-session download page context")
+        try:
+            authorize_request_hop = download_interceptor._redirect_hop_authorizer
+        except AttributeError as exc:
+            raise RuntimeError("Bound CDP download interceptor has no redirect hop authorizer") from exc
+        if not callable(authorize_request_hop):
+            raise RuntimeError("Bound CDP download interceptor has an invalid redirect hop authorizer")
+        yield (
+            download_interceptor,
+            cast(
+                "RedirectHopAuthorizer[GuardedFileFetchHopResult]",
+                authorize_request_hop,
+            ),
+        )
+
+
 async def _save_adopted_session_download(
     download: Download,
     page: Page,
     download_dir: Path,
+    *,
+    authorize_request_hop: "RedirectHopAuthorizer[GuardedFileFetchHopResult]",
+    request_headers: dict[str, str],
     workflow_run_id: str | None = None,
     eager_blob_bytes: bytes | None = None,
+    download_binding: DownloadBinding = DownloadBinding.RUN_DIR,
 ) -> Path | None:
     """Land an adopted-session download's bytes into download_dir, returning the file path or None.
 
-    Eager save_as is the only protection against the worker pod tearing the shared browser down before a
-    deferred save_as runs.
+    A provider-owned remote non-blob event is signal-only and returns None; blob and default behavior
+    are unchanged.
     """
     download_target = _download_target_path(download_dir, download.suggested_filename)
+    if download_binding == DownloadBinding.SESSION_DIR and not download.url.startswith("blob:"):
+        # Signal-only for a provider-owned remote binding: the run connection holds no bytes to save_as
+        # and a URL replay would run through the wrong identity, so defer to the provider destination.
+        LOG.info(
+            "Provider-owned remote download: suppressing local save/replay, deferring to provider destination",
+            workflow_run_id=workflow_run_id,
+        )
+        return None
     # Non-empty bytes captured at download-event time (blob owner still alive) win outright: skip
     # save_as, which returns empty for blobs anyway. A zero-byte eager capture is indistinguishable
     # from an unreadable one and would be a false success, so fall through to save_as + fan-out
@@ -999,9 +1066,8 @@ async def _save_adopted_session_download(
         )
 
     # Ordering: ``save_as`` above has already run and failed (empty or raised).
-    # ``blob:`` URLs cannot be fetched via APIRequestContext (Playwright rejects
-    # the scheme), so route them through an in-page fetch from the document that
-    # owns the blob. That document may be a different tab than the one clicked, so
+    # ``blob:`` URLs cannot be fetched by the guarded HTTP client, so route them
+    # through an in-page fetch from the document that owns the blob. That document may be a different tab, so
     # probe every open page (owner first) rather than reading from ``page`` alone.
     if download.url.startswith("blob:"):
         blob_bytes = await _read_adopted_session_blob_bytes(download, page, workflow_run_id=workflow_run_id)
@@ -1040,16 +1106,12 @@ async def _save_adopted_session_download(
         return download_target
 
     try:
-        response = await fetch_download_through_request_context(page.context.request, download.url)
-        if response.status != 200:
-            LOG.error(
-                "Adopted-session download url re-fetch returned non-200 status",
-                status=response.status,
-                workflow_run_id=workflow_run_id,
-            )
-            return None
-        # APIResponse.body() has no streaming variant, so a large download peaks at 2x its size in RSS.
-        body = await response.body()
+        response = await fetch_file_bytes(
+            download.url,
+            headers=request_headers,
+            authorize_request_hop=authorize_request_hop,
+        )
+        body = response.body
         if not body:
             LOG.error(
                 "Adopted-session download url re-fetch returned an empty body",
@@ -1058,7 +1120,7 @@ async def _save_adopted_session_download(
             return None
         download_target.write_bytes(body)
         return download_target
-    except DOWNLOAD_DESTINATION_ERRORS as e:
+    except (SkyvernHTTPException, HttpException) as e:
         LOG.error(
             "Adopted-session download destination refused",
             download_dir=str(download_dir),
@@ -3503,19 +3565,36 @@ class ActionHandler:
                                 and captured_download is not None
                                 and not download_event_fallback_attempted
                             ):
-                                download_event_fallback_attempted = True
-                                saved_path = await _save_adopted_session_download(
-                                    captured_download,
-                                    page,
-                                    download_dir,
-                                    workflow_run_id=task.workflow_run_id,
-                                    eager_blob_bytes=await eager_blob_capture.result(
-                                        timeout=min(
-                                            EAGER_BLOB_READ_TIMEOUT_SECONDS,
-                                            _remaining_download_wait_seconds(),
-                                        )
-                                    ),
+                                resolved_download_binding = (
+                                    browser_state.browser_artifacts.download_binding
+                                    if browser_state is not None
+                                    else DownloadBinding.RUN_DIR
                                 )
+                                download_event_fallback_attempted = True
+                                eager_blob_bytes = await eager_blob_capture.result(
+                                    timeout=min(
+                                        EAGER_BLOB_READ_TIMEOUT_SECONDS,
+                                        _remaining_download_wait_seconds(),
+                                    )
+                                )
+                                async with _adopted_session_download_binding(captured_download, page) as (
+                                    download_interceptor,
+                                    authorize_request_hop,
+                                ):
+                                    cookie_header = await download_interceptor._cookie_header_for_url(
+                                        captured_download.url
+                                    )
+                                    request_headers = {"Cookie": cookie_header} if cookie_header else {}
+                                    saved_path = await _save_adopted_session_download(
+                                        captured_download,
+                                        page,
+                                        download_dir,
+                                        authorize_request_hop=authorize_request_hop,
+                                        request_headers=request_headers,
+                                        workflow_run_id=task.workflow_run_id,
+                                        eager_blob_bytes=eager_blob_bytes,
+                                        download_binding=resolved_download_binding,
+                                    )
                                 if saved_path is not None:
                                     download_event_fallback_used = True
                                     download_triggered = True
@@ -3526,12 +3605,24 @@ class ActionHandler:
                                         workflow_run_id=task.workflow_run_id,
                                     )
                                     break
-                                download_event_fallback_failed = True
-                                LOG.warning(
-                                    "Adopted-session download could not be saved or re-fetched; falling through to browser-session folder poll",
-                                    download_dir=download_dir,
-                                    workflow_run_id=task.workflow_run_id,
-                                )
+                                if (
+                                    resolved_download_binding == DownloadBinding.SESSION_DIR
+                                    and not captured_download.url.startswith("blob:")
+                                ):
+                                    # Expected signal-only deferral for a provider-owned remote binding: no
+                                    # save_as/replay was attempted, so this is not a failure. Keep polling.
+                                    LOG.info(
+                                        "Provider-owned remote download deferred to provider-destination observation",
+                                        download_dir=download_dir,
+                                        workflow_run_id=task.workflow_run_id,
+                                    )
+                                else:
+                                    download_event_fallback_failed = True
+                                    LOG.warning(
+                                        "Adopted-session download could not be saved or re-fetched; falling through to browser-session folder poll",
+                                        download_dir=download_dir,
+                                        workflow_run_id=task.workflow_run_id,
+                                    )
                                 # Keep polling: the shared browser may still land the file in the session folder.
                                 if await _drain_and_move_staged_xhr(
                                     xhr_fallback_moved_paths, _remaining_download_wait_seconds()
