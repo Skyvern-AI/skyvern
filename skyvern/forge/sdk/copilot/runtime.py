@@ -519,7 +519,6 @@ class AgentContext:
     # returns. The freehand persist-seam surface leg exempts exactly this label and gates its siblings.
     spine_imposition_carrier_label: str | None = None
     synthesized_block_reopened_after_failed_run: bool = False
-    synthesized_block_reopened_for_credential_scout: bool = False
     # Business inputs proven required by an earlier synthesized-draft rejection stay required for the
     # rest of the turn. A later retry cannot evade the floor by deleting those parameters from its YAML.
     synthesized_business_required_parameter_keys: set[str] = field(default_factory=set)
@@ -528,7 +527,6 @@ class AgentContext:
     # login prefix; releases the is_goal_complete terminal-action gate mirroring reached_download_target.
     scout_observed_terminal_criterion_ids: set[str] = field(default_factory=set)
     scout_observation_contract: ScoutObservationContract | None = None
-    credential_scout_rescout_context_key: str | None = None
     # Which requires-live-scout fields (username/password, non-empty) each scouted credential
     # carries; recorded at credential resolve time and rehydrated from FillCarry across turns.
     scouted_credential_field_inventory_by_credential_id: dict[str, frozenset[str]] = field(default_factory=dict)
