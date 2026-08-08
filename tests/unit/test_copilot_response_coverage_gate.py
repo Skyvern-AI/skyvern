@@ -134,7 +134,9 @@ def test_ask_question_before_acting_on_discovery_candidate_fires_nudge() -> None
     assert nudge is not None
     assert nudge.rule == "post_discovery_entrypoint_url_question"
     # nosemgrep false positive: asserts the advisory interpolates the resolved entrypoint.
-    assert "https://example.com/" in nudge.message  # nosemgrep: incomplete-url-substring-sanitization
+    assert (
+        nudge.message.rpartition("Resolved candidate_url: ")[2] == ctx.resolved_discovery_entrypoint_url
+    )  # nosemgrep: incomplete-url-substring-sanitization
     assert ctx.discovery_entrypoint_url_question_nudge_count == 1
 
 
