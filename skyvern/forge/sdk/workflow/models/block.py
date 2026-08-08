@@ -27,7 +27,7 @@ from email.message import EmailMessage
 from functools import partial
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Annotated, Any, Awaitable, Callable, ClassVar, Literal, Union, cast
+from typing import TYPE_CHECKING, Annotated, Any, Awaitable, Callable, ClassVar, Literal, TypeVar, Union, cast
 from urllib.parse import quote, urlparse
 
 import aiofiles
@@ -51,6 +51,7 @@ from sqlalchemy.exc import InterfaceError, OperationalError
 from skyvern.config import settings
 from skyvern.constants import (
     AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT,
+    FILE_PARSE_STEP_TIMEOUT_SECONDS,
     GET_DOWNLOADED_FILES_TIMEOUT,
     MAX_FILE_PARSE_INPUT_TOKENS,
     MAX_PDF_OCR_PAGES,
@@ -145,6 +146,7 @@ from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRu
 from skyvern.forge.sdk.workflow.exceptions import (
     CustomizedCodeException,
     FailedToFormatJinjaStyleParameter,
+    FileParseTimeout,
     InsecureCodeDetected,
     InvalidEmailClientConfiguration,
     InvalidFileType,
@@ -201,7 +203,7 @@ from skyvern.schemas.workflows import (
     FileType,
     FileUploadDestination,
 )
-from skyvern.services import otp_service
+from skyvern.services import otp_service, planner_levers
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.self_heal_cap import check_and_increment_self_heal_cap
 from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
@@ -2554,7 +2556,7 @@ class ForLoopBlock(Block):
         None and an empty set must stay distinct: closing everything opened after an empty
         baseline closes every tab, so a failed snapshot has to suppress the reset entirely.
         """
-        if not settings.RESET_BROWSER_TABS_BETWEEN_LOOP_ITERATIONS:
+        if not await planner_levers.reset_browser_tabs_between_loop_iterations(organization_id):
             return None
         try:
             browser_state = await self._get_loop_browser_state(workflow_run_id, organization_id, browser_session_id)
@@ -2575,7 +2577,9 @@ class ForLoopBlock(Block):
         browser_session_id: str | None,
         baseline_pages: set[Page] | None,
     ) -> None:
-        if not settings.RESET_BROWSER_TABS_BETWEEN_LOOP_ITERATIONS or baseline_pages is None:
+        if baseline_pages is None or not await planner_levers.reset_browser_tabs_between_loop_iterations(
+            organization_id
+        ):
             return
         try:
             browser_state = await self._get_loop_browser_state(workflow_run_id, organization_id, browser_session_id)
@@ -8176,6 +8180,45 @@ class SendEmailBlock(Block):
         )
 
 
+_ParseStepResult = TypeVar("_ParseStepResult")
+
+
+async def _run_blocking_parse_step(
+    step: str,
+    file_url: str,
+    func: Callable[..., _ParseStepResult],
+    *args: Any,
+    **kwargs: Any,
+) -> _ParseStepResult:
+    """Run a blocking file-parse step in a worker thread under a wall-clock ceiling.
+
+    Parsing on the event loop starves the workflow activity's heartbeat task, and Temporal
+    reaps a run whose activity stops heartbeating. On timeout the worker thread is left to
+    run to completion — threads cannot be cancelled — so the ceiling bounds the run's
+    exposure to a pathological document rather than the CPU work itself.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(func, *args, **kwargs),
+            timeout=FILE_PARSE_STEP_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        LOG.warning(
+            "File parse step exceeded its time budget",
+            step=step,
+            file_url=file_url,
+            timeout_seconds=FILE_PARSE_STEP_TIMEOUT_SECONDS,
+        )
+        raise FileParseTimeout(file_url=file_url, step=step, timeout_seconds=FILE_PARSE_STEP_TIMEOUT_SECONDS)
+
+
+# csv.field_size_limit is process-global. Raising it once at import (rather than
+# set/restore around each parse) avoids a race between concurrent CSV parses on
+# separate worker threads stepping on each other's limit.
+_MAX_CSV_FIELD_SIZE_BYTES = 10 * 1024 * 1024
+csv.field_size_limit(_MAX_CSV_FIELD_SIZE_BYTES)
+
+
 class FileParserBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -8185,8 +8228,6 @@ class FileParserBlock(Block):
     _CSV_SNIFF_LINES = 5
     _CSV_BINARY_PREFIX_BYTES = 4096
     _CSV_UTF_BOMS = (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)
-    # Bounded cap for legitimate wide cells (JSON blobs, long descriptions); applied only while parsing.
-    _MAX_CSV_FIELD_SIZE_BYTES = 10 * 1024 * 1024
     # ZIP extraction guards (zip-bomb protection; sizes from central-directory metadata).
     # ClassVar keeps these plain class attributes — without it pydantic wraps underscore
     # names in ModelPrivateAttr and class-level access breaks.
@@ -8418,14 +8459,13 @@ class FileParserBlock(Block):
 
     async def _parse_csv_file(self, file_path: str) -> list[dict[str, Any]]:
         """Parse CSV/TSV file and return list of dictionaries."""
+        return await _run_blocking_parse_step("CSV parsing", self.file_url, self._parse_csv_file_sync, file_path)
+
+    def _parse_csv_file_sync(self, file_path: str) -> list[dict[str, Any]]:
         delimiter, encoding = self._sniff_csv_delimiter(file_path)
-        previous_limit = csv.field_size_limit(self._MAX_CSV_FIELD_SIZE_BYTES)
-        try:
-            with open(file_path, encoding=encoding, errors="replace", newline="") as file:
-                reader = csv.DictReader(file, delimiter=delimiter)
-                return list(reader)
-        finally:
-            csv.field_size_limit(previous_limit)
+        with open(file_path, encoding=encoding, errors="replace", newline="") as file:
+            reader = csv.DictReader(file, delimiter=delimiter)
+            return list(reader)
 
     def _clean_dataframe_for_json(self, df: pd.DataFrame) -> list[dict[str, Any]]:
         """Clean DataFrame to ensure it can be serialized to JSON."""
@@ -8451,6 +8491,9 @@ class FileParserBlock(Block):
 
     async def _parse_excel_file(self, file_path: str) -> list[dict[str, Any]]:
         """Parse Excel file and return list of dictionaries."""
+        return await _run_blocking_parse_step("Excel parsing", self.file_url, self._parse_excel_file_sync, file_path)
+
+    def _parse_excel_file_sync(self, file_path: str) -> list[dict[str, Any]]:
         try:
             # Read Excel file with pandas, specifying engine explicitly
             df = pd.read_excel(file_path, engine="calamine")
@@ -8481,7 +8524,13 @@ class FileParserBlock(Block):
         renders pages as images and sends them to a vision LLM for OCR.
         """
         try:
-            extracted_text = extract_pdf_file(file_path, file_identifier=self.file_url)
+            extracted_text = await _run_blocking_parse_step(
+                "PDF text extraction",
+                self.file_url,
+                extract_pdf_file,
+                file_path,
+                file_identifier=self.file_url,
+            )
         except PDFParsingError as e:
             raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
 
@@ -8497,7 +8546,9 @@ class FileParserBlock(Block):
             file_url=self.file_url,
         )
         try:
-            page_images = await asyncio.to_thread(
+            page_images = await _run_blocking_parse_step(
+                "PDF page rendering",
+                self.file_url,
                 render_pdf_pages_as_images,
                 file_path,
                 file_identifier=self.file_url,
@@ -8727,6 +8778,11 @@ class FileParserBlock(Block):
         Extracts text from all paragraphs and tables in the document,
         respecting the token limit.
         """
+        return await _run_blocking_parse_step(
+            "DOCX parsing", self.file_url, self._parse_docx_file_sync, file_path, max_tokens
+        )
+
+    def _parse_docx_file_sync(self, file_path: str, max_tokens: int = MAX_FILE_PARSE_INPUT_TOKENS) -> str:
         try:
             document = docx.Document(file_path)
             text_parts = []
@@ -9141,8 +9197,10 @@ class FileParserBlock(Block):
             if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF, FileType.DOCX, FileType.ZIP):
                 self.file_type = self._detect_file_type_from_url(self.file_url, file_path=file_path)
 
-            # Validate the file type
-            self.validate_file_type(self.file_url, file_path)
+            # Validation opens the document, so on a large file it is as slow as the parse itself.
+            await _run_blocking_parse_step(
+                "file type validation", self.file_url, self.validate_file_type, self.file_url, file_path
+            )
         except Exception as e:
             return await self._record_failure(
                 workflow_run_context,
@@ -9320,7 +9378,22 @@ class PDFParserBlock(Block):
             )
 
         try:
-            extracted_text = extract_pdf_file(file_path, file_identifier=self.file_url)
+            extracted_text = await _run_blocking_parse_step(
+                "PDF text extraction",
+                self.file_url,
+                extract_pdf_file,
+                file_path,
+                file_identifier=self.file_url,
+            )
+        except FileParseTimeout as e:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=str(e),
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
         except PDFParsingError:
             return await self.build_block_result(
                 success=False,
