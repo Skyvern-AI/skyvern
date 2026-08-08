@@ -237,19 +237,6 @@ _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL = ToolInputGuardrail(
 )
 
 
-def _request_policy_allows_untested_code_block_draft(ctx: Any) -> bool:
-    policy = getattr(ctx, "request_policy", None)
-    return (
-        getattr(ctx, "allow_untested_workflow_draft", False) is True
-        and isinstance(policy, RequestPolicy)
-        and policy.allow_update_workflow
-        and not policy.allow_run_blocks
-        and policy.testing_intent == "skip_test"
-        and policy.allow_missing_credentials_in_draft
-        and policy.credential_draft_deferred_explicitly
-    )
-
-
 def _request_policy_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
     policy = getattr(ctx, "request_policy", None)
     if not isinstance(policy, RequestPolicy):

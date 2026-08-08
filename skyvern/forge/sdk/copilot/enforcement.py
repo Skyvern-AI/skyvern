@@ -2291,8 +2291,6 @@ def synthesized_offer_reopened_for_extraction_plan(
 
 
 def synthesized_persistence_reopened(ctx: AgentContext) -> bool:
-    if ctx.synthesized_block_reopened_for_credential_scout:
-        return True
     if synthesized_goal_completion_landing_pending(ctx):
         return True
     return synthesized_persistence_reopened_after_failed_run(ctx)
@@ -2851,9 +2849,8 @@ def _credential_password_demand_holds(ctx: Any, interactions: list[dict[str, Any
 
 
 def _credential_flow_scout_gap_incomplete(ctx: Any, trajectory: list[Any]) -> bool:
-    """Trajectory- and inventory-scoped mirror of the persist seam's credential scout gate: engaged
-    credentials (username/password fills) must have every required field filled plus a post-fill
-    submit before the synthesized trajectory may grade goal-complete."""
+    """Engaged credentials (username/password fills) must have every required field filled plus a
+    post-fill submit before the synthesized trajectory may grade goal-complete."""
     interactions = [item for item in trajectory if isinstance(item, dict)]
     filled_by_credential = _credential_flow_filled_fields_by_credential(interactions)
     if not filled_by_credential:
@@ -3140,17 +3137,6 @@ def _should_force_advisory_run_dispatch(ctx: Any) -> bool:
     if getattr(ctx, "turn_halt", None) is not None:
         return False
     return not blocker_signal_is_genuinely_terminal(getattr(ctx, "blocker_signal", None))
-
-
-def arm_credential_scout_reopen(ctx: AgentContext, identity_digest: str) -> bool:
-    """Arm a one-shot scout-window reopen for the first author-time credential-scout reject per
-    (structural identity + credential binding) digest. A repeat identical reject returns False and
-    falls through so it counts normally toward the repair ceiling."""
-    if ctx.credential_scout_rescout_context_key == identity_digest:
-        return False
-    ctx.credential_scout_rescout_context_key = identity_digest
-    ctx.synthesized_block_reopened_for_credential_scout = True
-    return True
 
 
 def _runner_kwargs_with_forced_tool_choice(runner_kwargs: dict[str, Any], tool_name: str) -> dict[str, Any]:
