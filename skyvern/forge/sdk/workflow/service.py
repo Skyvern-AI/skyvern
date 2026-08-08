@@ -51,6 +51,7 @@ from skyvern.exceptions import (
     BrowserSessionNotRenewable,
     BrowserSessionStartupTimeout,
     DisabledBlockExecutionError,
+    DownloadSaveIncompleteError,
     InProcessScriptExecutionDenied,
     InvalidCredentialId,
     InvalidWorkflowParameter,
@@ -9968,10 +9969,18 @@ class WorkflowService:
                 async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                     context = skyvern_context.current()
                     finalization_run_id = context.run_id if context and context.run_id else workflow_run.workflow_run_id
-                    await app.STORAGE.save_downloaded_files(
-                        organization_id=workflow_run.organization_id,
-                        run_id=finalization_run_id,
-                    )
+                    try:
+                        await app.STORAGE.save_downloaded_files(
+                            organization_id=workflow_run.organization_id,
+                            run_id=finalization_run_id,
+                        )
+                    except DownloadSaveIncompleteError as exc:
+                        # Session-artifact claiming below must still run for the files that saved.
+                        LOG.warning(
+                            "Some downloaded files were skipped during finalization save",
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            skipped_file_count=len(exc.skipped_files),
+                        )
                     # Tag any session-scoped DOWNLOAD artifacts created during this
                     # workflow run with run_id (see
                     # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md).
