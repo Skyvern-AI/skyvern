@@ -510,6 +510,22 @@
             "description": "Optional folder ID to assign the workflow to"
           },
           {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
@@ -548,6 +564,9 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "A create with this idempotency key is still in progress"
           },
           "422": {
             "description": "Invalid agent definition"

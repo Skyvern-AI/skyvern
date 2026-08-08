@@ -141,7 +141,7 @@ async def test_session_create_extension_not_connected_returns_pinned_guidance(
 ) -> None:
     runtime = SimpleNamespace(
         wait_for_extension=AsyncMock(return_value=False),
-        open_pairing_page=MagicMock(return_value=pairing_opened),
+        open_pairing_page=AsyncMock(return_value=pairing_opened),
     )
     get_or_start = AsyncMock(return_value=runtime)
     resolve_browser = AsyncMock()
@@ -156,7 +156,7 @@ async def test_session_create_extension_not_connected_returns_pinned_guidance(
     assert "extension-token" not in result["error"]["message"]
     assert "paste the token" not in result["error"]["message"]
     get_or_start.assert_awaited_once_with()
-    runtime.open_pairing_page.assert_called_once_with()
+    runtime.open_pairing_page.assert_awaited_once_with()
     runtime.wait_for_extension.assert_awaited_once_with(10.0)
     resolve_browser.assert_not_awaited()
 
@@ -427,12 +427,12 @@ def test_browser_extension_status_reports_configuration_without_printing_token(
     token_path = token_dir / "browser_extension_token"
     token_path.write_text(token)
     token_path.chmod(0o600)
-    connection = MagicMock()
-    connect = MagicMock(return_value=connection)
+    probe = MagicMock(return_value="broker")
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("SKYVERN_BROWSER_EXTENSION_PORT", "20123")
     monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_TOKEN", raising=False)
-    monkeypatch.setattr(browser_commands.socket, "create_connection", connect)
+    monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_BROKER", raising=False)
+    monkeypatch.setattr(browser_commands, "_bridge_mode", probe)
 
     result = CliRunner().invoke(browser_app, ["extension-status"])
 
@@ -440,10 +440,27 @@ def test_browser_extension_status_reports_configuration_without_printing_token(
     assert str(BrowserExtensionRuntime.extension_dir().resolve()) in result.stdout
     assert "pairing token: configured (file exists)" in result.stdout
     assert "pairing token file permissions: OK" in result.stdout
-    assert "bridge listening on 20123" in result.stdout
+    assert "shared broker: enabled" in result.stdout
+    assert "bridge listening on 20123 (shared broker daemon)" in result.stdout
     assert token not in result.stdout
-    connect.assert_called_once_with(("127.0.0.1", 20123), timeout=0.5)
-    connection.close.assert_called_once_with()
+    probe.assert_called_once_with(20123)
+
+
+def test_browser_extension_status_flags_a_single_owner_bridge_as_unshareable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SKYVERN_BROWSER_EXTENSION_PORT", "20124")
+    monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_TOKEN", raising=False)
+    monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_BROKER", raising=False)
+    monkeypatch.setattr(browser_commands, "_bridge_mode", MagicMock(return_value="legacy"))
+
+    result = CliRunner().invoke(browser_app, ["extension-status"])
+
+    assert result.exit_code == 0
+    assert "bridge listening on 20124 (single-owner session)" in result.stdout
+    assert "share the bridge" in result.stdout
 
 
 def test_browser_extension_status_is_informational_when_bridge_is_not_running(
@@ -453,12 +470,14 @@ def test_browser_extension_status_is_informational_when_bridge_is_not_running(
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_TOKEN", raising=False)
     monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_PORT", raising=False)
-    monkeypatch.setattr(browser_commands.socket, "create_connection", MagicMock(side_effect=OSError))
+    monkeypatch.setenv("SKYVERN_BROWSER_EXTENSION_BROKER", "0")
+    monkeypatch.setattr(browser_commands, "_bridge_mode", MagicMock(return_value="none"))
 
     result = CliRunner().invoke(browser_app, ["extension-status"])
 
     assert result.exit_code == 0
     assert "pairing token: not configured" in result.stdout
+    assert "shared broker: disabled (SKYVERN_BROWSER_EXTENSION_BROKER)" in result.stdout
     assert "bridge not running (start your MCP server with --browser-extension)" in result.stdout
 
 
