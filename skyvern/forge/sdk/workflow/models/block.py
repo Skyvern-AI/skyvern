@@ -59,6 +59,7 @@ from skyvern.constants import (
     PDF_OCR_PAGE_CONCURRENCY,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
 )
+from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import (
     AzureConfigurationError,
     BranchEvaluationContextTooLargeError,
@@ -451,6 +452,17 @@ def build_block_failure_output(failure_reason: str, error_codes: Sequence[str]) 
         "status": BlockStatus.failed.value,
         "failure_reason": failure_reason,
         "errors": [{"error_code": code, "reasoning": failure_reason, "confidence_float": 1.0} for code in error_codes],
+    }
+
+
+def build_user_defined_error_output(error_code: str, reasoning: str) -> dict[str, Any]:
+    """<label>_output payload for a declared ErrorCode raise (SKY-13668): a UserDefinedError
+    entry with confidence 1.0, matching UserDefinedError's own serialized shape."""
+    error = UserDefinedError(error_code=error_code, reasoning=reasoning, confidence_float=1.0)
+    return {
+        "status": BlockStatus.failed.value,
+        "failure_reason": reasoning,
+        "errors": [error.model_dump(mode="json")],
     }
 
 
@@ -3774,6 +3786,18 @@ class CodeBlockCaptchaError(Exception):
     """Sanitized CAPTCHA-primitive error with no site, selector, vendor, or token details."""
 
 
+class ErrorCode(Exception):
+    """Caller-declared business error a code block can raise for a condition named in its
+    error_code_mapping manifest (SKY-13668). ``code`` must be a manifest key to be surfaced
+    as a USER_DEFINED_ERROR; otherwise it fails closed like any other unclassified exception.
+    """
+
+    def __init__(self, code: str, reasoning: str) -> None:
+        self.error_code = code
+        self.reasoning = reasoning
+        super().__init__(f"{code}: {reasoning}")
+
+
 CODE_BLOCK_TAB_OPEN_FAILURE_REASON = "Code block could not open a tab in the browser session; the session's browser may be held by another Playwright client"
 
 
@@ -4197,6 +4221,7 @@ class CodeBlock(Block):
 
     code: str
     parameters: list[PARAMETER_TYPE] = []
+    error_code_mapping: dict[str, str] | None = None
     prompt: str | None = None
     steps: list[CodeBlockStep] | None = None
 
@@ -4250,6 +4275,7 @@ class CodeBlock(Block):
             "json": SimpleNamespace(dumps=json.dumps, loads=json.loads),
             "html": SimpleNamespace(escape=html.escape),
             "Exception": Exception,
+            "ErrorCode": ErrorCode,
             "otp": _code_block_otp_builtin,
             "solve_captcha": _code_block_solve_captcha_builtin,
         }
@@ -5228,6 +5254,8 @@ async def wrapper({default_args}):
         organization_id: str | None,
         browser_state: BrowserState | None,
         page: Page | None,
+        output_parameter_value: dict[str, Any] | list | str | None = None,
+        error_codes: list[str] | None = None,
     ) -> BlockResult:
         """Fail a code block after recording the page it died on.
 
@@ -5245,10 +5273,11 @@ async def wrapper({default_args}):
         return await self.build_block_result(
             success=False,
             failure_reason=failure_reason,
-            output_parameter_value=None,
+            output_parameter_value=output_parameter_value,
             status=status,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
+            error_codes=error_codes,
         )
 
     async def _resolve_failure_with_heal(
@@ -5959,6 +5988,27 @@ async def wrapper({default_args}):
                     organization_id=organization_id,
                     browser_state=browser_state,
                     page=page,
+                )
+            if isinstance(e, ErrorCode) and self.error_code_mapping and e.error_code in self.error_code_mapping:
+                # A declared business error: skip self-heal entirely (it's an intentional
+                # outcome, not an unexpected failure to recover from) and shape the output as a
+                # USER_DEFINED_ERROR. An undeclared code, or ErrorCode with no manifest at all,
+                # falls through unchanged into the ordinary exception path below.
+                await recorder.persist(recorder.recorded_actions())
+                await recorder.finalize(success=False)
+                reasoning = workflow_run_context.mask_secrets_in_data(e.reasoning)
+                failure_output = build_user_defined_error_output(e.error_code, reasoning)
+                return await self._failed_result_with_evidence(
+                    failure_reason=reasoning,
+                    status=BlockStatus.failed,
+                    workflow_run_context=workflow_run_context,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    browser_state=browser_state,
+                    page=page,
+                    output_parameter_value=failure_output,
+                    error_codes=[e.error_code],
                 )
             exc = CustomizedCodeException(e)
             failing_line = user_code_line_from_exception(e)

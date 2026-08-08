@@ -78,6 +78,7 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
 )
 from skyvern.forge.sdk.copilot.completion_verification import only_structural_requested_output_abstentions
 from skyvern.forge.sdk.copilot.config import (
+    DEFAULT_MAX_TURNS,
     SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD,
     BlockAuthoringPolicy,
     CopilotConfig,
@@ -113,6 +114,7 @@ from skyvern.forge.sdk.copilot.credential_literal_rebind import (
 from skyvern.forge.sdk.copilot.credential_pause import credential_pause_reason, preflight_credential_pause
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
+    _elapsed_run_seconds,
     artifact_health_blocked,
     dump_derivation_inputs,
     log_scouted_spine_unresolved_at_turn_halt,
@@ -1918,6 +1920,15 @@ def _attempted_summary(narrative_summary: object, narrative_payload: object) -> 
     return None
 
 
+def _terminal_cause_for_context(ctx: CopilotContext) -> TerminalCause | None:
+    # The deadline owns capacity, so it wins if both capacity latches are set.
+    if ctx.copilot_total_timeout_exceeded is True:
+        return "deadline_expired"
+    if ctx.copilot_max_turns_exceeded is True:
+        return "max_turns_exceeded"
+    return None
+
+
 def _assemble_terminal_envelope_safe(
     *,
     response_type: str,
@@ -2080,7 +2091,7 @@ def _make_agent_result(
             workflow_mutated=bool(kwargs.get("workflow_was_persisted")) or kwargs.get("updated_workflow") is not None,
             turn_outcome_response_kind=turn_outcome_response_kind,
             final_message=str(kwargs.get("user_response") or ""),
-            terminal_cause="deadline_expired" if ctx.copilot_total_timeout_exceeded is True else None,
+            terminal_cause=_terminal_cause_for_context(ctx),
         )
     kwargs["terminal_envelope"] = terminal_envelope
     result = AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
@@ -3334,6 +3345,19 @@ def _build_max_turns_exit_result(ctx: CopilotContext, global_llm_context: str | 
         tested_reply=_MAX_TURNS_REPLY_TESTED,
         terminal_reason="max_turns",
     )
+
+
+def _handle_max_turns_exceeded(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+    ctx.copilot_max_turns_exceeded = True
+    start_monotonic = ctx.copilot_run_start_monotonic
+    LOG.warning(
+        "copilot_max_turns_exceeded",
+        limit=ctx.copilot_config.max_turns if ctx.copilot_config is not None else DEFAULT_MAX_TURNS,
+        iteration=ctx.enforcement_pass_count,
+        elapsed_seconds=round(_elapsed_run_seconds(ctx, start_monotonic), 3) if start_monotonic is not None else 0.0,
+        model_call_count=ctx.model_calls_this_turn,
+    )
+    return _build_max_turns_exit_result(ctx, global_llm_context)
 
 
 def _build_unexpected_error_exit_result(
@@ -5391,7 +5415,7 @@ async def _run_copilot_turn_impl(
                 )
                 return _build_turn_halt_exit_result(ctx, global_llm_context, exc.halt)
             except MaxTurnsExceeded:
-                return _build_max_turns_exit_result(ctx, global_llm_context)
+                return _handle_max_turns_exceeded(ctx, global_llm_context)
             except CopilotTotalTimeoutError:
                 return _build_timeout_exit_result(ctx, global_llm_context)
             except CopilotUnrecoverableToolError as exc:
