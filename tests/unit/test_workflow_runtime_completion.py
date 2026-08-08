@@ -21,6 +21,7 @@ from skyvern.forge.sdk.workflow.runtime_completion import (
     parse_completion_contract,
     with_contract,
 )
+from skyvern.forge.sdk.workflow.service import run_selection_is_partial
 
 _DOWNLOAD_CONTRACT = {
     "completion_contract": {
@@ -264,6 +265,83 @@ async def test_finalize_skips_grading_a_partial_run(monkeypatch: pytest.MonkeyPa
     )
 
     assert statuses == [WorkflowRunStatus.completed]
+
+
+@pytest.mark.asyncio
+async def test_finalize_grades_a_test_run_against_the_requested_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A copilot test run executes a version the obligation has not been written onto yet, so a run
+    that registered nothing must still not finalize as completed."""
+    service, run, statuses = _wire_finalize(monkeypatch, contract=None, downloaded=[])
+
+    await service._finalize_workflow_run_status(
+        workflow_run_id=run.workflow_run_id,
+        workflow_run=run,
+        pre_finally_status=WorkflowRunStatus.running,
+        pre_finally_failure_reason=None,
+        requested_completion_contract=_DERIVED_CONTRACT,
+    )
+
+    assert statuses == [WorkflowRunStatus.terminated]
+
+
+@pytest.mark.asyncio
+async def test_finalize_completes_a_test_run_that_produced_the_requested_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, run, statuses = _wire_finalize(monkeypatch, contract=None, downloaded=["invoice.pdf"])
+
+    await service._finalize_workflow_run_status(
+        workflow_run_id=run.workflow_run_id,
+        workflow_run=run,
+        pre_finally_status=WorkflowRunStatus.running,
+        pre_finally_failure_reason=None,
+        requested_completion_contract=_DERIVED_CONTRACT,
+    )
+
+    assert statuses == [WorkflowRunStatus.completed]
+
+
+@pytest.mark.asyncio
+async def test_a_subset_run_stays_ungraded_even_with_a_requested_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    service, run, statuses = _wire_finalize(monkeypatch, contract=None, downloaded=[])
+
+    await service._finalize_workflow_run_status(
+        workflow_run_id=run.workflow_run_id,
+        workflow_run=run,
+        pre_finally_status=WorkflowRunStatus.running,
+        pre_finally_failure_reason=None,
+        is_partial_run=True,
+        requested_completion_contract=_DERIVED_CONTRACT,
+    )
+
+    assert statuses == [WorkflowRunStatus.completed]
+
+
+def _workflow_with_blocks(*labels: str, finally_block_label: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        workflow_definition=SimpleNamespace(
+            blocks=[SimpleNamespace(label=label) for label in labels],
+            finally_block_label=finally_block_label,
+        )
+    )
+
+
+def test_a_selection_naming_every_block_is_not_a_partial_run() -> None:
+    workflow = _workflow_with_blocks("download_statement", "summarize")
+
+    assert run_selection_is_partial(workflow, None) is False
+    assert run_selection_is_partial(workflow, ["download_statement", "summarize"]) is False
+    assert run_selection_is_partial(workflow, ["download_statement"]) is True
+
+
+def test_the_finally_block_is_not_owed_by_a_full_selection() -> None:
+    """execute_workflow runs the finally block on its own path, so a full selection never names it.
+
+    Counting it as unrun would silently skip contract grading for every workflow that has one."""
+    workflow = _workflow_with_blocks("download_statement", "summarize", "cleanup", finally_block_label="cleanup")
+
+    assert run_selection_is_partial(workflow, ["download_statement", "summarize"]) is False
+    assert run_selection_is_partial(workflow, ["download_statement"]) is True
 
 
 def test_a_stored_contract_survives_a_write_that_does_not_carry_one() -> None:
