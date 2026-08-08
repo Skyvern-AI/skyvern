@@ -8571,7 +8571,7 @@ def _dump_imposition_decision(
         changed = result.workflow_yaml != workflow_yaml
         prior_source, prior_yaml = _prior_yaml_source(ctx)
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "source_version": __version__,
             "workflow_yaml": workflow_yaml,
             "prior_source": prior_source,
@@ -8582,7 +8582,7 @@ def _dump_imposition_decision(
             "impose_synthesized_code_block": ctx.impose_synthesized_code_block,
             "update_workflow_called": ctx.update_workflow_called,
             "turn_origin": str(ctx.turn_origin),
-            "raw_code_artifact_metadata": ctx.raw_code_artifact_metadata,
+            "raw_code_artifact_metadata": _imposition_dump_metadata(ctx.raw_code_artifact_metadata),
             # The branch inputs as the run left them, read from retained state: deriving the plan here
             # would latch one the decision never latched and change the next evaluation's reach.
             "reaches_goal": synthesized_trajectory_reaches_goal(ctx),
@@ -8598,6 +8598,19 @@ def _dump_imposition_decision(
             json.dump(payload, handle, default=str)
     except Exception:
         LOG.info("copilot_imposition_input_dump_failed", exc_info=True)
+
+
+def _imposition_dump_metadata(raw_metadata: object) -> object:
+    """Keep Pydantic metadata structured so offline replay receives the live branch inputs."""
+    if isinstance(raw_metadata, CodeArtifactMetadata):
+        return raw_metadata.model_dump(mode="json", exclude_none=True)
+    if isinstance(raw_metadata, list):
+        return [_imposition_dump_metadata(item) for item in raw_metadata]
+    if isinstance(raw_metadata, tuple):
+        return [_imposition_dump_metadata(item) for item in raw_metadata]
+    if isinstance(raw_metadata, dict):
+        return {key: _imposition_dump_metadata(value) for key, value in raw_metadata.items()}
+    return raw_metadata
 
 
 def _maybe_impose_synthesized_code_block(
