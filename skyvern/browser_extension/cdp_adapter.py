@@ -351,7 +351,6 @@ class ExtensionCdpAdapter:
                 if type(tab_id) is not int:
                     raise BrowserExtensionError("Created tab id is invalid")
                 tabs = [{"tabId": tab_id, "url": "about:blank", "title": ""}]
-                self._begin_tab_scope(tab_id)
             except Exception as exc:
                 LOG.debug(
                     "browser_extension_auto_attach_target_skipped",
