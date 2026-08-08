@@ -1,9 +1,14 @@
 import { ExclamationTriangleIcon } from "@radix-ui/react-icons";
 
-import { TurnNarrativeState } from "../narrativeState";
+import { humanizeJudgeText, TurnNarrativeState } from "../narrativeState";
 
 // eslint-disable-next-line react-refresh/only-export-components
 export function shouldShowFixCard(turn: TurnNarrativeState): boolean {
+  // Never offer to diagnose a run the user deliberately stopped; a cancel also
+  // lands on terminal "error".
+  if (turn.cancelled) {
+    return false;
+  }
   return (
     turn.terminal === "error" || turn.blocks.some((b) => b.state === "failed")
   );
@@ -31,10 +36,11 @@ type FixCardProps = {
 };
 
 export function FixCard({ turn, onFix, onExplain }: FixCardProps) {
-  const headline =
+  const headline = humanizeJudgeText(
     turn.terminalMessage ??
-    failedBlockError(turn) ??
-    "The last run hit an error.";
+      failedBlockError(turn) ??
+      "The last run hit an error.",
+  );
 
   return (
     <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-3">
