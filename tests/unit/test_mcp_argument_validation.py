@@ -7,11 +7,11 @@ names that don't match the tool's contract.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
+from skyvern.cli.core.browser_ops import NavigateResult
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import mcp
@@ -41,7 +41,7 @@ def _mock_navigation(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     page = make_skyvern_page(make_mock_page())
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
-    navigate = AsyncMock(return_value=SimpleNamespace(url="https://example.com", title="Example"))
+    navigate = AsyncMock(return_value=NavigateResult(url="https://example.com", title="Example"))
     monkeypatch.setattr(mcp_browser, "do_navigate", navigate)
     return navigate
 
