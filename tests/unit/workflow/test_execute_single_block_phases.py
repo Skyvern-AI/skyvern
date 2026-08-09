@@ -28,6 +28,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import DebugSessionProfileDecision, WorkflowService
 from skyvern.schemas.scripts import ScriptBlock
 from skyvern.schemas.workflows import BlockResult, BlockStatus
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
 
 
 def _output_parameter(key: str) -> OutputParameter:
@@ -368,6 +369,7 @@ async def test_login_block_with_saved_profile_rewrites_goal_and_persists_profile
     page.url = "https://example.com/home"
     browser_state = AsyncMock()
     browser_state.get_working_page = AsyncMock(return_value=page)
+    browser_state.browser_artifacts = BrowserArtifacts(applied_browser_profile_id="bp_123")
     # No browser open yet: the credential profile loads into a fresh browser (the seed path this test
     # covers). A pre-existing browser would instead degrade to fresh (see the cached-browser guard).
     monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *a, **k: None)
