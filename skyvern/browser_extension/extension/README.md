@@ -25,14 +25,10 @@ To set it up manually:
    skyvern run mcp --browser-extension
    ```
 
-5. Start the recommended one-click pairing flow:
-
-   ```bash
-   skyvern browser extension-pair
-   ```
-
+5. Ask your MCP client to create a browser session. If the extension is not paired, Skyvern automatically opens a secure
+   pairing tab. You can also start pairing explicitly with `skyvern browser extension-pair`.
 6. Click **Approve** in the pairing page, then approve the pairing in the **Skyvern Agent** confirmation tab that opens.
-   The link expires after two minutes and is single-use, so rerun the command when needed.
+   The link expires after two minutes and is single-use, so retry the browser-session request or rerun the command when needed.
 7. Add any tab you want Skyvern to control to the **Skyvern Controlled** tab group. Dragging a tab into the group grants
    access and dragging it out revokes access. The popup's **Add to Skyvern Controlled** and
    **Remove from Skyvern Controlled** buttons perform the same actions.

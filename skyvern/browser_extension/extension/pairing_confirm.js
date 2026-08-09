@@ -1,5 +1,4 @@
 const PENDING_PAIRING_STORAGE_KEY = "pendingPairingOffer";
-const RECOVERY_COMMAND = "skyvern browser extension-pair";
 
 const elements = {
   question: document.querySelector("#pairing-question"),
@@ -13,9 +12,6 @@ const elements = {
   resultTitle: document.querySelector("#result-title"),
   resultMessage: document.querySelector("#result-message"),
   recovery: document.querySelector("#recovery"),
-  recoveryCommand: document.querySelector("#recovery-command"),
-  copyButton: document.querySelector("#copy-command"),
-  copyLabel: document.querySelector("#copy-label"),
 };
 
 let renderGeneration = 0;
@@ -80,24 +76,6 @@ function clearResult() {
   elements.recovery.hidden = true;
 }
 
-async function copyRecoveryCommand() {
-  try {
-    await navigator.clipboard.writeText(RECOVERY_COMMAND);
-  } catch (_error) {
-    const range = document.createRange();
-    range.selectNodeContents(elements.recoveryCommand);
-    const selection = globalThis.getSelection();
-    selection.removeAllRanges();
-    selection.addRange(range);
-    document.execCommand("copy");
-    selection.removeAllRanges();
-  }
-  elements.copyLabel.textContent = "Copied";
-  setTimeout(() => {
-    elements.copyLabel.textContent = "Copy";
-  }, 1600);
-}
-
 async function renderPendingOffer() {
   const generation = ++renderGeneration;
   const stored = await chrome.storage.session.get(PENDING_PAIRING_STORAGE_KEY);
@@ -112,7 +90,7 @@ async function renderPendingOffer() {
     showResult({
       state: "error",
       title: "Pairing request expired",
-      message: "Start a new pairing request from your terminal to continue.",
+      message: "The secure pairing request expired before approval.",
       recoverable: true,
       terminal: true,
     });
@@ -194,10 +172,6 @@ elements.cancelButton.addEventListener("click", () => {
       });
       elements.cancelButton.disabled = false;
     });
-});
-
-elements.copyButton.addEventListener("click", () => {
-  void copyRecoveryCommand();
 });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {

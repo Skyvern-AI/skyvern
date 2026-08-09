@@ -96,6 +96,58 @@ export function isInterimOutcome(role: RunOutcomeRole | undefined): boolean {
   return role === "interim_build_test";
 }
 
+// The completion judge's verdict text is a backend log/policy contract, so it is rewritten
+// at the display layer rather than at the source. The backend also appends it to the
+// assistant's closing message, so both paths run through this. Unrecognized text passes through.
+const JUDGE_REWRITES: ReadonlyArray<readonly [RegExp, string]> = [
+  [
+    /The run completed but did not demonstrate the goal outcome\(s\)\.\s*Missing evidence:\s*/g,
+    "The run finished but didn't produce what you asked for: ",
+  ],
+  [
+    /The run completed but did not demonstrate the goal outcome\(s\):\s*/g,
+    "The run finished but didn't produce what you asked for: ",
+  ],
+  [
+    /The run completed but did not demonstrate the goal outcome\(s\)\./g,
+    "The run finished but didn't produce what you asked for.",
+  ],
+];
+
+// Repair instruction aimed at the agent; the user is not the one editing blocks. The backend
+// truncates display_reason to 160 chars, so it usually arrives cut at an arbitrary point.
+const JUDGE_INSTRUCTION =
+  "Add or fix the block that produces the missing outcome evidence, then re-run.";
+
+// Only ever reached for text whose judge headline was recognized. The trailing-prefix scan
+// would otherwise eat the last word of ordinary prose ("Choose option A" -> "Choose option").
+function stripJudgeInstruction(text: string): string {
+  const found = text.indexOf(JUDGE_INSTRUCTION);
+  if (found !== -1) {
+    return text.slice(0, found) + text.slice(found + JUDGE_INSTRUCTION.length);
+  }
+  // The 160-char budget cut the instruction short, so it always runs to end of string.
+  for (let i = 1; i < text.length; i += 1) {
+    if (!/\s/.test(text[i - 1]!)) continue;
+    if (JUDGE_INSTRUCTION.startsWith(text.slice(i))) {
+      return text.slice(0, i);
+    }
+  }
+  return text;
+}
+
+export function humanizeJudgeText(text: string): string {
+  const rewritten = JUDGE_REWRITES.reduce(
+    (result, [pattern, replacement]) => result.replace(pattern, replacement),
+    text,
+  );
+  // Free assistant prose never carries the judge headline, so leave it exactly as written.
+  if (rewritten === text) {
+    return text;
+  }
+  return stripJudgeInstruction(rewritten).replace(/ {2,}/g, " ").trim();
+}
+
 export interface TerminalEnvelopeFacts {
   runVerdict: BlockOutcome | null;
   runDisplayReason: string | null;
