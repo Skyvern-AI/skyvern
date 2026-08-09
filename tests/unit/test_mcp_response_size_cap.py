@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from skyvern.cli.core.browser_ops import NavigateResult
 from skyvern.cli.core.result import Artifact, BrowserContext
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import mcp
@@ -244,7 +245,7 @@ async def test_every_registered_extract_tool_caps_an_oversize_extraction(
     monkeypatch.setattr(
         mcp_browser,
         "do_navigate",
-        AsyncMock(return_value=SimpleNamespace(url="https://example.test", title="Example")),
+        AsyncMock(return_value=NavigateResult(url="https://example.test", title="Example")),
     )
     monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
     monkeypatch.setattr(
@@ -275,7 +276,7 @@ def _stub_browser(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         mcp_browser,
         "do_navigate",
-        AsyncMock(return_value=SimpleNamespace(url="https://example.test", title="Example")),
+        AsyncMock(return_value=NavigateResult(url="https://example.test", title="Example")),
     )
     monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
     monkeypatch.setattr(
