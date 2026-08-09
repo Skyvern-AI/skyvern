@@ -643,7 +643,7 @@ class TestOriginAuthorization:
 
 
 class TestRuntimeAuthority:
-    """The enrolled policy is a ceiling, not the complete authority (ADR-0011).
+    """The enrolled policy is a ceiling, not the complete authority (ADR-0013).
 
     Every test here pins verdict=NO_MATCH and puts the page origin *inside* POLICY.allowed_origins,
     so the only thing that can deny is the authority gate. Without those two pins a request denies
@@ -673,7 +673,7 @@ class TestRuntimeAuthority:
         assert decision.reasons == (PolicyReason.MISSING_RUNTIME_AUTHORITY,)
 
     def test_invalidated_authority_denies_even_carrying_the_right_origins(self) -> None:
-        # ADR-0011: rotation or conflict after a browser context is bound is permanent, and the
+        # ADR-0013: rotation or conflict after a browser context is bound is permanent, and the
         # origins it used to carry do not buy it back.
         authority = RuntimeOriginAuthority(state=AuthorityState.INVALIDATED, origins=POLICY.allowed_origins)
         decision = decide_browser_action(build_request(GotoUrlAction(url=HOME), authority=authority))
@@ -711,7 +711,7 @@ class TestRuntimeAuthority:
         assert decision.reasons == (PolicyReason.TARGET_ORIGIN_NOT_AUTHORIZED,)
 
     def test_recovery_actions_survive_an_unwired_authority(self) -> None:
-        # ADR-0011 keeps read-only and recovery actions available so a run can stop safely. If the
+        # ADR-0013 keeps read-only and recovery actions available so a run can stop safely. If the
         # authority gate ever swallows these, a protected run has no way out.
         for action in (WaitAction(), ScrollAction(), GoBackAction(), ExtractAction(), TerminateAction()):
             decision = decide_browser_action(build_request(action, authority=UNWIRED_AUTHORITY))

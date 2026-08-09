@@ -5,7 +5,7 @@ from fastapi import Depends, HTTPException, status
 
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
-from skyvern.exceptions import ScrapingFailed, SkyvernActionFailed
+from skyvern.exceptions import ActionPolicyBlocked, ScrapingFailed, SkyvernActionFailed
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import validate_download_url
 from skyvern.forge.sdk.core import skyvern_context
@@ -180,6 +180,11 @@ async def run_sdk_action(
         )
         result: Any | None = None
         try:
+            app.AGENT_FUNCTION.register_browser_origin_authority(
+                task_id=task.task_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                url=action_request.url,
+            )
             scraped_page = await ScriptSkyvernPage.create_scraped_page(browser_session_id=browser_session_id)
             page = await scraped_page._browser_state.must_get_working_page()
             page_ai = RealSkyvernPageAi(scraped_page, page)
@@ -256,6 +261,19 @@ async def run_sdk_action(
                 organization_id=organization_id,
                 status=TaskStatus.completed,
             )
+        except ActionPolicyBlocked as e:
+            await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.failed,
+                failure_reason=e.message,
+            )
+            LOG.warning(
+                "SDK action blocked by extension policy",
+                action_type=action.type,
+                error=e.message,
+            )
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=e.message)
         except ScrapingFailed as e:
             await app.DATABASE.tasks.update_task(
                 task_id=task.task_id,
