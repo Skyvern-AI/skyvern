@@ -772,6 +772,9 @@ class CopilotContext(AgentContext):
     format_nudge_count: int = 0
     no_workflow_nudge_count: int = 0
     copilot_total_timeout_exceeded: bool = False
+    copilot_max_turns_exceeded: bool = False
+    model_calls_this_turn: int = 0
+    enforcement_pass_count: int = 0
     user_message: str = ""
     block_goal_main_goal: str = ""
     allow_untested_workflow_draft: bool = False

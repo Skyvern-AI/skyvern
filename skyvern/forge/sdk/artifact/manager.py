@@ -463,6 +463,18 @@ class ArtifactManager:
             uri=uri,
         )
         if existing is not None:
+            # Changed bytes under the same uri refresh the row's checksum so the loop filter's
+            # (filename, checksum, url) signature moves with the content instead of hiding a
+            # genuine re-download behind the stale row. A failed refresh propagates: the stale
+            # row must not vouch for bytes it does not describe, so the save loop records the
+            # file as skipped and workflow finalization's re-save retries the refresh.
+            if checksum is not None and existing.checksum != checksum:
+                await app.DATABASE.artifacts.refresh_download_artifact_content(
+                    artifact_id=existing.artifact_id,
+                    organization_id=organization_id,
+                    checksum=checksum,
+                    file_size=file_size,
+                )
             return existing.artifact_id
 
         artifact_id = generate_artifact_id()

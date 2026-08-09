@@ -54,7 +54,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _should_force_advisory_run_dispatch,
     _summarize_tool_output,
     aggressive_prune,
-    arm_credential_scout_reopen,
     enforcement_decision,
     mint_scout_observation_contract_for_ctx,
     pre_run_gated_outputs_without_path,
@@ -135,8 +134,6 @@ class _Ctx:
         self.latest_diagnosis_repair_contract = None
         self.last_code_authoring_repair_context = None
         self.synthesized_block_reopened_after_failed_run = False
-        self.synthesized_block_reopened_for_credential_scout = False
-        self.credential_scout_rescout_context_key = None
         self.synthesized_goal_complete_landed = False
         self.impose_synthesized_code_block = False
         self.scouted_output_covered_paths: set[str] = set()
@@ -3260,29 +3257,6 @@ class TestCredentialFlowGoalComplete:
             observed_password_control=False,
         )
         assert synthesized_trajectory_is_goal_complete(ctx) is True
-
-
-class TestCredentialScoutReopen:
-    def _offered_complete_ctx(self) -> _Ctx:
-        helper = TestCredentialFlowGoalComplete()
-        return helper._ctx_with_inventory(
-            helper._two_screen_full_login(),
-            inventory={"cred_1": frozenset({"username", "password"})},
-        )
-
-    def test_arm_is_one_shot_per_identity_digest(self) -> None:
-        ctx = make_copilot_context()
-        assert arm_credential_scout_reopen(ctx, "identity-1") is True
-        assert ctx.synthesized_block_reopened_for_credential_scout is True
-        assert synthesized_persistence_reopened(ctx) is True
-
-        ctx.synthesized_block_reopened_for_credential_scout = False
-        assert arm_credential_scout_reopen(ctx, "identity-1") is False
-        assert ctx.synthesized_block_reopened_for_credential_scout is False
-        assert synthesized_persistence_reopened(ctx) is False
-
-        assert arm_credential_scout_reopen(ctx, "identity-2") is True
-        assert ctx.synthesized_block_reopened_for_credential_scout is True
 
 
 def _deadline_ctx() -> SimpleNamespace:
