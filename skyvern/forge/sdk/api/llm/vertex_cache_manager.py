@@ -9,6 +9,7 @@ Unlike the Anthropic-style cache_control markers, Vertex AI requires:
 """
 
 import json
+import re
 from datetime import datetime
 from typing import Any
 
@@ -20,8 +21,28 @@ from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 
 from skyvern.config import settings
+from skyvern.utils.token_counter import count_tokens
 
 LOG = structlog.get_logger()
+
+# /cachedContents rejects caches below a per-model token minimum (400 with min_total_token_count).
+# Vertex docs: 32,769 tokens for Gemini 1.5; 2,048 for Gemini 2.x; 4,096 for Gemini 3.x — the 3.x GA
+# floor is what broke every cache create when gemini-3.1-flash-lite moved off its -preview id
+# (SKY-10043 §9). Unknown families fail high to the 3.x floor.
+_MIN_CACHED_CONTENT_TOKENS_GEMINI_1X = 32769
+_MIN_CACHED_CONTENT_TOKENS_GEMINI_2X = 2048
+_MIN_CACHED_CONTENT_TOKENS_DEFAULT = 4096
+
+
+def min_cached_content_tokens(model_name: str) -> int:
+    match = re.search(r"gemini-(\d+)", model_name.lower())
+    if match:
+        major = int(match.group(1))
+        if major < 2:
+            return _MIN_CACHED_CONTENT_TOKENS_GEMINI_1X
+        if major == 2:
+            return _MIN_CACHED_CONTENT_TOKENS_GEMINI_2X
+    return _MIN_CACHED_CONTENT_TOKENS_DEFAULT
 
 
 class VertexCacheManager:
@@ -86,7 +107,7 @@ class VertexCacheManager:
         cache_key: str,
         ttl_seconds: int = 3600,
         system_instruction: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         """
         Create a cache object using Vertex AI's /cachedContents API.
 
@@ -98,8 +119,24 @@ class VertexCacheManager:
             system_instruction: Optional system instruction to include
 
         Returns:
-            Cache data with 'name', 'expireTime', etc.
+            Cache data with 'name', 'expireTime', etc., or None when the content is
+            below the model's minimum cacheable size and creation was skipped.
         """
+        min_tokens = min_cached_content_tokens(model_name)
+        content_token_count = count_tokens(static_content)
+        if system_instruction:
+            content_token_count += count_tokens(system_instruction)
+        if content_token_count < min_tokens:
+            LOG.info(
+                "Static content below Vertex cachedContents minimum, skipping cache creation",
+                sampling=True,
+                cache_key=cache_key,
+                model=model_name,
+                content_token_count=content_token_count,
+                min_required_tokens=min_tokens,
+            )
+            return None
+
         # Check if cache already exists for this key
         if cache_key in self._cache_registry:
             cache_data = self._cache_registry[cache_key]
