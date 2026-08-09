@@ -182,6 +182,36 @@ async def test_auto_attach_creates_blank_tab_when_scope_is_empty(
 
 
 @pytest.mark.asyncio
+async def test_auto_attach_scope_event_during_blank_tab_creation_attaches_once(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, _ = adapter_server
+    relay.block_attach_tab_id = 100
+    original_request = relay.request
+
+    async def request_with_scope_event(op: str, args: dict, timeout: float = 30.0) -> dict:
+        result = await original_request(op, args, timeout)
+        if op == "tabs.create":
+            await adapter.handle_extension_event(
+                "scope.tabAdded",
+                {"tabId": result["tabId"], "url": args["url"], "title": ""},
+            )
+            asyncio.get_running_loop().call_soon(relay.release_attach.set)
+        return result
+
+    relay.request = request_with_scope_event
+
+    async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+        await ws.send_json({"id": 1, "method": "Target.setAutoAttach", "params": {"autoAttach": True}})
+        assert await receive_response(ws, 1) == {"id": 1, "result": {}}
+        await receive_event(ws, "Target.attachedToTarget")
+
+    assert [call for call in relay.calls if call[0] == "debugger.attach"] == [
+        ("debugger.attach", {"tabId": 100}),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_auto_attach_existing_and_later_scoped_tabs() -> None:
     relay = StubRelay(
         [

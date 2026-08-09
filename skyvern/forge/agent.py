@@ -42,8 +42,10 @@ from skyvern.errors.errors import (
     filter_to_user_defined_codes,
 )
 from skyvern.exceptions import (
+    ActionPolicyBlocked,
     BrowserSessionNotFound,
     DownloadFileMaxWaitingTime,
+    DownloadSaveIncompleteError,
     EmptyScrapePage,
     FailedToGetTOTPVerificationCode,
     FailedToNavigateToUrl,
@@ -665,6 +667,8 @@ class ForgeAgent:
         for parameter in task_block_parameters:
             navigation_payload[parameter.key] = workflow_run_context.get_value(parameter.key)
 
+        # A URL rendered from workflow input is untrusted, so it must not become trusted authority.
+        declares_static_origin = task_block.declares_static_browser_origin(workflow_run_context)
         task_url = task_block.url
         if task_url is None:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(
@@ -711,6 +715,12 @@ class ForgeAgent:
             download_timeout=task_block.download_timeout,
             include_extracted_text=task_block.include_extracted_text,
         )
+        if declares_static_origin:
+            app.AGENT_FUNCTION.register_browser_origin_authority(
+                task_id=task.task_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                url=task.url,
+            )
         LOG.info(
             "Created a new task for workflow run",
             sampling=True,
@@ -1279,7 +1289,9 @@ class ForgeAgent:
                 list_files_before=list_files_before,
             )
             return step, detailed_output, None
-        except StepTerminationError as e:
+        except (StepTerminationError, ActionPolicyBlocked) as e:
+            # Extension action policies use a BaseException signal so it reaches this explicit run
+            # boundary through broad recovery handlers on the mutation paths.
             LOG.warning(
                 "Step cannot be executed, marking task as failed",
                 exc_info=True,
@@ -1470,7 +1482,7 @@ class ForgeAgent:
         step: Step | None,
         reason: str | None,
         browser_state: BrowserState | None = None,
-        exception: Exception | None = None,
+        exception: BaseException | None = None,
     ) -> bool:
         try:
             if step is not None:
@@ -1479,8 +1491,12 @@ class ForgeAgent:
                     status=StepStatus.failed,
                 )
 
-            # Update task status first
-            failure_category = classify_from_failure_reason(reason, exception=exception, fallback_to_unknown=True)
+            # Update task status first. A policy block is a BaseException, not a generic runtime failure,
+            # so keep it out of the Exception-typed classifier.
+            classifier_exception = exception if isinstance(exception, Exception) else None
+            failure_category = classify_from_failure_reason(
+                reason, exception=classifier_exception, fallback_to_unknown=True
+            )
             LOG.info(
                 "Task failure classified",
                 task_id=task.task_id,
@@ -1761,6 +1777,7 @@ class ForgeAgent:
             ScrapingFailed,
             MissingBrowserStatePage,
             ScreenshotTargetClosed,
+            StepTerminationError,
         ):
             raise
 
@@ -4168,6 +4185,8 @@ class ForgeAgent:
                 cache_key=cache_key,
                 ttl_seconds=3600,  # 1 hour
             )
+            if cache_data is None:
+                return
 
             # Store cache metadata in context
             context.vertex_cache_name = cache_data["name"]
@@ -4344,6 +4363,7 @@ class ForgeAgent:
             )
         else:
             elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
+        elements_for_prompt = app.AGENT_FUNCTION.transform_browser_elements_for_prompt(elements_for_prompt)
 
         open_tabs_context = await build_open_tabs_context(browser_state, page)
         show_close_page_action = open_tabs_context is not None
@@ -5025,10 +5045,19 @@ class ForgeAgent:
                         finalization_run_id = (
                             resolve_run_download_id(context, fallback_run_id=task.workflow_run_id) or task.task_id
                         )
-                        await app.STORAGE.save_downloaded_files(
-                            organization_id=task.organization_id,
-                            run_id=finalization_run_id,
-                        )
+                        try:
+                            await app.STORAGE.save_downloaded_files(
+                                organization_id=task.organization_id,
+                                run_id=finalization_run_id,
+                            )
+                        except DownloadSaveIncompleteError as exc:
+                            # Session-artifact claiming below must still run for the files that saved.
+                            LOG.warning(
+                                "Some downloaded files were skipped during cleanup save",
+                                task_id=task.task_id,
+                                workflow_run_id=task.workflow_run_id,
+                                skipped_file_count=len(exc.skipped_files),
+                            )
                         # Tag any session-scoped DOWNLOAD artifacts created during
                         # this run with run_id, so GET /v1/runs/{id} surfaces them
                         # (the watcher in browser_controller can't know the active

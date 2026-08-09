@@ -31,6 +31,7 @@ import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
 import { usePasteSkillHintStore } from "@/store/usePasteSkillHintStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+import { describeRecordedAction } from "@/routes/workflows/workflowBlockUtils";
 import {
   isBlockItem,
   WorkflowRunTimelineItem,
@@ -120,12 +121,6 @@ const MAX_TURN_SNAPSHOTS = 20;
 // they land without hammering the timeline endpoint.
 const RECORDED_ACTIONS_POLL_INTERVAL_MS = 2500;
 
-function normalizeInline(value: string | null | undefined): string | null {
-  if (!value) return null;
-  const trimmed = value.replace(/\s+/g, " ").trim();
-  return trimmed.length > 0 ? trimmed : null;
-}
-
 function recordedActionDurationMs(action: ActionsApiResponse): number | null {
   const output = action.output;
   if (!output || typeof output !== "object" || Array.isArray(output)) {
@@ -141,11 +136,9 @@ function toRecordedActionSummary(
   return {
     actionId: action.action_id,
     label: getReadableActionType(action.action_type),
-    summary:
-      normalizeInline(action.reasoning) ??
-      normalizeInline(action.text) ??
-      normalizeInline(action.response) ??
-      normalizeInline(action.description),
+    // The chat has no workflow definition in scope, so rows resolve from the action
+    // itself; the run-view timeline additionally matches the definition's step text.
+    summary: describeRecordedAction(action, null),
     durationMs: recordedActionDurationMs(action),
     failed: action.status === "failed",
   };

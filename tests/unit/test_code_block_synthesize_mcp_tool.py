@@ -79,6 +79,7 @@ def _expected_synthesis_data(*, strict_selectors: bool) -> dict[str, Any]:
     synthesized = synthesize_code_block(_fixture_trajectory(), strict_selectors=strict_selectors)
     assert synthesized is not None
     return {
+        "prompt": "",
         "code": textwrap.dedent(synthesized.code),
         "parameters": synthesized.parameters,
         "steps": synthesized.steps,

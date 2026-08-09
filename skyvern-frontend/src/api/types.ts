@@ -959,6 +959,9 @@ export type ActionsApiResponse = {
   created_by: string | null;
   text: string | null;
   screenshot_artifact_id?: string | null;
+  // On the base Action, so it survives the timeline's `list[Action]` serialization. Subclass-only
+  // fields (url, keys) do not and must not be declared here.
+  file_name?: string | null;
   // Code block recorded actions carry code_line and duration_ms here.
   output?:
     | { code_line?: number | null; duration_ms?: number | null }
@@ -1056,6 +1059,7 @@ export type CredentialApiResponse = {
   credential_type: "password" | "credit_card" | "secret";
   name: string;
   browser_profile_id?: string | null;
+  auto_profile_disabled?: boolean | null;
   pin_saved_session_ip?: boolean | null;
   tested_url?: string | null;
   user_context?: string | null;
@@ -1102,6 +1106,7 @@ export type CreateCredentialRequest = {
   proxy_session_id?: string | null;
   rotate_proxy_session_id?: boolean;
   browser_profile_id?: string | null;
+  auto_profile_disabled?: boolean;
   pin_saved_session_ip?: boolean;
 };
 

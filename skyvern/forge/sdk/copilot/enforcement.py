@@ -38,7 +38,6 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_carrier
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     CREDENTIAL_FILL_TOOL_NAME,
-    LIVE_SCOUT_CREDENTIAL_FIELDS,
     ONE_TIME_CODE_CREDENTIAL_FIELD,
     SYNTHESIZED_OFFER_SENTINEL,
     ObligationFinding,
@@ -84,6 +83,7 @@ from skyvern.forge.sdk.copilot.context import (
     coerce_ask_subject,
     parsed_ask_refs,
 )
+from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTIAL_FIELDS
 from skyvern.forge.sdk.copilot.credential_pause import credential_pause_would_fire, maybe_credential_pause
 from skyvern.forge.sdk.copilot.credential_resolution import url_parts
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
@@ -114,6 +114,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
 from skyvern.forge.sdk.copilot.reached_download_target import can_deliver_registered_download
 from skyvern.forge.sdk.copilot.request_policy import (
     REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS,
+    ClarificationReason,
     CompletionCriterion,
     RequestPolicy,
     floor_rekeyed_requested_output_paths,
@@ -153,7 +154,12 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     raise_if_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
-from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentMode
+from skyvern.forge.sdk.copilot.turn_intent import (
+    TurnIntent,
+    TurnIntentExpectedOutput,
+    TurnIntentMode,
+    turn_intent_authorizes_registered_download,
+)
 from skyvern.forge.sdk.copilot.turn_ownership import (
     TurnClaimant,
     claim_turn,
@@ -943,11 +949,65 @@ def _turn_intent_can_update_and_run_without_user_input(turn_intent: Any) -> bool
     return bool(turn_intent.authority.may_run_blocks)
 
 
+def turn_intent_output_schema_admitted(
+    *,
+    request_policy_has_completion_contract: bool,
+    request_policy_user_response_policy: str,
+    request_policy_clarification_reason: ClarificationReason | None,
+    turn_intent_mode: TurnIntentMode,
+    turn_intent_expected_output: TurnIntentExpectedOutput,
+    turn_intent_may_update_workflow: bool,
+    turn_intent_may_run_blocks: bool,
+    turn_intent_requires_user_input: bool,
+) -> bool:
+    """Pure form of the run-capable schema authority used by live enforcement and replay."""
+    return (
+        not request_policy_has_completion_contract
+        and request_policy_user_response_policy != "ask_clarification"
+        and request_policy_clarification_reason in (None, "none")
+        and turn_intent_mode in _AUTHORING_TURN_INTENT_MODES
+        and turn_intent_expected_output
+        in {TurnIntentExpectedOutput.RUN_RESULT, TurnIntentExpectedOutput.WORKFLOW_UPDATE}
+        and turn_intent_may_update_workflow
+        and turn_intent_may_run_blocks
+        and not turn_intent_requires_user_input
+    )
+
+
+def _turn_intent_settles_output_schema(ctx: CopilotContext) -> bool:
+    """Whether typed turn authority settles a schema-confirmation ask without classifier criteria.
+
+    The request-policy classifier used to mint an anonymous requested-output slot for requests such
+    as "get the number of errors". After the pre-pass ablation, a run-capable TurnIntent that says
+    no user input is required is the surviving typed authority for choosing a reasonable schema.
+    Keep this narrow to the typed ``output_schema`` consumer: it must not turn credential, URL, or
+    disambiguation asks into generic build retries.
+    """
+    request_policy = ctx.request_policy
+    if not isinstance(request_policy, RequestPolicy):
+        return False
+    turn_intent = ctx.turn_intent
+    if not isinstance(turn_intent, TurnIntent):
+        return False
+    return turn_intent_output_schema_admitted(
+        request_policy_has_completion_contract=request_policy_has_present_completion_contract(request_policy),
+        request_policy_user_response_policy=request_policy.user_response_policy,
+        request_policy_clarification_reason=request_policy.clarification_reason,
+        turn_intent_mode=turn_intent.mode,
+        turn_intent_expected_output=turn_intent.expected_output,
+        turn_intent_may_update_workflow=turn_intent.authority.may_update_workflow,
+        turn_intent_may_run_blocks=turn_intent.authority.may_run_blocks,
+        turn_intent_requires_user_input=turn_intent.authority.requires_user_input,
+    )
+
+
 def _present_completion_contract_ask_admission_base(ctx: CopilotContext) -> bool:
     request_policy = ctx.request_policy
     if not isinstance(request_policy, RequestPolicy):
         return False
-    if not request_policy_has_present_completion_contract(request_policy):
+    if not request_policy_has_present_completion_contract(
+        request_policy
+    ) and not turn_intent_authorizes_registered_download(ctx.turn_intent):
         return False
     if request_policy.user_response_policy == "ask_clarification":
         return False
@@ -1001,7 +1061,20 @@ def _dump_ask_gate_decision(ctx: CopilotContext, parsed: dict[str, Any], *, outc
             "user_response": parsed.get("user_response"),
             "admission_base": _present_completion_contract_ask_admission_base(ctx),
             "has_genuine_workflow_attempt": ctx.has_genuine_workflow_attempt(),
+            "request_policy_user_response_policy": policy.user_response_policy if policy else None,
+            "request_policy_clarification_reason": policy.clarification_reason if policy else None,
+            "request_policy_has_present_completion_contract": (
+                request_policy_has_present_completion_contract(policy) if isinstance(policy, RequestPolicy) else None
+            ),
             "turn_intent_mode": ctx.turn_intent.mode if ctx.turn_intent else None,
+            "turn_intent_expected_output": ctx.turn_intent.expected_output if ctx.turn_intent else None,
+            "turn_intent_may_update_workflow": (
+                ctx.turn_intent.authority.may_update_workflow if ctx.turn_intent else None
+            ),
+            "turn_intent_may_run_blocks": ctx.turn_intent.authority.may_run_blocks if ctx.turn_intent else None,
+            "turn_intent_requires_user_input": (
+                ctx.turn_intent.authority.requires_user_input if ctx.turn_intent else None
+            ),
             "criteria": [dataclasses.asdict(criterion) for criterion in criteria],
             "satisfied_criterion_ids": satisfied_ids,
         }
@@ -1019,7 +1092,7 @@ def _present_completion_contract_ask_retry(ctx: CopilotContext, parsed: dict[str
     if ask_subject is not None:
         # A schema ask the contract already answers is redundant whether or not the turn has
         # built anything yet, so it resolves on the base admission without the attempt check.
-        if _present_completion_contract_ask_admission_base(ctx):
+        if _present_completion_contract_ask_admission_base(ctx) or _turn_intent_settles_output_schema(ctx):
             auto_answer = _typed_ask_subject_auto_answer(ctx, ask_subject, parsed)
             if auto_answer is not None:
                 _dump_ask_gate_decision(ctx, parsed, outcome="auto_answered")
@@ -1082,7 +1155,26 @@ def _typed_ask_subject_auto_answer(ctx: CopilotContext, ask_subject: AskSubject,
     criteria = policy.graded_completion_criteria()
     requested = requested_output_paths(criteria) | floor_rekeyed_requested_output_paths(criteria)
     if not requested:
-        return None
+        if not _turn_intent_settles_output_schema(ctx):
+            return None
+        authority_source = (
+            "turn_intent_run_result"
+            if ctx.turn_intent and ctx.turn_intent.expected_output == TurnIntentExpectedOutput.RUN_RESULT
+            else "turn_intent_update_and_run"
+        )
+        LOG.info(
+            "copilot_ask_subject_auto_answered",
+            subject=ask_subject,
+            resolved_refs=[],
+            proposed_refs=parsed_ask_refs(parsed.get("refs")),
+            authority_source=authority_source,
+        )
+        return (
+            "This turn's typed intent already authorizes updating and testing the workflow and says "
+            "no user input is required. Choose reasonable names and representations for the "
+            "requested values, then author and test the workflow instead of asking the user to "
+            "confirm the output shape."
+        )
     refs = parsed_ask_refs(parsed.get("refs"))
     if refs and set(refs) <= requested:
         resolved = sorted(set(refs))
@@ -2291,8 +2383,6 @@ def synthesized_offer_reopened_for_extraction_plan(
 
 
 def synthesized_persistence_reopened(ctx: AgentContext) -> bool:
-    if ctx.synthesized_block_reopened_for_credential_scout:
-        return True
     if synthesized_goal_completion_landing_pending(ctx):
         return True
     return synthesized_persistence_reopened_after_failed_run(ctx)
@@ -2851,9 +2941,8 @@ def _credential_password_demand_holds(ctx: Any, interactions: list[dict[str, Any
 
 
 def _credential_flow_scout_gap_incomplete(ctx: Any, trajectory: list[Any]) -> bool:
-    """Trajectory- and inventory-scoped mirror of the persist seam's credential scout gate: engaged
-    credentials (username/password fills) must have every required field filled plus a post-fill
-    submit before the synthesized trajectory may grade goal-complete."""
+    """Engaged credentials (username/password fills) must have every required field filled plus a
+    post-fill submit before the synthesized trajectory may grade goal-complete."""
     interactions = [item for item in trajectory if isinstance(item, dict)]
     filled_by_credential = _credential_flow_filled_fields_by_credential(interactions)
     if not filled_by_credential:
@@ -3029,7 +3118,10 @@ def _request_expects_unreached_download(ctx: AgentContext) -> bool:
     download = ctx.reached_download_target
     if download is not None and download.selector:
         return False
-    return any(criterion.deliverable_kind == "registered_download" for criterion in _active_completion_criteria(ctx))
+    # Response-enforcement replay probes may predate typed intent construction.
+    return turn_intent_authorizes_registered_download(getattr(ctx, "turn_intent", None)) or any(
+        criterion.deliverable_kind == "registered_download" for criterion in _active_completion_criteria(ctx)
+    )
 
 
 def _trajectory_reaches_post_credential_commit(ctx: AgentContext) -> bool:
@@ -3140,17 +3232,6 @@ def _should_force_advisory_run_dispatch(ctx: Any) -> bool:
     if getattr(ctx, "turn_halt", None) is not None:
         return False
     return not blocker_signal_is_genuinely_terminal(getattr(ctx, "blocker_signal", None))
-
-
-def arm_credential_scout_reopen(ctx: AgentContext, identity_digest: str) -> bool:
-    """Arm a one-shot scout-window reopen for the first author-time credential-scout reject per
-    (structural identity + credential binding) digest. A repeat identical reject returns False and
-    falls through so it counts normally toward the repair ceiling."""
-    if ctx.credential_scout_rescout_context_key == identity_digest:
-        return False
-    ctx.credential_scout_rescout_context_key = identity_digest
-    ctx.synthesized_block_reopened_for_credential_scout = True
-    return True
 
 
 def _runner_kwargs_with_forced_tool_choice(runner_kwargs: dict[str, Any], tool_name: str) -> dict[str, Any]:
