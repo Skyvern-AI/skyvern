@@ -17,6 +17,7 @@ import pytest
 from structlog.testing import capture_logs
 
 import skyvern.webeye.cdp_download_interceptor as mod
+from skyvern.forge.sdk.core.http_request_authorization import deny_unenrolled_redirect_hop
 from skyvern.webeye.cdp_download_interceptor import (
     CDPDownloadInterceptor,
     _is_stale_interception_error,
@@ -2551,6 +2552,50 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
             log.get("event") == "Guarded direct download failed" and log.get("error_type") == "RuntimeError"
             for log in logs
         )
+
+    @pytest.mark.asyncio
+    async def test_guarded_download_failure_logs_the_raising_module(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+
+        async def guarded_fetch(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("exception-secret")
+
+        with (
+            patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True),
+            capture_logs() as logs,
+        ):
+            await interceptor._download_url_directly("https://site.example/report.pdf?sig=url-secret", "report.pdf")
+
+        failures = [log for log in logs if log.get("event") == "Guarded direct download failed"]
+        assert len(failures) == 1
+        assert failures[0]["error_type"] == "RuntimeError"
+        assert failures[0]["error_origin"].startswith(f"{__name__}:guarded_fetch:")
+        serialized_logs = repr(logs)
+        assert "url-secret" not in serialized_logs
+        assert "exception-secret" not in serialized_logs
+
+    @pytest.mark.asyncio
+    async def test_unenrolled_hop_authorizer_is_reported_as_unenrolled(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(
+            output_dir=str(tmp_path),
+            redirect_hop_authorizer=deny_unenrolled_redirect_hop,
+        )
+        interceptor._browser_context = self._context()
+        guarded_fetch = AsyncMock(side_effect=AssertionError("unenrolled authorization must not reach the fetch seam"))
+
+        with (
+            patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True),
+            capture_logs() as logs,
+        ):
+            await interceptor._download_url_directly("https://site.example/report.pdf?sig=url-secret", "report.pdf")
+
+        guarded_fetch.assert_not_awaited()
+        assert list(tmp_path.iterdir()) == []
+        assert [log["event"] for log in logs] == [
+            "Redirect hop authorization is unenrolled for this browser session, dropping direct download"
+        ]
+        assert "url-secret" not in repr(logs)
 
     @pytest.mark.asyncio
     async def test_cookie_header_omits_control_characters(self, tmp_path: Path) -> None:

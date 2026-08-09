@@ -1388,7 +1388,9 @@ async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
         call.kwargs.get("content")
         for call in app.DATABASE.workflow_params.create_workflow_copilot_chat_message.await_args_list
     ]
-    assert app.DATABASE.workflow_params.start_copilot_turn.await_args.kwargs["user_message"] == "Please update it"
+    assert app.DATABASE.workflow_params.start_copilot_turn.await_args.kwargs["user_message"] == (
+        "[Message unavailable because safety screening did not complete]"
+    )
     assistant_contents = [content for content in contents if isinstance(content, str)]
     assert len(assistant_contents) == 1
     assert expected_summary in assistant_contents[0]
@@ -1414,6 +1416,61 @@ async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
     assert response_frames[-1].narrative_payload is not None
     assert response_frames[-1].narrative_payload["terminal"] == "error"
     assert not any(isinstance(frame, WorkflowCopilotStreamErrorUpdate) for frame in frames)
+
+
+@pytest.mark.asyncio
+async def test_v2_route_never_persists_unscreened_user_message(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = SimpleNamespace(
+        user_response="I created a redacted draft.",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        unvalidated=False,
+        turn_outcome=None,
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    literal = "The password is semantic-secret-value"
+    canonical = "The password is [REDACTED_SECRET]"
+
+    async def _run_with_safety_redaction(**kwargs: Any) -> Any:
+        kwargs["chat_request"].message = canonical
+        await kwargs["persist_canonical_user_message"](canonical)
+        return agent_result
+
+    monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", _run_with_safety_redaction)
+    request = _make_chat_request()
+    request.message = literal
+
+    response = await workflow_copilot_chat_post(api_key_request, request, organization)
+    assert response is captured["sentinel"]
+    await captured["handler"](copilot_stream)
+
+    assert workflow_params.start_copilot_turn.await_args.kwargs["user_message"] != literal
+    replace_call = workflow_params.replace_workflow_copilot_chat_message.await_args
+    assert replace_call.kwargs["workflow_copilot_chat_message_id"] == "wccm-user-1"
+    assert replace_call.kwargs["content"] == canonical
 
 
 @pytest.mark.asyncio

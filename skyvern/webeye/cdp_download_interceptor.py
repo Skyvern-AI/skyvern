@@ -41,6 +41,7 @@ from playwright.async_api import Browser, BrowserContext, CDPSession, Page
 
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, BROWSER_INTERCEPTOR_DISABLE_TIMEOUT
 from skyvern.forge.sdk.api import files as file_api
+from skyvern.forge.sdk.core.http_request_authorization import is_unenrolled_redirect_hop_authorizer
 from skyvern.webeye.utils.page import SkyvernFrame
 
 if TYPE_CHECKING:
@@ -235,6 +236,22 @@ _STALE_INTERCEPTION_ERROR_SUBSTRINGS = (
 def _is_stale_interception_error(error: BaseException) -> bool:
     message = str(error).lower()
     return any(substr in message for substr in _STALE_INTERCEPTION_ERROR_SUBSTRINGS)
+
+
+def _exception_origin(error: BaseException) -> str:
+    """Name the frame that raised ``error`` as ``module:function:line``.
+
+    Exception messages and tracebacks on the download path can carry the credential-bearing
+    download URL, so this reports only where a failure came from and never what it said.
+    """
+    traceback = error.__traceback__
+    if traceback is None:
+        return "unknown"
+    while traceback.tb_next is not None:
+        traceback = traceback.tb_next
+    code = traceback.tb_frame.f_code
+    module = traceback.tb_frame.f_globals.get("__name__")
+    return f"{module if isinstance(module, str) else code.co_filename}:{code.co_name}:{traceback.tb_lineno}"
 
 
 def _parse_headers(raw_headers: list[dict[str, str]]) -> dict[str, str]:
@@ -1122,6 +1139,9 @@ class CDPDownloadInterceptor:
         if self._browser_context is None:
             LOG.error("Browser download context is unenrolled")
             return
+        if is_unenrolled_redirect_hop_authorizer(self._redirect_hop_authorizer):
+            LOG.error("Redirect hop authorization is unenrolled for this browser session, dropping direct download")
+            return
 
         t0 = time.monotonic()
         try:
@@ -1136,7 +1156,13 @@ class CDPDownloadInterceptor:
                 authorize_request_hop=self._redirect_hop_authorizer,
             )
         except Exception as exc:
-            LOG.error("Guarded direct download failed", error_type=type(exc).__name__)
+            # The download URL is credential-bearing and can reappear inside an exception message
+            # (aiohttp embeds it), so the raise site stands in for the message and traceback.
+            LOG.error(
+                "Guarded direct download failed",
+                error_type=type(exc).__name__,
+                error_origin=_exception_origin(exc),
+            )
             return
 
         data = response.body
