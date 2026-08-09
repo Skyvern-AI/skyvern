@@ -126,8 +126,9 @@ class WorkflowsRepository(BaseRepository):
             raise RuntimeError("Workflow creation locking requires a database engine")
 
         async with AsyncExitStack() as stack:
+            lock_timeout = asyncio.timeout(WORKFLOW_CREATION_LOCK_TIMEOUT_SECONDS)
             try:
-                async with asyncio.timeout(WORKFLOW_CREATION_LOCK_TIMEOUT_SECONDS):
+                async with lock_timeout:
                     if self._sqlite_workflow_creation_lock is not None:
                         await stack.enter_async_context(self._sqlite_workflow_creation_lock)
                     await stack.enter_async_context(
@@ -136,7 +137,9 @@ class WorkflowsRepository(BaseRepository):
                         )
                     )
             except TimeoutError as exc:
-                raise WorkflowCreationLockTimeout from exc
+                if lock_timeout.expired():
+                    raise WorkflowCreationLockTimeout from exc
+                raise
             yield
 
     @asynccontextmanager
