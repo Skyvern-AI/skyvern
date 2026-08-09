@@ -118,6 +118,46 @@ def deduplicate_credentials(credentials: list[Credential]) -> list[Credential]:
     return list(by_id.values())
 
 
+def credential_reference_spans(message: str, reference: str) -> list[tuple[int, int]]:
+    """Return structurally delimited occurrences of one exact saved reference."""
+    spans: list[tuple[int, int]] = []
+    start = 0
+    while True:
+        index = message.find(reference, start)
+        if index < 0:
+            return spans
+        end = index + len(reference)
+        before = message[index - 1] if index else ""
+        before_is_boundary = not before or before.isspace() or before in "([{\"'`"
+        cursor = end
+        while cursor < len(message) and message[cursor] in ")]\"}'`":
+            cursor += 1
+        if cursor < len(message) and message[cursor] in ".,;:!?":
+            cursor += 1
+        after_is_boundary = cursor == len(message) or message[cursor].isspace()
+        if before_is_boundary and after_is_boundary:
+            spans.append((index, end))
+        start = index + 1
+
+
+def grounded_credential_references(message: str, credentials: list[Credential]) -> set[str]:
+    """Find complete saved names/IDs in a turn, preferring the longest overlap."""
+    candidates = {value for credential in credentials for value in (credential.name, credential.credential_id) if value}
+    occurrences = [
+        (reference, start, end)
+        for reference in candidates
+        for start, end in credential_reference_spans(message, reference)
+    ]
+    return {
+        reference
+        for reference, start, end in occurrences
+        if not any(
+            other_start <= start and end <= other_end and (other_start, other_end) != (start, end)
+            for _other, other_start, other_end in occurrences
+        )
+    }
+
+
 def _match_by_url_tiered(
     credentials: list[Credential],
     urls: list[str],
