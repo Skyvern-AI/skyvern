@@ -71,9 +71,9 @@ function BrowserSessionVideo() {
   }
 
   return (
-    <div className="h-full w-full p-4">
+    <div className="h-full w-full overflow-auto p-4">
       <div className="mb-4">
-        <h2 className="text-xl font-semibold">Browser Session Videos</h2>
+        <h2 className="text-xl font-semibold">Recordings</h2>
         <p className="text-sm text-gray-500">
           Recorded videos from this browser session
         </p>

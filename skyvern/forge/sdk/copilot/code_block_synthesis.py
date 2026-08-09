@@ -197,8 +197,7 @@ _CODE_SUBMIT_ACTION_RE = re.compile(r"\.(?:click|press)\s*\(")
 
 
 def _is_submit_interaction(interaction: Mapping[str, Any]) -> bool:
-    """A submit is a click, or an Enter keypress; other keys (Tab between fields) are not submits, so
-    both the synthesis submit boundary and the persist-time credential-scout gate share one definition."""
+    """A submit is a click, or an Enter keypress; other keys (Tab between fields) are not submits."""
     tool_name = str(interaction.get("tool_name") or "").strip()
     if tool_name == "click":
         return True
@@ -3018,7 +3017,16 @@ def synthesize_code_block(
             }
         )
 
-    if compile_download_target and reached_download_target is not None:
+    if (
+        compile_download_target
+        and reached_download_target is not None
+        and reached_download_target.download_kind == "observed_render"
+    ):
+        # A render-type affordance fires no download event, so the expect_download terminal below
+        # would hang; registering captured bytes needs the execution layer (blocked on the
+        # render-capture registration ticket), so no terminal is emitted for this kind yet.
+        pass
+    elif compile_download_target and reached_download_target is not None:
         # The download affordance is observed in nav_targets, not necessarily a trajectory click, so the
         # download is an appended terminal step compiled from the typed target — never an in-place click upgrade.
         # Awaiting the download value lands the file in the run-scoped downloads dir; the execution-layer
@@ -4102,6 +4110,11 @@ def _render_artifact_metadata_block(metadata: Mapping[str, Any]) -> str:
     return json.dumps(metadata, indent=2, sort_keys=True)
 
 
+# The rendered offer's message content must begin with this sentinel; the
+# supersede-collapse and synthetic-turn classification key on the prefix.
+SYNTHESIZED_OFFER_SENTINEL = "SYNTHESIZED CODE BLOCK (offered once)."
+
+
 def render_synthesized_offer_text(
     synthesized: SynthesizedCodeBlock,
     trajectory: Sequence[Mapping[str, Any]] | None = None,
@@ -4120,7 +4133,7 @@ def render_synthesized_offer_text(
         )
     )
     parts = [
-        "SYNTHESIZED CODE BLOCK (offered once). The page interactions you scouted were compiled into a "
+        SYNTHESIZED_OFFER_SENTINEL + " The page interactions you scouted were compiled into a "
         "deterministic Playwright snippet. Persist it VERBATIM as a `code` block labeled "
         f"`{_SYNTHESIZED_BLOCK_LABEL}` via update_workflow / update_and_run_blocks. {extraction_instruction}",
         "```python",

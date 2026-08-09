@@ -510,6 +510,22 @@
             "description": "Optional folder ID to assign the workflow to"
           },
           {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
@@ -548,6 +564,9 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "A create with this idempotency key is still in progress"
           },
           "422": {
             "description": "Invalid agent definition"
@@ -10185,6 +10204,22 @@
             "description": "Whether the browser session supports VNC streaming",
             "default": false
           },
+          "stream_transport": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stream Transport",
+            "description": "Live-view transport for this session: \"vnc\" or \"cdp\". Resolved on the single-session fetch only; null elsewhere.",
+            "examples": [
+              "vnc",
+              "cdp"
+            ]
+          },
           "download_path": {
             "anyOf": [
               {
@@ -10552,6 +10587,20 @@
             "title": "Parameters",
             "default": []
           },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
+          },
           "prompt": {
             "anyOf": [
               {
@@ -10764,6 +10813,20 @@
               }
             ],
             "title": "Parameter Keys"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
           },
           "prompt": {
             "anyOf": [
@@ -11373,6 +11436,12 @@
             "title": "Browser Profile Id",
             "description": "Optional plain browser profile to link as this credential's saved profile. Must be an unmanaged profile in your organization that no other credential already owns."
           },
+          "auto_profile_disabled": {
+            "type": "boolean",
+            "title": "Auto Profile Disabled",
+            "description": "Disable automatic saving and reuse of this credential's browser profile.",
+            "default": false
+          },
           "pin_saved_session_ip": {
             "type": "boolean",
             "title": "Pin Saved Session Ip",
@@ -11783,6 +11852,18 @@
             ],
             "title": "Browser Profile Id",
             "description": "Browser profile ID linked to this credential"
+          },
+          "auto_profile_disabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Profile Disabled",
+            "description": "Whether automatic saving and reuse of this credential's browser profile is disabled."
           },
           "pin_saved_session_ip": {
             "type": "boolean",

@@ -77,6 +77,28 @@ class ArtifactsRepository(BaseRepository):
             await session.refresh(new_artifact)
             return convert_to_artifact(new_artifact, self.debug_enabled)
 
+    @db_operation("refresh_download_artifact_content")
+    async def refresh_download_artifact_content(
+        self,
+        artifact_id: str,
+        organization_id: str,
+        checksum: str,
+        file_size: int | None,
+    ) -> None:
+        # file_size is written unconditionally: a None (size unreadable) is more honest than a
+        # fresh checksum paired with the previous content's length.
+        async with self.Session() as session:
+            await session.execute(
+                update(ArtifactModel)
+                .where(
+                    ArtifactModel.artifact_id == artifact_id,
+                    ArtifactModel.organization_id == organization_id,
+                    ArtifactModel.artifact_type == ArtifactType.DOWNLOAD,
+                )
+                .values(checksum=checksum, file_size=file_size)
+            )
+            await session.commit()
+
     @db_operation("update_artifact_uri")
     async def update_artifact_uri(
         self,

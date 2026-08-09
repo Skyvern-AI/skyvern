@@ -7,6 +7,7 @@ import {
   getModifiers,
   mapCoordinates,
   mapMouseCoordinates,
+  virtualKeyCodeFor,
 } from "./cdpInputUtils";
 
 // 4411 is emitted mid-session (page resolution or dispatch failed), so unlike a setup-time close it
@@ -32,7 +33,14 @@ interface UseCdpInputReturn {
     handleKeyDown: (e: React.KeyboardEvent) => void;
     handleKeyUp: (e: React.KeyboardEvent) => void;
   };
+  navigate: (url: string) => void;
+  navigateError: string | null;
 }
+
+const NAVIGATE_ERROR_MESSAGES: Record<string, string> = {
+  blocked: "That destination isn't allowed.",
+  invalid_url: "Enter a valid http(s) URL.",
+};
 
 export function useCdpInput({
   inputWsUrl,
@@ -42,6 +50,7 @@ export function useCdpInput({
 }: UseCdpInputOptions): UseCdpInputReturn {
   const [userIsControlling, setUserIsControlling] = useState(false);
   const [inputReady, setInputReady] = useState(false);
+  const [navigateError, setNavigateError] = useState<string | null>(null);
   const credentialGetter = useCredentialGetter();
   const clientId = useClientIdStore((s) => s.clientId);
 
@@ -92,9 +101,16 @@ export function useCdpInput({
             );
             inputReconnectAttemptsRef.current = 0;
             setInputReady(true);
+            setNavigateError(null);
             if (userIsControllingRef.current) {
               ws.send(JSON.stringify({ kind: "take-control" }));
             }
+          }
+          if (msg.kind === "navigate-error") {
+            setNavigateError(
+              NAVIGATE_ERROR_MESSAGES[msg.reason] ??
+                "Couldn't navigate to that URL.",
+            );
           }
         } catch {
           // ignore non-JSON messages
@@ -159,6 +175,9 @@ export function useCdpInput({
   }, [userIsControlling]);
 
   useEffect(() => {
+    // A stale error from a prior take-control stint should not linger next to a page
+    // that has since been ceded, retaken, and possibly navigated by other means.
+    setNavigateError(null);
     const ws = inputSocketRef.current;
     const kind = userIsControlling ? "take-control" : "cede-control";
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -318,14 +337,20 @@ export function useCdpInput({
     (e: React.KeyboardEvent) => {
       if (!interactive || !userIsControlling) return;
       e.preventDefault();
-      sendInputEvent({
+      const isPrintable = e.key.length === 1;
+      const windowsVirtualKeyCode = virtualKeyCodeFor(e);
+      const payload: Record<string, unknown> = {
         type: "keyEvent",
-        eventType: "keyDown",
+        eventType: isPrintable ? "keyDown" : "rawKeyDown",
         key: e.key,
         code: e.code,
-        text: e.key.length === 1 ? e.key : "",
+        text: isPrintable ? e.key : "",
         modifiers: getModifiers(e),
-      });
+      };
+      if (windowsVirtualKeyCode !== undefined) {
+        payload.windowsVirtualKeyCode = windowsVirtualKeyCode;
+      }
+      sendInputEvent(payload);
     },
     [interactive, userIsControlling, sendInputEvent],
   );
@@ -334,13 +359,27 @@ export function useCdpInput({
     (e: React.KeyboardEvent) => {
       if (!interactive || !userIsControlling) return;
       e.preventDefault();
-      sendInputEvent({
+      const windowsVirtualKeyCode = virtualKeyCodeFor(e);
+      const payload: Record<string, unknown> = {
         type: "keyEvent",
         eventType: "keyUp",
         key: e.key,
         code: e.code,
         modifiers: getModifiers(e),
-      });
+      };
+      if (windowsVirtualKeyCode !== undefined) {
+        payload.windowsVirtualKeyCode = windowsVirtualKeyCode;
+      }
+      sendInputEvent(payload);
+    },
+    [interactive, userIsControlling, sendInputEvent],
+  );
+
+  const navigate = useCallback(
+    (url: string) => {
+      if (!interactive || !userIsControlling) return;
+      setNavigateError(null);
+      sendInputEvent({ type: "navigateEvent", url });
     },
     [interactive, userIsControlling, sendInputEvent],
   );
@@ -357,5 +396,7 @@ export function useCdpInput({
       handleKeyDown,
       handleKeyUp,
     },
+    navigate,
+    navigateError,
   };
 }
