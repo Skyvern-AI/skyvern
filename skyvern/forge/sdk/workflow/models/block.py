@@ -61,7 +61,6 @@ from skyvern.constants import (
 )
 from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import (
-    ActionPolicyBlocked,
     AzureConfigurationError,
     BranchEvaluationContextTooLargeError,
     CodeBlockRunnerSelectionError,
@@ -1252,35 +1251,9 @@ def _should_skip_retry_on_anti_bot_detection(task: Task) -> bool:
     return False
 
 
-MANAGED_STORAGE_SCHEMES = ("s3://", "gs://", "azure://")
-
-
-def is_managed_storage_uri(value: str | None) -> bool:
-    return value is not None and value.startswith(MANAGED_STORAGE_SCHEMES)
-
-
-def destination_is_dynamic(declared_url: str | None, workflow_run_context: WorkflowRunContext) -> bool:
-    """Whether a declared URL's origin comes from runtime input rather than the workflow definition."""
-    if not declared_url:
-        return False
-    if workflow_run_context.has_parameter(declared_url):
-        return True
-    parsed_url = urlparse(declared_url)
-    origin_source = (
-        f"{parsed_url.scheme}://{parsed_url.netloc}" if parsed_url.scheme and parsed_url.netloc else declared_url
-    )
-    return any(marker in origin_source for marker in ("{{", "{%", "{#")) or bool(
-        workflow_run_context.find_embedded_placeholder_tokens(origin_source)
-    )
-
-
 class BaseTaskBlock(Block):
     task_type: str = TaskType.general
     url: str | None = None
-    # `url` is overwritten in place with the rendered/parameter value, so the declared form is kept
-    # here: an origin the workflow input chose is not authority the egress guard may trust.
-    _declared_url_for_policy: str | None = PrivateAttr(default=None)
-    _declared_url_snapshotted: bool = PrivateAttr(default=False)
     title: str = ""
     engine: RunEngine = RunEngine.skyvern_v1
     complete_criterion: str | None = None
@@ -1316,20 +1289,9 @@ class BaseTaskBlock(Block):
 
         return parameters
 
-    def _snapshot_declared_url(self) -> None:
-        if not self._declared_url_snapshotted:
-            self._declared_url_for_policy = self.url
-            self._declared_url_snapshotted = True
-
-    def declares_static_browser_origin(self, workflow_run_context: WorkflowRunContext) -> bool:
-        """Whether this block's URL was written into the workflow rather than rendered at runtime."""
-        declared_url = self._declared_url_for_policy if self._declared_url_snapshotted else self.url
-        return bool(declared_url) and not destination_is_dynamic(declared_url, workflow_run_context)
-
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         self.title = self.format_block_parameter_template_from_workflow_run_context(self.title, workflow_run_context)
 
-        self._snapshot_declared_url()
         if self.url:
             self.url = self.format_block_parameter_template_from_workflow_run_context(self.url, workflow_run_context)
             self.url = prepend_scheme_and_validate_url(self.url)
@@ -1512,7 +1474,6 @@ class BaseTaskBlock(Block):
             # Cache the workflow back to context for future block executions
             workflow_run_context.set_workflow(workflow)
         # if the task url is parameterized, we need to get the value from the workflow run context
-        self._snapshot_declared_url()
         if self.url and workflow_run_context.has_parameter(self.url) and workflow_run_context.has_value(self.url):
             task_url_parameter_value = workflow_run_context.get_value(self.url)
             if task_url_parameter_value:
@@ -11000,23 +10961,6 @@ class HttpRequestBlock(Block):
 
     # Allowed directories for local file access (class variable, not a Pydantic field)
     _allowed_dirs: ClassVar[list[str] | None] = None
-    _declared_url_for_policy: str | None = PrivateAttr(default=None)
-    _declared_files_for_policy: dict[str, str] | None = PrivateAttr(default=None)
-
-    def _declared_file_sources(self) -> dict[str, str | None]:
-        """Map each rendered ``files`` key back to its pre-render value.
-
-        The JSON renderer templates keys as well as values, so a rendered key can miss the
-        pre-render snapshot by name. Rendering preserves order and cardinality, so position
-        recovers the pairing; a key it cannot recover maps to None and is treated as dynamic
-        rather than silently comparing the rendered value against itself.
-        """
-        rendered_keys = list(self.files or {})
-        declared_items = list((self._declared_files_for_policy or {}).items())
-        if len(declared_items) != len(rendered_keys):
-            return {key: None for key in rendered_keys}
-        declared_by_key = dict(declared_items)
-        return {key: declared_by_key.get(key, declared_items[index][1]) for index, key in enumerate(rendered_keys)}
 
     @classmethod
     def get_allowed_dirs(cls) -> list[str]:
@@ -11099,7 +11043,6 @@ class HttpRequestBlock(Block):
         workflow_run_id: str,
         workflow_run_block_id: str,
         organization_id: str | None,
-        allowed_redirect_origin: str | None,
     ) -> BlockResult:
         if not self.url:
             return await self.build_block_result(
@@ -11121,7 +11064,6 @@ class HttpRequestBlock(Block):
                 output_dir=output_dir,
                 filename=self.download_filename,
                 organization_id=organization_id,
-                allowed_redirect_origin=allowed_redirect_origin,
             )
 
             response_data = {
@@ -11194,12 +11136,6 @@ class HttpRequestBlock(Block):
         """Execute the HTTP request and return the response"""
 
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        if self._declared_url_for_policy is None:
-            self._declared_url_for_policy = self.url
-        if self._declared_files_for_policy is None:
-            self._declared_files_for_policy = dict(self.files) if self.files else {}
-        declared_url = self._declared_url_for_policy
-        declared_destination_is_dynamic = destination_is_dynamic(declared_url, workflow_run_context)
 
         try:
             self.format_potential_template_parameters(workflow_run_context)
@@ -11244,28 +11180,6 @@ class HttpRequestBlock(Block):
                 organization_id=organization_id,
             )
 
-        # Managed-storage URIs canonicalize to no origin, so the comparison would reject every
-        # s3://, gs:// and azure:// destination `download_file` supports. They are internal and
-        # exempt, exactly as the `files` path below exempts them — but only when the declared form
-        # was already one, so a runtime-rendered value cannot buy the exemption.
-        allowed_redirect_origin: str | None = None
-        if not (is_managed_storage_uri(declared_url or self.url) and is_managed_storage_uri(self.url)):
-            try:
-                allowed_redirect_origin = app.AGENT_FUNCTION.enforce_external_request_policy(
-                    declared_url=declared_url or self.url,
-                    rendered_url=self.url,
-                    destination_is_dynamic=declared_destination_is_dynamic,
-                )
-            except ActionPolicyBlocked:
-                return await self.build_block_result(
-                    success=False,
-                    failure_reason="External request blocked by policy.",
-                    output_parameter_value=None,
-                    status=BlockStatus.failed,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
-
         # Add default content-type as application/json if not provided (unless files are being uploaded)
         if not self.headers:
             self.headers = {}
@@ -11283,7 +11197,6 @@ class HttpRequestBlock(Block):
         # Also allow local files from allowed directories (ARTIFACT_STORAGE_PATH, VIDEO_PATH, HAR_PATH, LOG_PATH)
         if self.files:
             downloaded_files: dict[str, str] = {}
-            declared_file_sources = self._declared_file_sources()
             for field_name, file_path in self.files.items():
                 masked_file_path = str(workflow_run_context.mask_secrets_in_data(file_path))
                 # Parse file path (handle file:// URI format)
@@ -11310,7 +11223,9 @@ class HttpRequestBlock(Block):
                 is_url = (
                     file_path.startswith("http://") or file_path.startswith("https://") or file_path.startswith("www.")
                 )
-                is_managed_storage = is_managed_storage_uri(file_path)
+                is_managed_storage_uri = (
+                    file_path.startswith("s3://") or file_path.startswith("gs://") or file_path.startswith("azure://")
+                )
 
                 # Check if file is in allowed directories
                 is_allowed_local_file = False
@@ -11335,7 +11250,7 @@ class HttpRequestBlock(Block):
                             continue
 
                 # If not URL, managed storage URI, or allowed local file, reject
-                if not (is_url or is_managed_storage or is_allowed_local_file):
+                if not (is_url or is_managed_storage_uri or is_allowed_local_file):
                     return await self.build_block_result(
                         success=False,
                         failure_reason=(
@@ -11370,29 +11285,6 @@ class HttpRequestBlock(Block):
                         file_path=masked_local_file_path,
                     )
                 else:
-                    # Route http(s) file sources through the same sensitive-egress policy as the
-                    # request URL so a `files` value like `https://x/{{ secret }}` can't exfil rendered
-                    # secrets. Managed-storage URIs (s3://, gs://, azure://) are internal and skipped.
-                    file_allowed_redirect_origin: str | None = None
-                    if is_url:
-                        declared_file_path = declared_file_sources.get(field_name)
-                        try:
-                            file_allowed_redirect_origin = app.AGENT_FUNCTION.enforce_external_request_policy(
-                                declared_url=declared_file_path or file_path,
-                                rendered_url=file_path,
-                                destination_is_dynamic=declared_file_path is None
-                                or destination_is_dynamic(declared_file_path, workflow_run_context),
-                            )
-                        except ActionPolicyBlocked:
-                            return await self.build_block_result(
-                                success=False,
-                                failure_reason="External file source blocked by policy.",
-                                output_parameter_value=None,
-                                status=BlockStatus.failed,
-                                workflow_run_block_id=workflow_run_block_id,
-                                organization_id=organization_id,
-                            )
-
                     # Download from remote source
                     try:
                         LOG.info(
@@ -11400,13 +11292,9 @@ class HttpRequestBlock(Block):
                             field_name=field_name,
                             file_path=masked_file_path,
                             is_url=is_url,
-                            is_managed_storage_uri=is_managed_storage,
+                            is_managed_storage_uri=is_managed_storage_uri,
                         )
-                        local_file_path = await download_file(
-                            file_path,
-                            organization_id=organization_id,
-                            allowed_redirect_origin=file_allowed_redirect_origin,
-                        )
+                        local_file_path = await download_file(file_path, organization_id=organization_id)
                         downloaded_files[field_name] = local_file_path
                         LOG.info(
                             "HttpRequestBlock File downloaded successfully",
@@ -11434,7 +11322,6 @@ class HttpRequestBlock(Block):
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
-                allowed_redirect_origin=allowed_redirect_origin,
             )
 
         try:
@@ -11456,7 +11343,6 @@ class HttpRequestBlock(Block):
                 files=self.files,
                 timeout=self.timeout,
                 follow_redirects=self.follow_redirects,
-                allowed_redirect_origin=allowed_redirect_origin,
             )
 
             success = 200 <= status_code < 300

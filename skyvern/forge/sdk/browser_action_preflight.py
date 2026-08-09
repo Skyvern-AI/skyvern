@@ -291,7 +291,7 @@ def _live_observation(action: Action, page: Page) -> PageObservation | None:
     listener here; it was removed because a real browser never fires it for these cases, so it
     advertised coverage it did not have.
 
-    Content trust therefore lives entirely on the verdict axis, which is where ADR-0013 puts it:
+    Content trust therefore lives entirely on the verdict axis, which is where ADR-0011 puts it:
     the detector scans what the observation captured, and its verdict is what a content-dependent
     action is gated on. This function establishes only that the action came from the observation
     that describes this page — never that the page still matches what was observed.
@@ -588,7 +588,7 @@ def _emit(
     if decision.outcome is PolicyOutcome.NOT_ENROLLED:
         return
     origin = None if observation is None else canonicalize_origin(observation.page_url)
-    # ADR-0013's monitoring plan asks for origin-policy decisions by target canonical origin. A
+    # ADR-0011's monitoring plan asks for origin-policy decisions by target canonical origin. A
     # target whose origin does not canonicalize is already reported through the reason codes.
     target_origins = sorted(
         {

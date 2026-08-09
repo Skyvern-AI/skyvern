@@ -22,13 +22,12 @@ def workflow(
 def cached(cache_key: str) -> Callable:
     def decorator(func: Callable) -> Callable:
         async def wrapper(page: SkyvernPage, context: RunContext, *args: Any, **kwargs: Any) -> Any:
-            # Label mutation stays on the trusted internal wrapper; cached code receives a facade.
-            internal_page = script_run_context_manager.ensure_run_context().page
-            internal_page.current_label = cache_key
+            # Store the function in context.cached_fns
+            page.current_label = cache_key
             try:
                 return await func(page, context, *args, **kwargs)
             finally:
-                internal_page.current_label = None
+                page.current_label = None
 
         # Register the wrapper (not func) so callers get the label-setting behaviour
         script_run_context_manager.set_cached_fn(cache_key, wrapper)

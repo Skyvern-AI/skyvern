@@ -6,7 +6,6 @@ from pydantic import BaseModel
 from skyvern.constants import DEFAULT_MAX_TOKENS
 from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import SkyvernContextWindowExceededError
-from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.utils.strings import escape_code_fences
@@ -17,11 +16,12 @@ LOG = structlog.get_logger()
 
 
 def _sanitize_elements_for_prompt(builder: ElementTreeBuilder, html: str) -> str:
+    # Mirror the sanitized form onto last_used_element_tree_html so the
+    # extraction cache key (which hashes that field) matches what the LLM saw.
     sanitized = escape_code_fences(html)
-    transformed = app.AGENT_FUNCTION.transform_browser_elements_for_prompt(sanitized)
     if builder.last_used_element_tree_html is not None:
-        builder.last_used_element_tree_html = transformed
-    return transformed
+        builder.last_used_element_tree_html = sanitized
+    return sanitized
 
 
 class CheckPhoneNumberFormatResponse(BaseModel):

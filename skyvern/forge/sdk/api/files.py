@@ -240,7 +240,6 @@ async def fetch_file_bytes(
                 None,
                 current_url,
                 next_url,
-                strip_cross_origin_credentials=True,
             )
             source_url, current_url = current_url, next_url
 
@@ -450,7 +449,6 @@ async def download_file(
                     None,
                     current_url,
                     next_url,
-                    strip_cross_origin_credentials=True,
                 )
                 source_url, current_url = current_url, next_url
             raise SkyvernHTTPException(
