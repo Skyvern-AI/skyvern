@@ -17,13 +17,14 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 import structlog
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.utils.page import JS_FUNCTION_DEFS, SkyvernFrame
 
-from .guards import CREDENTIAL_HINT, GuardError
+from .guards import CREDENTIAL_HINT, GuardError, validate_wait_until
 
 LOG = structlog.get_logger(__name__)
 
@@ -68,10 +69,18 @@ LOCALHOST_RECOVERY_HINT = (
 )
 
 
+# Lifecycle states in ascending strength. A document that has committed is really there even
+# when a later state never arrives, so navigation degrades down this ladder rather than
+# reporting a failure for a page that is already loaded and usable.
+_LOAD_STATE_LADDER = ("commit", "domcontentloaded", "load", "networkidle")
+_WEAKER_LOAD_STATE_TIMEOUT_MS = 1000
+
+
 @dataclass
 class NavigateResult:
     url: str
     title: str
+    load_state: str = "load"
 
 
 @dataclass
@@ -104,6 +113,25 @@ def parse_extract_schema(schema: str | dict[str, Any] | None) -> dict[str, Any] 
         raise GuardError(f"Invalid JSON schema: {e}", "Provide schema as a valid JSON string")
 
 
+async def _reached_load_state(page: Any, requested: str, budget_ms: int) -> str:
+    """Return the strongest lifecycle state the committed document actually reached.
+
+    Anything below ``requested`` is probed briefly: those states have already fired in
+    every healthy navigation, so the short budget only bounds a document that stalled.
+    """
+    weaker_states = _LOAD_STATE_LADDER[1 : _LOAD_STATE_LADDER.index(requested) + 1]
+    for index, state in enumerate(reversed(weaker_states)):
+        try:
+            await page.wait_for_load_state(
+                state,
+                timeout=budget_ms if index == 0 else _WEAKER_LOAD_STATE_TIMEOUT_MS,
+            )
+        except PlaywrightTimeoutError:
+            continue
+        return state
+    return "commit"
+
+
 async def do_navigate(
     page: Any,
     url: str,
@@ -113,6 +141,7 @@ async def do_navigate(
     can_access_localhost: bool = False,
     is_localhost_destination: bool = False,
 ) -> NavigateResult:
+    validate_wait_until(wait_until)
     try:
         validated_url = await asyncio.to_thread(validate_fetch_url, url)
     except BlockedHost as e:
@@ -122,8 +151,19 @@ async def do_navigate(
         validated_url = url
     except SkyvernHTTPException as e:
         raise GuardError(str(e), "Use a valid public HTTP(S) URL") from e
-    await page.goto(validated_url, timeout=timeout, wait_until=wait_until)
-    return NavigateResult(url=page.url, title=await page.title())
+
+    # Commit first so a navigation that never reaches the document still fails, then wait for
+    # the requested lifecycle state separately: a page whose `load` never fires is navigated,
+    # not failed, and reporting the weaker state beats a false failure on a usable page.
+    started = time.monotonic()
+    await page.goto(validated_url, timeout=timeout, wait_until="commit")
+    requested = wait_until or "load"
+    load_state = "commit"
+    if requested != "commit":
+        # Floor the leftover budget: Playwright reads timeout=0 as "wait forever".
+        remaining_ms = max(timeout - int((time.monotonic() - started) * 1000), _WEAKER_LOAD_STATE_TIMEOUT_MS)
+        load_state = await _reached_load_state(page, requested, remaining_ms)
+    return NavigateResult(url=page.url, title=await page.title(), load_state=load_state)
 
 
 async def do_screenshot(
