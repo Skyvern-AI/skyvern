@@ -6,7 +6,6 @@ import pytest
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
     _LEAK_DENY_TOKENS,
-    SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
     BlockerKind,
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
@@ -342,7 +341,7 @@ def test_stash_non_final_signal_does_not_replace_a_held_final_reply_blocker() ->
     ctx = _Ctx()
     existing = _make(
         kind="tool_error",
-        internal_reason_code=SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
+        internal_reason_code="tool_error_post_budget_upstream_replay",
         renders_final_reply=True,
     )
     incoming = _make(

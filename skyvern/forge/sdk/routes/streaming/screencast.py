@@ -31,23 +31,44 @@ async def wait_for_browser_state(
     poll_interval: float = 0.25,
 ) -> BrowserState | None:
     elapsed = 0.0
-    while elapsed < timeout:
-        browser_state = await _resolve_browser_state(
-            entity_id,
-            entity_type,
-            workflow_run_id,
-            organization_id=organization_id,
-        )
+    observed: BrowserState | None = None
+    try:
+        while elapsed < timeout:
+            browser_state = observed or await _resolve_browser_state(
+                entity_id,
+                entity_type,
+                workflow_run_id,
+                organization_id=organization_id,
+            )
 
-        if browser_state is not None:
-            page = await browser_state.get_working_page()
-            if page is not None:
-                return browser_state
+            if browser_state is not None:
+                # An observer connection belongs to this websocket, so it is held across polls
+                # rather than re-dialed while the session's first page comes up.
+                if entity_type == "browser_session":
+                    observed = browser_state
+                page = await browser_state.get_working_page()
+                if page is not None:
+                    # Ownership passes to the caller, who releases it when the websocket ends.
+                    observed = None
+                    return browser_state
 
-        await asyncio.sleep(poll_interval)
-        elapsed += poll_interval
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
 
-    return None
+        return None
+    finally:
+        # Whatever is still held here was never handed to a caller, so nobody else will give it back.
+        await release_browser_state(observed, entity_type, entity_id)
+
+
+async def release_browser_state(browser_state: BrowserState | None, entity_type: str, entity_id: str) -> None:
+    """Give back whatever watching adopted. Only the manager knows whether that is anything."""
+    if browser_state is None or entity_type != "browser_session":
+        return
+    try:
+        await app.PERSISTENT_SESSIONS_MANAGER.release_observer_browser_state(entity_id, browser_state)
+    except Exception:
+        LOG.warning("Could not release the live-view browser connection", browser_session_id=entity_id, exc_info=True)
 
 
 async def _resolve_browser_state(
@@ -61,7 +82,7 @@ async def _resolve_browser_state(
     if entity_type == "task":
         return app.BROWSER_MANAGER.get_for_task(entity_id, workflow_run_id)
     if entity_type == "browser_session":
-        return await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(entity_id, organization_id)
+        return await app.PERSISTENT_SESSIONS_MANAGER.get_observer_browser_state(entity_id, organization_id)
     return None
 
 
@@ -73,6 +94,13 @@ async def _resolve_working_page(
     organization_id: str | None = None,
     fall_back_to_captured: bool = True,
 ) -> object | None:
+    # The viewer's own connection outlives every page the session opens, so following the active page
+    # needs no re-resolution here — and re-resolving would dial a second connection every poll.
+    if entity_type == "browser_session":
+        try:
+            return await browser_state.get_working_page()
+        except Exception:
+            return None
     # Re-resolve each poll so the screencast follows a BrowserState the run swaps in post-connect (skyvern#6703).
     try:
         state = await _resolve_browser_state(entity_id, entity_type, workflow_run_id, organization_id)

@@ -18,6 +18,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db.id import WORKFLOW_RUN_PREFIX
 from skyvern.forge.sdk.routes.streaming.registries import (
     complete_stream_teardown,
     mark_stream_closing,
@@ -27,8 +28,9 @@ from skyvern.forge.sdk.routes.streaming.registries import (
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
-from skyvern.webeye.browser_artifacts import VideoArtifact
+from skyvern.webeye.browser_artifacts import DownloadBinding, VideoArtifact
 from skyvern.webeye.browser_engine import (
+    BrowserEngineBootstrapError,
     BrowserEngineContext,
     BrowserEngineSelection,
     resolve_browser_engine,
@@ -47,6 +49,8 @@ from skyvern.webeye.session_cookies import persist_session_cookies
 from skyvern.webeye.video_utils import prepare_recording_for_upload
 
 LOG = structlog.get_logger()
+
+_WORKFLOW_RUN_KEY_PREFIX = f"{WORKFLOW_RUN_PREFIX}_"
 
 # Only driver/transport-level CDP drops trigger the cached-PBS evict + reconnect path.
 # Playwright also surfaces page/context-only closes ("Target page, context or browser
@@ -128,6 +132,15 @@ async def _rebind_pbs_download_dir(
     download_run_id: str,
     browser_session_id: str,
 ) -> None:
+    if browser_state.browser_artifacts.download_binding == DownloadBinding.SESSION_DIR:
+        # Provider-owned remote binding: preserve the provider-selected destination. Re-pointing to a
+        # run-scoped dir would overwrite it, so skip the rebind.
+        LOG.info(
+            "Skipping download-dir rebind: preserving provider-selected destination",
+            browser_session_id=browser_session_id,
+            download_run_id=download_run_id,
+        )
+        return
     browser_context = browser_state.browser_context
     if browser_context is None:
         return
@@ -213,7 +226,9 @@ class _EngineSelectionOwner:
 
     __slots__ = ("task", "terminal")
 
-    def __init__(self, task: asyncio.Task[BrowserEngineSelection]) -> None:
+    def __init__(self, task: asyncio.Future[BrowserEngineSelection]) -> None:
+        # A resolver Task (single-flight) or an already-resolved Future (a guarded-repinned effective
+        # selection). Both satisfy the await/shield/done/cancel surface waiters use.
         self.task = task
         self.terminal = False
 
@@ -474,6 +489,19 @@ class RealBrowserManager(BrowserManager):
         if self._engine_owners.get(run_key) is owner:
             del self._engine_owners[run_key]
 
+    def _repin_engine_selection(self, run_key: str | None, selection: BrowserEngineSelection) -> None:
+        """Replace a run's pinned engine owner with an already-resolved ``selection`` so later
+        browser-resource creation reuses it. Guarded no-op for an ephemeral (``run_key`` None),
+        already-removed, or ``terminal`` owner — never resurrects a missing/terminal owner."""
+        if run_key is None:
+            return
+        owner = self._engine_owners.get(run_key)
+        if owner is None or owner.terminal:
+            return
+        resolved: asyncio.Future[BrowserEngineSelection] = asyncio.get_running_loop().create_future()
+        resolved.set_result(selection)
+        owner.task = resolved
+
     async def _create_browser_state(
         self,
         proxy_location: ProxyLocationInput = None,
@@ -490,9 +518,11 @@ class RealBrowserManager(BrowserManager):
         engine_run_key: str | None = None,
         engine_workflow_run_id: str | None = None,
     ) -> BrowserState:
+        run_key = engine_run_key or canonical_run_key(
+            workflow_run_id=workflow_run_id, task_id=task_id, script_id=script_id
+        )
         engine_selection = await self.get_or_resolve_engine_selection(
-            run_key=engine_run_key
-            or canonical_run_key(workflow_run_id=workflow_run_id, task_id=task_id, script_id=script_id),
+            run_key=run_key,
             context=BrowserEngineContext(
                 organization_id=organization_id,
                 # Engine-flag identity only: a caller that pins under workflow_run_id while keeping it out
@@ -506,62 +536,92 @@ class RealBrowserManager(BrowserManager):
                 browser_source=settings.BROWSER_TYPE,
             ),
         )
-        LOG.info(
-            "Creating browser state",
-            task_id=task_id,
-            workflow_run_id=workflow_run_id,
-            browser_source=settings.BROWSER_TYPE,
-            **engine_selection.attribution(),
-        )
-        pw = await engine_selection.start_driver()
         context = skyvern_context.current()
-        try:
-            (
-                browser_context,
-                browser_artifacts,
-                browser_cleanup,
-            ) = await BrowserContextFactory.create_browser_context(
-                pw,
-                proxy_location=proxy_location,
-                url=url,
+
+        async def _start(selection: BrowserEngineSelection) -> BrowserState:
+            LOG.info(
+                "Creating browser state",
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                script_id=script_id,
-                organization_id=organization_id,
-                extra_http_headers=extra_http_headers,
-                cdp_connect_headers=cdp_connect_headers,
-                browser_address=browser_address,
-                browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
-                browser_profile_id=browser_profile_id,
-                engine_selection=engine_selection,
+                browser_source=settings.BROWSER_TYPE,
+                **selection.attribution(),
             )
-        except BaseException:
-            # start() already launched the local Node driver, so a failed context
-            # creation (e.g. a remote-CDP connect_over_cdp error) would leak that driver
-            # per attempt; stop it here, time-bounded like RealBrowserState.close() so a
-            # hung stop() cannot stall the original error. BaseException so a cancellation
-            # also releases the driver; a stop() error/timeout must never mask the original.
             try:
-                async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
-                    await pw.stop()
-            except Exception:
-                LOG.warning(
-                    "Failed to stop Playwright driver after browser-context creation failure",
+                pw = await selection.start_driver()
+            except Exception as start_error:
+                # Mark a fallback-eligible driver-start failure so the boundary can degrade once; a
+                # no-fallback selection (and CancelledError, a BaseException) propagates unchanged.
+                if selection.boot_fallback_selection is None:
+                    raise
+                raise BrowserEngineBootstrapError(f"{selection.name} driver failed to start") from start_error
+            try:
+                (
+                    browser_context,
+                    browser_artifacts,
+                    browser_cleanup,
+                ) = await BrowserContextFactory.create_browser_context(
+                    pw,
+                    proxy_location=proxy_location,
+                    url=url,
                     task_id=task_id,
                     workflow_run_id=workflow_run_id,
-                    exc_info=True,
+                    workflow_permanent_id=workflow_permanent_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    extra_http_headers=extra_http_headers,
+                    cdp_connect_headers=cdp_connect_headers,
+                    browser_address=browser_address,
+                    browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
+                    browser_profile_id=browser_profile_id,
+                    engine_selection=selection,
                 )
-            raise
-        return RealBrowserState(
-            pw=pw,
-            browser_context=browser_context,
-            page=None,
-            browser_artifacts=browser_artifacts,
-            browser_cleanup=browser_cleanup,
-            release_driver_on_close=browser_address is not None,
-            engine_selection=engine_selection,
-        )
+            except BaseException:
+                # start() launched the local Node driver; stop it (time-bounded) so a failed context
+                # creation doesn't leak it, and never let a stop() error/timeout mask the original.
+                try:
+                    async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+                        await pw.stop()
+                except Exception:
+                    LOG.warning(
+                        "Failed to stop Playwright driver after browser-context creation failure",
+                        task_id=task_id,
+                        workflow_run_id=workflow_run_id,
+                        exc_info=True,
+                    )
+                raise
+            return RealBrowserState(
+                pw=pw,
+                browser_context=browser_context,
+                page=None,
+                browser_artifacts=browser_artifacts,
+                browser_cleanup=browser_cleanup,
+                release_driver_on_close=browser_address is not None,
+                engine_selection=selection,
+            )
+
+        # At most two attempts: a fallback-eligible (Rustwright) selection degrades EXACTLY ONCE to its
+        # classical boot fallback before any usable context; the classical has none, so it then propagates.
+        boot_fallback = engine_selection.boot_fallback_selection
+        try:
+            state = await _start(engine_selection)
+        except BrowserEngineBootstrapError:
+            if boot_fallback is None:
+                raise
+            LOG.warning(
+                "Browser engine boot failed before a usable context; falling back once to its classical engine",
+                failed_engine=engine_selection.name,
+                fallback_engine=boot_fallback.name,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+            self._repin_engine_selection(run_key, boot_fallback)
+            return await _start(boot_fallback)
+        if boot_fallback is not None:
+            # Commit-strip: re-pin the same engine with its boot fallback removed so a later same-run
+            # recreation reuses the effective engine and can no longer fall back.
+            self._repin_engine_selection(run_key, replace(engine_selection, boot_fallback_selection=None))
+        return state
 
     def evict_page(self, page_id: str) -> None:
         self.pages.pop(page_id, None)
@@ -934,6 +994,7 @@ class RealBrowserManager(BrowserManager):
                 "Creating browser state for workflow run",
                 sampling=True,
                 workflow_run_id=workflow_run.workflow_run_id,
+                browser_profile_id=browser_profile_id or "none",
             )
             if browser_session_id and workflow_run.organization_id:
                 session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
@@ -1026,7 +1087,11 @@ class RealBrowserManager(BrowserManager):
         finalize: bool = True,
     ) -> list[VideoArtifact]:
         if len(browser_state.browser_artifacts.video_artifacts) == 0:
-            LOG.warning(
+            # Empty is the expected state on browsers with no local Playwright recording
+            # (vendor/CDP/persistent sessions) until finalize time, when vendor recordings
+            # have been attached and a still-empty list means the recording is missing.
+            log = LOG.warning if finalize else LOG.debug
+            log(
                 "Video data not found for task",
                 task_id=task_id,
                 workflow_id=workflow_id,
@@ -1175,6 +1240,28 @@ class RealBrowserManager(BrowserManager):
 
         return browser_state_to_close
 
+    def _shared_with_another_workflow_run(self, workflow_run_id: str, browser_state_to_close: BrowserState) -> bool:
+        # NON-PBS ONLY. Python-object sharing of an ephemeral BrowserState is process-local, so an
+        # alias may veto the terminal close only when it denotes ANOTHER workflow run that is
+        # currently live in THIS process and legitimately shares this exact state (parent/child
+        # use_parent_browser_session). Three qualifications, all required:
+        #   1. another run's key (wr_ prefix, not our own) — same-run task/script aliases never share;
+        #   2. object identity — it points at the exact state we are about to close;
+        #   3. that run is live here — it still has a workflow-run context. A remote/finished/ghost
+        #      parent whose key was forward-synced into this process, or a never-cleaned
+        #      synthetic-run key, has no context and must not veto the close, or the browser
+        #      would outlive every run in this process.
+        # PBS lifetime is distributed (runnable_id + generation CAS across processes) and is governed
+        # elsewhere: close is force-gated off (close_browser_on_completion=False) and release goes
+        # through the expected-owner CAS. This local-liveness predicate must never decide PBS close.
+        return any(
+            page_id != workflow_run_id
+            and page_id.startswith(_WORKFLOW_RUN_KEY_PREFIX)
+            and browser_state is browser_state_to_close
+            and app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(page_id)
+            for page_id, browser_state in self.pages.items()
+        )
+
     async def cleanup_for_workflow_run(
         self,
         workflow_run_id: str,
@@ -1192,7 +1279,6 @@ class RealBrowserManager(BrowserManager):
         session_lease = self._persistent_session_leases.get(workflow_run_id)
         recording_finalized = False
         finalization_attempted = False
-        cleanup_page_ids = {workflow_run_id, *task_ids, *(child_workflow_run_ids or [])}
 
         # Drop the run's pinned engine — the run is ending, so no further browser resource will be
         # created for it. Covers the run, its inherited children, and its tasks.
@@ -1220,10 +1306,7 @@ class RealBrowserManager(BrowserManager):
             # If another workflow run still references this browser state (e.g. a
             # parent whose in-memory browser was shared via use_parent_browser_session),
             # skip closing the browser so the parent can continue using it.
-            shared = any(
-                page_id != workflow_run_id and browser_state is browser_state_to_close
-                for page_id, browser_state in self.pages.items()
-            )
+            shared = self._shared_with_another_workflow_run(workflow_run_id, browser_state_to_close)
             effective_close = close_browser_on_completion and not shared
             if shared:
                 LOG.info(
@@ -1251,10 +1334,7 @@ class RealBrowserManager(BrowserManager):
                     browser_state_to_close.browser_context,
                     browser_state_to_close.browser_artifacts.browser_session_dir,
                 )
-                shared_after_cleanup = any(
-                    page_id not in cleanup_page_ids and browser_state is browser_state_to_close
-                    for page_id, browser_state in self.pages.items()
-                )
+                shared_after_cleanup = self._shared_with_another_workflow_run(workflow_run_id, browser_state_to_close)
                 deferred_close = close_browser_on_completion and not shared_after_cleanup
                 release_driver = False if (shared_after_cleanup or browser_session_id) else None
                 owner = (
@@ -1313,8 +1393,10 @@ class RealBrowserManager(BrowserManager):
                 continue
             if task_browser_state is browser_state_to_close and finalization_attempted:
                 continue
-            # Same shared-state check for task-level entries
-            shared = any(bs is task_browser_state for bs in self.pages.values())
+            # Same liveness-qualified ownership predicate as the run-level close: a distinct
+            # task-level state must not be held open by a ghost alias, and it must still yield to a
+            # genuinely live cross-run sharer.
+            shared = self._shared_with_another_workflow_run(task_id, task_browser_state)
             effective_close = close_browser_on_completion and not shared
             if shared:
                 LOG.info(
