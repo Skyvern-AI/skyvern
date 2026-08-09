@@ -60,14 +60,16 @@ For manual setup:
 
 ## Pair the extension
 
-With your MCP server running, start the recommended one-click flow:
+With your MCP server running, ask your MCP client to create a browser session. If the extension is not paired, Skyvern
+opens a secure pairing tab automatically. You can also start the flow explicitly:
 
 ```bash
 skyvern browser extension-pair
 ```
 
 Click **Approve** in the pairing page, then approve the pairing again in the **Skyvern Agent** confirmation tab that
-opens. The pairing link expires after two minutes and can be used only once; rerun the command if it expires.
+opens. The pairing link expires after two minutes and can be used only once; retry the browser-session request or rerun
+the command if it expires.
 
 As a manual fallback, copy the pairing token to your clipboard:
 
@@ -108,7 +110,8 @@ skyvern run mcp --browser-extension
 ```
 
 The environment setting starts the bridge lazily when `skyvern_browser_session_create` needs it. The flag starts the
-bridge eagerly with the MCP server.
+bridge in the background as the MCP server boots, so the server answers your client's `initialize` request without
+waiting for the bridge. Either way, `skyvern_browser_session_create` starts the bridge if it is not up yet.
 
 Check the local setup without exposing the pairing token:
 
@@ -190,6 +193,26 @@ The extension refuses to control `chrome://`, `chrome-untrusted://`, `chrome-ext
     - If one-click pairing fails, open the **Skyvern Agent** popup and use `skyvern browser extension-token` as the
       manual paste fallback.
     - Add at least one controllable tab to **Skyvern Controlled**, then retry.
+  </Accordion>
+
+  <Accordion title="The MCP server never finishes connecting">
+    The server loads a large Python dependency tree before it serves its first request. That usually takes a few
+    seconds, but the first start after an install or upgrade — and any start on a busy machine — can take
+    considerably longer than an MCP client's default startup window.
+
+    Watch for this: when a local server fails to mount, coding agents fall back to the identically named hosted
+    Skyvern tools, so a run that looks like it is driving your Chrome is really driving a cloud browser. Confirm the
+    server is connected before you trust an extension flow.
+
+    Raise your client's startup timeout:
+
+    - Claude Code: set `MCP_TIMEOUT` (milliseconds) in the environment that launches it, for example
+      `MCP_TIMEOUT=180000`.
+    - Codex: raise `startup_timeout_sec` for the server entry in `~/.codex/config.toml`.
+
+    To see where the time goes, read the client-launched server's `mcp_boot_ready` log line after it connects. The
+    event is emitted only after the server successfully handles `initialize`; it reports `spawn_to_serve_ms`
+    alongside the `env_ms` and `tool_import_ms` phases that make it up.
   </Accordion>
 
   <Accordion title="Port already in use">
