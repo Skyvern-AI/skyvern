@@ -4185,6 +4185,8 @@ class ForgeAgent:
                 cache_key=cache_key,
                 ttl_seconds=3600,  # 1 hour
             )
+            if cache_data is None:
+                return
 
             # Store cache metadata in context
             context.vertex_cache_name = cache_data["name"]
