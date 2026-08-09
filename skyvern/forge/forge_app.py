@@ -280,7 +280,6 @@ def create_forge_app() -> ForgeApp:
         if settings.WORKFLOW_COPILOT_LITE_LLM_KEY
         else None
     )
-
     app.WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
     app.WORKFLOW_SERVICE = WorkflowService()
     app.AGENT_FUNCTION = AgentFunction()
