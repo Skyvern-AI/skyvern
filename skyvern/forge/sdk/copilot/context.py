@@ -16,6 +16,7 @@ from typing_extensions import NotRequired, TypedDict
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import AuthoringParameterBindingDirective
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELDS
 from skyvern.forge.sdk.copilot.result_evidence import (
     LoadedResultCompositionEvidence,
     loaded_result_target_structure_signature,
@@ -31,7 +32,7 @@ ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
 COPILOT_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
 ProposalDisposition = Literal["no_proposal", "auto_applicable", "review_untested", "review_tested"]
 
-AskSubject = Literal["output_schema", "credentials", "target_url", "disambiguation", "other"]
+AskSubject = Literal["output_schema", "credentials", "target_url", "disambiguation", "deliverable_permission", "other"]
 COPILOT_ASK_SUBJECTS: tuple[AskSubject, ...] = get_args(AskSubject)
 
 
@@ -434,7 +435,7 @@ _MAX_OBSERVED_ACTED_PAGES = 20
 _MAX_FILL_CARRY = 20
 _FILL_CARRY_TEXT_CAP = 240
 _FILL_CARRY_TOOLS = frozenset({"type_text", "select_option", "fill_credential_field"})
-_FILL_CARRY_CREDENTIAL_FIELDS = frozenset({"username", "password", "totp"})
+_FILL_CARRY_CREDENTIAL_FIELDS = CREDENTIAL_FILL_FIELDS
 FillCarryPrimitive = str | int | bool | None
 
 
@@ -769,10 +770,12 @@ class CopilotContext(AgentContext):
     update_workflow_called: bool = False
     test_after_update_done: bool = False
     post_update_nudge_count: int = 0
-    coverage_nudge_count: int = 0
     format_nudge_count: int = 0
     no_workflow_nudge_count: int = 0
     copilot_total_timeout_exceeded: bool = False
+    copilot_max_turns_exceeded: bool = False
+    model_calls_this_turn: int = 0
+    enforcement_pass_count: int = 0
     user_message: str = ""
     block_goal_main_goal: str = ""
     allow_untested_workflow_draft: bool = False

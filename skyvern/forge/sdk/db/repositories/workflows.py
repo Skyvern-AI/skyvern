@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator, Callable
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import structlog
-from sqlalchemy import exists, func, or_, select, update
+from sqlalchemy import exists, func, or_, select, text, update
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.constants import DEFAULT_SCRIPT_RUN_ID, DEFAULT_WORKFLOW_TITLES
 from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy, declare_policy
@@ -47,7 +52,15 @@ from skyvern.forge.sdk.workflow.runtime_completion import carried_contract, with
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.schemas.workflows import WorkflowStatus
 
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
+
 LOG = structlog.get_logger()
+WORKFLOW_CREATION_LOCK_TIMEOUT_SECONDS = 10
+
+
+class WorkflowCreationLockTimeout(Exception):
+    pass
 
 
 @dataclass(frozen=True)
@@ -94,6 +107,63 @@ def _align_block_output_parameters(workflow_definition: WorkflowDefinition) -> N
 
 class WorkflowsRepository(BaseRepository):
     """Database operations for workflow management."""
+
+    def __init__(
+        self,
+        session_factory: _SessionFactory,
+        debug_enabled: bool = False,
+        is_retryable_error_fn: Callable[[SQLAlchemyError], bool] | None = None,
+        db_engine: AsyncEngine | None = None,
+        sqlite_workflow_creation_lock: asyncio.Lock | None = None,
+    ) -> None:
+        super().__init__(session_factory, debug_enabled, is_retryable_error_fn)
+        self._db_engine = db_engine
+        self._sqlite_workflow_creation_lock = sqlite_workflow_creation_lock
+
+    @asynccontextmanager
+    async def acquire_workflow_creation_lock(self, lock_key: str) -> AsyncIterator[None]:
+        if self._sqlite_workflow_creation_lock is None and self._db_engine is None:
+            raise RuntimeError("Workflow creation locking requires a database engine")
+
+        async with AsyncExitStack() as stack:
+            lock_timeout = asyncio.timeout(WORKFLOW_CREATION_LOCK_TIMEOUT_SECONDS)
+            try:
+                async with lock_timeout:
+                    if self._sqlite_workflow_creation_lock is not None:
+                        await stack.enter_async_context(self._sqlite_workflow_creation_lock)
+                    await stack.enter_async_context(
+                        self._workflow_creation_transaction(
+                            None if self._sqlite_workflow_creation_lock is not None else lock_key
+                        )
+                    )
+            except TimeoutError as exc:
+                if lock_timeout.expired():
+                    raise WorkflowCreationLockTimeout from exc
+                raise
+            yield
+
+    @asynccontextmanager
+    async def _workflow_creation_transaction(self, lock_key: str | None = None) -> AsyncIterator[None]:
+        if self._db_engine is None:
+            raise RuntimeError("Workflow creation locking requires a database engine")
+        if lock_key is not None:
+            while True:
+                async with self._db_engine.connect() as connection:
+                    async with connection.begin():
+                        acquired = await connection.scalar(
+                            text("SELECT pg_try_advisory_xact_lock(hashtext(:key))"),
+                            {"key": lock_key},
+                        )
+                        if acquired:
+                            async with self.Session.bind_connection(connection):
+                                yield
+                            return
+                # ponytail: Polling frees the SQL pool; use a lock service if this key becomes hot.
+                await asyncio.sleep(0.1)
+        async with self._db_engine.connect() as connection:
+            async with connection.begin():
+                async with self.Session.bind_connection(connection):
+                    yield
 
     async def _policy_of_latest_version(
         self, session: Any, workflow_permanent_id: str, organization_id: str | None

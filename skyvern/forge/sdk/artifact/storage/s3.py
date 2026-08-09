@@ -13,6 +13,7 @@ from botocore.exceptions import ClientError
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
+from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge import app
 from skyvern.forge.sdk.api.aws import AsyncAWSClient, S3StorageClass, S3Uri
 from skyvern.forge.sdk.api.files import (
@@ -731,6 +732,7 @@ class S3Storage(BaseStorage):
         """Save files from local download directory to S3."""
         download_dir = get_download_dir(run_id=run_id)
         files = os.listdir(download_dir)
+        skipped_files: list[str] = []
         for file in files:
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
@@ -768,6 +770,7 @@ class S3Storage(BaseStorage):
                     run_id=run_id,
                     exc_info=True,
                 )
+                skipped_files.append(file)
                 continue
 
             # Register the file as an Artifact so GET run output can serve it via
@@ -792,6 +795,9 @@ class S3Storage(BaseStorage):
                         run_id=run_id,
                         exc_info=True,
                     )
+                    skipped_files.append(file)
+        if skipped_files:
+            raise DownloadSaveIncompleteError(skipped_files)
 
     async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
         # Artifact-first: when a run has DOWNLOAD artifact rows, return them as

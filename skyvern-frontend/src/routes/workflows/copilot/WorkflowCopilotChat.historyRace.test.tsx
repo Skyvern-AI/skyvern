@@ -341,7 +341,7 @@ describe("WorkflowCopilotChat — queued prompt survives initial history load (i
       ).toBeTruthy(),
     );
     expect(
-      screen.getByRole("button", { name: "Cancel queued message" }),
+      screen.getByRole("button", { name: "Edit queued message" }),
     ).toBeTruthy();
 
     // History resolves and replaces messages, dropping the queued bubble — the
@@ -354,7 +354,7 @@ describe("WorkflowCopilotChat — queued prompt survives initial history load (i
       screen.getByText("Prompt queued. Waiting for live browser..."),
     ).toBeTruthy();
     const cancel = screen.getByRole("button", {
-      name: "Cancel queued message",
+      name: "Edit queued message",
     });
 
     await act(async () => {

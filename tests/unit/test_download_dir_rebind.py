@@ -15,8 +15,10 @@ import pytest
 from skyvern.forge.sdk.api.files import get_download_dir, resolve_run_download_id
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.models.block import Block, CodeBlock, PrintPageBlock
+from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_factory import (
     _apply_download_behaviour,
+    _create_headless_chromium,
     rebind_download_dir,
     set_download_file_listener,
 )
@@ -237,6 +239,54 @@ async def test_apply_download_behaviour_falls_back_to_workflow_run_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_connect_creator_skips_run_dir_setdownloadbehavior_for_session_dir() -> None:
+    """The generic ``browser_address`` reconnect path must not re-point a provider-owned remote
+    binding's downloads to the run dir. ``_connect_to_cdp_browser`` skips ``_apply_download_behaviour``
+    for SESSION_DIR so the provider-selected destination is preserved, and stamps the fresh artifacts
+    SESSION_DIR by construction (not a later relabel)."""
+    browser, cdp_session = _recording_browser()
+    browser.new_context = AsyncMock(return_value=MagicMock(pages=[]))
+    ctx = SkyvernContext(run_id="run_x", workflow_run_id="wr_y")
+
+    with (
+        patch("skyvern.webeye.browser_factory._connect_over_cdp_with_diagnostics", AsyncMock(return_value=browser)),
+        patch("skyvern.webeye.browser_factory.ensure_context", return_value=ctx),
+    ):
+        _, artifacts, _ = await _create_headless_chromium(
+            MagicMock(),
+            browser_address="ws://remote.example/cdp",
+            download_binding=DownloadBinding.SESSION_DIR,
+        )
+
+    sent_methods = [call.args[0] for call in cdp_session.send.await_args_list if call.args]
+    assert "Browser.setDownloadBehavior" not in sent_methods
+    assert artifacts.download_binding == DownloadBinding.SESSION_DIR
+
+
+@pytest.mark.asyncio
+async def test_connect_creator_binds_run_dir_setdownloadbehavior_for_run_dir() -> None:
+    """RUN_DIR (default local/OSS/vendor) still physically binds downloads to the run dir on connect —
+    the SESSION_DIR skip must not disable the ordinary run-scoped rebind."""
+    browser, cdp_session = _recording_browser()
+    browser.new_context = AsyncMock(return_value=MagicMock(pages=[]))
+    ctx = SkyvernContext(run_id="run_x", workflow_run_id="wr_y")
+
+    with (
+        patch("skyvern.webeye.browser_factory._connect_over_cdp_with_diagnostics", AsyncMock(return_value=browser)),
+        patch("skyvern.webeye.browser_factory.ensure_context", return_value=ctx),
+    ):
+        _, artifacts, _ = await _create_headless_chromium(
+            MagicMock(),
+            browser_address="ws://remote.example/cdp",
+        )
+
+    method, params = cdp_session.send.await_args.args
+    assert method == "Browser.setDownloadBehavior"
+    assert params["downloadPath"] == get_download_dir("run_x")
+    assert artifacts.download_binding == DownloadBinding.RUN_DIR
+
+
+@pytest.mark.asyncio
 async def test_listener_logs_run_identity_from_context(tmp_path: Path) -> None:
     captured: dict[str, object] = {}
 
@@ -339,6 +389,30 @@ async def test_block_adoption_seam_rebinds_to_run_dir() -> None:
 
 
 @pytest.mark.asyncio
+async def test_block_adoption_skips_rebind_when_session_dir_binding() -> None:
+    """A provider-owned remote binding preserves the provider-selected destination: the block adoption
+    seam must not re-send setDownloadBehavior to a run-scoped dir."""
+    browser, cdp_session = _recording_browser()
+    browser_state = MagicMock()
+    browser_state.browser_context.browser = browser
+    browser_state.browser_artifacts.download_binding = DownloadBinding.SESSION_DIR
+
+    with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
+        mock_app.BROWSER_MANAGER.get_or_create_for_workflow_run = AsyncMock()
+
+        result = await Block.get_or_create_browser_state(
+            MagicMock(),
+            workflow_run_id="wr_block",
+            organization_id="org_1",
+            browser_session_id="bs_block",
+        )
+
+    assert result is browser_state
+    cdp_session.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_block_adoption_seam_rebinds_via_context_page_without_owning_browser() -> None:
     """Persistent-context adoption (browser_context.browser is None) rebinds via the working page's CDP session."""
     page, context, cdp_session = _recording_context_page()
@@ -407,6 +481,32 @@ async def test_block_non_adoption_cache_hit_rebinds_to_run_dir() -> None:
     _, params = cdp_session.send.await_args.args
     assert params["downloadPath"] == get_download_dir("wr_own")
     assert params["downloadPath"].endswith("/wr_own")
+
+
+@pytest.mark.asyncio
+async def test_block_non_adoption_skips_rebind_when_session_dir_binding() -> None:
+    """Defense-in-depth: an own-browser state carrying a SESSION_DIR binding must not be rebound off its
+    provider-selected destination even on the non-adoption path."""
+
+    browser, cdp_session = _recording_browser()
+    browser_state = MagicMock()
+    browser_state.browser_context.browser = browser
+    browser_state.is_connected = MagicMock(return_value=True)
+    browser_state.browser_artifacts.download_binding = DownloadBinding.SESSION_DIR
+
+    with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+        mock_app.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=browser_state)
+
+        result = await Block.get_or_create_browser_state(
+            MagicMock(),
+            workflow_run_id="wr_own",
+            organization_id=None,
+            browser_session_id=None,
+            download_run_id_override="wr_own",
+        )
+
+    assert result is browser_state
+    cdp_session.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

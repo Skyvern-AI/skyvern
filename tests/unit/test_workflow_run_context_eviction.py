@@ -33,6 +33,18 @@ def test_remove_workflow_run_context_evicts_and_is_idempotent() -> None:
     manager.remove_workflow_run_context("wr_never_seen")
 
 
+def test_has_workflow_run_context_tracks_process_local_liveness() -> None:
+    # The non-PBS sharing predicate reads this as its run-liveness signal: True only while the run's
+    # context is registered in THIS process, flipping to False once cleanup removes it.
+    manager = _context_manager_with(["wr_live"])
+
+    assert manager.has_workflow_run_context("wr_live") is True
+    assert manager.has_workflow_run_context("wr_absent") is False
+
+    manager.remove_workflow_run_context("wr_live")
+    assert manager.has_workflow_run_context("wr_live") is False
+
+
 @pytest.mark.asyncio
 async def test_clean_up_workflow_evicts_run_and_child_contexts(monkeypatch: pytest.MonkeyPatch) -> None:
     service = WorkflowService()

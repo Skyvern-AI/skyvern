@@ -45,9 +45,12 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory, resolve_run_download_id
+from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
+from skyvern.forge.sdk.core.http_request_authorization import deny_unenrolled_redirect_hop
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, get_tzinfo_from_proxy
-from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
+from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding, VideoArtifact
+from skyvern.webeye.browser_engine import BrowserEngineBootstrapError
 from skyvern.webeye.cdp_connection import (
     build_cdp_connect_headers,
 )
@@ -543,6 +546,16 @@ async def _apply_download_behaviour(browser: Browser) -> None:
     await rebind_download_dir(browser, resolve_run_download_id(context))
 
 
+def _resolve_download_binding(kwargs: dict[str, Any]) -> DownloadBinding:
+    """Read the optional caller-threaded download binding from loosely-typed creator kwargs.
+
+    ``**kwargs`` values carry no static type, so narrow to DownloadBinding and fall back to the RUN_DIR
+    default for any absent or unexpected value — keeping the generic browser_address path type-safe.
+    """
+    binding = kwargs.get("download_binding")
+    return binding if isinstance(binding, DownloadBinding) else DownloadBinding.RUN_DIR
+
+
 class BrowserContextCreator(Protocol):
     def __call__(
         self, playwright: Playwright, proxy_location: ProxyLocationInput = None, **kwargs: dict[str, Any]
@@ -680,6 +693,17 @@ class BrowserContextFactory:
             if not creator:
                 raise UnknownBrowserType(browser_type)
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **creator_kwargs)
+            requested_profile_id = cast(str | None, kwargs.get("browser_profile_id"))
+            if requested_profile_id and browser_artifacts.applied_browser_profile_id != requested_profile_id:
+                LOG.warning(
+                    "Browser profile was requested but not applied by the chosen browser creator — "
+                    "run continues without the saved profile",
+                    browser_profile_id=requested_profile_id,
+                    browser_type=browser_type,
+                    workflow_run_id=kwargs.get("workflow_run_id"),
+                    task_id=kwargs.get("task_id"),
+                    organization_id=kwargs.get("organization_id"),
+                )
             await restore_session_cookies(browser_context, browser_artifacts.browser_session_dir)
             # After session cookies so a verified-login heal (banked by the credential living-profile
             # engine) wins over the profile's own older session cookies on a key clash. Gated on the
@@ -726,7 +750,7 @@ class BrowserContextFactory:
                 with suppress(Exception):
                     await cleanup_func()
 
-            if not isinstance(e, Exception) or isinstance(e, UnknownBrowserType):
+            if not isinstance(e, Exception) or isinstance(e, (UnknownBrowserType, BrowserEngineBootstrapError)):
                 raise e
 
             raise UnknownErrorWhileCreatingBrowserContext(browser_type, e) from e
@@ -827,6 +851,7 @@ async def _create_headless_chromium(
             cdp_connect_headers=cdp_connect_headers,
             apply_download_behaviour=True,
             validate_browser_address=True,
+            download_binding=_resolve_download_binding(kwargs),
         )
 
     # Check for browser_profile_id and load from storage if available
@@ -878,6 +903,8 @@ async def _create_headless_chromium(
         har_path=browser_args["record_har_path"],
         browser_session_dir=user_data_dir,
     )
+    if loaded_from_saved_profile:
+        browser_artifacts.applied_browser_profile_id = browser_profile_id
     try:
         browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
     except Exception as launch_error:
@@ -920,6 +947,7 @@ async def _create_headful_chromium(
             cdp_connect_headers=cdp_connect_headers,
             apply_download_behaviour=True,
             validate_browser_address=True,
+            download_binding=_resolve_download_binding(kwargs),
         )
 
     # Check for browser_profile_id and load from storage if available
@@ -971,6 +999,8 @@ async def _create_headful_chromium(
         har_path=browser_args["record_har_path"],
         browser_session_dir=user_data_dir,
     )
+    if loaded_from_saved_profile:
+        browser_artifacts.applied_browser_profile_id = browser_profile_id
     try:
         browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
     except Exception as launch_error:
@@ -1041,6 +1071,7 @@ async def _create_cdp_connection_browser(
             cdp_connect_headers=cdp_connect_headers,
             apply_download_behaviour=True,
             validate_browser_address=True,
+            download_binding=_resolve_download_binding(kwargs),
         )
 
     browser_type = settings.BROWSER_TYPE
@@ -1106,6 +1137,7 @@ async def _connect_to_cdp_browser(
     cdp_connect_headers: dict[str, str] | None = None,
     apply_download_behaviour: bool = False,
     validate_browser_address: bool = True,
+    download_binding: DownloadBinding = DownloadBinding.RUN_DIR,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     parsed_headers = parse_extra_headers(extra_http_headers)
 
@@ -1119,6 +1151,9 @@ async def _connect_to_cdp_browser(
     # Single chokepoint for OSS remote-CDP creation; stamp the marker so
     # RealBrowserManager attaches the CDP frame publisher.
     browser_artifacts.needs_cdp_frame_publisher = True
+    # Carry the caller's binding onto the fresh artifacts so a reconnect that rebuilds through this
+    # generic path preserves the provider-selected destination by construction, not by a later relabel.
+    browser_artifacts.download_binding = download_binding
 
     LOG.info("Connecting browser CDP connection", remote_browser_url=redact_cdp_url(remote_browser_url))
     cdp_headers = merge_cdp_connect_headers(
@@ -1134,7 +1169,14 @@ async def _connect_to_cdp_browser(
         validate_browser_address=validate_browser_address,
     )
 
-    if apply_download_behaviour:
+    if apply_download_behaviour and download_binding == DownloadBinding.SESSION_DIR:
+        # Provider-owned remote binding: preserve the provider-selected destination. Re-sending a
+        # run-scoped download path here would overwrite it, so leave the binding untouched.
+        LOG.info(
+            "Skipping run-dir download rebind on CDP connect: preserving provider-selected destination",
+            remote_browser_url=redact_cdp_url(remote_browser_url),
+        )
+    elif apply_download_behaviour:
         try:
             await _apply_download_behaviour(browser)
         except Exception:
@@ -1165,7 +1207,13 @@ async def _connect_to_cdp_browser(
     # This captures downloads via the Fetch domain and saves them locally.
     if parsed_headers.enable_download:
         download_dir = initialize_download_dir()
-        interceptor = CDPDownloadInterceptor(output_dir=download_dir)
+        # No run-scoped network authority is threaded into this OSS creator; the interceptor stays
+        # unenrolled, which fails closed on every intercepted request rather than defaulting open.
+        interceptor = CDPDownloadInterceptor(
+            output_dir=download_dir,
+            network_egress_monitor=BrowserNetworkEgressMonitor.unenrolled(),
+            redirect_hop_authorizer=deny_unenrolled_redirect_hop,
+        )
 
         # Enable interception on all existing pages
         for page in browser_context.pages:
