@@ -9,6 +9,7 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
+from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
@@ -566,6 +567,7 @@ class GcsStorage(BaseStorage):
         """Save files from local download directory to GCS."""
         download_dir = get_download_dir(run_id=run_id)
         files = os.listdir(download_dir)
+        skipped_files: list[str] = []
         for file in files:
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
@@ -600,6 +602,7 @@ class GcsStorage(BaseStorage):
                     run_id=run_id,
                     exc_info=True,
                 )
+                skipped_files.append(file)
                 continue
 
             # Register the file as an Artifact so GET run output can serve it via
@@ -623,6 +626,9 @@ class GcsStorage(BaseStorage):
                         run_id=run_id,
                         exc_info=True,
                     )
+                    skipped_files.append(file)
+        if skipped_files:
+            raise DownloadSaveIncompleteError(skipped_files)
 
     async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
         # Artifact-first — see s3.py::get_downloaded_files for rationale. When

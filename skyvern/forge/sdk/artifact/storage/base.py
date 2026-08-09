@@ -284,7 +284,9 @@ class BaseStorage(ABC):
         organization_id: str,
         run_id: str | None,
     ) -> None:
-        pass
+        """Raises DownloadSaveIncompleteError after the loop when any file could not be fully
+        saved and registered; every other file already is when it raises, so the save is
+        retryable-incomplete."""
 
     @abstractmethod
     async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:

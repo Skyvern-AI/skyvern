@@ -51,7 +51,6 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     summarize_unsatisfied_outcomes,
     verdict_missing_evidence,
 )
-from skyvern.forge.sdk.copilot.enforcement import _goal_likely_needs_more_blocks
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_completion_verification
 from skyvern.forge.sdk.copilot.output_utils import iter_failure_reasons
@@ -809,14 +808,12 @@ def _download_file_name(value: Any) -> str | None:
 def _completion_evidence_payload(output: Any) -> Any:
     if not isinstance(output, dict):
         return output
-    nested_output = output.get("output")
+    # Root scope only: the execution layer binds registration keys at the root of every block
+    # output, so keys found only in a nested scope are the code's own claim, not registration.
     has_download_output = any(output.get(key) for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS)
-    has_nested_download_output = isinstance(nested_output, dict) and any(
-        nested_output.get(key) for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS
-    )
-    if not has_download_output and not has_nested_download_output:
+    if not has_download_output:
         return output
-    download_output = output if has_download_output or not isinstance(nested_output, dict) else nested_output
+    download_output = output
     names: list[str] = []
     if name := _download_file_name(download_output.get("downloaded_file_name")):
         names.append(name)
@@ -836,14 +833,6 @@ def _completion_evidence_payload(output: Any) -> Any:
         payload["downloaded_file_artifact_count"] = len(artifacts)
     if names:
         payload["downloaded_file_names"] = list(dict.fromkeys(names))[:_MAX_EVIDENCE_FILE_NAMES]
-    if has_nested_download_output and not has_download_output and isinstance(nested_output, dict):
-        preserved_output = {
-            key: value
-            for key, value in nested_output.items()
-            if key not in REGISTERED_DOWNLOAD_OUTPUT_KEYS and key not in {"page", "download"}
-        }
-        if preserved_output:
-            payload["output"] = preserved_output
     return payload
 
 
@@ -1953,15 +1942,8 @@ def _tool_visible_result_after_completion_verification(
 def _emit_completion_verification_trace(
     copilot_ctx: Any, completion_verification: CompletionVerificationResult
 ) -> None:
-    block_count = getattr(copilot_ctx, "last_update_block_count", None)
-    policy = getattr(copilot_ctx, "request_policy", None)
-    contract = policy.completion_contract if policy is not None else None
-    heuristic_would_block = isinstance(block_count, int) and _goal_likely_needs_more_blocks(
-        getattr(copilot_ctx, "user_message", ""), block_count, contract
-    )
     trace_data = {
         **completion_verification.to_trace_data(),
-        "heuristic_would_block": heuristic_would_block,
         "evidence_block_present": _current_workflow_has_evidence_block(copilot_ctx),
         "warrants_repair": _outcome_failure_warrants_repair(copilot_ctx, completion_verification),
     }
