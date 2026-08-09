@@ -69,21 +69,6 @@ def _open_browser_process(command: list[str], *, windows: bool) -> bool:
     return True
 
 
-def _open_browser_process(command: list[str], *, windows: bool) -> bool:
-    options: dict[str, Any] = {
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-        "close_fds": True,
-    }
-    options["creationflags" if windows else "start_new_session"] = 0x00000208 if windows else True
-    try:
-        subprocess.Popen(command, **options)
-    except OSError:
-        return False
-    return True
-
-
 class BrowserExtensionRuntime:
     _instance: BrowserExtensionRuntime | None = None
     _lock = asyncio.Lock()
@@ -214,55 +199,6 @@ class BrowserExtensionRuntime:
             LOG.info("browser_extension_pairing_page_unavailable", error_type=type(exc).__name__)
             return False
         url = f"http://127.0.0.1:{self._transport.bound_port}/pair#{nonce}"
-        return self.open_extension_url(url)
-
-    @staticmethod
-    def open_extension_url(url: str) -> bool:
-        if sys.platform == "darwin":
-            executable = shutil.which("open")
-            if executable is None:
-                return False
-            for app_name in ("Google Chrome", "Google Chrome Beta", "Google Chrome Dev", "Google Chrome Canary"):
-                try:
-                    subprocess.run(
-                        [executable, "-a", app_name, url],
-                        check=True,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                except (OSError, subprocess.CalledProcessError):
-                    continue
-                return True
-            return False
-
-        if sys.platform.startswith("linux"):
-            for browser_name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
-                executable = shutil.which(browser_name)
-                if executable is None:
-                    continue
-                if _open_browser_process([executable, url], windows=False):
-                    return True
-            return False
-
-        if sys.platform == "win32":
-            roots = (
-                os.environ.get("LOCALAPPDATA"),
-                os.environ.get("PROGRAMFILES"),
-                os.environ.get("PROGRAMFILES(X86)"),
-            )
-            for root in roots:
-                if not root:
-                    continue
-                executable = Path(root) / "Google" / "Chrome" / "Application" / "chrome.exe"
-                if not executable.is_file():
-                    continue
-                if _open_browser_process([str(executable), url], windows=True):
-                    return True
-        return False
-
-    def open_pairing_page(self) -> bool:
-        nonce = self._relay.get_or_create_pairing_nonce()
-        url = f"http://127.0.0.1:{self._relay.bound_port}/pair#{nonce}"
         return self.open_extension_url(url)
 
     async def shutdown(self) -> None:
