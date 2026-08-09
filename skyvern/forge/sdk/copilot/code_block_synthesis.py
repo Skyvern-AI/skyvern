@@ -197,8 +197,7 @@ _CODE_SUBMIT_ACTION_RE = re.compile(r"\.(?:click|press)\s*\(")
 
 
 def _is_submit_interaction(interaction: Mapping[str, Any]) -> bool:
-    """A submit is a click, or an Enter keypress; other keys (Tab between fields) are not submits, so
-    both the synthesis submit boundary and the persist-time credential-scout gate share one definition."""
+    """A submit is a click, or an Enter keypress; other keys (Tab between fields) are not submits."""
     tool_name = str(interaction.get("tool_name") or "").strip()
     if tool_name == "click":
         return True

@@ -445,25 +445,18 @@ async def test_update_workflow_stops_before_persisting_for_answer_only_intent() 
     mock_app.WORKFLOW_SERVICE.update_workflow_definition.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_request_policy_refusal_wins_even_when_turn_intent_allows_update() -> None:
+def test_request_policy_flags_do_not_override_turn_intent_authority() -> None:
     intent = TurnIntent(
         mode=TurnIntentMode.BUILD,
         authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
     )
     ctx = _ctx(intent, RequestPolicy(allow_update_workflow=False, allow_run_blocks=False))
 
-    with patch("skyvern.forge.sdk.copilot.tools.workflow_update.app") as mock_app:
-        mock_app.WORKFLOW_SERVICE.update_workflow_definition = AsyncMock()
-        result = await _update_workflow({"workflow_yaml": ctx.workflow_yaml}, ctx)
-
-    assert result["ok"] is False
-    assert ctx.blocker_signal is not None
-    assert ctx.blocker_signal.internal_reason_code == "request_policy_blocks_update_workflow"
-    mock_app.WORKFLOW_SERVICE.update_workflow_definition.assert_not_called()
+    assert _authority_tool_error(ctx, "update_workflow") is None
+    assert ctx.blocker_signal is None
 
 
-def test_authority_dispatcher_stashes_request_policy_signal_when_both_block() -> None:
+def test_authority_dispatcher_uses_turn_intent_when_policy_flags_also_block() -> None:
     intent = TurnIntent(
         mode=TurnIntentMode.DIAGNOSE,
         authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
@@ -474,8 +467,7 @@ def test_authority_dispatcher_stashes_request_policy_signal_when_both_block() ->
     payload = _authority_tool_error(ctx, "update_workflow")
     assert payload is not None
     assert ctx.blocker_signal is not None
-    # Request policy precedence — turn-intent signal must not win the stash.
-    assert ctx.blocker_signal.internal_reason_code == "request_policy_blocks_update_workflow"
+    assert ctx.blocker_signal.internal_reason_code == "turn_intent_no_mutation_update_blocked"
     for token in _LEAK_TOKENS:
         assert token not in payload
 
@@ -690,54 +682,25 @@ async def test_get_run_results_rejects_different_run_while_reconciliation_pendin
 
 
 @pytest.mark.parametrize(
-    ("policy", "expected_reason_code", "expected_recovery_hint", "expects_cleared_by_update"),
+    "policy",
     [
-        (
-            RequestPolicy(allow_update_workflow=True, allow_run_blocks=False, testing_intent="skip_test"),
-            "request_policy_blocks_run_blocks_skip_test",
-            "retry_with_different_tool",
-            True,
+        RequestPolicy(allow_update_workflow=True, allow_run_blocks=False, testing_intent="skip_test"),
+        RequestPolicy(
+            allow_update_workflow=True,
+            allow_run_blocks=False,
+            clarification_reason="workflow_credential_inputs_unbound",
         ),
-        (
-            RequestPolicy(
-                allow_update_workflow=True,
-                allow_run_blocks=False,
-                clarification_reason="workflow_credential_inputs_unbound",
-            ),
-            "request_policy_blocks_run_blocks_credential_unbound",
-            "report_blocker_to_user",
-            False,
-        ),
-        (
-            RequestPolicy(allow_update_workflow=True, allow_run_blocks=False),
-            "request_policy_blocks_run_blocks_generic",
-            "ask_user_clarifying",
-            False,
-        ),
+        RequestPolicy(allow_update_workflow=True, allow_run_blocks=False),
     ],
 )
-def test_request_policy_run_block_branches(
-    policy: RequestPolicy,
-    expected_reason_code: str,
-    expected_recovery_hint: str,
-    expects_cleared_by_update: bool,
-) -> None:
+def test_request_policy_run_flags_do_not_override_turn_intent(policy: RequestPolicy) -> None:
     intent = TurnIntent(
         mode=TurnIntentMode.BUILD,
         authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
     )
     ctx = _ctx(intent, policy)
-    payload = _authority_tool_error(ctx, "update_and_run_blocks")
-    assert payload is not None
-    assert ctx.blocker_signal is not None
-    assert ctx.blocker_signal.internal_reason_code == expected_reason_code
-    assert ctx.blocker_signal.recovery_hint == expected_recovery_hint
-    if expects_cleared_by_update:
-        assert "update_workflow" in ctx.blocker_signal.cleared_by_tools
-    else:
-        assert ctx.blocker_signal.cleared_by_tools == frozenset()
-    for token in _LEAK_TOKENS:
-        assert token not in payload
+    assert _authority_tool_error(ctx, "update_and_run_blocks") is None
+    assert ctx.blocker_signal is None
 
 
 def test_cleared_by_tools_implies_retry_recovery_hint_convention() -> None:

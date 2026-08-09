@@ -42,6 +42,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     CUSTOM_LLM_KEY_PREFIX,
     ensure_custom_llm_registered_for_org,
@@ -69,6 +70,7 @@ from skyvern.forge.sdk.db.repositories.tags import (
     TagValueRenameCollision,
     TagValueRenameResult,
 )
+from skyvern.forge.sdk.db.repositories.workflows import WorkflowCreationLockTimeout
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
@@ -821,6 +823,7 @@ async def create_workflow_legacy(
     summary="Create a new agent",
     responses={
         200: {"description": "Successfully created agent"},
+        409: {"description": "A create with this idempotency key is still in progress"},
         422: {"description": "Invalid agent definition"},
     },
 )
@@ -833,6 +836,7 @@ async def create_workflow(
     folder_id: str | None = Query(None, description="Optional folder ID to assign the workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-create")
     try:
@@ -851,6 +855,47 @@ async def create_workflow(
         # Override folder_id if provided as query parameter
         if folder_id is not None:
             workflow_definition.folder_id = folder_id
+        if idempotency_key is not None and idempotency_key.strip():
+            digest = calculate_sha256(f"create_workflow\0{current_org.organization_id}\0{idempotency_key}")
+            workflow_permanent_id = f"wpid_{digest}"
+            try:
+                return await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=current_org.organization_id,
+                    version=1,
+                    filter_deleted=False,
+                )
+            except WorkflowNotFound:
+                pass
+            resolved_title = await app.WORKFLOW_SERVICE.resolve_workflow_creation_title(
+                current_org.organization_id,
+                workflow_definition,
+            )
+            created_workflow: Workflow
+            async with app.DATABASE.workflows.acquire_workflow_creation_lock(workflow_permanent_id):
+                try:
+                    return await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+                        workflow_permanent_id=workflow_permanent_id,
+                        organization_id=current_org.organization_id,
+                        version=1,
+                        filter_deleted=False,
+                    )
+                except WorkflowNotFound:
+                    pass
+                created_workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
+                    organization=current_org,
+                    request=workflow_definition,
+                    new_workflow_permanent_id=workflow_permanent_id,
+                    created_by=user_id,
+                    edited_by=user_id,
+                    notify_workflow_saved=False,
+                    resolved_title=resolved_title,
+                )
+            app.WORKFLOW_SERVICE.schedule_workflow_saved_hook(
+                organization_id=created_workflow.organization_id,
+                edited_by=user_id,
+            )
+            return created_workflow
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_definition,
@@ -859,6 +904,11 @@ async def create_workflow(
         )
     except yaml.YAMLError as exc:
         raise HTTPException(status_code=422, detail=format_yaml_error(exc))
+    except WorkflowCreationLockTimeout as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Workflow creation with this idempotency key is still in progress.",
+        ) from exc
     except WorkflowDefinitionValidationException as e:
         raise e
     except (SkyvernHTTPException, ValidationError) as e:

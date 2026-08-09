@@ -622,17 +622,23 @@ async def list_credentials_tool(
     ctx: RunContextWrapper,
     page: int = 1,
     page_size: int = 10,
+    exact_reference: str | None = None,
 ) -> str:
     """List stored credentials (metadata only — never passwords or secrets).
     Use this to find credential IDs for login blocks.
 
-    Paginated. `page_size` caps at 50. The response includes `has_more`;
+    For a saved name or credential ID stated exactly in the latest user turn, pass it as
+    `exact_reference`. Exact mode resolves organization-wide cardinality and atomically binds
+    the single match into server-owned request authority. It never falls back to fuzzy search,
+    discovery, or pagination. Zero or multiple exact matches grant no authority.
+
+    Without `exact_reference`, this is metadata-only discovery. Paginated. `page_size` caps at 50. The response includes `has_more`;
     before concluding no credential exists, keep incrementing `page` until
     `has_more` is `false` — otherwise you risk telling the user to create
     a credential they have already stored on a later page.
     """
     copilot_ctx = ctx.context
-    arguments = {"page": page, "page_size": page_size}
+    arguments = {"page": page, "page_size": page_size, "exact_reference": exact_reference}
     loop_error = _tool_loop_error(copilot_ctx, "list_credentials", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})

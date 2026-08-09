@@ -306,6 +306,46 @@ async def test_initialize_captures_client_info() -> None:
 
 
 @pytest.mark.asyncio
+async def test_initialize_runs_boot_ready_callback_after_success() -> None:
+    events: list[str] = []
+    context = _initialize_context(SimpleNamespace())
+
+    async def call_next(_context: MiddlewareContext[object]) -> object:
+        events.append("initialize")
+        return SimpleNamespace()
+
+    configure_mcp_telemetry_runtime(
+        server_mode="local_cli",
+        transport="stdio",
+        boot_ready_callback=lambda: events.append("ready"),
+    )
+
+    await MCPTelemetryMiddleware().on_initialize(context, call_next)
+
+    assert events == ["initialize", "ready"]
+
+
+@pytest.mark.asyncio
+async def test_initialize_does_not_run_boot_ready_callback_on_failure() -> None:
+    ready = Mock()
+    context = _initialize_context(SimpleNamespace())
+
+    async def fail(_context: MiddlewareContext[object]) -> object:
+        raise RuntimeError("initialize failed")
+
+    configure_mcp_telemetry_runtime(
+        server_mode="local_cli",
+        transport="stdio",
+        boot_ready_callback=ready,
+    )
+
+    with pytest.raises(RuntimeError, match="initialize failed"):
+        await MCPTelemetryMiddleware().on_initialize(context, fail)
+
+    ready.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_initialize_missing_client_info_defaults_to_unknown() -> None:
     payload = await _run_initialize(_initialize_context(SimpleNamespace()))
 

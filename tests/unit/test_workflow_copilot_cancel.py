@@ -300,7 +300,9 @@ async def test_route_cancel_branch_persists_user_and_cancelled_messages(
     contents = [c.kwargs.get("content") for c in insert_calls]
     assert senders.count("user") == 0
     assert senders.count("ai") == 1
-    assert workflow_params.start_copilot_turn.await_args.kwargs["user_message"] == "please update"
+    assert workflow_params.start_copilot_turn.await_args.kwargs["user_message"] == (
+        "[Message unavailable because safety screening did not complete]"
+    )
 
     assert "Cancelled by user." in contents
 
@@ -395,7 +397,9 @@ async def test_route_cancel_wip_persists_proposal_and_response_frame(
 
     insert_calls = workflow_params.create_workflow_copilot_chat_message.await_args_list
     contents = [c.kwargs.get("content") for c in insert_calls]
-    assert workflow_params.start_copilot_turn.await_args.kwargs["user_message"] == "please update"
+    assert workflow_params.start_copilot_turn.await_args.kwargs["user_message"] == (
+        "[Message unavailable because safety screening did not complete]"
+    )
     assert user_response in contents
 
     response_frames = [
