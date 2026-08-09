@@ -100,6 +100,31 @@ class TestStripFinallyBlockReferences:
                 "Branch pointing to finally_block should have been nullified"
             )
 
+    def test_conditional_own_next_block_label_pointing_to_finally_is_nullified(self):
+        block_1 = _make_task_block("block_1")
+        cond_block = ConditionalBlock(
+            label="cond_block",
+            output_parameter=_make_output_parameter("cond_block"),
+            next_block_label="finally_block",
+            branch_conditions=[
+                BranchCondition(next_block_label="block_1", is_default=True),
+                BranchCondition(
+                    next_block_label="finally_block",
+                    criteria={"criteria_type": "jinja2_template", "expression": "{{ true }}"},
+                ),
+            ],
+        )
+        finally_block = _make_http_block("finally_block")
+
+        result = WorkflowService._strip_finally_block_references(
+            [block_1, cond_block, finally_block],
+            "finally_block",
+        )
+
+        cond = next(b for b in result if b.label == "cond_block")
+        assert cond.next_block_label is None
+        assert [branch.next_block_label for branch in cond.branch_conditions] == ["block_1", None]
+
     def test_noop_when_no_finally_block(self):
         block_1 = _make_task_block("block_1", next_block_label="block_2")
         block_2 = _make_task_block("block_2")
@@ -159,6 +184,45 @@ class TestBuildWorkflowGraphWithFinallyBlock:
 
         assert start_label == "cond_block"
         assert set(label_to_block.keys()) == {"cond_block", "block_1"}
+
+    def test_dag_validation_with_conditional_whose_merge_point_is_the_finally_block(self):
+        """A conditional whose own next_block_label is the finally block must still build.
+
+        The stale merge point used to be re-pointed onto every branch terminal by
+        resolve_conditional_merge_edges, so the graph build blamed a terminal block
+        the user never edited.
+        """
+        cond_block = ConditionalBlock(
+            label="cond_block",
+            output_parameter=_make_output_parameter("cond_block"),
+            next_block_label="finally_block",
+            branch_conditions=[
+                BranchCondition(next_block_label="branch_a_terminal", is_default=True),
+                BranchCondition(
+                    next_block_label="branch_b_terminal",
+                    criteria={"criteria_type": "jinja2_template", "expression": "{{ true }}"},
+                ),
+            ],
+        )
+        branch_a_terminal = _make_task_block("branch_a_terminal")
+        branch_b_terminal = _make_task_block("branch_b_terminal")
+        finally_block = _make_http_block("finally_block")
+
+        dag_blocks = WorkflowService._strip_finally_block_references(
+            [cond_block, branch_a_terminal, branch_b_terminal, finally_block],
+            "finally_block",
+        )
+
+        svc = WorkflowService()
+        start_label, label_to_block, default_next_map = svc._build_workflow_graph(dag_blocks)
+
+        assert start_label == "cond_block"
+        assert set(label_to_block.keys()) == {"cond_block", "branch_a_terminal", "branch_b_terminal"}
+        # No merge point survives the strip, so both branch terminals end the traversal
+        # and the finally block runs out-of-band.
+        assert default_next_map["cond_block"] is None
+        assert default_next_map["branch_a_terminal"] is None
+        assert default_next_map["branch_b_terminal"] is None
 
     def test_dag_validation_without_finally_block(self):
         block_1 = _make_task_block("block_1", next_block_label="block_2")

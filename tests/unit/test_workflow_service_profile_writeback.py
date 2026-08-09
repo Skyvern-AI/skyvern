@@ -7,16 +7,20 @@ overwrite the shared S3 profile with their dirty state.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.forge import app
+from skyvern.forge.sdk.schemas.credentials import credential_auto_profile_disabled
 from skyvern.forge.sdk.workflow.browser_profile_key import build_workflow_browser_session_storage_key
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.webeye.browser_manager import BrowserCleanupResult
+from skyvern.webeye.profile_cookie_merge import BANKED_COOKIES_FILENAME
 
 
 def _make_workflow(persist: bool = True) -> MagicMock:
@@ -56,6 +60,12 @@ def _make_browser_state(applied_browser_profile_id: str | None = None) -> MagicM
     bs.browser_artifacts._seed_capture_failed = False
     bs.browser_artifacts.applied_browser_profile_id = applied_browser_profile_id
     return bs
+
+
+def test_auto_profile_opt_out_predicate_is_explicit_true_only() -> None:
+    assert credential_auto_profile_disabled(SimpleNamespace(auto_profile_disabled=True)) is True
+    assert credential_auto_profile_disabled(SimpleNamespace(auto_profile_disabled=False)) is False
+    assert credential_auto_profile_disabled(SimpleNamespace(auto_profile_disabled=None)) is False
 
 
 def _patch_clean_up_deps(monkeypatch: pytest.MonkeyPatch, browser_state: MagicMock) -> AsyncMock:
@@ -856,6 +866,33 @@ async def test_sink_writeback_suppressed_when_seed_profile_failed_to_load(monkey
         effective_workflow_run_status=WorkflowRunStatus.completed,
     )
     store.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sink_full_write_drops_the_seed_era_banked_sidecar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The sidecar restored from the seed archive rides this dir into the sink profile, where every later
+    # boot would replay it over a fresher Cookies database. The closed browser's database is authoritative.
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    banked = tmp_path / BANKED_COOKIES_FILENAME
+    banked.write_text(json.dumps([{"name": "seed_era", "value": "x", "domain": "example.test", "path": "/"}]))
+    store = AsyncMock()
+    monkeypatch.setattr(app.STORAGE, "store_browser_profile", store)
+    wr = _make_workflow_run(WorkflowRunStatus.completed, browser_sink_profile_id="bp")
+    bs = _make_browser_state_b2(seed_cookies=[], seed_etag=None, fresh_login=False)
+    bs.browser_artifacts.browser_session_dir = str(tmp_path)
+
+    await WorkflowService()._persist_run_sink_profile_if_needed(
+        workflow_run=wr,
+        browser_state=bs,
+        close_browser_on_completion=True,
+        effective_workflow_run_status=WorkflowRunStatus.completed,
+    )
+
+    store.assert_awaited_once()
+    assert not banked.exists()
 
 
 @pytest.mark.asyncio

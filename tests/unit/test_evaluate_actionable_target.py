@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
+from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState, ReconcileDecision
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.result_evidence import loaded_result_source_producible
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import scouting
+from skyvern.forge.sdk.copilot.turn_intent import (
+    TurnIntent,
+    TurnIntentAuthority,
+    TurnIntentDeliverableKind,
+    TurnIntentMode,
+)
 
 
 def _packet() -> dict:
@@ -109,6 +118,9 @@ def _single_max_structural_loaded_result_packet() -> dict:
 def _ctx() -> AgentContext:
     ctx = AgentContext.__new__(AgentContext)
     ctx.scout_trajectory = []
+    ctx.completion_criteria_turn_state = None
+    ctx.request_policy = None
+    ctx.completion_verification_result = None
     return ctx
 
 
@@ -373,6 +385,18 @@ async def test_hash_route_change_not_steered(monkeypatch) -> None:
     assert "next_action" not in second["data"]
 
 
+def test_recon_result_keeps_raw_payload_within_its_own_ceiling() -> None:
+    moderate = {"ok": True, "data": {"result": {"bodyText": "y" * 10_000}, "next_action_reason": "recon"}}
+    scouting._fit_evaluate_steer_under_cap(moderate, moderate["data"], keep_raw_page_payload=True)
+    assert moderate["data"]["result"]["bodyText"] == "y" * 10_000
+
+
+def test_recon_result_over_ceiling_sheds_down_to_recon_cap() -> None:
+    huge = {"ok": True, "data": {"result": "z" * 60_000, "raw_page_text": "w" * 30_000}}
+    scouting._fit_evaluate_steer_under_cap(huge, huge["data"], keep_raw_page_payload=True)
+    assert len(json.dumps(huge, default=str)) <= scouting._SCOUT_RECON_RESULT_CHAR_CAP
+
+
 @pytest.mark.asyncio
 async def test_repeat_scalar_result_sheds_under_cap(monkeypatch) -> None:
     ctx = _ctx()
@@ -392,8 +416,8 @@ async def test_repeat_scalar_result_sheds_under_cap(monkeypatch) -> None:
     serialized = json.dumps(second, default=str)
     assert second["data"].get("next_action") == "click"
     assert second["data"].get("actionable_targets")
-    assert len(serialized) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
-    assert '"next_action"' in serialized[: scouting._RECENT_TOOL_OUTPUT_CHAR_CAP]
+    assert len(serialized) <= scouting._SCOUT_RESULT_CHAR_CAP
+    assert '"next_action"' in serialized[: scouting._SCOUT_RESULT_CHAR_CAP]
 
 
 @pytest.mark.asyncio
@@ -417,8 +441,8 @@ async def test_first_loaded_result_table_sheds_large_payload_but_keeps_compositi
     assert ctx.latest_recorded_build_test_outcome.phase == "scout_evaluate"
     assert ctx.latest_recorded_build_test_outcome.reason_code == "loaded_result_targets_observed"
     assert ctx.latest_recorded_build_test_outcome.structural_key is not None
-    assert len(serialized) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
-    assert '"next_action"' in serialized[: scouting._RECENT_TOOL_OUTPUT_CHAR_CAP]
+    assert len(serialized) <= scouting._SCOUT_RESULT_CHAR_CAP
+    assert '"next_action"' in serialized[: scouting._SCOUT_RESULT_CHAR_CAP]
     assert "compose_extraction" in serialized
 
 
@@ -448,7 +472,7 @@ async def test_loaded_result_composition_targets_are_cap_aware_for_max_shaped_ev
     serialized = json.dumps(result, default=str)
     composition_targets = result["data"]["composition_targets"]
     target = composition_targets["targets"][0]
-    assert len(serialized) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert len(serialized) <= scouting._SCOUT_RESULT_CHAR_CAP
     assert result["data"]["next_action"] == "compose_extraction"
     assert composition_targets["result_container_count"] == 8
     assert composition_targets["table_result_container_count"] == 8
@@ -490,7 +514,7 @@ async def test_single_loaded_result_structural_target_fits_evaluate_cap_with_url
     serialized = json.dumps(result, default=str)
     composition_targets = result["data"]["composition_targets"]
     target = composition_targets["targets"][0]
-    assert len(serialized) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert len(serialized) <= scouting._SCOUT_RESULT_CHAR_CAP
     assert result["data"]["next_action"] == "compose_extraction"
     assert composition_targets["result_container_count"] == 1
     assert composition_targets["table_result_container_count"] == 1
@@ -537,8 +561,8 @@ async def test_repeat_nested_result_sheds_under_cap(monkeypatch) -> None:
     serialized = json.dumps(second, default=str)
     assert second["data"].get("next_action") == "click"
     assert second["data"].get("actionable_targets")
-    assert len(serialized) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
-    assert '"next_action"' in serialized[: scouting._RECENT_TOOL_OUTPUT_CHAR_CAP]
+    assert len(serialized) <= scouting._SCOUT_RESULT_CHAR_CAP
+    assert '"next_action"' in serialized[: scouting._SCOUT_RESULT_CHAR_CAP]
 
 
 @pytest.mark.asyncio
@@ -901,7 +925,7 @@ async def test_single_low_tier_link_auto_acts(monkeypatch) -> None:
     assert second["data"]["page"]["page_title"] == "Statement"
     assert "next_action" not in second["data"]
     assert "actionable_targets" not in second["data"]
-    assert len(json.dumps(second, default=str)) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert len(json.dumps(second, default=str)) <= scouting._SCOUT_RESULT_CHAR_CAP
 
 
 @pytest.mark.asyncio
@@ -929,7 +953,7 @@ async def test_auto_act_post_evidence_none_sheds_bulky_result_under_cap(monkeypa
     assert second["data"]["auto_acted"]["selector"] == "#stmt"
     assert second["data"]["auto_acted"].get("note")
     assert "page" not in second["data"]
-    assert len(json.dumps(second, default=str)) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert len(json.dumps(second, default=str)) <= scouting._SCOUT_RESULT_CHAR_CAP
 
 
 @pytest.mark.asyncio
@@ -975,7 +999,7 @@ async def test_auto_act_success_branch_sheds_oversized_page_under_cap(monkeypatc
     assert [call[0] for call in server.calls].count("skyvern_click") == 1
     assert "auto_acted" in second["data"]
     assert "page" in second["data"]
-    assert len(json.dumps(second, default=str)) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert len(json.dumps(second, default=str)) <= scouting._SCOUT_RESULT_CHAR_CAP
 
 
 @pytest.mark.asyncio
@@ -1087,3 +1111,151 @@ async def test_auto_act_front_runs_the_third_evaluate(monkeypatch) -> None:
     detect_tool_loop(tripping, "evaluate")
     detect_tool_loop(tripping, "evaluate")
     assert detect_tool_loop(tripping, "evaluate") is not None
+
+
+def _ctx_with_unmet_download_goal() -> AgentContext:
+    ctx = _ctx()
+    criterion = CompletionCriterion(
+        id="c0",
+        outcome="the invoice for July is downloaded",
+        deliverable_kind="registered_download",
+    )
+    ctx.completion_criteria_turn_state = CompletionCriteriaTurnState(
+        decision=ReconcileDecision(action="create", reason="first", epoch=1, criteria=(criterion,))
+    )
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_result_table_with_unmet_download_goal_keeps_actionable_targets(monkeypatch) -> None:
+    """A page can be both a results table and the place a download must be earned. While a
+    registered-download criterion is unmet, the composition steer must not hide the click
+    affordances the goal still needs."""
+
+    async def fake_evidence(ctx, *, url):
+        return _result_table_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake_evidence)
+    ctx = _ctx_with_unmet_download_goal()
+    ctx.last_evaluate_actionable_signature = "stale"
+    ctx.last_evaluate_actionable_url = "https://example.com/previous"
+    result = {
+        "ok": True,
+        "data": {
+            "url": "https://example.com/results",
+            "actionable_targets": [{"selector": "#details", "text": "Details"}],
+        },
+    }
+
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://example.com/results")
+
+    assert result["data"].get("next_action") != "compose_extraction"
+    assert "actionable_targets" in result["data"]
+    assert "composition_targets" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_typed_turn_intent_download_keeps_targets_without_request_policy_criteria(monkeypatch) -> None:
+    async def fake_evidence(ctx, *, url):
+        return _result_table_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake_evidence)
+    ctx = _ctx()
+    ctx.request_policy = RequestPolicy(completion_criteria=[])
+    ctx.turn_intent = TurnIntent(
+        mode=TurnIntentMode.BUILD,
+        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        deliverable_kind=TurnIntentDeliverableKind.REGISTERED_DOWNLOAD,
+    )
+    result = {
+        "ok": True,
+        "data": {
+            "url": "https://example.com/results",
+            "actionable_targets": [{"selector": "#details", "text": "Details"}],
+        },
+    }
+
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://example.com/results")
+
+    assert result["data"].get("next_action") != "compose_extraction"
+    assert "actionable_targets" in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_typed_turn_intent_download_composes_after_registered_run_evidence(monkeypatch) -> None:
+    async def fake_evidence(ctx, *, url):
+        return _result_table_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake_evidence)
+    ctx = _ctx()
+    ctx.request_policy = RequestPolicy(completion_criteria=[])
+    ctx.turn_intent = TurnIntent(
+        mode=TurnIntentMode.BUILD,
+        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        deliverable_kind=TurnIntentDeliverableKind.REGISTERED_DOWNLOAD,
+    )
+    ctx.verified_block_outputs = {"download_invoice": {"download_registered": True, "downloaded_file_count": 1}}
+    result = {
+        "ok": True,
+        "data": {
+            "url": "https://example.com/results",
+            "actionable_targets": [{"selector": "#details", "text": "Details"}],
+        },
+    }
+
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://example.com/results")
+
+    assert result["data"].get("next_action") == "compose_extraction"
+    assert "actionable_targets" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_result_table_with_satisfied_download_goal_still_composes(monkeypatch) -> None:
+    async def fake_evidence(ctx, *, url):
+        return _result_table_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake_evidence)
+    ctx = _ctx_with_unmet_download_goal()
+    ctx.completion_verification_result = SimpleNamespace(verdicts=[SimpleNamespace(criterion_id="c0", satisfied=True)])
+    ctx.last_evaluate_actionable_signature = "stale"
+    ctx.last_evaluate_actionable_url = "https://example.com/previous"
+    result = {
+        "ok": True,
+        "data": {
+            "url": "https://example.com/results",
+            "actionable_targets": [{"selector": "#details", "text": "Details"}],
+        },
+    }
+
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://example.com/results")
+
+    assert result["data"].get("next_action") == "compose_extraction"
+    assert "actionable_targets" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_result_table_composes_again_once_download_target_is_reached(monkeypatch) -> None:
+    from skyvern.forge.sdk.copilot.reached_download_target import derive_from_observed_render
+
+    async def fake_evidence(ctx, *, url):
+        return _result_table_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake_evidence)
+    ctx = _ctx_with_unmet_download_goal()
+    ctx.reached_download_target = derive_from_observed_render(
+        selector="a.bill", rendered_url="https://example.com/bill-image"
+    )
+    ctx.last_evaluate_actionable_signature = "stale"
+    ctx.last_evaluate_actionable_url = "https://example.com/previous"
+    result = {
+        "ok": True,
+        "data": {
+            "url": "https://example.com/results",
+            "actionable_targets": [{"selector": "#details", "text": "Details"}],
+        },
+    }
+
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://example.com/results")
+
+    assert result["data"].get("next_action") == "compose_extraction"
+    assert "actionable_targets" not in result["data"]

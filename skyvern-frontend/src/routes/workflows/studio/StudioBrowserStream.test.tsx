@@ -40,6 +40,9 @@ vi.mock("@/hooks/useRuntimeConfig", () => ({
   useBrowserStreamingMode: () => ({
     browserStreamingMode: runtimeConfigMock.browserStreamingMode,
   }),
+  useStreamTransport: () => ({
+    streamTransport: runtimeConfigMock.browserStreamingMode,
+  }),
 }));
 
 vi.mock("@/components/BrowserStream", () => ({

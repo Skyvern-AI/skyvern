@@ -41,6 +41,7 @@ from skyvern.forge.sdk.copilot.config import (
 )
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.enforcement import (
+    _RECENT_TOOL_OUTPUT_CHAR_CAP,
     KEEP_RECENT_TOOL_OUTPUTS,
     TOTAL_TIMEOUT_SECONDS,
     _mark_copilot_total_timeout,
@@ -53,7 +54,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _should_force_advisory_run_dispatch,
     _summarize_tool_output,
     aggressive_prune,
-    arm_credential_scout_reopen,
     enforcement_decision,
     mint_scout_observation_contract_for_ctx,
     pre_run_gated_outputs_without_path,
@@ -116,7 +116,6 @@ class _Ctx:
         self.persisted_draft_browser_calls = None
         self.test_after_update_done = False
         self.post_update_nudge_count = 0
-        self.coverage_nudge_count = 0
         self.format_nudge_count = 0
         self.user_message = ""
         self.last_update_block_count = None
@@ -135,8 +134,6 @@ class _Ctx:
         self.latest_diagnosis_repair_contract = None
         self.last_code_authoring_repair_context = None
         self.synthesized_block_reopened_after_failed_run = False
-        self.synthesized_block_reopened_for_credential_scout = False
-        self.credential_scout_rescout_context_key = None
         self.synthesized_goal_complete_landed = False
         self.impose_synthesized_code_block = False
         self.scouted_output_covered_paths: set[str] = set()
@@ -1640,6 +1637,35 @@ def test_recent_outputs_preserved_full() -> None:
         assert pruned[i]["output"] == short
 
 
+def test_recent_code_sized_output_survives_untruncated() -> None:
+    # A code-bearing result in the recent window must reach the model whole; the cap
+    # is a pathological-payload tripwire, never a ration on legitimate code payloads.
+    code_sized = json.dumps({"ok": True, "data": {"code": "await page.click()\n" * 400}})
+    assert 2000 < len(code_sized) < _RECENT_TOOL_OUTPUT_CHAR_CAP
+    items = [_fco("c0", code_sized)]
+
+    pruned = _prune_input_list(items)
+    assert pruned[0]["output"] == code_sized
+
+
+def test_scout_budgets_stay_within_the_recent_window_cap() -> None:
+    from skyvern.forge.sdk.copilot.tools.scouting import _SCOUT_RECON_RESULT_CHAR_CAP, _SCOUT_RESULT_CHAR_CAP
+
+    # The shed-never-slice guarantee holds only while every scout budget fits inside
+    # the transcript's recent-window cap.
+    assert _SCOUT_RESULT_CHAR_CAP <= _SCOUT_RECON_RESULT_CHAR_CAP <= _RECENT_TOOL_OUTPUT_CHAR_CAP
+
+
+def test_old_code_output_synopsis_names_elided_code_size() -> None:
+    code = "await page.click()\n" * 300
+    old_output = json.dumps({"ok": True, "data": {"code": code}})
+    items = [_fco("c_old", old_output)] + [_fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)]
+
+    pruned = _prune_input_list(items)
+    synopsis = json.loads(pruned[0]["output"])
+    assert synopsis["code_chars_elided"] == len(code)
+
+
 def test_old_large_output_is_summarized() -> None:
     # An older, large JSON tool output gets compressed into a synopsis.
     heavy_payload = {
@@ -1702,15 +1728,19 @@ def test_summarize_short_output_is_unchanged() -> None:
 
 
 def test_recent_large_output_is_head_truncated_not_summarized() -> None:
-    # Big JSON in the most-recent slot should be head-truncated at 2000 chars,
+    import structlog.testing
+
+    # Over-cap JSON in the most-recent slot should be head-truncated,
     # NOT replaced with a summary.
-    large = '{"ok":true,"data":{"value":"' + ("y" * 3000) + '"}}'
+    large = '{"ok":true,"data":{"value":"' + ("y" * (_RECENT_TOOL_OUTPUT_CHAR_CAP + 1000)) + '"}}'
     items = [_fco("c_recent", large)]
-    pruned = _prune_input_list(items)
+    with structlog.testing.capture_logs() as logs:
+        pruned = _prune_input_list(items)
     out = pruned[0]["output"]
     assert out.startswith('{"ok":true,')
     assert out.endswith("\n... [truncated]")
-    assert len(out) <= 2020
+    assert len(out) <= _RECENT_TOOL_OUTPUT_CHAR_CAP + 20
+    assert any(entry["event"] == "copilot_recent_tool_output_truncated" for entry in logs)
 
 
 class TestEnforcement:
@@ -1723,7 +1753,6 @@ class TestEnforcement:
         ctx.update_workflow_called = False
         ctx.test_after_update_done = False
         ctx.post_update_nudge_count = 0
-        ctx.coverage_nudge_count = 0
         ctx.format_nudge_count = 0
         ctx.explore_without_workflow_nudge_count = 0
         ctx.last_test_suspicious_success = False
@@ -1788,71 +1817,7 @@ class TestEnforcement:
         assert nudge is not None
         assert nudge.rule == "post_navigate"
 
-    def test_intermediate_success_nudge_for_multistep_goal(self) -> None:
-        ctx = self._make_ctx(
-            update_workflow_called=True,
-            test_after_update_done=True,
-            last_test_ok=True,
-            last_update_block_count=1,
-            user_message="Go to france.fr and then download all french regulations",
-            coverage_nudge_count=0,
-        )
-        # Coverage gate only fires when the model tries to emit a REPLY.
-        nudge = enforcement_decision(ctx, self._reply_result("draft response"))
-        assert nudge.rule == "post_intermediate_success"
-        assert ctx.coverage_nudge_count == 1
-
-    def test_no_intermediate_success_nudge_for_single_step_goal(self) -> None:
-        ctx = self._make_ctx(
-            update_workflow_called=True,
-            test_after_update_done=True,
-            last_test_ok=True,
-            last_update_block_count=1,
-            user_message="Go to france.fr",
-            coverage_nudge_count=0,
-        )
-        assert enforcement_decision(ctx, self._reply_result("done")) is None
-
-    def test_intermediate_success_nudge_fires_for_two_blocks(self) -> None:
-        """Key regression: nudge must fire even when block_count > 1."""
-
-        ctx = self._make_ctx(
-            update_workflow_called=True,
-            test_after_update_done=True,
-            last_test_ok=True,
-            last_update_block_count=2,
-            user_message="Go to france.fr and then download all french regulations and extract the titles",
-            coverage_nudge_count=0,
-        )
-        nudge = enforcement_decision(ctx, self._reply_result("two-block draft"))
-        assert nudge.rule == "post_intermediate_success"
-
-    def test_intermediate_nudge_respects_global_cap(self) -> None:
-        from skyvern.forge.sdk.copilot.enforcement import MAX_INTERMEDIATE_NUDGES
-
-        ctx = self._make_ctx(
-            update_workflow_called=True,
-            test_after_update_done=True,
-            last_test_ok=True,
-            last_update_block_count=2,
-            user_message="Go to france.fr and then download all french regulations",
-            coverage_nudge_count=MAX_INTERMEDIATE_NUDGES,
-        )
-        assert enforcement_decision(ctx, self._reply_result("capped")) is None
-
-    def test_intermediate_nudge_does_not_fire_for_ten_plus_blocks(self) -> None:
-        ctx = self._make_ctx(
-            update_workflow_called=True,
-            test_after_update_done=True,
-            last_test_ok=True,
-            last_update_block_count=10,
-            user_message="Go to france.fr and then download all french regulations",
-            coverage_nudge_count=0,
-        )
-        assert enforcement_decision(ctx, self._reply_result("ten blocks")) is None
-
-    def test_ask_question_always_passes_even_with_coverage_gap(self) -> None:
-        """Regression guard: ASK_QUESTION must never be blocked by coverage."""
+    def test_ask_question_passes_response_enforcement(self) -> None:
         import json
 
         ctx = self._make_ctx(
@@ -1861,21 +1826,19 @@ class TestEnforcement:
             last_test_ok=True,
             last_update_block_count=1,
             user_message="Go to france.fr and then download all french regulations",
-            coverage_nudge_count=0,
         )
         ask = MagicMock()
         ask.final_output = json.dumps({"type": "ASK_QUESTION", "user_response": "Which source?"})
         ask.new_items = []
         assert enforcement_decision(ctx, ask) is None
 
-    def test_plain_labeled_ask_question_passes_even_with_coverage_gap(self) -> None:
+    def test_plain_labeled_ask_question_passes_response_enforcement(self) -> None:
         ctx = self._make_ctx(
             update_workflow_called=True,
             test_after_update_done=True,
             last_test_ok=True,
             last_update_block_count=1,
             user_message="Go to france.fr and then download all french regulations",
-            coverage_nudge_count=0,
         )
         ask = MagicMock()
         ask.final_output = "ASK_QUESTION\nWhich source?"
@@ -2034,45 +1997,6 @@ class TestEnforcement:
         )
         assert returned is fake_result
         assert ctx.post_update_nudge_count == 1
-
-
-class TestGoalLikelyNeedsMoreBlocks:
-    @staticmethod
-    def _check(user_message: str, block_count: int, completion_contract: str | None = None) -> bool:
-        from skyvern.forge.sdk.copilot.enforcement import _goal_likely_needs_more_blocks
-
-        return _goal_likely_needs_more_blocks(user_message, block_count, completion_contract)
-
-    def test_navigate_and_download_needs_two(self) -> None:
-        assert self._check("Go to france.fr and then download regulations", 1) is True
-        assert self._check("Go to france.fr and then download regulations", 2) is False
-
-    def test_login_search_and_extract_needs_three(self) -> None:
-        assert self._check("Login to the site, search for products, and extract prices", 1) is True
-        assert self._check("Login to the site, search for products, and extract prices", 2) is True
-        assert self._check("Login to the site, search for products, and extract prices", 3) is False
-
-    def test_single_action_does_not_need_more(self) -> None:
-        assert self._check("Go to france.fr", 1) is False
-
-    def test_completion_contract_does_not_force_extra_blocks_after_success(self) -> None:
-        user_message = "Go to example.com/contact, fill out the form, and submit it."
-        assert self._check(user_message, 1, "confirmation banner appears") is False
-
-    def test_completion_contract_still_requires_sequential_blocks(self) -> None:
-        user_message = "Go to example.com and then download the report."
-        assert self._check(user_message, 1, "download starts") is True
-        assert self._check(user_message, 2, "download starts") is False
-
-    def test_sequential_connector_needs_at_least_two(self) -> None:
-        assert self._check("Do X and then do Y", 1) is True
-
-    def test_ten_plus_blocks_always_false(self) -> None:
-        assert self._check("Go to X and then download Y and extract Z", 10) is False
-
-    def test_non_string_returns_false(self) -> None:
-        assert self._check(None, 1) is False  # type: ignore[arg-type]
-        assert self._check(123, 1) is False  # type: ignore[arg-type]
 
 
 LISTING_DETAIL_URL = "http://localhost:8901/record/1457803926"
@@ -3335,29 +3259,6 @@ class TestCredentialFlowGoalComplete:
         assert synthesized_trajectory_is_goal_complete(ctx) is True
 
 
-class TestCredentialScoutReopen:
-    def _offered_complete_ctx(self) -> _Ctx:
-        helper = TestCredentialFlowGoalComplete()
-        return helper._ctx_with_inventory(
-            helper._two_screen_full_login(),
-            inventory={"cred_1": frozenset({"username", "password"})},
-        )
-
-    def test_arm_is_one_shot_per_identity_digest(self) -> None:
-        ctx = make_copilot_context()
-        assert arm_credential_scout_reopen(ctx, "identity-1") is True
-        assert ctx.synthesized_block_reopened_for_credential_scout is True
-        assert synthesized_persistence_reopened(ctx) is True
-
-        ctx.synthesized_block_reopened_for_credential_scout = False
-        assert arm_credential_scout_reopen(ctx, "identity-1") is False
-        assert ctx.synthesized_block_reopened_for_credential_scout is False
-        assert synthesized_persistence_reopened(ctx) is False
-
-        assert arm_credential_scout_reopen(ctx, "identity-2") is True
-        assert ctx.synthesized_block_reopened_for_credential_scout is True
-
-
 def _deadline_ctx() -> SimpleNamespace:
     return SimpleNamespace(
         copilot_total_timeout_exceeded=False,
@@ -3505,3 +3406,102 @@ class TestUnboundOfferReopen:
         # Without the latch this stays True for the rest of the turn and the whole offer is
         # re-emitted on every prompt build.
         assert synthesized_offer_reopened_for_extraction_plan(ctx, None) is False
+
+
+class TestCollapseSupersededSynthesizedOffers:
+    """Refreshed synthesized-block offers supersede rather than stack: the
+    collapse keeps at most the last offer and drops the superseded ones."""
+
+    @staticmethod
+    def _offer(body: str) -> dict[str, Any]:
+        from skyvern.forge.sdk.copilot.code_block_synthesis import SYNTHESIZED_OFFER_SENTINEL
+
+        return {"role": "user", "content": SYNTHESIZED_OFFER_SENTINEL + " " + body}
+
+    def test_keeps_only_the_last_offer_with_distinct_payloads(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import collapse_superseded_synthesized_offers
+
+        goal = {"role": "user", "content": "build me a login workflow"}
+        # Distinct, non-monotonic payloads: a refresh can fire because the plan
+        # changed or the trajectory was evicted, so the newest body is not a
+        # superset of the older ones. Keep-last must not assume it is.
+        items = [
+            goal,
+            self._offer("await page.goto('https://a.example')"),
+            {"type": "function_call", "call_id": "c1", "name": "evaluate", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": '{"ok": true}'},
+            self._offer("await page.click('#submit')"),
+            {"role": "assistant", "content": "scouting"},
+            self._offer("await page.goto('https://b.example')"),
+        ]
+        result = collapse_superseded_synthesized_offers(items)
+
+        offers = [it for it in result if isinstance(it, dict) and "SYNTHESIZED CODE BLOCK" in str(it.get("content"))]
+        assert len(offers) == 1
+        assert "b.example" in offers[0]["content"]
+        # Everything that is not a superseded offer survives untouched, in order.
+        assert result[0] == goal
+        assert [it.get("call_id") for it in result if isinstance(it, dict) and it.get("call_id")] == ["c1", "c1"]
+
+    def test_idempotent_and_noop_without_stacking(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import collapse_superseded_synthesized_offers
+
+        items = [
+            {"role": "user", "content": "build me a workflow"},
+            {"type": "function_call_output", "call_id": "c1", "output": "{}"},
+            self._offer("await page.goto('https://a.example')"),
+        ]
+        once = collapse_superseded_synthesized_offers(items)
+        assert once == items
+        assert collapse_superseded_synthesized_offers(once) == once
+
+    def test_never_drops_the_opening_item(self) -> None:
+        """A first transcript item that happens to start with the sentinel is the
+        user's goal, not a superseded offer; collapsing it would delete the turn's
+        anchor. It also must not count as the kept offer."""
+        from skyvern.forge.sdk.copilot.enforcement import collapse_superseded_synthesized_offers
+
+        opening = self._offer("verbatim text a user pasted")
+        items = [opening, self._offer("stale"), self._offer("fresh")]
+        result = collapse_superseded_synthesized_offers(items)
+        assert result[0] == opening
+        assert [it["content"] for it in result[1:]] == [items[2]["content"]]
+
+    def test_ignores_non_offer_user_messages_and_list_content(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import collapse_superseded_synthesized_offers
+
+        items = [
+            {"role": "user", "content": "build me a workflow"},
+            {"role": "user", "content": "SYNTHESIZED but not the sentinel"},
+            {"role": "user", "content": [{"type": "input_text", "text": "screenshot-ish"}]},
+            self._offer("stale"),
+            self._offer("fresh"),
+            {"role": "user", "content": "one more real message"},
+        ]
+        result = collapse_superseded_synthesized_offers(items)
+        assert [it.get("content") for it in result] == [
+            "build me a workflow",
+            "SYNTHESIZED but not the sentinel",
+            [{"type": "input_text", "text": "screenshot-ish"}],
+            items[4]["content"],
+            "one more real message",
+        ]
+
+    def test_prune_input_list_collapses_offers(self) -> None:
+        items = [
+            {"role": "user", "content": "build me a workflow"},
+            self._offer("stale one"),
+            {"type": "function_call_output", "call_id": "c1", "output": "{}"},
+            self._offer("stale two"),
+            self._offer("fresh"),
+        ]
+        result = _prune_input_list(items)
+        offers = [it for it in result if isinstance(it, dict) and "SYNTHESIZED CODE BLOCK" in str(it.get("content"))]
+        assert len(offers) == 1
+        assert "fresh" in offers[0]["content"]
+
+    def test_offer_is_a_synthetic_user_message(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import is_synthetic_user_message
+
+        assert is_synthetic_user_message(self._offer("await page.goto('https://a.example')"))
+        assert not is_synthetic_user_message({"role": "user", "content": "build me a workflow"})

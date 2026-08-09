@@ -26,6 +26,7 @@ from skyvern.forge.sdk.copilot import code_block_synthesis as code_block_synthes
 from skyvern.forge.sdk.copilot import enforcement as enforcement_module
 from skyvern.forge.sdk.copilot import request_policy as request_policy_module
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.author_time_block import CODE_SAFETY_BLOCK_ID
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     AuthoringParameterBindingCandidate,
     build_authoring_parameter_binding_directive,
@@ -5151,7 +5152,7 @@ class TestCodeRepairProgressClassification:
         assert ctx.last_code_authoring_repair_context is None
 
     @pytest.mark.asyncio
-    async def test_credential_scout_reject_is_not_classified_as_progress(self) -> None:
+    async def test_credential_reference_reject_is_not_classified_as_progress(self) -> None:
         ctx = _code_only_ctx()
         ctx.scout_trajectory = []
         result = await _update_workflow(
@@ -5169,8 +5170,8 @@ class TestCodeRepairProgressClassification:
             ctx,
         )
         assert result["ok"] is False
-        assert result["data"]["failure_type"] == "missing_credential_or_init"
-        assert result["data"].get("surface_kind") is None
+        assert "was not found in this organization" in result["error"]
+        assert (result.get("data") or {}).get("surface_kind") is None
 
 
 _SPINE_SYNTH_CODE = 'await page.locator("#stage-a").click()\nawait page.locator("#stage-b").click()'
@@ -5541,6 +5542,26 @@ def _imposition_split_ctx() -> CopilotContext:
     return ctx
 
 
+def _reaching_imposition_split_ctx() -> CopilotContext:
+    """The split fixture whose scouted pair carries indices, so it reads as an opening click and its commit."""
+    ctx = _imposition_split_ctx()
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "click",
+            "selector": "#stage-a",
+            "source_url": "https://example.com/records",
+            "trajectory_index": 0,
+        },
+        {
+            "tool_name": "click",
+            "selector": "#stage-b",
+            "source_url": "https://example.com/records",
+            "trajectory_index": 1,
+        },
+    ]
+    return ctx
+
+
 class TestSeparatedSpineImpositionRunEligibility:
     def test_imposition_accepts_scouted_browser_stage_siblings(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(workflow_update_module, "synthesize_code_block", lambda *a, **k: _fake_spine_synthesized())
@@ -5805,7 +5826,15 @@ class TestCompiledAuthoringImposition:
                 "role": "textbox",
                 "accessible_name": "Provider Name",
                 "trajectory_index": 0,
-            }
+            },
+            {
+                "tool_name": "click",
+                "selector": "#provider-search-submit",
+                "source_url": "https://example.com/find-care",
+                "role": "button",
+                "accessible_name": "Search",
+                "trajectory_index": 1,
+            },
         ]
         return ctx
 
@@ -5865,7 +5894,7 @@ class TestCompiledAuthoringImposition:
         ]
         assert result["data"]["imposed_substitutions"] == {
             "block_label": "search_registry",
-            "source_trajectory_count": 1,
+            "source_trajectory_count": 2,
             "parameter_keys": ["provider_name"],
             "credential_parameter_keys": [],
             "selector_provenance": [
@@ -5874,7 +5903,13 @@ class TestCompiledAuthoringImposition:
                     "selector": "#provInput",
                     "emitted_literal": "#provInput",
                     "source": "selector",
-                }
+                },
+                {
+                    "trajectory_index": 1,
+                    "selector": "#provider-search-submit",
+                    "emitted_literal": "#provider-search-submit",
+                    "source": "selector",
+                },
             ],
             "prior_source": "workflow_yaml",
         }
@@ -6571,7 +6606,15 @@ class TestCompiledAuthoringImposition:
                 "role": "textbox",
                 "accessible_name": "Address or postal code",
                 "trajectory_index": 0,
-            }
+            },
+            {
+                "tool_name": "click",
+                "selector": "#directory-search-submit",
+                "source_url": "https://example.com/find-care",
+                "role": "button",
+                "accessible_name": "Search",
+                "trajectory_index": 1,
+            },
         ]
         submitted = _yaml(
             """
@@ -6634,6 +6677,14 @@ class TestCompiledAuthoringImposition:
                 "role": "textbox",
                 "accessible_name": "Provider First Name",
                 "trajectory_index": 1,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#directory-search-submit",
+                "source_url": "https://example.com/find-care",
+                "role": "button",
+                "accessible_name": "Search",
+                "trajectory_index": 2,
             },
         ]
         submitted = _yaml(
@@ -7199,7 +7250,7 @@ class TestCredentialScoutPersistGate:
     )
 
     @pytest.mark.asyncio
-    async def test_rejects_credential_submit_code_without_matching_fill_scouts(self) -> None:
+    async def test_credential_submit_code_needs_no_fill_scouts_before_reference_validation(self) -> None:
         ctx = _code_only_ctx()
         ctx.scout_trajectory = []
         ctx.last_code_authoring_repair_context = _stale_unresolved_repair_context()
@@ -7207,33 +7258,25 @@ class TestCredentialScoutPersistGate:
         result = await _update_workflow({"workflow_yaml": self._SUBMIT_CODE_YAML}, ctx)
 
         assert result["ok"] is False
-        assert "fill_credential_field" in result["error"]
-        assert "click the submit control or press Enter" in result["error"]
-        assert "authoring_repair_context" not in result["data"]
+        error_text = str(result.get("error") or "")
+        assert "fill_credential_field" not in error_text
+        assert "was not found in this organization" in error_text
         assert ctx.last_code_authoring_repair_context is None
-        assert result["user_facing_summary"] == (
-            "I need to verify the saved-credential login in the browser before I can save or run this code."
-        )
 
     @pytest.mark.asyncio
-    async def test_credential_scout_blocker_takes_precedence_over_code_safety(self) -> None:
+    async def test_code_safety_reject_surfaces_for_unscouted_credential_code(self) -> None:
         ctx = _code_only_ctx()
         ctx.scout_trajectory = []
 
         result = await _update_workflow({"workflow_yaml": self._UNSAFE_SUBMIT_CODE_YAML}, ctx)
 
         assert result["ok"] is False
-        assert "fill_credential_field" in result["error"]
-        assert "Insecure code detected" not in result["error"]
-        assert result["user_facing_summary"] == (
-            "I need to verify the saved-credential login in the browser before I can save or run this code."
-        )
-        assert result["data"]["failure_type"] == "missing_credential_or_init"
-        code_safety_diagnostics = result["data"]["diagnostic_code_safety_errors"]
-        assert any("private methods or attributes" in error for error in code_safety_diagnostics)
+        assert result["block_id"] == CODE_SAFETY_BLOCK_ID
+        assert "fill_credential_field" not in result["error"]
+        assert result["user_facing_summary"] != CREDENTIAL_SCOUT_VERIFY_REPLY
 
     @pytest.mark.asyncio
-    async def test_allows_submit_code_gate_once_matching_fills_and_submit_are_scouted(self) -> None:
+    async def test_scouted_submit_code_reaches_reference_validation(self) -> None:
         ctx = _code_only_ctx()
         ctx.scout_trajectory = [
             _credential_fill_interaction("username"),
@@ -7251,7 +7294,7 @@ class TestCredentialScoutPersistGate:
         assert "saved-credential login flow" not in error_text
 
     @pytest.mark.asyncio
-    async def test_submit_code_still_requires_later_submit_after_matching_fills(self) -> None:
+    async def test_submit_code_needs_no_scouted_submit_before_reference_validation(self) -> None:
         ctx = _code_only_ctx()
         ctx.scout_trajectory = [
             _credential_fill_interaction("username"),
@@ -7262,11 +7305,12 @@ class TestCredentialScoutPersistGate:
         result = await _update_workflow({"workflow_yaml": self._SUBMIT_CODE_YAML}, ctx)
 
         assert result["ok"] is False
-        assert "later submit action on the same page" in result["error"]
-        assert "click the submit control or press Enter" in result["error"]
+        error_text = str(result.get("error") or "")
+        assert "later submit action on the same page" not in error_text
+        assert "was not found in this organization" in error_text
 
     @pytest.mark.asyncio
-    async def test_fill_only_code_requires_matching_fill_scouts_but_not_submit(self) -> None:
+    async def test_fill_only_code_reaches_reference_validation(self) -> None:
         ctx = _code_only_ctx()
         ctx.scout_trajectory = [
             _credential_fill_interaction("username"),
@@ -7283,7 +7327,7 @@ class TestCredentialScoutPersistGate:
         assert "saved-credential login flow" not in error_text
 
     @pytest.mark.asyncio
-    async def test_runtime_otp_method_does_not_require_impossible_live_otp_fill(self) -> None:
+    async def test_runtime_otp_code_reaches_reference_validation(self) -> None:
         ctx = _code_only_ctx()
         ctx.scout_trajectory = [
             _credential_fill_interaction("username"),
@@ -7324,137 +7368,6 @@ class TestCredentialScoutPersistGate:
         error_text = str(result.get("error") or "")
         assert "fill_credential_field" not in error_text
         assert "saved-credential login flow" not in error_text
-
-    @pytest.mark.asyncio
-    async def test_targeted_run_labels_scope_credential_scout_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _stub_successful_update(monkeypatch)
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = []
-
-        accepted = await _update_workflow(
-            {
-                "workflow_yaml": self._MULTI_BLOCK_TARGETED_CREDENTIAL_YAML,
-                "block_labels": ["open_matching_statement"],
-            },
-            ctx,
-            allow_missing_credentials=True,
-        )
-
-        assert accepted["ok"] is True
-
-        selected_credential_ctx = _code_only_ctx()
-        selected_credential_ctx.scout_trajectory = []
-        rejected = await _update_workflow(
-            {
-                "workflow_yaml": self._MULTI_BLOCK_TARGETED_CREDENTIAL_YAML,
-                "block_labels": ["sign_in_to_business_center"],
-            },
-            selected_credential_ctx,
-        )
-
-        assert rejected["ok"] is False
-        assert rejected["data"]["failure_type"] == "missing_credential_or_init"
-        assert "sign_in_to_business_center" in rejected["error"]
-        assert rejected["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
-
-    @pytest.mark.asyncio
-    async def test_persisted_parameter_shape_does_not_rescout_unchanged_selected_credential_block(self) -> None:
-        sign_in_code = """
-        await page.locator("#email").fill(login_credential.username)
-        await page.locator("input[type='password']").fill(login_credential.password)
-        await page.locator("#sign-in").click()
-        """
-        sign_in_code = textwrap.dedent(sign_in_code).strip()
-        login_parameter = {
-            "parameter_type": "workflow",
-            "workflow_parameter_type": "credential_id",
-            "key": "login_credential",
-            "default_value": "cred_missing",
-        }
-        prior_yaml = yaml.safe_dump(
-            {
-                "title": "Saved credential login",
-                "workflow_definition": {
-                    "parameters": [login_parameter],
-                    "blocks": [
-                        {
-                            "block_type": "code",
-                            "label": "sign_in_to_business_center",
-                            "parameters": [login_parameter],
-                            "code": sign_in_code,
-                        }
-                    ],
-                },
-            },
-            sort_keys=False,
-        )
-        submitted_yaml = yaml.safe_dump(
-            {
-                "title": "Saved credential login",
-                "workflow_definition": {
-                    "parameters": [
-                        login_parameter,
-                        {
-                            "parameter_type": "workflow",
-                            "workflow_parameter_type": "string",
-                            "key": "account_number",
-                            "default_value": "100245",
-                        },
-                    ],
-                    "blocks": [
-                        {
-                            "block_type": "code",
-                            "label": "sign_in_to_business_center",
-                            "parameter_keys": ["login_credential"],
-                            "code": sign_in_code,
-                        },
-                        {
-                            "block_type": "code",
-                            "label": "open_matching_statement",
-                            "parameter_keys": ["account_number"],
-                            "code": 'await page.get_by_text("View Printable Statement").wait_for(timeout=5000)',
-                        },
-                    ],
-                },
-            },
-            sort_keys=False,
-        )
-        ctx = _code_only_ctx()
-        ctx.workflow_yaml = prior_yaml
-        ctx.scout_trajectory = []
-
-        result = await _update_workflow(
-            {
-                "workflow_yaml": submitted_yaml,
-                "block_labels": ["sign_in_to_business_center", "open_matching_statement"],
-            },
-            ctx,
-        )
-
-        assert result["ok"] is False
-        error_text = str(result.get("error") or "")
-        assert "open_matching_statement" in error_text
-        assert "fill_credential_field" not in error_text
-
-        changed_yaml = submitted_yaml.replace(
-            'await page.locator("#sign-in").click()',
-            'await page.locator("#sign-in").click()\n      await page.locator("#post-login").click()',
-        )
-        changed_ctx = _code_only_ctx()
-        changed_ctx.workflow_yaml = prior_yaml
-        changed_ctx.scout_trajectory = []
-
-        changed_result = await _update_workflow(
-            {
-                "workflow_yaml": changed_yaml,
-                "block_labels": ["sign_in_to_business_center"],
-            },
-            changed_ctx,
-        )
-
-        assert changed_result["ok"] is False
-        assert changed_result["data"]["failure_type"] == "missing_credential_or_init"
-        assert changed_result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
 
 
 def test_run_id_leak_check_covers_non_numeric_ids() -> None:
@@ -7642,7 +7555,7 @@ def _terminal_challenge_signal() -> CopilotToolBlockerSignal:
 
 class TestCodeAuthoringGuardrailChurnBackstop:
     @pytest.mark.asyncio
-    async def test_counter_climbs_through_credential_scout_branch(self) -> None:
+    async def test_counter_climbs_for_unsafe_credential_code(self) -> None:
         ctx = _code_only_ctx()
         ctx.scout_trajectory = []
         unsafe_credential_yaml = _credential_code_yaml(
@@ -7657,7 +7570,7 @@ class TestCodeAuthoringGuardrailChurnBackstop:
         result = await _update_workflow({"workflow_yaml": unsafe_credential_yaml}, ctx)
 
         assert result["ok"] is False
-        assert result["data"]["failure_type"] == "missing_credential_or_init"
+        assert result["block_id"] == CODE_SAFETY_BLOCK_ID
         assert ctx.code_authoring_guardrail_reject_count == 1
 
     @pytest.mark.asyncio
@@ -7710,31 +7623,16 @@ class TestCodeAuthoringGuardrailChurnBackstop:
         ) in info_calls
 
     @pytest.mark.asyncio
-    async def test_single_credential_priority_reject_defers_to_credential_scout_reply(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = []
-
-        result = await _update_workflow({"workflow_yaml": _distinct_credential_collision_yaml(1)}, ctx)
-
-        assert ctx.code_authoring_guardrail_reject_count == 1
-        assert result["ok"] is False
-        assert result["data"]["failure_type"] == "missing_credential_or_init"
-        assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
-        assert ctx.blocker_signal is None
-        assert ctx.latest_tool_blocker_signal is None
-
-    @pytest.mark.asyncio
-    async def test_mixed_credential_and_non_name_guardrail_uses_credential_priority_path(self) -> None:
+    async def test_mixed_credential_and_non_name_guardrail_uses_code_safety_path(self) -> None:
         ctx = _code_only_ctx()
         ctx.scout_trajectory = []
 
         result = await _update_workflow({"workflow_yaml": _distinct_credential_collision_yaml(1)}, ctx)
 
         assert result["ok"] is False
-        assert result["data"]["failure_type"] == "missing_credential_or_init"
-        assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
+        assert result["block_id"] == CODE_SAFETY_BLOCK_ID
         assert ctx.last_code_authoring_repair_context is None
-        assert ctx.last_code_authoring_reject_was_credential_priority is True
+        assert ctx.last_code_authoring_reject_was_credential_priority is False
 
     @pytest.mark.asyncio
     async def test_standard_policy_mixed_credential_and_unresolved_name_omits_repair_context(self) -> None:
@@ -7748,7 +7646,7 @@ class TestCodeAuthoringGuardrailChurnBackstop:
         assert ctx.last_code_authoring_repair_context is None
 
     @pytest.mark.asyncio
-    async def test_single_pure_credential_reject_defers_to_credential_scout_reply(self) -> None:
+    async def test_single_pure_credential_reject_still_routes_credential_priority(self) -> None:
         ctx = _code_only_ctx()
         ctx.scout_trajectory = []
 
@@ -7756,9 +7654,8 @@ class TestCodeAuthoringGuardrailChurnBackstop:
 
         assert ctx.code_authoring_guardrail_reject_count == 1
         assert result["ok"] is False
-        assert result["data"]["failure_type"] == "missing_credential_or_init"
-        assert "diagnostic_code_safety_errors" not in result["data"]
-        assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
+        assert "was not found in this organization" in result["error"]
+        assert ctx.last_code_authoring_reject_was_credential_priority is True
         assert ctx.blocker_signal is None
         assert ctx.latest_tool_blocker_signal is None
 
@@ -7779,16 +7676,19 @@ class TestCodeAuthoringGuardrailChurnBackstop:
         assert ctx.code_authoring_guardrail_reject_count == 0
 
     @pytest.mark.asyncio
-    async def test_changed_persisted_credential_block_still_requires_new_scout(self) -> None:
+    async def test_changed_credential_block_needs_no_new_scout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
         ctx = _code_only_ctx()
         ctx.workflow_yaml = _safe_credential_collision_yaml(0)
         ctx.scout_trajectory = []
 
-        result = await _update_workflow({"workflow_yaml": _safe_credential_collision_yaml(1)}, ctx)
+        result = await _update_workflow(
+            {"workflow_yaml": _safe_credential_collision_yaml(1)}, ctx, allow_missing_credentials=True
+        )
 
-        assert result["ok"] is False
-        assert result["data"]["failure_type"] == "missing_credential_or_init"
-        assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
+        assert result["ok"] is True
+        assert result.get("user_facing_summary") != CREDENTIAL_SCOUT_VERIFY_REPLY
+        assert ctx.code_authoring_guardrail_reject_count == 0
 
 
 _RESALE_URL = "https://example.com/orders"
@@ -9229,7 +9129,14 @@ class TestBareDropSupersession:
     def test_imposition_two_refiners_forgive_two_bare_drops(self) -> None:
         ctx = _resale_ctx()
         ctx.scout_trajectory = [
-            {"tool_name": "click", "selector": "#start", "source_url": _RESALE_URL, "trajectory_index": 0},
+            {
+                "tool_name": "type_text",
+                "selector": "#order-id",
+                "source_url": _RESALE_URL,
+                "typed_length": 6,
+                "typed_value": "abc123",
+                "trajectory_index": 0,
+            },
             {"tool_name": "click", "selector": "button", "source_url": _RESALE_URL, "trajectory_index": 1},
             {"tool_name": "click", "selector": "button", "source_url": _RESALE_URL, "trajectory_index": 2},
             {
@@ -9253,7 +9160,7 @@ class TestBareDropSupersession:
               - block_type: code
                 label: order_status
                 code: |
-                  await page.locator("#start").click()
+                  await page.locator("#order-id").fill(str(order_id))
                   await page.locator("button[data-action=\\"open\\"]").click()
                   await page.locator("button[data-action=\\"status\\"]").click()
             """
@@ -10618,7 +10525,7 @@ class TestScoutedSpinePersistSeamCoverage:
             "synthesize_code_block",
             lambda *a, **k: _fake_spine_synthesized(diagnostics=diagnostics),
         )
-        ctx = _imposition_split_ctx()
+        ctx = _reaching_imposition_split_ctx()
         workflow_yaml = _records_block_yaml(
             _SPINE_SYNTH_CODE
             + '\nvalue = await page.locator("#result").inner_text()\nreturn {"output": {"record_id": value}}'
@@ -10632,21 +10539,6 @@ class TestScoutedSpinePersistSeamCoverage:
         events = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
         assert len(events) == 1
         assert events[0]["site"] == "separated_split"
-
-    @pytest.mark.asyncio
-    async def test_credential_scout_reject_carries_open_obligation_artifact(self) -> None:
-        ctx = _credential_spine_ctx()
-        synthesized = workflow_update_module.synthesize_code_block(ctx.scout_trajectory, strict_selectors=True)
-        assert synthesized is not None
-
-        result = await _update_workflow({"workflow_yaml": _credential_spine_block_yaml(synthesized)}, ctx)
-
-        assert result["ok"] is False
-        assert result["data"]["failure_type"] == "missing_credential_or_init"
-        assert "later submit action on the same page" in result["error"]
-        assert "The persisted draft is missing scouted rung(s)." in result["error"]
-        assert "Missing rung source to reuse verbatim" in result["error"]
-        assert ".password" in result["error"]
 
 
 class TestPartitionAwareImpositionFastPath:
@@ -10893,51 +10785,6 @@ class TestCredentialScoutGapMatcher:
             requires_submit=True,
         )
         assert gap == ScoutGap(missing_fields=[], missing_submit=False)
-
-
-class TestCredentialScoutGatePredicateCoherence:
-    _TWO_FIELD_LOGIN_YAML = _credential_code_yaml(
-        code="""
-        await page.locator("#user").fill(login_credential.username)
-        await page.locator("#pass").fill(login_credential.password)
-        await page.locator("button[type='submit']").click()
-        """,
-        credential_id="cred_1",
-    )
-
-    @staticmethod
-    def _trajectory(*steps: dict[str, object]) -> list[dict[str, object]]:
-        return list(steps)
-
-    def _gate_ctx(self, trajectory: list[dict[str, object]]) -> CopilotContext:
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = trajectory
-        ctx.scouted_credential_field_inventory_by_credential_id = {"cred_1": frozenset({"username", "password"})}
-        return ctx
-
-    def test_predicate_complete_trajectory_passes_the_real_gate(self) -> None:
-        helper = TestCredentialScoutGapMatcher
-        trajectory = self._trajectory(
-            helper._fill("cred_1", "username", helper._PAGE_ONE),
-            helper._click(helper._PAGE_ONE),
-            helper._fill("cred_1", "password", helper._PAGE_TWO),
-            helper._click(helper._PAGE_TWO),
-        )
-        ctx = self._gate_ctx(trajectory)
-        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
-        assert workflow_update_module._credentialed_code_block_scout_gate_errors(self._TWO_FIELD_LOGIN_YAML, ctx) == []
-
-    def test_predicate_incomplete_half_login_is_also_gate_rejected(self) -> None:
-        helper = TestCredentialScoutGapMatcher
-        trajectory = self._trajectory(
-            helper._fill("cred_1", "username", helper._PAGE_ONE),
-            helper._click(helper._PAGE_ONE),
-        )
-        ctx = self._gate_ctx(trajectory)
-        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
-        errors = workflow_update_module._credentialed_code_block_scout_gate_errors(self._TWO_FIELD_LOGIN_YAML, ctx)
-        assert errors
-        assert "password" in errors[0]
 
 
 class TestTerminalActionScoutGate:
@@ -11201,91 +11048,6 @@ class TestTerminalActionScoutGate:
         enforcement_module.record_reached_terminal_action_observation(ctx)
         assert ctx.scout_observed_terminal_criterion_ids == set()
         assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
-
-
-class TestCredentialScoutReopenSeam:
-    @pytest.mark.asyncio
-    async def test_pure_credential_reject_arms_then_same_identity_does_not_re_arm(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = []
-        yaml_text = TestCredentialScoutPersistGate._SUBMIT_CODE_YAML
-
-        result = await _update_workflow({"workflow_yaml": yaml_text}, ctx)
-
-        assert result["ok"] is False
-        assert result["data"]["failure_type"] == "missing_credential_or_init"
-        assert ctx.synthesized_block_reopened_for_credential_scout is True
-        first_key = ctx.credential_scout_rescout_context_key
-        assert first_key
-
-        result = await _update_workflow({"workflow_yaml": yaml_text}, ctx)
-
-        assert result["ok"] is False
-        assert ctx.synthesized_block_reopened_for_credential_scout is False
-        assert ctx.credential_scout_rescout_context_key == first_key
-
-    @pytest.mark.asyncio
-    async def test_new_binding_identity_re_arms_reopen(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = []
-
-        await _update_workflow({"workflow_yaml": TestCredentialScoutPersistGate._SUBMIT_CODE_YAML}, ctx)
-        first_key = ctx.credential_scout_rescout_context_key
-        assert ctx.synthesized_block_reopened_for_credential_scout is True
-
-        rebound_yaml = _credential_code_yaml(
-            code="""
-            await page.locator("#email").fill(login_credential.username)
-            await page.locator("input[type='password']").fill(login_credential.password)
-            await page.locator("#totpmfa").fill(login_credential.totp)
-            await page.locator("input[type='submit']").click()
-            await page.wait_for_load_state("load")
-            """,
-            credential_id="cred_rebound",
-        )
-        result = await _update_workflow({"workflow_yaml": rebound_yaml}, ctx)
-
-        assert result["ok"] is False
-        assert ctx.synthesized_block_reopened_for_credential_scout is True
-        assert ctx.credential_scout_rescout_context_key != first_key
-
-    @pytest.mark.asyncio
-    async def test_combined_credential_and_code_safety_reject_arms_reopen(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = []
-
-        result = await _update_workflow({"workflow_yaml": TestCredentialScoutPersistGate._UNSAFE_SUBMIT_CODE_YAML}, ctx)
-
-        assert result["ok"] is False
-        assert result["data"]["failure_type"] == "missing_credential_or_init"
-        assert ctx.synthesized_block_reopened_for_credential_scout is True
-        assert ctx.credential_scout_rescout_context_key
-
-    @pytest.mark.asyncio
-    async def test_gate_passing_attempt_leaves_window_closed(self) -> None:
-        ctx = _code_only_ctx()
-        ctx.scout_trajectory = []
-
-        await _update_workflow({"workflow_yaml": TestCredentialScoutPersistGate._SUBMIT_CODE_YAML}, ctx)
-        assert ctx.synthesized_block_reopened_for_credential_scout is True
-
-        ctx.scout_trajectory = [
-            _credential_fill_interaction("username"),
-            _credential_fill_interaction("password"),
-            _credential_fill_interaction("totp"),
-            _submit_interaction(),
-        ]
-        result = await _update_workflow({"workflow_yaml": TestCredentialScoutPersistGate._SUBMIT_CODE_YAML}, ctx)
-
-        assert ctx.synthesized_block_reopened_for_credential_scout is False
-        error_text = str(result.get("error") or "")
-        assert "fill_credential_field" not in error_text
-
-    def test_should_impose_after_update_attempt_honors_reopen_flag(self) -> None:
-        ctx = _code_only_ctx()
-        assert workflow_update_module._should_impose_after_update_attempt(ctx) is False
-        ctx.synthesized_block_reopened_for_credential_scout = True
-        assert workflow_update_module._should_impose_after_update_attempt(ctx) is True
 
 
 def _persisted_workflow_result() -> dict[str, object]:
@@ -14411,3 +14173,88 @@ def test_a_goal_path_stays_bare_when_the_block_returns_a_bare_mapping() -> None:
     )
 
     assert bare == {"records"}
+
+
+class TestUnlandedReplayNeverReplacesSubmission:
+    """SKY-13624: with nothing landed (no goal-reaching trajectory, no bound plan), the agent's
+    submitted code persists byte-equal; trajectory replay may only materialize an empty stub."""
+
+    def _probe_only_ctx(self) -> CopilotContext:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "read_value",
+                "read_expression": "document.body.innerText.slice(0, 12000)",
+                "read_output_path": "output.scouted_read",
+                "read_output_path_source": "elimination",
+                "read_result_shape": "list",
+                "source_url": "https://example.com/dashboard",
+                "trajectory_index": 0,
+            }
+        ]
+        return ctx
+
+    def _submitted_program_yaml(self) -> str:
+        return _yaml(
+            """
+            title: Append visitors
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: collect_visitors
+                code: |
+                  await page.goto("https://example.com/dashboard", wait_until="domcontentloaded")
+                  card_text = await page.locator("body").inner_text()
+                  visitor_count = card_text.split()[0]
+                  return {"visitor_count": visitor_count}
+            """
+        )
+
+    def test_unlanded_replay_keeps_submitted_code_byte_equal(self) -> None:
+        ctx = self._probe_only_ctx()
+        submitted = self._submitted_program_yaml()
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.workflow_yaml == submitted
+
+    def test_unlanded_replay_keeps_submission_even_when_prior_version_differs(self) -> None:
+        ctx = self._probe_only_ctx()
+        ctx.last_workflow_yaml = _yaml(
+            """
+            title: Append visitors
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: collect_visitors
+                code: |
+                  return {"visitor_count": "8.08K"}
+            """
+        )
+        submitted = self._submitted_program_yaml()
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.workflow_yaml == submitted
+
+    def test_empty_stub_carrier_is_still_materialized(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        submitted = _yaml(
+            """
+            title: Append visitors
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: collect_visitors
+                code: ""
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
+        assert code.strip()
