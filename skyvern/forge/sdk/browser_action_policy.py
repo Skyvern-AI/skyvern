@@ -62,7 +62,7 @@ class ObservationVerdict(StrEnum):
 
 
 class AuthorityState(StrEnum):
-    """Availability of the run's ADR-0011 task-URL-derived origin authority.
+    """Availability of the run's ADR-0013 task-URL-derived origin authority.
 
     Separate from enrollment on purpose. Enrollment answers "is this run protected, and what did an
     operator authorize at most"; this answers "what may this run reach right now". Only ESTABLISHED
@@ -70,9 +70,9 @@ class AuthorityState(StrEnum):
     """
 
     ESTABLISHED = "established"
-    #: Never established, or lost before a browser context was bound. ADR-0011 blocks until it is.
+    #: Never established, or lost before a browser context was bound. ADR-0013 blocks until it is.
     MISSING = "missing"
-    #: Rotated or conflicted after a browser context was bound. ADR-0011 makes this permanent,
+    #: Rotated or conflicted after a browser context was bound. ADR-0013 makes this permanent,
     #: because existing connections cannot be proven closed.
     INVALIDATED = "invalidated"
     #: No runtime authority source is wired into this build at all — see UNWIRED_AUTHORITY.
@@ -339,7 +339,7 @@ class BrowserActionPolicy:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeOriginAuthority:
-    """What the run may reach right now, per ADR-0011's task-URL-derived exact-origin authority.
+    """What the run may reach right now, per ADR-0013's task-URL-derived exact-origin authority.
 
     `origins` is only consulted when `state` is ESTABLISHED, and even then it is intersected with the
     enrolled ceiling: an authority naming an origin the operator never enrolled grants nothing.
@@ -349,17 +349,10 @@ class RuntimeOriginAuthority:
     origins: frozenset[BrowserOrigin] = frozenset()
 
 
-#: The authority every caller passes today, because nothing derives one yet.
-#:
-#: SKY-12883, SKY-12884 and SKY-12886 are the tickets that fill this seam. Until they land, two
-#: ADR-0011 behaviours have no implementation anywhere in this repository:
-#:   * blocking until authority is established, and unblocking once it is;
-#:   * permanently invalidating a task or workflow context when authority is lost or rotated after a
-#:     browser context has been bound.
-#: A static enrolled origin set never goes missing and never rotates, so neither behaviour can be
-#: inferred from enrollment — do not read "the run is enrolled" as "the run has authority".
-#: This state is deliberately distinct from MISSING so that source, decisions and observe-mode logs
-#: all distinguish "the authority source says no" from "there is no authority source".
+#: The default before a deployment extension derives runtime authority. OSS remains unwired; an
+#: enrolled cloud run may establish or permanently invalidate this state from its declared task URL.
+#: UNWIRED stays distinct from MISSING so decisions distinguish "the source says no" from "there is
+#: no authority source".
 UNWIRED_AUTHORITY = RuntimeOriginAuthority(state=AuthorityState.UNWIRED)
 
 _AUTHORITY_REASONS: dict[AuthorityState, PolicyReason] = {
