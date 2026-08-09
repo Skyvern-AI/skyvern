@@ -87,6 +87,7 @@ from skyvern.schemas.workflows import (
     WorkflowDefinitionYAML,
     WorkflowStatus,
 )
+from skyvern.services import planner_levers
 from skyvern.services.webhook_delivery import deliver_webhook_with_retries, describe_delivery_error
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
@@ -685,14 +686,11 @@ def _should_run_post_block_completion_check(
     task_type: str,
     *,
     navigate_completion_check_enabled: bool,
+    skip_completion_check_after_navigate: bool,
 ) -> bool:
     if block_success is not True:
         return False
-    if (
-        settings.TASK_V2_SKIP_COMPLETION_CHECK_AFTER_NAVIGATE
-        and task_type == "navigate"
-        and navigate_completion_check_enabled
-    ):
+    if skip_completion_check_after_navigate and task_type == "navigate" and navigate_completion_check_enabled:
         return False
     return True
 
@@ -939,6 +937,10 @@ async def run_task_v2_helper(
                     except Exception:
                         LOG.exception("Failed to load Google fallback", exc_info=True, url=url, current_url=current_url)
 
+        skip_completion_check_after_navigate_enabled = await planner_levers.skip_completion_check_after_navigate(
+            organization_id
+        )
+
         if i == 0 and current_url != url:
             if should_fallback:
                 plan = f"Go to Google because the intended website ({url}) failed to load properly."
@@ -978,13 +980,16 @@ async def run_task_v2_helper(
                 continue
             current_url = current_url if current_url else str(await SkyvernFrame.get_url(frame=page) if page else url)
 
-            iterations_remaining = _converge_iterations_remaining(i, max_iterations, settings.TASK_V2_CONVERGE_PCT)
+            iterations_remaining = _converge_iterations_remaining(
+                i, max_iterations, await planner_levers.converge_pct(organization_id)
+            )
             try:
                 open_tabs_context = await build_open_tabs_context(browser_state, page)
             except Exception:
                 LOG.warning("Failed to build open-tabs context for the planner", exc_info=True)
                 open_tabs_context = None
             planner_mini_goal_improvements = await _is_planner_mini_goal_improvements_enabled(organization_id)
+            carry_subgoals_enabled = await planner_levers.carry_subgoals(organization_id)
             task_v2_prompt = load_prompt_with_elements(
                 scraped_page,
                 prompt_engine,
@@ -995,7 +1000,7 @@ async def run_task_v2_helper(
                 open_tabs_context=open_tabs_context,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
                 compute_enabled=compute_enabled,
-                prior_required_subgoals=prior_required_subgoals if settings.TASK_V2_CARRY_SUBGOALS else None,
+                prior_required_subgoals=prior_required_subgoals if carry_subgoals_enabled else None,
                 iterations_remaining=iterations_remaining,
                 step_budget=organization.max_steps_per_run or settings.MAX_STEPS_PER_RUN,
                 planner_mini_goal_improvements=planner_mini_goal_improvements,
@@ -1037,7 +1042,7 @@ async def run_task_v2_helper(
                 (task_v2_response.get("complete_criterion") or None) if planner_mini_goal_improvements else None
             )
             complete_criterion_is_untrusted = bool(complete_criterion)
-            if settings.TASK_V2_CARRY_SUBGOALS:
+            if carry_subgoals_enabled:
                 _subgoals = task_v2_response.get("required_subgoals")
                 if _subgoals:
                     prior_required_subgoals = _subgoals
@@ -1289,6 +1294,7 @@ async def run_task_v2_helper(
             block_result.success,
             task_type,
             navigate_completion_check_enabled=bool(complete_criterion),
+            skip_completion_check_after_navigate=skip_completion_check_after_navigate_enabled,
         ):
             completion_screenshots: list[bytes] = []
             completion_scraped_page: ScrapedPage | None = None

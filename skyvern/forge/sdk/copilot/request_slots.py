@@ -1,22 +1,15 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import re
-import time
 import unicodedata
 from enum import StrEnum
 from typing import Literal
 
 import structlog
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
-from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat
-from skyvern.forge.sdk.copilot.context import sanitize_global_llm_context_for_prompt
-from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.utils.strings import escape_code_fences
 
@@ -58,16 +51,6 @@ class RequestSlotAntecedentFamily(StrEnum):
     UNCONDITIONAL = "unconditional"
     BLOCKER = "blocker"
     UNDECIDABLE = "undecidable"
-
-
-class RequestSlotProducerFailureKind(StrEnum):
-    MISSING_HANDLER = "missing_handler"
-    PROMPT_RENDER_ERROR = "prompt_render_error"
-    TIMEOUT = "timeout"
-    PROVIDER_ERROR = "provider_error"
-    EMPTY_OUTPUT = "empty_output"
-    INVALID_OUTPUT = "invalid_output"
-    INCONSISTENT_OUTPUT = "inconsistent_output"
 
 
 class RequestSlotDatumTargetV1(BaseModel):
@@ -363,37 +346,6 @@ class RequestSlotContractV1(BaseModel):
         return self
 
 
-class RequestSlotProducerResult(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-
-    status: Literal["success", "failure"]
-    attempts: int = Field(ge=0, le=_MAX_CLASSIFIER_ATTEMPTS)
-    contract: RequestSlotContractV1 | None = None
-    failure_kind: RequestSlotProducerFailureKind | None = None
-
-    @model_validator(mode="after")
-    def _validate_exclusive_result(self) -> RequestSlotProducerResult:
-        if self.status == "success":
-            if self.contract is None or self.failure_kind is not None or self.attempts == 0:
-                raise ValueError("success requires a contract, at least one attempt, and no failure")
-        elif self.contract is not None or self.failure_kind is None:
-            raise ValueError("failure requires a failure kind and no contract")
-        return self
-
-    @classmethod
-    def success(cls, contract: RequestSlotContractV1, *, attempts: int) -> RequestSlotProducerResult:
-        return cls(status="success", attempts=attempts, contract=contract)
-
-    @classmethod
-    def failure(
-        cls,
-        failure_kind: RequestSlotProducerFailureKind,
-        *,
-        attempts: int,
-    ) -> RequestSlotProducerResult:
-        return cls(status="failure", attempts=attempts, failure_kind=failure_kind)
-
-
 def _middle_truncate(text: str, cap: int) -> str:
     if len(text) <= cap:
         return text
@@ -628,50 +580,6 @@ def canonicalize_request_slots(
     )
 
 
-def _render_prompt(request: RequestSlotProducerInputV1) -> str:
-    safe_global_context = sanitize_global_llm_context_for_prompt(request.global_context)
-    sources = request_slot_sources(request)
-    return prompt_engine.load_prompt(
-        template=PROMPT_NAME,
-        request_sources=json.dumps(
-            [source.model_dump(mode="json") for source in sources],
-            ensure_ascii=True,
-            separators=(",", ":"),
-        ),
-        workflow_context=_safe_prompt_text(request.workflow_context, _MAX_WORKFLOW_PROMPT_CHARS),
-        latest_assistant_turn=_safe_prompt_text(request.latest_assistant_turn, _MAX_TRANSCRIPT_ANCHOR_PROMPT_CHARS),
-        global_context=_safe_prompt_text(safe_global_context, _MAX_GLOBAL_CONTEXT_PROMPT_CHARS),
-        datum_targets=json.dumps(
-            [target.model_dump(mode="json") for target in request.datum_targets],
-            ensure_ascii=True,
-            separators=(",", ":"),
-        ),
-        detected_output_candidates=json.dumps(
-            list(request.detected_output_candidates),
-            ensure_ascii=True,
-            separators=(",", ":"),
-        ),
-    )
-
-
-def _is_empty_output(raw: object) -> bool:
-    return raw is None or (isinstance(raw, str) and not raw.strip())
-
-
-def _parse_envelope(raw: object) -> RequestSlotEnvelopeV1 | None:
-    try:
-        payload = raw if isinstance(raw, str) else json.dumps(raw)
-        return RequestSlotEnvelopeV1.model_validate_json(payload)
-    except (TypeError, ValueError, ValidationError):
-        return None
-
-
-# Fields the contract carries for the record rather than to be acted on. Two attempts that named
-# the same slots and bindings describe one request, so letting a differing rationale list refuse the
-# whole contract left a turn with no requested output at all (SKY-13226).
-_INFORMATIONAL_CONTRACT_FIELDS: frozenset[str] = frozenset({"candidate_refutations"})
-
-
 def request_slot_contract_disagreements(
     first: RequestSlotContractV1,
     second: RequestSlotContractV1,
@@ -717,76 +625,3 @@ def request_slot_contracts_agree(
     second: RequestSlotContractV1,
 ) -> bool:
     return not request_slot_contract_disagreements(first, second)
-
-
-async def produce_request_slots(
-    *,
-    request: RequestSlotProducerInputV1,
-    handler: LLMAPIHandler | None,
-    timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
-) -> RequestSlotProducerResult:
-    if handler is None:
-        return RequestSlotProducerResult.failure(RequestSlotProducerFailureKind.MISSING_HANDLER, attempts=0)
-    try:
-        prompt = _render_prompt(request)
-    except Exception as exc:
-        LOG.warning("request-slot prompt render failed", error=str(exc))
-        return RequestSlotProducerResult.failure(RequestSlotProducerFailureKind.PROMPT_RENDER_ERROR, attempts=0)
-
-    deadline = time.monotonic() + max(timeout_seconds, 0.0)
-    last_failure = RequestSlotProducerFailureKind.INVALID_OUTPUT
-    candidate_contract: RequestSlotContractV1 | None = None
-    for attempt in range(1, _MAX_CLASSIFIER_ATTEMPTS + 1):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return RequestSlotProducerResult.failure(RequestSlotProducerFailureKind.TIMEOUT, attempts=attempt - 1)
-        try:
-            raw = await asyncio.wait_for(
-                handler(prompt=prompt, prompt_name=PROMPT_NAME),
-                timeout=remaining,
-            )
-        except asyncio.TimeoutError:
-            return RequestSlotProducerResult.failure(RequestSlotProducerFailureKind.TIMEOUT, attempts=attempt)
-        except EmptyLLMResponseError:
-            last_failure = RequestSlotProducerFailureKind.EMPTY_OUTPUT
-            continue
-        except InvalidLLMResponseFormat:
-            last_failure = RequestSlotProducerFailureKind.INVALID_OUTPUT
-            continue
-        except Exception as exc:
-            if attempt < _MAX_CLASSIFIER_ATTEMPTS and is_retriable_llm_error(exc):
-                continue
-            if time.monotonic() >= deadline:
-                return RequestSlotProducerResult.failure(RequestSlotProducerFailureKind.TIMEOUT, attempts=attempt)
-            LOG.warning("request-slot classifier provider failed", error=str(exc), attempt=attempt)
-            return RequestSlotProducerResult.failure(RequestSlotProducerFailureKind.PROVIDER_ERROR, attempts=attempt)
-
-        if _is_empty_output(raw):
-            last_failure = RequestSlotProducerFailureKind.EMPTY_OUTPUT
-            continue
-        envelope = _parse_envelope(raw)
-        if envelope is None:
-            last_failure = RequestSlotProducerFailureKind.INVALID_OUTPUT
-            continue
-        try:
-            contract = canonicalize_request_slots(request=request, envelope=envelope)
-        except ValueError:
-            last_failure = RequestSlotProducerFailureKind.INVALID_OUTPUT
-            continue
-        if candidate_contract is not None:
-            disagreements = request_slot_contract_disagreements(candidate_contract, contract)
-            decisive = tuple(field for field in disagreements if field not in _INFORMATIONAL_CONTRACT_FIELDS)
-            if not decisive:
-                if disagreements:
-                    LOG.info(
-                        "request-slot classifier agreed despite informational differences",
-                        attempt=attempt,
-                        fields=disagreements,
-                    )
-                return RequestSlotProducerResult.success(candidate_contract, attempts=attempt)
-            LOG.info("request-slot classifier attempts disagreed", attempt=attempt, fields=disagreements)
-        candidate_contract = contract
-
-    if candidate_contract is not None:
-        last_failure = RequestSlotProducerFailureKind.INCONSISTENT_OUTPUT
-    return RequestSlotProducerResult.failure(last_failure, attempts=_MAX_CLASSIFIER_ATTEMPTS)

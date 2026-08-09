@@ -45,6 +45,7 @@ from skyvern.exceptions import (
     ActionPolicyBlocked,
     BrowserSessionNotFound,
     DownloadFileMaxWaitingTime,
+    DownloadSaveIncompleteError,
     EmptyScrapePage,
     FailedToGetTOTPVerificationCode,
     FailedToNavigateToUrl,
@@ -5044,10 +5045,19 @@ class ForgeAgent:
                         finalization_run_id = (
                             resolve_run_download_id(context, fallback_run_id=task.workflow_run_id) or task.task_id
                         )
-                        await app.STORAGE.save_downloaded_files(
-                            organization_id=task.organization_id,
-                            run_id=finalization_run_id,
-                        )
+                        try:
+                            await app.STORAGE.save_downloaded_files(
+                                organization_id=task.organization_id,
+                                run_id=finalization_run_id,
+                            )
+                        except DownloadSaveIncompleteError as exc:
+                            # Session-artifact claiming below must still run for the files that saved.
+                            LOG.warning(
+                                "Some downloaded files were skipped during cleanup save",
+                                task_id=task.task_id,
+                                workflow_run_id=task.workflow_run_id,
+                                skipped_file_count=len(exc.skipped_files),
+                            )
                         # Tag any session-scoped DOWNLOAD artifacts created during
                         # this run with run_id, so GET /v1/runs/{id} surfaces them
                         # (the watcher in browser_controller can't know the active

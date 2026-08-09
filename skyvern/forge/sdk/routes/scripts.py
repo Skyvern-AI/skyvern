@@ -8,7 +8,6 @@ from fastapi import BackgroundTasks, Depends, HTTPException, Path, Query, Reques
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.models import WorkflowScriptModel
 
-from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.routers import base_router
@@ -1316,17 +1315,8 @@ async def review_script_with_instructions(
     """
     organization_id = current_org.organization_id
 
-    # Enforce CODE_BLOCK_ENABLED feature flag server-side (mirrors frontend gating).
-    # When ENABLE_CODE_BLOCK=True (self-hosted), all orgs have code block access by default
-    # so the PostHog check is skipped — self-hosted operators control their own deployment.
-    if not settings.ENABLE_CODE_BLOCK and app.EXPERIMENTATION_PROVIDER:
-        code_block_enabled = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-            "CODE_BLOCK_ENABLED",
-            organization_id,
-            properties={"organization_id": organization_id},
-        )
-        if not code_block_enabled:
-            raise HTTPException(status_code=403, detail="Script editing is not enabled for this organization")
+    if not await app.AGENT_FUNCTION.has_code_block_access(organization_id):
+        raise HTTPException(status_code=403, detail="Script editing is not enabled for this organization")
 
     # Load the workflow
     workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(

@@ -500,3 +500,51 @@ describe("NarrativeView rollup expand affordance", () => {
     expect(head.getAttribute("aria-expanded")).toBe("false");
   });
 });
+
+describe("a stopped block stays inspectable", () => {
+  const stoppedTurn = (): TurnNarrativeState => ({
+    ...terminalBuildTurn(),
+    cancelled: true,
+    blocks: [
+      {
+        ...completedBlock("log_in", "wrb_stopped_log_in"),
+        state: "stopped",
+        activity: [
+          {
+            kind: "tool_result",
+            text: "opened the sign-in page",
+            iteration: 1,
+            id: "act-1",
+            success: true,
+          },
+        ],
+      },
+    ],
+  });
+
+  // The collapsed rollup is the default view, so a stopped block has to be
+  // named there too — a failed block gets its own section, and dropping the
+  // stopped one made it vanish from the summary entirely.
+  it("names the stopped block in the collapsed rollup", () => {
+    render(<NarrativeView turn={stoppedTurn()} />);
+
+    expect(screen.getByText("Stopped", { selector: "div" })).toBeTruthy();
+    expect(screen.getByText("log_in")).toBeTruthy();
+    expect(screen.queryByText("Halted")).toBeNull();
+  });
+
+  // A stop is not a failure, so the row must not auto-open and shout — but what
+  // the block did before the stop still has to be reachable.
+  it("can be expanded to reveal what ran before the stop", () => {
+    render(<NarrativeView turn={stoppedTurn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Stopped/ }));
+
+    // Not auto-opened: a stop does not shout the way a failure does.
+    expect(screen.queryByText("opened the sign-in page")).toBeNull();
+
+    fireEvent.click(screen.getByTitle("Highlight log_in on canvas"));
+
+    expect(screen.getByText("opened the sign-in page")).toBeTruthy();
+  });
+});
