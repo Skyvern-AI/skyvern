@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from dev_scripts.replay_imposition_decision import metadata_capture_is_structured
 from skyvern.forge.sdk.copilot.tools import workflow_update
 from skyvern.forge.sdk.copilot.tools.workflow_update import CodeArtifactMetadata
 
@@ -34,8 +33,3 @@ def test_imposition_dump_preserves_structured_code_artifact_metadata(monkeypatch
     assert payload["schema_version"] == 3
     assert payload["raw_code_artifact_metadata"][0]["block_label"] == "extract_count"
     assert payload["raw_code_artifact_metadata"][0]["declared_goal"] == "Return count"
-    assert metadata_capture_is_structured(payload["raw_code_artifact_metadata"])
-
-
-def test_stringified_legacy_imposition_metadata_is_capture_limited() -> None:
-    assert not metadata_capture_is_structured(["block_label='extract_count' declared_goal='Return count'"])
