@@ -606,6 +606,7 @@ def block_yaml_to_block(
             **base_kwargs,
             code=block_yaml.code,
             parameters=_resolve_block_parameters(block_yaml, parameters),
+            error_code_mapping=block_yaml.error_code_mapping,
             prompt=block_yaml.prompt,
             steps=code_block_steps,
         )

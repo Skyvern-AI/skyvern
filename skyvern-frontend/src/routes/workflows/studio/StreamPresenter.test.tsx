@@ -7,6 +7,7 @@ import { StreamPresenter } from "./StreamPresenter";
 
 const runtimeConfigMock = vi.hoisted(() => ({
   browserStreamingMode: "cdp" as "cdp" | "vnc",
+  transportPending: false,
 }));
 
 const browserStreamProps = vi.hoisted(
@@ -17,6 +18,11 @@ const browserStreamProps = vi.hoisted(
 vi.mock("@/hooks/useRuntimeConfig", () => ({
   useBrowserStreamingMode: () => ({
     browserStreamingMode: runtimeConfigMock.browserStreamingMode,
+  }),
+  useStreamTransport: () => ({
+    streamTransport: runtimeConfigMock.transportPending
+      ? undefined
+      : runtimeConfigMock.browserStreamingMode,
   }),
 }));
 
@@ -36,6 +42,17 @@ describe("StreamPresenter transport-swap recording", () => {
     cleanup();
     browserStreamProps.last = null;
     runtimeConfigMock.browserStreamingMode = "cdp";
+    runtimeConfigMock.transportPending = false;
+  });
+
+  it("shows neither stream until the session's transport is known", () => {
+    runtimeConfigMock.transportPending = true;
+    // Global mode is cdp, but an unanswered session must not be painted as either: a session
+    // that turns out to stream the other way would have shown a stream that cannot connect.
+    render(<StreamPresenter browserSessionId="pbs_test" />);
+
+    expect(screen.queryByTestId("cdp-stream")).toBeNull();
+    expect(screen.queryByTestId("vnc-stream")).toBeNull();
   });
 
   it("shows the CDP stream when not recording in cdp mode", () => {

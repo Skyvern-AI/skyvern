@@ -16,6 +16,7 @@ from skyvern.cli.core.browser_ops import (
     CustomSelectMatchError,
     CustomSelectOpenError,
     CustomSelectPasswordError,
+    NavigateResult,
     do_select_option,
 )
 from skyvern.cli.core.result import Artifact, BrowserContext, set_concise_responses
@@ -965,7 +966,7 @@ def _sdk_equivalent_page(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         mcp_browser,
         "do_navigate",
-        AsyncMock(return_value=SimpleNamespace(url="https://example.test", title="Example")),
+        AsyncMock(return_value=NavigateResult(url="https://example.test", title="Example")),
     )
     monkeypatch.setattr(mcp_browser, "do_extract", AsyncMock(return_value=SimpleNamespace(extracted={})))
     monkeypatch.setattr(mcp_browser, "do_act", AsyncMock(return_value=SimpleNamespace(prompt="done", completed=True)))
@@ -2801,6 +2802,69 @@ async def test_navigating_paired_tools_clear_the_ref_map_around_navigation(
 
     assert result["ok"] is True, result
     assert clear.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_navigate_reports_ok_with_a_warning_when_the_page_settles_below_the_requested_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page that never fires `load` is navigated, not failed — say so instead of ACTION_FAILED."""
+    _sdk_equivalent_page(monkeypatch)
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_navigate",
+        AsyncMock(return_value=NavigateResult(url="https://example.test", title="Example", load_state="commit")),
+    )
+
+    result = await mcp_browser.skyvern_navigate(url="https://example.test")
+
+    assert result["ok"] is True, result
+    assert result["data"]["load_state"] == "commit"
+    assert result["data"]["url"] == "https://example.test"
+    assert any("never reached 'load'" in warning for warning in result["warnings"]), result
+
+
+@pytest.mark.asyncio
+async def test_navigate_does_not_warn_when_the_requested_state_is_reached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _sdk_equivalent_page(monkeypatch)
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_navigate",
+        AsyncMock(
+            return_value=NavigateResult(url="https://example.test", title="Example", load_state="domcontentloaded")
+        ),
+    )
+
+    result = await mcp_browser.skyvern_navigate(url="https://example.test", wait_until="domcontentloaded")
+
+    assert result["ok"] is True, result
+    assert result["warnings"] == []
+
+
+@pytest.mark.asyncio
+async def test_navigating_paired_tools_surface_the_degraded_load_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _sdk_equivalent_page(monkeypatch)
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_navigate",
+        AsyncMock(return_value=NavigateResult(url="https://example.test", title="Example", load_state="commit")),
+    )
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
+    monkeypatch.setattr(
+        mcp_browser,
+        "save_artifact",
+        Mock(return_value=Artifact(kind="screenshot", path="/tmp/shot.png", mime="image/png", bytes=3)),
+    )
+
+    result = await mcp_browser.skyvern_navigate_and_screenshot(url="https://example.test")
+
+    assert result["ok"] is True, result
+    assert result["data"]["load_state"] == "commit"
+    assert any("never reached 'load'" in warning for warning in result["warnings"]), result
 
 
 @pytest.mark.asyncio

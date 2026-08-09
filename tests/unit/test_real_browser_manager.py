@@ -7,19 +7,26 @@ on every call and re-invoke navigate_to_url() on every step.
 """
 
 import asyncio
+from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.exceptions import MissingBrowserStateForBrowserSession
+from skyvern.exceptions import BrowserSessionAlreadyOccupiedError, MissingBrowserStateForBrowserSession
+from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.artifact.storage.recording_test_helpers import fake_prepared_recording
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.routes.streaming import registries
 from skyvern.webeye import real_browser_manager
-from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
-from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
+from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding, VideoArtifact
+from skyvern.webeye.browser_engine import (
+    BrowserEngineBootstrapError,
+    BrowserEngineMetadata,
+    BrowserEngineSelection,
+)
 from skyvern.webeye.browser_factory import set_popup_video_listener
 from skyvern.webeye.real_browser_manager import RealBrowserManager, _PersistentSessionLease
 from skyvern.webeye.real_browser_state import RealBrowserState
@@ -797,7 +804,7 @@ async def test_get_video_artifacts_non_webm_skips_ffmpeg(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_get_video_artifacts_empty_snapshot_path_does_not_warn() -> None:
     """The finalize=False snapshot path runs once per step on browsers that never record
-    locally (vendor/CDP/persistent sessions), where an empty list is the expected state."""
+    locally (remote/CDP/persistent sessions), where an empty list is the expected state."""
     browser_state = MagicMock()
     browser_state.browser_artifacts.video_artifacts = []
 
@@ -1041,7 +1048,7 @@ async def test_cleanup_persists_session_cookies_when_close_deferred_for_streams(
     manager.pages["wfr_streamed"] = browser_state
     manager.pages["tsk_streamed"] = browser_state
     if shared_with_parent:
-        manager.pages["wfr_parent"] = browser_state
+        manager.pages["wr_parent"] = browser_state
 
     persist_mock = AsyncMock()
     defer_mock = MagicMock(return_value=True)
@@ -1049,11 +1056,13 @@ async def test_cleanup_persists_session_cookies_when_close_deferred_for_streams(
     monkeypatch.setattr("skyvern.webeye.real_browser_manager.stream_ref_active", lambda wrid: True)
     monkeypatch.setattr("skyvern.webeye.real_browser_manager.set_deferred_close_params", defer_mock)
 
-    result = await manager.cleanup_for_workflow_run(
-        "wfr_streamed",
-        task_ids=["tsk_streamed"],
-        close_browser_on_completion=True,
-    )
+    # The parent alias only suppresses the close when it is a genuinely live run in this process.
+    with _live_workflow_run_contexts("wr_parent"):
+        result = await manager.cleanup_for_workflow_run(
+            "wfr_streamed",
+            task_ids=["tsk_streamed"],
+            close_browser_on_completion=True,
+        )
 
     persist_mock.assert_awaited_once_with(browser_state.browser_context, "/tmp/fake_profile")
     defer_mock.assert_called_once_with(
@@ -1321,6 +1330,51 @@ async def test_public_workflow_cleanup_retains_owner_lease_until_release_succeed
 
 
 @pytest.mark.asyncio
+async def test_pbs_cleanup_is_release_only_not_terminal_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PBS lifetime is distributed — owned by runnable_id + generation CAS across Pods, not by this
+    process. Even when the local non-PBS sharing predicate sees no other alias (``shared=False``,
+    i.e. "this process could close it"), a cleanup carrying a browser_session_id must NOT terminal-
+    close the remote browser: it detaches the local driver (``release_driver=False``) and releases
+    occupancy only through the expected-owner CAS (PBS/non-PBS boundary)."""
+    workflow_run_id = "wr_pbs_owner"
+    manager = RealBrowserManager()
+    browser_state = MagicMock()
+    browser_state.browser_artifacts.traces_dir = None
+    browser_state.close = AsyncMock(return_value=False)
+    manager.pages[workflow_run_id] = browser_state
+    lease = _PersistentSessionLease(
+        session_id="pbs_owner",
+        organization_id="org_test",
+        runnable_id=workflow_run_id,
+        browser_state=browser_state,
+    )
+    manager._persistent_session_leases[workflow_run_id] = lease
+    sessions = MagicMock()
+    sessions.release_browser_session = AsyncMock(return_value=True)
+    monkeypatch.setattr(real_browser_manager, "app", MagicMock(PERSISTENT_SESSIONS_MANAGER=sessions))
+
+    await manager.cleanup_for_workflow_run(
+        workflow_run_id,
+        task_ids=[],
+        close_browser_on_completion=False,
+        browser_session_id="pbs_owner",
+        organization_id="org_test",
+    )
+
+    browser_state.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=False)
+    sessions.release_browser_session.assert_awaited_once_with(
+        session_id="pbs_owner",
+        organization_id="org_test",
+        expected_runnable_id=workflow_run_id,
+        expected_runnable_generation_id=None,
+        expected_browser_state=browser_state,
+    )
+    assert workflow_run_id not in manager._persistent_session_leases
+
+
+@pytest.mark.asyncio
 async def test_pbs_adoption_rebinds_download_dir_to_run_id() -> None:
     """Adopting a persistent session must rebind its CDP download dir to the run's id (SKY-11083)."""
     manager = RealBrowserManager()
@@ -1359,7 +1413,8 @@ async def test_pbs_adoption_rebinds_download_dir_without_an_interceptor() -> Non
     SimpleNamespace, not MagicMock: the latter auto-creates the interceptor attribute."""
     adopted_browser = MagicMock()
     browser_context = SimpleNamespace(browser=adopted_browser)
-    pbs_state = SimpleNamespace(browser_context=browser_context)
+    # A real BrowserState always carries browser_artifacts; default RUN_DIR keeps today's rebind path.
+    pbs_state = SimpleNamespace(browser_context=browser_context, browser_artifacts=BrowserArtifacts())
 
     with patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind:
         await real_browser_manager._rebind_pbs_download_dir(pbs_state, "wfr_own_infra", "bs_own_infra")
@@ -1412,8 +1467,8 @@ async def test_public_workflow_adoption_keeps_lease_identity_separate_from_downl
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("has_vendor_interceptor", [True, False])
-async def test_pbs_task_adoption_rebinds_regardless_of_vendor_interceptor(has_vendor_interceptor: bool) -> None:
+@pytest.mark.parametrize("has_remote_interceptor", [True, False])
+async def test_pbs_task_adoption_rebinds_regardless_of_remote_interceptor(has_remote_interceptor: bool) -> None:
     """Own-infra sessions carry no interceptor and are rebound through setDownloadBehavior; skipping
     them would leave their downloads in the session-scoped connect-time dir, which collection
     (get_download_dir(run_id)) never reads."""
@@ -1422,7 +1477,7 @@ async def test_pbs_task_adoption_rebinds_regardless_of_vendor_interceptor(has_ve
     adopted_browser = MagicMock()
     pbs_state = MagicMock()
     pbs_state.browser_context.browser = adopted_browser
-    pbs_state.browser_context._skyvern_cdp_download_interceptor = MagicMock() if has_vendor_interceptor else None
+    pbs_state.browser_context._skyvern_cdp_download_interceptor = MagicMock() if has_remote_interceptor else None
     pbs_state.get_working_page = AsyncMock(return_value=None)
     pbs_state.get_or_create_page = AsyncMock()
 
@@ -1525,6 +1580,67 @@ async def test_non_pbs_workflow_run_does_not_rebind() -> None:
 
     assert result is parent_state
     mock_rebind.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pbs_adoption_skips_rebind_when_session_dir_binding() -> None:
+    """A provider-owned remote binding must preserve the provider-selected destination: the run-dir
+    rebind must be skipped."""
+    manager = RealBrowserManager()
+    workflow_run = make_workflow_run("wfr_session")
+
+    adopted_browser = MagicMock()
+    pbs_state = MagicMock()
+    pbs_state.browser_context.browser = adopted_browser
+    pbs_state.browser_artifacts.download_binding = DownloadBinding.SESSION_DIR
+    pbs_state.get_working_page = AsyncMock(return_value=None)
+    pbs_state.get_or_create_page = AsyncMock()
+
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind,
+    ):
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url=None,
+            browser_session_id="bs_session",
+        )
+
+    mock_rebind.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pbs_adoption_rebinds_when_run_dir_binding() -> None:
+    """A RUN_DIR (local/OSS) adopted session keeps today's rebind: it is the only delivery path there."""
+    manager = RealBrowserManager()
+    workflow_run = make_workflow_run("wfr_run_dir")
+
+    adopted_browser = MagicMock()
+    pbs_state = MagicMock()
+    pbs_state.browser_context.browser = adopted_browser
+    pbs_state.browser_artifacts.download_binding = DownloadBinding.RUN_DIR
+    pbs_state.get_working_page = AsyncMock(return_value=None)
+    pbs_state.get_or_create_page = AsyncMock()
+
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind,
+    ):
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url=None,
+            browser_session_id="bs_run_dir",
+        )
+
+    mock_rebind.assert_awaited_once_with(adopted_browser, run_id="wfr_run_dir")
 
 
 def _stale_pbs_browser_state(*, navigate_exc: Exception) -> MagicMock:
@@ -1893,3 +2009,531 @@ async def test_repair_forwards_pinned_engine_selection() -> None:
         await state.check_and_fix_state()
 
     assert create_browser_context.await_args.kwargs["engine_selection"] is selection
+
+
+class _EngE(Exception):
+    pass
+
+
+class _EngT(_EngE):
+    pass
+
+
+def _engine_sel(
+    name: str,
+    *,
+    boot_fallback: BrowserEngineSelection | None = None,
+    start=None,
+) -> BrowserEngineSelection:
+    async def _ok_start() -> MagicMock:
+        driver = MagicMock()
+        driver.stop = AsyncMock()
+        return driver
+
+    return BrowserEngineSelection(
+        name=name,
+        start_driver=start or _ok_start,
+        error_type=_EngE,
+        timeout_error_type=_EngT,
+        metadata=BrowserEngineMetadata(name=name, version=None),
+        selection_reason="test",
+        boot_fallback_selection=boot_fallback,
+    )
+
+
+def _install_owner(manager: RealBrowserManager, run_key: str, selection: BrowserEngineSelection):
+    resolved = asyncio.get_event_loop().create_future()
+    resolved.set_result(selection)
+    owner = real_browser_manager._EngineSelectionOwner(resolved)
+    manager._engine_owners[run_key] = owner
+    return owner
+
+
+def _failing_start(message: str):
+    async def _boom():
+        raise RuntimeError(message)
+
+    return _boom
+
+
+@pytest.mark.asyncio
+async def test_boot_fallback_driver_start_failure_falls_back_once_and_repins() -> None:
+    manager = RealBrowserManager()
+    classical = _engine_sel("playwright")
+    rustwright = _engine_sel("rustwright", boot_fallback=classical, start=_failing_start("start boom"))
+    _install_owner(manager, "wr_1", rustwright)
+    with (
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=rustwright)),
+        patch.object(
+            real_browser_manager.BrowserContextFactory,
+            "create_browser_context",
+            AsyncMock(return_value=(MagicMock(), BrowserArtifacts(), None)),
+        ),
+    ):
+        state = await manager._create_browser_state(workflow_run_id="wr_1", engine_run_key="wr_1")
+    assert state.engine_selection.name == "playwright"
+    pinned = manager._engine_owners["wr_1"].task.result()
+    assert pinned.name == "playwright"
+    assert pinned.boot_fallback_selection is None  # classical fallback carries no further fallback
+
+
+@pytest.mark.asyncio
+async def test_boot_fallback_context_bootstrap_error_falls_back_once() -> None:
+    manager = RealBrowserManager()
+    classical = _engine_sel("playwright")
+    rustwright = _engine_sel("rustwright", boot_fallback=classical)
+    _install_owner(manager, "wr_1", rustwright)
+
+    calls: list[str] = []
+
+    async def _create(pw, **kwargs):
+        calls.append(kwargs["engine_selection"].name)
+        if kwargs["engine_selection"].name == "rustwright":
+            raise BrowserEngineBootstrapError("rustwright launch failed")
+        return (MagicMock(), BrowserArtifacts(), None)
+
+    with (
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=rustwright)),
+        patch.object(real_browser_manager.BrowserContextFactory, "create_browser_context", _create),
+    ):
+        state = await manager._create_browser_state(workflow_run_id="wr_1", engine_run_key="wr_1")
+    assert state.engine_selection.name == "playwright"
+    assert calls == ["rustwright", "playwright"]  # one hop only
+
+
+@pytest.mark.asyncio
+async def test_boot_fallback_stripped_on_successful_rustwright_commit() -> None:
+    manager = RealBrowserManager()
+    classical = _engine_sel("playwright")
+    rustwright = _engine_sel("rustwright", boot_fallback=classical)
+    _install_owner(manager, "wr_1", rustwright)
+    with (
+        patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=rustwright)),
+        patch.object(
+            real_browser_manager.BrowserContextFactory,
+            "create_browser_context",
+            AsyncMock(return_value=(MagicMock(), BrowserArtifacts(), None)),
+        ),
+    ):
+        state = await manager._create_browser_state(workflow_run_id="wr_1", engine_run_key="wr_1")
+    assert state.engine_selection.name == "rustwright"
+    # Commit-strip: a later same-run recreation reuses rustwright but can no longer fall back.
+    pinned = manager._engine_owners["wr_1"].task.result()
+    assert pinned.name == "rustwright"
+    assert pinned.boot_fallback_selection is None
+
+
+@pytest.mark.asyncio
+async def test_classical_fallback_failure_propagates_with_no_second_hop() -> None:
+    manager = RealBrowserManager()
+    classical = _engine_sel("playwright", start=_failing_start("classical boom"))
+    rustwright = _engine_sel("rustwright", boot_fallback=classical, start=_failing_start("rustwright boom"))
+    _install_owner(manager, "wr_1", rustwright)
+    with patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=rustwright)):
+        with pytest.raises(RuntimeError, match="classical boom"):
+            await manager._create_browser_state(workflow_run_id="wr_1", engine_run_key="wr_1")
+
+
+@pytest.mark.asyncio
+async def test_non_fallback_driver_start_failure_propagates_unchanged() -> None:
+    # Default path preserved: a selection with no boot fallback that fails to start propagates as before.
+    manager = RealBrowserManager()
+    plain = _engine_sel("playwright", start=_failing_start("start boom"))
+    _install_owner(manager, "wr_1", plain)
+    with patch.object(manager, "get_or_resolve_engine_selection", AsyncMock(return_value=plain)):
+        with pytest.raises(RuntimeError, match="start boom"):
+            await manager._create_browser_state(workflow_run_id="wr_1", engine_run_key="wr_1")
+
+
+@pytest.mark.asyncio
+async def test_repin_engine_selection_is_guarded_against_resurrection() -> None:
+    manager = RealBrowserManager()
+    # Missing owner: repin must not create one.
+    manager._repin_engine_selection("absent", _engine_sel("playwright"))
+    assert "absent" not in manager._engine_owners
+    # Terminal owner: repin must not replace its task (no resurrection of a torn-down run).
+    owner = _install_owner(manager, "wr_t", _engine_sel("rustwright"))
+    owner.terminal = True
+    original_task = owner.task
+    manager._repin_engine_selection("wr_t", _engine_sel("playwright"))
+    assert manager._engine_owners["wr_t"].task is original_task
+    # Ephemeral resource (run_key None): no-op, no error.
+    manager._repin_engine_selection(None, _engine_sel("playwright"))
+
+
+def _fake_cleanup_state() -> MagicMock:
+    state = MagicMock()
+    state.close = AsyncMock(return_value=True)
+    state.browser_context = None
+    state.browser_artifacts.traces_dir = None
+    state.browser_cleanup = object()
+    return state
+
+
+def _close_true_count(state: MagicMock) -> int:
+    return sum(1 for call in state.close.await_args_list if call.kwargs.get("close_browser_on_completion") is True)
+
+
+@contextmanager
+def _live_workflow_run_contexts(*run_ids: str) -> Iterator[None]:
+    """Control the process-local run-liveness signal the non-PBS sharing predicate consults: only
+    the given run ids read as live, every other wr_ alias is treated as a ghost. Backs the C1 fix —
+    a forward-synced parent key whose run is not live here must not veto the terminal close."""
+    wcm = forge_app.WORKFLOW_CONTEXT_MANAGER
+    live = set(run_ids)
+    original = wcm.has_workflow_run_context
+    wcm.has_workflow_run_context = lambda workflow_run_id: workflow_run_id in live
+    try:
+        yield
+    finally:
+        wcm.has_workflow_run_context = original
+
+
+@pytest.mark.asyncio
+async def test_cleanup_same_run_alias_and_ghost_alias_closes_browser_once() -> None:
+    manager = RealBrowserManager()
+    state = _fake_cleanup_state()
+    manager.pages["wr_1"] = state
+    manager.pages["tsk_1"] = state
+    manager.pages["tsk_ghost"] = state
+
+    result = await manager.cleanup_for_workflow_run("wr_1", ["tsk_1"], close_browser_on_completion=True)
+
+    assert _close_true_count(state) == 1
+    assert result.recording_finalized is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_ghost_only_alias_absent_from_task_list_still_closes() -> None:
+    manager = RealBrowserManager()
+    state = _fake_cleanup_state()
+    manager.pages["wr_1"] = state
+    manager.pages["tsk_ghost"] = state
+
+    result = await manager.cleanup_for_workflow_run("wr_1", [], close_browser_on_completion=True)
+
+    assert _close_true_count(state) == 1
+    assert result.recording_finalized is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_genuine_live_parent_sharing_does_not_close_early() -> None:
+    # A use_parent_browser_session parent that is genuinely live in THIS process shares the exact
+    # BrowserState; the child's terminal cleanup must not close it out from under the live parent.
+    manager = RealBrowserManager()
+    state = _fake_cleanup_state()
+    manager.pages["wr_child"] = state
+    manager.pages["tsk_c"] = state
+    manager.pages["wr_parent"] = state
+
+    with _live_workflow_run_contexts("wr_child", "wr_parent"):
+        result = await manager.cleanup_for_workflow_run("wr_child", ["tsk_c"], close_browser_on_completion=True)
+
+    assert _close_true_count(state) == 0
+    assert "wr_parent" in manager.pages
+    assert result.recording_finalized is False
+
+
+@pytest.mark.asyncio
+async def test_cleanup_ghost_parent_alias_without_live_context_closes_once() -> None:
+    # A ghost parent: a child whose parent ran in another process creates a fresh
+    # state and forward-syncs pages[wr_parent] = state. The parent is NOT live in this process, so
+    # its ghost alias must not veto the child's terminal close — otherwise the browser leaks.
+    manager = RealBrowserManager()
+    state = _fake_cleanup_state()
+    manager.pages["wr_child"] = state
+    manager.pages["tsk_c"] = state
+    manager.pages["wr_parent"] = state  # forward-synced ghost; parent lives in another process
+
+    with _live_workflow_run_contexts("wr_child"):  # only the child is live here
+        result = await manager.cleanup_for_workflow_run("wr_child", ["tsk_c"], close_browser_on_completion=True)
+        # The ghost parent key is not a live run, so it does not veto the close.
+        assert manager._shared_with_another_workflow_run("wr_child", state) is False
+
+    # The browser is closed exactly once instead of leaking behind the ghost parent veto.
+    assert _close_true_count(state) == 1
+    assert result.recording_finalized is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_synthetic_ghost_wr_alias_does_not_suppress_close() -> None:
+    # A never-cleaned synthetic-run wr_ key (SDK action ghost) aliasing this state has no live
+    # context and must not suppress the terminal close.
+    manager = RealBrowserManager()
+    state = _fake_cleanup_state()
+    manager.pages["wr_1"] = state
+    manager.pages["wr_synthetic_ghost"] = state
+
+    with _live_workflow_run_contexts("wr_1"):
+        result = await manager.cleanup_for_workflow_run("wr_1", [], close_browser_on_completion=True)
+
+    assert _close_true_count(state) == 1
+    assert result.recording_finalized is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_task_state_ghost_alias_still_closes_uniformly() -> None:
+    # Task-loop uniformity: a distinct task-level state aliased only by a ghost tsk_ key (not a live
+    # wr_ run) must still close exactly once — the task-loop predicate is the same liveness-qualified
+    # ownership check as the run-level close.
+    manager = RealBrowserManager()
+    run_state = _fake_cleanup_state()
+    task_state = _fake_cleanup_state()
+    manager.pages["wr_1"] = run_state
+    manager.pages["tsk_a"] = task_state
+    manager.pages["tsk_ghost"] = task_state  # ghost alias of the distinct task state
+
+    with _live_workflow_run_contexts("wr_1"):
+        await manager.cleanup_for_workflow_run("wr_1", ["tsk_a"], close_browser_on_completion=True)
+
+    assert _close_true_count(run_state) == 1
+    assert _close_true_count(task_state) == 1
+
+
+@pytest.mark.asyncio
+async def test_cleanup_separate_task_browser_states_each_close_once() -> None:
+    manager = RealBrowserManager()
+    run_state = _fake_cleanup_state()
+    task_state = _fake_cleanup_state()
+    manager.pages["wr_1"] = run_state
+    manager.pages["tsk_other"] = task_state
+    manager.pages["tsk_run"] = run_state
+
+    await manager.cleanup_for_workflow_run("wr_1", ["tsk_other", "tsk_run"], close_browser_on_completion=True)
+
+    assert _close_true_count(run_state) == 1
+    assert _close_true_count(task_state) == 1
+
+
+@pytest.mark.asyncio
+async def test_cleanup_child_workflow_pre_pop_permits_terminal_close() -> None:
+    manager = RealBrowserManager()
+    state = _fake_cleanup_state()
+    manager.pages["wr_1"] = state
+    manager.pages["wr_child"] = state
+
+    await manager.cleanup_for_workflow_run(
+        "wr_1", [], close_browser_on_completion=True, child_workflow_run_ids=["wr_child"]
+    )
+
+    assert _close_true_count(state) == 1
+
+
+@pytest.mark.asyncio
+async def test_cleanup_deferred_streams_ghost_alias_defers_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = RealBrowserManager()
+    state = _fake_cleanup_state()
+    state.browser_artifacts.browser_session_dir = "/tmp/fake_profile"
+    manager.pages["wr_1"] = state
+    manager.pages["tsk_ghost"] = state
+
+    defer_mock = MagicMock(return_value=True)
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.persist_session_cookies", AsyncMock())
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.stream_ref_active", lambda wrid: True)
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.set_deferred_close_params", defer_mock)
+
+    await manager.cleanup_for_workflow_run("wr_1", [], close_browser_on_completion=True)
+
+    defer_mock.assert_called_once_with("wr_1", True, release_driver=None)
+    state.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_task_close_error_is_contained() -> None:
+    manager = RealBrowserManager()
+    run_state = _fake_cleanup_state()
+    bad_state = _fake_cleanup_state()
+    bad_state.close = AsyncMock(side_effect=RuntimeError("already closed"))
+    ok_state = _fake_cleanup_state()
+    manager.pages["wr_1"] = run_state
+    manager.pages["tsk_bad"] = bad_state
+    manager.pages["tsk_ok"] = ok_state
+
+    result = await manager.cleanup_for_workflow_run("wr_1", ["tsk_bad", "tsk_ok"], close_browser_on_completion=True)
+
+    assert _close_true_count(run_state) == 1
+    assert _close_true_count(ok_state) == 1
+    assert result.browser_state is run_state
+
+
+@pytest.mark.asyncio
+async def test_pbs_cleanup_release_only_even_with_zero_local_contexts(monkeypatch: pytest.MonkeyPatch) -> None:
+    # PBS/non-PBS boundary: with NO live workflow context anywhere and a ghost wr_ alias present, a
+    # PBS cleanup must still be release-only. The local-liveness predicate can never drive a PBS
+    # terminal close — PBS lifetime is distributed, not decided by this process.
+    workflow_run_id = "wr_pbs_zero_ctx"
+    manager = RealBrowserManager()
+    state = MagicMock()
+    state.browser_artifacts.traces_dir = None
+    state.close = AsyncMock(return_value=False)
+    manager.pages[workflow_run_id] = state
+    manager.pages["wr_ghost_local"] = state  # a wr_ alias; irrelevant under the PBS regime
+    manager._persistent_session_leases[workflow_run_id] = _PersistentSessionLease(
+        session_id="pbs_zero", organization_id="org_test", runnable_id=workflow_run_id, browser_state=state
+    )
+    sessions = MagicMock()
+    sessions.release_browser_session = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        real_browser_manager,
+        "app",
+        MagicMock(
+            PERSISTENT_SESSIONS_MANAGER=sessions,
+            WORKFLOW_CONTEXT_MANAGER=MagicMock(has_workflow_run_context=MagicMock(return_value=False)),
+        ),
+    )
+
+    await manager.cleanup_for_workflow_run(
+        workflow_run_id,
+        task_ids=[],
+        close_browser_on_completion=False,
+        browser_session_id="pbs_zero",
+        organization_id="org_test",
+    )
+
+    state.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=False)
+    sessions.release_browser_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pbs_cross_process_stale_cleanup_is_release_cas_noop_and_never_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Two processes, one PBS. Ownership has moved to process B (generation gen2, wrapper_b); process A
+    # is stale (gen1, wrapper_a). Process A's cleanup must (a) never terminal-close the remote browser
+    # and (b) release only through the expected-owner CAS, which rejects its stale identity — so
+    # process B's live ownership is untouched (PBS distributed ownership).
+    session_id = "pbs_shared"
+    wrapper_b = object()
+    current_owner = {"runnable_id": "wr_podB", "generation": "gen2", "wrapper": wrapper_b}
+
+    async def release_cas(
+        *,
+        session_id: str,
+        organization_id: str,
+        expected_runnable_id: str | None,
+        expected_runnable_generation_id: str | None,
+        expected_browser_state: object,
+    ) -> bool:
+        return (
+            expected_runnable_id == current_owner["runnable_id"]
+            and expected_runnable_generation_id == current_owner["generation"]
+            and expected_browser_state is current_owner["wrapper"]
+        )
+
+    sessions = MagicMock()
+    sessions.release_browser_session = AsyncMock(side_effect=release_cas)
+    monkeypatch.setattr(real_browser_manager, "app", MagicMock(PERSISTENT_SESSIONS_MANAGER=sessions))
+
+    mgr_a = RealBrowserManager()
+    wrapper_a = MagicMock()
+    wrapper_a.browser_artifacts.traces_dir = None
+    wrapper_a.close = AsyncMock(return_value=False)
+    mgr_a.pages["wr_podA"] = wrapper_a
+    mgr_a._persistent_session_leases["wr_podA"] = _PersistentSessionLease(
+        session_id=session_id,
+        organization_id="org_test",
+        runnable_id="wr_podA",
+        runnable_generation_id="gen1",
+        browser_state=wrapper_a,
+    )
+
+    await mgr_a.cleanup_for_workflow_run(
+        "wr_podA",
+        task_ids=[],
+        close_browser_on_completion=False,
+        browser_session_id=session_id,
+        organization_id="org_test",
+    )
+
+    # The stale Pod never terminal-closes the remote browser.
+    wrapper_a.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=False)
+    # It releases with its OWN stale expected-owner tuple, which the CAS rejects.
+    release_call = sessions.release_browser_session.await_args
+    assert release_call.kwargs["expected_runnable_id"] == "wr_podA"
+    assert release_call.kwargs["expected_runnable_generation_id"] == "gen1"
+    assert release_call.kwargs["expected_browser_state"] is wrapper_a
+    assert (
+        await release_cas(
+            session_id=session_id,
+            organization_id="org_test",
+            expected_runnable_id="wr_podA",
+            expected_runnable_generation_id="gen1",
+            expected_browser_state=wrapper_a,
+        )
+        is False
+    )
+    # The live owner (Pod B, gen2, wrapper_b) is still accepted — ownership genuinely moved and holds.
+    assert (
+        await release_cas(
+            session_id=session_id,
+            organization_id="org_test",
+            expected_runnable_id="wr_podB",
+            expected_runnable_generation_id="gen2",
+            expected_browser_state=wrapper_b,
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_pbs_second_occupancy_rejected_leaves_no_local_lease() -> None:
+    # A second concurrent runnable attempting to occupy a PBS already held by another runnable is
+    # rejected by begin_session's occupancy CAS; the manager propagates and leaves no local lease.
+    manager = RealBrowserManager()
+    task = make_task("tsk_second", workflow_run_id=None)
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock(
+            side_effect=BrowserSessionAlreadyOccupiedError("pbs_busy", "wr_first_owner")
+        )
+        with pytest.raises(BrowserSessionAlreadyOccupiedError):
+            await manager.get_or_create_for_task(task=task, browser_session_id="pbs_busy")
+
+    assert manager.live_session_runnable_ids() == set()
+
+
+@pytest.mark.asyncio
+async def test_address_only_cleanup_preserves_remote_and_defers_local_driver_with_zero_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Broad PBS, remote-address form: a caller-provided remote browser has no DB session lease, so the
+    # service gate hands cleanup close_browser_on_completion=False. Even with a ghost wr_ alias and NO
+    # live workflow context anywhere, the manager must keep the remote browser alive — close(False) —
+    # and pass release_driver=None so the state stops only its own per-run local driver via
+    # release_driver_on_close. Local liveness must never terminal-close the durable remote browser.
+    manager = RealBrowserManager()
+    state = _fake_cleanup_state()
+    manager.pages["wr_addr"] = state
+    manager.pages["wr_ghost_local"] = state  # ghost wr_ alias; not a live run
+    monkeypatch.setattr(
+        real_browser_manager,
+        "app",
+        MagicMock(WORKFLOW_CONTEXT_MANAGER=MagicMock(has_workflow_run_context=MagicMock(return_value=False))),
+    )
+
+    await manager.cleanup_for_workflow_run("wr_addr", [], close_browser_on_completion=False)
+
+    state.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=None)
+    assert _close_true_count(state) == 0
+
+
+@pytest.mark.asyncio
+async def test_address_only_cross_pod_stale_cleanup_never_terminal_closes_durable_browser() -> None:
+    # Two Pods hold different local wrappers for the same durable remote browser reached by
+    # browser_address (no session id, no lease). Pod A's cleanup must never terminal-close the durable
+    # browser and must not touch Pod B's wrapper — the remote browser is owned by neither process.
+    mgr_a = RealBrowserManager()
+    wrapper_a = _fake_cleanup_state()
+    mgr_a.pages["wr_podA"] = wrapper_a
+
+    wrapper_b = _fake_cleanup_state()  # Pod B's independent wrapper for the same remote browser
+
+    with _live_workflow_run_contexts():  # nothing is live in Pod A's process
+        await mgr_a.cleanup_for_workflow_run("wr_podA", [], close_browser_on_completion=False)
+
+    # The durable remote browser is preserved: close(False), never a terminal close.
+    wrapper_a.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=None)
+    assert _close_true_count(wrapper_a) == 0
+    # Pod B's wrapper is entirely untouched by Pod A's cleanup.
+    wrapper_b.close.assert_not_awaited()

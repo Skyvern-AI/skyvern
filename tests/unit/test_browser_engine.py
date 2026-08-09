@@ -802,6 +802,34 @@ def test_rich_family_type_colliding_with_base_rejects_construction():
         _selection("engine-base-collide", _RichEngineError, _RichEngineTimeout, target_closed_types=(_RichEngineError,))
 
 
+def test_selection_boot_fallback_defaults_none_and_is_settable_via_replace():
+    # A selection carries no boot fallback by default (select() and direct construction), so a boot
+    # failure fails the run exactly as before. Any engine may DESIGNATE a one-shot classical fallback
+    # by composing it onto the immutable selection; the derived error families recompute unchanged.
+    stock = browser_engine.REGISTRY.get(STOCK_ENGINE_NAME).select(selection_reason="test")
+    assert stock.boot_fallback_selection is None
+
+    classical = _selection("engine-classical", _EngineBError, _EngineBTimeout)
+    experiment = _selection("engine-exp", _EngineAError, _EngineATimeout)
+    with_fallback = dataclasses.replace(experiment, boot_fallback_selection=classical)
+    assert with_fallback.boot_fallback_selection is classical
+    assert with_fallback.boot_fallback_selection.boot_fallback_selection is None
+    # replace() re-derives the init=False families from the same identities, unchanged.
+    assert with_fallback.error_families.base_error_types == (_EngineAError,)
+    assert with_fallback.is_engine_error(_EngineAError())
+
+    stripped = dataclasses.replace(with_fallback, boot_fallback_selection=None)
+    assert stripped.boot_fallback_selection is None
+    assert stripped.name == "engine-exp"
+
+
+def test_browser_engine_bootstrap_error_is_a_skyvern_exception():
+    from skyvern.exceptions import SkyvernException
+
+    assert issubclass(browser_engine.BrowserEngineBootstrapError, SkyvernException)
+    assert isinstance(browser_engine.BrowserEngineBootstrapError("launch failed"), SkyvernException)
+
+
 async def _ok_start():
     return object()
 

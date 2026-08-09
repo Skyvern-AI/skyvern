@@ -1590,3 +1590,14 @@ class CodeBlockRunnerSelectionError(SkyvernException):
     The block-execution call site catches this and fails the block closed instead of
     silently falling back to in-process execution.
     """
+
+
+class DownloadSaveIncompleteError(SkyvernException):
+    """save_downloaded_files finished its loop but skipped at least one file.
+
+    Files that could be saved are already saved when this raises, so a caller may treat
+    the save as retryable-incomplete rather than failed."""
+
+    def __init__(self, skipped_files: Sequence[str]) -> None:
+        self.skipped_files = list(skipped_files)
+        super().__init__(f"{len(self.skipped_files)} downloaded file(s) could not be fully saved and registered")
