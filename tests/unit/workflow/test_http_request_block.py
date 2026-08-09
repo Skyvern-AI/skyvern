@@ -60,6 +60,13 @@ def _http_block(**kwargs: object) -> HttpRequestBlock:
     return HttpRequestBlock(**kwargs)
 
 
+@pytest.fixture(autouse=True)
+def _allow_external_request_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_function = MagicMock()
+    agent_function.enforce_external_request_policy.return_value = None
+    monkeypatch.setattr(block_module.app, "AGENT_FUNCTION", agent_function)
+
+
 def test_register_secret_value_returns_placeholder_and_stores_value() -> None:
     context = _make_context()
 

@@ -554,10 +554,25 @@ async def skyvern_navigate(
             # second bump can invalidate its snapshot of the old document.
             clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
 
+    requested_load_state = wait_until or "load"
+    warnings = (
+        []
+        if result.load_state == requested_load_state
+        else [
+            f"Navigation succeeded but the page never reached '{requested_load_state}'; "
+            f"it settled at '{result.load_state}'. The page is loaded — retrying the navigation will not help."
+        ]
+    )
     return action_result(
         "skyvern_navigate",
         browser_context=ctx,
-        data={"url": result.url, "title": result.title, "sdk_equivalent": f"await page.goto({url!r})"},
+        data={
+            "url": result.url,
+            "title": result.title,
+            "load_state": result.load_state,
+            "sdk_equivalent": f"await page.goto({url!r})",
+        },
+        warnings=warnings,
         timing_ms=timer.timing_ms,
     )
 
@@ -2500,6 +2515,7 @@ async def _run_paired_capture(
     data: dict[str, Any] = {}
     artifacts: list[dict[str, Any]] = []
     sdk_equivalents: list[str] = []
+    warnings: list[str] = []
     error: dict[str, Any] | None = None
     skip_to_screenshot = False
 
@@ -2507,6 +2523,9 @@ async def _run_paired_capture(
         if skip_to_screenshot and operation != "screenshot":
             continue
         operation_result = await operation_functions[operation](**params, session_id=session_id, cdp_url=cdp_url)
+        operation_warnings = operation_result.get("warnings")
+        if isinstance(operation_warnings, list):
+            warnings.extend(item for item in operation_warnings if isinstance(item, str))
         operation_data = operation_result.get("data")
         if isinstance(operation_data, dict) and isinstance(operation_data.get("sdk_equivalent"), str):
             sdk_equivalents.append(operation_data["sdk_equivalent"])
@@ -2542,6 +2561,7 @@ async def _run_paired_capture(
         ok=error is None,
         browser_context=ctx,
         data=data,
+        warnings=warnings,
         error=error,
         timing_ms={"total": int((time.perf_counter() - started_at) * 1000)},
     )
