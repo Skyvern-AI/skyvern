@@ -16,6 +16,7 @@ import zstandard as zstd
 from freezegun import freeze_time
 
 from skyvern.config import settings
+from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge.sdk.api.aws import S3StorageClass, S3Uri
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
@@ -1343,3 +1344,67 @@ class TestS3ShareLinkSensitiveCap:
 
         s3_storage.async_client.create_presigned_urls = AsyncMock(side_effect=fake_presign)
         assert await s3_storage.get_share_links([screenshot, download]) is None
+
+
+@pytest.mark.asyncio
+class TestS3SaveDownloadedFiles:
+    def _seed_run_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        run_dir = tmp_path / "downloads" / "wr_partial"
+        run_dir.mkdir(parents=True)
+        (run_dir / "a.pdf").write_bytes(b"first")
+        (run_dir / "b.pdf").write_bytes(b"second")
+        monkeypatch.setattr("skyvern.forge.sdk.api.files.settings.DOWNLOAD_PATH", str(tmp_path / "downloads"))
+
+    async def test_partial_upload_failure_raises_after_saving_the_rest(
+        self, s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import skyvern.forge.sdk.artifact.storage.s3 as s3_module
+
+        self._seed_run_dir(tmp_path, monkeypatch)
+        uploaded: list[str] = []
+
+        async def _upload(*, uri: str, file_path: str, **kwargs: object) -> None:
+            if uri.endswith("/a.pdf"):
+                raise RuntimeError("transient 503")
+            uploaded.append(uri)
+
+        monkeypatch.setattr(s3_storage.async_client, "upload_file_from_path", _upload)
+        create_download_artifact = AsyncMock()
+        monkeypatch.setattr(
+            s3_module,
+            "app",
+            SimpleNamespace(ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=create_download_artifact)),
+        )
+
+        with pytest.raises(DownloadSaveIncompleteError) as raised:
+            await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
+
+        assert raised.value.skipped_files == ["a.pdf"]
+        assert [uri.rsplit("/", 1)[-1] for uri in uploaded] == ["b.pdf"]
+        assert create_download_artifact.await_count == 1
+        assert create_download_artifact.await_args.kwargs["filename"] == "b.pdf"
+
+    async def test_artifact_row_failure_counts_as_skipped(
+        self, s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import skyvern.forge.sdk.artifact.storage.s3 as s3_module
+
+        self._seed_run_dir(tmp_path, monkeypatch)
+        monkeypatch.setattr(s3_storage.async_client, "upload_file_from_path", AsyncMock())
+
+        async def _create_row(*, filename: str, **kwargs: object) -> None:
+            if filename == "a.pdf":
+                raise RuntimeError("db down")
+
+        monkeypatch.setattr(
+            s3_module,
+            "app",
+            SimpleNamespace(
+                ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=AsyncMock(side_effect=_create_row))
+            ),
+        )
+
+        with pytest.raises(DownloadSaveIncompleteError) as raised:
+            await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
+
+        assert raised.value.skipped_files == ["a.pdf"]

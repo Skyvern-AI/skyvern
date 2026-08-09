@@ -474,9 +474,14 @@ describe("BrowserSessionTimeline", () => {
       { status: "completed", downloaded_files: null, recordings: null },
       true,
     );
-    const emptyState =
-      "No timeline events available yet — actions, downloads, and recordings will appear here as they become available.";
-    expect(await screen.findAllByText(emptyState)).toHaveLength(2);
+    expect(
+      await screen.findAllByText("No timeline events available yet"),
+    ).toHaveLength(2);
+    expect(
+      screen.getAllByText(
+        "actions, downloads, and recordings will appear here as they become available.",
+      ),
+    ).toHaveLength(2);
     expect(get).toHaveBeenCalledTimes(2);
   });
 });

@@ -8,7 +8,7 @@ import tokenize
 from typing import Any, Callable, cast
 
 import structlog
-from jinja2 import StrictUndefined
+from jinja2 import ChainableUndefined, StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.config import settings
@@ -120,8 +120,37 @@ def render_templates_in_json_value(value: object, render_string: Callable[[str],
     return value
 
 
-jinja_json_finalize_env = SandboxedEnvironment(finalize=_json_finalize)
-jinja_json_finalize_env.filters["json"] = _json_type_filter
+class RequiredBindingUndefined(ChainableUndefined):
+    """Raises where an undefined is rendered directly into the payload.
+
+    StrictUndefined would also break `{% if %}` guards, `{% for %}` over an absent collection, and
+    `| default(...)` on a producer block that never ran — all legitimate ways to author a conditional
+    payload — so only `__str__` fails. The trade-off is that filters consuming an undefined as a
+    sequence (`join`, `length`) still emit, because raising on iteration would take `{% for %}` with it.
+    """
+
+    __slots__ = ()
+
+    def __str__(self) -> str:
+        self._fail_with_undefined_error()
+        raise AssertionError("unreachable")
+
+
+def _json_finalize_required_binding(value: Any) -> Any:
+    # A producer that returned null said "no value"; rendering it into a quoted JSON slot would write
+    # the text "None". An omitted binding is the loud case and is handled by the undefined type above.
+    if value is None:
+        return ""
+    return _json_finalize(value)
+
+
+# A payload a block sends to an external system cannot distinguish "the producer omitted this" from
+# "the user wanted an empty value" once an undefined reference renders as "". Rendering one under this
+# environment raises instead, and stays strict regardless of WORKFLOW_TEMPLATING_STRICTNESS.
+jinja_json_finalize_required_binding_env = SandboxedEnvironment(
+    undefined=RequiredBindingUndefined, finalize=_json_finalize_required_binding
+)
+jinja_json_finalize_required_binding_env.filters["json"] = _json_type_filter
 
 if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
     jinja_json_finalize_strict_env = SandboxedEnvironment(undefined=StrictUndefined, finalize=_json_finalize)
