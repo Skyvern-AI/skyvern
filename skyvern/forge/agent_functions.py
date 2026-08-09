@@ -18,7 +18,7 @@ from cachetools import TTLCache
 from google.oauth2.credentials import Credentials
 from playwright.async_api import Frame, Page
 
-from skyvern.config import settings
+from skyvern.config import CodeBlockMode, settings
 from skyvern.constants import CUSTOMER_STORAGE_UPLOAD_MAX_BYTES, SKYVERN_ID_ATTR
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem_with_tier
 from skyvern.exceptions import (
@@ -1104,22 +1104,6 @@ class AgentFunction:
         """
         return False
 
-    async def should_route_to_secure_runner_pool(
-        self,
-        *,
-        workflow_run_id: str,
-        organization_id: str | None,
-        workflow_permanent_id: str | None = None,
-        workflow_id: str | None = None,
-    ) -> bool:
-        """Whether this run must be dispatched to a worker pool that has the runner sidecar.
-
-        Answered at dispatch, before a queue is chosen, so it is run-level: no block context
-        exists yet. OSS has no runner and returns False; cloud overrides to consult the same
-        gate as should_use_codeblock_runner.
-        """
-        return False
-
     async def execute_code_block_override(
         self,
         *,
@@ -2146,7 +2130,7 @@ class AgentFunction:
         return cleanup_element_tree_func
 
     async def has_code_block_access(self, organization_id: str | None = None) -> bool:
-        return settings.ENABLE_CODE_BLOCK and not settings.DISABLE_CODE_BLOCK_EXECUTION
+        return settings.CODE_BLOCK_MODE is CodeBlockMode.enabled
 
     async def validate_code_block(self, organization_id: str | None = None) -> None:
         if not await self.has_code_block_access(organization_id):

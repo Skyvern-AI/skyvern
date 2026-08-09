@@ -34,7 +34,7 @@ def download_scout_act_required_for_policy(block_authoring_policy: BlockAuthorin
 
 
 DEFAULT_PROMPT_TEMPLATE = "workflow-copilot-agent.j2"
-DEFAULT_MAX_TURNS = 35
+DEFAULT_MAX_TURNS = 200
 DEFAULT_TOKEN_BUDGET = 90_000
 SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD = 3
 
@@ -58,17 +58,6 @@ POST_NAVIGATE_NUDGE = (
     "You MUST use evaluate, get_browser_screenshot, click, type_text, "
     "scroll, select_option, press_key, or console_messages "
     "to inspect the page before responding. Do NOT answer from memory."
-)
-
-POST_INTERMEDIATE_SUCCESS_NUDGE = (
-    "STOP — do NOT respond to the user yet. "
-    "Your workflow only covers a subset of what the user asked for. "
-    "You MUST add the next block now: call update_and_run_blocks with the complete "
-    "workflow YAML, but pass only the next 1-2 unverified block labels when the "
-    "workflow has several page-changing stages. Keep later blocks in the YAML; "
-    "shrink only the block_labels test frontier. "
-    "Only respond to the user when every distinct action they requested is covered "
-    "by a workflow block, or you have clear evidence that continuing is infeasible."
 )
 
 POST_FAILED_TEST_NUDGE = (
@@ -308,7 +297,6 @@ DEFAULT_ENFORCEMENT_NUDGES: dict[str, str] = {
     "screenshot_dropped": SCREENSHOT_DROPPED_NUDGE,
     "post_update": POST_UPDATE_NUDGE,
     "post_navigate": POST_NAVIGATE_NUDGE,
-    "post_intermediate_success": POST_INTERMEDIATE_SUCCESS_NUDGE,
     "post_failed_test": POST_FAILED_TEST_NUDGE,
     "post_failed_test_inspect_first": POST_FAILED_TEST_INSPECT_FIRST_NUDGE,
     "post_explore_without_workflow": POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE,

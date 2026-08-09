@@ -241,7 +241,7 @@ dev = [
 # install sets. `uv export --no-default-groups --group rustwright` is an isolation probe;
 # the shared worker image resolves it via `uv export --extra server --group cloud --group rustwright --no-dev`.
 rustwright = [
-    "rustwright==0.1.1",
+    "rustwright==0.2.0",
 ]
 
 [tool.hatch.build]

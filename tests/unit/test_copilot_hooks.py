@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.code_block_synthesis import dynamic_row_evidence_fingerprint, synthesize_code_block
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import (
     _capture_scout_ambiguity,
     _click_post_hook,
@@ -28,6 +29,7 @@ from skyvern.forge.sdk.copilot.tools.scouting import (
     _prenav_dynamic_row_for_selector,
 )
 from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, turn_halt_from_blocker_signal
+from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
 @dataclass
@@ -1004,6 +1006,9 @@ class TestBrowserInteractionObservationHooks:
             pending_scout_reanchor=None,
             pending_scout_dynamic_row=None,
             pending_scout_download_snapshot=None,
+            pending_scout_popup=None,
+            pending_scout_popup_content_type=None,
+            reached_download_target=None,
             discovery_mcp_server=None,
             scouted_interactions=[],
             scout_trajectory=[],
@@ -1045,6 +1050,9 @@ class TestBrowserInteractionObservationHooks:
             pending_scout_reanchor=None,
             pending_scout_dynamic_row=None,
             pending_scout_download_snapshot=None,
+            pending_scout_popup=None,
+            pending_scout_popup_content_type=None,
+            reached_download_target=None,
             discovery_mcp_server=None,
             scouted_interactions=[],
             scout_trajectory=[],
@@ -1104,6 +1112,9 @@ class TestScoutedInteractionCapture:
             pending_scout_reanchor=None,
             pending_scout_dynamic_row=None,
             pending_scout_download_snapshot=None,
+            pending_scout_popup=None,
+            pending_scout_popup_content_type=None,
+            reached_download_target=None,
             discovery_mcp_server=None,
             browser_session_id=None,
             scouted_interactions=[],
@@ -1963,3 +1974,35 @@ def test_browser_overlays_are_gated_by_phase_and_session_classification() -> Non
     # is asking the model to do — leaving one out re-asks for work it already did.
     observers = browser_overlays - {"navigate_browser"}
     assert observers <= _OBSERVATION_TOOLS, observers - _OBSERVATION_TOOLS
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_hooks_count_model_calls_and_enforcement_passes() -> None:
+    ctx = make_copilot_ctx()
+    hooks = CopilotRunHooks(ctx)
+
+    await hooks.on_agent_start(MagicMock(), MagicMock())
+    await hooks.on_llm_start(MagicMock(), MagicMock(), None, [])
+    await hooks.on_llm_start(MagicMock(), MagicMock(), None, [])
+
+    assert ctx.enforcement_pass_count == 1
+    assert ctx.model_calls_this_turn == 2
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_hooks_count_on_a_bare_agent_context() -> None:
+    ctx = AgentContext(
+        organization_id="org-1",
+        workflow_id="wf-1",
+        workflow_permanent_id="wfp-1",
+        workflow_yaml="",
+        browser_session_id=None,
+        stream=MagicMock(is_disconnected=AsyncMock(return_value=False)),
+    )
+    hooks = CopilotRunHooks(ctx)
+
+    await hooks.on_agent_start(MagicMock(), MagicMock())
+    await hooks.on_llm_start(MagicMock(), MagicMock(), None, [])
+
+    assert ctx.enforcement_pass_count == 1
+    assert ctx.model_calls_this_turn == 1

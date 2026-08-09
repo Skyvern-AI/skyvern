@@ -39,6 +39,18 @@ def test_code_block_yaml_defaults_keep_legacy_shape() -> None:
     block_yaml = CodeBlockYAML(label="code_1", code="x = 1")
     assert block_yaml.prompt is None
     assert block_yaml.steps is None
+    assert block_yaml.error_code_mapping is None
+
+
+def test_code_block_yaml_and_converter_preserve_error_code_mapping() -> None:
+    mapping = {"login_failed": "could not find the login button", "CAPTCHA-1": "captcha detected"}
+    block_yaml = CodeBlockYAML(label="code_1", code="x = 1", error_code_mapping=mapping)
+
+    block = block_yaml_to_block(block_yaml, {"code_1_output": _output_parameter()})
+
+    assert block_yaml.error_code_mapping == mapping
+    assert isinstance(block, CodeBlock)
+    assert block.error_code_mapping == mapping
 
 
 def test_converter_coerces_step_action_type_to_enum() -> None:
@@ -194,6 +206,7 @@ def test_code_block_model_roundtrip() -> None:
     dumped = block.model_dump()
     assert dumped["prompt"] == "g"
     assert dumped["steps"][0]["action_type"] == "click"
+    assert dumped["error_code_mapping"] is None
 
 
 def _make_workflow_run_context(values: dict | None = None) -> WorkflowRunContext:

@@ -140,6 +140,25 @@ def test_budgeted_sweep_prevents_subsequent_background_sweep(monkeypatch: pytest
 
 
 @pytest.mark.skipif(os.name == "nt", reason="managed profile sweep is POSIX-only")
+def test_background_sweep_logs_failure_instead_of_killing_its_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(local_browser_profile, "_sweep_triggered", False)
+    monkeypatch.setattr(
+        local_browser_profile,
+        "sweep_local_browser_profiles_with_budget",
+        MagicMock(side_effect=OSError("cannot spawn sweep")),
+    )
+    warning = MagicMock()
+    monkeypatch.setattr(local_browser_profile.LOG, "warning", warning)
+
+    thread = local_browser_profile.sweep_local_browser_profiles_once_in_background()
+
+    assert thread is not None
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert warning.call_args.args[0] == "local_browser_profile_background_sweep_failed"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="managed profile sweep is POSIX-only")
 def test_create_background_sweep_reaps_orphan_and_preserves_new_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
