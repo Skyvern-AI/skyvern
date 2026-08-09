@@ -38,7 +38,6 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_carrier
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     CREDENTIAL_FILL_TOOL_NAME,
-    LIVE_SCOUT_CREDENTIAL_FIELDS,
     ONE_TIME_CODE_CREDENTIAL_FIELD,
     SYNTHESIZED_OFFER_SENTINEL,
     ObligationFinding,
@@ -84,6 +83,7 @@ from skyvern.forge.sdk.copilot.context import (
     coerce_ask_subject,
     parsed_ask_refs,
 )
+from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTIAL_FIELDS
 from skyvern.forge.sdk.copilot.credential_pause import credential_pause_would_fire, maybe_credential_pause
 from skyvern.forge.sdk.copilot.credential_resolution import url_parts
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (

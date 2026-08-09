@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from skyvern.exceptions import NoTOTPVerificationCodeFound
+from skyvern.exceptions import ActionPolicyBlocked, NoTOTPVerificationCodeFound
 from skyvern.forge.agent import ForgeAgent, StepPromptResult
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -230,6 +230,15 @@ async def test_no_generated_actions_marks_step_failed(monkeypatch: pytest.Monkey
     assert step.status == StepStatus.failed
     assert rig.action_handler.await_count == 0
     assert output.actions == []
+
+
+@pytest.mark.asyncio
+async def test_action_policy_block_propagates_out_of_action_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    blocked = ActionPolicyBlocked("blocked by extension policy", step_id="step-char", task_id="task-123")
+    rig = make_agent_step_rig(monkeypatch, action_handler=AsyncMock(side_effect=blocked))
+
+    with pytest.raises(ActionPolicyBlocked):
+        await rig.run()
 
 
 @pytest.mark.asyncio
