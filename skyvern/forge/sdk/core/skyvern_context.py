@@ -286,14 +286,11 @@ class SkyvernContext:
     browser_action_policy: BrowserActionPolicy | None = None
 
     # What the run may reach *right now* (SKY-12874). The ceiling above says what an operator
-    # authorized at most; this says what ADR-0011's task-URL-derived authority grants at this
+    # authorized at most; this says what ADR-0013's task-URL-derived authority grants at this
     # moment, and an origin-gated action needs both.
     #
-    # It is UNWIRED_AUTHORITY on every run today, because nothing derives an authority yet:
-    # SKY-12883, SKY-12884 and SKY-12886 are the tickets that fill this slot. Until they land, no
-    # code in this repository implements ADR-0011's "block until authority is established" or its
-    # "permanently invalidate on loss or rotation after a browser context is bound". Enrollment
-    # cannot stand in for either — a static origin set never goes missing and never rotates.
+    # It defaults to UNWIRED_AUTHORITY. A deployment extension may establish it from an explicit
+    # task URL or permanently invalidate it after loss, rotation, or conflicting registration.
     browser_action_authority: RuntimeOriginAuthority = field(default_factory=_unwired_authority)
 
     # Newest accepted scrape (SKY-12874). Advanced by the scrape itself; actions are stamped with
