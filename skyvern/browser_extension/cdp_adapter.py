@@ -5,7 +5,6 @@ import json
 import secrets
 from collections.abc import Coroutine
 from functools import partial
-from typing import TYPE_CHECKING
 
 import structlog
 from aiohttp import WSMsgType, web
@@ -14,10 +13,7 @@ from skyvern.browser_extension.errors import BrowserExtensionError, ExtensionReq
 from skyvern.browser_extension.protocol import is_cdp_method_allowed
 from skyvern.browser_extension.relay import _MAX_WS_MESSAGE_BYTES
 from skyvern.browser_extension.target_registry import VirtualTargetRegistry
-
-if TYPE_CHECKING:
-    from skyvern.browser_extension.relay import ExtensionRelayServer
-
+from skyvern.browser_extension.transport import ExtensionTransport
 
 LOG = structlog.get_logger()
 
@@ -59,7 +55,7 @@ _ROOT_TARGET_GATE_METHODS = {
 
 
 class ExtensionCdpAdapter:
-    def __init__(self, registry: VirtualTargetRegistry, relay: ExtensionRelayServer) -> None:
+    def __init__(self, registry: VirtualTargetRegistry, relay: ExtensionTransport) -> None:
         self._registry = registry
         self._relay = relay
         self._capability = secrets.token_urlsafe(32)
@@ -355,7 +351,6 @@ class ExtensionCdpAdapter:
                 if type(tab_id) is not int:
                     raise BrowserExtensionError("Created tab id is invalid")
                 tabs = [{"tabId": tab_id, "url": "about:blank", "title": ""}]
-                self._begin_tab_scope(tab_id)
             except Exception as exc:
                 LOG.debug(
                     "browser_extension_auto_attach_target_skipped",
