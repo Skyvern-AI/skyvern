@@ -11,6 +11,7 @@ import {
   computeTurnSummary,
   condenseActivityEntries,
   effectiveMode,
+  humanizeJudgeText,
   hydrateHistoryNarrative,
   hydrateNarrativeFromPayload,
   mapBlockStatus,
@@ -1649,6 +1650,91 @@ describe("applyNarrativeEvent — terminal adjudication on live frames", () => {
     const s = applyNarrativeEvent(EMPTY_NARRATIVE, response());
     expect(s.responseKind).toBeNull();
     expect(s.verifiedSuccess).toBeNull();
+  });
+});
+
+describe("humanizeJudgeText", () => {
+  // Verbatim shape of completion.py::_outcome_unverified_reason.
+  const JUDGE_REASON =
+    "The run completed but did not demonstrate the goal outcome(s). " +
+    "Missing evidence: the number of Customer Agents is known. " +
+    "Add or fix the block that produces the missing outcome evidence, then re-run.";
+
+  // What actually reaches the client: run_outcome_display_reason truncates display_reason to
+  // _DISPLAY_REASON_MAX_CHARS (160), so the trailing instruction always arrives cut mid-word.
+  const TRUNCATED_JUDGE_REASON = JUDGE_REASON.slice(0, 160);
+
+  it("rewrites the truncated verdict the backend actually sends", () => {
+    expect(TRUNCATED_JUDGE_REASON).toHaveLength(160);
+    expect(TRUNCATED_JUDGE_REASON.endsWith("produces the ")).toBe(true);
+
+    expect(humanizeJudgeText(TRUNCATED_JUDGE_REASON)).toBe(
+      "The run finished but didn't produce what you asked for: the number of Customer Agents is known.",
+    );
+  });
+
+  it("still rewrites the untruncated verdict", () => {
+    expect(humanizeJudgeText(JUDGE_REASON)).toBe(
+      "The run finished but didn't produce what you asked for: the number of Customer Agents is known.",
+    );
+  });
+
+  it("strips the instruction wherever the 160-char cut lands inside it", () => {
+    const instruction =
+      " Add or fix the block that produces the missing outcome evidence, then re-run.";
+    const head =
+      "The run completed but did not demonstrate the goal outcome(s): title check.";
+    for (let cut = 0; cut <= instruction.length; cut += 1) {
+      const humanized = humanizeJudgeText(head + instruction.slice(0, cut));
+      expect(humanized).not.toContain("Add or fix");
+      expect(humanized.startsWith("The run finished but didn't produce")).toBe(
+        true,
+      );
+    }
+  });
+
+  it("rewrites the verdict where the backend appends it to the closing message", () => {
+    const closing = `I ran the workflow, but I could not confirm the goal was met. Reason: ${TRUNCATED_JUDGE_REASON}`;
+    const humanized = humanizeJudgeText(closing);
+
+    expect(humanized).toContain("I ran the workflow, but I could not confirm");
+    expect(humanized).not.toContain("did not demonstrate the goal outcome");
+    expect(humanized).not.toContain("Add or fix");
+  });
+
+  it("leaves ordinary assistant prose alone, even when it ends like the instruction", () => {
+    // The trailing-prefix scan must never reach free prose: these reach FixCard and
+    // RollupCard headlines, which are not judge text.
+    for (const prose of [
+      "Choose option A",
+      "Click the button labelled Add",
+      "Add or fix the selector yourself",
+    ]) {
+      expect(humanizeJudgeText(prose)).toBe(prose);
+    }
+  });
+
+  it("strips the instruction when the backend appends Evidence after it", () => {
+    // terminal_envelope.py appends " Evidence: <blocker_reason>" after the Reason sentence.
+    const withEvidence =
+      "I could not confirm the goal was met. Reason: " +
+      JUDGE_REASON +
+      " Evidence: the login form never submitted";
+    const humanized = humanizeJudgeText(withEvidence);
+
+    expect(humanized).not.toContain("Add or fix");
+    expect(humanized).not.toContain("did not demonstrate the goal outcome");
+    expect(humanized).toContain("Evidence: the login form never submitted");
+  });
+
+  it("passes unrecognized text through untouched", () => {
+    const other = "The run stopped because the browser session ended.";
+    expect(humanizeJudgeText(other)).toBe(other);
+  });
+
+  it("is idempotent, so a re-humanized string is unchanged", () => {
+    const once = humanizeJudgeText(TRUNCATED_JUDGE_REASON);
+    expect(humanizeJudgeText(once)).toBe(once);
   });
 });
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -30,7 +31,13 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.request_slots import is_canonical_request_slot_path
-from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
+from skyvern.forge.sdk.copilot.turn_intent import (
+    TurnIntent,
+    TurnIntentAuthority,
+    TurnIntentDeliverableKind,
+    TurnIntentExpectedOutput,
+    TurnIntentMode,
+)
 
 
 class _Ctx:
@@ -337,6 +344,108 @@ def _anonymous_slot_contract_policy() -> RequestPolicy:
             ),
         ],
     )
+
+
+def _run_result_intent(*, requires_user_input: bool = False) -> TurnIntent:
+    return TurnIntent(
+        mode=TurnIntentMode.BUILD,
+        expected_output=TurnIntentExpectedOutput.RUN_RESULT,
+        authority=TurnIntentAuthority(
+            may_update_workflow=True,
+            may_run_blocks=True,
+            requires_user_input=requires_user_input,
+        ),
+    )
+
+
+def _workflow_update_intent(*, requires_user_input: bool = False, may_run_blocks: bool = True) -> TurnIntent:
+    return TurnIntent(
+        mode=TurnIntentMode.BUILD,
+        expected_output=TurnIntentExpectedOutput.WORKFLOW_UPDATE,
+        authority=TurnIntentAuthority(
+            may_update_workflow=True,
+            may_run_blocks=may_run_blocks,
+            requires_user_input=requires_user_input,
+        ),
+    )
+
+
+def test_output_schema_ask_auto_answers_from_run_result_intent_without_classifier_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dump_dir = tmp_path / "ask"
+    monkeypatch.setenv("COPILOT_DUMP_ASK_INPUTS", str(dump_dir))
+    ctx = _present_contract_ctx(
+        request_policy=RequestPolicy(user_response_policy="proceed", clarification_reason="none"),
+        turn_intent=_run_result_intent(),
+    )
+
+    with capture_logs() as logs:
+        nudge = _response_output_nudge(ctx, _output_schema_ask(["output.azure_error_count"]))
+
+    assert nudge is not None
+    assert nudge.rule == "typed_ask_subject_auto_answer"
+    assert "reasonable names and representations" in nudge.message
+    events = [entry for entry in logs if entry["event"] == "copilot_ask_subject_auto_answered"]
+    assert len(events) == 1
+    assert events[0]["authority_source"] == "turn_intent_run_result"
+    [dump_path] = dump_dir.glob("ask-auto_answered-*.json")
+    dumped = json.loads(dump_path.read_text())
+    assert dumped["request_policy_user_response_policy"] == "proceed"
+    assert dumped["request_policy_clarification_reason"] == "none"
+    assert dumped["request_policy_has_present_completion_contract"] is False
+    assert dumped["turn_intent_may_update_workflow"] is True
+    assert dumped["turn_intent_may_run_blocks"] is True
+
+
+def test_output_schema_ask_auto_answers_from_run_capable_workflow_update_intent_without_classifier_contract() -> None:
+    ctx = _present_contract_ctx(
+        request_policy=RequestPolicy(user_response_policy="proceed", clarification_reason="none"),
+        turn_intent=_workflow_update_intent(),
+    )
+
+    with capture_logs() as logs:
+        nudge = _response_output_nudge(ctx, _output_schema_ask(["output.azure_error_count"]))
+
+    assert nudge is not None
+    assert nudge.rule == "typed_ask_subject_auto_answer"
+    assert "author and test the workflow" in nudge.message
+    events = [entry for entry in logs if entry["event"] == "copilot_ask_subject_auto_answered"]
+    assert len(events) == 1
+    assert events[0]["authority_source"] == "turn_intent_update_and_run"
+
+
+@pytest.mark.parametrize(
+    "turn_intent",
+    [
+        pytest.param(_authoring_intent(), id="workflow_draft"),
+        pytest.param(_run_result_intent(requires_user_input=True), id="requires_user_input"),
+        pytest.param(
+            _workflow_update_intent(requires_user_input=True),
+            id="workflow_update_requires_user_input",
+        ),
+        pytest.param(_workflow_update_intent(may_run_blocks=False), id="workflow_update_without_run_authority"),
+    ],
+)
+def test_output_schema_ask_without_classifier_contract_preserves_real_clarification(
+    turn_intent: TurnIntent,
+) -> None:
+    ctx = _present_contract_ctx(
+        request_policy=RequestPolicy(user_response_policy="proceed", clarification_reason="none"),
+        turn_intent=turn_intent,
+    )
+
+    assert _response_output_nudge(ctx, _output_schema_ask(["output.azure_error_count"])) is None
+
+
+def test_non_output_schema_ask_without_classifier_contract_still_reaches_user() -> None:
+    ctx = _present_contract_ctx(
+        request_policy=RequestPolicy(user_response_policy="proceed", clarification_reason="none"),
+        turn_intent=_run_result_intent(),
+    )
+
+    assert _response_output_nudge(ctx, _CREDENTIALS_ASK) is None
 
 
 def test_output_schema_ask_auto_answers_when_the_contract_only_holds_anonymous_slots() -> None:
@@ -753,3 +862,20 @@ def test_deliverable_permission_ask_for_an_unrelated_side_effect_reaches_user() 
     }
 
     assert _response_output_nudge(ctx, payment_ask) is None
+
+
+def test_typed_turn_intent_bounces_exact_download_ref_without_request_policy_criteria() -> None:
+    ctx = _mid_build_ctx(RequestPolicy(completion_criteria=[], completion_contract_status="absent"))
+    ctx.turn_intent.deliverable_kind = TurnIntentDeliverableKind.REGISTERED_DOWNLOAD
+
+    nudge = _response_output_nudge(ctx, _deliverable_ask("deliverable_permission"))
+
+    assert nudge is not None
+    assert nudge.rule == "deliverable_permission_ask_retry"
+    assert (
+        _response_output_nudge(
+            ctx,
+            _deliverable_ask("deliverable_permission", refs=["output.unrelated"]),
+        )
+        is None
+    )
