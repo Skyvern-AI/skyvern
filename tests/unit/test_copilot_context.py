@@ -643,7 +643,6 @@ class TestCopilotContext:
             "update_workflow_called",
             "test_after_update_done",
             "post_update_nudge_count",
-            "coverage_nudge_count",
             "format_nudge_count",
             "explore_without_workflow_nudge_count",
             "user_message",
@@ -671,7 +670,6 @@ class TestCopilotContext:
         )
         assert ctx.navigate_called is False
         assert ctx.update_workflow_called is False
-        assert ctx.coverage_nudge_count == 0
         assert ctx.format_nudge_count == 0
         assert ctx.explore_without_workflow_nudge_count == 0
         assert ctx.user_message == ""

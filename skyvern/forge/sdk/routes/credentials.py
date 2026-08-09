@@ -730,7 +730,8 @@ async def create_credential(
 
     pin_provided = "pin_saved_session_ip" in data.model_fields_set
     bpid_provided = "browser_profile_id" in data.model_fields_set
-    if bpid_provided or pin_provided:
+    auto_profile_disabled_provided = "auto_profile_disabled" in data.model_fields_set
+    if bpid_provided or pin_provided or auto_profile_disabled_provided:
         # Only pass browser_profile_id when the caller sent it, so a pin-only request never passes the
         # omitted default (None) into the repo's unlink sentinel.
         profile_update: dict[str, Any] = {"browser_profile_id": data.browser_profile_id} if bpid_provided else {}
@@ -740,6 +741,7 @@ async def create_credential(
             **profile_update,
             # Only touch the pin when the caller sent it — supplying a profile alone must not reset it.
             pin_saved_session_ip=data.pin_saved_session_ip if pin_provided else None,
+            auto_profile_disabled=data.auto_profile_disabled if auto_profile_disabled_provided else None,
         )
 
     return _convert_to_response(credential)
@@ -888,6 +890,8 @@ async def rename_credential(
         update_kwargs["user_context"] = data.user_context
     if data.save_browser_session_intent is not None:
         update_kwargs["save_browser_session_intent"] = data.save_browser_session_intent
+    if data.auto_profile_disabled is not None:
+        update_kwargs["auto_profile_disabled"] = data.auto_profile_disabled
     if data.run_sequentially is True and not app.AGENT_FUNCTION.supports_sequential_credentials():
         raise HTTPException(
             status_code=400,
@@ -2010,7 +2014,8 @@ async def update_credential(
     # (pin omitted) must not reset the pin.
     pin_provided = "pin_saved_session_ip" in data.model_fields_set
     bpid_provided = "browser_profile_id" in data.model_fields_set
-    if bpid_provided or pin_provided:
+    auto_profile_disabled_provided = "auto_profile_disabled" in data.model_fields_set
+    if bpid_provided or pin_provided or auto_profile_disabled_provided:
         # Only pass browser_profile_id when the caller sent it — a pin-only update must not pass the
         # field's omitted default (None) and unlink the profile via the repo's unlink sentinel.
         profile_update: dict[str, Any] = {"browser_profile_id": data.browser_profile_id} if bpid_provided else {}
@@ -2019,6 +2024,7 @@ async def update_credential(
             organization_id=current_org.organization_id,
             **profile_update,
             pin_saved_session_ip=data.pin_saved_session_ip if pin_provided else None,
+            auto_profile_disabled=data.auto_profile_disabled if auto_profile_disabled_provided else None,
         )
 
     return _convert_to_response(updated_credential)
@@ -3405,6 +3411,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             name=credential.name,
             vault_type=credential.vault_type,
             browser_profile_id=credential.browser_profile_id,
+            auto_profile_disabled=credential.auto_profile_disabled,
             pin_saved_session_ip=credential.pin_saved_session_ip,
             tested_url=credential.tested_url,
             user_context=credential.user_context,
@@ -3426,6 +3433,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             name=credential.name,
             vault_type=credential.vault_type,
             browser_profile_id=credential.browser_profile_id,
+            auto_profile_disabled=credential.auto_profile_disabled,
             pin_saved_session_ip=credential.pin_saved_session_ip,
             tested_url=credential.tested_url,
             user_context=credential.user_context,
@@ -3444,6 +3452,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             name=credential.name,
             vault_type=credential.vault_type,
             browser_profile_id=credential.browser_profile_id,
+            auto_profile_disabled=credential.auto_profile_disabled,
             pin_saved_session_ip=credential.pin_saved_session_ip,
             tested_url=credential.tested_url,
             user_context=credential.user_context,
