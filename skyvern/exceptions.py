@@ -974,6 +974,20 @@ class TaskTerminationError(TerminationError):
         super().__init__(f"Task {task_id} failed. Reason: {reason}")
 
 
+class ActionPolicyBlocked(BaseException):
+    """Fail-closed signal raised when an extension policy blocks a browser action.
+
+    Deliberately derives from BaseException so broad action-recovery handlers cannot convert a policy
+    decision into a retry or fallback. It is caught only at the run's explicit termination boundaries.
+    """
+
+    def __init__(self, reason: str, step_id: str | None = None, task_id: str | None = None) -> None:
+        self.message = f"Browser action blocked by policy. Reason: {reason}"
+        self.step_id = step_id
+        self.task_id = task_id
+        super().__init__(self.message)
+
+
 class BlockTerminationError(SkyvernException):
     def __init__(self, workflow_run_block_id: str, workflow_run_id: str, reason: str) -> None:
         super().__init__(
