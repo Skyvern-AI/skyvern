@@ -6,10 +6,16 @@ from types import SimpleNamespace
 import pytest
 
 from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState, ReconcileDecision
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.result_evidence import loaded_result_source_producible
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import scouting
+from skyvern.forge.sdk.copilot.turn_intent import (
+    TurnIntent,
+    TurnIntentAuthority,
+    TurnIntentDeliverableKind,
+    TurnIntentMode,
+)
 
 
 def _packet() -> dict:
@@ -1146,6 +1152,61 @@ async def test_result_table_with_unmet_download_goal_keeps_actionable_targets(mo
     assert result["data"].get("next_action") != "compose_extraction"
     assert "actionable_targets" in result["data"]
     assert "composition_targets" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_typed_turn_intent_download_keeps_targets_without_request_policy_criteria(monkeypatch) -> None:
+    async def fake_evidence(ctx, *, url):
+        return _result_table_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake_evidence)
+    ctx = _ctx()
+    ctx.request_policy = RequestPolicy(completion_criteria=[])
+    ctx.turn_intent = TurnIntent(
+        mode=TurnIntentMode.BUILD,
+        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        deliverable_kind=TurnIntentDeliverableKind.REGISTERED_DOWNLOAD,
+    )
+    result = {
+        "ok": True,
+        "data": {
+            "url": "https://example.com/results",
+            "actionable_targets": [{"selector": "#details", "text": "Details"}],
+        },
+    }
+
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://example.com/results")
+
+    assert result["data"].get("next_action") != "compose_extraction"
+    assert "actionable_targets" in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_typed_turn_intent_download_composes_after_registered_run_evidence(monkeypatch) -> None:
+    async def fake_evidence(ctx, *, url):
+        return _result_table_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake_evidence)
+    ctx = _ctx()
+    ctx.request_policy = RequestPolicy(completion_criteria=[])
+    ctx.turn_intent = TurnIntent(
+        mode=TurnIntentMode.BUILD,
+        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        deliverable_kind=TurnIntentDeliverableKind.REGISTERED_DOWNLOAD,
+    )
+    ctx.verified_block_outputs = {"download_invoice": {"download_registered": True, "downloaded_file_count": 1}}
+    result = {
+        "ok": True,
+        "data": {
+            "url": "https://example.com/results",
+            "actionable_targets": [{"selector": "#details", "text": "Details"}],
+        },
+    }
+
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://example.com/results")
+
+    assert result["data"].get("next_action") == "compose_extraction"
+    assert "actionable_targets" not in result["data"]
 
 
 @pytest.mark.asyncio
