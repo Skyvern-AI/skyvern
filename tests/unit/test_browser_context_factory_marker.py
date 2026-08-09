@@ -206,3 +206,32 @@ async def test_headless_chromium_stamps_applied_browser_profile_id(
         organization_id="o_test",
     )
     assert artifacts_no_profile.applied_browser_profile_id is None
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_error_propagates_unwrapped_but_other_errors_are_wrapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A creator's ``BrowserEngineBootstrapError`` (the narrow engine-boot marker) must reach the
+    acquisition boundary unchanged so it can drive a one-hop engine fallback; an ordinary creator error
+    is still wrapped in ``UnknownErrorWhileCreatingBrowserContext`` as before."""
+    from skyvern.exceptions import UnknownErrorWhileCreatingBrowserContext
+    from skyvern.webeye.browser_engine import BrowserEngineBootstrapError
+    from skyvern.webeye.browser_factory import BrowserContextFactory
+
+    async def _bootstrap_failing_creator(playwright: Any, **kwargs: Any) -> tuple[Any, Any, None]:
+        raise BrowserEngineBootstrapError("rustwright launch failed")
+
+    async def _generic_failing_creator(playwright: Any, **kwargs: Any) -> tuple[Any, Any, None]:
+        raise RuntimeError("some unrelated context failure")
+
+    BrowserContextFactory.register_type("test-bootstrap-fail", _bootstrap_failing_creator)
+    BrowserContextFactory.register_type("test-generic-fail", _generic_failing_creator)
+
+    monkeypatch.setattr(factory_module.settings, "BROWSER_TYPE", "test-bootstrap-fail")
+    with pytest.raises(BrowserEngineBootstrapError):
+        await BrowserContextFactory.create_browser_context(playwright=object())
+
+    monkeypatch.setattr(factory_module.settings, "BROWSER_TYPE", "test-generic-fail")
+    with pytest.raises(UnknownErrorWhileCreatingBrowserContext):
+        await BrowserContextFactory.create_browser_context(playwright=object())

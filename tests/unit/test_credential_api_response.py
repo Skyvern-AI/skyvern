@@ -27,6 +27,7 @@ def _make_credential(**overrides: object) -> Credential:
         "card_brand": None,
         "secret_label": None,
         "browser_profile_id": None,
+        "auto_profile_disabled": None,
         "tested_url": None,
         "user_context": None,
         "save_browser_session_intent": False,
@@ -42,6 +43,12 @@ def test_convert_to_response_includes_totp_identifier() -> None:
     credential = _make_credential(totp_identifier="login_otp")
     response = _convert_to_response(credential)
     assert response.credential.totp_identifier == "login_otp"
+
+
+def test_convert_to_response_includes_auto_profile_disabled() -> None:
+    assert _convert_to_response(_make_credential(auto_profile_disabled=True)).auto_profile_disabled is True
+    assert _convert_to_response(_make_credential(auto_profile_disabled=False)).auto_profile_disabled is False
+    assert _convert_to_response(_make_credential(auto_profile_disabled=None)).auto_profile_disabled is None
 
 
 def test_convert_to_response_totp_identifier_none_when_not_set() -> None:
