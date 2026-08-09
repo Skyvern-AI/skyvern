@@ -18,6 +18,7 @@ from sse_starlette import EventSourceResponse
 
 from skyvern import analytics
 from skyvern.config import settings
+from skyvern.constants import DEFAULT_WORKFLOW_TITLES
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
@@ -27,14 +28,6 @@ from skyvern.forge.sdk.copilot.agent import run_copilot_agent
 from skyvern.forge.sdk.copilot.attribution import is_copilot_born_initial_write, resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
 from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_steps
-from skyvern.forge.sdk.copilot.completion_criteria_store import (
-    CRITERIA_SET_STATUS_ACTIVE,
-    StoredCriteriaSet,
-    StoredCriteriaSnapshot,
-    criteria_from_json,
-    criteria_to_json,
-    plan_persistence,
-)
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.context import (
     AgentResult,
@@ -51,7 +44,7 @@ from skyvern.forge.sdk.copilot.credential_pause import (
 )
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
-from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
+from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler, resolve_raw_secret_safety_handler
 from skyvern.forge.sdk.copilot.output_utils import truncate_output
 from skyvern.forge.sdk.copilot.recoverable_failure import (
     RecoverableFailure,
@@ -59,7 +52,6 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
     format_recoverable_failure_reply,
     merge_failure_into_context,
 )
-from skyvern.forge.sdk.copilot.request_policy import is_defer_authoring_durable_fill_criterion
 from skyvern.forge.sdk.copilot.terminal_envelope import (
     INTERRUPTED_TERMINAL_MESSAGE,
     INTERRUPTED_TERMINAL_REASON,
@@ -77,6 +69,7 @@ from skyvern.forge.sdk.copilot.turn_outcome import (
 from skyvern.forge.sdk.copilot.workflow_yaml import _normalize_copilot_yaml as _normalize_copilot_yaml
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _process_workflow_yaml
 from skyvern.forge.sdk.copilot.workflow_yaml import _repair_next_block_label_chain as _repair_next_block_label_chain
+from skyvern.forge.sdk.copilot.workflow_yaml import with_workflow_yaml_title
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.event_source_stream import EventSourceStream, FastAPIEventSourceStream
 from skyvern.forge.sdk.routes.routers import base_router
@@ -84,7 +77,6 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOut
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     CopilotPendingTurn,
-    NonAdoptableCriteriaSet,
     WorkflowCopilotApplyProposedWorkflowRequest,
     WorkflowCopilotAudioUploadResponse,
     WorkflowCopilotCancelRequest,
@@ -108,7 +100,6 @@ from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
-from skyvern.forge.sdk.workflow.runtime_completion import contract_from_request_criteria
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.workflows import (
     WorkflowCreateYAMLRequest,
@@ -147,6 +138,10 @@ async def _resolve_copilot_agent_handler(
 ) -> LLMAPIHandler:
     handler = await resolve_main_copilot_handler(workflow_permanent_id, organization_id)
     return handler or app.LLM_API_HANDLER
+
+
+def _workflow_copilot_ingress_log_fields(message: str) -> dict[str, int]:
+    return {"message_length": len(message or "")}
 
 
 @contextmanager
@@ -611,107 +606,12 @@ async def _clear_proposed_workflow(chat: Any) -> None:
     chat.proposed_workflow = None
 
 
-async def _load_completion_criteria_snapshot(chat: Any) -> StoredCriteriaSnapshot | None:
-    """None disables the lifecycle for this turn on load failure, which degrades to
-    today's per-turn regeneration rather than risking a duplicate-epoch write."""
-    try:
-        latest = await app.DATABASE.workflow_params.get_latest_workflow_copilot_completion_criteria_set(
-            organization_id=chat.organization_id,
-            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-        )
-    except Exception:
-        LOG.warning("copilot completion criteria snapshot load failed", exc_info=True)
-        return None
-    if latest is None:
-        return StoredCriteriaSnapshot()
-    if isinstance(latest, NonAdoptableCriteriaSet):
-        LOG.warning(
-            "copilot completion criteria set not adoptable; disabling active set for this turn",
-            reason=latest.reason,
-            completion_criteria_set_id=latest.completion_criteria_set_id,
-            goal_epoch=latest.goal_epoch,
-        )
-        return StoredCriteriaSnapshot(active=None, next_epoch=latest.goal_epoch + 1)
-    active = None
-    if latest.status == CRITERIA_SET_STATUS_ACTIVE:
-        try:
-            active = StoredCriteriaSet(
-                set_id=latest.completion_criteria_set_id,
-                goal_epoch=latest.goal_epoch,
-                criteria=criteria_from_json(latest.criteria),
-                consecutive_all_no_evidence=latest.consecutive_all_no_evidence,
-                tripwire_fired=latest.tripwire_fired,
-                last_fully_satisfied_workflow_yaml=latest.last_fully_satisfied_workflow_yaml,
-            )
-        except Exception:
-            LOG.warning(
-                "copilot completion criteria decode failed; disabling active set for this turn",
-                completion_criteria_set_id=latest.completion_criteria_set_id,
-                goal_epoch=latest.goal_epoch,
-                exc_info=True,
-            )
-            return StoredCriteriaSnapshot(active=None, next_epoch=latest.goal_epoch + 1)
-    return StoredCriteriaSnapshot(active=active, next_epoch=latest.goal_epoch + 1)
-
-
-async def _persist_completion_criteria_state(chat: Any, agent_result: AgentResult, user_message: str) -> None:
-    plan = plan_persistence(getattr(agent_result, "completion_criteria_turn_state", None))
-    if plan is None:
-        return
-    try:
-        if plan.creates_set:
-            new_set = await app.DATABASE.workflow_params.create_workflow_copilot_completion_criteria_set(
-                organization_id=chat.organization_id,
-                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                goal_epoch=plan.create_epoch or 1,
-                criteria=criteria_to_json(
-                    [c for c in plan.create_criteria if not is_defer_authoring_durable_fill_criterion(c)]
-                ),
-                source_turn_id=agent_result.turn_id,
-                source_goal_text=user_message[:2000] if user_message else None,
-                consecutive_all_no_evidence=plan.counter_value,
-                last_fully_satisfied_workflow_yaml=plan.fully_satisfied_workflow_yaml,
-            )
-            if plan.supersede_set_id:
-                await app.DATABASE.workflow_params.supersede_workflow_copilot_completion_criteria_set(
-                    organization_id=chat.organization_id,
-                    completion_criteria_set_id=plan.supersede_set_id,
-                    supersede_reason=plan.supersede_reason or "not_subset",
-                    superseded_by_set_id=new_set.completion_criteria_set_id,
-                )
-        else:
-            if plan.counter_set_id:
-                await app.DATABASE.workflow_params.update_workflow_copilot_completion_criteria_set_state(
-                    organization_id=chat.organization_id,
-                    completion_criteria_set_id=plan.counter_set_id,
-                    consecutive_all_no_evidence=plan.counter_value,
-                    tripwire_fired=plan.tripwire_fired,
-                    last_fully_satisfied_workflow_yaml=plan.fully_satisfied_workflow_yaml,
-                )
-            if plan.supersede_set_id:
-                await app.DATABASE.workflow_params.supersede_workflow_copilot_completion_criteria_set(
-                    organization_id=chat.organization_id,
-                    completion_criteria_set_id=plan.supersede_set_id,
-                    supersede_reason=plan.supersede_reason or "tripwire",
-                )
-        LOG.info(
-            "copilot completion criteria persisted",
-            criteria_set_created=plan.creates_set,
-            criteria_epoch=plan.create_epoch,
-            criteria_superseded_set_id=plan.supersede_set_id,
-            criteria_supersede_reason=plan.supersede_reason,
-            criteria_consecutive_all_no_evidence=plan.counter_value,
-            criteria_tripwire_fired=plan.tripwire_fired,
-        )
-    except Exception:
-        # A failed persist degrades to per-turn regeneration on the next turn.
-        LOG.warning("copilot completion criteria persist failed", exc_info=True)
-
-
 def _build_proposed_workflow_data(updated_workflow: Workflow, agent_result: AgentResult) -> dict[str, Any]:
     proposed_data = dict(updated_workflow.model_dump(mode="json"))
     if agent_result.workflow_yaml:
-        proposed_data["_copilot_yaml"] = agent_result.workflow_yaml
+        # Accept reparses this YAML and never passes through _process_workflow_yaml, so the
+        # title it carries has to be the effective one rather than whatever the model typed.
+        proposed_data["_copilot_yaml"] = with_workflow_yaml_title(agent_result.workflow_yaml, updated_workflow.title)
     code_artifact_metadata = getattr(agent_result, "code_artifact_metadata", None)
     if code_artifact_metadata:
         proposed_data["_copilot_code_artifact_metadata"] = code_artifact_metadata
@@ -1087,9 +987,6 @@ async def _finalise_normal_turn(
             restore_failed = True
 
     if _should_commit_staged_workflow(chat.auto_accept, agent_result):
-        # Both acceptance paths must carry the same contract, or the obligation depends on which
-        # button the user pressed.
-        await _attach_requested_completion_contract(chat, agent_result.staged_workflow, agent_result)
         try:
             await _commit_staged_workflow(
                 organization_id=organization_id,
@@ -1112,7 +1009,6 @@ async def _finalise_normal_turn(
         # don't honor keep_pending_proposal against an unverified "nothing changed" state.
         keep_pending_proposal=chat_request.keep_pending_proposal and not restore_failed,
     )
-    await _persist_completion_criteria_state(chat, agent_result, chat_request.message)
     proposal_disposition = _proposal_disposition(agent_result)
     workflow_applied = _effective_auto_accept(chat.auto_accept, agent_result)
     terminal_envelope_result = _finalized_terminal_envelope(
@@ -1253,10 +1149,26 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
     """
     if not original_workflow:
         return
+    # Rolling a canvas back must not un-name the agent: naming is a separate, one-shot
+    # write that only ever fires on a placeholder, so restoring the pre-turn placeholder
+    # over a name would leave the user watching their agent revert to "New Agent".
+    restored_title = original_workflow.title
+    if restored_title in DEFAULT_WORKFLOW_TITLES:
+        # Best-effort: preserving a name must never be the reason a rollback fails, and this
+        # lookup raises rather than returning None when the workflow is gone.
+        try:
+            current = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+                workflow_permanent_id=original_workflow.workflow_permanent_id,
+                organization_id=organization_id,
+            )
+        except Exception:
+            current = None
+        if current is not None and current.title not in DEFAULT_WORKFLOW_TITLES:
+            restored_title = current.title
     await app.WORKFLOW_SERVICE.update_workflow_definition(
         workflow_id=original_workflow.workflow_id,
         organization_id=organization_id,
-        title=original_workflow.title,
+        title=restored_title,
         description=original_workflow.description,
         workflow_definition=original_workflow.workflow_definition,
         proxy_location=original_workflow.proxy_location,
@@ -1786,7 +1698,7 @@ async def _new_copilot_chat_post(
             "Workflow copilot v2 chat request",
             workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
             workflow_run_id=chat_request.workflow_run_id,
-            message=chat_request.message,
+            **_workflow_copilot_ingress_log_fields(chat_request.message),
             workflow_yaml_length=len(chat_request.workflow_yaml),
             organization_id=organization.organization_id,
         )
@@ -2033,6 +1945,10 @@ async def _new_copilot_chat_post(
             llm_api_handler = await _resolve_copilot_agent_handler(
                 chat_request.workflow_permanent_id, organization.organization_id
             )
+            raw_secret_safety_handler = await resolve_raw_secret_safety_handler(
+                chat_request.workflow_permanent_id,
+                organization.organization_id,
+            )
 
             api_key = request.headers.get("x-api-key")
             if not api_key:
@@ -2096,9 +2012,7 @@ async def _new_copilot_chat_post(
             elif original_workflow is not None and original_workflow.workflow_definition is not None:
                 prior_block_count = len(original_workflow.workflow_definition.blocks or [])
 
-            stored_completion_criteria = await _load_completion_criteria_snapshot(chat)
-
-            await app.DATABASE.workflow_params.start_copilot_turn(
+            pending_user_message = await app.DATABASE.workflow_params.start_copilot_turn(
                 organization_id=organization.organization_id,
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                 pending_turn=CopilotPendingTurn(
@@ -2108,10 +2022,23 @@ async def _new_copilot_chat_post(
                     pre_turn_proposed_workflow=proposed_workflow_at_turn_start,
                     keep_pending_proposal=chat_request.keep_pending_proposal,
                 ),
-                user_message=chat_request.message,
+                # The semantic safety screen runs inside the agent guardrail. Persisting the
+                # literal before that screen would leave a cross-turn disclosure path if the
+                # dedicated classifier finds a secret outside deterministic redaction patterns.
+                user_message="[Message unavailable because safety screening did not complete]",
                 audio_artifact_id=chat_request.audio_artifact_id,
             )
             turn_started = True
+
+            async def persist_canonical_user_message(content: str) -> None:
+                await app.DATABASE.workflow_params.replace_workflow_copilot_chat_message(
+                    organization_id=organization.organization_id,
+                    workflow_copilot_chat_message_id=pending_user_message.workflow_copilot_chat_message_id,
+                    content=content,
+                    global_llm_context=None,
+                    turn_outcome=None,
+                    narrative_payload=None,
+                )
 
             with bind_copilot_session_id(chat.workflow_copilot_chat_id):
                 agent_result = await run_copilot_agent(
@@ -2123,14 +2050,16 @@ async def _new_copilot_chat_post(
                     global_llm_context=global_llm_context,
                     debug_run_info_text=debug_run_info_text,
                     llm_api_handler=llm_api_handler,
+                    raw_secret_safety_handler=raw_secret_safety_handler,
                     api_key=api_key,
                     config=copilot_config,
                     turn_index=turn_index,
                     turn_id=turn_id,
                     prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
                     prior_block_count=prior_block_count,
-                    stored_completion_criteria=stored_completion_criteria,
+                    stored_completion_criteria=None,
                     prior_turn_outcome=prior_turn_outcome,
+                    persist_canonical_user_message=persist_canonical_user_message,
                 )
 
             agent_result.turn_outcome = _with_current_copilot_code_mode_metadata(
@@ -2530,7 +2459,9 @@ async def workflow_copilot_chat_post(
                 # _copilot_yaml is what /apply-proposed-workflow re-parses into
                 # WorkflowCreateYAMLRequest. Without it, Accept 400s.
                 if updated_workflow_yaml:
-                    proposed_data["_copilot_yaml"] = updated_workflow_yaml
+                    proposed_data["_copilot_yaml"] = with_workflow_yaml_title(
+                        updated_workflow_yaml, updated_workflow.title
+                    )
                 await app.DATABASE.workflow_params.update_workflow_copilot_chat(
                     organization_id=chat.organization_id,
                     workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
@@ -2898,44 +2829,6 @@ async def workflow_copilot_clear_proposed_workflow(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
 
 
-async def _turn_completion_criteria(chat: Any, agent_result: Any) -> object | None:
-    """This turn's typed criteria, preferring the in-memory turn state over the stored snapshot.
-
-    Auto-accept commits before the turn's criteria are persisted, so a turn that first mints a
-    download criterion would otherwise read a pre-turn snapshot and commit with no contract."""
-    turn_state = getattr(agent_result, "completion_criteria_turn_state", None)
-    decision = getattr(turn_state, "decision", None)
-    criteria = getattr(decision, "criteria", None)
-    if criteria:
-        return criteria
-    snapshot = await _load_completion_criteria_snapshot(chat)
-    active = snapshot.active if snapshot is not None else None
-    return active.criteria if active is not None else None
-
-
-async def _attach_requested_completion_contract(chat: Any, target: Any, agent_result: Any = None) -> None:
-    """Carry the request's typed completion criteria onto the version being accepted.
-
-    Read at accept time so the contract binds to the definition being accepted, and skipped silently
-    when the chat has no active criteria — a workflow that promised nothing is graded as before.
-    Applied on both acceptance paths so the obligation cannot depend on which one ran."""
-    try:
-        definition = getattr(target, "workflow_definition", None)
-        if definition is None:
-            return
-        contract = contract_from_request_criteria(await _turn_completion_criteria(chat, agent_result))
-        if contract is None:
-            return
-        definition.completion_contract = contract
-        LOG.info(
-            "copilot_completion_contract_attached_from_request",
-            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-            workflow_permanent_id=chat.workflow_permanent_id,
-        )
-    except Exception:
-        LOG.warning("copilot_completion_contract_attach_failed", exc_info=True)
-
-
 @base_router.post("/workflow/copilot/apply-proposed-workflow", include_in_schema=False)
 async def workflow_copilot_apply_proposed_workflow(
     apply_request: WorkflowCopilotApplyProposedWorkflowRequest,
@@ -2969,8 +2862,6 @@ async def workflow_copilot_apply_proposed_workflow(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Proposed copilot YAML is invalid: {e}",
         )
-
-    await _attach_requested_completion_contract(chat, yaml_request)
 
     current_workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
         workflow_permanent_id=chat.workflow_permanent_id,

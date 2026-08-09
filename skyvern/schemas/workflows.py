@@ -896,6 +896,7 @@ class CodeBlockYAML(BlockYAML):
 
     code: str
     parameter_keys: list[str] | None = None
+    error_code_mapping: dict[str, str] | None = None
     prompt: str | None = Field(
         default=None,
         description="Plain-language goal of this code block, shown as the block's Goal in the editor",

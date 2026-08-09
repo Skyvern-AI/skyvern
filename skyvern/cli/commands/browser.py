@@ -21,9 +21,11 @@ if TYPE_CHECKING:
 
 import typer
 
+from skyvern._cli_bootstrap import prepare_cli_runtime
 from skyvern.browser_extension.auth import load_or_create_pairing_token
+from skyvern.browser_extension.broker.protocol import BROKER_HEALTH_PATH
 from skyvern.browser_extension.errors import BrowserExtensionError
-from skyvern.browser_extension.runtime import BrowserExtensionRuntime
+from skyvern.browser_extension.runtime import BrowserExtensionRuntime, broker_enabled
 from skyvern.cli.commands._output import (
     console,
 )
@@ -68,6 +70,7 @@ from skyvern.cli.lazy import SkyvernTyperGroup
 from skyvern.cli.mcp_tools.browser import skyvern_login as tool_login
 from skyvern.cli.mcp_tools.browser import skyvern_run_task as tool_run_task
 from skyvern.cli.mcp_tools.inspection import skyvern_har_start, skyvern_har_stop
+from skyvern.utils.env_paths import EnvIntent
 
 browser_app = typer.Typer(cls=SkyvernTyperGroup, help="Browser automation commands.", no_args_is_help=True)
 session_app = typer.Typer(cls=SkyvernTyperGroup, help="Manage browser sessions.", no_args_is_help=True)
@@ -80,6 +83,12 @@ browser_app.add_typer(frame_app, name="frame")
 browser_app.add_typer(state_app, name="state")
 browser_app.add_typer(storage_app, name="storage")
 browser_app.add_typer(network_app, name="network")
+
+
+@browser_app.callback()
+def browser_callback() -> None:
+    """Load environment and mark the CLI runtime so credential-bearing clients hit the base-URL guard."""
+    prepare_cli_runtime(intent=EnvIntent.CLOUD)
 
 
 @dataclass(frozen=True)
@@ -273,6 +282,26 @@ def _bridge_is_listening(port: int) -> bool:
     return True
 
 
+def _bridge_mode(port: int) -> Literal["broker", "legacy", "none"]:
+    """Tell a shared broker daemon apart from a pre-broker single-owner MCP session."""
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1.0)
+    try:
+        connection.request("GET", BROKER_HEALTH_PATH)
+        response = connection.getresponse()
+        body = response.read(4096)
+    except OSError:
+        return "none"
+    finally:
+        connection.close()
+    if response.status != 200:
+        return "legacy"
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return "legacy"
+    return "broker" if isinstance(payload, dict) and payload.get("broker") is True else "legacy"
+
+
 def _request_pairing_nonce(port: int, token: str) -> str:
     proof = hmac.new(token.encode("utf-8"), b"skyvern-pair-begin-v1", hashlib.sha256).hexdigest()
     body = json.dumps({"v": 1, "proof": proof}, separators=(",", ":"))
@@ -304,22 +333,7 @@ def _request_pairing_nonce(port: int, token: str) -> str:
 
 
 def _open_pairing_url(url: str) -> bool:
-    command: list[str] | None = None
-    if sys.platform == "darwin":
-        executable = shutil.which("open")
-        if executable:
-            command = [executable, url]
-    elif sys.platform.startswith("linux"):
-        executable = shutil.which("xdg-open")
-        if executable:
-            command = [executable, url]
-    if command is None:
-        return False
-    try:
-        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except (OSError, subprocess.CalledProcessError):
-        return False
-    return True
+    return BrowserExtensionRuntime.open_extension_url(url)
 
 
 def _launch_extension_pairing(port: int) -> None:
@@ -375,10 +389,16 @@ def extension_status() -> None:
         console.print(f"bridge configuration invalid ({exc})")
         return
 
-    if not _bridge_is_listening(port):
+    console.print(f"shared broker: {'enabled' if broker_enabled() else 'disabled (SKYVERN_BROWSER_EXTENSION_BROKER)'}")
+
+    mode = _bridge_mode(port)
+    if mode == "none":
         console.print("bridge not running (start your MCP server with --browser-extension)")
+    elif mode == "broker":
+        console.print(f"bridge listening on {port} (shared broker daemon)")
     else:
-        console.print(f"bridge listening on {port}")
+        console.print(f"bridge listening on {port} (single-owner session)")
+        console.print("restart that session on this version so every agent can share the bridge")
 
 
 @browser_app.command("extension-pair")
@@ -836,7 +856,7 @@ def navigate(
             cli_state.frame_name = None
             cli_state.frame_index = None
             save_state(cli_state)
-        return {"url": result.url, "title": result.title}
+        return {"url": result.url, "title": result.title, "load_state": result.load_state}
 
     try:
         data = asyncio.run(_run())

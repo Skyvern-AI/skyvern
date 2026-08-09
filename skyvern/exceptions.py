@@ -56,6 +56,10 @@ class SkyvernException(Exception):
         # so the concrete name stays in logs/monitoring but never reaches end users.
         return type(self).__name__
 
+    @property
+    def message_is_user_facing(self) -> bool:
+        return False
+
 
 class SkyvernPageAnalysisTimeout(SkyvernException):
     pass
@@ -358,6 +362,12 @@ class MissingBrowserStatePage(SkyvernException):
         super().__init__(f"Browser state page is missing. {task_str} {workflow_run_str}")
 
 
+class BrowserProfileNotApplied(SkyvernException):
+    def __init__(self, browser_profile_id: str) -> None:
+        self.browser_profile_id = browser_profile_id
+        super().__init__(f"Browser profile {browser_profile_id} was not applied by the created browser")
+
+
 class MissingWorkflowRunBrowserState(SkyvernException):
     def __init__(self, workflow_run_id: str, task_id: str) -> None:
         super().__init__(f"Browser state for workflow run {workflow_run_id} and task {task_id} is missing.")
@@ -643,6 +653,9 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
 
     @staticmethod
     def _get_detail(exception: Exception) -> str:
+        if isinstance(exception, SkyvernException) and exception.message_is_user_facing:
+            return exception.message or "Unexpected browser creation failure."
+
         if isinstance(exception, CdpConnectionConfigurationError):
             return exception.message or str(exception)
 
@@ -959,6 +972,20 @@ class StepTerminationError(TerminationError):
 class TaskTerminationError(TerminationError):
     def __init__(self, reason: str, step_id: str | None = None, task_id: str | None = None) -> None:
         super().__init__(f"Task {task_id} failed. Reason: {reason}")
+
+
+class ActionPolicyBlocked(BaseException):
+    """Fail-closed signal raised when an extension policy blocks a browser action.
+
+    Deliberately derives from BaseException so broad action-recovery handlers cannot convert a policy
+    decision into a retry or fallback. It is caught only at the run's explicit termination boundaries.
+    """
+
+    def __init__(self, reason: str, step_id: str | None = None, task_id: str | None = None) -> None:
+        self.message = f"Browser action blocked by policy. Reason: {reason}"
+        self.step_id = step_id
+        self.task_id = task_id
+        super().__init__(self.message)
 
 
 class BlockTerminationError(SkyvernException):
@@ -1577,3 +1604,14 @@ class CodeBlockRunnerSelectionError(SkyvernException):
     The block-execution call site catches this and fails the block closed instead of
     silently falling back to in-process execution.
     """
+
+
+class DownloadSaveIncompleteError(SkyvernException):
+    """save_downloaded_files finished its loop but skipped at least one file.
+
+    Files that could be saved are already saved when this raises, so a caller may treat
+    the save as retryable-incomplete rather than failed."""
+
+    def __init__(self, skipped_files: Sequence[str]) -> None:
+        self.skipped_files = list(skipped_files)
+        super().__init__(f"{len(self.skipped_files)} downloaded file(s) could not be fully saved and registered")

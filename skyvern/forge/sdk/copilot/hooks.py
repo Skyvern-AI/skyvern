@@ -7,9 +7,10 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from agents.agent import Agent
+from agents.agent import Agent, AgentBase
+from agents.items import TResponseInputItem
 from agents.lifecycle import RunHooksBase
-from agents.run_context import RunContextWrapper
+from agents.run_context import AgentHookContext, RunContextWrapper
 from agents.tool import Tool
 
 from skyvern.forge.sdk.copilot.enforcement import (
@@ -74,6 +75,32 @@ class CopilotRunHooks(RunHooksBase):
 
     def __init__(self, ctx: CopilotContext) -> None:
         self._ctx = ctx
+
+    async def on_llm_start(
+        self,
+        context: RunContextWrapper,
+        agent: Agent,
+        system_prompt: str | None,
+        input_items: list[TResponseInputItem],
+    ) -> None:
+        try:
+            self._ctx.model_calls_this_turn += 1
+        except Exception:
+            LOG.warning(
+                "CopilotRunHooks.on_llm_start counting failed",
+                **_copilot_log_fields(self._ctx),
+                exc_info=True,
+            )
+
+    async def on_agent_start(self, context: AgentHookContext, agent: AgentBase) -> None:
+        try:
+            self._ctx.enforcement_pass_count += 1
+        except Exception:
+            LOG.warning(
+                "CopilotRunHooks.on_agent_start counting failed",
+                **_copilot_log_fields(self._ctx),
+                exc_info=True,
+            )
 
     async def on_tool_end(
         self,

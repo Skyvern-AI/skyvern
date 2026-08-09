@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import copy
+import inspect
 import json
 import os
 import re
@@ -12,7 +13,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Awaitable, Callable, List, NamedTuple, TypedDict
+from typing import Any, AsyncIterator, Awaitable, Callable, List, NamedTuple, TypedDict, cast
 
 import structlog
 from cachetools import TTLCache
@@ -31,11 +32,13 @@ from skyvern.constants import (
     BROWSER_DOWNLOADING_SUFFIX,
     DROPDOWN_MENU_MAX_DISTANCE,
     SKYVERN_ID_ATTR,
+    TEXT_PRESS_MAX_LENGTH,
 )
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
 from skyvern.errors.errors import TOTPExpiredError, UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     ActionExecutionTimeout,
+    ActionPolicyBlocked,
     BlockedHost,
     CaptchaSolveError,
     CardNumberInputMismatch,
@@ -49,6 +52,7 @@ from skyvern.exceptions import (
     FailToSelectByIndex,
     FailToSelectByLabel,
     FailToSelectByValue,
+    HttpException,
     IllegitComplete,
     ImaginaryFileUrl,
     ImaginarySecretValue,
@@ -73,15 +77,19 @@ from skyvern.exceptions import (
     PhoneNumberInputMismatch,
     SecretInputMismatch,
     SkyvernException,
+    SkyvernHTTPException,
     SkyvernPageAnalysisTimeout,
+    StepTerminationError,
     UnresolvableHost,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
+    GuardedFileFetchHopResult,
     calculate_sha256_for_file,
     check_downloading_files_and_wait_for_download_to_complete,
+    fetch_file_bytes,
     get_download_dir,
     list_files_in_directory,
     make_temp_directory,
@@ -100,6 +108,7 @@ from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
+from skyvern.forge.sdk.core.http_request_authorization import RedirectHopAuthorizer
 from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener, ensure_context
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
@@ -152,16 +161,15 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
+from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_factory import initialize_download_dir, resolve_artifact_path
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
-    DOWNLOAD_DESTINATION_ERRORS,
     DOWNLOAD_MIME_TYPES,
     MAX_FILE_SIZE_BYTES,
     download_filename_from_suffix,
     extract_filename,
-    fetch_download_through_request_context,
     is_download_response,
     normalize_download_filename,
     settle_browser_downloads_for_context,
@@ -632,6 +640,7 @@ async def _reset_autocomplete_for_llm_fallback(
     if engine_selection is UNSET_SELECTION:
         engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
     await current_incremental_scraped.stop_listen_dom_increment()
+    app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT)
     await skyvern_element.input_clear()
 
     incremental_scraped = IncrementalScrapePage(
@@ -952,19 +961,82 @@ async def _close_eager_capture_then_teardown_retention(
                 LOG.debug("Failed to tear down blob URL retention", workflow_run_id=workflow_run_id)
 
 
+@contextlib.asynccontextmanager
+async def _adopted_session_download_binding(
+    download: Download,
+    active_page: Page,
+) -> AsyncIterator[tuple[Any, "RedirectHopAuthorizer[GuardedFileFetchHopResult]"]]:
+    """Lease the exact context binding that owns an adopted-session download."""
+    download_page = download.page
+    if download_page is None:
+        raise RuntimeError("Adopted-session download has no owning page")
+    download_context = download_page.context
+    if download_context is not active_page.context:
+        raise RuntimeError("Adopted-session download page context does not match the active page context")
+
+    try:
+        bind_lock = download_context._skyvern_cdp_download_interceptor_bind_lock  # type: ignore[attr-defined]
+    except AttributeError as exc:
+        raise RuntimeError("Adopted-session download context has no interceptor ownership lock") from exc
+    if not isinstance(bind_lock, asyncio.Lock):
+        raise RuntimeError("Adopted-session download context has an invalid interceptor ownership lock")
+
+    # Narrow exception to the usual explicit-injection rule: bind_to_context already stores the
+    # constructor-injected interceptor on its owned context. Holding its established bind lock
+    # keeps that exact Page -> BrowserContext -> interceptor association live through the fallback.
+    async with bind_lock:
+        try:
+            download_interceptor = download_context._skyvern_cdp_download_interceptor  # type: ignore[attr-defined]
+        except AttributeError as exc:
+            raise RuntimeError(
+                "Adopted-session download recovery requires the page context's CDP download interceptor"
+            ) from exc
+        try:
+            interceptor_context = download_interceptor._page_context
+        except AttributeError as exc:
+            raise RuntimeError("Bound CDP download interceptor has no page-context ownership binding") from exc
+        if interceptor_context is not download_context:
+            raise RuntimeError("Bound CDP download interceptor does not own the adopted-session download page context")
+        try:
+            authorize_request_hop = download_interceptor._redirect_hop_authorizer
+        except AttributeError as exc:
+            raise RuntimeError("Bound CDP download interceptor has no redirect hop authorizer") from exc
+        if not callable(authorize_request_hop):
+            raise RuntimeError("Bound CDP download interceptor has an invalid redirect hop authorizer")
+        yield (
+            download_interceptor,
+            cast(
+                "RedirectHopAuthorizer[GuardedFileFetchHopResult]",
+                authorize_request_hop,
+            ),
+        )
+
+
 async def _save_adopted_session_download(
     download: Download,
     page: Page,
     download_dir: Path,
+    *,
+    authorize_request_hop: "RedirectHopAuthorizer[GuardedFileFetchHopResult]",
+    request_headers: dict[str, str],
     workflow_run_id: str | None = None,
     eager_blob_bytes: bytes | None = None,
+    download_binding: DownloadBinding = DownloadBinding.RUN_DIR,
 ) -> Path | None:
     """Land an adopted-session download's bytes into download_dir, returning the file path or None.
 
-    Eager save_as is the only protection against the worker pod tearing the shared browser down before a
-    deferred save_as runs.
+    A provider-owned remote non-blob event is signal-only and returns None; blob and default behavior
+    are unchanged.
     """
     download_target = _download_target_path(download_dir, download.suggested_filename)
+    if download_binding == DownloadBinding.SESSION_DIR and not download.url.startswith("blob:"):
+        # Signal-only for a provider-owned remote binding: the run connection holds no bytes to save_as
+        # and a URL replay would run through the wrong identity, so defer to the provider destination.
+        LOG.info(
+            "Provider-owned remote download: suppressing local save/replay, deferring to provider destination",
+            workflow_run_id=workflow_run_id,
+        )
+        return None
     # Non-empty bytes captured at download-event time (blob owner still alive) win outright: skip
     # save_as, which returns empty for blobs anyway. A zero-byte eager capture is indistinguishable
     # from an unreadable one and would be a false success, so fall through to save_as + fan-out
@@ -998,9 +1070,8 @@ async def _save_adopted_session_download(
         )
 
     # Ordering: ``save_as`` above has already run and failed (empty or raised).
-    # ``blob:`` URLs cannot be fetched via APIRequestContext (Playwright rejects
-    # the scheme), so route them through an in-page fetch from the document that
-    # owns the blob. That document may be a different tab than the one clicked, so
+    # ``blob:`` URLs cannot be fetched by the guarded HTTP client, so route them
+    # through an in-page fetch from the document that owns the blob. That document may be a different tab, so
     # probe every open page (owner first) rather than reading from ``page`` alone.
     if download.url.startswith("blob:"):
         blob_bytes = await _read_adopted_session_blob_bytes(download, page, workflow_run_id=workflow_run_id)
@@ -1039,16 +1110,12 @@ async def _save_adopted_session_download(
         return download_target
 
     try:
-        response = await fetch_download_through_request_context(page.context.request, download.url)
-        if response.status != 200:
-            LOG.error(
-                "Adopted-session download url re-fetch returned non-200 status",
-                status=response.status,
-                workflow_run_id=workflow_run_id,
-            )
-            return None
-        # APIResponse.body() has no streaming variant, so a large download peaks at 2x its size in RSS.
-        body = await response.body()
+        response = await fetch_file_bytes(
+            download.url,
+            headers=request_headers,
+            authorize_request_hop=authorize_request_hop,
+        )
+        body = response.body
         if not body:
             LOG.error(
                 "Adopted-session download url re-fetch returned an empty body",
@@ -1057,7 +1124,7 @@ async def _save_adopted_session_download(
             return None
         download_target.write_bytes(body)
         return download_target
-    except DOWNLOAD_DESTINATION_ERRORS as e:
+    except (SkyvernHTTPException, HttpException) as e:
         LOG.error(
             "Adopted-session download destination refused",
             download_dir=str(download_dir),
@@ -2411,6 +2478,104 @@ async def _fill_secret_with_readback(
     return ActionFailure(SecretInputMismatch())
 
 
+_TRUNCATION_HEAL_TAGS = frozenset({"input", "textarea"})
+
+
+def _is_prefix_loss_truncation(*, intended: str, rendered: str | None) -> bool:
+    # input_sequentially sets intended[:-TEXT_PRESS_MAX_LENGTH] in one atomic fill, then types the last
+    # TEXT_PRESS_MAX_LENGTH characters individually. A field that resets on the input event can wipe that
+    # leading fill and keep only the per-character tail, so the rendered value is a proper suffix of the
+    # intended text no longer than that tail (SKY-13631). The comparison is case-folded so a field that
+    # transforms case still matches -- which also means a fully-present, only-case-changed value is NOT a
+    # truncation. A longer, equal, or non-suffix value (e.g. an autocomplete expansion) is not a match.
+    if rendered is None:
+        return False
+    intended_cf = intended.casefold()
+    rendered_cf = rendered.casefold()
+    if not rendered_cf or len(rendered_cf) >= len(intended_cf) or len(rendered_cf) > TEXT_PRESS_MAX_LENGTH:
+        return False
+    return intended_cf.endswith(rendered_cf)
+
+
+async def _observe_input_value(
+    *,
+    skyvern_element: SkyvernElement,
+    tag_name: str,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> tuple[bool, str | None]:
+    # Bounded, best-effort read-back for the truncation heal. Re-resolves a stale/re-mounted locator the same
+    # way the neighbouring fill paths do, then caps the read at BROWSER_ACTION_TIMEOUT_MS so a field that
+    # re-mounts on input -- the exact population this heal targets -- cannot stall on Playwright's 30s default
+    # or raise out of an INPUT_TEXT action that already succeeded. Returns (observed, value); observed is
+    # False when the value could not be obtained (stale, timeout, or driver error), and the caller must then
+    # neither heal nor re-fill. Never logs the value.
+    async def _read() -> str | None:
+        await skyvern_element.refresh_locator_if_stale()
+        return await get_input_value(
+            tag_name=tag_name, locator=skyvern_element.get_locator(), engine_selection=engine_selection
+        )
+
+    try:
+        value = await asyncio.wait_for(_read(), timeout=settings.BROWSER_ACTION_TIMEOUT_MS / 1000)
+        return True, value
+    except Exception:
+        LOG.warning(
+            "Free-text truncation read-back could not be obtained; leaving field as typed",
+            element_id=skyvern_element.get_id(),
+            exc_info=True,
+        )
+        return False, None
+
+
+async def _heal_truncated_freetext_input(
+    *,
+    skyvern_element: SkyvernElement,
+    tag_name: str,
+    text: str,
+    is_secret_value: bool = False,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> None:
+    # Generic free-text guard for the fill(prefix)+type(tail) seam: only values longer than the split
+    # boundary can lose a prefix, so shorter values and non-free-text tags are skipped without a read-back.
+    # Secret values are excluded outright -- their exact length must not reach the logs and an unmasked
+    # secret must not be rewritten from this generic path; _fill_secret_with_readback owns that recovery.
+    # On the exact prefix-loss signature, re-enter the value once with a single atomic fill; a matching or
+    # autocomplete-expanded value is left as typed so the normal keystroke/autocomplete behavior is
+    # preserved. Both read-backs are observational only: bounded and best-effort, they never fail or stall an
+    # action that already succeeded, and an unobtainable read-back heals nothing. Logs carry only lengths.
+    if is_secret_value or tag_name not in _TRUNCATION_HEAL_TAGS or len(text) <= TEXT_PRESS_MAX_LENGTH:
+        return
+    observed, rendered = await _observe_input_value(
+        skyvern_element=skyvern_element, tag_name=tag_name, engine_selection=engine_selection
+    )
+    if not observed or not _is_prefix_loss_truncation(intended=text, rendered=rendered):
+        return
+    LOG.warning(
+        "Free-text input lost its leading fill and kept only a trailing suffix; re-entering atomically",
+        element_id=skyvern_element.get_id(),
+        intended_length=len(text),
+        rendered_length=len(rendered or ""),
+    )
+    await skyvern_element.refresh_locator_if_stale()
+    await skyvern_element.input_fill(text=text)
+    # One post-refill read-back for observability only: record whether the single atomic fill produced the
+    # full intended value. No second write and no raised failure -- an unobtainable or non-matching read-back
+    # (a field that legally normalizes a trailing suffix, or resets again) is an explicit residual, not a
+    # claim of a heal. Confirmation requires a full case-folded value match, not merely the absence of the
+    # loss signature, so an empty or unrelated post-refill value is recorded as NON-confirmed. Metadata only.
+    observed_after, confirmed_value = await _observe_input_value(
+        skyvern_element=skyvern_element, tag_name=tag_name, engine_selection=engine_selection
+    )
+    refill_confirmed = observed_after and confirmed_value is not None and confirmed_value.casefold() == text.casefold()
+    LOG.info(
+        "Free-text truncation refill read-back",
+        element_id=skyvern_element.get_id(),
+        intended_length=len(text),
+        rendered_length=len(confirmed_value or ""),
+        refill_confirmed=refill_confirmed,
+    )
+
+
 def _select_option_target_value(option: SelectOption) -> str | None:
     if option.label:
         return option.label
@@ -2971,9 +3136,19 @@ class ActionHandler:
         # Re-evaluated here, against the page as it is now, before anything downstream looks up a
         # browser, chooses the download-capturing path or persists a row.
         preflight_action(action, page, site="handle_action")
+        egress_policy_result = app.AGENT_FUNCTION.enforce_browser_action_egress_policy(
+            action=action,
+            task=task,
+            page=page,
+            scraped_page=scraped_page,
+        )
+        if inspect.isawaitable(egress_policy_result):
+            await egress_policy_result
+        app.AGENT_FUNCTION.enforce_browser_action_policy(action.action_type)
+        # Authorization reads the latest page/origin state before execution timing is mutated.
+        # Hydrated/cached actions can arrive with prior timestamps; leave them intact when a guard
+        # blocks, and reset them only after every guard authorizes this execution.
         action.started_at = naive_utc_now()
-        # Hydrated/cached actions can arrive with a prior finished_at; clear it so the
-        # exceptional-exit fallback below stamps this execution, not the previous one.
         action.finished_at = None
         browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
         # TODO: maybe support all action types in the future(?)
@@ -3404,19 +3579,36 @@ class ActionHandler:
                                 and captured_download is not None
                                 and not download_event_fallback_attempted
                             ):
-                                download_event_fallback_attempted = True
-                                saved_path = await _save_adopted_session_download(
-                                    captured_download,
-                                    page,
-                                    download_dir,
-                                    workflow_run_id=task.workflow_run_id,
-                                    eager_blob_bytes=await eager_blob_capture.result(
-                                        timeout=min(
-                                            EAGER_BLOB_READ_TIMEOUT_SECONDS,
-                                            _remaining_download_wait_seconds(),
-                                        )
-                                    ),
+                                resolved_download_binding = (
+                                    browser_state.browser_artifacts.download_binding
+                                    if browser_state is not None
+                                    else DownloadBinding.RUN_DIR
                                 )
+                                download_event_fallback_attempted = True
+                                eager_blob_bytes = await eager_blob_capture.result(
+                                    timeout=min(
+                                        EAGER_BLOB_READ_TIMEOUT_SECONDS,
+                                        _remaining_download_wait_seconds(),
+                                    )
+                                )
+                                async with _adopted_session_download_binding(captured_download, page) as (
+                                    download_interceptor,
+                                    authorize_request_hop,
+                                ):
+                                    cookie_header = await download_interceptor._cookie_header_for_url(
+                                        captured_download.url
+                                    )
+                                    request_headers = {"Cookie": cookie_header} if cookie_header else {}
+                                    saved_path = await _save_adopted_session_download(
+                                        captured_download,
+                                        page,
+                                        download_dir,
+                                        authorize_request_hop=authorize_request_hop,
+                                        request_headers=request_headers,
+                                        workflow_run_id=task.workflow_run_id,
+                                        eager_blob_bytes=eager_blob_bytes,
+                                        download_binding=resolved_download_binding,
+                                    )
                                 if saved_path is not None:
                                     download_event_fallback_used = True
                                     download_triggered = True
@@ -3427,12 +3619,24 @@ class ActionHandler:
                                         workflow_run_id=task.workflow_run_id,
                                     )
                                     break
-                                download_event_fallback_failed = True
-                                LOG.warning(
-                                    "Adopted-session download could not be saved or re-fetched; falling through to browser-session folder poll",
-                                    download_dir=download_dir,
-                                    workflow_run_id=task.workflow_run_id,
-                                )
+                                if (
+                                    resolved_download_binding == DownloadBinding.SESSION_DIR
+                                    and not captured_download.url.startswith("blob:")
+                                ):
+                                    # Expected signal-only deferral for a provider-owned remote binding: no
+                                    # save_as/replay was attempted, so this is not a failure. Keep polling.
+                                    LOG.info(
+                                        "Provider-owned remote download deferred to provider-destination observation",
+                                        download_dir=download_dir,
+                                        workflow_run_id=task.workflow_run_id,
+                                    )
+                                else:
+                                    download_event_fallback_failed = True
+                                    LOG.warning(
+                                        "Adopted-session download could not be saved or re-fetched; falling through to browser-session folder poll",
+                                        download_dir=download_dir,
+                                        workflow_run_id=task.workflow_run_id,
+                                    )
                                 # Keep polling: the shared browser may still land the file in the session folder.
                                 if await _drain_and_move_staged_xhr(
                                     xhr_fallback_moved_paths, _remaining_download_wait_seconds()
@@ -4898,23 +5102,24 @@ async def handle_input_text_action(
                 )
                 await skyvern_element.scroll_into_view()
             finally:
-                if await skyvern_element.is_visible():
-                    blocking_element, exist = await skyvern_element.find_blocking_element(
-                        dom=dom, incremental_page=incremental_scraped
-                    )
-                    if blocking_element and exist:
-                        LOG.info(
-                            "Find a blocking element to the current element, going to blur the blocking element first",
-                            blocking_element=blocking_element.get_locator(),
+                if not app.AGENT_FUNCTION.should_block_browser_action(ActionType.KEYPRESS):
+                    if await skyvern_element.is_visible():
+                        blocking_element, exist = await skyvern_element.find_blocking_element(
+                            dom=dom, incremental_page=incremental_scraped
                         )
-                        if await blocking_element.get_locator().count():
-                            await blocking_element.press_key("Escape")
-                        if await blocking_element.get_locator().count():
-                            await blocking_element.blur()
+                        if blocking_element and exist:
+                            LOG.info(
+                                "Find a blocking element to the current element, going to blur the blocking element first",
+                                blocking_element=blocking_element.get_locator(),
+                            )
+                            if await blocking_element.get_locator().count():
+                                await blocking_element.press_key("Escape")
+                            if await blocking_element.get_locator().count():
+                                await blocking_element.blur()
 
-                if try_to_quit_dropdown and await skyvern_element.is_visible():
-                    await skyvern_element.press_key("Escape")
-                    await skyvern_element.blur()
+                    if try_to_quit_dropdown and await skyvern_element.is_visible():
+                        await skyvern_element.press_key("Escape")
+                        await skyvern_element.blur()
                 await incremental_scraped.stop_listen_dom_increment()
 
     ### Start filling text logic
@@ -4988,6 +5193,8 @@ async def handle_input_text_action(
                 action=action,
                 exc_info=True,
             )
+        # The helper may refresh page state; recheck the extension policy before mutation.
+        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT)
 
     await _apply_secret_visual_mask_if_needed(
         skyvern_element,
@@ -5241,6 +5448,13 @@ async def handle_input_text_action(
                     await skyvern_element.input_fill(text)
                 else:
                     await skyvern_element.input_sequentially(text=text)
+                    await _heal_truncated_freetext_input(
+                        skyvern_element=skyvern_element,
+                        tag_name=tag_name,
+                        text=text,
+                        is_secret_value=is_secret_value,
+                        engine_selection=engine_selection,
+                    )
                 if log_tel_fallback_readback:
                     await _log_tel_fallback_fill_digit_counts(
                         skyvern_element=skyvern_element,
@@ -5405,6 +5619,9 @@ async def handle_input_text_action(
         # HACK: force to finish missing auto completion input
         if (
             auto_complete_hacky_flag
+            # A blocked policy state must not commit a suggestion via Tab while another
+            # exception is unwinding through this finally block.
+            and not app.AGENT_FUNCTION.should_block_browser_action(ActionType.KEYPRESS)
             and await skyvern_element.is_visible()
             and not await skyvern_element.is_raw_input()
             and not action.skip_auto_complete_tab
@@ -5918,6 +6135,7 @@ async def handle_select_option_action(
                 element_id=skyvern_element.get_id(),
             )
             await skyvern_element.scroll_into_view()
+            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.KEYPRESS)
             await skyvern_element.press_key("ArrowDown")
             # wait for options to load
             await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="select_option.arrowdown")
@@ -6020,17 +6238,18 @@ async def handle_select_option_action(
         results.append(ActionFailure(exception=e))
         return results
     finally:
-        if (
-            await skyvern_element.is_visible()
-            and is_open
-            and len(results) > 0
-            and not isinstance(results[-1], ActionSuccess)
-        ):
-            await skyvern_element.scroll_into_view()
-            await skyvern_element.coordinate_click(page=page)
-            await skyvern_element.press_key("Escape")
+        if not app.AGENT_FUNCTION.should_block_browser_action(ActionType.CLICK):
+            if (
+                await skyvern_element.is_visible()
+                and is_open
+                and len(results) > 0
+                and not isinstance(results[-1], ActionSuccess)
+            ):
+                await skyvern_element.scroll_into_view()
+                await skyvern_element.coordinate_click(page=page)
+                await skyvern_element.press_key("Escape")
+            await skyvern_element.blur()
         is_open = False
-        await skyvern_element.blur()
         await incremental_scraped.stop_listen_dom_increment()
 
     LOG.info(
@@ -6045,6 +6264,7 @@ async def handle_select_option_action(
 
         try:
             await EventStrategyFactory.move_to_element(page, skyvern_element.get_locator())
+            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK)
             await skyvern_element.get_locator().click(timeout=timeout)
         except Exception:
             LOG.info(
@@ -6052,6 +6272,7 @@ async def handle_select_option_action(
                 element_id=skyvern_element.get_id(),
             )
             await skyvern_element.scroll_into_view()
+            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.KEYPRESS)
             await skyvern_element.press_key("ArrowDown")
 
         await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="select_option.fallback")
@@ -6076,17 +6297,18 @@ async def handle_select_option_action(
         return results
 
     finally:
-        if (
-            await skyvern_element.is_visible()
-            and is_open
-            and len(results) > 0
-            and not isinstance(results[-1], ActionSuccess)
-        ):
-            await skyvern_element.scroll_into_view()
-            await skyvern_element.coordinate_click(page=page)
-            await skyvern_element.press_key("Escape")
+        if not app.AGENT_FUNCTION.should_block_browser_action(ActionType.CLICK):
+            if (
+                await skyvern_element.is_visible()
+                and is_open
+                and len(results) > 0
+                and not isinstance(results[-1], ActionSuccess)
+            ):
+                await skyvern_element.scroll_into_view()
+                await skyvern_element.coordinate_click(page=page)
+                await skyvern_element.press_key("Escape")
+            await skyvern_element.blur()
         is_open = False
-        await skyvern_element.blur()
         await incremental_scraped.stop_listen_dom_increment()
 
 
@@ -7585,6 +7807,7 @@ async def choose_auto_completion_dropdown(
                                 matched_index=matched_index,
                                 matched_label=matched_label,
                             )
+                            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK)
                             try:
                                 await matched_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
                                 if await _verify_autocomplete_input_readback(
@@ -7678,6 +7901,7 @@ async def choose_auto_completion_dropdown(
                             element_id=fast_path_element_id,
                             input_value=text,
                         )
+                        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK)
                         try:
                             await fast_path_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
                             clear_input = False
@@ -7753,6 +7977,7 @@ async def choose_auto_completion_dropdown(
                 "Decided to directly search with the current value",
                 value=text,
             )
+            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.KEYPRESS)
             await skyvern_element.press_key("Enter")
             clear_input = False
             return result
@@ -7795,10 +8020,14 @@ async def choose_auto_completion_dropdown(
             engine_selection=engine_selection,
         )
         await selected_element.scroll_into_view()
+        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK)
         await selected_element.click(page=page, engine_selection=engine_selection)
         clear_input = False
         return result
 
+    except ActionPolicyBlocked:
+        clear_input = False
+        raise
     except Exception as e:
         LOG.info(
             "Failed to choose the auto completion dropdown",
@@ -7811,6 +8040,7 @@ async def choose_auto_completion_dropdown(
     finally:
         await incremental_scraped.stop_listen_dom_increment()
         if clear_input and await skyvern_element.is_visible():
+            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT)
             await skyvern_element.input_clear()
 
 
@@ -8042,6 +8272,7 @@ async def discover_and_select_from_full_dropdown(
 
     try:
         await skyvern_element.scroll_into_view()
+        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT)
         await skyvern_element.input_clear()
 
         # Try click first to open the dropdown (most combobox components respond to click)
@@ -8069,6 +8300,7 @@ async def discover_and_select_from_full_dropdown(
                 "Discover fallback: no options after click, trying ArrowDown",
                 element_id=skyvern_element.get_id(),
             )
+            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.KEYPRESS)
             try:
                 await skyvern_element.press_key("ArrowDown")
             except Exception as exc:
@@ -8175,12 +8407,14 @@ async def discover_and_select_from_full_dropdown(
         # Instead of clicking the option directly (dropdown may have closed during re-scrape),
         # input the discovered value into the combobox. Since it's an exact match, the combobox's
         # filter will show it as the only option. Then find and click it directly via Playwright.
+        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT)
         await skyvern_element.input_clear()
         await skyvern_element.press_fill(discovered_value)
         await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="dropdown_discover.exact_match")
 
         # Select the first matching option via keyboard: ArrowDown highlights it, Enter confirms.
         # This avoids needing to locate the option element in shadow DOM.
+        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.KEYPRESS)
         try:
             await skyvern_element.press_key("ArrowDown")
             await skyvern_element.press_key("Enter")
@@ -8197,6 +8431,8 @@ async def discover_and_select_from_full_dropdown(
             )
             return None
 
+    except StepTerminationError:
+        raise
     except Exception:
         LOG.warning(
             "Discover fallback failed",
@@ -8366,11 +8602,14 @@ async def sequentially_select_from_dropdown(
             if skyvern_element.get_tag_name() == InteractiveElement.INPUT and action.option.label:
                 try:
                     LOG.info("Try to input the date directly")
+                    app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT)
                     await skyvern_element.input_sequentially(action.option.label)
                     result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
                     result.action_result = ActionSuccess()
                     return result
 
+                except StepTerminationError:
+                    raise
                 except Exception:
                     LOG.warning(
                         "Failed to input the date directly",
@@ -9198,6 +9437,7 @@ async def _select_deterministic_custom_option(
                 )
                 emit(CustomSelectFamilyOutcome.llm_fallback_pre_click_error)
                 return None
+        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK)
         click_attempted = True
         if on_click_attempted is not None:
             on_click_attempted()
@@ -9213,6 +9453,8 @@ async def _select_deterministic_custom_option(
         if verified:
             emit(CustomSelectFamilyOutcome.success_verified)
             return ActionSuccess(), matched_label
+    except StepTerminationError:
+        raise
     except Exception as exc:
         if not click_attempted or isinstance(exc, InteractWithDisabledElement):
             LOG.info(
@@ -9554,6 +9796,7 @@ async def select_from_emerging_elements(
             )
             return ActionFailure(InputToReadonlyElement(element_id=element_id))
 
+        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT)
         await input_element.input_clear()
         await input_element.input_sequentially(actual_value)
         return ActionSuccess()
@@ -9564,6 +9807,7 @@ async def select_from_emerging_elements(
             return ActionFailure(exception=InteractWithDropdownContainer(element_id=element_id))
 
     await selected_element.scroll_into_view()
+    app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK)
     await selected_element.click(page=page, engine_selection=engine_selection)
     return ActionSuccess()
 
@@ -9817,10 +10061,13 @@ async def select_from_dropdown(
                         return _terminal_post_reset_fallback_result()
                     return single_select_result
 
+                app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT)
                 await input_element.input_clear()
                 await input_element.input_sequentially(actual_value)
                 single_select_result.action_result = ActionSuccess()
                 return _proceeded_post_reset_fallback_result()
+            except StepTerminationError:
+                raise
             except Exception as e:
                 single_select_result.action_result = ActionFailure(exception=e)
                 if post_reset_fallback:
@@ -9838,6 +10085,7 @@ async def select_from_dropdown(
                     option=SelectOption(label=value),
                     input_or_select_context=context,
                 )
+                app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.SELECT_OPTION)
                 results = await normal_select(
                     action=action,
                     skyvern_element=selected_element,
@@ -9861,6 +10109,7 @@ async def select_from_dropdown(
                 return single_select_result
 
             await selected_element.scroll_into_view()
+            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK)
             await selected_element.click(
                 page=page,
                 timeout=timeout,
@@ -9885,21 +10134,25 @@ async def select_from_dropdown(
             if post_reset_fallback:
                 return _terminal_post_reset_fallback_result()
             return single_select_result
-
         try:
             LOG.info(
                 "Find an alternative option with the same value. Try to select the option.",
                 value=value,
             )
+            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK)
             await EventStrategyFactory.move_to_element(page, locator)
             await locator.click(timeout=timeout)
             single_select_result.action_result = ActionSuccess()
             return _proceeded_post_reset_fallback_result()
+        except StepTerminationError:
+            raise
         except Exception as e:
             single_select_result.action_result = ActionFailure(exception=e)
             if post_reset_fallback:
                 return _terminal_post_reset_fallback_result()
             return single_select_result
+    except StepTerminationError:
+        raise
     except Exception:
         if post_reset_fallback:
             return _terminal_post_reset_fallback_result()
@@ -9934,6 +10187,7 @@ async def select_from_dropdown_by_value(
 
     element_locator = await incremental_scraped.select_one_element_by_value(value=value)
     if element_locator is not None:
+        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK)
         await element_locator.click(timeout=timeout)
         return ActionSuccess()
 
@@ -9974,6 +10228,7 @@ async def select_from_dropdown_by_value(
 
         element_locator = await incre_scraped.select_one_element_by_value(value=value)
         if element_locator is not None:
+            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK)
             await element_locator.click(timeout=timeout)
             nonlocal selected
             selected = True
@@ -10268,6 +10523,15 @@ async def normal_select(
 
     select_options_result = await skyvern_element.refresh_select_options()
     select_options = select_options_result[0] if select_options_result else skyvern_element.get_options()
+    # build_HTML deepcopies and renders, so the deterministic fast path below only pays for it when
+    # an extension actually consumes the observation; the LLM path builds it on demand instead.
+    options_html: str | None = None
+    if app.AGENT_FUNCTION.needs_browser_observation():
+        options_html = skyvern_element.build_HTML()
+        await app.AGENT_FUNCTION.inspect_browser_observation(
+            options_html, cast(list[dict[str, Any]], select_options), None
+        )
+    app.AGENT_FUNCTION.enforce_browser_action_policy(action.action_type)
     target_value = _select_option_target_value(action.option)
     if target_value and select_options and collapse_select_fanout_enabled:
         option_labels, option_values = _select_option_labels_and_values(select_options)
@@ -10306,7 +10570,6 @@ async def normal_select(
 
     if collapse_select_fanout_enabled:
         action.set_has_mini_agent()
-    options_html = skyvern_element.build_HTML()
     field_information = (
         input_or_select_context.field if not input_or_select_context.intention else input_or_select_context.intention
     )
@@ -10316,7 +10579,7 @@ async def normal_select(
         required_field=input_or_select_context.is_required,
         navigation_goal=task.navigation_goal,
         navigation_payload_str=json.dumps(task.navigation_payload),
-        options=options_html,
+        options=options_html if options_html is not None else skyvern_element.build_HTML(),
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
 

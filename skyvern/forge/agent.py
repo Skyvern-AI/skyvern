@@ -42,8 +42,10 @@ from skyvern.errors.errors import (
     filter_to_user_defined_codes,
 )
 from skyvern.exceptions import (
+    ActionPolicyBlocked,
     BrowserSessionNotFound,
     DownloadFileMaxWaitingTime,
+    DownloadSaveIncompleteError,
     EmptyScrapePage,
     FailedToGetTOTPVerificationCode,
     FailedToNavigateToUrl,
@@ -665,6 +667,8 @@ class ForgeAgent:
         for parameter in task_block_parameters:
             navigation_payload[parameter.key] = workflow_run_context.get_value(parameter.key)
 
+        # A URL rendered from workflow input is untrusted, so it must not become trusted authority.
+        declares_static_origin = task_block.declares_static_browser_origin(workflow_run_context)
         task_url = task_block.url
         if task_url is None:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(
@@ -711,6 +715,12 @@ class ForgeAgent:
             download_timeout=task_block.download_timeout,
             include_extracted_text=task_block.include_extracted_text,
         )
+        if declares_static_origin:
+            app.AGENT_FUNCTION.register_browser_origin_authority(
+                task_id=task.task_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                url=task.url,
+            )
         LOG.info(
             "Created a new task for workflow run",
             sampling=True,
@@ -1279,7 +1289,9 @@ class ForgeAgent:
                 list_files_before=list_files_before,
             )
             return step, detailed_output, None
-        except StepTerminationError as e:
+        except (StepTerminationError, ActionPolicyBlocked) as e:
+            # Extension action policies use a BaseException signal so it reaches this explicit run
+            # boundary through broad recovery handlers on the mutation paths.
             LOG.warning(
                 "Step cannot be executed, marking task as failed",
                 exc_info=True,
@@ -1470,7 +1482,7 @@ class ForgeAgent:
         step: Step | None,
         reason: str | None,
         browser_state: BrowserState | None = None,
-        exception: Exception | None = None,
+        exception: BaseException | None = None,
     ) -> bool:
         try:
             if step is not None:
@@ -1479,8 +1491,12 @@ class ForgeAgent:
                     status=StepStatus.failed,
                 )
 
-            # Update task status first
-            failure_category = classify_from_failure_reason(reason, exception=exception, fallback_to_unknown=True)
+            # Update task status first. A policy block is a BaseException, not a generic runtime failure,
+            # so keep it out of the Exception-typed classifier.
+            classifier_exception = exception if isinstance(exception, Exception) else None
+            failure_category = classify_from_failure_reason(
+                reason, exception=classifier_exception, fallback_to_unknown=True
+            )
             LOG.info(
                 "Task failure classified",
                 task_id=task.task_id,
@@ -1761,6 +1777,7 @@ class ForgeAgent:
             ScrapingFailed,
             MissingBrowserStatePage,
             ScreenshotTargetClosed,
+            StepTerminationError,
         ):
             raise
 
@@ -4168,6 +4185,8 @@ class ForgeAgent:
                 cache_key=cache_key,
                 ttl_seconds=3600,  # 1 hour
             )
+            if cache_data is None:
+                return
 
             # Store cache metadata in context
             context.vertex_cache_name = cache_data["name"]
@@ -4344,6 +4363,7 @@ class ForgeAgent:
             )
         else:
             elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
+        elements_for_prompt = app.AGENT_FUNCTION.transform_browser_elements_for_prompt(elements_for_prompt)
 
         open_tabs_context = await build_open_tabs_context(browser_state, page)
         show_close_page_action = open_tabs_context is not None
@@ -4363,6 +4383,16 @@ class ForgeAgent:
             properties={"task_url": task.url, "organization_id": task.organization_id},
         )
         extra_action_guidance = await app.AGENT_FUNCTION.get_extra_extract_action_guidance(task)
+
+        # SKY-9983: render per-step-changing sections (action history, dialogs, tabs) after the
+        # element tree so provider prefix caches can hit the tree across steps on the same page.
+        stable_prefix_ordering = False
+        if template == EXTRACT_ACTION_TEMPLATE:
+            stable_prefix_ordering = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "EXTRACT_ACTION_STABLE_PREFIX",
+                task.workflow_run_id if task.workflow_run_id else task.task_id,
+                properties={"task_url": task.url, "organization_id": task.organization_id},
+            )
 
         # Offer PASTE_TEXT (fill a spreadsheet grid with one tab/newline block) only under the umbrella,
         # so grid-fill guidance is scoped to the eval org until proven out.
@@ -4419,6 +4449,7 @@ class ForgeAgent:
                     "llm_screenshots_enabled": llm_screenshots_enabled,
                     "enriched_tree_enabled": enriched_tree_enabled,
                     "slim_output": slim_output,
+                    "stable_prefix_ordering": stable_prefix_ordering,
                 }
                 cache_variant = self._build_extract_action_cache_variant(
                     verification_code_check=verification_code_check,
@@ -4494,6 +4525,7 @@ class ForgeAgent:
                     task_id=task.task_id,
                     prompt_name=EXTRACT_ACTION_PROMPT_NAME,
                     cache_variant=cache_variant,
+                    stable_prefix_ordering=stable_prefix_ordering,
                 )
                 # Map template to prompt_name for logging/caching guards
                 prompt_name = EXTRACT_ACTION_PROMPT_NAME if template == EXTRACT_ACTION_TEMPLATE else template
@@ -4552,6 +4584,7 @@ class ForgeAgent:
                 llm_screenshots_enabled=llm_screenshots_enabled,
                 enriched_tree_enabled=enriched_tree_enabled,
                 slim_output=slim_output,
+                stable_prefix_ordering=stable_prefix_ordering,
                 lean_compress_long_href=False,
                 lean_compress_image_src=context.enable_lean_element_tree,
                 lean_strip_url_query_strings=context.enable_lean_element_tree,
@@ -4567,6 +4600,7 @@ class ForgeAgent:
         _prompt_build_span.set_attribute("prompt_name", prompt_name)
         _prompt_build_span.set_attribute("prompt_tokens", count_tokens(full_prompt))
         _prompt_build_span.set_attribute("use_caching", bool(use_caching))
+        _prompt_build_span.set_attribute("stable_prefix_ordering", stable_prefix_ordering)
 
         if recent_dialog_messages_str is not None:
             context.clear_recent_dialog_messages()
@@ -5011,10 +5045,19 @@ class ForgeAgent:
                         finalization_run_id = (
                             resolve_run_download_id(context, fallback_run_id=task.workflow_run_id) or task.task_id
                         )
-                        await app.STORAGE.save_downloaded_files(
-                            organization_id=task.organization_id,
-                            run_id=finalization_run_id,
-                        )
+                        try:
+                            await app.STORAGE.save_downloaded_files(
+                                organization_id=task.organization_id,
+                                run_id=finalization_run_id,
+                            )
+                        except DownloadSaveIncompleteError as exc:
+                            # Session-artifact claiming below must still run for the files that saved.
+                            LOG.warning(
+                                "Some downloaded files were skipped during cleanup save",
+                                task_id=task.task_id,
+                                workflow_run_id=task.workflow_run_id,
+                                skipped_file_count=len(exc.skipped_files),
+                            )
                         # Tag any session-scoped DOWNLOAD artifacts created during
                         # this run with run_id, so GET /v1/runs/{id} surfaces them
                         # (the watcher in browser_controller can't know the active
@@ -5560,11 +5603,11 @@ class ForgeAgent:
             if getattr(task, key) != value
         }
 
+        start_time = task.started_at.replace(tzinfo=UTC) if task.started_at else task.created_at.replace(tzinfo=UTC)
+        duration_seconds = (datetime.now(UTC) - start_time).total_seconds()
         # Track task duration when task is completed, failed, or terminated
         if status in [TaskStatus.completed, TaskStatus.failed, TaskStatus.terminated]:
-            start_time = task.started_at.replace(tzinfo=UTC) if task.started_at else task.created_at.replace(tzinfo=UTC)
             queued_seconds = (start_time - task.created_at.replace(tzinfo=UTC)).total_seconds()
-            duration_seconds = (datetime.now(UTC) - start_time).total_seconds()
             LOG.info(
                 "Task duration metrics",
                 task_id=task.task_id,
@@ -5575,14 +5618,22 @@ class ForgeAgent:
                 organization_id=task.organization_id,
                 failure_reason=failure_reason,
             )
-
         await save_task_logs(task.task_id)
         LOG.info("Updating task in db", task_id=task.task_id, diff=update_comparison, sampling=True)
-        return await app.DATABASE.tasks.update_task(
+        updated_task = await app.DATABASE.tasks.update_task(
             task.task_id,
             organization_id=task.organization_id,
             **updates,
         )
+        # Minutes emit after the terminal write lands and only on the non-final ->
+        # final transition (task holds the pre-write status), so neither a retried
+        # failed write nor a repeated terminal update double-counts the run;
+        # is_final() includes canceled and timed_out, matching the workflow-run gate.
+        if task.workflow_run_id is None and status.is_final() and not task.status.is_final():
+            await app.AGENT_FUNCTION.record_run_duration(
+                run_type="task_v1", status=str(status), duration_seconds=duration_seconds
+            )
+        return updated_task
 
     async def _handle_completed_step_with_parallel_verification(
         self,
