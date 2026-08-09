@@ -31,6 +31,7 @@ import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
 import { usePasteSkillHintStore } from "@/store/usePasteSkillHintStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+import { describeRecordedAction } from "@/routes/workflows/workflowBlockUtils";
 import {
   isBlockItem,
   WorkflowRunTimelineItem,
@@ -63,6 +64,7 @@ import {
   WorkflowCopilotAudioUploadResponse,
 } from "./workflowCopilotTypes";
 import { WorkflowCopilotHistory } from "./WorkflowCopilotHistory";
+import { selectAutoBoundReceiptIndexes } from "./autoBoundReceiptIndexes";
 import { shouldWaitForLiveBrowser } from "./browserReadiness";
 import {
   QueuedPromptReason,
@@ -119,12 +121,6 @@ const MAX_TURN_SNAPSHOTS = 20;
 // they land without hammering the timeline endpoint.
 const RECORDED_ACTIONS_POLL_INTERVAL_MS = 2500;
 
-function normalizeInline(value: string | null | undefined): string | null {
-  if (!value) return null;
-  const trimmed = value.replace(/\s+/g, " ").trim();
-  return trimmed.length > 0 ? trimmed : null;
-}
-
 function recordedActionDurationMs(action: ActionsApiResponse): number | null {
   const output = action.output;
   if (!output || typeof output !== "object" || Array.isArray(output)) {
@@ -140,11 +136,9 @@ function toRecordedActionSummary(
   return {
     actionId: action.action_id,
     label: getReadableActionType(action.action_type),
-    summary:
-      normalizeInline(action.reasoning) ??
-      normalizeInline(action.text) ??
-      normalizeInline(action.response) ??
-      normalizeInline(action.description),
+    // The chat has no workflow definition in scope, so rows resolve from the action
+    // itself; the run-view timeline additionally matches the definition's step text.
+    summary: describeRecordedAction(action, null),
     durationMs: recordedActionDurationMs(action),
     failed: action.status === "failed",
   };
@@ -429,6 +423,17 @@ function credentialCardFrameFor(
     };
   }
   return null;
+}
+
+// A co-occurring credential ask/pause owns this turn's credential UI and its
+// credentialResolutions[turnId] entry; the auto-bind receipt would double up and
+// mis-adopt that ask's resolution, so it defers whenever a card frame exists.
+function autoBoundReceiptFor(
+  message: ChatMessage,
+): TurnNarrativeState["credentialAutoBound"] {
+  const turn = message.narrative;
+  if (message.sender !== "ai" || !turn || turn.turnId === null) return null;
+  return credentialCardFrameFor(turn) ? null : turn.credentialAutoBound;
 }
 
 function historicalCredentialOutcome(
@@ -2919,6 +2924,16 @@ export function WorkflowCopilotChat({
     }
   }, [isOpen, buttonRef, size.width, size.height]);
 
+  const autoBoundReceiptIndexes = useMemo(
+    () =>
+      selectAutoBoundReceiptIndexes(
+        messages.map(
+          (message) => autoBoundReceiptFor(message)?.credentialId ?? null,
+        ),
+      ),
+    [messages],
+  );
+
   if (!isOpen) {
     return null;
   }
@@ -3372,14 +3387,8 @@ export function WorkflowCopilotChat({
                         turnId === null
                       )
                         return null;
-                      const autoBound = message.narrative.credentialAutoBound;
-                      // A co-occurring credential ask/pause owns this turn's credential UI and its
-                      // credentialResolutions[turnId] entry; the auto-bind receipt would double up and
-                      // mis-adopt that ask's resolution, so it defers whenever a card frame exists.
-                      if (
-                        !autoBound ||
-                        credentialCardFrameFor(message.narrative)
-                      )
+                      const autoBound = autoBoundReceiptFor(message);
+                      if (!autoBound || !autoBoundReceiptIndexes.has(index))
                         return null;
                       // The receipt renders on any message (scrollback-safe). Before a Change it shows
                       // the auto-bound credential with a Change picker; after one, the local resolution

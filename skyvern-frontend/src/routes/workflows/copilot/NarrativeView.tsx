@@ -18,6 +18,7 @@ import {
   condenseActivityEntries,
   effectiveMode,
   formatElapsed,
+  humanizeJudgeText,
   isBlockOk,
   isInterimOutcome,
   latestBlocksByLabel,
@@ -37,7 +38,9 @@ function normalizeOutcomeReason(
   reason: string | null | undefined,
 ): string | null {
   const trimmed = reason?.trim();
-  return trimmed && trimmed.length > 0 ? trimmed : null;
+  if (!trimmed) return null;
+  const humanized = humanizeJudgeText(trimmed);
+  return humanized.length > 0 ? humanized : null;
 }
 
 function normalizeOutcomeReasonSearchText(
@@ -595,7 +598,7 @@ function FBlockRun({
                 !
               </span>
               <div className="text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/90">
-                {block.outcomeReason ??
+                {normalizeOutcomeReason(block.outcomeReason) ??
                   "The step ran, but the run did not demonstrate the goal was met."}
               </div>
             </div>
@@ -781,7 +784,8 @@ function DraftPlaceholderNote({ turn }: { turn: TurnNarrativeState }) {
     turn.lastRunOutcome?.verdict === "not_evaluated";
   const text = priorFailedVerdict
     ? `Draft v${turn.authoringCount + 1} — revising after failed verify: ${
-        turn.lastRunOutcome?.displayReason ?? "outcome not confirmed"
+        normalizeOutcomeReason(turn.lastRunOutcome?.displayReason) ??
+        "outcome not confirmed"
       }`
     : "Writing the workflow code…";
   return (
@@ -1106,8 +1110,11 @@ function RollupCard({
   onBlockSelect,
   uxV1,
 }: RollupCardProps) {
-  const closing =
-    turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "";
+  // The backend appends the judge's verdict to the closing message, so it needs the
+  // same display-layer rewrite the outcome reason gets.
+  const closing = humanizeJudgeText(
+    turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "",
+  );
   const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
   const truncatedOutcomeReason = collapsedOutcomeReason
     ? truncateOutcomeReason(collapsedOutcomeReason)
@@ -1374,7 +1381,9 @@ function DetailView({
 
       {turn.terminal && (turn.narrativeSummary || turn.terminalMessage) ? (
         <div className="whitespace-pre-wrap pl-9 pr-8 text-[13px] leading-[1.55] text-foreground dark:text-slate-200">
-          {turn.narrativeSummary?.trim() || turn.terminalMessage?.trim()}
+          {humanizeJudgeText(
+            turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "",
+          )}
         </div>
       ) : null}
     </div>

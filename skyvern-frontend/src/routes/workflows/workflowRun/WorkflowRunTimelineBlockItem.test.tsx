@@ -422,12 +422,17 @@ describe("WorkflowRunTimelineBlockItem", () => {
       />,
     );
 
+    // Rows read as plain language; the raw recorder trace is demoted to the row tooltip.
     const gotoRow = screen.getByText(
-      /page\.goto https:\/\/example\.com · line 1 · 1m 5s/,
+      /Open https:\/\/example\.com · line 1 · 1m 5s/,
     );
-    const clickRow = screen.getByText(
-      /locator\.click #submit · line 3 · 1\.5s/,
-    );
+    const clickRow = screen.getByText(/Click · line 3 · 1\.5s/);
+    expect(screen.queryByText(/locator\.click/)).toBeNull();
+    expect(
+      within(container)
+        .getAllByRole("button")
+        .some((el) => el.getAttribute("title") === "locator.click #submit"),
+    ).toBe(true);
     expect(
       gotoRow.compareDocumentPosition(clickRow) &
         Node.DOCUMENT_POSITION_FOLLOWING,
@@ -438,7 +443,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     expect(within(container).getByText("Click").className).toContain("sr-only");
     expect(
       within(container).getByRole("button", {
-        name: /Goto URL.*page\.goto https:\/\/example\.com/,
+        name: /Goto URL.*Open https:\/\/example\.com/,
       }),
     ).toBeDefined();
   });
@@ -884,7 +889,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto", title: "Open the homepage", line_start: 1 },
+      { action_type: "goto_url", title: "Open the homepage", line_start: 1 },
       { action_type: "click", title: "Submit the form", line_start: 3 },
       { action_type: "extract", title: "Read the result", line_start: 5 },
       {
@@ -1118,7 +1123,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     );
 
     expect(
-      screen.getByText(/page\.goto https:\/\/example\.com · line 1/),
+      screen.getByText(/Open https:\/\/example\.com · line 1/),
     ).toBeDefined();
     expect(screen.queryByText("Outline step that should be hidden")).toBeNull();
   });
