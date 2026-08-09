@@ -499,6 +499,36 @@ describe("BrowserStream", () => {
     expect(onActivity).toHaveBeenCalledTimes(1);
   });
 
+  it("shows a two-sentence message on an unclean VNC disconnect", async () => {
+    renderBrowserStream();
+
+    await waitFor(() => {
+      expect(mocks.rfbInstances).toHaveLength(1);
+    });
+
+    const rfb = mocks.rfbInstances[0] as unknown as {
+      emit: (type: string, detail?: unknown) => void;
+    };
+    rfb.emit("disconnect", { clean: false });
+
+    // The component reconnects after a disconnect, which flips isReady back
+    // quickly -- assert everything about this one render in a single atomic
+    // callback so a reconnect between separate awaits can't hide a failure.
+    await waitFor(() => {
+      expect(screen.getByText("The browser stream slipped away")).toBeTruthy();
+      expect(
+        screen.getByText(
+          "Refresh the page or switch to local browser streaming.",
+        ),
+      ).toBeTruthy();
+      expect(
+        screen.queryByText(
+          "The browser stream dropped before everything wrapped up.",
+        ),
+      ).toBeNull();
+    });
+  });
+
   describe("recording reset lifecycle", () => {
     it("resets the recording store on unmount by default", async () => {
       const { unmount } = renderWithRecordingReset(undefined);
