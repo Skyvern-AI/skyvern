@@ -24,7 +24,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
-    _response_coverage_nudge,
+    _response_output_nudge,
 )
 from skyvern.forge.sdk.copilot.loop_detection import tool_step_identity
 from skyvern.forge.sdk.copilot.output_policy import (
@@ -2974,7 +2974,7 @@ def test_seam_ordering_avoidable_ask_defers_then_recycle_fires() -> None:
     assert diagnostics["deferred_reason_codes"] == [OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION.value]
     assert diagnostics["final_output_policy_allowed"] is True
 
-    assert _response_coverage_nudge(ctx, _AVOIDABLE_ASK).rule == "present_completion_contract_ask_retry"
+    assert _response_output_nudge(ctx, _AVOIDABLE_ASK).rule == "present_completion_contract_ask_retry"
 
 
 @pytest.mark.asyncio
@@ -3016,7 +3016,7 @@ def test_avoidable_deferral_iff_recycle_admits(
         **marker,
     )
 
-    recycle_decision = _response_coverage_nudge(ctx, _AVOIDABLE_ASK)
+    recycle_decision = _response_output_nudge(ctx, _AVOIDABLE_ASK)
     recycle_admits = recycle_decision is not None and recycle_decision.rule == "present_completion_contract_ask_retry"
     assert recycle_admits is expected_admit
 

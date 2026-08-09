@@ -63,11 +63,14 @@ def test_coerce_scopes_accepts_strings_and_iterables() -> None:
     assert google_oauth_service._coerce_scopes("") == _default_scopes_list()
 
 
-def test_google_sheets_scopes_includes_drive_file_and_metadata_readonly() -> None:
-    scopes = google_oauth_service.GOOGLE_SHEETS_SCOPES
-    assert "https://www.googleapis.com/auth/spreadsheets" in scopes
-    assert "https://www.googleapis.com/auth/drive.file" in scopes
-    assert "https://www.googleapis.com/auth/drive.metadata.readonly" in scopes
+def test_google_oauth_scope_profiles_are_exact() -> None:
+    assert google_oauth_service.GOOGLE_SHEETS_SCOPES == (
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/drive.metadata.readonly",
+    )
+    assert google_oauth_service.GOOGLE_GMAIL_SCOPES == ("https://www.googleapis.com/auth/gmail.readonly",)
+    assert google_oauth_service.GOOGLE_DRIVE_SCOPES == ("https://www.googleapis.com/auth/drive",)
 
 
 def test_google_drive_scope_profile_uses_full_drive_scope_for_folder_uploads() -> None:
@@ -2087,11 +2090,33 @@ def test_build_authorize_url_includes_required_params(monkeypatch: pytest.Monkey
     assert params["scope"] == " ".join(google_oauth_service.GOOGLE_SHEETS_SCOPES)
     assert params["access_type"] == "offline"
     assert params["prompt"] == "consent"
+    assert "include_granted_scopes" not in params
     assert params["state"] == "abc123"
     # PKCE: a code_challenge must be on the URL and the verifier returned for replay.
     assert params["code_challenge_method"] == "S256"
     assert params["code_challenge"]
     assert code_verifier and len(code_verifier) >= 43
+
+
+@pytest.mark.parametrize("profile", ["google_sheets", "gmail", "google_drive"])
+def test_build_authorize_url_uses_exact_scope_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    profile: str,
+) -> None:
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["app"], raising=False)
+    scopes = google_oauth_service.scopes_for_profile(profile)
+
+    url, _ = google_oauth_service.build_authorize_url(
+        redirect_uri="https://app/settings/google/callback",
+        state="abc123",
+        scopes=scopes,
+    )
+
+    params = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
+    assert params["scope"] == " ".join(scopes)
+    assert "include_granted_scopes" not in params
 
 
 def test_build_authorize_url_passes_autogenerate_code_verifier_explicitly(monkeypatch: pytest.MonkeyPatch) -> None:

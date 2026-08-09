@@ -54,7 +54,6 @@ from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     derive_same_month_file_match_transform,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
-    CREDENTIAL_SCOUT_VERIFY_REPLY,
     CopilotToolBlockerSignal,
     clear_terminal_evidence_on_workflow_edit,
 )
@@ -63,7 +62,6 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     RecordedOutcomeBindingConstraint,
     RecordedOutcomeGroundingRequirement,
-    _stable_hash,
     authored_structure_signature_from_workflow,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
@@ -80,7 +78,6 @@ from skyvern.forge.sdk.copilot.code_block_preflight import (
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_steps, fill_code_block_prompts_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
-    _CODE_SUBMIT_ACTION_RE,
     _INTERNAL_SCOUT_VARS,
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
@@ -96,7 +93,6 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     SynthesisDiagnostics,
     SynthesizedCodeBlock,
     _bare_drop_superseded_on_screen,
-    _credential_field_accesses,
     _get_by_role_expr_strict,
     _is_ignorable_entry_opener_drop,
     _is_positional_selector,
@@ -106,7 +102,6 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     artifact_observation_ref_id,
     build_input_templated_locator,
     build_same_month_file_match_locator,
-    credential_scout_gap,
     dynamic_row_evidence_fingerprint,
     dynamic_row_period_matches_match_selected_row,
     freeze_requested_output_extraction_candidate,
@@ -127,7 +122,6 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     synthesize_code_block_with_extraction,
     templated_selection_locator_binding,
     uncovered_required_emitted_interactions,
-    uncovered_rung_records,
     validated_dynamic_row_period_matches,
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import wrapped_code_ast as _wrapped_code_ast
@@ -147,7 +141,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _CHURN_REASON_CODES,
     _record_code_authoring_guardrail_reject,
     _scouted_spine_open_obligation,
-    arm_credential_scout_reopen,
     download_satisfied_requested_output_paths,
     requested_output_extraction_plan,
     requested_output_extraction_plan_changed,
@@ -182,6 +175,7 @@ from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_P
 from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     ReachedDownloadTarget,
+    can_deliver_registered_download,
     code_is_download_intent,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -250,10 +244,7 @@ from .frontier import (
     _invalidate_verified_state_on_edit,
     _workflow_requires_canonical_persist,
 )
-from .guardrails import (
-    _authority_tool_error,
-    _request_policy_allows_untested_code_block_draft,
-)
+from .guardrails import _authority_tool_error
 
 LOG = structlog.get_logger()
 
@@ -1265,51 +1256,6 @@ def _code_safety_reject_payload(errors: list[str | CodeBlockSecurityError]) -> M
     if not entries:
         return None
     return {"code_safety_errors": entries}
-
-
-def _credential_scout_reject_payload(workflow_yaml: str) -> Mapping[str, object] | None:
-    entries: list[dict[str, object]] = []
-    for label, block in _workflow_yaml_code_blocks_by_label(workflow_yaml).items():
-        code = str(block.get("code") or "")
-        if not code.strip():
-            continue
-        accesses = [
-            {
-                "parameter_key": access.parameter_key,
-                "field": access.field,
-                "requires_live_scout": access.requires_live_scout,
-            }
-            for access in _credential_field_accesses(code)
-        ]
-        if accesses or _CODE_SUBMIT_ACTION_RE.search(code):
-            entries.append(
-                {
-                    "block_label": label,
-                    "credential_field_accesses": accesses,
-                    "requires_submit": bool(_CODE_SUBMIT_ACTION_RE.search(code)),
-                }
-            )
-    if not entries:
-        return None
-    return {"credential_scout_requirements": entries}
-
-
-def _credential_scout_reopen_identity_digest(workflow_yaml: str) -> str:
-    structural_identity = "author_time:" + _stable_hash(_credential_scout_reject_payload(workflow_yaml) or {})
-    accessed_parameter_keys: set[str] = set()
-    for block in _workflow_yaml_code_blocks_by_label(workflow_yaml).values():
-        code = str(block.get("code") or "")
-        accessed_parameter_keys.update(
-            access.parameter_key for access in _credential_field_accesses(code) if access.requires_live_scout
-        )
-    credential_params_by_key: dict[str, set[str]] = {}
-    parsed = parse_workflow_yaml(workflow_yaml)
-    if isinstance(parsed, dict):
-        workflow_definition = parsed.get("workflow_definition")
-        if isinstance(workflow_definition, dict):
-            credential_params_by_key = credential_param_ids(workflow_definition.get("parameters"))
-    binding = {key: sorted(ids) for key, ids in credential_params_by_key.items() if key in accessed_parameter_keys}
-    return f"{structural_identity}|{_stable_hash(binding)}"
 
 
 def _metadata_item_extraction_schema_paths(item: Mapping[str, Any]) -> set[str]:
@@ -5879,9 +5825,13 @@ def _submitted_code_block_changed(block: Mapping[str, Any], prior_yaml: str | No
 def _should_impose_after_update_attempt(ctx: AgentContext, *, repeated_identical_omission: bool = False) -> bool:
     target = ctx.reached_download_target
     return (
-        (isinstance(target, ReachedDownloadTarget) and not target.already_registered and bool(target.selector.strip()))
+        (
+            isinstance(target, ReachedDownloadTarget)
+            and can_deliver_registered_download(target)
+            and not target.already_registered
+            and bool(target.selector.strip())
+        )
         or synthesized_persistence_reopened_after_failed_run(ctx)
-        or ctx.synthesized_block_reopened_for_credential_scout
         or repeated_identical_omission
         or _author_time_reject_reopens_synthesized_imposition(ctx)
     )
@@ -7186,35 +7136,6 @@ _SCOUTED_SPINE_REASON_CODES = frozenset(
 )
 
 
-def _synthesized_resubmission_credential_scout_requirements(
-    ctx: AgentContext, synthesized: SynthesizedCodeBlock, *, block_label: str
-) -> list[str]:
-    # Runs the credential-scout gate against the verbatim resubmission the under-build reject asks
-    # for, so the reject names every step of a route that is admissible end-to-end.
-    credential_parameters = [
-        parameter for parameter in synthesized.parameters if str(parameter.get("credential_id") or "").strip()
-    ]
-    if not credential_parameters:
-        return []
-    probe_yaml = yaml.safe_dump(
-        {
-            "workflow_definition": {
-                "parameters": [
-                    {
-                        "parameter_type": "credential",
-                        "key": str(parameter.get("key") or ""),
-                        "credential_id": str(parameter.get("credential_id") or ""),
-                    }
-                    for parameter in credential_parameters
-                ],
-                "blocks": [{"block_type": "code", "label": block_label, "code": synthesized.code}],
-            }
-        },
-        sort_keys=False,
-    )
-    return _credentialed_code_block_scout_gate_errors(probe_yaml, ctx)
-
-
 def _scouted_spine_omission_digest(records: Sequence[Mapping[str, Any]]) -> str:
     items = sorted(
         (
@@ -7249,9 +7170,6 @@ def _scouted_spine_under_build_result(
         uncovered_required_emitted_interactions(diagnostics.emitted_interactions, draft_calls) if required else []
     )
     if uncovered:
-        credential_scout_requirements = _synthesized_resubmission_credential_scout_requirements(
-            ctx, synthesized, block_label=block_label
-        )
         missing_text = missing_rung_text(uncovered)
         LOG.info(
             "copilot_scouted_spine_under_build",
@@ -7260,7 +7178,6 @@ def _scouted_spine_under_build_result(
             required_rung_count=len(required),
             covered_rung_count=len(required) - len(uncovered),
             missing_rungs=missing_text,
-            credential_scout_precondition_pending=bool(credential_scout_requirements),
         )
         first_uncovered = uncovered[0]
         pass_route = render_missing_rung_call_sources(uncovered)
@@ -7269,18 +7186,10 @@ def _scouted_spine_under_build_result(
             f"({_SCOUTED_SPINE_UNDER_BUILD_REASON_CODE}): the draft covers "
             f"{len(required) - len(uncovered)} of {len(required)} scouted rung(s); missing: {missing_text}. "
         )
-        if credential_scout_requirements:
-            violation += (
-                "Two steps are required, in order. Step 1 — satisfy the credential-scout precondition: "
-                + " ".join(credential_scout_requirements)
-                + " Step 2 — resubmit the code block, reusing the synthesized rung source verbatim so every "
-                "scouted rung is replayed."
-            )
-        else:
-            violation += (
-                "Author the remaining synthesized rungs — reuse the synthesized code block verbatim so every "
-                "scouted rung is replayed."
-            )
+        violation += (
+            "Author the remaining synthesized rungs — reuse the synthesized code block verbatim so every "
+            "scouted rung is replayed."
+        )
         if pass_route:
             violation += "\n" + pass_route
         return _SynthesizedCodeImpositionResult(
@@ -8662,7 +8571,7 @@ def _dump_imposition_decision(
         changed = result.workflow_yaml != workflow_yaml
         prior_source, prior_yaml = _prior_yaml_source(ctx)
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "source_version": __version__,
             "workflow_yaml": workflow_yaml,
             "prior_source": prior_source,
@@ -8673,7 +8582,7 @@ def _dump_imposition_decision(
             "impose_synthesized_code_block": ctx.impose_synthesized_code_block,
             "update_workflow_called": ctx.update_workflow_called,
             "turn_origin": str(ctx.turn_origin),
-            "raw_code_artifact_metadata": ctx.raw_code_artifact_metadata,
+            "raw_code_artifact_metadata": _imposition_dump_metadata(ctx.raw_code_artifact_metadata),
             # The branch inputs as the run left them, read from retained state: deriving the plan here
             # would latch one the decision never latched and change the next evaluation's reach.
             "reaches_goal": synthesized_trajectory_reaches_goal(ctx),
@@ -8689,6 +8598,19 @@ def _dump_imposition_decision(
             json.dump(payload, handle, default=str)
     except Exception:
         LOG.info("copilot_imposition_input_dump_failed", exc_info=True)
+
+
+def _imposition_dump_metadata(raw_metadata: object) -> object:
+    """Keep Pydantic metadata structured so offline replay receives the live branch inputs."""
+    if isinstance(raw_metadata, CodeArtifactMetadata):
+        return raw_metadata.model_dump(mode="json", exclude_none=True)
+    if isinstance(raw_metadata, list):
+        return [_imposition_dump_metadata(item) for item in raw_metadata]
+    if isinstance(raw_metadata, tuple):
+        return [_imposition_dump_metadata(item) for item in raw_metadata]
+    if isinstance(raw_metadata, dict):
+        return {key: _imposition_dump_metadata(value) for key, value in raw_metadata.items()}
+    return raw_metadata
 
 
 def _maybe_impose_synthesized_code_block(
@@ -10245,132 +10167,8 @@ def _artifact_string_list(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
-def _credentialed_code_block_scout_gate_errors(
-    workflow_yaml: str | None,
-    ctx: AgentContext,
-    *,
-    block_labels: Iterable[str] | None = None,
-) -> list[str]:
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return []
-    if not workflow_yaml:
-        return []
-    parsed = parse_workflow_yaml(workflow_yaml)
-    if not isinstance(parsed, dict):
-        return []
-    workflow_definition = parsed.get("workflow_definition")
-    if not isinstance(workflow_definition, dict):
-        return []
-    credential_params_by_key = credential_param_ids(workflow_definition.get("parameters"))
-    if not credential_params_by_key:
-        return []
-    prior_blocks_by_label = {}
-    prior_credential_params_by_key = {}
-    prior_workflow_yaml = ctx.workflow_yaml
-    if isinstance(prior_workflow_yaml, str) and prior_workflow_yaml.strip():
-        prior_parsed = parse_workflow_yaml(prior_workflow_yaml)
-        if isinstance(prior_parsed, dict):
-            prior_workflow_definition = prior_parsed.get("workflow_definition")
-            if isinstance(prior_workflow_definition, dict):
-                prior_credential_params_by_key = credential_param_ids(prior_workflow_definition.get("parameters"))
-                for prior_block in workflow_blocks(prior_parsed):
-                    if _enum_or_string_name(prior_block.get("block_type")) != BlockType.CODE.value:
-                        continue
-                    prior_label = str(prior_block.get("label") or "").strip()
-                    if prior_label:
-                        prior_blocks_by_label[prior_label] = prior_block
-    scout_trajectory = getattr(ctx, "scout_trajectory", None)
-    if not isinstance(scout_trajectory, list):
-        scout_trajectory = []
-    selected_block_labels = {label.strip() for label in block_labels or [] if label.strip()}
-
-    errors: list[str] = []
-    for block in workflow_blocks(parsed):
-        if _enum_or_string_name(block.get("block_type")) != BlockType.CODE.value:
-            continue
-        code = str(block.get("code") or "")
-        if not code.strip():
-            continue
-        block_label = str(block.get("label") or "").strip()
-        if selected_block_labels and block_label not in selected_block_labels:
-            continue
-        matching_prior_block = prior_blocks_by_label.get(block_label) if block_label else None
-        if (
-            isinstance(matching_prior_block, dict)
-            and str(matching_prior_block.get("code") or "") == code
-            and _code_block_parameter_keys(matching_prior_block) == _code_block_parameter_keys(block)
-        ):
-            accessed_parameter_keys = {
-                access.parameter_key for access in _credential_field_accesses(code) if access.requires_live_scout
-            }
-            if accessed_parameter_keys and all(
-                prior_credential_params_by_key.get(parameter_key) == credential_params_by_key.get(parameter_key)
-                for parameter_key in accessed_parameter_keys
-            ):
-                continue
-        required_fields_by_parameter: dict[str, tuple[set[str], set[str]]] = {}
-        for access in _credential_field_accesses(code):
-            if not access.requires_live_scout:
-                continue
-            credential_ids = credential_params_by_key.get(access.parameter_key)
-            if credential_ids:
-                allowed_credential_ids, required_fields = required_fields_by_parameter.setdefault(
-                    access.parameter_key, (credential_ids, set())
-                )
-                required_fields.add(access.field)
-        if not required_fields_by_parameter:
-            continue
-
-        gap = credential_scout_gap(
-            scout_trajectory,
-            list(required_fields_by_parameter.values()),
-            requires_submit=bool(_CODE_SUBMIT_ACTION_RE.search(code)),
-        )
-        missing_fields = gap.missing_fields
-        missing_submit = gap.missing_submit
-
-        if not missing_fields and not missing_submit:
-            continue
-
-        block_label = block_label or "this code block"
-        requirements: list[str] = []
-        if missing_fields:
-            joined_fields = ", ".join(f"`{field}`" for field in missing_fields)
-            requirements.append(f"successful `fill_credential_field` scouting for {joined_fields}")
-        if missing_submit:
-            requirements.append("a later submit action on the same page")
-        requirement_text = " and ".join(requirements)
-        errors.append(
-            f"Code block `{block_label}` reads saved credential fields, but the current debug-browser scout "
-            f"record is missing {requirement_text}. First scout the live form with `fill_credential_field` for "
-            "each referenced credential field, then click the submit control or press Enter in the debug browser "
-            "before retrying `update_workflow` or `update_and_run_blocks`."
-        )
-    return errors
-
-
 def _missing_scouted_rung_violation_text(artifact: str) -> str:
     return "The persisted draft is missing scouted rung(s). " + artifact
-
-
-def _open_scouted_spine_obligation_artifact(ctx: AgentContext) -> str:
-    try:
-        findings = _scouted_spine_open_obligation(ctx)
-    except Exception:
-        LOG.warning("copilot_scouted_spine_obligation_read_failed", exc_info=True)
-        return ""
-    artifact = render_missing_rung_call_sources(uncovered_rung_records(findings))
-    if not artifact:
-        return ""
-    return _missing_scouted_rung_violation_text(artifact)
-
-
-def _credential_scout_reject_error_text(ctx: AgentContext, credential_scout_errors: list[str]) -> str:
-    error_text = "\n".join(credential_scout_errors)
-    obligation_artifact = _open_scouted_spine_obligation_artifact(ctx)
-    if obligation_artifact:
-        error_text += "\n" + obligation_artifact
-    return error_text
 
 
 def carry_author_time_findings(update_result: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
@@ -10561,7 +10359,6 @@ async def _update_workflow(
         ctx,
         runtime_parameters if isinstance(runtime_parameters, Mapping) else None,
     )
-    ctx.synthesized_block_reopened_for_credential_scout = False
     if not imposition.violations:
         workflow_yaml = imposition.workflow_yaml
     stripped_sandbox_imports: list[str] = []
@@ -10633,11 +10430,6 @@ async def _update_workflow(
         if code_safety_errors and _unresolved_symbol_repair_context_enabled(ctx)
         else None
     )
-    credential_scout_errors = (
-        []
-        if _request_policy_allows_untested_code_block_draft(ctx)
-        else _credentialed_code_block_scout_gate_errors(workflow_yaml, ctx, block_labels=params.get("block_labels"))
-    )
     if code_safety_errors:
         _set_code_authoring_repair_context(ctx, code_authoring_repair_context)
         if code_authoring_repair_context is None:
@@ -10667,38 +10459,6 @@ async def _update_workflow(
         params["code_artifact_metadata"] = merged_metadata
         workflow_yaml = _apply_metadata_contract_schema_to_workflow_yaml(ctx, workflow_yaml, merged_metadata)
         params["workflow_yaml"] = workflow_yaml
-    if credential_scout_errors and code_safety_errors:
-        if _is_unresolved_symbol_repair_context(code_authoring_repair_context):
-            return _blocked(
-                AuthorTimeBlock(
-                    block_id=CODE_SAFETY_BLOCK_ID,
-                    error="\n".join(str(error) for error in code_safety_errors if error),
-                    user_facing_summary=_code_seam_rejection_user_summary(
-                        metadata_rejected=False,
-                        code_rejected=True,
-                    ),
-                    data=_code_repair_progress_data(code_authoring_repair_context),
-                ),
-                repair_context=code_authoring_repair_context,
-            )
-        arm_credential_scout_reopen(ctx, _credential_scout_reopen_identity_digest(workflow_yaml))
-        return _blocked(
-            AuthorTimeBlock(
-                block_id=CREDENTIAL_SCOUT_BLOCK_ID,
-                error=_credential_scout_reject_error_text(ctx, credential_scout_errors),
-                user_facing_summary=CREDENTIAL_SCOUT_VERIFY_REPLY,
-                data={
-                    "failure_type": "missing_credential_or_init",
-                    "diagnostic_code_safety_errors": code_safety_errors,
-                    **(
-                        {"authoring_repair_context": code_authoring_repair_context.model_dump(mode="json")}
-                        if code_authoring_repair_context is not None
-                        else {}
-                    ),
-                },
-            ),
-            repair_context=code_authoring_repair_context,
-        )
     human_facing_code_safety_errors = _human_facing_code_safety_errors(code_safety_errors)
     if human_facing_code_safety_errors:
         return _blocked(
@@ -10712,22 +10472,6 @@ async def _update_workflow(
                 data=_code_repair_progress_data(code_authoring_repair_context),
             ),
             repair_context=code_authoring_repair_context,
-        )
-    if credential_scout_errors:
-        _record_author_time_reject_outcome(
-            ctx,
-            reason_code="credential_scout_reject",
-            summary=CREDENTIAL_SCOUT_VERIFY_REPLY,
-            structural_payload=_credential_scout_reject_payload(workflow_yaml),
-        )
-        arm_credential_scout_reopen(ctx, _credential_scout_reopen_identity_digest(workflow_yaml))
-        return _blocked(
-            AuthorTimeBlock(
-                block_id=CREDENTIAL_SCOUT_BLOCK_ID,
-                error=_credential_scout_reject_error_text(ctx, credential_scout_errors),
-                user_facing_summary=CREDENTIAL_SCOUT_VERIFY_REPLY,
-                data={"failure_type": "missing_credential_or_init"},
-            )
         )
     if allow_missing_credentials is None:
         allow_missing_credentials = ctx.allow_untested_workflow_draft is True

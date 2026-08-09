@@ -326,6 +326,8 @@ class TestWorkflowRunCompleteHookFires:
         mock_status.is_final.return_value = True
 
         mock_db = MagicMock()
+        # Final transitions claim the flip via the conditional update first.
+        mock_db.workflow_runs.update_workflow_run_if_not_final = AsyncMock(return_value=mock_workflow_run)
         mock_db.workflow_runs.update_workflow_run = AsyncMock(return_value=mock_workflow_run)
         mock_db.tags.apply_system_run_tag_changes = AsyncMock()
 

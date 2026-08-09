@@ -75,6 +75,17 @@ function sanitizeFileName(name: string): string {
   return name.replace(/[/\\:*?"<>|]/g, "_");
 }
 
+// zipSync()'s Uint8Array return type carries whatever ArrayBuffer-ish generic
+// the active @types/node augments as its default, which isn't always the
+// concrete ArrayBuffer Blob's BlobPart expects. Copying into a plain
+// ArrayBuffer sidesteps that: ArrayBuffer itself isn't generic, so this is
+// valid under any @types/node version without a cast.
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const buffer = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(buffer).set(bytes);
+  return buffer;
+}
+
 // Two selected agents can share a title; number repeats so every archive
 // entry name stays unique.
 function uniqueFileName(used: Set<string>, title: string, ext: string): string {
@@ -269,7 +280,7 @@ function BulkActionBar({
     }
     downloadFile(
       `agents-export-${selectedWorkflows.length}.zip`,
-      new Uint8Array(zipSync(entries)),
+      toArrayBuffer(zipSync(entries)),
       "application/zip",
     );
   }

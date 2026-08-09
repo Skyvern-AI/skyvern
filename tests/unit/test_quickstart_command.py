@@ -7,11 +7,14 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import types
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
+import structlog
 from structlog.testing import capture_logs
 from typer.testing import CliRunner
 
@@ -26,6 +29,25 @@ from skyvern.utils.env_paths import (
     load_backend_env_files,
     resolve_backend_env_path,
 )
+
+
+@pytest.fixture(autouse=True)
+def _structlog_config_capture_can_see(monkeypatch: pytest.MonkeyPatch) -> None:
+    # capture_logs() swaps processors but keeps the configured wrapper_class, so a
+    # filtering wrapper above WARNING or a logger cached under an earlier config makes
+    # this module's warning assertions silently fail depending on shard order.
+    saved = structlog.get_config()
+    structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=False,
+    )
+    from skyvern.cli import run_commands
+
+    monkeypatch.setattr(run_commands.LOG, "_logger", None, raising=False)
+    yield
+    structlog.configure(**saved)
+
 
 _BLOCKING_SWEEP_WITH_DESCENDANT = """
 import subprocess
@@ -310,7 +332,9 @@ def test_run_mcp_prepares_cloud_env_before_starting_mcp(tmp_path, monkeypatch) -
 
     fake_telemetry = types.ModuleType("skyvern.cli.mcp_tools.telemetry")
 
-    def fake_configure_mcp_telemetry_runtime(*, server_mode: str, transport: str | None) -> None:
+    def fake_configure_mcp_telemetry_runtime(
+        *, server_mode: str, transport: str | None, boot_ready_callback: object | None = None
+    ) -> None:
         assert os.environ[BACKEND_ENV_INTENT_ENV_VAR] == EnvIntent.CLOUD.value
         assert os.environ["SKYVERN_BASE_URL"] == "http://project"
         events.append(f"telemetry:{server_mode}:{transport}")
@@ -318,7 +342,7 @@ def test_run_mcp_prepares_cloud_env_before_starting_mcp(tmp_path, monkeypatch) -
     fake_telemetry.configure_mcp_telemetry_runtime = fake_configure_mcp_telemetry_runtime
 
     fake_local_browser_profile = types.ModuleType("skyvern.library.local_browser_profile")
-    fake_local_browser_profile.sweep_local_browser_profiles_with_budget = lambda: events.append("sweep")
+    fake_local_browser_profile.sweep_local_browser_profiles_once_in_background = lambda: events.append("sweep")
 
     fake_mcp_tools = types.ModuleType("skyvern.cli.mcp_tools")
 
@@ -369,7 +393,7 @@ def test_run_mcp_prepares_cloud_env_before_starting_mcp(tmp_path, monkeypatch) -
 
 
 @pytest.mark.parametrize("failure_stage", ["import", "call"])
-def test_run_mcp_logs_sweep_failure_and_continues(monkeypatch, caplog, failure_stage: str) -> None:
+def test_run_mcp_logs_sweep_failure_and_continues(monkeypatch, failure_stage: str) -> None:
     events: list[str] = []
     run_commands = _patch_minimal_run_mcp_dependencies(monkeypatch, events, lambda: events.append("run"))
 
@@ -377,7 +401,7 @@ def test_run_mcp_logs_sweep_failure_and_continues(monkeypatch, caplog, failure_s
     if failure_stage == "import":
 
         def missing_sweep(name: str) -> object:
-            if name == "sweep_local_browser_profiles_with_budget":
+            if name == "sweep_local_browser_profiles_once_in_background":
                 raise ImportError("sweep import failed")
             raise AttributeError(name)
 
@@ -387,31 +411,86 @@ def test_run_mcp_logs_sweep_failure_and_continues(monkeypatch, caplog, failure_s
         def failing_sweep() -> None:
             raise RuntimeError("sweep call failed")
 
-        fake_local_browser_profile.sweep_local_browser_profiles_with_budget = failing_sweep
+        fake_local_browser_profile.sweep_local_browser_profiles_once_in_background = failing_sweep
     monkeypatch.setitem(sys.modules, "skyvern.library.local_browser_profile", fake_local_browser_profile)
 
-    with capture_logs() as logs, caplog.at_level(logging.WARNING, logger="skyvern.cli.run_commands"):
-        run_commands.run_mcp()
+    # Assert on the logger call itself rather than capture_logs: capture depends on
+    # process-global structlog state that other tests in the shard can leave behind.
+    recording_logger = MagicMock()
+    monkeypatch.setattr(run_commands, "LOG", recording_logger)
+    run_commands.run_mcp()
 
     assert events == ["prepare", "run", "cleanup"]
-    structlog_warning = any(
-        log.get("event") == "local_browser_profile_startup_sweep_failed"
-        and (log.get("log_level") or log.get("level")) == "warning"
-        for log in logs
-    )
-    stdlib_warning = any(
-        record.levelno == logging.WARNING and "local_browser_profile_startup_sweep_failed" in record.getMessage()
-        for record in caplog.records
-    )
-    assert structlog_warning or stdlib_warning
+    warned_events = [call.args[0] for call in recording_logger.warning.call_args_list if call.args]
+    assert "local_browser_profile_startup_sweep_failed" in warned_events
 
 
-def test_run_mcp_starts_within_sweep_budget_and_stops_blocking_child(tmp_path: Path, monkeypatch) -> None:
+def test_run_mcp_reports_boot_phase_timings_after_initialize(monkeypatch) -> None:
+    events: list[str] = []
+    recorded: list[dict[str, object]] = []
+    boot_ready_callbacks: list[object] = []
+
+    def initialize() -> None:
+        events.append("initialize")
+        callback = boot_ready_callbacks[0]
+        assert callable(callback)
+        callback()
+
+    run_commands = _patch_minimal_run_mcp_dependencies(monkeypatch, events, initialize)
+    fake_telemetry = sys.modules["skyvern.cli.mcp_tools.telemetry"]
+    fake_telemetry.configure_mcp_telemetry_runtime = lambda **kwargs: boot_ready_callbacks.append(
+        kwargs["boot_ready_callback"]
+    )
+    monkeypatch.setattr(
+        run_commands.LOG,
+        "info",
+        lambda event, **kwargs: recorded.append({"event": event, **kwargs}),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "skyvern.library.local_browser_profile",
+        types.SimpleNamespace(sweep_local_browser_profiles_once_in_background=lambda: None),
+    )
+
+    run_commands.run_mcp()
+
+    boot = next(entry for entry in recorded if entry["event"] == "mcp_boot_ready")
+    assert boot["transport"] == "stdio"
+    assert boot["spawn_to_serve_ms"] >= 0
+    assert boot["env_ms"] >= 0
+    assert boot["tool_import_ms"] >= 0
+
+
+def test_run_mcp_does_not_report_ready_when_serving_fails(monkeypatch) -> None:
+    events: list[str] = []
+
+    def fail_to_serve() -> None:
+        raise RuntimeError("MCP serving failed")
+
+    run_commands = _patch_minimal_run_mcp_dependencies(monkeypatch, events, fail_to_serve)
+    recording_logger = MagicMock()
+    monkeypatch.setattr(run_commands, "LOG", recording_logger)
+    monkeypatch.setitem(
+        sys.modules,
+        "skyvern.library.local_browser_profile",
+        types.SimpleNamespace(sweep_local_browser_profiles_once_in_background=lambda: None),
+    )
+
+    with pytest.raises(RuntimeError, match="MCP serving failed"):
+        run_commands.run_mcp()
+
+    info_events = [call.args[0] for call in recording_logger.info.call_args_list if call.args]
+    assert "mcp_boot_ready" not in info_events
+
+
+def test_run_mcp_serves_without_waiting_for_sweep_and_stops_blocking_child(tmp_path: Path, monkeypatch) -> None:
     from skyvern.library import local_browser_profile
 
     events: list[str] = []
     children: list[subprocess.Popen[bytes]] = []
+    threads: list[threading.Thread] = []
     run_started_at: list[float] = []
+    sweep_in_flight_at_serve: list[bool] = []
     real_popen = subprocess.Popen
     budget_seconds = 0.3
     descendant_ready = tmp_path / "descendant-ready"
@@ -434,24 +513,39 @@ def test_run_mcp_starts_within_sweep_budget_and_stops_blocking_child(tmp_path: P
 
     def run_mcp_server() -> None:
         run_started_at.append(time.monotonic())
-        assert children and children[0].poll() is not None
+        sweep_in_flight_at_serve.append(bool(threads) and threads[0].is_alive())
         events.append("run")
+
+    trigger = local_browser_profile.sweep_local_browser_profiles_once_in_background
+
+    def capture_thread() -> threading.Thread | None:
+        thread = trigger()
+        if thread is not None:
+            threads.append(thread)
+        return thread
 
     run_commands = _patch_minimal_run_mcp_dependencies(monkeypatch, events, run_mcp_server)
     monkeypatch.setattr(subprocess, "Popen", start_blocking_child)
     monkeypatch.setattr(local_browser_profile, "PROFILE_SWEEP_STARTUP_BUDGET_SECONDS", budget_seconds)
+    monkeypatch.setattr(local_browser_profile, "_sweep_triggered", False)
+    monkeypatch.setattr(local_browser_profile, "sweep_local_browser_profiles_once_in_background", capture_thread)
 
     started_at = time.monotonic()
     try:
         with capture_logs() as logs:
             run_commands.run_mcp()
+            assert not threads[0].is_alive()
+            assert children[0].poll() is not None
     finally:
         for child in children:
             if child.poll() is None:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
+        for thread in threads:
+            thread.join(timeout=5)
 
-    assert run_started_at[0] - started_at <= budget_seconds + 0.075
+    assert run_started_at[0] - started_at < budget_seconds
+    assert sweep_in_flight_at_serve == [True]
     assert events == ["prepare", "run", "cleanup"]
     assert any(log.get("event") == "local_browser_profile_sweep_timed_out" for log in logs)
     time.sleep(0.55)
