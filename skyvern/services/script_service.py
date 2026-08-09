@@ -36,6 +36,7 @@ from skyvern.exceptions import (
     ActionPolicyBlocked,
     CachedDownloadError,
     CodeBlockRunnerSelectionError,
+    DownloadSaveIncompleteError,
     IllegitCompleteScriptTermination,
     InProcessScriptExecutionDenied,
     ScriptNotFound,
@@ -2564,6 +2565,16 @@ async def download(
                         organization_id=org_id,
                         run_id=run_id,
                     )
+                save_ok = True
+            except DownloadSaveIncompleteError as exc:
+                # A partial save still verifies: the files that saved are readable, and if the new
+                # download is the one that was skipped, verification fails into the AI fallback.
+                LOG.warning(
+                    "Some downloaded files were skipped during cached-download save",
+                    organization_id=org_id,
+                    workflow_run_id=run_id,
+                    skipped_file_count=len(exc.skipped_files),
+                )
                 save_ok = True
             except asyncio.TimeoutError:
                 LOG.warning(

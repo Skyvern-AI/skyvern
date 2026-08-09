@@ -2,7 +2,7 @@ import asyncio
 import copy
 import json
 from collections import defaultdict
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from opentelemetry import trace as otel_trace
@@ -195,6 +195,30 @@ def clean_element_before_hashing(element: dict) -> dict:
         return element_cleaned
 
     return clean_nested(element)
+
+
+_ELEMENT_TREE_IMMUTABLE_LEAF = (str, bytes, bool, int, float, type(None))
+
+
+def _deepcopy_element_tree(element_tree: list[dict]) -> list[dict]:
+    """Deep copy the scraped element tree without ``copy.deepcopy``'s generic overhead.
+
+    The tree is pure JSON-like data (acyclic; only dict/list mutable containers with immutable
+    leaves, as proven by ``hash_element``'s ``json.dumps``), so recursing dict/list and sharing
+    immutable leaves is equivalent to ``copy.deepcopy``. Any unexpected non-scalar leaf falls back
+    to ``copy.deepcopy`` to preserve exact semantics.
+    """
+
+    def copy_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: copy_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [copy_value(item) for item in value]
+        if isinstance(value, _ELEMENT_TREE_IMMUTABLE_LEAF):
+            return value
+        return copy.deepcopy(value)
+
+    return [copy_value(element) for element in element_tree]
 
 
 def hash_element(element: dict) -> str:
@@ -513,8 +537,8 @@ async def scrape_web_unsafe(
             engine_selection=browser_state.engine_selection,
         )
 
-    element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))
-    element_tree_trimmed = trim_element_tree(copy.deepcopy(element_tree))
+    element_tree = await cleanup_element_tree(page, url, _deepcopy_element_tree(element_tree))
+    element_tree_trimmed = trim_element_tree(_deepcopy_element_tree(element_tree))
 
     screenshots = []
     if take_screenshots:

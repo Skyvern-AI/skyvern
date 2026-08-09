@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TypeAlias, TypeVar
+from typing import Any, TypeAlias, TypeVar
 
 T = TypeVar("T")
 
@@ -64,3 +64,12 @@ async def deny_unenrolled_redirect_hop(
     the network.
     """
     raise RuntimeError("Redirect hop authorization is not enrolled for this browser session")
+
+
+def is_unenrolled_redirect_hop_authorizer(authorizer: RedirectHopAuthorizer[Any]) -> bool:
+    """Whether this authorizer is the unenrolled sentinel, which denies every hop it is given.
+
+    Call sites use this to report an unenrolled seam as its own operational state instead of
+    surfacing the sentinel's denial as an indistinguishable transport failure.
+    """
+    return authorizer is deny_unenrolled_redirect_hop
