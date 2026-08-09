@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -141,7 +142,7 @@ async def test_session_create_extension_not_connected_returns_pinned_guidance(
 ) -> None:
     runtime = SimpleNamespace(
         wait_for_extension=AsyncMock(return_value=False),
-        open_pairing_page=MagicMock(return_value=pairing_opened),
+        open_pairing_page=AsyncMock(return_value=pairing_opened),
     )
     get_or_start = AsyncMock(return_value=runtime)
     resolve_browser = AsyncMock()
@@ -156,7 +157,7 @@ async def test_session_create_extension_not_connected_returns_pinned_guidance(
     assert "extension-token" not in result["error"]["message"]
     assert "paste the token" not in result["error"]["message"]
     get_or_start.assert_awaited_once_with()
-    runtime.open_pairing_page.assert_called_once_with()
+    runtime.open_pairing_page.assert_awaited_once_with()
     runtime.wait_for_extension.assert_awaited_once_with(10.0)
     resolve_browser.assert_not_awaited()
 
@@ -427,12 +428,12 @@ def test_browser_extension_status_reports_configuration_without_printing_token(
     token_path = token_dir / "browser_extension_token"
     token_path.write_text(token)
     token_path.chmod(0o600)
-    connection = MagicMock()
-    connect = MagicMock(return_value=connection)
+    probe = MagicMock(return_value="broker")
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("SKYVERN_BROWSER_EXTENSION_PORT", "20123")
     monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_TOKEN", raising=False)
-    monkeypatch.setattr(browser_commands.socket, "create_connection", connect)
+    monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_BROKER", raising=False)
+    monkeypatch.setattr(browser_commands, "_bridge_mode", probe)
 
     result = CliRunner().invoke(browser_app, ["extension-status"])
 
@@ -440,10 +441,27 @@ def test_browser_extension_status_reports_configuration_without_printing_token(
     assert str(BrowserExtensionRuntime.extension_dir().resolve()) in result.stdout
     assert "pairing token: configured (file exists)" in result.stdout
     assert "pairing token file permissions: OK" in result.stdout
-    assert "bridge listening on 20123" in result.stdout
+    assert "shared broker: enabled" in result.stdout
+    assert "bridge listening on 20123 (shared broker daemon)" in result.stdout
     assert token not in result.stdout
-    connect.assert_called_once_with(("127.0.0.1", 20123), timeout=0.5)
-    connection.close.assert_called_once_with()
+    probe.assert_called_once_with(20123)
+
+
+def test_browser_extension_status_flags_a_single_owner_bridge_as_unshareable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SKYVERN_BROWSER_EXTENSION_PORT", "20124")
+    monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_TOKEN", raising=False)
+    monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_BROKER", raising=False)
+    monkeypatch.setattr(browser_commands, "_bridge_mode", MagicMock(return_value="legacy"))
+
+    result = CliRunner().invoke(browser_app, ["extension-status"])
+
+    assert result.exit_code == 0
+    assert "bridge listening on 20124 (single-owner session)" in result.stdout
+    assert "share the bridge" in result.stdout
 
 
 def test_browser_extension_status_is_informational_when_bridge_is_not_running(
@@ -453,12 +471,14 @@ def test_browser_extension_status_is_informational_when_bridge_is_not_running(
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_TOKEN", raising=False)
     monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_PORT", raising=False)
-    monkeypatch.setattr(browser_commands.socket, "create_connection", MagicMock(side_effect=OSError))
+    monkeypatch.setenv("SKYVERN_BROWSER_EXTENSION_BROKER", "0")
+    monkeypatch.setattr(browser_commands, "_bridge_mode", MagicMock(return_value="none"))
 
     result = CliRunner().invoke(browser_app, ["extension-status"])
 
     assert result.exit_code == 0
     assert "pairing token: not configured" in result.stdout
+    assert "shared broker: disabled (SKYVERN_BROWSER_EXTENSION_BROKER)" in result.stdout
     assert "bridge not running (start your MCP server with --browser-extension)" in result.stdout
 
 
@@ -586,6 +606,7 @@ def test_run_mcp_browser_extension_flag_starts_and_stops_runtime(monkeypatch: py
     async def run_async(**_kwargs: object) -> None:
         assert run_commands.os.environ["BROWSER_TYPE"] == "extension-connect"
         events.append("serve")
+        await asyncio.sleep(0)
 
     async def cleanup() -> None:
         events.append("cleanup")
@@ -605,13 +626,15 @@ def test_run_mcp_browser_extension_flag_starts_and_stops_runtime(monkeypatch: py
     )
     monkeypatch.setattr("skyvern.cli.mcp_tools.mcp.run_async", run_async)
     monkeypatch.setattr(BrowserExtensionRuntime, "get_or_start", AsyncMock(side_effect=get_or_start))
+    monkeypatch.setattr(BrowserExtensionRuntime, "instance", MagicMock(return_value=runtime))
     monkeypatch.setattr(run_commands, "_mcp_cleanup_done", False)
     monkeypatch.setattr(run_commands, "_mcp_cleanup_in_progress", False)
 
     run_commands.run_mcp(browser_extension=True)
 
     assert run_commands.os.environ["BROWSER_TYPE"] == "extension-connect"
-    assert events == ["start", "serve", "cleanup", "shutdown"]
+    # Serving precedes the bridge: `initialize` must not wait on relay startup.
+    assert events == ["serve", "start", "cleanup", "shutdown"]
     runtime.shutdown.assert_awaited_once_with()
 
 
@@ -621,7 +644,12 @@ async def test_run_mcp_with_cleanup_serves_when_extension_start_fails(
 ) -> None:
     message = "browser extension bridge unavailable"
     get_or_start = AsyncMock(side_effect=BrowserExtensionError(message))
-    run_async = AsyncMock()
+    served = MagicMock()
+
+    async def run_async(**kwargs: object) -> None:
+        served(**kwargs)
+        await asyncio.sleep(0)
+
     cleanup = AsyncMock()
     warning = MagicMock()
     instance = MagicMock(return_value=None)
@@ -633,7 +661,7 @@ async def test_run_mcp_with_cleanup_serves_when_extension_start_fails(
     await run_commands._run_mcp_with_cleanup(run_async, browser_extension=True, transport="stdio")
 
     get_or_start.assert_awaited_once_with()
-    run_async.assert_awaited_once_with(transport="stdio")
+    served.assert_called_once_with(transport="stdio")
     cleanup.assert_awaited_once_with()
     instance.assert_called_once_with()
     assert warning.call_count == 1
@@ -641,22 +669,57 @@ async def test_run_mcp_with_cleanup_serves_when_extension_start_fails(
 
 
 @pytest.mark.asyncio
-async def test_run_mcp_with_cleanup_propagates_unexpected_extension_start_error(
+async def test_run_mcp_with_cleanup_serves_on_unexpected_extension_start_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     get_or_start = AsyncMock(side_effect=RuntimeError("unexpected startup failure"))
-    run_async = AsyncMock()
     cleanup = AsyncMock()
+    warning = MagicMock()
+    served = MagicMock()
+
+    async def run_async(**_kwargs: object) -> None:
+        served()
+        await asyncio.sleep(0)
+
     monkeypatch.setattr(BrowserExtensionRuntime, "get_or_start", get_or_start)
     monkeypatch.setattr(BrowserExtensionRuntime, "instance", MagicMock(return_value=None))
     monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", cleanup)
+    monkeypatch.setattr(run_commands.LOG, "warning", warning)
 
-    with pytest.raises(RuntimeError, match="unexpected startup failure"):
-        await run_commands._run_mcp_with_cleanup(run_async, browser_extension=True)
+    await run_commands._run_mcp_with_cleanup(run_async, browser_extension=True)
 
     get_or_start.assert_awaited_once_with()
-    run_async.assert_not_awaited()
+    served.assert_called_once_with()
     cleanup.assert_awaited_once_with()
+    assert warning.call_count == 1
+    assert warning.call_args.kwargs["exc_info"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_mcp_with_cleanup_serves_while_extension_start_hangs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+
+    async def get_or_start() -> object:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("bridge startup must stay pending")
+
+    async def run_async(**_kwargs: object) -> None:
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+    cleanup = AsyncMock()
+    instance = MagicMock(return_value=None)
+    monkeypatch.setattr(BrowserExtensionRuntime, "get_or_start", AsyncMock(side_effect=get_or_start))
+    monkeypatch.setattr(BrowserExtensionRuntime, "instance", instance)
+    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", cleanup)
+
+    await run_commands._run_mcp_with_cleanup(run_async, browser_extension=True)
+
+    cleanup.assert_awaited_once_with()
+    instance.assert_called_once_with()
+    assert [task for task in asyncio.all_tasks() if task is not asyncio.current_task()] == []
 
 
 @pytest.mark.parametrize("transport", ["sse", "streamable-http"])

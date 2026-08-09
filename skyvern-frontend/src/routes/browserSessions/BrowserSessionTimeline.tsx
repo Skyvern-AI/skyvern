@@ -183,9 +183,14 @@ function BrowserSessionTimeline() {
   if (timeline.length === 0) {
     return (
       <div className="flex h-full w-full items-center justify-center">
-        <div className="max-w-lg text-center text-lg text-gray-500">
-          No timeline events available yet — actions, downloads, and recordings
-          will appear here as they become available.
+        <div className="text-center">
+          <div className="mb-2 text-lg text-gray-500">
+            No timeline events available yet
+          </div>
+          <div className="text-sm text-gray-400">
+            actions, downloads, and recordings will appear here as they become
+            available.
+          </div>
         </div>
       </div>
     );
