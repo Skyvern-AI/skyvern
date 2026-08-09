@@ -33,7 +33,14 @@ interface UseCdpInputReturn {
     handleKeyDown: (e: React.KeyboardEvent) => void;
     handleKeyUp: (e: React.KeyboardEvent) => void;
   };
+  navigate: (url: string) => void;
+  navigateError: string | null;
 }
+
+const NAVIGATE_ERROR_MESSAGES: Record<string, string> = {
+  blocked: "That destination isn't allowed.",
+  invalid_url: "Enter a valid http(s) URL.",
+};
 
 export function useCdpInput({
   inputWsUrl,
@@ -43,6 +50,7 @@ export function useCdpInput({
 }: UseCdpInputOptions): UseCdpInputReturn {
   const [userIsControlling, setUserIsControlling] = useState(false);
   const [inputReady, setInputReady] = useState(false);
+  const [navigateError, setNavigateError] = useState<string | null>(null);
   const credentialGetter = useCredentialGetter();
   const clientId = useClientIdStore((s) => s.clientId);
 
@@ -93,9 +101,16 @@ export function useCdpInput({
             );
             inputReconnectAttemptsRef.current = 0;
             setInputReady(true);
+            setNavigateError(null);
             if (userIsControllingRef.current) {
               ws.send(JSON.stringify({ kind: "take-control" }));
             }
+          }
+          if (msg.kind === "navigate-error") {
+            setNavigateError(
+              NAVIGATE_ERROR_MESSAGES[msg.reason] ??
+                "Couldn't navigate to that URL.",
+            );
           }
         } catch {
           // ignore non-JSON messages
@@ -160,6 +175,9 @@ export function useCdpInput({
   }, [userIsControlling]);
 
   useEffect(() => {
+    // A stale error from a prior take-control stint should not linger next to a page
+    // that has since been ceded, retaken, and possibly navigated by other means.
+    setNavigateError(null);
     const ws = inputSocketRef.current;
     const kind = userIsControlling ? "take-control" : "cede-control";
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -357,6 +375,15 @@ export function useCdpInput({
     [interactive, userIsControlling, sendInputEvent],
   );
 
+  const navigate = useCallback(
+    (url: string) => {
+      if (!interactive || !userIsControlling) return;
+      setNavigateError(null);
+      sendInputEvent({ type: "navigateEvent", url });
+    },
+    [interactive, userIsControlling, sendInputEvent],
+  );
+
   return {
     userIsControlling,
     setUserIsControlling,
@@ -369,5 +396,7 @@ export function useCdpInput({
       handleKeyDown,
       handleKeyUp,
     },
+    navigate,
+    navigateError,
   };
 }

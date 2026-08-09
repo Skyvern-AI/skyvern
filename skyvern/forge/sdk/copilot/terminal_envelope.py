@@ -12,7 +12,7 @@ LOG = structlog.get_logger(__name__)
 
 TerminalNextState = Literal["completed", "proposal_pending", "awaiting_user_input", "stopped"]
 TerminalResponseKind = Literal["question", "update", "answer", "stopped"]
-TerminalCause = Literal["deadline_expired"]
+TerminalCause = Literal["deadline_expired", "max_turns_exceeded"]
 _FINAL_RUN_VERDICTS = frozenset({"demonstrated", "not_demonstrated", "not_evaluated"})
 _REVIEW_PROPOSAL_DISPOSITIONS = frozenset({"review_untested", "review_tested"})
 _SHADOW_REASON_TRAILING_PUNCTUATION = ".,;:!?"
