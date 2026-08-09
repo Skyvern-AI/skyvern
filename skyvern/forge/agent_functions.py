@@ -1190,6 +1190,22 @@ class AgentFunction:
         """
         return False
 
+    async def should_route_to_secure_runner_pool(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str | None,
+        workflow_permanent_id: str | None = None,
+        workflow_id: str | None = None,
+    ) -> bool:
+        """Whether this run must be dispatched to a worker pool that has the runner sidecar.
+
+        Answered at dispatch, before a queue is chosen, so it is run-level: no block context
+        exists yet. OSS has no runner and returns False; cloud overrides to consult the same
+        gate as should_use_codeblock_runner.
+        """
+        return False
+
     async def execute_code_block_override(
         self,
         *,
