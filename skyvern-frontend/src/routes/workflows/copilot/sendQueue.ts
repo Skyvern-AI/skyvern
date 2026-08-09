@@ -9,6 +9,7 @@ export type SendAction =
   | "send"
   | "queue_working"
   | "queue_live_browser"
+  | "replace_queued"
   | "noop";
 
 type ResolveSendInput = {
@@ -38,8 +39,11 @@ export function resolveSendAction({
   if (!candidate.trim()) {
     return "noop";
   }
+  // One queued prompt at a time still holds — a second send rewrites the one
+  // that's parked rather than being swallowed, so the composer is never a
+  // dead box while a turn is parked waiting on the user.
   if (hasQueuedPrompt && !isDrain) {
-    return "noop";
+    return "replace_queued";
   }
   if (inFlight) {
     return "queue_working";

@@ -92,6 +92,22 @@ class PersistentSessionsManager(Protocol):
         """Get the browser state for a session."""
         ...
 
+    async def get_observer_browser_state(
+        self, session_id: str, organization_id: str | None = None
+    ) -> BrowserState | None:
+        """Get the browser state for a session to watch it, never to drive it.
+
+        A watcher must not arm request interception on a browser a run is driving, and must not
+        publish what it connects into any cache a run could pick up. Pair every call with
+        ``release_observer_browser_state`` — whether that releases anything is the implementation's
+        to know, since a manager that returns a state it already drives must not tear it down.
+        """
+        ...
+
+    async def release_observer_browser_state(self, session_id: str, browser_state: BrowserState) -> None:
+        """Release what ``get_observer_browser_state`` handed out. Never closes the remote browser."""
+        ...
+
     async def set_browser_state(
         self, session_id: str, browser_state: BrowserState, organization_id: str | None = None
     ) -> None:

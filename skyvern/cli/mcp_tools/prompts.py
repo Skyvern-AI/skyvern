@@ -406,11 +406,9 @@ or what the data looks like), not the schema.
 
 ## Caching Considerations
 
-Workflows created via MCP default to AI agent execution (run_with="agent"). For JSON definitions \
-code_version=2 is also injected by default; YAML definitions use the backend schema (currently \
-leaves code_version unset, so pass `code_version: 2` explicitly in YAML if you want to opt into \
-the v2 caching framework). Set run_with="code" on the workflow (or at run time) to opt into cached \
-script execution.
+When omitted, run_with defaults to "agent" and code_version defaults to 2 for workflows created \
+via MCP, for both JSON and YAML definitions. Set run_with="code" on the workflow (or at run time) \
+to opt into cached script execution.
 {CODE_ONLY_SCHEMA_GUIDANCE}
 
 ### What this means for workflow design

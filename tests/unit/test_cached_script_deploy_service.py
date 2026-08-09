@@ -282,6 +282,9 @@ def _stub_app(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
                 previous_workflow_script=state.previous_workflow_script,
             )
 
+        async def get_workflow_script(self, **kwargs: object) -> None:
+            return None
+
         async def create_workflow_script(self, **kwargs: object) -> SimpleNamespace:
             state.workflow_script_upserts.append(kwargs)
             return SimpleNamespace(**kwargs)
