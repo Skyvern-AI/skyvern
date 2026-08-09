@@ -11,9 +11,8 @@ import pytest
 
 from skyvern.config import settings
 from skyvern.constants import DOWNLOAD_FILE_PREFIX
-from skyvern.exceptions import BlockedHost, HttpException, SkyvernHTTPException
+from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge.sdk.api import files
-from skyvern.forge.sdk.core.http_request_authorization import RedirectHopAuthorization
 from skyvern.utils.url_validators import MAX_SAFE_REDIRECTS
 
 ATTACKER_ORG_ID = "o_attacker"
@@ -266,165 +265,6 @@ async def test_download_file_blocks_hostname_resolving_to_private_ip(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_policy_grant_cannot_bypass_ssrf_lower_bound(monkeypatch: pytest.MonkeyPatch) -> None:
-    def resolves_private(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
-        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.42", port or 0))]
-
-    async def allow(
-        _authorization: RedirectHopAuthorization,
-        dispatch: object,
-    ) -> object:
-        return await dispatch(())  # type: ignore[operator]
-
-    authorizer = AsyncMock(side_effect=allow)
-    client_session = MagicMock()
-    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_private)
-    monkeypatch.setattr(files.aiohttp, "ClientSession", client_session)
-
-    with pytest.raises(BlockedHost):
-        await files.download_file(
-            "https://evil.example.test/secret.pdf",
-            authorize_request_hop=authorizer,
-        )
-
-    authorizer.assert_not_awaited()
-    client_session.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_download_file_authorizes_every_redirect_hop_before_dispatch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def resolves_public(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
-        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
-
-    class Content:
-        async def iter_chunked(self, chunk_size: int) -> AsyncIterator[bytes]:
-            yield b"file-bytes"
-
-    def response(status: int, location: str | None = None) -> AsyncMock:
-        item = AsyncMock()
-        item.status = status
-        item.headers = {"Location": location} if location is not None else {}
-        item.content_length = len(b"file-bytes")
-        item.content = Content()
-        item.__aenter__ = AsyncMock(return_value=item)
-        item.__aexit__ = AsyncMock(return_value=None)
-        return item
-
-    responses = [
-        response(302, "/middle.pdf"),
-        response(307, "https://example.com/final.pdf"),
-        response(200),
-    ]
-    mock_session = MagicMock()
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=None)
-    mock_session.get = MagicMock(side_effect=lambda *_args, **_kwargs: responses.pop(0))
-    authorizations: list[RedirectHopAuthorization] = []
-
-    async def authorize(
-        authorization: RedirectHopAuthorization,
-        dispatch: object,
-    ) -> object:
-        authorizations.append(authorization)
-        return await dispatch(())  # type: ignore[operator]
-
-    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_public)
-    monkeypatch.setattr(files.aiohttp, "ClientSession", MagicMock(return_value=mock_session))
-
-    result = await files.download_file(
-        "https://example.com/start.pdf",
-        output_dir=str(tmp_path),
-        authorize_request_hop=authorize,
-    )
-
-    assert Path(result).read_bytes() == b"file-bytes"
-    assert authorizations == [
-        RedirectHopAuthorization(None, "https://example.com/start.pdf", "GET"),
-        RedirectHopAuthorization("https://example.com/start.pdf", "https://example.com/middle.pdf", "GET"),
-        RedirectHopAuthorization("https://example.com/middle.pdf", "https://example.com/final.pdf", "GET"),
-    ]
-    assert mock_session.get.call_count == 3
-
-
-@pytest.mark.asyncio
-async def test_fetch_file_bytes_returns_metadata_and_authorizes_each_validated_hop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def resolves_public(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
-        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
-
-    class Content:
-        async def iter_chunked(self, chunk_size: int) -> AsyncIterator[bytes]:
-            yield b"pdf-body"
-
-    def response(status: int, headers: dict[str, str]) -> AsyncMock:
-        item = AsyncMock()
-        item.status = status
-        item.headers = headers
-        item.content_length = len(b"pdf-body")
-        item.content = Content()
-        item.__aenter__ = AsyncMock(return_value=item)
-        item.__aexit__ = AsyncMock(return_value=None)
-        return item
-
-    responses = [
-        response(302, {"Location": "/artifact"}),
-        response(
-            200,
-            {
-                "Content-Type": "application/pdf",
-                "Content-Disposition": 'attachment; filename="statement.pdf"',
-            },
-        ),
-    ]
-    mock_session = MagicMock()
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=None)
-    mock_session.get = MagicMock(side_effect=lambda *_args, **_kwargs: responses.pop(0))
-    authorizations: list[RedirectHopAuthorization] = []
-
-    async def authorize(authorization: RedirectHopAuthorization, dispatch: object) -> object:
-        authorizations.append(authorization)
-        return await dispatch(())  # type: ignore[operator]
-
-    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_public)
-    monkeypatch.setattr(files.aiohttp, "ClientSession", MagicMock(return_value=mock_session))
-
-    result = await files.fetch_file_bytes(
-        "https://public.example/start",
-        max_size_mb=1,
-        authorize_request_hop=authorize,
-    )
-
-    assert result.body == b"pdf-body"
-    assert result.content_type == "application/pdf"
-    assert result.filename == "statement.pdf"
-    assert authorizations == [
-        RedirectHopAuthorization(None, "https://public.example/start", "GET"),
-        RedirectHopAuthorization("https://public.example/start", "https://public.example/artifact", "GET"),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_fetch_file_bytes_does_not_authorize_invalid_target(monkeypatch: pytest.MonkeyPatch) -> None:
-    authorizer = AsyncMock()
-    client_session = MagicMock()
-    monkeypatch.setattr(files.aiohttp, "ClientSession", client_session)
-
-    with pytest.raises(SkyvernHTTPException):
-        await files.fetch_file_bytes(
-            "file:///etc/passwd",
-            authorize_request_hop=authorizer,
-        )
-
-    authorizer.assert_not_awaited()
-    client_session.assert_not_called()
-
-
-@pytest.mark.asyncio
 async def test_download_file_rejects_unsafe_redirect_target(monkeypatch: pytest.MonkeyPatch) -> None:
     def resolves_public(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
         return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
@@ -447,36 +287,6 @@ async def test_download_file_rejects_unsafe_redirect_target(monkeypatch: pytest.
         await files.download_file("https://example.com/start.pdf")
 
     mock_session.get.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_download_file_blocks_cross_origin_redirect_when_origin_is_pinned(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def resolves_public(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
-        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
-
-    redirect_response = AsyncMock()
-    redirect_response.status = 307
-    redirect_response.headers = {"Location": "https://other.example.com/collect?secret=value"}
-    redirect_response.__aenter__ = AsyncMock(return_value=redirect_response)
-    redirect_response.__aexit__ = AsyncMock(return_value=None)
-    mock_session = MagicMock()
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=None)
-    mock_session.get = MagicMock(return_value=redirect_response)
-    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_public)
-    monkeypatch.setattr(files.aiohttp, "ClientSession", MagicMock(return_value=mock_session))
-
-    with pytest.raises(HttpException) as exc_info:
-        await files.download_file(
-            "https://example.com/start.pdf",
-            allowed_redirect_origin="https://example.com",
-        )
-
-    assert exc_info.value.url == "[redacted]"
-    assert exc_info.value.error_message == "Cross-origin redirect blocked by policy"
-    assert mock_session.get.call_count == 1
 
 
 @pytest.mark.asyncio

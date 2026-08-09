@@ -5,7 +5,6 @@ from zoneinfo import ZoneInfo
 import pytest
 import structlog.testing
 
-from skyvern.exceptions import ActionPolicyBlocked
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.webeye.actions import handler
@@ -778,11 +777,7 @@ async def _run_outcome_case(
     )
     get_skyvern_element = AsyncMock(return_value=selected)
     monkeypatch.setattr(handler.app, "EXPERIMENTATION_PROVIDER", provider)
-    monkeypatch.setattr(
-        handler.app,
-        "AGENT_FUNCTION",
-        SimpleNamespace(resolve_field_option=resolver, enforce_browser_action_policy=Mock()),
-    )
+    monkeypatch.setattr(handler.app, "AGENT_FUNCTION", SimpleNamespace(resolve_field_option=resolver))
     monkeypatch.setattr(
         handler,
         "_read_custom_select_matched_state",
@@ -1095,7 +1090,6 @@ async def test_outcome_event_once_per_dropdown_level_with_group_id(monkeypatch: 
         handler.app,
         "AGENT_FUNCTION",
         SimpleNamespace(
-            enforce_browser_action_policy=Mock(),
             resolve_field_option=AsyncMock(
                 return_value=SimpleNamespace(
                     fallback_to_llm=False,
@@ -1103,7 +1097,7 @@ async def test_outcome_event_once_per_dropdown_level_with_group_id(monkeypatch: 
                     matched_label="Choice",
                     matched_tier="exact",
                 )
-            ),
+            )
         ),
     )
     monkeypatch.setattr(
@@ -1175,7 +1169,6 @@ async def _run_post_reset_fallback_case(
     llm_response: object,
     entry_action_type: str = "input_text",
     input_value_reads: list[str | None] | None = None,
-    policy_guard: Mock | None = None,
 ) -> tuple[object, list[dict[str, object]], MagicMock, MagicMock, BaseException | None, AsyncMock]:
     handler._COLLAPSE_XP_ASSIGNMENT_MEMO.clear()
     monkeypatch.setattr(
@@ -1190,7 +1183,6 @@ async def _run_post_reset_fallback_case(
         handler.app,
         "AGENT_FUNCTION",
         SimpleNamespace(
-            enforce_browser_action_policy=policy_guard or Mock(),
             resolve_field_option=AsyncMock(
                 return_value=SimpleNamespace(
                     fallback_to_llm=False,
@@ -1198,7 +1190,7 @@ async def _run_post_reset_fallback_case(
                     matched_label="Committed Value",
                     matched_tier="exact",
                 )
-            ),
+            )
         ),
     )
     llm_handler = (
@@ -1275,7 +1267,7 @@ async def _run_post_reset_fallback_case(
                     entry_action_type=entry_action_type,
                     selection_group_id="group-1",
                 )
-            except BaseException as exc:
+            except Exception as exc:
                 raised = exc
 
     events = [log for log in logs if log.get("event") == "custom_select_family_outcome"]
@@ -1332,30 +1324,6 @@ async def test_post_reset_restored_text_is_retyped_and_emits_single_proceeded_ou
     assert events[0]["family_gate_enabled"] is True
     assert events[0]["assigned"] is True
     assert events[0]["llm_fallback_requested"] is True
-
-
-@pytest.mark.asyncio
-async def test_post_reset_policy_block_stops_retype_before_browser_mutation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    policy_guard = Mock(side_effect=[None, ActionPolicyBlocked("blocked post-reset retype")])
-
-    result, events, input_element, reset_locator, raised, _ = await _run_post_reset_fallback_case(
-        monkeypatch,
-        llm_response={"id": "matched-id", "value": "Committed Value", "action_type": "input_text"},
-        policy_guard=policy_guard,
-    )
-
-    assert result is None
-    assert isinstance(raised, ActionPolicyBlocked)
-    assert [call.args for call in policy_guard.call_args_list] == [
-        (handler.ActionType.CLICK,),
-        (handler.ActionType.INPUT_TEXT,),
-    ]
-    assert [call.args for call in reset_locator.fill.await_args_list] == [("",), ("Committed Value",)]
-    input_element.input_clear.assert_not_awaited()
-    input_element.input_sequentially.assert_not_awaited()
-    assert events == []
 
 
 @pytest.mark.asyncio

@@ -7,9 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from skyvern.exceptions import ActionPolicyBlocked, ScrapingFailed, SkyvernActionFailed
+from skyvern.exceptions import ScrapingFailed, SkyvernActionFailed
 from skyvern.forge.sdk.routes.sdk import _sdk_action_context_refcounts, run_sdk_action
-from skyvern.forge.sdk.schemas.tasks import TaskStatus
 
 
 @pytest.fixture
@@ -95,69 +94,6 @@ async def test_handler_returns_422_when_action_raises_skyvern_action_failed(
     assert exc_info.value.status_code == 422
     assert "AI click failed" in str(exc_info.value.detail)
     mock_app.DATABASE.tasks.update_task.assert_awaited()
-
-
-@pytest.mark.asyncio
-async def test_handler_returns_403_when_action_policy_blocks(
-    mock_request: Any, mock_organization: Any, mock_app: Any
-) -> None:
-    blocked = ActionPolicyBlocked("extension denied action", step_id="stp_test", task_id="tsk_test")
-    with (
-        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
-        patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
-        patch(
-            "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
-            new_callable=AsyncMock,
-            side_effect=blocked,
-        ),
-    ):
-        mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)
-        with pytest.raises(HTTPException) as exc_info:
-            await run_sdk_action(mock_request, organization=mock_organization)
-
-    assert exc_info.value.status_code == 403
-    assert exc_info.value.detail == blocked.message
-    mock_app.AGENT_FUNCTION.register_browser_origin_authority.assert_called_once_with(
-        task_id="tsk_test",
-        workflow_run_id="wr_test",
-        url="https://example.com",
-    )
-    mock_app.DATABASE.tasks.update_task.assert_awaited_once_with(
-        task_id="tsk_test",
-        organization_id="o_test",
-        status=TaskStatus.failed,
-        failure_reason=blocked.message,
-    )
-
-
-@pytest.mark.asyncio
-async def test_origin_registration_failure_updates_task_and_runs_cleanup(
-    mock_request: Any, mock_organization: Any, mock_app: Any
-) -> None:
-    mock_app.AGENT_FUNCTION.register_browser_origin_authority.side_effect = RuntimeError("guard bind failed")
-    mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock()
-
-    with (
-        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
-        patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
-        patch(
-            "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
-            new_callable=AsyncMock,
-        ) as create_scraped_page,
-    ):
-        mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)
-        with pytest.raises(RuntimeError, match="guard bind failed"):
-            await run_sdk_action(mock_request, organization=mock_organization)
-
-    mock_app.DATABASE.tasks.update_task.assert_awaited_once_with(
-        task_id="tsk_test",
-        organization_id="o_test",
-        status=TaskStatus.failed,
-        failure_reason="guard bind failed",
-    )
-    mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks.assert_awaited_once_with(["tsk_test"])
-    mock_ctx.reset.assert_called_once_with()
-    create_scraped_page.assert_not_awaited()
 
 
 @pytest.mark.asyncio
