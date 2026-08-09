@@ -67,6 +67,7 @@ from skyvern.exceptions import (
     ConditionalBranchEvaluationError,
     ContextParameterValueNotFound,
     DownloadFileMaxSizeExceeded,
+    DownloadSaveIncompleteError,
     FailedToGetTOTPVerificationCode,
     MalformedBranchEvaluationError,
     MissingBrowserState,
@@ -343,17 +344,24 @@ def bind_downloaded_files_to_output(result: Any, downloaded_files: list[FileInfo
     return result
 
 
-def local_download_dir_file_names(download_run_id: str | None) -> set[str] | None:
-    """Names of the files currently sitting in the run's local download directory.
-
-    Host-side evidence the executing code cannot author: a snapshot taken before the block and one
-    after it discriminate a download this block produced from files earlier blocks left behind.
-    ``None`` means the directory could not be read — an unknown snapshot, never an empty one, so a
-    failed read cannot make pre-existing files look new."""
+def local_download_dir_file_identities(download_run_id: str | None) -> set[tuple[str, int, int]] | None:
+    """(name, size, mtime_ns) of the files in the run's local download directory, so a same-name
+    overwrite is visible in a before/after diff. ``None`` means the directory could not be read —
+    an unknown snapshot, never an empty one, so a failed read cannot make pre-existing files look
+    new; a single entry vanishing mid-scan is skipped rather than voiding the whole snapshot."""
     if not download_run_id:
         return None
     try:
-        return {entry.name for entry in Path(get_download_dir(download_run_id)).iterdir() if entry.is_file()}
+        identities: set[tuple[str, int, int]] = set()
+        for entry in Path(get_download_dir(download_run_id)).iterdir():
+            try:
+                if not entry.is_file():
+                    continue
+                stat = entry.stat()
+            except OSError:
+                continue
+            identities.add((entry.name, stat.st_size, stat.st_mtime_ns))
+        return identities
     except Exception:
         return None
 
@@ -4492,15 +4500,17 @@ async def wrapper({default_args}):
         workflow_run_id: str,
         workflow_run_block_id: str,
         download_run_id: str | None = None,
-    ) -> list[FileInfo] | None:
-        """Registered downloads, or ``None`` when registration could not complete.
+    ) -> tuple[list[FileInfo] | None, set[str]]:
+        """Registered downloads, plus the names of files whose save storage skipped.
 
         ``None`` is not an empty registration: workflow finalization retries the save, so a caller
-        must not read a storage timeout as proof that nothing was downloaded."""
+        must not read a storage timeout as proof that nothing was downloaded. A partial save returns
+        what did register plus the skipped names, so saved files keep their evidence while the
+        binding verdict can abstain for exactly the files storage dropped."""
         # Register up front so the block output carries downloaded_file_urls for
         # downstream blocks in the same run; workflow finalization re-runs the save safely.
         if not organization_id:
-            return None
+            return None, set()
         storage_run_id = download_run_id or workflow_run_id
         try:
             async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
@@ -4514,7 +4524,21 @@ async def wrapper({default_args}):
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
             )
-            return None
+            return None, set()
+        except DownloadSaveIncompleteError as exc:
+            LOG.warning(
+                "Storage skipped saving some downloaded files; will retry at workflow finalization",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                skipped_file_count=len(exc.skipped_files),
+            )
+            partial_files = await self._read_back_downloaded_files(
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                download_run_id=storage_run_id,
+            )
+            return partial_files, set(exc.skipped_files)
         except Exception:
             LOG.warning(
                 "CodeBlock failed to register downloaded files; will retry at workflow finalization",
@@ -4522,13 +4546,14 @@ async def wrapper({default_args}):
                 workflow_run_block_id=workflow_run_block_id,
                 exc_info=True,
             )
-            return None
-        return await self._read_back_downloaded_files(
+            return None, set()
+        registered_files = await self._read_back_downloaded_files(
             organization_id=organization_id,
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
             download_run_id=storage_run_id,
         )
+        return registered_files, set()
 
     async def _read_back_downloaded_files(
         self,
@@ -4569,12 +4594,13 @@ async def wrapper({default_args}):
         engine: str,
         result: Any,
         downloaded_files: list[FileInfo] | None,
-        download_dir_before: set[str] | None,
+        download_dir_before: set[tuple[str, int, int]] | None,
         resolved_download_id: str | None,
         workflow_run_context: WorkflowRunContext,
         workflow_run_id: str,
         workflow_run_block_id: str,
         organization_id: str | None,
+        skipped_file_names: set[str],
         authored_registration: bool = False,
     ) -> tuple[Any, str | None]:
         """Bind registration evidence into the block output, returning a failure reason if it cannot.
@@ -4609,6 +4635,7 @@ async def wrapper({default_args}):
             )
             return result, None
         current_context = skyvern_context.current()
+        registered_file_names = {file_info.filename for file_info in downloaded_files}
         downloaded_files = filter_downloaded_files_for_current_iteration(
             downloaded_files,
             current_context.loop_internal_state if current_context else None,
@@ -4623,9 +4650,25 @@ async def wrapper({default_args}):
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
         )
+
+        def _log_verdict_skipped_for_partial_save() -> None:
+            # A partial save may have skipped exactly the file a verdict would blame the code
+            # for; emitted only on abstaining exits, so the log never coexists with an accusation.
+            if skipped_file_names:
+                LOG.warning(
+                    "codeblock.download_binding_verdict_skipped",
+                    engine=engine,
+                    reason="registration_incomplete",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    block_label=self.label,
+                    organization_id=organization_id,
+                )
+
         if downloaded_files:
+            _log_verdict_skipped_for_partial_save()
             return output, None
-        download_dir_after = local_download_dir_file_names(resolved_download_id)
+        download_dir_after = local_download_dir_file_identities(resolved_download_id)
         if download_dir_after is None or download_dir_before is None:
             LOG.warning(
                 "codeblock.download_binding_verdict_skipped",
@@ -4637,8 +4680,15 @@ async def wrapper({default_args}):
                 organization_id=organization_id,
             )
             return output, None
-        new_file_names = download_dir_after - download_dir_before
-        if not new_file_names:
+        new_files = download_dir_after - download_dir_before
+        if not new_files:
+            _log_verdict_skipped_for_partial_save()
+            return output, None
+        unaccounted = {name for name, _, _ in new_files} - registered_file_names - skipped_file_names
+        if not unaccounted:
+            # Every new file is either registered to this run (the filter above merely attributed
+            # it elsewhere) or named by storage as skipped — neither is a download the code swallowed.
+            _log_verdict_skipped_for_partial_save()
             return output, None
         LOG.error(
             "codeblock.download_on_disk_unbound",
@@ -4646,7 +4696,7 @@ async def wrapper({default_args}):
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
             block_label=self.label,
-            new_file_count=len(new_file_names),
+            new_file_count=len(unaccounted),
             organization_id=organization_id,
         )
         return unbound_download_output(output), DOWNLOAD_BINDING_FAILURE_REASON
@@ -5418,7 +5468,7 @@ async def wrapper({default_args}):
         workflow_run_block_id: str,
         organization_id: str | None,
         resolved_download_id: str | None,
-        download_dir_before: set[str] | None,
+        download_dir_before: set[tuple[str, int, int]] | None,
         result: dict[str, Any] | list | str | None = None,
     ) -> dict[str, Any] | None:
         """Registration evidence for a block that failed after a download already landed.
@@ -5427,24 +5477,28 @@ async def wrapper({default_args}):
         nothing keeps whatever output the caller supplied. The block is already failing for its own
         reason, so the binding verdict is discarded here — only the evidence is kept, bound onto the
         caller's failure payload when one exists."""
-        download_dir_after = local_download_dir_file_names(resolved_download_id)
+        download_dir_after = local_download_dir_file_identities(resolved_download_id)
         if download_dir_after is None or download_dir_before is None:
             return None
-        new_file_names = download_dir_after - download_dir_before
-        if not new_file_names:
+        new_files = download_dir_after - download_dir_before
+        if not new_files:
             return None
         # Read back before saving so a sidecar run that already uploaded is not uploaded twice, but
         # skip the save only when the read-back already accounts for what this block added — an
-        # earlier block's registration is not evidence for this one's file.
+        # earlier block's registration is not evidence for this one's file, and a registration
+        # made before an overwrite is stale for the rewritten bytes.
         downloaded_files = await self._read_back_downloaded_files(
             organization_id=organization_id or workflow_run_context.organization_id,
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
             download_run_id=resolved_download_id,
         )
+        skipped_file_names: set[str] = set()
         registered_names = {file_info.filename for file_info in downloaded_files or []}
-        if not new_file_names.issubset(registered_names):
-            downloaded_files = await self._register_downloaded_files(
+        new_names = {name for name, _, _ in new_files}
+        before_names = {name for name, _, _ in download_dir_before}
+        if new_names & before_names or not new_names.issubset(registered_names):
+            downloaded_files, skipped_file_names = await self._register_downloaded_files(
                 organization_id=organization_id or workflow_run_context.organization_id,
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
@@ -5454,6 +5508,7 @@ async def wrapper({default_args}):
             engine=engine,
             result=result,
             downloaded_files=downloaded_files,
+            skipped_file_names=skipped_file_names,
             download_dir_before=download_dir_before,
             resolved_download_id=resolved_download_id,
             workflow_run_context=workflow_run_context,
@@ -5478,7 +5533,7 @@ async def wrapper({default_args}):
         page: Page | None,
         engine: str,
         resolved_download_id: str | None,
-        download_dir_before: set[str] | None,
+        download_dir_before: set[tuple[str, int, int]] | None,
         output_parameter_value: dict[str, Any] | list | str | None = None,
         error_codes: list[str] | None = None,
     ) -> BlockResult:
@@ -5533,7 +5588,7 @@ async def wrapper({default_args}):
         browser_state: BrowserState | None = None,
         page: Page | None = None,
         resolved_download_id: str | None = None,
-        download_dir_before: set[str] | None = None,
+        download_dir_before: set[tuple[str, int, int]] | None = None,
     ) -> BlockResult:
         # Capture before the healable branch: a non-healable failure is exactly the case the
         # repair loop has the least to go on.
@@ -5556,7 +5611,7 @@ async def wrapper({default_args}):
                     # exit that recorded the heal's own output without ever looking at the run
                     # directory (SKY-13694's completed-with-null arm).
                     try:
-                        downloaded_files = await self._register_downloaded_files(
+                        downloaded_files, skipped_file_names = await self._register_downloaded_files(
                             organization_id=organization_id or workflow_run_context.organization_id,
                             workflow_run_id=workflow_run_id,
                             workflow_run_block_id=workflow_run_block_id,
@@ -5566,6 +5621,7 @@ async def wrapper({default_args}):
                             engine="inline",
                             result=result.output_parameter_value,
                             downloaded_files=downloaded_files,
+                            skipped_file_names=skipped_file_names,
                             download_dir_before=download_dir_before,
                             resolved_download_id=resolved_download_id,
                             workflow_run_context=workflow_run_context,
@@ -5955,7 +6011,7 @@ async def wrapper({default_args}):
             )
 
         resolved_download_id = resolve_run_download_id(block_context, fallback_run_id=workflow_run_id)
-        download_dir_before = local_download_dir_file_names(resolved_download_id)
+        download_dir_before = local_download_dir_file_identities(resolved_download_id)
         browser_state = await self.get_or_create_browser_state(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
@@ -6227,7 +6283,8 @@ async def wrapper({default_args}):
                     secure_output = secure_code_block_result.block_result.output_parameter_value
                     # The sidecar already saved what it downloaded, so read back rather than
                     # re-uploading; the save runs when the read-back does not account for the files
-                    # this block added — an earlier block's registration is not evidence for them.
+                    # this block added — an earlier block's registration is not evidence for them,
+                    # and a registration made before an overwrite is stale for the rewritten bytes.
                     try:
                         host_files = await self._read_back_downloaded_files(
                             organization_id=organization_id or workflow_run_context.organization_id,
@@ -6235,16 +6292,24 @@ async def wrapper({default_args}):
                             workflow_run_block_id=workflow_run_block_id,
                             download_run_id=resolved_download_id,
                         )
-                        secure_dir_after = local_download_dir_file_names(resolved_download_id)
+                        secure_skipped_file_names: set[str] = set()
+                        secure_dir_after = local_download_dir_file_identities(resolved_download_id)
                         secure_registered_names = {file_info.filename for file_info in host_files or []}
                         # An unreadable snapshot is unknown, never empty: coverage cannot be proven,
                         # so the save runs rather than being skipped on a coerced empty diff.
                         if secure_dir_after is None or download_dir_before is None:
-                            secure_new_file_names = None
+                            secure_new_names = None
+                            secure_before_names = None
                         else:
-                            secure_new_file_names = secure_dir_after - download_dir_before
-                        if secure_new_file_names is None or not secure_new_file_names.issubset(secure_registered_names):
-                            host_files = await self._register_downloaded_files(
+                            secure_new_names = {name for name, _, _ in secure_dir_after - download_dir_before}
+                            secure_before_names = {name for name, _, _ in download_dir_before}
+                        if (
+                            secure_new_names is None
+                            or secure_before_names is None
+                            or secure_new_names & secure_before_names
+                            or not secure_new_names.issubset(secure_registered_names)
+                        ):
+                            host_files, secure_skipped_file_names = await self._register_downloaded_files(
                                 organization_id=organization_id or workflow_run_context.organization_id,
                                 workflow_run_id=workflow_run_id,
                                 workflow_run_block_id=workflow_run_block_id,
@@ -6254,6 +6319,7 @@ async def wrapper({default_args}):
                             engine="secure_runner",
                             result=secure_output,
                             downloaded_files=host_files,
+                            skipped_file_names=secure_skipped_file_names,
                             download_dir_before=download_dir_before,
                             resolved_download_id=resolved_download_id,
                             workflow_run_context=workflow_run_context,
@@ -6478,7 +6544,7 @@ async def wrapper({default_args}):
             result = workflow_run_context.mask_secrets_in_data(result)
 
             try:
-                downloaded_files = await self._register_downloaded_files(
+                downloaded_files, skipped_file_names = await self._register_downloaded_files(
                     organization_id=organization_id or workflow_run_context.organization_id,
                     workflow_run_id=workflow_run_id,
                     workflow_run_block_id=workflow_run_block_id,
@@ -6488,6 +6554,7 @@ async def wrapper({default_args}):
                     engine="inline",
                     result=result,
                     downloaded_files=downloaded_files,
+                    skipped_file_names=skipped_file_names,
                     download_dir_before=download_dir_before,
                     resolved_download_id=resolved_download_id,
                     workflow_run_context=workflow_run_context,
@@ -11500,6 +11567,14 @@ class PrintPageBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
             )
             return []
+        except DownloadSaveIncompleteError as exc:
+            # The PDF may be among the files that did save; read back what registered.
+            LOG.warning(
+                "Storage skipped saving some downloaded files; reading back what registered",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                skipped_file_count=len(exc.skipped_files),
+            )
         except Exception:
             LOG.warning(
                 "PrintPageBlock failed to register PDF as downloaded file; will retry at workflow finalization",
