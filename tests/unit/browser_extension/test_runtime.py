@@ -11,6 +11,7 @@ import pytest
 import pytest_asyncio
 
 import skyvern.browser_extension.runtime as runtime_module
+from skyvern.browser_extension.broker.client import LegacyBridgeOwnerError
 from skyvern.browser_extension.errors import BrowserExtensionError
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime
 
@@ -24,7 +25,7 @@ class StubRelay:
         on_disconnect: Callable[[], Awaitable[None]] | None = None,
         *,
         calls: list[str],
-        start_error: OSError | None = None,
+        start_error: BaseException | None = None,
     ) -> None:
         self.token = token
         self.port = port
@@ -36,7 +37,7 @@ class StubRelay:
         self.connected = True
         self.stop_count = 0
 
-    def get_or_create_pairing_nonce(self) -> str:
+    async def acquire_pairing_nonce(self) -> str:
         return "runtime-pairing-nonce"
 
     async def start(self) -> None:
@@ -89,7 +90,7 @@ async def reset_runtime() -> AsyncGenerator[None]:
 def install_stubs(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    relay_start_error: OSError | None = None,
+    relay_start_error: BaseException | None = None,
 ) -> tuple[list[StubRelay], list[StubAdapter], list[str]]:
     relays: list[StubRelay] = []
     adapters: list[StubAdapter] = []
@@ -113,6 +114,7 @@ def install_stubs(
         return adapter
 
     monkeypatch.setattr(runtime_module, "_relay_factory", relay_factory)
+    monkeypatch.setattr(runtime_module, "_broker_factory", relay_factory)
     monkeypatch.setattr(runtime_module, "_adapter_factory", adapter_factory)
     monkeypatch.setattr(runtime_module, "load_or_create_pairing_token", lambda: "runtime-test-token")
     return relays, adapters, calls
@@ -149,11 +151,60 @@ async def test_open_pairing_page_uses_relay_nonce_without_exposing_token(monkeyp
     monkeypatch.setattr(BrowserExtensionRuntime, "open_extension_url", staticmethod(opener))
     runtime = await BrowserExtensionRuntime.get_or_start(21003)
 
-    assert runtime.open_pairing_page()
-    assert runtime.open_pairing_page()
+    assert await runtime.open_pairing_page()
+    assert await runtime.open_pairing_page()
     opener.assert_called_with("http://127.0.0.1:21003/pair#runtime-pairing-nonce")
     assert opener.call_count == 2
     assert "runtime-test-token" not in opener.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_broker_is_the_default_transport_and_the_env_flag_opts_back_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chosen: list[str] = []
+
+    def make_factory(name: str):
+        def factory(token, port, on_event, on_disconnect) -> StubRelay:
+            chosen.append(name)
+            return StubRelay(token, port, on_event, on_disconnect, calls=[])
+
+        return factory
+
+    monkeypatch.setattr(runtime_module, "_relay_factory", make_factory("relay"))
+    monkeypatch.setattr(runtime_module, "_broker_factory", make_factory("broker"))
+    monkeypatch.setattr(
+        runtime_module, "_adapter_factory", lambda registry, relay: StubAdapter(registry, relay, calls=[])
+    )
+    monkeypatch.setattr(runtime_module, "load_or_create_pairing_token", lambda: "runtime-test-token")
+
+    brokered = await BrowserExtensionRuntime.get_or_start(21010)
+    assert brokered.brokered
+    await brokered.shutdown()
+
+    monkeypatch.setenv("SKYVERN_BROWSER_EXTENSION_BROKER", "0")
+    legacy = await BrowserExtensionRuntime.get_or_start(21011)
+    assert not legacy.brokered
+    await legacy.shutdown()
+
+    assert chosen == ["broker", "relay"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_bridge_owner_explains_that_the_other_session_cannot_share(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, adapters, _ = install_stubs(monkeypatch, relay_start_error=LegacyBridgeOwnerError("held"))
+
+    with pytest.raises(BrowserExtensionError) as error_info:
+        await BrowserExtensionRuntime.get_or_start(23002)
+
+    message = str(error_info.value)
+    assert "23002" in message
+    assert "older Skyvern MCP session" in message
+    assert "restart that session" in message
+    assert adapters[0].stop_count == 1
+    assert BrowserExtensionRuntime.instance() is None
 
 
 def test_open_extension_url_targets_google_chrome_on_macos(monkeypatch: pytest.MonkeyPatch) -> None:

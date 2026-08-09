@@ -89,8 +89,12 @@ def setup_new_copilot_mocks(
             return_value=SimpleNamespace(created_at=datetime(2026, 4, 14, tzinfo=timezone.utc))
         ),
         start_copilot_turn=AsyncMock(
-            return_value=SimpleNamespace(created_at=datetime(2026, 4, 14, tzinfo=timezone.utc))
+            return_value=SimpleNamespace(
+                workflow_copilot_chat_message_id="wccm-user-1",
+                created_at=datetime(2026, 4, 14, tzinfo=timezone.utc),
+            )
         ),
+        replace_workflow_copilot_chat_message=AsyncMock(),
         claim_pending_copilot_turn=AsyncMock(return_value=True),
         clear_pending_copilot_turn=AsyncMock(),
     )
