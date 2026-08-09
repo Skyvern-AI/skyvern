@@ -33,6 +33,10 @@ from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_carrier
 from skyvern.forge.sdk.copilot.composition_evidence import SCOUT_INTERACTION_EVIDENCE_TOOL
+from skyvern.forge.sdk.copilot.credential_fill_fields import (
+    CREDENTIAL_FILL_FIELDS,
+    LIVE_SCOUT_CREDENTIAL_FIELDS,
+)
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     FrozenRequestedOutputExtractionCandidate,
     LiveReadBinding,
@@ -94,7 +98,7 @@ _DOWNLOAD_PATH_VAR_BASE = "_downloaded_file_path"
 _DOWNLOAD_OUTPUT_VAR_BASE = "downloaded_files"
 
 CREDENTIAL_FILL_TOOL_NAME = "fill_credential_field"
-_CREDENTIAL_FIELDS = frozenset({"username", "password", "totp"})
+_CREDENTIAL_FIELDS = CREDENTIAL_FILL_FIELDS
 
 # Shape of a synthesized credential fill, ``.fill(<param>.<field>)`` or the runtime OTP
 # accessor ``.fill(await <param>.otp())`` — distinguishes a login fill from a plain
@@ -102,7 +106,6 @@ _CREDENTIAL_FIELDS = frozenset({"username", "password", "totp"})
 CREDENTIAL_FILL_CODE_PATTERN = re.compile(r"\.fill\(\s*(?:[A-Za-z_]\w*\.\w+|await\s+[A-Za-z_]\w*\.otp\(\))\s*\)")
 # Credential fields the scout must fill live before a code block reading them may persist;
 # `.otp()` resolves at runtime only, so totp never requires (or credits) a live scout fill.
-LIVE_SCOUT_CREDENTIAL_FIELDS = frozenset({"username", "password"})
 ONE_TIME_CODE_CREDENTIAL_FIELD = "totp"
 
 
@@ -219,7 +222,7 @@ def _credential_field_accesses(code: str) -> list[CredentialFieldAccess]:
                 CredentialFieldAccess(
                     parameter_key=match.group("parameter"),
                     field=field,
-                    requires_live_scout=True,
+                    requires_live_scout=field in LIVE_SCOUT_CREDENTIAL_FIELDS,
                 )
             )
             continue
