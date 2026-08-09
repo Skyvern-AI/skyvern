@@ -42,6 +42,7 @@ from skyvern.errors.errors import (
     filter_to_user_defined_codes,
 )
 from skyvern.exceptions import (
+    ActionPolicyBlocked,
     BrowserSessionNotFound,
     DownloadFileMaxWaitingTime,
     DownloadSaveIncompleteError,
@@ -666,6 +667,8 @@ class ForgeAgent:
         for parameter in task_block_parameters:
             navigation_payload[parameter.key] = workflow_run_context.get_value(parameter.key)
 
+        # A URL rendered from workflow input is untrusted, so it must not become trusted authority.
+        declares_static_origin = task_block.declares_static_browser_origin(workflow_run_context)
         task_url = task_block.url
         if task_url is None:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(
@@ -712,6 +715,12 @@ class ForgeAgent:
             download_timeout=task_block.download_timeout,
             include_extracted_text=task_block.include_extracted_text,
         )
+        if declares_static_origin:
+            app.AGENT_FUNCTION.register_browser_origin_authority(
+                task_id=task.task_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                url=task.url,
+            )
         LOG.info(
             "Created a new task for workflow run",
             sampling=True,
@@ -1280,7 +1289,9 @@ class ForgeAgent:
                 list_files_before=list_files_before,
             )
             return step, detailed_output, None
-        except StepTerminationError as e:
+        except (StepTerminationError, ActionPolicyBlocked) as e:
+            # Extension action policies use a BaseException signal so it reaches this explicit run
+            # boundary through broad recovery handlers on the mutation paths.
             LOG.warning(
                 "Step cannot be executed, marking task as failed",
                 exc_info=True,
@@ -1471,7 +1482,7 @@ class ForgeAgent:
         step: Step | None,
         reason: str | None,
         browser_state: BrowserState | None = None,
-        exception: Exception | None = None,
+        exception: BaseException | None = None,
     ) -> bool:
         try:
             if step is not None:
@@ -1480,8 +1491,12 @@ class ForgeAgent:
                     status=StepStatus.failed,
                 )
 
-            # Update task status first
-            failure_category = classify_from_failure_reason(reason, exception=exception, fallback_to_unknown=True)
+            # Update task status first. A policy block is a BaseException, not a generic runtime failure,
+            # so keep it out of the Exception-typed classifier.
+            classifier_exception = exception if isinstance(exception, Exception) else None
+            failure_category = classify_from_failure_reason(
+                reason, exception=classifier_exception, fallback_to_unknown=True
+            )
             LOG.info(
                 "Task failure classified",
                 task_id=task.task_id,
@@ -1762,6 +1777,7 @@ class ForgeAgent:
             ScrapingFailed,
             MissingBrowserStatePage,
             ScreenshotTargetClosed,
+            StepTerminationError,
         ):
             raise
 
@@ -4345,6 +4361,7 @@ class ForgeAgent:
             )
         else:
             elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
+        elements_for_prompt = app.AGENT_FUNCTION.transform_browser_elements_for_prompt(elements_for_prompt)
 
         open_tabs_context = await build_open_tabs_context(browser_state, page)
         show_close_page_action = open_tabs_context is not None

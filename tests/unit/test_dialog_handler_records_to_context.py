@@ -82,9 +82,10 @@ async def test_record_failure_does_not_break_dialog_acceptance(
 
 @pytest.mark.asyncio
 async def test_non_alert_dialogs_are_not_recorded(
-    isolated_context: SkyvernContext,
+    isolated_context: SkyvernContext, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     isolated_context.navigation_goal = "test"
+    monkeypatch.setattr(dialog_handler.app, "SECONDARY_LLM_API_HANDLER", AsyncMock(return_value={"action": "accept"}))
 
     await dialog_handler._handle_dialog(_make_dialog("confirm", "Are you sure?"))
     await dialog_handler._handle_dialog(_make_dialog("prompt", "Enter your name:"))

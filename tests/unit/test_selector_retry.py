@@ -35,20 +35,24 @@ def _mock_skyvern_context(code_version=2):
     return ctx
 
 
+def _make_mock_page():
+    from skyvern.core.script_generations.skyvern_page import _PAGE_INTERNALS, SkyvernPage, _PageInternals
+
+    page = MagicMock(spec=SkyvernPage)
+    page._locator_scope = MagicMock()
+    page.engine_selection = None
+    _PAGE_INTERNALS[page] = _PageInternals(page=page._locator_scope, ai=MagicMock())
+    page._wait_for_selector_with_retry = SkyvernPage._wait_for_selector_with_retry.__get__(page)
+    return page
+
+
 @pytest.fixture
 def mock_page():
     """Create a minimal mock SkyvernPage with the retry method.
 
     Patches skyvern_context.current() to return code_version=2 so retries are enabled.
     """
-    from skyvern.core.script_generations.skyvern_page import SkyvernPage
-
-    page = MagicMock(spec=SkyvernPage)
-    page._locator_scope = MagicMock()
-    page.engine_selection = None
-
-    # Bind the real method to our mock
-    page._wait_for_selector_with_retry = SkyvernPage._wait_for_selector_with_retry.__get__(page)
+    page = _make_mock_page()
 
     # Patch skyvern_context.current() to return code_version=2 so retries are enabled
     with patch(
@@ -285,11 +289,7 @@ async def test_locator_reacquired_between_retries(mock_page):
 @pytest.mark.asyncio
 async def test_no_retry_for_code_v1():
     """Code version 1 scripts should NOT retry — fail immediately."""
-    from skyvern.core.script_generations.skyvern_page import SkyvernPage
-
-    page = MagicMock(spec=SkyvernPage)
-    page._locator_scope = MagicMock()
-    page._wait_for_selector_with_retry = SkyvernPage._wait_for_selector_with_retry.__get__(page)
+    page = _make_mock_page()
 
     locator = _make_locator(wait_for_side_effect=PlaywrightTimeoutError("Timeout"))
     page._locator_scope.locator.return_value = locator
@@ -313,11 +313,7 @@ async def test_no_retry_for_code_v1():
 @pytest.mark.asyncio
 async def test_no_retry_without_context():
     """When there's no SkyvernContext (e.g. non-script execution), no retries."""
-    from skyvern.core.script_generations.skyvern_page import SkyvernPage
-
-    page = MagicMock(spec=SkyvernPage)
-    page._locator_scope = MagicMock()
-    page._wait_for_selector_with_retry = SkyvernPage._wait_for_selector_with_retry.__get__(page)
+    page = _make_mock_page()
 
     locator = _make_locator(wait_for_side_effect=PlaywrightTimeoutError("Timeout"))
     page._locator_scope.locator.return_value = locator
