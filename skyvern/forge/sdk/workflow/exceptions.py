@@ -126,6 +126,15 @@ class InvalidFileType(BaseWorkflowHTTPException):
         )
 
 
+class FileParseTimeout(BaseWorkflowHTTPException):
+    def __init__(self, file_url: str, step: str, timeout_seconds: float) -> None:
+        super().__init__(
+            f"Timed out after {timeout_seconds}s while running {step} on file URL {file_url}. "
+            "The file is too large or too complex to parse within the time budget for a single block.",
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+
+
 class WorkflowDefinitionValidationException(BaseWorkflowHTTPException):
     """Base exception for workflow definition validation errors."""
 

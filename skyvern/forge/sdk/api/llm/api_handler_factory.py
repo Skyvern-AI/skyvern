@@ -204,6 +204,7 @@ VISION_FALLBACK_PROMPT_NAMES = {
     "css-shape-convert",
     "extract-text-from-image",
     "solve-arithmetic-captcha",
+    "solve-dice-captcha",
     "ui-tars-system-prompt",
 }
 

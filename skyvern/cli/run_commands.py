@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 if TYPE_CHECKING:
@@ -227,27 +228,78 @@ def _handle_mcp_shutdown_signal(_signum: int, _frame: Any) -> None:
     _mcp_main_task.cancel()
 
 
+def _log_mcp_boot_timings(
+    *,
+    transport: str,
+    env_started_at: float,
+    imports_started_at: float,
+    imports_finished_at: float,
+) -> None:
+    """Attribute the spawn-to-serving window, which MCP clients cap at tens of seconds."""
+    try:
+        spawn_ms = round((time.time() - psutil.Process().create_time()) * 1000)
+    except Exception:
+        spawn_ms = None
+    LOG.info(
+        "mcp_boot_ready",
+        transport=transport,
+        spawn_to_serve_ms=spawn_ms,
+        env_ms=round((imports_started_at - env_started_at) * 1000),
+        tool_import_ms=round((imports_finished_at - imports_started_at) * 1000),
+    )
+
+
+async def _start_browser_extension_bridge() -> None:
+    from skyvern.browser_extension.errors import BrowserExtensionError  # noqa: PLC0415
+    from skyvern.browser_extension.runtime import BrowserExtensionRuntime  # noqa: PLC0415
+
+    try:
+        await BrowserExtensionRuntime.get_or_start()
+    except BrowserExtensionError as exc:
+        LOG.warning(
+            "Browser extension bridge startup failed; the bridge will be retried on first browser-tool use",
+            error=str(exc),
+        )
+    except Exception:
+        LOG.warning(
+            "Browser extension bridge startup failed; the bridge will be retried on first browser-tool use",
+            exc_info=True,
+        )
+
+
+async def _settle_browser_extension_startup(startup: asyncio.Task[None]) -> None:
+    """Leave no half-started bridge behind: a relay that binds after we read the instance would leak its port."""
+    startup.cancel()
+    try:
+        await startup
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        LOG.warning("Browser extension bridge startup cleanup failed", exc_info=True)
+
+
 async def _run_mcp_with_cleanup(run_async: Any, *, browser_extension: bool = False, **kwargs: Any) -> None:
     global _mcp_cleanup_done, _mcp_cleanup_in_progress, _mcp_main_task
     current_task = asyncio.current_task()
     _mcp_main_task = current_task
-    extension_runtime: BrowserExtensionRuntime | None = None
+    extension_startup: asyncio.Task[None] | None = None
     try:
         if browser_extension:
-            from skyvern.browser_extension.runtime import BrowserExtensionRuntime  # noqa: PLC0415
-
-            extension_runtime = await BrowserExtensionRuntime.get_or_start()
+            # Serving `initialize` must not wait on the relay: clients give the server tens of seconds
+            # to mount, and browser tools already start the bridge on demand.
+            extension_startup = asyncio.create_task(_start_browser_extension_bridge())
         await run_async(**kwargs)
     finally:
         _mcp_cleanup_in_progress = True
         try:
             try:
+                if extension_startup is not None:
+                    await _settle_browser_extension_startup(extension_startup)
                 await _cleanup_mcp_resources()
             finally:
-                if extension_runtime is None:
-                    from skyvern.browser_extension.runtime import BrowserExtensionRuntime  # noqa: PLC0415
+                from skyvern.browser_extension.runtime import BrowserExtensionRuntime  # noqa: PLC0415
 
-                    extension_runtime = BrowserExtensionRuntime.instance()
+                extension_runtime = BrowserExtensionRuntime.instance()
                 if extension_runtime is not None:
                     await extension_runtime.shutdown()
         finally:
@@ -636,15 +688,18 @@ def run_mcp(
         raise typer.BadParameter("--browser-extension requires --transport stdio", param_hint="--browser-extension")
     if browser_extension:
         os.environ.setdefault("BROWSER_TYPE", "extension-connect")
+    profile_sweep_thread: threading.Thread | None = None
+    env_started_at = time.monotonic()
     prepare_cli_runtime(intent=EnvIntent.CLOUD)
     try:
         from skyvern.library.local_browser_profile import (  # noqa: PLC0415
-            sweep_local_browser_profiles_with_budget,
+            sweep_local_browser_profiles_once_in_background,
         )
 
-        sweep_local_browser_profiles_with_budget()
+        profile_sweep_thread = sweep_local_browser_profiles_once_in_background()
     except Exception:
         LOG.warning("local_browser_profile_startup_sweep_failed", exc_info=True)
+    imports_started_at = time.monotonic()
     from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware  # noqa: PLC0415
     from skyvern.cli.core.session_manager import (  # noqa: PLC0415
         set_stateless_http_mode,
@@ -653,9 +708,28 @@ def run_mcp(
     from skyvern.cli.mcp_tools import mcp  # noqa: PLC0415
     from skyvern.cli.mcp_tools.telemetry import configure_mcp_telemetry_runtime  # noqa: PLC0415
 
+    imports_finished_at = time.monotonic()
     path = _normalize_mcp_path(path)
     stateless_http_enabled = transport != "stdio" and stateless_http
-    configure_mcp_telemetry_runtime(server_mode="local_cli", transport=transport)
+    boot_ready_logged = False
+
+    def log_mcp_boot_ready() -> None:
+        nonlocal boot_ready_logged
+        if boot_ready_logged:
+            return
+        boot_ready_logged = True
+        _log_mcp_boot_timings(
+            transport=transport,
+            env_started_at=env_started_at,
+            imports_started_at=imports_started_at,
+            imports_finished_at=imports_finished_at,
+        )
+
+    configure_mcp_telemetry_runtime(
+        server_mode="local_cli",
+        transport=transport,
+        boot_ready_callback=log_mcp_boot_ready,
+    )
     # EOF dispatches the SIGINT cleanup handler; finally covers normal returns, with atexit as the last backstop.
     atexit.register(_cleanup_mcp_resources_sync)
     set_stateless_http_mode(stateless_http_enabled)
@@ -707,10 +781,14 @@ def run_mcp(
             set_stdio_local_file_access_enabled(False)
             set_concise_responses(False)
         finally:
-            for handled_signal, original_handler in original_signal_handlers.items():
-                signal.signal(handled_signal, original_handler)
-            if shutdown_complete is not None:
-                shutdown_complete.set()
+            try:
+                for handled_signal, original_handler in original_signal_handlers.items():
+                    signal.signal(handled_signal, original_handler)
+                if shutdown_complete is not None:
+                    shutdown_complete.set()
+            finally:
+                if profile_sweep_thread is not None:
+                    profile_sweep_thread.join()
 
 
 def _normalize_mcp_path(path: str) -> str:
