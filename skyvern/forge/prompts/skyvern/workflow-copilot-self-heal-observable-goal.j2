@@ -1,0 +1,12 @@
+Convert the runtime recovery instruction into one independently gradeable observable page state.
+Return only JSON in this exact shape:
+{"version":"1","observable_end_state":"<one concise state visible on the page>","source_citations":["<verbatim phrase from the instruction>"]}
+
+- Describe what must be visible after successful recovery, never the action to perform.
+- Do not copy imperative verbs such as click, type, submit, navigate, or select into the criterion.
+- Do not add requirements absent from the recovery instruction.
+- If the instruction gives multiple details, preserve only those needed to distinguish success.
+- Cite the exact instruction phrase(s) that establish the derived state. Never invent or paraphrase citations.
+
+Runtime recovery instruction:
+```{{ recovery_goal }}```
