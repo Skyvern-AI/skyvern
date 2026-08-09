@@ -681,3 +681,21 @@ async def test_gated_skip_does_not_advance_dedupe_digest(streaming_temp_dir: Pat
     await _drive_publish_once(pub)
     assert pub._last_published_digest is not None
     assert fake_storage.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_start_writes_remote_browser_sentinel_and_stop_leaves_it(streaming_temp_dir: Path) -> None:
+    pub = CDPFramePublisher(
+        browser_state=_make_browser_state(None, connected=False),
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+    )
+
+    await pub.start()
+    sentinel = streaming_temp_dir / ORG_ID / f"{STREAM_KEY}.remote"
+    assert sentinel.exists()
+
+    # Deliberately left in place: the display never shows a remote browser, so a dead
+    # publisher must not let display capture resume publishing black frames.
+    await pub.stop()
+    assert sentinel.exists()
