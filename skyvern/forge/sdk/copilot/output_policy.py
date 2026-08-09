@@ -1005,11 +1005,11 @@ def _bound_approved_credential_ids(request_policy: RequestPolicy, workflow_yaml:
 
 
 def _allowed_unresolved_credential_ids(request_policy: RequestPolicy) -> set[str]:
-    # invalid_credential_ids is negation-filtered and affirmative; credential_refs is not — a
-    # model-carried or negated ref must not become draft-bindable (SKY-13552).
     if not request_policy.allow_missing_credentials_in_draft:
         return set()
-    return set(request_policy.invalid_credential_ids)
+    ids = set(request_policy.invalid_credential_ids)
+    ids.update(ref for ref in request_policy.credential_refs if isinstance(ref, str) and ref.startswith("cred_"))
+    return ids
 
 
 def _existing_workflow_credential_ids(request_policy: RequestPolicy) -> set[str]:

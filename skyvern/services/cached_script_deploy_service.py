@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 from dataclasses import dataclass
 
@@ -11,6 +12,7 @@ from skyvern.core.script_generations.script_block_extractor import (
     ScriptBlockExtractionError,
     extract_script_blocks,
 )
+from skyvern.core.script_generations.skyvern_page import CACHED_SCRIPT_PAGE_API
 from skyvern.forge import app
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.repositories.scripts import WorkflowScriptUpsertStatus, WorkflowScriptWriterIntent
@@ -29,7 +31,129 @@ from skyvern.services.workflow_script_service import CacheKeyResolutionError, re
 _CODE_VERSION_STATIC = 1
 _CODE_VERSION_ADAPTIVE = 2
 
+_CACHED_CONTEXT_API = frozenset(
+    {"credential_totp_identifier", "extracted_params", "loop_item_selector", "loop_value", "parameters", "prompt"}
+)
+_DYNAMIC_ATTRIBUTE_BUILTINS = frozenset({"dir", "getattr", "hasattr", "vars"})
+
 LOG = structlog.get_logger(__name__)
+
+
+def _attribute_chain(node: ast.Attribute) -> tuple[str | None, tuple[str, ...]]:
+    attributes: list[str] = []
+    current: ast.expr = node
+    while isinstance(current, ast.Attribute):
+        attributes.append(current.attr)
+        current = current.value
+    root = current.id if isinstance(current, ast.Name) else None
+    return root, tuple(reversed(attributes))
+
+
+def _cached_function_labels(node: ast.AsyncFunctionDef | ast.FunctionDef) -> set[str]:
+    labels: set[str] = set()
+    for decorator in node.decorator_list:
+        if not isinstance(decorator, ast.Call) or not isinstance(decorator.func, ast.Attribute):
+            continue
+        if not isinstance(decorator.func.value, ast.Name) or decorator.func.value.id != "skyvern":
+            continue
+        if decorator.func.attr != "cached":
+            continue
+        if decorator.args and isinstance(decorator.args[0], ast.Constant):
+            if isinstance(decorator.args[0].value, str):
+                labels.add(decorator.args[0].value)
+            continue
+        for keyword in decorator.keywords:
+            if keyword.arg == "cache_key" and isinstance(keyword.value, ast.Constant):
+                if isinstance(keyword.value.value, str):
+                    labels.add(keyword.value.value)
+                break
+    return labels
+
+
+class _CachedCapabilityVisitor(ast.NodeVisitor):
+    def __init__(self, root: ast.AsyncFunctionDef | ast.FunctionDef) -> None:
+        self.root = root
+        self.directly_unsafe = False
+        self.local_calls: set[str] = set()
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        if node is self.root:
+            for child in node.body:
+                self.visit(child)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        if node is self.root:
+            for child in node.body:
+                self.visit(child)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        return
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        root, attributes = _attribute_chain(node)
+        if root == "page" and (
+            not attributes
+            or attributes[0] not in CACHED_SCRIPT_PAGE_API
+            or (len(attributes) > 1 and attributes[0] != "url")
+        ):
+            self.directly_unsafe = True
+        if root == "context" and (not attributes or attributes[0] not in _CACHED_CONTEXT_API):
+            self.directly_unsafe = True
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if isinstance(node.func, ast.Name):
+            self.local_calls.add(node.func.id)
+            if (
+                node.func.id in _DYNAMIC_ATTRIBUTE_BUILTINS
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in ("page", "context")
+            ):
+                self.directly_unsafe = True
+        self.generic_visit(node)
+
+
+def _transitively_unsafe_function_names(visitors: dict[str, _CachedCapabilityVisitor]) -> set[str]:
+    unsafe_functions = {name for name, visitor in visitors.items() if visitor.directly_unsafe}
+    callers_by_callee: dict[str, set[str]] = {}
+    for caller, visitor in visitors.items():
+        for callee in visitor.local_calls:
+            if callee in visitors:
+                callers_by_callee.setdefault(callee, set()).add(caller)
+
+    pending = list(unsafe_functions)
+    while pending:
+        for caller in callers_by_callee.get(pending.pop(), ()):
+            if caller not in unsafe_functions:
+                unsafe_functions.add(caller)
+                pending.append(caller)
+    return unsafe_functions
+
+
+def _unsafe_cached_block_labels(source: str) -> set[str]:
+    """Find cached functions that transitively leave the explicit page/context surface."""
+    function_nodes = [
+        node for node in ast.parse(source).body if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+    ]
+    analyzed_functions: list[tuple[ast.AsyncFunctionDef | ast.FunctionDef, _CachedCapabilityVisitor]] = []
+    for node in function_nodes:
+        visitor = _CachedCapabilityVisitor(node)
+        visitor.visit(node)
+        analyzed_functions.append((node, visitor))
+
+    visitors_by_runtime_name = {node.name: visitor for node, visitor in analyzed_functions}
+    unsafe_functions = _transitively_unsafe_function_names(visitors_by_runtime_name)
+
+    return {
+        label
+        for node, visitor in analyzed_functions
+        if visitor.directly_unsafe or visitor.local_calls & unsafe_functions
+        for label in _cached_function_labels(node)
+    }
 
 
 @dataclass(frozen=True)
@@ -178,6 +302,13 @@ async def _build_cached_script_deploy_plan(
     if missing_globals:
         raise HTTPException(status_code=400, detail={"missing_globals": missing_globals})
 
+    unsafe_cached_blocks = _unsafe_cached_block_labels(main_py)
+    warnings = list(extraction.warnings)
+    warnings.extend(
+        f"Cached block {label!r} uses an unmediated browser capability; agent fallback required"
+        for label in sorted(unsafe_cached_blocks)
+    )
+
     try:
         cache_key_value = resolve_cache_key_value(
             proposed_workflow,
@@ -207,7 +338,10 @@ async def _build_cached_script_deploy_plan(
             is_cacheable=block.is_cacheable,
             is_compound=block.is_compound,
             missing_globals=list(block.missing_globals),
-            requires_agent=request.requires_agent_overrides.get(block.label, not block.is_cacheable),
+            requires_agent=(
+                block.label in unsafe_cached_blocks
+                or request.requires_agent_overrides.get(block.label, not block.is_cacheable)
+            ),
         )
         for block in extraction.blocks
     ]
@@ -219,7 +353,7 @@ async def _build_cached_script_deploy_plan(
         block_plans=block_plans,
         cacheable_block_count=len(cacheable_blocks),
         skipped_block_labels=[block.label for block in extraction.blocks if not block.is_cacheable],
-        warnings=list(extraction.warnings),
+        warnings=warnings,
         validated_files=validated_files,
     )
 
