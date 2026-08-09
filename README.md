@@ -65,7 +65,7 @@ If you'd like to try it out, navigate to [app.skyvern.com](https://app.skyvern.c
 
 Choose your preferred setup method:
 
-> **Database default**: `skyvern quickstart` and `skyvern run server` default to a SQLite database at `~/.skyvern/data.db` so the pip path works without Postgres or Docker. To use Postgres instead, pass `--postgres` for a local container or `--database-string` for an existing database. Docker Compose always uses the bundled Postgres service.
+> **Database default**: `skyvern quickstart` and `skyvern run server` default to a SQLite database at `~/.skyvern/data.db` so the pip path works without Postgres or Docker. To use Postgres instead, pass `--database-string` for an existing database (or omit `--no-postgres` so `quickstart` starts its own Postgres container). Docker Compose always uses the bundled Postgres service.
 
 ### Option A: pip install (Recommended for Python-managed local setup)
 
@@ -88,7 +88,7 @@ pip install "skyvern[all]"
 skyvern quickstart
 ```
 
-The pip quickstart uses SQLite by default. For a local Postgres container, run `skyvern quickstart --postgres`.
+The pip quickstart uses SQLite by default. To use a local Postgres container instead, run `skyvern quickstart` (Postgres container is started unless you pass `--no-postgres`), or connect to an existing database with `--database-string=postgresql+psycopg://user:pass@host:5432/dbname`.
 
 ### Option B: Docker Compose
 
@@ -135,9 +135,8 @@ uv pip install skyvern
 **Installation:**
 - Python SDK / cloud API: `pip install skyvern`
 - Local server + packaged UI: `pip install "skyvern[all]"` then run `skyvern quickstart`
-- Local server + packaged UI with Postgres: `pip install "skyvern[all]"` then run `skyvern quickstart --postgres`
-- Packaged UI for an existing API: `pip install "skyvern[ui]"` then run
-  `skyvern run ui --api-url <api-url> --api-key <api-key>`
+- Local server + packaged UI with Postgres: `pip install "skyvern[all]"` then run `skyvern quickstart --database-string=postgresql+psycopg://user:pass@host:5432/dbname`
+- Packaged UI for an existing API: `pip install "skyvern[ui]"` then set `VITE_API_BASE_URL` (and `VITE_SKYVERN_API_KEY` if your API requires a key) and run `skyvern run ui`
 - TypeScript: `npm install @skyvern/client`
 
 ### AI-Powered Page Commands
@@ -209,12 +208,16 @@ summary = await page.prompt("Summarize what's on this page")
 ```bash
 skyvern run all
 ```
-Navigate to http://localhost:8080 to run tasks through the web interface. If the packaged UI is missing, `skyvern run ui` will offer to install the matching UI package. For non-interactive setup, use `skyvern run ui --install-ui` or `skyvern run all --install-ui`.
+Navigate to http://localhost:8080 to run tasks through the web interface. If the packaged UI is missing, `skyvern run ui` will offer to install the matching UI package.
 
-To run only the packaged UI against an existing Skyvern API, install `skyvern[ui]` and pass
-`--api-url`; the CLI infers `--wss-url` from the API URL unless you override it. You can also set
-`VITE_API_BASE_URL`, `VITE_WSS_BASE_URL`, `VITE_ARTIFACT_API_BASE_URL`, `VITE_SKYVERN_API_KEY`,
-and `VITE_BROWSER_STREAMING_MODE` before running `skyvern run ui`.
+To run only the packaged UI against an existing Skyvern API, install `skyvern[ui]` and set the
+environment variables below before running `skyvern run ui`:
+
+- `VITE_API_BASE_URL` (e.g. `http://localhost:8000/api/v1`) — points the UI at your Skyvern API
+- `VITE_SKYVERN_API_KEY` — the API key if your API requires one
+- `VITE_WSS_BASE_URL` — WebSocket endpoint (inferred from `VITE_API_BASE_URL` if unset)
+- `VITE_ARTIFACT_API_BASE_URL` — base URL for artifact downloads
+- `VITE_BROWSER_STREAMING_MODE` — browser viewport streaming mode
 
 **Python SDK:**
 ```python
