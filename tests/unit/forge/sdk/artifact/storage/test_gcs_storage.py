@@ -7,6 +7,7 @@ import pytest
 
 import skyvern.forge.sdk.api.real_gcp as real_gcp_module
 from skyvern.config import settings
+from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge.sdk.api.gcp import STORAGE_CLASS_STANDARD
 from skyvern.forge.sdk.api.real_gcp import RealAsyncGcsStorageClient
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
@@ -60,6 +61,7 @@ def mock_browser_session_artifact_create(monkeypatch: pytest.MonkeyPatch) -> Non
     fake_app = MagicMock()
     fake_app.ARTIFACT_MANAGER.create_browser_session_download_artifact = AsyncMock(return_value="a_test")
     fake_app.ARTIFACT_MANAGER.create_browser_session_recording_artifact = AsyncMock(return_value="a_test")
+    fake_app.ARTIFACT_MANAGER.create_download_artifact = AsyncMock(return_value="a_test")
     monkeypatch.setattr(gcs_module, "app", fake_app)
 
 
@@ -392,3 +394,31 @@ class TestGcsShareLinkSensitiveCap:
             f"{screenshot.uri}?h={SENSITIVE_SHARE_URL_EXPIRY_HOURS}",
             f"{download.uri}?h=24",
         ]
+
+
+@pytest.mark.asyncio
+async def test_save_downloaded_files_partial_upload_failure_raises_after_saving_the_rest(
+    gcs_storage: GcsStorageForTests, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "downloads" / "wr_partial"
+    run_dir.mkdir(parents=True)
+    (run_dir / "a.pdf").write_bytes(b"first")
+    (run_dir / "b.pdf").write_bytes(b"second")
+    monkeypatch.setattr("skyvern.forge.sdk.api.files.settings.DOWNLOAD_PATH", str(tmp_path / "downloads"))
+    monkeypatch.setattr(gcs_storage, "_get_storage_class_for_org", AsyncMock(return_value="STANDARD"))
+    monkeypatch.setattr(gcs_storage, "_get_tags_for_org", AsyncMock(return_value=None))
+
+    uploaded: list[str] = []
+
+    async def _upload(*, uri: str, file_path: str, **kwargs: object) -> None:
+        if uri.endswith("/a.pdf"):
+            raise RuntimeError("transient 503")
+        uploaded.append(uri)
+
+    monkeypatch.setattr(gcs_storage.async_client, "upload_file_from_path", _upload)
+
+    with pytest.raises(DownloadSaveIncompleteError) as raised:
+        await gcs_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
+
+    assert raised.value.skipped_files == ["a.pdf"]
+    assert [uri.rsplit("/", 1)[-1] for uri in uploaded] == ["b.pdf"]

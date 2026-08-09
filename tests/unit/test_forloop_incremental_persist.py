@@ -460,12 +460,18 @@ class TestResetBrowserTabsBetweenIterations:
         mock_bs = MagicMock(spec=RealBrowserState)
         mock_bs.close_pages_opened_after = AsyncMock()
         baseline = {MagicMock()}
+        reset_browser_tabs = AsyncMock(return_value=True)
         with (
-            patch.object(block_module.settings, "RESET_BROWSER_TABS_BETWEEN_LOOP_ITERATIONS", True),
+            patch.object(
+                block_module.planner_levers,
+                "reset_browser_tabs_between_loop_iterations",
+                reset_browser_tabs,
+            ),
             patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
         ):
             mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=mock_bs)
             await loop_block._reset_browser_tabs_for_iteration("wr_test", "org_test", "pbs_test", baseline)
+            reset_browser_tabs.assert_awaited_once_with("org_test")
             mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_awaited_once_with("pbs_test", "org_test")
             mock_bs.close_pages_opened_after.assert_awaited_once_with(baseline)
 
@@ -473,7 +479,12 @@ class TestResetBrowserTabsBetweenIterations:
     async def test_reset_helper_noop_when_flag_off(self) -> None:
         loop_block = self._loop_block()
         with (
-            patch.object(block_module.settings, "RESET_BROWSER_TABS_BETWEEN_LOOP_ITERATIONS", False),
+            patch.object(
+                block_module.planner_levers,
+                "reset_browser_tabs_between_loop_iterations",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
             patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
         ):
             await loop_block._reset_browser_tabs_for_iteration("wr_test", "org_test", "pbs_test", set())
@@ -483,19 +494,30 @@ class TestResetBrowserTabsBetweenIterations:
     @pytest.mark.asyncio
     async def test_snapshot_none_when_flag_off(self) -> None:
         loop_block = self._loop_block()
+        reset_browser_tabs = AsyncMock(return_value=False)
         with (
-            patch.object(block_module.settings, "RESET_BROWSER_TABS_BETWEEN_LOOP_ITERATIONS", False),
+            patch.object(
+                block_module.planner_levers,
+                "reset_browser_tabs_between_loop_iterations",
+                reset_browser_tabs,
+            ),
             patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
         ):
             result = await loop_block._snapshot_loop_baseline_pages("wr_test", "org_test", None)
             assert result is None
+            reset_browser_tabs.assert_awaited_once_with("org_test")
             mock_app.BROWSER_MANAGER.get_for_workflow_run.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_snapshot_returns_none_when_it_fails(self) -> None:
         loop_block = self._loop_block()
         with (
-            patch.object(block_module.settings, "RESET_BROWSER_TABS_BETWEEN_LOOP_ITERATIONS", True),
+            patch.object(
+                block_module.planner_levers,
+                "reset_browser_tabs_between_loop_iterations",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
             patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
         ):
             mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(side_effect=Exception("boom"))
@@ -505,11 +527,17 @@ class TestResetBrowserTabsBetweenIterations:
     async def test_reset_helper_noop_when_baseline_unknown(self) -> None:
         """A failed snapshot must suppress the reset — an empty baseline would close every tab."""
         loop_block = self._loop_block()
+        reset_browser_tabs = AsyncMock(return_value=True)
         with (
-            patch.object(block_module.settings, "RESET_BROWSER_TABS_BETWEEN_LOOP_ITERATIONS", True),
+            patch.object(
+                block_module.planner_levers,
+                "reset_browser_tabs_between_loop_iterations",
+                reset_browser_tabs,
+            ),
             patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
         ):
             await loop_block._reset_browser_tabs_for_iteration("wr_test", "org_test", "pbs_test", None)
+            reset_browser_tabs.assert_not_awaited()
             mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_not_called()
             mock_app.BROWSER_MANAGER.get_for_workflow_run.assert_not_called()
 

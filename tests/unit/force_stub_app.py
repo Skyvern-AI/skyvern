@@ -17,6 +17,10 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.WORKFLOW_CONTEXT_MANAGER = _LazyNamespace()
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.mask_secrets_enabled_for_run = MagicMock(return_value=False)
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run = MagicMock(return_value=set())
+    # Sync liveness predicate — _LazyNamespace would auto-mock it as a truthy (never-awaited) AsyncMock,
+    # making every wr_ alias read as a live sharer. Default to "no run is live" so tests must opt a run
+    # into liveness explicitly (non-PBS ownership signal).
+    fake_app_module.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context = MagicMock(return_value=False)
     fake_app_module.WORKFLOW_SERVICE = _LazyNamespace()
     fake_app_module.BROWSER_MANAGER = _LazyNamespace()
     # get_for_task is a sync lookup returning None when no browser state is registered; _LazyNamespace
@@ -42,6 +46,15 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.allow_copilot_inline_code_execution = MagicMock(return_value=False)
     fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_org_lookups = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.get_mcp_request_organization_id = MagicMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.begin_browser_observation = MagicMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.record_browser_observation_failure = MagicMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.inspect_browser_observation = AsyncMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.needs_browser_observation_text = MagicMock(return_value=False)
+    fake_app_module.AGENT_FUNCTION.transform_browser_elements_for_prompt = MagicMock(side_effect=lambda value: value)
+    fake_app_module.AGENT_FUNCTION.inspect_browser_dialog = AsyncMock(return_value=False)
+    fake_app_module.AGENT_FUNCTION.should_dismiss_browser_dialog = MagicMock(return_value=False)
+    fake_app_module.AGENT_FUNCTION.should_block_browser_action = MagicMock(return_value=False)
+    fake_app_module.AGENT_FUNCTION.enforce_browser_action_policy = MagicMock(return_value=None)
     # Sync method returning a key or None — _LazyNamespace would auto-mock it as a truthy
     # AsyncMock and hijack the TextPromptBlock llm_key. Match the OSS no-op.
     fake_app_module.AGENT_FUNCTION.get_fallback_llm_key = MagicMock(return_value=None)

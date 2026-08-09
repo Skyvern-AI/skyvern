@@ -179,6 +179,13 @@ class LocalBrowserProfile:
             return True
 
 
+def _sweep_with_budget_logging_failures() -> None:
+    try:
+        sweep_local_browser_profiles_with_budget()
+    except Exception:
+        LOG.warning("local_browser_profile_background_sweep_failed", exc_info=True)
+
+
 def sweep_local_browser_profiles_once_in_background() -> threading.Thread | None:
     if sys.platform == "win32":
         return None
@@ -190,7 +197,7 @@ def sweep_local_browser_profiles_once_in_background() -> threading.Thread | None
         _sweep_triggered = True
 
     thread = threading.Thread(
-        target=sweep_local_browser_profiles_with_budget,
+        target=_sweep_with_budget_logging_failures,
         daemon=True,
         name="skyvern-profile-sweep",
     )
