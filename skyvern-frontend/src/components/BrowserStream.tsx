@@ -615,8 +615,6 @@ function BrowserStream({
                   }
                 : {
                     title: "The browser stream slipped away",
-                    detail:
-                      "The browser stream dropped before everything wrapped up.",
                     hint: "Refresh the page or switch to local browser streaming.",
                   }),
           );

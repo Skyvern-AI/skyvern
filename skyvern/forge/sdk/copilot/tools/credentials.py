@@ -7,6 +7,11 @@ import structlog
 import yaml
 
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.credential_resolution import (
+    credential_reference_spans,
+    grounded_credential_references,
+    load_credentials,
+)
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_blocks
@@ -268,7 +273,115 @@ async def _credential_reference_validation_error(value: Any, ctx: AgentContext) 
     return await _credential_ids_validation_error(credential_ids, ctx)
 
 
+def _serialize_credential(credential: Credential) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "credential_id": credential.credential_id,
+        "name": credential.name,
+        "credential_type": str(credential.credential_type),
+    }
+    if credential.username:
+        entry["username"] = credential.username
+        entry["totp_type"] = str(credential.totp_type) if credential.totp_type else None
+    elif credential.card_last4:
+        entry["card_last_four"] = credential.card_last4
+        entry["card_brand"] = credential.card_brand
+    elif credential.secret_label:
+        entry["secret_label"] = credential.secret_label
+    return entry
+
+
+def _reference_is_typed_resume(reference: str, policy: RequestPolicy) -> bool:
+    return any(
+        credential.credential_id in policy.current_turn_named_credential_ids
+        and reference in {credential.credential_id, credential.name}
+        for credential in policy.resolved_credentials
+    )
+
+
+async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[str, Any]:
+    policy = ctx.request_policy
+    if not isinstance(policy, RequestPolicy):
+        return {
+            "ok": False,
+            "data": {
+                "status": "denied",
+                "reference": reference,
+                "next_action": "Ask the user to provide the exact saved credential name in this turn.",
+            },
+        }
+
+    credentials = await load_credentials(ctx.organization_id)
+    grounded_references = grounded_credential_references(policy.canonical_user_message, credentials)
+    matches_by_id = {
+        credential.credential_id: credential
+        for credential in credentials
+        if credential.credential_id == reference or credential.name == reference
+    }
+    matches = list(matches_by_id.values())
+    literal_reference = bool(credential_reference_spans(policy.canonical_user_message, reference))
+    typed_resume = _reference_is_typed_resume(reference, policy)
+    typed_credential_targets = (
+        set(ctx.turn_intent.target_entities.get("credential", [])) if ctx.turn_intent is not None else set()
+    )
+    if reference not in grounded_references and not typed_resume and (matches or not literal_reference):
+        return {
+            "ok": False,
+            "data": {
+                "status": "denied",
+                "reference": reference,
+                "next_action": "Ask the user to provide the exact saved credential name in this turn.",
+            },
+        }
+    if not typed_resume and reference not in typed_credential_targets:
+        return {
+            "ok": False,
+            "data": {
+                "status": "denied",
+                "reference": reference,
+                "next_action": "Ask the user to affirm the exact saved credential name to use.",
+            },
+        }
+    if len(matches) != 1:
+        status = "not_found" if not matches else "ambiguous"
+        next_action = (
+            "Ask the user to verify the exact saved credential name."
+            if status == "not_found"
+            else "Ask the user to choose a credential ID because multiple saved credentials have that exact name."
+        )
+        return {
+            "ok": False,
+            "data": {
+                "status": status,
+                "reference": reference,
+                "candidates": [_serialize_credential(credential) for credential in matches],
+                "next_action": next_action,
+            },
+        }
+
+    credential = matches[0]
+    policy.resolved_credentials = [
+        *[item for item in policy.resolved_credentials if item.credential_id != credential.credential_id],
+        credential,
+    ]
+    policy.current_turn_named_credential_ids.add(credential.credential_id)
+    return {
+        "ok": True,
+        "data": {
+            "status": "resolved",
+            "reference": reference,
+            "credential": _serialize_credential(credential),
+            "next_action": "Use this credential ID only through credential-aware tools.",
+        },
+    }
+
+
 async def _list_credentials(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
+    exact_reference = params.get("exact_reference")
+    if exact_reference is not None:
+        if not isinstance(exact_reference, str) or not exact_reference:
+            return {"ok": False, "error": "exact_reference must be a non-empty exact saved name or credential ID"}
+        return await _resolve_exact_credential(exact_reference, ctx)
+
     page = params.get("page", 1)
     page_size = min(params.get("page_size", 10), 50)
     credentials = await app.DATABASE.credentials.get_credentials(
@@ -276,22 +389,7 @@ async def _list_credentials(params: dict[str, Any], ctx: AgentContext) -> dict[s
         page=page,
         page_size=page_size,
     )
-    serialized = []
-    for cred in credentials:
-        entry: dict[str, Any] = {
-            "credential_id": cred.credential_id,
-            "name": cred.name,
-            "credential_type": str(cred.credential_type),
-        }
-        if cred.username:
-            entry["username"] = cred.username
-            entry["totp_type"] = str(cred.totp_type) if cred.totp_type else None
-        elif cred.card_last4:
-            entry["card_last_four"] = cred.card_last4
-            entry["card_brand"] = cred.card_brand
-        elif cred.secret_label:
-            entry["secret_label"] = cred.secret_label
-        serialized.append(entry)
+    serialized = [_serialize_credential(credential) for credential in credentials]
     _record_discovered_credentials_on_policy(ctx, credentials)
     return {
         "ok": True,

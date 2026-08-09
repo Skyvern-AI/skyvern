@@ -309,9 +309,11 @@ class AgentContext:
     update_workflow_called: bool = False
     test_after_update_done: bool = False
     post_update_nudge_count: int = 0
-    coverage_nudge_count: int = 0
     format_nudge_count: int = 0
     copilot_total_timeout_exceeded: bool = False
+    copilot_max_turns_exceeded: bool = False
+    model_calls_this_turn: int = 0
+    enforcement_pass_count: int = 0
     failed_test_nudge_count: int = 0
     explore_without_workflow_nudge_count: int = 0
     last_test_ok: bool | None = None
@@ -520,7 +522,6 @@ class AgentContext:
     # returns. The freehand persist-seam surface leg exempts exactly this label and gates its siblings.
     spine_imposition_carrier_label: str | None = None
     synthesized_block_reopened_after_failed_run: bool = False
-    synthesized_block_reopened_for_credential_scout: bool = False
     # Business inputs proven required by an earlier synthesized-draft rejection stay required for the
     # rest of the turn. A later retry cannot evade the floor by deleting those parameters from its YAML.
     synthesized_business_required_parameter_keys: set[str] = field(default_factory=set)
@@ -529,7 +530,6 @@ class AgentContext:
     # login prefix; releases the is_goal_complete terminal-action gate mirroring reached_download_target.
     scout_observed_terminal_criterion_ids: set[str] = field(default_factory=set)
     scout_observation_contract: ScoutObservationContract | None = None
-    credential_scout_rescout_context_key: str | None = None
     # Which requires-live-scout fields (username/password, non-empty) each scouted credential
     # carries; recorded at credential resolve time and rehydrated from FillCarry across turns.
     scouted_credential_field_inventory_by_credential_id: dict[str, frozenset[str]] = field(default_factory=dict)
@@ -555,6 +555,8 @@ class AgentContext:
     # Browser-session download filenames snapshotted before a scout click, so the post-hook can tell
     # a download this click produced from one an earlier click left behind.
     pending_scout_download_snapshot: frozenset[str] | None = None
+    pending_scout_popup: Page | None = None
+    pending_scout_popup_content_type: str | None = None
     repair_obligation_nudge_count: int = 0
     # (selector, ambiguous) verdict from a pre-dispatch live count probe, applied to the recorded
     # interaction only when the post-action resolved selector matches the probed one.

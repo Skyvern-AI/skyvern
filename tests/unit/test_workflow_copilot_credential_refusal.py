@@ -64,16 +64,13 @@ class TestAgentPromptRefusalClause:
         assert "press_key" in rendered
         assert "any other direct browser tool" in rendered
 
-    def test_list_credentials_pagination_instruction(self) -> None:
-        """Prompt must tell the agent to page list_credentials before concluding 'no match'.
-
-        list_credentials defaults to page_size=10 and caps at 50. Without this
-        instruction the agent can falsely tell the user 'no stored credential
-        exists' and send them to the UI to create one they already have.
-        """
+    def test_exact_saved_reference_uses_atomic_resolution(self) -> None:
+        """An exact saved name must use the authority-granting lookup, not discovery."""
         rendered = _render_agent_prompt()
-        assert "page_size=50" in rendered
-        assert "has_more" in rendered
+
+        assert "list_credentials(exact_reference=<verbatim reference>)" in rendered
+        assert "one organization-scoped exact match grounded in this turn" in rendered
+        assert "Never infer a name from nearby prose" in rendered
 
     def test_negative_bare_identifier_is_not_a_credential(self) -> None:
         """A bare username/email alone must not trigger the refusal rule.
@@ -86,16 +83,20 @@ class TestAgentPromptRefusalClause:
         assert "NOT a raw credential" in rendered
         assert "does not trigger this rule" in rendered
 
-    def test_list_credentials_called_first(self) -> None:
-        """The refusal flow routes through list_credentials for discoverable matches."""
+    def test_raw_secret_refusal_does_not_select_from_discovery(self) -> None:
+        """A raw-secret turn asks for an exact saved reference instead of choosing inventory."""
         rendered = _render_agent_prompt()
-        assert "FIRST call `list_credentials`" in rendered
 
-    def test_no_domain_matching(self) -> None:
-        """list_credentials has no domain field, so the rule must match on name/username only."""
+        assert "Ask the user to choose a saved credential in the UI" in rendered
+        assert "Do not derive a choice from a discovery result" in rendered
+
+    def test_vague_reference_discovery_is_metadata_only(self) -> None:
+        """Inventory discovery cannot silently become credential-use authority."""
         rendered = _render_agent_prompt()
-        assert "no site/domain field" in rendered
-        assert "on `name` / `username` only" in rendered
+
+        assert "genuinely vague credential reference" in rendered
+        assert "Discovery results are metadata, not authority" in rendered
+        assert "ask the user to state the exact name before using one" in rendered
 
     def test_no_raw_secret_echoed(self) -> None:
         """The agent must not echo the raw secret into its reply or persistent context."""

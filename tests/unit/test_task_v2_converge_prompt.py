@@ -1,10 +1,24 @@
+import pytest
+
 from skyvern.config import Settings
 from skyvern.forge.prompts import prompt_engine
+from skyvern.services import planner_levers
 from skyvern.services.task_v2_service import _converge_iterations_remaining
+from tests.unit.test_task_v2_completion_gate import _run_task_v2_wiring_case
 
 
 def test_converge_ships_disabled() -> None:
     assert Settings.model_fields["TASK_V2_CONVERGE_PCT"].default == 0
+
+
+@pytest.mark.asyncio
+async def test_converge_resolver_drives_final_window_in_planner_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(planner_levers.settings, "TASK_V2_CONVERGE_PCT", 0)
+    planner_inputs, _ = await _run_task_v2_wiring_case(
+        monkeypatch, [39, 40], shared_flag_enabled=True, max_iterations=50
+    )
+
+    assert [inputs["iterations_remaining"] for inputs in planner_inputs] == [None, 10]
 
 
 def _render(iterations_remaining: int | None) -> str:
