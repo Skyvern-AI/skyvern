@@ -152,7 +152,7 @@ async def skyvern_browser_session_create(
             try:
                 runtime = await BrowserExtensionRuntime.get_or_start()
                 if not await runtime.wait_for_extension(10.0):
-                    pairing_opened = runtime.open_pairing_page()
+                    pairing_opened = await runtime.open_pairing_page()
                     timer.mark("sdk")
                     return make_result(
                         "skyvern_browser_session_create",

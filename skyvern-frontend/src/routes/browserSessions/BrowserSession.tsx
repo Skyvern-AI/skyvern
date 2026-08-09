@@ -110,9 +110,9 @@ function BrowserSession() {
   if (query.isLoading) {
     return (
       <div className="h-screen w-full gap-4 p-6">
-        <div className="flex h-full w-full items-center justify-center">
-          {/* we need nice artwork here */}
-          Loading...
+        <div className="flex h-full w-full items-center justify-center gap-2 text-muted-foreground">
+          <ReloadIcon className="h-4 w-4 animate-spin" />
+          Loading browser session...
         </div>
       </div>
     );
@@ -132,7 +132,7 @@ function BrowserSession() {
   return (
     <div className="h-screen w-full gap-4 p-6">
       <div className="flex h-full w-full flex-col items-start justify-start gap-2">
-        <div className="flex w-full flex-shrink-0 flex-row items-center justify-between rounded-lg border p-4">
+        <div className="flex w-full flex-shrink-0 flex-row items-center justify-between p-4">
           <div className="flex w-full flex-row items-center justify-start gap-2">
             <div className="text-xl">Browser Session</div>
             {activeTab === "stream" && <StreamModeBadge mode={streamMode} />}
