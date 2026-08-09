@@ -18,7 +18,7 @@ from cachetools import TTLCache
 from google.oauth2.credentials import Credentials
 from playwright.async_api import Frame, Page
 
-from skyvern.config import settings
+from skyvern.config import CodeBlockMode, settings
 from skyvern.constants import CUSTOMER_STORAGE_UPLOAD_MAX_BYTES, SKYVERN_ID_ATTR
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem_with_tier
 from skyvern.exceptions import (
@@ -857,6 +857,21 @@ async def _convert_css_shape_to_string(
 
 
 class AgentFunction:
+    async def record_run_duration(
+        self,
+        run_type: str,
+        status: str,
+        duration_seconds: float,
+        workflow_run_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> None:
+        """Cloud overrides this to emit run-duration telemetry; the OSS default is a no-op.
+
+        workflow_run_id/organization_id let the override refine run_type (e.g. a
+        workflow run that backs a task_v2) without the caller paying for the lookup.
+        """
+        return None
+
     workflow_schedules_enabled: bool = settings.ENABLE_WORKFLOW_SCHEDULES
     """Whether the workflow scheduler routes should serve traffic on this build.
 
@@ -2131,7 +2146,7 @@ class AgentFunction:
         return cleanup_element_tree_func
 
     async def has_code_block_access(self, organization_id: str | None = None) -> bool:
-        return settings.ENABLE_CODE_BLOCK and not settings.DISABLE_CODE_BLOCK_EXECUTION
+        return settings.CODE_BLOCK_MODE is CodeBlockMode.enabled
 
     async def validate_code_block(self, organization_id: str | None = None) -> None:
         if not await self.has_code_block_access(organization_id):
