@@ -218,6 +218,41 @@ async def test_create_workflow_idempotency_wait_deadline_returns_conflict(
 
 
 @pytest.mark.asyncio
+async def test_create_workflow_idempotency_database_timeout_is_not_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'idempotency-database-timeout.db'}")
+    async with database.engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    organization = await database.organizations.create_organization(
+        organization_name="Test",
+        organization_id="o_test",
+    )
+
+    @asynccontextmanager
+    async def database_timeout(_lock_key: str | None = None) -> AsyncIterator[None]:
+        raise TimeoutError("database timed out")
+        yield
+
+    monkeypatch.setattr(database.workflows, "_workflow_creation_transaction", database_timeout)
+    monkeypatch.setattr(app, "DATABASE", database)
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", WorkflowService())
+
+    try:
+        with pytest.raises(FailedToCreateWorkflow, match="database timed out"):
+            await agent_protocol.create_workflow(
+                data=WorkflowRequest.model_validate(WORKFLOW_CREATE_PAYLOAD),
+                folder_id=None,
+                current_org=organization,
+                user_id="u_test",
+                idempotency_key="database-timeout-key",
+            )
+    finally:
+        await database.engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_create_workflow_idempotency_failure_does_not_record_first_save(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

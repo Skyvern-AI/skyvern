@@ -10,6 +10,7 @@ from skyvern.cli.core.session_manager import get_page
 from skyvern.forge import app
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELDS
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, url_parts
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -53,7 +54,7 @@ from .scouting import (
 
 LOG = structlog.get_logger()
 
-_CREDENTIAL_FILL_FIELDS = frozenset({"username", "password", "totp"})
+_CREDENTIAL_FILL_FIELDS = CREDENTIAL_FILL_FIELDS
 _CREDENTIAL_FILL_TIMEOUT_MS = 15000
 
 
