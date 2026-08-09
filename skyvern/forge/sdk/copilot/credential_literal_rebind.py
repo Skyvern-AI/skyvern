@@ -10,12 +10,12 @@ import structlog
 import yaml
 
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
-    _CREDENTIAL_FIELDS,
     CREDENTIAL_FILL_TOOL_NAME,
     block_has_unguarded_credential_fill,
     credential_fill_source,
     wrapped_code_ast,
 )
+from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELDS
 from skyvern.forge.sdk.copilot.workflow_credential_utils import credential_param_ids, workflow_blocks
 
 LOG = structlog.get_logger()
@@ -92,7 +92,7 @@ def scouted_credential_targets(scout_trajectory: Sequence[Mapping[str, Any]] | N
         selector = str(interaction.get("selector") or "").strip()
         credential_id = str(interaction.get("credential_id") or "").strip()
         field = str(interaction.get("credential_field") or "").strip()
-        if not selector or not credential_id or field not in _CREDENTIAL_FIELDS:
+        if not selector or not credential_id or field not in CREDENTIAL_FILL_FIELDS:
             continue
         mapping = (credential_id, field)
         existing = targets.get(selector)
