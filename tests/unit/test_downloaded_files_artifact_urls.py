@@ -651,3 +651,139 @@ async def test_get_downloaded_files_lists_when_run_unresolvable(keyring_configur
 
     assert result == []
     storage.async_client.list_files.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_download_artifact_refreshes_checksum_for_changed_bytes():
+    """A re-save of changed bytes under the same uri moves the row's checksum, so the loop
+    filter's (filename, checksum, url) signature moves with the content (SKY-13782)."""
+    manager = ArtifactManager()
+
+    existing = Artifact(
+        artifact_id="a_existing",
+        artifact_type=ArtifactType.DOWNLOAD,
+        uri="s3://skyvern-uploads/downloads/local/o_1/wr_1/file.pdf",
+        organization_id="o_1",
+        run_id="wr_1",
+        workflow_run_id="wr_1",
+        checksum="stale",
+        created_at="2026-04-23T00:00:00Z",
+        modified_at="2026-04-23T00:00:00Z",
+    )
+    find_existing = AsyncMock(return_value=existing)
+    mock_db_create = AsyncMock()
+    mock_refresh = AsyncMock()
+
+    with (
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.find_download_artifact",
+            find_existing,
+        ),
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.create_artifact",
+            mock_db_create,
+        ),
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.refresh_download_artifact_content",
+            mock_refresh,
+        ),
+    ):
+        artifact_id = await manager.create_download_artifact(
+            organization_id="o_1",
+            run_id="wr_1",
+            workflow_run_id="wr_1",
+            uri=existing.uri,
+            filename="file.pdf",
+            checksum="fresh",
+            file_size=10,
+        )
+
+    assert artifact_id == "a_existing"
+    mock_db_create.assert_not_awaited()
+    mock_refresh.assert_awaited_once()
+    assert mock_refresh.await_args.kwargs["checksum"] == "fresh"
+
+
+@pytest.mark.asyncio
+async def test_create_download_artifact_keeps_row_untouched_for_identical_bytes():
+    """A byte-identical re-save (a loop iteration re-uploading the same file) must not touch the
+    row, or every iteration's URL would read as a new download."""
+    manager = ArtifactManager()
+
+    existing = Artifact(
+        artifact_id="a_existing",
+        artifact_type=ArtifactType.DOWNLOAD,
+        uri="s3://skyvern-uploads/downloads/local/o_1/wr_1/file.pdf",
+        organization_id="o_1",
+        run_id="wr_1",
+        workflow_run_id="wr_1",
+        checksum="same",
+        created_at="2026-04-23T00:00:00Z",
+        modified_at="2026-04-23T00:00:00Z",
+    )
+    find_existing = AsyncMock(return_value=existing)
+    mock_refresh = AsyncMock()
+
+    with (
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.find_download_artifact",
+            find_existing,
+        ),
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.refresh_download_artifact_content",
+            mock_refresh,
+        ),
+    ):
+        artifact_id = await manager.create_download_artifact(
+            organization_id="o_1",
+            run_id="wr_1",
+            workflow_run_id="wr_1",
+            uri=existing.uri,
+            filename="file.pdf",
+            checksum="same",
+        )
+
+    assert artifact_id == "a_existing"
+    mock_refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_download_artifact_propagates_refresh_failure():
+    """A stale row must not vouch for bytes it does not describe: a failed refresh raises so the
+    save loop records the file as skipped instead of the binder trusting the stale registration."""
+    manager = ArtifactManager()
+
+    existing = Artifact(
+        artifact_id="a_existing",
+        artifact_type=ArtifactType.DOWNLOAD,
+        uri="s3://skyvern-uploads/downloads/local/o_1/wr_1/file.pdf",
+        organization_id="o_1",
+        run_id="wr_1",
+        workflow_run_id="wr_1",
+        checksum="stale",
+        created_at="2026-04-23T00:00:00Z",
+        modified_at="2026-04-23T00:00:00Z",
+    )
+    find_existing = AsyncMock(return_value=existing)
+    mock_refresh = AsyncMock(side_effect=RuntimeError("db down"))
+
+    with (
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.find_download_artifact",
+            find_existing,
+        ),
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.refresh_download_artifact_content",
+            mock_refresh,
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="db down"):
+            await manager.create_download_artifact(
+                organization_id="o_1",
+                run_id="wr_1",
+                workflow_run_id="wr_1",
+                uri=existing.uri,
+                filename="file.pdf",
+                checksum="fresh",
+                file_size=10,
+            )
