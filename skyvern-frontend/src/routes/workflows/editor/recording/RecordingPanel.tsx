@@ -328,6 +328,12 @@ function RecordingPanel({ browserSessionId }: Props) {
   });
   const insertionPoint = insertionPointState.insertionPoint;
   const insertionPointMissing = !insertionPointState.isValid;
+  // The debug session's browser_session_id resolves asynchronously; Done can
+  // be reachable before it does (isRecording lives in the in-memory
+  // useRecordingStore and can already be true when this component remounts),
+  // so gate on it the same way as insertionPointMissing rather than letting
+  // the mutation guard throw.
+  const browserSessionMissing = !browserSessionId;
   const [confirmDiscardOpen, setConfirmDiscardOpen] = useState(false);
   const feedEndRef = useRef<HTMLDivElement | null>(null);
   const committedRef = useRef(false);
@@ -414,7 +420,11 @@ function RecordingPanel({ browserSessionId }: Props) {
   }, [mutationIsError]);
 
   const commit = () => {
-    if (committedRef.current || insertionPointMissing) {
+    if (
+      committedRef.current ||
+      insertionPointMissing ||
+      browserSessionMissing
+    ) {
       return;
     }
     committedRef.current = true;
@@ -430,7 +440,7 @@ function RecordingPanel({ browserSessionId }: Props) {
   // commitRef keeps the timeout callback stable; mutationIsError clears
   // committedRef so the timeout can fire again on retry.
   useEffect(() => {
-    if (!finishRequested || committedRef.current) {
+    if (!finishRequested || committedRef.current || browserSessionMissing) {
       return;
     }
     if (interpretationFinalized || sessionRevision === 0) {
@@ -439,7 +449,12 @@ function RecordingPanel({ browserSessionId }: Props) {
     }
     const timeout = setTimeout(() => commitRef.current(), FINALIZE_TIMEOUT_MS);
     return () => clearTimeout(timeout);
-  }, [finishRequested, interpretationFinalized, sessionRevision]);
+  }, [
+    finishRequested,
+    interpretationFinalized,
+    sessionRevision,
+    browserSessionMissing,
+  ]);
 
   // keep the newest block in view
   useEffect(() => {
@@ -468,7 +483,7 @@ function RecordingPanel({ browserSessionId }: Props) {
   };
 
   const onDoneClick = () => {
-    if (insertionPointMissing) {
+    if (insertionPointMissing || browserSessionMissing) {
       return;
     }
     if (finishRequested) {
@@ -616,7 +631,11 @@ function RecordingPanel({ browserSessionId }: Props) {
         <Button
           size="sm"
           className="ml-auto h-8"
-          disabled={insertionPointMissing || (isFinishing && !mutationIsError)}
+          disabled={
+            insertionPointMissing ||
+            browserSessionMissing ||
+            (isFinishing && !mutationIsError)
+          }
           onClick={onDoneClick}
         >
           <CheckIcon className="mr-1.5 h-4 w-4" />
