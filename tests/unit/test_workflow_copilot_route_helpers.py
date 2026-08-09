@@ -26,9 +26,18 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     _prior_copilot_workflow_yaml,
     _proposal_disposition,
     _should_restore_persisted_workflow,
+    _workflow_copilot_ingress_log_fields,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamResponseUpdate
 from skyvern.schemas.runs import ProxyLocation
+
+
+def test_workflow_copilot_ingress_log_fields_are_content_free() -> None:
+    literal = "Hunter2Portal!"
+    fields = _workflow_copilot_ingress_log_fields(f"The password is {literal}")
+
+    assert fields == {"message_length": len(f"The password is {literal}")}
+    assert literal not in repr(fields)
 
 
 def _agent_result(
