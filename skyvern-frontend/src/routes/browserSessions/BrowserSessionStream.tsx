@@ -99,6 +99,11 @@ interface Props {
   onReadyChange?: (isReady: boolean, browserSessionId: string | null) => void;
   onUrlChange?: (url: string) => void;
   onActivity?: () => void;
+  // Opt-in: turns the read-only URL bar into a navigable input. Only the
+  // hosted-browser-session live view passes this today (SKY-13683) -- the
+  // workflow studio/editor callers of this component leave it unset and keep
+  // today's read-only display.
+  enableUrlInput?: boolean;
 }
 
 function BrowserSessionStream({
@@ -109,6 +114,7 @@ function BrowserSessionStream({
   onReadyChange,
   onUrlChange,
   onActivity,
+  enableUrlInput = false,
 }: Props) {
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const [streamFormat, setStreamFormat] = useState<string>("png");
@@ -141,6 +147,8 @@ function BrowserSessionStream({
     inputReady,
     containerRef,
     handlers,
+    navigate,
+    navigateError,
   } = useCdpInput({
     inputWsUrl,
     interactive: controllable,
@@ -345,6 +353,8 @@ function BrowserSessionStream({
         handlers={handlers}
         currentUrl={currentUrl}
         centered={centered}
+        onNavigate={enableUrlInput ? navigate : undefined}
+        navigateError={enableUrlInput ? navigateError : undefined}
       />
     );
   }

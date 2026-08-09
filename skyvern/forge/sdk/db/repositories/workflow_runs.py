@@ -302,6 +302,7 @@ class WorkflowRunsRepository(BaseRepository):
         ai_fallback: bool | None = None,
         depends_on_workflow_run_id: str | None = None,
         browser_session_id: str | None = None,
+        browser_runtime: str | None = None,
         waiting_for_verification_code: bool | None = None,
         verification_code_identifier: str | None = None,
         verification_code_polling_started_at: datetime | None = None,
@@ -399,6 +400,8 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.depends_on_workflow_run_id = depends_on_workflow_run_id
                 if browser_session_id:
                     workflow_run.browser_session_id = browser_session_id
+                if browser_runtime is not None:
+                    workflow_run.browser_runtime = browser_runtime
                 if browser_address:
                     workflow_run.browser_address = browser_address
                 if extra_http_headers is not None:
@@ -475,6 +478,7 @@ class WorkflowRunsRepository(BaseRepository):
         status: WorkflowRunStatus,
         failure_reason: str | None = None,
         run_with: str | None = None,
+        ai_fallback: bool | None = None,
         failure_category: list[dict[str, Any]] | None = None,
     ) -> WorkflowRun | None:
         """Transition a workflow run to ``status`` only if it is not already in a
@@ -499,6 +503,8 @@ class WorkflowRunsRepository(BaseRepository):
             values["failure_reason"] = failure_reason
         if run_with is not None:
             values["run_with"] = run_with
+        if ai_fallback is not None:
+            values["ai_fallback"] = ai_fallback
         if failure_category is not None:
             values["failure_category"] = failure_category
 

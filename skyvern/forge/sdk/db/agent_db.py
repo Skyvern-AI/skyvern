@@ -368,10 +368,20 @@ class AgentDB(BaseAlchemyDB):
         self._sqlite_schedule_lock: asyncio.Lock | None = (
             asyncio.Lock() if self.engine.dialect.name == "sqlite" else None
         )
+        # ponytail: Embedded SQLite is single-user; use keyed locks if concurrent local creates become material.
+        self._sqlite_workflow_creation_lock: asyncio.Lock | None = (
+            asyncio.Lock() if self.engine.dialect.name == "sqlite" else None
+        )
 
         # -- Zero-dependency repositories --
         self.tasks = TasksRepository(self.Session, debug_enabled, self.is_retryable_error)
-        self.workflows = WorkflowsRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.workflows = WorkflowsRepository(
+            self.Session,
+            debug_enabled,
+            self.is_retryable_error,
+            db_engine=self.engine,
+            sqlite_workflow_creation_lock=self._sqlite_workflow_creation_lock,
+        )
         self.workflow_params = WorkflowParametersRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.workflow_run_credential_selections = WorkflowRunCredentialSelectionsRepository(
             self.Session, debug_enabled, self.is_retryable_error

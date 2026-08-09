@@ -64,6 +64,8 @@ type Props = {
   urlDisabled?: boolean;
   /** Slot rendered between URL and the separator before Username (e.g. browser profile checkbox) */
   afterUrl?: React.ReactNode;
+  /** Slot rendered directly under the password input, inside the credential-fields section */
+  afterPassword?: React.ReactNode;
   /** Slot rendered right before the separator between Name/URL and Username/Password */
   beforeCredentialFields?: React.ReactNode;
   editMode?: boolean;
@@ -213,6 +215,7 @@ function PasswordCredentialContent({
   urlRequired,
   urlDisabled,
   afterUrl,
+  afterPassword,
   beforeCredentialFields,
   editMode,
   configuredAdditionalTwoFactorMethod,
@@ -763,6 +766,7 @@ function PasswordCredentialContent({
           </div>
         )}
       </div>
+      {afterPassword}
       <Separator />
       <Accordion
         type="single"

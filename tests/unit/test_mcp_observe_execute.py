@@ -15,6 +15,7 @@ from skyvern.cli.core.browser_ops import (
     _DOMUTILS_INTERACTABILITY_READY_JS,
     _OBSERVE_INTERACTABLES_JS,
     ExecuteStep,
+    NavigateResult,
     ObserveResult,
     _flatten_a11y_tree,
     do_execute,
@@ -1576,7 +1577,7 @@ class TestSkyvernExecuteMCP:
 
         async def fake_navigate(*args: Any, **kwargs: Any) -> Any:
             in_flight_generation.append(session_manager.session_ref_generation(session_id=ctx.session_id))
-            return SimpleNamespace(url="https://example.com/next", title="Next")
+            return NavigateResult(url="https://example.com/next", title="Next")
 
         monkeypatch.setattr(mcp_browser, "do_navigate", fake_navigate)
 

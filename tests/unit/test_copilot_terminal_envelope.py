@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import pytest
@@ -10,6 +11,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     clear_terminal_evidence_on_workflow_edit,
 )
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.terminal_envelope import (
     TerminalOutcomeEnvelope,
@@ -614,6 +616,62 @@ def test_envelope_has_no_cause_when_deadline_did_not_expire() -> None:
     ctx.copilot_total_timeout_exceeded = False
 
     result = agent_module._build_timeout_exit_result(ctx, global_llm_context=None)
+
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["terminal_cause"] is None
+
+
+def test_max_turns_exit_types_the_cause_and_logs_the_backstop_fields() -> None:
+    ctx = make_copilot_ctx()
+    ctx.copilot_config = CopilotConfig()
+    ctx.copilot_run_start_monotonic = time.monotonic() - 12.0
+    ctx.enforcement_pass_count = 3
+    ctx.model_calls_this_turn = 12
+
+    with structlog.testing.capture_logs() as logs:
+        result = agent_module._handle_max_turns_exceeded(ctx, global_llm_context=None)
+
+    assert ctx.copilot_max_turns_exceeded is True
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["terminal_cause"] == "max_turns_exceeded"
+
+    backstop_logs = [entry for entry in logs if entry.get("event") == "copilot_max_turns_exceeded"]
+    assert len(backstop_logs) == 1
+    assert backstop_logs[0]["limit"] == 200
+    assert backstop_logs[0]["iteration"] == 3
+    assert backstop_logs[0]["model_call_count"] == 12
+    assert backstop_logs[0]["elapsed_seconds"] == pytest.approx(12.0, abs=1.0)
+
+
+def test_max_turns_exit_without_deadline_is_not_an_untyped_stop() -> None:
+    ctx = make_copilot_ctx()
+    ctx.copilot_total_timeout_exceeded = False
+    ctx.copilot_max_turns_exceeded = True
+
+    result = agent_module._build_max_turns_exit_result(ctx, global_llm_context=None)
+
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["terminal_cause"] is not None
+    assert result.terminal_envelope["terminal_cause"] == "max_turns_exceeded"
+
+
+def test_deadline_wins_when_both_capacity_latches_are_set() -> None:
+    ctx = make_copilot_ctx()
+    ctx.copilot_total_timeout_exceeded = True
+    ctx.copilot_max_turns_exceeded = True
+
+    result = agent_module._build_max_turns_exit_result(ctx, global_llm_context=None)
+
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["terminal_cause"] == "deadline_expired"
+
+
+def test_max_turns_exit_has_no_cause_when_neither_latch_is_set() -> None:
+    ctx = make_copilot_ctx()
+    ctx.copilot_total_timeout_exceeded = False
+    ctx.copilot_max_turns_exceeded = False
+
+    result = agent_module._build_max_turns_exit_result(ctx, global_llm_context=None)
 
     assert result.terminal_envelope is not None
     assert result.terminal_envelope["terminal_cause"] is None

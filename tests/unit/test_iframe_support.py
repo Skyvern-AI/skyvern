@@ -67,6 +67,7 @@ class TestMCPFrameTools:
 
         fake_page = MagicMock()
         fake_page.goto = AsyncMock()
+        fake_page.wait_for_load_state = AsyncMock()
         fake_page.url = "https://example.com/new"
         fake_page.title = AsyncMock(return_value="New Page")
         fake_ctx = MagicMock()

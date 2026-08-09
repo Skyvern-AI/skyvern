@@ -2441,3 +2441,40 @@ def test_user_code_error_still_repairs_through_the_contract() -> None:
 
     assert contract.diagnosis_result.suspected_failure_type != DiagnosisFailureType.UNRECOVERABLE_TOOL_ERROR
     assert contract.repair_decision.next_action != RepairNextAction.STOP
+
+
+def test_sheets_missing_binding_failure_arms_repair_on_the_failed_block() -> None:
+    # SKY-13624 B2: the strict-render failure is run evidence that arms repair targeting the failed
+    # block, never an evidence-free fresh-build route.
+    run_result = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_failed",
+            "overall_status": "failed",
+            "blocks": [
+                {"label": "collect_visitors", "status": "completed"},
+                {
+                    "label": "append_visitors_to_sheet",
+                    "status": "failed",
+                    "failure_reason": (
+                        "Failed to format jinja template: block `append_visitors_to_sheet` field `values` "
+                        "references a value no upstream block produced: 'dict object' has no attribute "
+                        "'visitor_count'. Return that key from the producing block, or write an explicit "
+                        "default (e.g. {{ block_label.field | default('') }}) if an empty cell is intended."
+                    ),
+                },
+            ],
+        },
+    }
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=run_result,
+        ctx=_ctx(),
+        workflow_updated=True,
+    )
+
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert contract.repair_decision.target_blocks == ["append_visitors_to_sheet"]
+    assert contract.diagnosis_input.failed_block_labels == ["append_visitors_to_sheet"]

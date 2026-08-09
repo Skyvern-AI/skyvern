@@ -1,7 +1,8 @@
-import type { RefObject } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { ExitIcon, GlobeIcon, HandIcon } from "@radix-ui/react-icons";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { cn } from "@/util/utils";
 
 interface InteractiveStreamViewProps {
@@ -22,6 +23,11 @@ interface InteractiveStreamViewProps {
   };
   currentUrl?: string;
   centered?: boolean;
+  // Only wired up by callers that want the URL bar to double as a navigation
+  // input (currently: the hosted-browser-session live view). Omitted, the bar
+  // stays the plain read-only display every other caller already gets.
+  onNavigate?: (url: string) => void;
+  navigateError?: string | null;
 }
 
 function UrlBar({ url }: { url: string }) {
@@ -30,6 +36,65 @@ function UrlBar({ url }: { url: string }) {
       <GlobeIcon className="h-3 w-3 flex-shrink-0 text-slate-400" />
       <span className="truncate">{url}</span>
     </div>
+  );
+}
+
+function NavigableUrlBar({
+  url,
+  onNavigate,
+  navigateError,
+}: {
+  url: string;
+  onNavigate: (url: string) => void;
+  navigateError?: string | null;
+}) {
+  const [value, setValue] = useState(url);
+  const isFocusedRef = useRef(false);
+
+  useEffect(() => {
+    // Don't stomp a URL the user is mid-typing if the remote page navigates elsewhere
+    // (e.g. an in-flight action) while they still have the input focused.
+    if (!isFocusedRef.current) {
+      setValue(url);
+    }
+  }, [url]);
+
+  return (
+    <form
+      className="flex h-8 w-full items-center gap-2 rounded-t-md bg-slate-800 px-2"
+      onSubmit={(e) => {
+        e.preventDefault();
+        const trimmed = value.trim();
+        if (trimmed) {
+          onNavigate(trimmed);
+        }
+      }}
+    >
+      <GlobeIcon className="h-3 w-3 flex-shrink-0 text-slate-400" />
+      <Input
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onFocus={() => {
+          isFocusedRef.current = true;
+        }}
+        onBlur={() => {
+          isFocusedRef.current = false;
+        }}
+        onClick={(e) => e.stopPropagation()}
+        // The stream container forwards every keystroke to the remote CDP session
+        // (see InteractiveStreamView's onKeyDown/onKeyUp); typing a URL must not
+        // also leak as keyboard input to the page being viewed.
+        onKeyDown={(e) => e.stopPropagation()}
+        onKeyUp={(e) => e.stopPropagation()}
+        placeholder="Enter a URL and press Enter"
+        className="h-6 flex-1 border-none bg-transparent px-1 text-xs text-slate-100 shadow-none focus-visible:ring-1 focus-visible:ring-slate-500"
+      />
+      {navigateError && (
+        <span className="flex-shrink-0 truncate text-xs text-red-400">
+          {navigateError}
+        </span>
+      )}
+    </form>
   );
 }
 
@@ -45,10 +110,17 @@ function InteractiveStreamView({
   handlers,
   currentUrl,
   centered,
+  onNavigate,
+  navigateError,
 }: InteractiveStreamViewProps) {
   const imgDataUrl = `data:image/${streamFormat};base64,${streamImgSrc}`;
 
   if (interactive) {
+    const showNavigableBar =
+      Boolean(onNavigate) && userIsControlling && currentUrl !== undefined;
+    const showReadOnlyBar = !showNavigableBar && Boolean(currentUrl);
+    const showUrlBar = showNavigableBar || showReadOnlyBar;
+
     return (
       <div
         ref={containerRef}
@@ -57,7 +129,14 @@ function InteractiveStreamView({
         onKeyDown={handlers.handleKeyDown}
         onKeyUp={handlers.handleKeyUp}
       >
-        {currentUrl && <UrlBar url={currentUrl} />}
+        {showNavigableBar && (
+          <NavigableUrlBar
+            url={currentUrl ?? ""}
+            onNavigate={onNavigate!}
+            navigateError={navigateError}
+          />
+        )}
+        {showReadOnlyBar && <UrlBar url={currentUrl!} />}
         {showControlButtons && !userIsControlling && inputReady && (
           <div className="absolute inset-0 z-10 flex items-center justify-center">
             <Button
@@ -84,7 +163,7 @@ function InteractiveStreamView({
           src={imgDataUrl}
           className={cn(
             "w-full rounded-md object-contain",
-            currentUrl ? "h-[calc(100%-2rem)]" : "h-full",
+            showUrlBar ? "h-[calc(100%-2rem)]" : "h-full",
             { "cursor-default": userIsControlling },
           )}
           onMouseDown={handlers.handleMouseDown}
