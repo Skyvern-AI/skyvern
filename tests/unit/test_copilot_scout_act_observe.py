@@ -34,7 +34,6 @@ from skyvern.forge.sdk.copilot.context import (
     finalize_discovery_counter_in_global_llm_context,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
-    _RECENT_TOOL_OUTPUT_CHAR_CAP,
     record_scouted_output_coverage,
 )
 from skyvern.forge.sdk.copilot.output_extraction_plan import ShapeExpectation, ValueCardinality, ValueShape
@@ -44,6 +43,7 @@ from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import _click_post_hook
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools.scouting import (
+    _SCOUT_RESULT_CHAR_CAP,
     _capture_scout_source_url,
     _consume_pending_browser_interaction_observation,
     _mark_pending_browser_interaction_observation,
@@ -155,6 +155,10 @@ def _ctx(*, server: Any = None, source_url: str | None = _SOURCE_URL) -> SimpleN
         scout_observed_terminal_criterion_ids=set(),
         request_policy=None,
         org_credentials_for_turn=None,
+        completion_verification_result=None,
+        reached_download_target=None,
+        pending_scout_popup=None,
+        pending_scout_popup_content_type=None,
     )
 
 
@@ -547,7 +551,7 @@ class TestActObserveSuccess:
         assert page["result_container_count"] == 1
         assert page["challenge_detected"] is False
         assert page["modal_dismiss_controls"] == ["Accept"]
-        assert len(json.dumps(result)) <= _RECENT_TOOL_OUTPUT_CHAR_CAP
+        assert len(json.dumps(result)) <= _SCOUT_RESULT_CHAR_CAP
 
     @pytest.mark.asyncio
     async def test_content_witnessed_kv_reveal_admitted_without_bounded_schema(self) -> None:
@@ -1157,7 +1161,7 @@ class TestActObserveSummaryBound:
 
         assert result["ok"] is True
         serialized = json.dumps(result)
-        assert len(serialized) <= _RECENT_TOOL_OUTPUT_CHAR_CAP
+        assert len(serialized) <= _SCOUT_RESULT_CHAR_CAP
         assert json.loads(serialized) == result
         # The flow-evidence packet keeps the full schema; only the tool result is compact.
         assert ctx.flow_evidence[0]["had_bounded_schema"] is True

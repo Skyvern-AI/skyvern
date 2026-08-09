@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
     GENUINELY_TERMINAL_BLOCKER_REASON_CODES,
-    SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
     CopilotToolBlockerSignal,
     stash_blocker_signal,
 )
@@ -48,23 +47,6 @@ def _churn_signal() -> CopilotToolBlockerSignal:
     return _signal("code_authoring_guardrail_churn")
 
 
-_REPLAY_STRUCTURAL_KEY = "b3d8aac91f1ae3a92d60ebd15ebee04216af45b03f18fe39d6deeefa77140e33"
-
-
-def _synthesized_force_signal() -> CopilotToolBlockerSignal:
-    return _signal(SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE, blocker_kind="tool_error", renders_final_reply=False)
-
-
-def _synthesized_replay_context() -> CopilotContext:
-    ctx = make_copilot_context()
-    ctx.impose_synthesized_code_block = True
-    ctx.recorded_build_test_outcome_history = [
-        {"structural_key": _REPLAY_STRUCTURAL_KEY, "phase": "build_test"},
-        {"structural_key": _REPLAY_STRUCTURAL_KEY, "phase": "build_test"},
-    ]
-    return ctx
-
-
 def _grant_ladder(ctx: CopilotContext) -> None:
     ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
 
@@ -92,30 +74,6 @@ def test_two_claimants_one_owner_loser_recorded() -> None:
     assert owner.claimant is TurnClaimant.CODE_AUTHORING_CHURN
     assert ctx.blocker_signal is signal
     assert _conflict_fingerprints(ctx) == ["code_authoring_guardrail_churn>loop_detected"]
-
-
-def test_r31_three_way_contradiction_yields_single_owner() -> None:
-    ctx = make_copilot_context()
-    _grant_ladder(ctx)
-    claim_turn(ctx, TurnClaimant.OUTPUT_CONTRACT_ACTUATION)
-
-    credential_churn = claim_turn(ctx, TurnClaimant.CREDENTIAL_PRIORITY_CHURN)
-    persistence_payload = claim_and_stash_blocker_signal(
-        ctx,
-        TurnClaimant.SYNTHESIZED_BLOCK_PERSISTENCE_FORCE,
-        _signal(SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE, blocker_kind="tool_error", renders_final_reply=False),
-    )
-
-    assert credential_churn is ClaimOutcome.YIELDED
-    assert persistence_payload is None
-    assert ctx.blocker_signal is None
-    owner = current_turn_owner(ctx)
-    assert owner is not None
-    assert owner.claimant is TurnClaimant.OUTPUT_CONTRACT_ACTUATION
-    assert sorted(_conflict_fingerprints(ctx)) == [
-        "output_contract_actuation>credential_priority_authoring_churn",
-        "output_contract_actuation>synthesized_block_persistence_force",
-    ]
 
 
 def test_precedence_order_covers_every_claimant_once() -> None:
@@ -232,48 +190,6 @@ def test_unclaimed_signal_fails_open_to_render_while_owner_live() -> None:
 
     assert blocker_signal_render_allowed(ctx, signal) is True
     assert ctx.gate_precedence_conflict_events == []
-
-
-def test_transient_claim_never_outlives_the_claiming_call() -> None:
-    ctx = make_copilot_context()
-    assert claim_turn(ctx, TurnClaimant.CREDENTIAL_SCOUT_REOPEN) is ClaimOutcome.OWNED
-    assert current_turn_owner(ctx) is None
-
-    churn = _churn_signal()
-    assert claim_and_stash_blocker_signal(ctx, TurnClaimant.CODE_AUTHORING_CHURN, churn) is not None
-    assert blocker_signal_render_allowed(ctx, churn) is True
-
-
-def test_transient_claim_yields_to_live_ladder_and_records_conflict() -> None:
-    ctx = make_copilot_context()
-    _grant_ladder(ctx)
-    assert claim_turn(ctx, TurnClaimant.CREDENTIAL_SCOUT_REOPEN) is ClaimOutcome.YIELDED
-    assert _conflict_fingerprints(ctx) == ["output_contract_actuation>credential_scout_reopen"]
-
-
-def test_carve_out_claimants_are_transient() -> None:
-    ctx = make_copilot_context()
-    assert claim_turn(ctx, TurnClaimant.ACTUATION_OBLIGATION_FILL) is ClaimOutcome.OWNED
-    assert claim_turn(ctx, TurnClaimant.CREDENTIAL_SCOUT_REOPEN) is ClaimOutcome.OWNED
-    assert current_turn_owner(ctx) is None
-
-
-def test_credential_priority_churn_yields_only_to_ladder_and_terminal() -> None:
-    ctx = make_copilot_context()
-    _grant_ladder(ctx)
-    signal = _signal("credential_priority_authoring_churn")
-    assert claim_and_stash_blocker_signal(ctx, TurnClaimant.CREDENTIAL_PRIORITY_CHURN, signal) is None
-
-    ctx2 = make_copilot_context()
-    assert claim_and_stash_blocker_signal(
-        ctx2,
-        TurnClaimant.SYNTHESIZED_BLOCK_PERSISTENCE_FORCE,
-        _signal(SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE, blocker_kind="tool_error", renders_final_reply=False),
-    )
-    credential_signal = _signal("credential_priority_authoring_churn")
-    assert claim_and_stash_blocker_signal(ctx2, TurnClaimant.CREDENTIAL_PRIORITY_CHURN, credential_signal) is not None
-    assert ctx2.blocker_signal is credential_signal
-    assert blocker_signal_render_allowed(ctx2, credential_signal) is True
 
 
 def test_emit_blocker_signal_payload_returns_payload_even_on_yield() -> None:

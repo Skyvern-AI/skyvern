@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast, get_args
 
 import structlog
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -18,11 +19,7 @@ from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.context import (
-    StructuredContext,
-    prior_signin_email_from_context,
-    sanitize_global_llm_context_for_prompt,
-)
+from skyvern.forge.sdk.copilot.context import StructuredContext
 from skyvern.forge.sdk.copilot.credential_resolution import (
     CredentialResolution,
     CredentialResolutionTier,
@@ -38,15 +35,12 @@ from skyvern.forge.sdk.copilot.credential_resolution import (
     unresolved_page_url_for_log,
 )
 from skyvern.forge.sdk.copilot.credential_resolution import url_parts as _url_parts
-from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
 from skyvern.forge.sdk.copilot.request_slots import (
     CanonicalRequestSlotV1,
     RequestSlotContractV1,
-    RequestSlotDatumTargetV1,
     RequestSlotProducerInputV1,
-    produce_request_slots,
     request_slot_request_digest,
     request_slot_source_text,
     request_slot_sources,
@@ -56,7 +50,7 @@ from skyvern.forge.sdk.copilot.secret_redaction import (
     contains_email_password_pair,
     redact_raw_secrets_for_prompt,
 )
-from skyvern.forge.sdk.copilot.signin_email import connected_gmail_address, is_email_address
+from skyvern.forge.sdk.copilot.signin_email import is_email_address
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     URL_CANDIDATE_RE,
@@ -73,7 +67,6 @@ from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()
-PROMPT_NAME = "workflow-copilot-request-policy"
 _TESTING_INTENTS = {"require_test", "skip_test", "unspecified"}
 _AUTHORING_INTENTS = {"author_now", "defer_authoring"}
 DEFER_AUTHORING_DURABLE_FILL_CRITERION_ID = "defer_authoring_durable_fill"
@@ -121,6 +114,161 @@ ClarificationReason = Literal[
     "signin_email_unresolved",
 ]
 RawSecretHandling = Literal["none", "block", "redacted_draft"]
+RawSecretSafetyStatus = Literal["not_run", "clean", "detected", "blocked"]
+RawSecretSafetyFailureKind = Literal[
+    "none",
+    "missing_handler",
+    "timeout",
+    "provider_error",
+    "malformed_output",
+    "contradictory_verdict",
+    "invalid_citation",
+]
+_RAW_SECRET_SAFETY_PROMPT_NAME = "workflow-copilot-raw-secret-safety"
+_RAW_SECRET_SAFETY_BLOCKED_TURN = "[INPUT_BLOCKED_BY_SECRET_SAFETY]"
+
+
+class RawSecretSafetyVerdict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal["1"]
+    state: Literal["clean", "detected"]
+    handling: RawSecretHandling
+    citations: list[str]
+
+
+@dataclass(frozen=True)
+class _RawSecretSafetyScreen:
+    status: RawSecretSafetyStatus
+    canonical_user_message: str
+    handling: RawSecretHandling = "none"
+    citation_count: int = 0
+    failure_kind: RawSecretSafetyFailureKind = "none"
+    latency_ms: float = 0.0
+
+
+def _raw_secret_safety_verdict(raw: object) -> RawSecretSafetyVerdict | None:
+    if isinstance(raw, str):
+        raw = parse_final_response(raw)
+    try:
+        return RawSecretSafetyVerdict.model_validate(raw)
+    except ValidationError:
+        return None
+
+
+def _validate_raw_secret_safety_verdict(
+    verdict: RawSecretSafetyVerdict,
+    *,
+    original_user_message: str,
+    screened_user_message: str,
+) -> RawSecretSafetyFailureKind:
+    if verdict.state == "clean":
+        if verdict.handling != "none" or verdict.citations:
+            return "contradictory_verdict"
+        return "none"
+    if verdict.handling == "none" or not verdict.citations:
+        return "contradictory_verdict"
+    if len(set(verdict.citations)) != len(verdict.citations) or any(not citation for citation in verdict.citations):
+        return "contradictory_verdict"
+    if any(
+        citation == "[REDACTED_SECRET]"
+        or not _verify_raw_secret_evidence(citation, original_user_message)
+        or citation not in screened_user_message
+        for citation in verdict.citations
+    ):
+        return "invalid_citation"
+    return "none"
+
+
+async def _screen_raw_secret_safety(
+    user_message: str,
+    handler: LLMAPIHandler | None,
+) -> _RawSecretSafetyScreen:
+    deterministic_safe_message = redact_raw_secrets_for_prompt(user_message)
+    if handler is None:
+        return _RawSecretSafetyScreen(
+            status="blocked",
+            canonical_user_message=_RAW_SECRET_SAFETY_BLOCKED_TURN,
+            failure_kind="missing_handler",
+        )
+    try:
+        prompt = prompt_engine.load_prompt(
+            template=_RAW_SECRET_SAFETY_PROMPT_NAME,
+            user_message=escape_code_fences(deterministic_safe_message),
+        )
+    except Exception:
+        return _RawSecretSafetyScreen(
+            status="blocked",
+            canonical_user_message=_RAW_SECRET_SAFETY_BLOCKED_TURN,
+            failure_kind="malformed_output",
+        )
+
+    started_at = time.monotonic()
+    try:
+        raw = await asyncio.wait_for(
+            handler(prompt=prompt, prompt_name=_RAW_SECRET_SAFETY_PROMPT_NAME),
+            timeout=settings.COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return _RawSecretSafetyScreen(
+            status="blocked",
+            canonical_user_message=_RAW_SECRET_SAFETY_BLOCKED_TURN,
+            failure_kind="timeout",
+            latency_ms=(time.monotonic() - started_at) * 1000,
+        )
+    except Exception as exc:
+        LOG.warning("raw-secret safety provider failed", exception_type=type(exc).__name__)
+        return _RawSecretSafetyScreen(
+            status="blocked",
+            canonical_user_message=_RAW_SECRET_SAFETY_BLOCKED_TURN,
+            failure_kind="provider_error",
+            latency_ms=(time.monotonic() - started_at) * 1000,
+        )
+
+    latency_ms = (time.monotonic() - started_at) * 1000
+    verdict = _raw_secret_safety_verdict(raw)
+    if verdict is None:
+        return _RawSecretSafetyScreen(
+            status="blocked",
+            canonical_user_message=_RAW_SECRET_SAFETY_BLOCKED_TURN,
+            failure_kind="malformed_output",
+            latency_ms=latency_ms,
+        )
+    failure_kind = _validate_raw_secret_safety_verdict(
+        verdict,
+        original_user_message=user_message,
+        screened_user_message=deterministic_safe_message,
+    )
+    if failure_kind != "none":
+        return _RawSecretSafetyScreen(
+            status="blocked",
+            canonical_user_message=_RAW_SECRET_SAFETY_BLOCKED_TURN,
+            failure_kind=failure_kind,
+            latency_ms=latency_ms,
+        )
+
+    if verdict.state == "detected":
+        # A model citation proves that some secret material exists, but it cannot prove that a
+        # cited substring covers the complete value (especially for whitespace-bearing secrets).
+        # Discard the entire turn rather than persist a partially redacted remainder.
+        return _RawSecretSafetyScreen(
+            status="detected",
+            canonical_user_message=_RAW_SECRET_SAFETY_BLOCKED_TURN,
+            handling="block",
+            citation_count=len(verdict.citations),
+            latency_ms=latency_ms,
+        )
+
+    deterministic_detected = deterministic_safe_message != user_message
+    return _RawSecretSafetyScreen(
+        status="detected" if deterministic_detected else "clean",
+        canonical_user_message=deterministic_safe_message,
+        handling="redacted_draft" if deterministic_detected else "none",
+        citation_count=len(verdict.citations),
+        latency_ms=latency_ms,
+    )
+
+
 _VALID_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(get_args(ClarificationReason))
 # Only deterministic post-resolution code may mint these; a classifier emission would
 # skip the concrete-target and credential-reachability checks the reason stands for.
@@ -167,7 +315,7 @@ _CREDENTIALS_UI_DIRECTIONS = (
 _CREDENTIAL_PROMPT_TEXT_MARKERS = ("/credentials", "credentials ui")
 # Stable tail of every raw-secret refusal; transcript redaction keys off it, so all refusal emitters must keep it verbatim.
 RAW_SECRET_REFUSAL_SENTINEL = "DO NOT PROVIDE RAW LOGIN/PASSWORD"
-_RAW_SECRET_QUESTION = (
+RAW_SECRET_QUESTION = (
     "Please do not paste raw login credentials or secrets in chat because they can enter model telemetry and execution traces. "
     "Store the credential in the Skyvern Credentials UI and reply with its exact saved credential name or a credential ID beginning with cred_. "
     f"{_CREDENTIALS_UI_DIRECTIONS} "
@@ -218,22 +366,6 @@ _INVALID_CONDITIONAL_CONTAINER_MARKERS = (
     "inside conditional",
     "within conditional",
 )
-# The leading (?<!\w) keeps a contraction's apostrophe ("I've", "can't") from opening a quote and
-# pairing with a later one, which would swallow the run between them as a bogus credential name.
-_QUOTED_CREDENTIAL_NAME_RE = re.compile(r"(?:`([^`]{1,100})`|\"([^\"]{1,100})\"|(?<!\w)'([^']{1,100})')")
-_NAMED_CREDENTIAL_TOKEN_RE = re.compile(
-    r"\b(?:saved\s+credential|credential)\s+(?:named|called)\s+([A-Za-z0-9_.@:-]{2,100})\b",
-    re.I,
-)
-_DIRECT_CREDENTIAL_TOKEN_RE = re.compile(
-    r"\b(?:use|using|with)\s+(?:the\s+)?(?:saved\s+)?credential"
-    r"(?:\s+(?:named|called))?\s+([A-Za-z0-9_.@:-]{2,100})\b",
-    re.I,
-)
-_POSTFIX_CREDENTIAL_TOKEN_RE = re.compile(
-    r"\b(?:use|using|with)\s+(?:my\s+|the\s+)?(?:saved\s+)?([A-Za-z0-9_.@:-]{2,100})\s+credential\b",
-    re.I,
-)
 _CREDENTIAL_REPLACEMENT_TARGET_RES = (
     re.compile(
         r"\bswitch(?:ing)?\s+to\b"
@@ -263,7 +395,6 @@ _CREDENTIAL_REPLACEMENT_OBJECT_RE = re.compile(
     r"(?:\s+(?:(?:id|named|called)\s+)?[A-Za-z0-9_.@:-]{2,100})?)\s*",
     re.I,
 )
-_CREDENTIAL_QUOTE_CONTEXT_RE = re.compile(r"\b(?:credentials?|log[\s-]?in)\b", re.I)
 _NEGATED_CREDENTIAL_CONTEXT_RE = re.compile(
     r"(?:"
     r"\b(?:do\s+not|don't|never|without|avoid(?:ing)?|exclud(?:e|ed|es|ing))\b"
@@ -277,9 +408,6 @@ _EXPLICIT_LOGIN_ACTION_RE = re.compile(
     r"(?<![/\w-])(?:log[\s-]?in|login|sign[\s-]?in)\b"
     r"(?!\s+(?:form|page|path|route|screen|url)\b)",
     re.I,
-)
-_CREDENTIAL_REFERENCE_STOPWORDS = frozenset(
-    {"a", "an", "credential", "for", "login", "my", "saved", "stored", "the", "to"}
 )
 _CODE_BLOCK_AUTHORING_MARKERS = ("code block", "code-block", "codeblock")
 _LOGIN_BLOCK_BAN_MARKERS = ("do not create a login block", "don't create a login block", "no login block")
@@ -616,6 +744,10 @@ class RequestPolicy:
     raw_secret_detected: bool = False
     raw_secret_evidence: str | None = None
     raw_secret_handling: RawSecretHandling = "none"
+    raw_secret_safety_status: RawSecretSafetyStatus = "not_run"
+    raw_secret_safety_failure_kind: RawSecretSafetyFailureKind = "none"
+    raw_secret_safety_citation_count: int = 0
+    raw_secret_safety_latency_ms: float = 0.0
     clarification_reason: ClarificationReason = "none"
     # `clarification_reason` cannot say this on its own: credential_name_unresolved is also raised
     # by raw-secret, invention and invalid-id asks the credential card cannot answer.
@@ -643,6 +775,10 @@ class RequestPolicy:
     classifier_non_runtime_requested_output_evidence_sources: list[str] = field(default_factory=list)
     completion_contract_status: str = "absent"
     request_slot_failure_kind: str | None = None
+    # Ephemeral, server-owned provenance for exact credential references. This is deliberately
+    # excluded from traces and comparisons: it must describe only the latest literal user turn,
+    # even when the agent input later expands terse replies with earlier context.
+    canonical_user_message: str = field(default="", repr=False, compare=False)
     _authoring_pending: bool = field(default=False, repr=False, compare=False)
 
     def graded_completion_criteria(self) -> list[CompletionCriterion]:
@@ -662,9 +798,6 @@ class RequestPolicy:
             "allow_missing_credentials_in_draft": self.allow_missing_credentials_in_draft,
             "credential_draft_deferred_explicitly": self.credential_draft_deferred_explicitly,
             "resolved_credential_count": len(self.resolved_credentials),
-            "current_turn_named_credential_count": len(self.current_turn_named_credential_ids),
-            "invalid_credential_id_count": len(self.invalid_credential_ids),
-            "auto_bound_credential_count": len(self.auto_bound_credentials),
             "has_completion_contract": bool(self.completion_contract),
             "completion_criteria_count": len(self.graded_completion_criteria()),
             "completion_criteria_implicit_count": sum(
@@ -681,6 +814,10 @@ class RequestPolicy:
             "raw_secret_detected": self.raw_secret_detected,
             "has_raw_secret_evidence": self.raw_secret_evidence is not None,
             "raw_secret_handling": self.raw_secret_handling,
+            "raw_secret_safety_status": self.raw_secret_safety_status,
+            "raw_secret_safety_failure_kind": self.raw_secret_safety_failure_kind,
+            "raw_secret_safety_citation_count": self.raw_secret_safety_citation_count,
+            "raw_secret_safety_latency_ms": round(self.raw_secret_safety_latency_ms, 3),
             "classifier_status": self.classifier_status,
             "classifier_failure_kind": self.classifier_failure_kind,
             "classifier_retry_count": self.classifier_retry_count,
@@ -1102,9 +1239,27 @@ _MIN_RAW_SECRET_EVIDENCE_CHARS = 4
 def _verify_raw_secret_evidence(evidence: str | None, user_message: str) -> bool:
     if not evidence or len(evidence) < _MIN_RAW_SECRET_EVIDENCE_CHARS:
         return False
-    if evidence not in (user_message or ""):
+    message = user_message or ""
+    if evidence not in message:
         return False
-    return any(c.isdigit() or (not c.isalnum() and not c.isspace()) for c in evidence)
+    has_secret_shape = any(c.isdigit() or (not c.isalnum() and not c.isspace()) for c in evidence)
+    if not has_secret_shape:
+        return False
+    start = 0
+    while True:
+        index = message.find(evidence, start)
+        if index < 0:
+            return False
+        end = index + len(evidence)
+        before = message[index - 1] if index else ""
+        after = message[end] if end < len(message) else ""
+        before_is_boundary = not before or before.isspace() or before in "([{\"'"
+        after_is_boundary = (
+            not after or after.isspace() or after in ")]\"}'" or (not evidence[-1].isalnum() and after in ".,;:?")
+        )
+        if before_is_boundary and after_is_boundary:
+            return True
+        start = index + 1
 
 
 def _coerce_clarification_reason(value: Any) -> ClarificationReason:
@@ -3827,1049 +3982,12 @@ def _fallback_structured_record_completion_criteria(user_message: str) -> list[C
     ]
 
 
-def _explicit_code_block_credential_draft_requested(user_message: str) -> bool:
-    normalized = " ".join((user_message or "").lower().split())
-    if not normalized:
-        return False
-    has_code_marker = any(marker in normalized for marker in _CODE_BLOCK_AUTHORING_MARKERS)
-    if not has_code_marker:
-        return False
-    blocks_login = any(marker in normalized for marker in _LOGIN_BLOCK_BAN_MARKERS)
-    mentions_credential_code = any(marker in normalized for marker in _CREDENTIAL_CODE_MARKERS)
-    return blocks_login or mentions_credential_code
-
-
-def _apply_explicit_code_block_credential_draft_policy(policy: RequestPolicy, user_message: str) -> None:
-    if policy.raw_secret_detected:
-        return
-    if not _explicit_code_block_credential_draft_requested(user_message):
-        return
-    policy.testing_intent = "skip_test"
-    policy.allow_update_workflow = True
-    policy.allow_run_blocks = False
-    policy.allow_missing_credentials_in_draft = True
-    policy.credential_draft_deferred_explicitly = True
-    policy.requires_user_clarification = False
-    policy.user_response_policy = "proceed"
-    policy.clarification_reason = "none"
-    policy.clarification_question = None
-
-
-async def _run_request_policy_classifier(
-    handler: LLMAPIHandler,
-    prompt: str,
-    *,
-    deadline: float | None = None,
-) -> tuple[Any | None, str, int]:
-    # Diverges from turn-intent on purpose: a retriable provider error (429/5xx) retries once
-    # within the budget, while a timeout is never retried (retrying cannot beat the budget).
-    if deadline is None:
-        deadline = time.monotonic() + settings.COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS
-    retry_count = 0
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            # Only reachable after a retriable error consumed the budget before the retry ran.
-            return None, "transient_error", retry_count
-        try:
-            raw = await asyncio.wait_for(
-                handler(prompt=prompt, prompt_name=PROMPT_NAME),
-                timeout=remaining,
-            )
-            return raw, "none", retry_count
-        except asyncio.TimeoutError:
-            return None, "timeout", retry_count
-        except Exception as exc:
-            if retry_count == 0 and is_retriable_llm_error(exc):
-                retry_count += 1
-                continue
-            return None, "provider_error", retry_count
-
-
-def _terminal_action_reconciliation_candidates(policy: RequestPolicy) -> list[CompletionCriterion]:
-    return [
-        criterion
-        for criterion in policy.completion_criteria
-        if criterion.kind == "outcome" and not criterion.method_mandated
-    ]
-
-
-def _render_terminal_action_reconciliation_criteria(criteria: list[CompletionCriterion]) -> str:
-    return json.dumps(
-        [
-            {
-                "id": criterion.id,
-                "outcome": criterion.outcome,
-                "contingent_on": criterion.contingent_on,
-                "implicit": criterion.implicit,
-                "method_mandated": criterion.method_mandated,
-                "level": criterion.level,
-                "output_path": criterion.output_path,
-                "kind": criterion.kind,
-            }
-            for criterion in criteria
-        ],
-        ensure_ascii=True,
-        separators=(",", ":"),
-    )
-
-
-def _policy_needs_terminal_action_reconciliation(policy: RequestPolicy) -> bool:
-    if policy.requires_user_clarification:
-        return False
-    if policy.credential_input_kind not in _TERMINAL_ACTION_RECONCILABLE_CREDENTIAL_KINDS:
-        return False
-    return not any(
-        criterion.kind == "terminal_action" and not criterion.method_mandated
-        for criterion in policy.completion_criteria
-    )
-
-
-def _log_terminal_action_reconciliation_omitted(
-    policy: RequestPolicy,
-    *,
-    reason: str,
-    failure_kind: str = "none",
-    retry_count: int = 0,
-) -> None:
-    request_slot_failure_kind = policy.request_slot_failure_kind
-    if request_slot_failure_kind:
-        surface = RequestSlotFailureSurfaceV1(
-            version="1",
-            reason="request_slot_failure",
-            failure_kind="request_slot_failure",
-            retryable=False,
-            request_slot_failure_kind=request_slot_failure_kind,
-        )
-        LOG.info(
-            "copilot_terminal_action_reconciliation_omitted",
-            reason=surface.reason,
-            failure_kind=surface.failure_kind,
-            retryable=surface.retryable,
-            request_slot_failure_kind=surface.request_slot_failure_kind,
-            retry_count=retry_count,
-            credential_input_kind=policy.credential_input_kind,
-            completion_criteria_count=len(policy.completion_criteria),
-        )
-        return
-    LOG.info(
-        "copilot_terminal_action_reconciliation_omitted",
-        reason=reason,
-        failure_kind=failure_kind,
-        retry_count=retry_count,
-        credential_input_kind=policy.credential_input_kind,
-        completion_criteria_count=len(policy.completion_criteria),
-    )
-
-
-async def _reconcile_missing_terminal_action(
-    policy: RequestPolicy,
-    *,
-    user_message: str,
-    handler: LLMAPIHandler,
-) -> None:
-    if not _policy_needs_terminal_action_reconciliation(policy):
-        return
-    candidates = _terminal_action_reconciliation_candidates(policy)
-    if not candidates:
-        _log_terminal_action_reconciliation_omitted(policy, reason="no_eligible_criteria")
-        return
-
-    prompt = prompt_engine.load_prompt(
-        template=PROMPT_NAME,
-        terminal_action_reconciliation=True,
-        user_message=escape_code_fences(redact_raw_secrets_for_prompt(user_message)),
-        reconciliation_credential_input_kind=policy.credential_input_kind,
-        reconciliation_criteria=escape_code_fences(_render_terminal_action_reconciliation_criteria(candidates)),
-    )
-    raw, failure_kind, retry_count = await _run_request_policy_classifier(
-        handler,
-        prompt,
-    )
-    if raw is None:
-        _log_terminal_action_reconciliation_omitted(
-            policy,
-            reason="classifier_failed",
-            failure_kind=failure_kind,
-            retry_count=retry_count,
-        )
-        return
-    reconciliation = _parse_terminal_action_reconciliation(raw)
-    if reconciliation is None:
-        _log_terminal_action_reconciliation_omitted(
-            policy,
-            reason="malformed_response",
-            failure_kind=failure_kind,
-            retry_count=retry_count,
-        )
-        return
-    if reconciliation.criterion_id is None:
-        _log_terminal_action_reconciliation_omitted(
-            policy,
-            reason="model_abstained",
-            failure_kind=failure_kind,
-            retry_count=retry_count,
-        )
-        return
-
-    matching_indexes = [
-        index for index, criterion in enumerate(candidates) if criterion.id == reconciliation.criterion_id
-    ]
-    if len(matching_indexes) != 1:
-        _log_terminal_action_reconciliation_omitted(
-            policy,
-            reason="unknown_or_ambiguous_criterion",
-            failure_kind=failure_kind,
-            retry_count=retry_count,
-        )
-        return
-    selected = candidates[matching_indexes[0]]
-    policy_index = next(
-        (index for index, criterion in enumerate(policy.completion_criteria) if criterion is selected),
-        None,
-    )
-    if policy_index is None:
-        _log_terminal_action_reconciliation_omitted(policy, reason="criterion_not_in_policy")
-        return
-    policy.completion_criteria[policy_index] = replace(
-        selected,
-        kind="terminal_action",
-        terminal_action_family=reconciliation.terminal_action_family,
-        terminal_action_verification_mode="semantic_outcome_v1",
-    )
-    LOG.info(
-        "copilot_terminal_action_reconciled",
-        criterion_id=selected.id,
-        terminal_action_family=reconciliation.terminal_action_family,
-        credential_input_kind=policy.credential_input_kind,
-        completion_criteria_count=len(policy.completion_criteria),
-        retry_count=retry_count,
-    )
-
-
-async def _classify_request(
-    user_message: str,
-    workflow_yaml: str,
-    chat_history: list[WorkflowCopilotChatHistoryMessage],
-    global_llm_context: str,
-    handler: LLMAPIHandler | None,
-    *,
-    active_criteria: list[CompletionCriterion] | None = None,
-    config: CopilotConfig | None = None,
-) -> RequestPolicy:
-    requested_output_path_aliases = config.requested_output_path_aliases if config is not None else {}
-    ids = _credential_ids(user_message)
-    raw_secret_present = _raw_secret_detected(user_message)
-    if raw_secret_present and handler is None:
-        return _classifier_fallback_policy(
-            ids,
-            raw_secret_present=True,
-            failure_kind="raw_secret_no_handler",
-            user_message=user_message,
-            requested_output_path_aliases=requested_output_path_aliases,
-        )
-    structural_reason = _structural_clarification_reason(user_message)
-    if structural_reason != "none" and not raw_secret_present:
-        return RequestPolicy(
-            credential_input_kind="credential_id" if ids else "none",
-            credential_refs=ids,
-            requires_user_clarification=True,
-            clarification_reason=structural_reason,
-        )
-    if handler is None:
-        return _classifier_fallback_policy(
-            ids,
-            raw_secret_present=False,
-            failure_kind="missing_handler",
-            user_message=user_message,
-            requested_output_path_aliases=requested_output_path_aliases,
-        )
-
-    # Raw-secret turns intentionally reach the classifier when available so it
-    # can distinguish unsafe secret use from redacted draft/spec conversion.
-    # Timeout and exception fallbacks remain conservative blocks below.
-    safe_user_message = redact_raw_secrets_for_prompt(user_message) if raw_secret_present else user_message
-    safe_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
-    transcript = build_transcript_context(chat_history, safe_user_message)
-    request_slot_request = RequestSlotProducerInputV1(
-        version="1",
-        latest_request=safe_user_message[:16_384],
-        workflow_context=workflow_yaml[:32_768],
-        earliest_user_turn=""
-        if transcript.earliest_user_turn == _EMPTY_SLOT_SENTINEL
-        else transcript.earliest_user_turn,
-        latest_prior_user_turn=(
-            "" if transcript.latest_prior_user_turn == _EMPTY_SLOT_SENTINEL else transcript.latest_prior_user_turn
-        ),
-        latest_assistant_turn=(
-            "" if transcript.latest_assistant_turn == _EMPTY_SLOT_SENTINEL else transcript.latest_assistant_turn
-        ),
-        retained_history=(
-            () if transcript.retained_history == _EMPTY_SLOT_SENTINEL else (transcript.retained_history,)
-        ),
-        global_context=safe_global_llm_context[:32_768],
-        detected_output_candidates=_detected_output_candidates(safe_user_message, requested_output_path_aliases),
-    )
-    prompt = prompt_engine.load_prompt(
-        template=PROMPT_NAME,
-        terminal_action_reconciliation=False,
-        trust_floor_only=False,
-        user_message=escape_code_fences(safe_user_message),
-        raw_secret_present=str(raw_secret_present).lower(),
-        workflow_yaml=escape_code_fences(redact_raw_secrets_for_prompt(workflow_yaml)[:2048]),
-        earliest_user_turn=transcript.earliest_user_turn,
-        latest_prior_user_turn=transcript.latest_prior_user_turn,
-        latest_assistant_turn=transcript.latest_assistant_turn,
-        retained_history=transcript.retained_history,
-        global_llm_context=escape_code_fences(redact_raw_secrets_for_prompt(safe_global_llm_context)[:2048]),
-        active_completion_criteria=escape_code_fences(_render_active_criteria_for_prompt(active_criteria)),
-        request_slot_sources=json.dumps(
-            # The classifier needs the same bounded, byte-exact source set as the
-            # producer so it can nominate an unambiguous source ID + quote. This is
-            # intentionally repeated alongside the role-labelled transcript context;
-            # the latter supplies conversational meaning, while this block supplies
-            # server-verifiable identity.
-            [source.model_dump(mode="json") for source in request_slot_sources(request_slot_request)],
-            ensure_ascii=True,
-            separators=(",", ":"),
-        ),
-    )
-    classifier_deadline = time.monotonic() + settings.COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS
-    raw, failure_kind, retry_count = await _run_request_policy_classifier(
-        handler,
-        prompt,
-        deadline=classifier_deadline,
-    )
-    if raw is None:
-        LOG.warning("request-policy classifier failed", failure_kind=failure_kind, retry_count=retry_count)
-        return _classifier_fallback_policy(
-            ids,
-            raw_secret_present=raw_secret_present,
-            failure_kind=failure_kind,
-            retry_count=retry_count,
-            user_message=user_message,
-            requested_output_path_aliases=requested_output_path_aliases,
-        )
-
-    raw_payload = _coerce_classifier_payload(raw)
-    if raw_payload is None:
-        LOG.warning("request-policy classifier returned malformed payload")
-        return _classifier_fallback_policy(
-            ids,
-            raw_secret_present=raw_secret_present,
-            failure_kind=failure_kind if failure_kind != "none" else "provider_error",
-            retry_count=retry_count,
-            user_message=user_message,
-            requested_output_path_aliases=requested_output_path_aliases,
-        )
-
-    # The primary classifier may describe candidate criteria, but it cannot mint
-    # provenance for itself. Datum bindings become trusted only after the separate
-    # producer-owned envelope is mechanically joined below.
-    raw_payload = copy.deepcopy(raw_payload)
-    raw_criteria = raw_payload.get("completion_criteria")
-    if isinstance(raw_criteria, list):
-        for item in raw_criteria:
-            if isinstance(item, dict):
-                item.pop("request_slot_datum_binding", None)
-
-    request_slot_contract: RequestSlotContractV1 | None = None
-    request_slot_contract_request = request_slot_request
-    request_slot_failure_kind: str | None = None
-    trusted_datum_bindings: tuple[TrustedRequestSlotDatumBindingV1, ...] = ()
-    datum_binding_targets = _request_slot_datum_binding_targets(
-        raw_criteria,
-        request_slot_request=request_slot_request,
-    )
-    if datum_binding_targets:
-        targeted_request_data = request_slot_request.model_dump()
-        try:
-            targeted_request_data["datum_targets"] = tuple(
-                RequestSlotDatumTargetV1(
-                    criterion_index=target.criterion_index,
-                    datum_field=target.datum_field,
-                    datum_value=target.datum_value,
-                    criterion_outcome_sha256=target.criterion_outcome_sha256,
-                )
-                for target in datum_binding_targets
-            )
-            targeted_request = RequestSlotProducerInputV1.model_validate(targeted_request_data)
-        except ValueError:
-            targeted_request = None
-            request_slot_failure_kind = "invalid_output"
-            LOG.warning(
-                "request-policy request-slot target construction failed",
-                failure_kind=request_slot_failure_kind,
-                target_count=len(datum_binding_targets),
-            )
-        if targeted_request is not None:
-            request_slot_result = await produce_request_slots(request=targeted_request, handler=handler)
-            if request_slot_result.status == "success":
-                request_slot_contract = request_slot_result.contract
-                request_slot_contract_request = targeted_request
-            else:
-                request_slot_failure_kind = (
-                    request_slot_result.failure_kind.value
-                    if request_slot_result.failure_kind is not None
-                    else "unknown"
-                )
-                LOG.warning(
-                    "request-policy request-slot producer failed",
-                    failure_kind=request_slot_failure_kind,
-                    attempts=request_slot_result.attempts,
-                )
-        if request_slot_contract is not None:
-            datum_binding_decision = _apply_request_slot_datum_bindings(
-                raw_payload,
-                request_slot_request=targeted_request,
-                request_slot_contract=request_slot_contract,
-                datum_binding_targets=datum_binding_targets,
-            )
-            if datum_binding_decision.accepted_payload is not None:
-                raw_payload = datum_binding_decision.accepted_payload
-                raw_criteria = raw_payload.get("completion_criteria")
-                trusted_datum_bindings = datum_binding_decision.trusted_bindings
-            else:
-                request_slot_failure_kind = "invalid_anchor_correction"
-                request_slot_contract = None
-                LOG.warning(
-                    "copilot_request_slot_datum_binding_contract_rejected",
-                    event_version="1",
-                    predicate=datum_binding_decision.predicate,
-                    criterion_index=datum_binding_decision.criterion_index,
-                )
-    elif _request_slot_claims_need_anchor_correction(
-        raw_criteria,
-        request_slot_request=request_slot_request,
-    ):
-        correction_prompt = _request_slot_anchor_correction_prompt(
-            prompt,
-            raw_payload=raw_payload,
-        )
-        corrected_raw, correction_failure_kind, correction_retry_count = await _run_request_policy_classifier(
-            handler,
-            correction_prompt,
-        )
-        retry_count += correction_retry_count
-        corrected_payload = _coerce_classifier_payload(corrected_raw)
-        anchor_correction_decision = (
-            _accept_request_slot_anchor_correction(
-                raw_payload,
-                corrected_payload,
-                request_slot_request=request_slot_request,
-            )
-            if corrected_payload is not None
-            else None
-        )
-        accepted_payload = (
-            anchor_correction_decision.accepted_payload if anchor_correction_decision is not None else None
-        )
-        if accepted_payload is not None:
-            raw_payload = accepted_payload
-            raw_criteria = raw_payload.get("completion_criteria")
-        else:
-            request_slot_failure_kind = "invalid_anchor_correction"
-            capture = (
-                _anchor_correction_rejection_capture(raw_payload, corrected_payload)
-                if corrected_payload is not None
-                else None
-            )
-            if anchor_correction_decision is not None and capture is not None:
-                LOG.warning(
-                    "copilot_request_slot_anchor_correction_rejected",
-                    event_version="1",
-                    predicate=anchor_correction_decision.predicate,
-                    criterion_index=anchor_correction_decision.criterion_index,
-                    **capture,
-                )
-            LOG.warning(
-                "request-policy request-slot anchor correction failed",
-                failure_kind=correction_failure_kind,
-                predicate=(anchor_correction_decision.predicate if anchor_correction_decision is not None else None),
-                criterion_index=(
-                    anchor_correction_decision.criterion_index if anchor_correction_decision is not None else None
-                ),
-            )
-    if request_slot_failure_kind is None and request_slot_contract is None:
-        # The independent producer owns slot membership as well as type. Run it even
-        # when the primary classifier declares no slots so an omitted conditional
-        # fallback cannot disappear from the completion contract.
-        request_slot_result = await produce_request_slots(request=request_slot_request, handler=handler)
-        if request_slot_result.status == "success":
-            request_slot_contract = request_slot_result.contract
-            request_slot_contract_request = request_slot_request
-            if request_slot_contract is not None and request_slot_contract.candidate_refutations:
-                LOG.info(
-                    "request-policy producer refuted detected output candidates",
-                    refutations=[
-                        {"candidate": refutation.candidate, "reason": refutation.reason}
-                        for refutation in request_slot_contract.candidate_refutations
-                    ],
-                )
-        else:
-            request_slot_failure_kind = (
-                request_slot_result.failure_kind.value if request_slot_result.failure_kind is not None else "unknown"
-            )
-            LOG.warning(
-                "request-policy request-slot producer failed",
-                failure_kind=request_slot_failure_kind,
-                attempts=request_slot_result.attempts,
-            )
-    if request_slot_failure_kind is None and request_slot_contract is not None:
-        omitted_targets = _omitted_request_slot_datum_binding_targets(
-            raw_criteria,
-            request_slot_request=request_slot_contract_request,
-            request_slot_contract=request_slot_contract,
-            existing_targets=datum_binding_targets,
-        )
-        if omitted_targets:
-            completed_request_data = request_slot_request.model_dump()
-            completed_request_data["datum_targets"] = tuple(
-                RequestSlotDatumTargetV1(
-                    criterion_index=target.criterion_index,
-                    datum_field=target.datum_field,
-                    datum_value=target.datum_value,
-                    criterion_outcome_sha256=target.criterion_outcome_sha256,
-                )
-                for target in (*datum_binding_targets, *omitted_targets)
-            )
-            try:
-                completed_request = RequestSlotProducerInputV1.model_validate(completed_request_data)
-            except ValueError:
-                completed_request = None
-                request_slot_failure_kind = "invalid_output"
-                request_slot_contract = None
-            if completed_request is not None:
-                completed_result = await produce_request_slots(request=completed_request, handler=handler)
-                if completed_result.status == "success" and completed_result.contract is not None:
-                    request_slot_contract = completed_result.contract
-                    request_slot_contract_request = completed_request
-                    if datum_binding_targets:
-                        datum_binding_decision = _apply_request_slot_datum_bindings(
-                            raw_payload,
-                            request_slot_request=completed_request,
-                            request_slot_contract=request_slot_contract,
-                            datum_binding_targets=datum_binding_targets,
-                        )
-                        if datum_binding_decision.accepted_payload is None:
-                            request_slot_failure_kind = "invalid_anchor_correction"
-                            request_slot_contract = None
-                        else:
-                            raw_payload = datum_binding_decision.accepted_payload
-                            raw_criteria = raw_payload.get("completion_criteria")
-                            trusted_datum_bindings = datum_binding_decision.trusted_bindings
-                    if request_slot_contract is not None:
-                        trusted_datum_bindings = (
-                            *trusted_datum_bindings,
-                            *_trusted_omitted_request_slot_datum_bindings(
-                                request_slot_request=completed_request,
-                                request_slot_contract=request_slot_contract,
-                                omitted_targets=omitted_targets,
-                            ),
-                        )
-                else:
-                    request_slot_failure_kind = (
-                        completed_result.failure_kind.value if completed_result.failure_kind is not None else "unknown"
-                    )
-                    request_slot_contract = None
-    policy = _classification_from_raw(
-        raw_payload,
-        request_slot_request=request_slot_contract_request,
-        request_slot_contract=request_slot_contract,
-        request_slot_failure_kind=request_slot_failure_kind,
-        trusted_datum_bindings=trusted_datum_bindings,
-    )
-    policy.classifier_retry_count = retry_count
-    policy.classifier_non_runtime_requested_output_evidence_sources = sorted(
-        {
-            criterion.requested_output_evidence_source
-            for criterion in policy.completion_criteria
-            if criterion.requested_output_evidence_source != "runtime_output"
-        }
-    )
-    policy.completion_contract = _ground_completion_contract(user_message, policy.completion_contract)
-    policy.completion_contract_status = (
-        "present" if policy.completion_contract or policy.completion_criteria else "absent"
-    )
-    classifier_credential_refs = [_canonicalize_credential_ref(ref) for ref in policy.credential_refs]
-    policy.credential_refs = _clean_list(classifier_credential_refs + ids)
-    if raw_secret_present:
-        policy.raw_secret_detected = True
-        if policy.raw_secret_handling == "redacted_draft":
-            if policy.credential_input_kind == "raw_secret":
-                policy.credential_input_kind = "placeholder"
-            policy.raw_secret_evidence = None
-        else:
-            policy.credential_input_kind = "raw_secret"
-            policy.raw_secret_handling = "block"
-            policy.clarification_reason = structural_reason if structural_reason != "none" else "raw_secret"
-    if policy.testing_intent == "skip_test" and policy.completion_contract:
-        policy.testing_intent = "unspecified"
-    if ids and policy.credential_input_kind != "raw_secret":
-        # A deterministically-extracted `cred_`-shaped token overrides a non-ID kind, unless the
-        # classifier pointed at another resolvable target — a saved name (an ID-shaped ref does
-        # not count) or a login-page URL — leaving the cred_ token as contextual.
-        classifier_named_a_credential = any(not _credential_ids(ref) for ref in classifier_credential_refs)
-        classifier_target_wins = (
-            policy.credential_input_kind == "credential_name" and classifier_named_a_credential
-        ) or (policy.credential_input_kind == "website_stored_credential" and bool(policy.login_page_urls))
-        if not classifier_target_wins:
-            policy.credential_input_kind = "credential_id"
-    if (
-        policy.credential_input_kind == "raw_secret"
-        and not raw_secret_present
-        and not _verify_raw_secret_evidence(policy.raw_secret_evidence, user_message)
-    ):
-        # The classifier claimed raw_secret but cited no verifiable secret in
-        # the latest message — typically a token carried over from a prior turn.
-        # Clear the claim so the turn classifies on its own merits downstream.
-        LOG.warning(
-            "request-policy raw_secret claim failed evidence verification; clearing",
-            evidence_cited=policy.raw_secret_evidence is not None,
-        )
-        policy.credential_input_kind = "credential_id" if ids else "none"
-        policy.clarification_reason = "none"
-        policy.requires_user_clarification = False
-        policy.raw_secret_evidence = None
-    _degrade_pathless_contingent_criteria(policy)
-    _apply_requested_output_labels(policy, user_message, requested_output_path_aliases)
-    await _reconcile_missing_terminal_action(
-        policy,
-        user_message=safe_user_message,
-        handler=handler,
-    )
-    policy.completion_contract_status = (
-        "present" if policy.completion_contract or policy.graded_completion_criteria() else "absent"
-    )
-    return policy
-
-
-def _quote_in_credential_context(user_message: str, quote_start: int) -> bool:
-    return bool(_CREDENTIAL_QUOTE_CONTEXT_RE.search(user_message[max(0, quote_start - 48) : quote_start]))
-
-
-def _credential_reference_is_negated(user_message: str, reference_start: int) -> bool:
-    clause_start = max(user_message.rfind(delimiter, 0, reference_start) for delimiter in (".", "!", "?", "\n", ";"))
-    context = user_message[clause_start + 1 : reference_start]
-    context = re.sub(r",\s*(?=credential\b)", " ", context, flags=re.I)
-    if context.rstrip().endswith(",") and re.match(
-        # Any wrapper the name arrives in — quotes, markdown emphasis, brackets — reads the same:
-        # "do not use the credential, **prod**" is one clause, not an appositive.
-        r"\s*(?:credential\b|cred_|[`'\"“”‘’*_([{<])",
-        user_message[reference_start:],
-        re.I,
-    ):
-        context = f"{context.rstrip()[:-1]} "
-    return bool(_NEGATED_CREDENTIAL_CONTEXT_RE.search(context))
-
-
-def _credential_reference_is_unrelated_replacement(user_message: str, reference_start: int) -> bool:
-    clause_start = max(
-        user_message.rfind(delimiter, 0, reference_start) for delimiter in (".", "!", "?", "\n", ",", ";")
-    )
-    replacement = _REPLACEMENT_CONTEXT_RE.search(user_message[clause_start + 1 : reference_start])
-    return bool(replacement and not _CREDENTIAL_REPLACEMENT_OBJECT_RE.fullmatch(replacement.group("object")))
-
-
-def _credential_authority_text(user_message: str) -> str:
-    replacement_targets = [
-        match.end()
-        for pattern in _CREDENTIAL_REPLACEMENT_TARGET_RES
-        for match in pattern.finditer(user_message)
-        if not _credential_reference_is_negated(user_message, match.start())
-    ]
-    if not replacement_targets:
-        return user_message
-    return f"use {user_message[max(replacement_targets) :].lstrip()}"
-
-
-def _exact_credential_name_candidates(user_message: str) -> list[str]:
-    text = _credential_authority_text(user_message or "")
-    mentions: list[tuple[str, int, bool, bool]] = []
-
-    def add_mention(value: str, start: int, *, context_matches: bool = True) -> None:
-        value = value.strip()
-        if not context_matches or not value or value.lower() in _CREDENTIAL_REFERENCE_STOPWORDS:
-            return
-        mentions.append(
-            (
-                value,
-                start,
-                _credential_reference_is_negated(text, start),
-                _credential_reference_is_unrelated_replacement(text, start),
-            )
-        )
-
-    for match in _QUOTED_CREDENTIAL_NAME_RE.finditer(text):
-        group_index = next((index for index, group in enumerate(match.groups(), start=1) if group), 1)
-        value = (match.group(group_index) or "").strip()
-        add_mention(
-            value,
-            match.start(),
-            context_matches=_quote_in_credential_context(text, match.start()),
-        )
-    for match in _NAMED_CREDENTIAL_TOKEN_RE.finditer(text):
-        add_mention(match.group(1), match.start(1))
-    for match in _DIRECT_CREDENTIAL_TOKEN_RE.finditer(text):
-        add_mention(match.group(1), match.start(1))
-    for match in _POSTFIX_CREDENTIAL_TOKEN_RE.finditer(text):
-        add_mention(match.group(1), match.start(1))
-
-    last_negated_mention = {
-        value: start for value, start, is_negated, is_unrelated in mentions if is_negated and not is_unrelated
-    }
-    return _clean_list(
-        [
-            value
-            for value, start, is_negated, is_unrelated in mentions
-            if not is_negated and not is_unrelated and last_negated_mention.get(value, -1) < start
-        ]
-    )
-
-
-def _credential_name_candidates(user_message: str) -> list[str]:
-    # Classifier refs are model-authored hints, not current-turn credential
-    # authority. Resolve names only from deterministic, affirmative references
-    # in the latest user message.
-    return _exact_credential_name_candidates(user_message)
-
-
-_CREDENTIAL_NAME_MIN_DISTINCTIVE_LENGTH = 4
-# Labels that mean the classifier read this turn as referring to a stored credential at all.
-_CREDENTIAL_REFERENCE_INPUT_KINDS = frozenset({"credential_id", "credential_name", "website_stored_credential"})
-
-
-def _explicit_login_action_asserted(user_message: str) -> bool:
-    """Whether the message asks for a login in its own words, ignoring phrasings that refuse one.
-
-    Shares the negation rule with saved-name matching, so "do not log in with prod" authorizes neither.
-    """
-    text = _credential_authority_text(user_message or "")
-    return any(
-        not _credential_reference_is_negated(text, match.start()) for match in _EXPLICIT_LOGIN_ACTION_RE.finditer(text)
-    )
-
-
-def _wrapper_start(text: str, index: int) -> int:
-    """Step back over quotes, brackets or markdown emphasis wrapping a reference."""
-    while index > 0 and text[index - 1] in "`'\"“”‘’*_([{<":
-        index -= 1
-    return index
-
-
-def _name_stated_affirmatively(text: str, name: str) -> bool:
-    name = (name or "").strip()
-    if len(name) < _CREDENTIAL_NAME_MIN_DISTINCTIVE_LENGTH or name.lower() in _CREDENTIAL_REFERENCE_STOPWORDS:
-        return False
-    pattern = rf"(?<![A-Za-z0-9_.@:-]){re.escape(name)}(?![A-Za-z0-9_.@:-])"
-    for match in re.finditer(pattern, text, re.IGNORECASE):
-        # Negation reads the clause before the reference, and any wrapper around the name belongs to
-        # it: from inside the quotes, "credential, `prod`" no longer reads as an appositive.
-        start = _wrapper_start(text, match.start())
-        if not _credential_reference_is_negated(text, start) and not _credential_reference_is_unrelated_replacement(
-            text, start
-        ):
-            return True
-    return False
-
-
-def _saved_credential_names_mentioned(user_message: str, credentials: list[Credential]) -> list[str]:
-    """Saved names a message states outright, e.g. "use skyvern-datadog to login".
-
-    The saved names are known, so match on them rather than on the prose around them.
-    """
-    text = _credential_authority_text(user_message or "")
-    return _clean_list(
-        [
-            (credential.name or "").strip()
-            for credential in credentials
-            if _name_stated_affirmatively(text, credential.name or "")
-        ]
-    )
-
-
-def _classifier_ref_stated_in_message(policy: RequestPolicy, user_message: str) -> bool:
-    """Whether a credential-labelled turn's extracted name appears affirmatively in this message.
-
-    Which credential label the classifier chose must not decide whether a name the user wrote is
-    looked up by name (SKY-12917), but a turn it never called a credential request may not scan.
-    """
-    if policy.classifier_status == "fallback" or policy.credential_input_kind not in _CREDENTIAL_REFERENCE_INPUT_KINDS:
-        return False
-    text = _credential_authority_text(user_message or "")
-    return any(isinstance(ref, str) and _name_stated_affirmatively(text, ref) for ref in policy.credential_refs)
-
-
-def _explicit_credential_ids(user_message: str) -> list[str]:
-    """Credential IDs the user's own message hands to this turn.
-
-    Accepts the canonical ``cred_`` form and ``_MALFORMED_CREDENTIAL_ID_RE``'s ``cred <12+ digits>``
-    normalization; surrounding prose can only withdraw a token, never qualify it.
-    """
-    text = _credential_authority_text(user_message or "")
-    matches = sorted(
-        [(match, match.group(0)) for match in _CREDENTIAL_ID_RE.finditer(text)]
-        + [(match, f"cred_{match.group(1)}") for match in _MALFORMED_CREDENTIAL_ID_RE.finditer(text)],
-        key=lambda item: item[0].start(),
-    )
-    last_negated_mention = {
-        credential_id: match.start()
-        for match, credential_id in matches
-        if _credential_reference_is_negated(text, match.start())
-    }
-    return _clean_list(
-        [
-            credential_id
-            for match, credential_id in matches
-            if last_negated_mention.get(credential_id, -1) <= match.start()
-            and not _credential_reference_is_negated(text, match.start())
-            and not _credential_reference_is_unrelated_replacement(text, match.start())
-        ]
-    )
-
-
 def credential_candidate_label(credential: Credential) -> str:
-    parts = [f"`{credential.credential_id}`", credential.name]
-    parts += [f"Login Page URL: {credential.tested_url}"] if credential.tested_url else []
-    return " - ".join(parts)
-
-
-def _block(
-    policy: RequestPolicy,
-    question: str,
-    candidates: list[Credential] | None = None,
-    *,
-    reason: ClarificationReason | None = None,
-    card_answerable: bool = False,
-) -> None:
-    policy.requires_user_clarification = True
-    policy.user_response_policy = "ask_clarification"
-    policy.allow_update_workflow = policy.allow_run_blocks = False
-    if reason is not None:
-        policy.clarification_reason = reason
-    policy.credential_ask_card_answerable = card_answerable
-    # Candidate ids ride the pause frame as BE machinery; the card renders the full-org picker, so
-    # the ask never enumerates credentials in prose.
-    policy.credential_ask_candidate_ids = [candidate.credential_id for candidate in candidates or []]
-    policy.clarification_question = question
-
-
-def _login_url_candidates(policy: RequestPolicy, user_message: str) -> list[str]:
-    if policy.login_page_urls:
-        return _clean_list(policy.login_page_urls)
-    candidates = _clean_list([candidate.rstrip(".,;:!?") for candidate in URL_CANDIDATE_RE.findall(user_message)])
-    candidate_hosts = {parts[2] for candidate in candidates if (parts := _url_parts(candidate))}
-    if len(candidate_hosts) > 1:
-        return []
-    return candidates
-
-
-_CLARIFICATION_DECISION_PREFIX = "request-policy clarification required:"
-_PRIOR_CREDENTIAL_CLARIFICATION_REASONS = frozenset(
-    {
-        "credential_name_unresolved",
-        "credential_invention_requested",
-        "workflow_credential_inputs_unbound",
-        "raw_secret",
-    }
-)
-
-
-def _prior_turn_was_credential_clarification(global_llm_context: str) -> bool:
-    # Walk in reverse so a stale credential clarification followed by later non-credential
-    # work does not keep routing the generic fallback into credential-help text.
-    structured = StructuredContext.from_json_str(global_llm_context)
-    for decision in reversed(structured.decisions_made):
-        if not decision.startswith(_CLARIFICATION_DECISION_PREFIX):
-            continue
-        return any(decision.endswith(f"/{reason}") for reason in _PRIOR_CREDENTIAL_CLARIFICATION_REASONS)
-    return False
-
-
-def _clarification_question(policy: RequestPolicy, global_llm_context: str = "") -> str:
-    if policy.clarification_reason == "raw_secret":
-        return _RAW_SECRET_QUESTION
-    if policy.clarification_reason == "credential_name_unresolved":
-        if policy.credential_input_kind == "website_stored_credential":
-            return _STORED_CREDENTIAL_URL_QUESTION
-        return _SAVED_CREDENTIAL_NAME_QUESTION
-    if policy.clarification_reason == "credential_invention_requested":
-        return (
-            "I cannot invent a credential ID. Please provide a valid saved credential ID, "
-            f"select an existing credential, or create one in the Credentials UI. {_CREDENTIALS_UI_DIRECTIONS}"
-        )
-    if policy.clarification_reason == "ambiguous_loop_edit":
-        return "Which block or blocks should go inside the loop, and what should the loop iterate over or stop on?"
-    if policy.clarification_reason == "invalid_conditional_container":
-        return (
-            "Conditional blocks route to other blocks; they do not contain loop blocks. "
-            "What condition should route into the loop, and should any default branch skip it?"
-        )
-    if policy.clarification_reason == "missing_conditional_condition":
-        return "What condition should trigger this conditional route?"
-    if policy.clarification_reason == "missing_target_context":
-        if policy.credential_input_kind == "website_stored_credential":
-            return _STORED_CREDENTIAL_URL_QUESTION
-        return "Which page or URL should the workflow go to?"
-    if policy.clarification_reason == "workflow_credential_inputs_unbound":
-        return _WORKFLOW_CREDENTIAL_INPUTS_UNBOUND_QUESTION
-    if policy.credential_input_kind == "credential_name":
-        return _SAVED_CREDENTIAL_NAME_QUESTION
-    if policy.credential_input_kind == "website_stored_credential":
-        return _STORED_CREDENTIAL_URL_QUESTION
-    if _prior_turn_was_credential_clarification(global_llm_context):
-        return _SAVED_CREDENTIAL_NAME_QUESTION
-    return "I need one more detail before I can build and test this workflow safely."
-
-
-def _has_resolvable_credential_scope(policy: RequestPolicy, user_message: str = "") -> bool:
-    if policy.raw_secret_detected:
-        return False
-    if _explicit_credential_ids(user_message):
-        return True
-    if _credential_name_candidates(user_message):
-        return True
-    if policy.login_page_urls:
-        return True
-    if not policy.login_intent:
-        return False
-    if policy.testing_intent == "skip_test" or policy.allow_missing_credentials_in_draft:
-        return False
-    return bool(_login_url_candidates(policy, user_message))
-
-
-def _login_target_is_concrete(policy: RequestPolicy, user_message: str, workflow_yaml: str) -> bool:
-    """A login phrase with no site, workflow, or URL yet has nothing to hold a credential.
-
-    Asking there would demand a credential on first touch, before the task and URL
-    clarification the user still owes.
-    """
-    return bool(
-        policy.login_page_urls
-        or workflow_yaml.strip()
-        or policy.existing_workflow_credential_ids
-        or URL_CANDIDATE_RE.search(user_message)
-    )
-
-
-def _login_credentials_unresolved(policy: RequestPolicy, user_message: str, workflow_yaml: str) -> bool:
-    """Login was explicitly requested against a concrete target and no credential is reachable.
-
-    Evaluated after ``_resolve_credentials`` so an org/URL/name match counts as
-    resolved; a user-named credential keeps ``credential_name_unresolved`` because
-    naming one makes the lookup failure, not the absence of login credentials, the ask.
-    """
-    if not policy.login_intent or policy.raw_secret_detected:
-        return False
-    if _is_passwordless_email_signin(policy):
-        # Nothing a password credential could satisfy: _resolve_signin_email owns this shape,
-        # and asking for a saved credential here is unanswerable on an email-only site.
-        return False
-    if policy.testing_intent == "skip_test" or policy.allow_missing_credentials_in_draft:
-        return False
-    if policy.clarification_reason not in _LOGIN_CREDENTIAL_OVERRIDABLE_REASONS:
-        return False
-    if not _login_target_is_concrete(policy, user_message, workflow_yaml):
-        return False
-    return not (policy.resolved_credentials or policy.discovered_credentials or policy.existing_workflow_credential_ids)
-
-
-def _signin_target_hosts(policy: RequestPolicy, user_message: str) -> list[str]:
-    return [parts[2] for url in _login_url_candidates(policy, user_message) if (parts := _url_parts(url))]
+    return f"{credential.name} (`{credential.credential_id}`)"
 
 
 def _is_passwordless_email_signin(policy: RequestPolicy) -> bool:
-    """Email-address sign-in with no credential material referenced anywhere in the request."""
-    return (
-        (policy.email_signin_intent or bool(policy.resolved_signin_email))
-        and policy.login_intent
-        and not policy.raw_secret_detected
-        and policy.credential_input_kind == "none"
-        and not policy.credential_refs
-    )
-
-
-async def _resolve_signin_email(
-    policy: RequestPolicy,
-    organization_id: str,
-    *,
-    user_message: str,
-    workflow_yaml: str,
-) -> None:
-    """Settle which address signs in, or ask for one — never ask for a password credential."""
-    if not _is_passwordless_email_signin(policy):
-        return
-    if policy.testing_intent == "skip_test" or policy.allow_missing_credentials_in_draft:
-        return
-    # Same first-touch rule the password path uses: with no site yet, the address is not
-    # the question the user still owes.
-    if not _login_target_is_concrete(policy, user_message, workflow_yaml):
-        return
-    # A clarification already on the policy is a different question the user still owes;
-    # _block would overwrite it and lose it, so this ask waits for a later turn. A question
-    # without a reason set counts, which is why this checks the flag and not just the reason.
-    if policy.requires_user_clarification or policy.clarification_reason != "none":
-        return
-
-    named = next(iter(policy.signin_email_candidates), None)
-    if named:
-        # An explicit instruction outranks both a carried identity and the connected account.
-        policy.resolved_signin_email = named
-    elif not policy.resolved_signin_email:
-        policy.resolved_signin_email = await connected_gmail_address(organization_id)
-    if not policy.resolved_signin_email:
-        _block(policy, _SIGNIN_EMAIL_QUESTION, reason="signin_email_unresolved")
-        return
-    policy.resolved_signin_host = next(iter(_signin_target_hosts(policy, user_message)), None)
-
-
-def _prioritize_credential_clarification(policy: RequestPolicy) -> None:
-    if policy.credential_input_kind not in ("credential_id", "credential_name"):
-        return
-    if not policy.credential_refs:
-        return
-    if policy.clarification_reason not in _REASONS_OVERRIDDEN_BY_CREDENTIAL_REFS:
-        return
-    policy.clarification_reason = "credential_name_unresolved"
-
-
-def _previous_credential_clarification_was_asked(global_llm_context: str) -> bool:
-    structured = StructuredContext.from_json_str(global_llm_context)
-    return any(
-        decision.startswith(_CLARIFICATION_DECISION_PREFIX) and "/credential_name_unresolved" in decision
-        for decision in structured.decisions_made
-    )
-
-
-def _discovered_credential_ids_from_context(global_llm_context: str) -> set[str]:
-    structured = StructuredContext.from_json_str(global_llm_context)
-    return {
-        check.credential_id
-        for check in structured.credentials_checked
-        if check.found and isinstance(check.credential_id, str) and check.credential_id.startswith("cred_")
-    }
-
-
-async def _seed_discovered_credentials(
-    policy: RequestPolicy,
-    *,
-    organization_id: str,
-    global_llm_context: str,
-) -> None:
-    discovered_ids = _discovered_credential_ids_from_context(global_llm_context)
-    if not discovered_ids:
-        return
-    policy.discovered_credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-        sorted(discovered_ids),
-        organization_id=organization_id,
-    )
-
-
-def _prior_approved_credential_ids_from_context(global_llm_context: str) -> set[str]:
-    structured = StructuredContext.from_json_str(global_llm_context)
-    return {
-        record.credential_id for record in structured.approved_credentials if record.credential_id.startswith("cred_")
-    }
+    return policy.login_intent and policy.email_signin_intent
 
 
 def _ground_user_provided_sites(
@@ -4906,13 +4024,11 @@ def _ground_user_provided_sites(
     policy.user_site_url_sources = sources
 
 
-def _record_current_turn_named_credentials(policy: RequestPolicy, credentials: Sequence[Credential]) -> None:
-    """Mark credentials the user picked out by name or id in the message being handled, kept apart from
-    ``resolved_credentials`` because a turn-old approval is not evidence about the page in front of us.
-    """
-    policy.current_turn_named_credential_ids.update(
-        credential.credential_id for credential in credentials if credential.credential_id
-    )
+def _prior_approved_credential_ids(global_llm_context: str) -> set[str]:
+    structured = StructuredContext.from_json_str(global_llm_context)
+    return {
+        record.credential_id for record in structured.approved_credentials if record.credential_id.startswith("cred_")
+    }
 
 
 async def _seed_prior_approved_credentials(
@@ -4921,281 +4037,20 @@ async def _seed_prior_approved_credentials(
     organization_id: str,
     global_llm_context: str,
 ) -> None:
-    prior_ids = _prior_approved_credential_ids_from_context(global_llm_context)
-    carry_ids = sorted(prior_ids - {credential.credential_id for credential in policy.resolved_credentials})
-    if not carry_ids:
+    approved_ids = _prior_approved_credential_ids(global_llm_context)
+    missing_ids = sorted(approved_ids - {credential.credential_id for credential in policy.resolved_credentials})
+    if not missing_ids:
         return
-    carried = await app.DATABASE.credentials.get_credentials_by_ids(carry_ids, organization_id=organization_id)
-    if not carried:
-        return
-    policy.resolved_credentials = list(policy.resolved_credentials) + carried
-    LOG.info(
-        "request-policy prior approved credentials carried",
+    credentials = await app.DATABASE.credentials.get_credentials_by_ids(
+        missing_ids,
         organization_id=organization_id,
-        carried_credential_ids=[credential.credential_id for credential in carried],
-        carried_count=len(carried),
     )
-
-
-def _last_assistant_message_was_saved_credential_question(
-    chat_history: list[WorkflowCopilotChatHistoryMessage],
-) -> bool:
-    for message in reversed(chat_history):
-        if message.sender == WorkflowCopilotChatSender.AI:
-            return (
-                _SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX in message.content
-                or _STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX in message.content
-            )
-    return False
-
-
-def _can_defer_unresolved_credential_name_for_draft(
-    policy: RequestPolicy,
-    *,
-    global_llm_context: str,
-    user_message: str,
-) -> bool:
-    if policy.clarification_reason != "credential_name_unresolved":
-        return False
-    # A classifier-carried name may justify leaving an unvalidated placeholder
-    # in a draft, but _credential_name_candidates still requires current-turn
-    # anchoring before the name can enter resolved_credentials and authorize a run.
-    if policy.credential_refs:
-        return True
-    if _has_resolvable_credential_scope(policy, user_message):
-        return True
-    if _previous_credential_clarification_was_asked(global_llm_context):
-        return True
-    return False
-
-
-def _should_defer_repeated_unresolved_credential_question(
-    policy: RequestPolicy,
-    *,
-    chat_history: list[WorkflowCopilotChatHistoryMessage],
-    user_message: str,
-) -> bool:
-    if not _last_assistant_message_was_saved_credential_question(chat_history):
-        return False
-    return (
-        policy.credential_input_kind in ("none", "credential_name")
-        and policy.clarification_reason == "credential_name_unresolved"
-        and not _has_resolvable_credential_scope(policy, user_message)
+    policy.resolved_credentials = _deduplicate_credentials(
+        [
+            *policy.resolved_credentials,
+            *(credential for credential in credentials if credential.credential_id in approved_ids),
+        ]
     )
-
-
-def _defer_unresolved_credential_for_draft(policy: RequestPolicy) -> None:
-    # Preserve the reason code for observability after the question stops being user-blocking.
-    policy.requires_user_clarification = False
-    policy.user_response_policy = "proceed"
-    policy.allow_update_workflow = True
-    policy.allow_run_blocks = False
-    policy.allow_missing_credentials_in_draft = True
-    policy.clarification_reason = "credential_name_unresolved"
-    policy.clarification_question = None
-
-
-async def _resolve_credentials(
-    policy: RequestPolicy,
-    organization_id: str,
-    *,
-    user_message: str,
-    defer_unresolved_credential_name: bool = False,
-) -> None:
-    if policy.raw_secret_detected:
-        return
-
-    # Explicit IDs are deterministic current-turn authority and must win
-    # regardless of the classifier label. Do not trust stale/model-authored
-    # credential_refs that are absent from the latest user message.
-    ids = _explicit_credential_ids(user_message)
-    explicit_name_candidates = _credential_name_candidates(user_message)
-    if ids:
-        existing = await app.DATABASE.credentials.get_credentials_by_ids(ids, organization_id=organization_id)
-        found = {credential.credential_id for credential in existing}
-        policy.resolved_credentials = existing
-        _record_current_turn_named_credentials(policy, existing)
-        policy.invalid_credential_ids = [credential_id for credential_id in ids if credential_id not in found]
-        # An unresolvable stated ID asks rather than falling through to the inference tiers below,
-        # but it never blocks another stated reference that did resolve.
-        if not explicit_name_candidates:
-            if existing or not policy.invalid_credential_ids:
-                return
-            if policy.testing_intent == "skip_test":
-                policy.allow_run_blocks = False
-                policy.allow_missing_credentials_in_draft = True
-                return
-            formatted = ", ".join(f"`{credential_id}`" for credential_id in policy.invalid_credential_ids)
-            _block(
-                policy,
-                f"The credential ID(s) {formatted} were not found in this organization. Please provide a valid saved credential ID or explicitly ask for an unvalidated draft that will not be run yet.",
-                reason="credential_name_unresolved",
-            )
-            return
-
-    # `login_intent` is a classifier-authored hint that misses on runs where the model does not set
-    # it, so a message asking for a login in its own words must still count. A classifier that failed
-    # outright is a different case: a degraded turn never enumerates the org's saved credentials.
-    login_phrase_asserted = _explicit_login_action_asserted(user_message)
-    may_scan_saved_names = (
-        policy.login_intent
-        or (policy.classifier_status != "fallback" and login_phrase_asserted)
-        or _classifier_ref_stated_in_message(policy, user_message)
-    )
-    name_candidates = explicit_name_candidates
-    credentials: list[Credential] | None = None
-    # Only a request that already asserts a login or credential intent may be matched against the
-    # org's saved names; without that gate an unrelated message would scan the credential list.
-    if not name_candidates and may_scan_saved_names:
-        credentials = await _load_credentials(organization_id)
-        name_candidates = _saved_credential_names_mentioned(user_message, credentials)
-    if name_candidates:
-        if credentials is None:
-            credentials = await _load_credentials(organization_id)
-        named_matches = _deduplicate_credentials(
-            [credential for credential in credentials if credential.name in name_candidates]
-        )
-        if len(named_matches) == 1:
-            policy.resolved_credentials = _deduplicate_credentials(list(policy.resolved_credentials) + named_matches)
-            _record_current_turn_named_credentials(policy, named_matches)
-            if (
-                policy.classifier_status == "fallback"
-                and policy.credential_input_kind == "none"
-                and not policy.credential_refs
-            ):
-                # Preserve the pre-existing fallback telemetry contract while
-                # keeping successful classifier labels advisory.
-                policy.credential_input_kind = "credential_name"
-                policy.credential_refs = [named_matches[0].name]
-            return
-        if named_matches:
-            if policy.testing_intent == "skip_test" or policy.allow_missing_credentials_in_draft:
-                policy.allow_run_blocks = False
-                policy.allow_missing_credentials_in_draft = True
-                return
-            question = (
-                "I found multiple stored credentials with that exact name. Which one should I use?"
-                if len(name_candidates) == 1
-                else "I found multiple saved credentials named in your request. Which one should I use?"
-            )
-            _block(
-                policy,
-                question,
-                named_matches,
-                reason="credential_name_unresolved",
-                card_answerable=True,
-            )
-            return
-        if policy.resolved_credentials:
-            # A stated ID already resolved; an unmatched name rides along as a finding, not a wall.
-            return
-        if policy.testing_intent == "skip_test" or defer_unresolved_credential_name:
-            policy.allow_run_blocks, policy.allow_missing_credentials_in_draft = False, True
-            if defer_unresolved_credential_name:
-                _defer_unresolved_credential_for_draft(policy)
-            return
-        if policy.allow_missing_credentials_in_draft:
-            policy.allow_run_blocks = False
-            return
-        question = (
-            f"I could not find a stored credential named `{name_candidates[0]}`. Please choose an existing credential "
-            "by exact name or a credential ID beginning with cred_."
-            if policy.credential_input_kind == "credential_name"
-            else _clarification_question(policy)
-        )
-        _block(
-            policy,
-            question,
-            reason="credential_name_unresolved",
-            card_answerable=True,
-        )
-        return
-
-    message_url_candidates = _clean_list(
-        [candidate.rstrip(".,;:!?") for candidate in URL_CANDIDATE_RE.findall(user_message)]
-    )
-    # A passwordless turn must not reach the URL credential tiers below: a host match there
-    # asks for a saved credential under a different reason, which is the same dead end.
-    current_turn_login_authorized = (
-        policy.login_intent or login_phrase_asserted
-    ) and not _is_passwordless_email_signin(policy)
-    url_candidates: list[str] = []
-    allow_host_fallback = False
-    if (
-        current_turn_login_authorized
-        and policy.testing_intent != "skip_test"
-        and not policy.allow_missing_credentials_in_draft
-    ):
-        url_candidates = _login_url_candidates(policy, user_message)
-        allow_host_fallback = bool(policy.login_page_urls)
-    elif policy.credential_input_kind == "website_stored_credential" and message_url_candidates:
-        # A URL explicitly supplied by the current user is independent
-        # authority for the URL tier; classifier-only URLs are not.
-        url_candidates = message_url_candidates
-
-    if url_candidates:
-        policy.credential_ask_login_page_urls = list(url_candidates)
-        if credentials is None:
-            credentials = await _load_credentials(organization_id)
-        resolution = resolve_by_url(
-            credentials,
-            url_candidates,
-            # A URL merely mentioned in prose is a weaker signal than a
-            # classifier-extracted login page; require an exact tested-URL hit.
-            tiers=("url_exact", "url_host") if allow_host_fallback else ("url_exact",),
-            password_only=current_turn_login_authorized,
-            allow_urlless_sole=current_turn_login_authorized,
-        )
-        if resolution.verdict == "resolved":
-            policy.resolved_credentials = list(resolution.candidates)
-            policy.auto_bound_credentials = list(resolution.candidates)
-            return
-        if resolution.verdict == "ambiguous":
-            # Found-but-unbound keeps the unresolved-login override from
-            # relabeling this disambiguation ask as a missing-credential turn.
-            policy.discovered_credentials = list(resolution.candidates)
-            _block(
-                policy,
-                _AMBIGUOUS_URLLESS_CREDENTIAL_QUESTION
-                if resolution.tier == "urlless_sole"
-                else _AMBIGUOUS_URL_CREDENTIAL_QUESTION,
-                list(resolution.candidates),
-                reason="credential_name_unresolved",
-                card_answerable=True,
-            )
-            return
-
-    if policy.credential_input_kind == "credential_name":
-        if policy.testing_intent == "skip_test" or defer_unresolved_credential_name:
-            policy.allow_run_blocks, policy.allow_missing_credentials_in_draft = False, True
-            if defer_unresolved_credential_name:
-                _defer_unresolved_credential_for_draft(policy)
-            return
-        if policy.allow_missing_credentials_in_draft:
-            policy.allow_run_blocks = False
-            return
-        _block(
-            policy,
-            _SAVED_CREDENTIAL_NAME_QUESTION,
-            reason="credential_name_unresolved",
-            card_answerable=True,
-        )
-        return
-
-    if policy.credential_input_kind == "website_stored_credential":
-        if not policy.login_page_urls:
-            _block(
-                policy,
-                _STORED_CREDENTIAL_URL_QUESTION,
-                reason="missing_target_context",
-            )
-            return
-        _block(
-            policy,
-            "I could not find a stored credential for that login page. Please select a saved credential by exact name or a credential ID beginning with cred_, or create one in the Credentials UI.",
-            reason="credential_name_unresolved",
-            card_answerable=True,
-        )
 
 
 @dataclass(frozen=True)
@@ -5544,284 +4399,34 @@ def _workflow_credential_inputs_unbound(workflow_yaml: str) -> list[dict[str, st
     return findings
 
 
-async def _classify_request_trust_floor(
-    user_message: str,
-    workflow_yaml: str,
-    chat_history: list[WorkflowCopilotChatHistoryMessage],
-    global_llm_context: str,
-    handler: LLMAPIHandler | None,
-    *,
-    config: CopilotConfig | None = None,
-) -> RequestPolicy:
-    requested_output_path_aliases = config.requested_output_path_aliases if config is not None else {}
-    ids = _credential_ids(user_message)
-    raw_secret_present = _raw_secret_detected(user_message)
-    structural_reason = _structural_clarification_reason(user_message)
-    if raw_secret_present and handler is None:
-        policy = _classifier_fallback_policy(
-            ids,
-            raw_secret_present=True,
-            failure_kind="raw_secret_no_handler",
-            user_message=user_message,
-            requested_output_path_aliases=requested_output_path_aliases,
-        )
-        policy.authoring_intent = "pending"
-        policy.completion_contract = None
-        policy.completion_criteria = []
-        policy.completion_contract_status = "absent"
-        policy._authoring_pending = True
-        return policy
-    if structural_reason != "none" and not raw_secret_present:
-        return RequestPolicy(
-            authoring_intent="pending",
-            credential_input_kind="credential_id" if ids else "none",
-            credential_refs=ids,
-            requires_user_clarification=True,
-            clarification_reason=structural_reason,
-            _authoring_pending=True,
-        )
-    if handler is None:
-        policy = _classifier_fallback_policy(
-            ids,
-            raw_secret_present=False,
-            failure_kind="missing_handler",
-            user_message=user_message,
-            requested_output_path_aliases=requested_output_path_aliases,
-        )
-        policy.authoring_intent = "pending"
-        policy.completion_contract = None
-        policy.completion_criteria = []
-        policy.completion_contract_status = "absent"
-        policy._authoring_pending = True
-        return policy
-
-    safe_user_message = redact_raw_secrets_for_prompt(user_message) if raw_secret_present else user_message
-    safe_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
-    transcript = build_transcript_context(chat_history, safe_user_message)
-    prompt = prompt_engine.load_prompt(
-        template=PROMPT_NAME,
-        terminal_action_reconciliation=False,
-        trust_floor_only=True,
-        user_message=escape_code_fences(safe_user_message),
-        raw_secret_present=str(raw_secret_present).lower(),
-        workflow_yaml=escape_code_fences(redact_raw_secrets_for_prompt(workflow_yaml)[:2048]),
-        earliest_user_turn=transcript.earliest_user_turn,
-        latest_prior_user_turn=transcript.latest_prior_user_turn,
-        latest_assistant_turn=transcript.latest_assistant_turn,
-        retained_history=transcript.retained_history,
-        global_llm_context=escape_code_fences(redact_raw_secrets_for_prompt(safe_global_llm_context)[:2048]),
-    )
-    classifier_deadline = time.monotonic() + settings.COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS
-    raw, failure_kind, retry_count = await _run_request_policy_classifier(
-        handler,
-        prompt,
-        deadline=classifier_deadline,
-    )
-    raw_payload = _coerce_classifier_payload(raw)
-    if raw_payload is None:
-        policy = _classifier_fallback_policy(
-            ids,
-            raw_secret_present=raw_secret_present,
-            failure_kind=failure_kind if failure_kind != "none" else "provider_error",
-            retry_count=retry_count,
-            user_message=user_message,
-            requested_output_path_aliases=requested_output_path_aliases,
-        )
-        policy.authoring_intent = "pending"
-        policy.completion_contract = None
-        policy.completion_criteria = []
-        policy.completion_contract_status = "absent"
-        policy._authoring_pending = True
-        return policy
-
-    policy = _classification_from_raw(raw_payload)
-    policy.classifier_retry_count = retry_count
-    policy.authoring_intent = "pending"
-    policy.completion_contract = None
-    policy.completion_criteria = []
-    policy._authoring_pending = True
-    policy.raw_secret_detected = raw_secret_present or policy.credential_input_kind == "raw_secret"
-    classifier_credential_refs = [_canonicalize_credential_ref(ref) for ref in policy.credential_refs]
-    policy.credential_refs = _clean_list(classifier_credential_refs + ids)
-    if raw_secret_present:
-        if policy.raw_secret_handling == "redacted_draft":
-            if policy.credential_input_kind == "raw_secret":
-                policy.credential_input_kind = "placeholder"
-            policy.raw_secret_evidence = None
-        else:
-            policy.credential_input_kind = "raw_secret"
-            policy.raw_secret_handling = "block"
-            policy.clarification_reason = structural_reason if structural_reason != "none" else "raw_secret"
-    if ids and policy.credential_input_kind != "raw_secret":
-        classifier_named_a_credential = any(not _credential_ids(ref) for ref in classifier_credential_refs)
-        classifier_target_wins = (
-            policy.credential_input_kind == "credential_name" and classifier_named_a_credential
-        ) or (policy.credential_input_kind == "website_stored_credential" and bool(policy.login_page_urls))
-        if not classifier_target_wins:
-            policy.credential_input_kind = "credential_id"
-    if (
-        policy.credential_input_kind == "raw_secret"
-        and not raw_secret_present
-        and not _verify_raw_secret_evidence(policy.raw_secret_evidence, user_message)
-    ):
-        policy.credential_input_kind = "credential_id" if ids else "none"
-        policy.clarification_reason = "none"
-        policy.requires_user_clarification = False
-        policy.raw_secret_evidence = None
-    policy.completion_contract_status = "absent"
-    return policy
-
-
-async def build_request_policy(
+async def _build_request_policy_bootstrap(
     *,
     user_message: str,
     workflow_yaml: str,
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     global_llm_context: str,
     organization_id: str,
-    handler: LLMAPIHandler | None,
-    active_criteria: list[CompletionCriterion] | None = None,
-    config: CopilotConfig | None = None,
-    # The whole chat, not the model-context tail `chat_history` carries: a site is grounded by the
-    # user having written it, which does not expire when the message leaves the prompt window.
     prior_user_messages: Sequence[WorkflowCopilotChatHistoryMessage] = (),
     _preclassified_policy: RequestPolicy | None = None,
 ) -> RequestPolicy:
-    policy = _preclassified_policy
-    if policy is None:
-        policy = await _classify_request(
-            user_message,
-            workflow_yaml,
-            chat_history,
-            global_llm_context,
-            handler,
-            active_criteria=active_criteria,
-            config=config,
-        )
-    policy.raw_secret_detected = policy.raw_secret_detected or policy.credential_input_kind == "raw_secret"
+    """Build the deterministic request safety record without model-backed policy inference."""
+    credential_ids = _credential_ids(user_message)
+    raw_secret_present = _raw_secret_detected(user_message)
+    policy = _preclassified_policy or RequestPolicy(
+        authoring_intent="author_now",
+        credential_input_kind=("raw_secret" if raw_secret_present else "credential_id" if credential_ids else "none"),
+        credential_refs=credential_ids,
+        raw_secret_detected=raw_secret_present,
+        raw_secret_handling="redacted_draft" if raw_secret_present else "none",
+        classifier_status="not_run",
+        completion_contract_status="absent",
+        canonical_user_message=(redact_raw_secrets_for_prompt(user_message) if raw_secret_present else user_message),
+    )
     policy.existing_workflow_credential_ids = sorted(workflow_credential_ids(workflow_yaml))
     policy.existing_workflow_credential_origins = {
         credential_id: sorted(origins) for credential_id, origins in workflow_credential_origins(workflow_yaml).items()
     }
-    # This narrows classifier output only after the classifier has identified
-    # credential intent; running it earlier would be overwritten by the model verdict.
-    _apply_explicit_code_block_credential_draft_policy(policy, user_message)
-    try:
-        await _seed_discovered_credentials(
-            policy,
-            organization_id=organization_id,
-            global_llm_context=global_llm_context,
-        )
-    except Exception:
-        LOG.warning(
-            "request-policy discovered-credential seeding failed",
-            organization_id=organization_id,
-            exc_info=True,
-        )
-    _prioritize_credential_clarification(policy)
-    # Before credential resolution, so a carried sign-in identity also keeps this turn out of
-    # the URL credential tiers.
-    carried = prior_signin_email_from_context(global_llm_context, _signin_target_hosts(policy, user_message))
-    policy.resolved_signin_email = policy.resolved_signin_email or (
-        carried if carried and is_email_address(carried) else None
-    )
-
-    # Unconditional: a turn blocked here can resume mid-turn (credential card), and the resumed
-    # fill still needs to know which sites the user has provided.
     _ground_user_provided_sites(policy, user_message, prior_user_messages or chat_history)
-
-    if policy.raw_secret_detected and policy.raw_secret_handling == "redacted_draft":
-        policy.testing_intent = "skip_test"
-        policy.requires_user_clarification = False
-        policy.user_response_policy = "proceed"
-        policy.allow_update_workflow = True
-        policy.allow_run_blocks = False
-        policy.allow_missing_credentials_in_draft = True
-        policy.credential_draft_deferred_explicitly = True
-        policy.clarification_reason = "none"
-        policy.clarification_question = None
-
-    if policy.clarification_reason == "none" and not policy.raw_secret_detected:
-        if _workflow_credential_inputs_unbound(workflow_yaml):
-            policy.clarification_reason = "workflow_credential_inputs_unbound"
-            policy.allow_run_blocks = False
-            policy.allow_missing_credentials_in_draft = True
-    if policy.testing_intent == "skip_test":
-        policy.allow_run_blocks = False
-        if (
-            policy.credential_input_kind != "raw_secret"
-            and policy.clarification_reason not in _PRE_RESOLUTION_CLARIFICATION_REASONS
-        ):
-            if (
-                policy.clarification_reason == "credential_name_unresolved"
-                and not _can_defer_unresolved_credential_name_for_draft(
-                    policy,
-                    global_llm_context=global_llm_context,
-                    user_message=user_message,
-                )
-            ):
-                policy.requires_user_clarification = True
-                policy.allow_update_workflow = False
-            else:
-                policy.requires_user_clarification = False
-                policy.allow_missing_credentials_in_draft = True
-
-    if _should_defer_repeated_unresolved_credential_question(
-        policy,
-        chat_history=chat_history,
-        user_message=user_message,
-    ):
-        policy.requires_user_clarification = False
-        policy.allow_update_workflow = True
-        policy.allow_run_blocks = False
-        policy.allow_missing_credentials_in_draft = True
-
-    if policy.raw_secret_detected and policy.raw_secret_handling != "redacted_draft":
-        question = _RAW_SECRET_QUESTION
-        if policy.clarification_reason in _PRE_RESOLUTION_CLARIFICATION_REASONS:
-            question += "\n\n" + _clarification_question(policy, global_llm_context)
-        _block(
-            policy,
-            question,
-            reason="raw_secret",
-        )
-    elif (
-        policy.requires_user_clarification
-        and policy.clarification_reason in _PRE_RESOLUTION_CLARIFICATION_REASONS
-        and not (
-            policy.clarification_reason == "missing_target_context"
-            and _has_resolvable_credential_scope(policy, user_message)
-        )
-    ):
-        _block(policy, _clarification_question(policy, global_llm_context))
-    elif policy.requires_user_clarification and not _has_resolvable_credential_scope(policy, user_message):
-        _block(policy, _clarification_question(policy, global_llm_context))
-    else:
-        try:
-            # A resolvable credential scope can override the classifier's
-            # conservative clarification flag; _resolve_credentials will block
-            # again if the lookup is missing or ambiguous.
-            policy.requires_user_clarification = False
-            await _resolve_credentials(
-                policy,
-                organization_id,
-                user_message=user_message,
-                defer_unresolved_credential_name=_last_assistant_message_was_saved_credential_question(chat_history),
-            )
-        except Exception:
-            LOG.warning(
-                "request-policy credential resolution failed",
-                organization_id=organization_id,
-                credential_input_kind=policy.credential_input_kind,
-                exc_info=True,
-            )
-            _block(
-                policy,
-                "I could not verify the requested credential metadata for this organization. Please provide a valid saved credential by exact name or a credential ID beginning with cred_.",
-            )
-
-    # Seeded before the login-credential reachability check so a credential approved on an
-    # earlier turn counts as reachable and a confirmation-only turn does not re-ask for it.
     try:
         await _seed_prior_approved_credentials(
             policy,
@@ -5835,48 +4440,54 @@ async def build_request_policy(
             exc_info=True,
         )
 
-    if policy.resolved_credentials and policy.clarification_reason == "missing_target_context":
-        policy.requires_user_clarification = False
-        policy.user_response_policy = "proceed"
-        policy.clarification_reason = "none"
-        policy.clarification_question = None
-
-    try:
-        await _resolve_signin_email(
-            policy,
-            organization_id,
-            user_message=user_message,
-            workflow_yaml=workflow_yaml,
-        )
-    except Exception:
-        LOG.warning(
-            "request-policy sign-in email resolution failed",
-            organization_id=organization_id,
-            exc_info=True,
-        )
-        # The credential requirement is already lifted for this shape, so falling through
-        # would build a login with no identity and no question asked.
-        if _is_passwordless_email_signin(policy) and not policy.requires_user_clarification:
-            _block(policy, _SIGNIN_EMAIL_QUESTION, reason="signin_email_unresolved")
-
-    if _login_credentials_unresolved(policy, user_message, workflow_yaml):
-        if policy.clarification_reason == "none":
-            _block(policy, _LOGIN_CREDENTIAL_QUESTION, reason="login_credentials_unresolved")
-        else:
-            policy.clarification_reason = "login_credentials_unresolved"
-
-    if policy.authoring_intent == "defer_authoring" and not policy._authoring_pending:
-        policy.allow_update_workflow = False
+    # The literal is already absent from server-owned provenance. TurnIntent must still
+    # authorize DRAFT_ONLY before the compatibility projector permits an update.
+    if policy.raw_secret_detected:
         policy.allow_run_blocks = False
-        if not any(is_defer_authoring_durable_fill_criterion(criterion) for criterion in policy.completion_criteria):
-            policy.completion_criteria = list(policy.completion_criteria) + [_defer_authoring_durable_fill_criterion()]
+        redacted_draft_candidate = (
+            policy.raw_secret_handling == "redacted_draft" and policy.user_response_policy != "ask_clarification"
+        )
+        policy.allow_missing_credentials_in_draft = redacted_draft_candidate
+        policy.credential_draft_deferred_explicitly = redacted_draft_candidate
+
+    if _workflow_credential_inputs_unbound(workflow_yaml):
+        policy.clarification_reason = "workflow_credential_inputs_unbound"
+        policy.allow_run_blocks = False
+        policy.allow_missing_credentials_in_draft = True
 
     trace_data = policy.to_trace_data()
-    if policy.classifier_status == "fallback":
-        LOG.warning("request-policy fallback policy used", **trace_data)
     with copilot_span("request_policy", data=trace_data):
-        LOG.info("request-policy decision", **trace_data)
+        LOG.info("request-policy deterministic bootstrap", **trace_data)
     return policy
+
+
+async def build_request_policy(
+    *,
+    user_message: str,
+    workflow_yaml: str,
+    chat_history: list[WorkflowCopilotChatHistoryMessage],
+    global_llm_context: str,
+    organization_id: str,
+    handler: LLMAPIHandler | None,
+    active_criteria: list[CompletionCriterion] | None = None,
+    config: CopilotConfig | None = None,
+    prior_user_messages: Sequence[WorkflowCopilotChatHistoryMessage] = (),
+) -> RequestPolicy:
+    """Compatibility wrapper for offline probes that still call the retired builder shape.
+
+    Interactive production uses ``build_request_policy_trust_floor``. Keep this wrapper only until
+    the remaining recorded-policy probes migrate; the deterministic bootstrap has no model/config
+    dependency and cannot revive the retired classifier.
+    """
+    del handler, active_criteria, config
+    return await _build_request_policy_bootstrap(
+        user_message=user_message,
+        workflow_yaml=workflow_yaml,
+        chat_history=chat_history,
+        global_llm_context=global_llm_context,
+        organization_id=organization_id,
+        prior_user_messages=prior_user_messages,
+    )
 
 
 async def build_request_policy_trust_floor(
@@ -5890,66 +4501,46 @@ async def build_request_policy_trust_floor(
     config: CopilotConfig | None = None,
     prior_user_messages: Sequence[WorkflowCopilotChatHistoryMessage] = (),
 ) -> RequestPolicy:
-    policy = await _classify_request_trust_floor(
-        user_message,
-        workflow_yaml,
-        chat_history,
-        global_llm_context,
-        handler,
-        config=config,
+    del config
+    safety = await _screen_raw_secret_safety(user_message, handler)
+    credential_ids = _credential_ids(user_message)
+    raw_secret_present = safety.status == "detected"
+    safety_blocked = safety.status == "blocked" or (raw_secret_present and safety.handling == "block")
+    policy = RequestPolicy(
+        authoring_intent="author_now",
+        credential_input_kind=("raw_secret" if raw_secret_present else "credential_id" if credential_ids else "none"),
+        credential_refs=credential_ids,
+        raw_secret_detected=raw_secret_present,
+        # A safety-approved redacted draft still needs DRAFT_ONLY authority before mutation.
+        raw_secret_handling=safety.handling if raw_secret_present else "block" if safety_blocked else "none",
+        raw_secret_safety_status=safety.status,
+        raw_secret_safety_failure_kind=safety.failure_kind,
+        raw_secret_safety_citation_count=safety.citation_count,
+        raw_secret_safety_latency_ms=safety.latency_ms,
+        requires_user_clarification=safety_blocked,
+        allow_update_workflow=not safety_blocked,
+        allow_run_blocks=not safety_blocked,
+        user_response_policy="ask_clarification" if safety_blocked else "proceed",
+        clarification_reason="raw_secret" if safety_blocked else "none",
+        clarification_question=RAW_SECRET_QUESTION if safety_blocked else None,
+        classifier_status="not_run",
+        completion_contract_status="absent",
+        canonical_user_message=safety.canonical_user_message,
     )
-    return await build_request_policy(
+    policy = await _build_request_policy_bootstrap(
         user_message=user_message,
         workflow_yaml=workflow_yaml,
         chat_history=chat_history,
         global_llm_context=global_llm_context,
         organization_id=organization_id,
-        handler=handler,
-        config=config,
         prior_user_messages=prior_user_messages,
         _preclassified_policy=policy,
     )
-
-
-async def materialize_request_policy_authoring(
-    policy: RequestPolicy,
-    *,
-    user_message: str,
-    workflow_yaml: str,
-    chat_history: list[WorkflowCopilotChatHistoryMessage],
-    global_llm_context: str,
-    handler: LLMAPIHandler | None,
-    active_criteria: list[CompletionCriterion] | None = None,
-    config: CopilotConfig | None = None,
-) -> RequestPolicy:
-    if not policy._authoring_pending:
-        return policy
-    enriched = await _classify_request(
-        user_message,
-        workflow_yaml,
-        chat_history,
-        global_llm_context,
-        handler,
-        active_criteria=active_criteria,
-        config=config,
-    )
-    policy.authoring_intent = enriched.authoring_intent
-    policy.completion_contract = enriched.completion_contract
-    policy.completion_criteria = list(enriched.completion_criteria)
-    policy.classifier_non_runtime_requested_output_evidence_sources = list(
-        enriched.classifier_non_runtime_requested_output_evidence_sources
-    )
-    policy.completion_contract_status = enriched.completion_contract_status
-    policy.request_slot_failure_kind = enriched.request_slot_failure_kind
-    policy._authoring_pending = False
-    if policy.authoring_intent == "defer_authoring":
-        policy.allow_update_workflow = False
-        policy.allow_run_blocks = False
-        if not any(is_defer_authoring_durable_fill_criterion(criterion) for criterion in policy.completion_criteria):
-            policy.completion_criteria = list(policy.completion_criteria) + [_defer_authoring_durable_fill_criterion()]
     LOG.info(
-        "request-policy authoring enrichment materialized",
-        completion_criteria_count=len(policy.completion_criteria),
-        completion_contract_status=policy.completion_contract_status,
+        "raw-secret safety screen",
+        status=policy.raw_secret_safety_status,
+        failure_kind=policy.raw_secret_safety_failure_kind,
+        citation_count=policy.raw_secret_safety_citation_count,
+        latency_ms=round(policy.raw_secret_safety_latency_ms, 3),
     )
     return policy
