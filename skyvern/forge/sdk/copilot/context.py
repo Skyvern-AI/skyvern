@@ -16,6 +16,7 @@ from typing_extensions import NotRequired, TypedDict
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import AuthoringParameterBindingDirective
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELDS
 from skyvern.forge.sdk.copilot.result_evidence import (
     LoadedResultCompositionEvidence,
     loaded_result_target_structure_signature,
@@ -434,7 +435,7 @@ _MAX_OBSERVED_ACTED_PAGES = 20
 _MAX_FILL_CARRY = 20
 _FILL_CARRY_TEXT_CAP = 240
 _FILL_CARRY_TOOLS = frozenset({"type_text", "select_option", "fill_credential_field"})
-_FILL_CARRY_CREDENTIAL_FIELDS = frozenset({"username", "password", "totp"})
+_FILL_CARRY_CREDENTIAL_FIELDS = CREDENTIAL_FILL_FIELDS
 FillCarryPrimitive = str | int | bool | None
 
 
