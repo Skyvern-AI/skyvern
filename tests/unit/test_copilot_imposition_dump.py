@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 
 from dev_scripts.replay_imposition_decision import metadata_capture_is_structured
+
 from skyvern.forge.sdk.copilot.tools import workflow_update
 from skyvern.forge.sdk.copilot.tools.workflow_update import CodeArtifactMetadata
 
