@@ -105,6 +105,11 @@ class SkyvernContext:
     # Set only by run_sdk_action when it mints a bookkeeping run for a standalone action. A minted
     # run never begins the browser session, so it must not be presented as the expected owner.
     workflow_run_is_synthetic: bool = False
+    # Set by run_sdk_action for EVERY inline action, whether it minted the run or the caller supplied an
+    # existing (possibly already-terminal) run id. The browser is driven directly by the caller across
+    # calls, so a run-scoped external allocation under it must never be an owner-terminal early-reap
+    # input — unlike workflow_run_is_synthetic, this stays true for the supplied-run reuse path too.
+    is_sdk_inline_action: bool = False
     browser_runtime: str | None = None
     browser_address_is_server_assigned: bool = False
     tz_info: ZoneInfo | None = None

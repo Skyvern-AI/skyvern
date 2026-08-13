@@ -5,7 +5,8 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import WebSocketDisconnect
 
-from skyvern.forge.sdk.routes.streaming import cdp_input, registries
+from skyvern.forge.sdk.routes.streaming import cdp_input
+from skyvern.forge.sdk.streaming import registries
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 
 
