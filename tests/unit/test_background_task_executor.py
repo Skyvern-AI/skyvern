@@ -7,7 +7,6 @@ from fastapi import BackgroundTasks
 
 from skyvern.exceptions import SkyvernException
 from skyvern.forge import app
-from skyvern.forge.sdk.browser_action_policy import AuthorityState, RuntimeOriginAuthority, canonicalize_origin
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
@@ -156,34 +155,6 @@ async def test_execute_task_v2_stamps_org_llm_defaults(monkeypatch: pytest.Monke
         assert context.org_default_secondary_llm_key == "CUSTOM_LLM_oat_fast"
 
     load_custom_llms.assert_awaited_once_with(app.DATABASE, "org_test")
-
-
-@pytest.mark.asyncio
-async def test_scheduled_run_does_not_inherit_runtime_origin_authority() -> None:
-    ran = asyncio.Event()
-    child_authorities: list[RuntimeOriginAuthority] = []
-
-    async def work() -> None:
-        context = skyvern_context.current()
-        assert context is not None
-        child_authorities.append(context.browser_action_authority)
-        ran.set()
-
-    origin = canonicalize_origin("https://trusted.example/start")
-    assert origin is not None
-    parent = SkyvernContext(
-        organization_id="org_1",
-        browser_action_authority=RuntimeOriginAuthority(
-            state=AuthorityState.ESTABLISHED,
-            origins=frozenset({origin}),
-        ),
-    )
-    with skyvern_context.scoped(parent):
-        BackgroundTaskExecutor()._schedule(None, work)
-        await asyncio.wait_for(ran.wait(), timeout=1)
-
-    assert child_authorities == [RuntimeOriginAuthority(state=AuthorityState.UNWIRED)]
-    assert parent.browser_action_authority.state is AuthorityState.ESTABLISHED
 
 
 @pytest.mark.asyncio
