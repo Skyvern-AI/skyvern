@@ -198,6 +198,7 @@ class TestSanitization:
             "artifacts": [],
             "data": {
                 "url": "https://example.com",
+                "observed_wait_ms": 121595,
                 "sdk_equivalent": "await page.goto(...)",
             },
         }
@@ -207,6 +208,7 @@ class TestSanitization:
         assert "timing_ms" not in sanitized
         assert "artifacts" not in sanitized
         assert "sdk_equivalent" not in sanitized.get("data", {})
+        assert sanitized["data"]["observed_wait_ms"] == 121595
 
     def test_workflow_key_stripped(self) -> None:
         from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
@@ -606,21 +608,6 @@ class TestFormatToolResultForUser:
         assert "update_and_run_blocks" not in summary
         assert "STOP" not in detail
 
-    def test_loop_detected_failure_drops_use_a_different_tool_tail(self) -> None:
-        summary = self._format(
-            "click",
-            {
-                "ok": False,
-                "error": (
-                    "LOOP DETECTED: 'click' has been called 3 times consecutively. "
-                    "This tool will not run again. Use a DIFFERENT tool to continue."
-                ),
-            },
-        )
-        assert summary == "The agent got stuck retrying the same step — moving on."
-        assert "DIFFERENT tool" not in summary
-        assert "click" not in summary
-
     def test_jinja_template_failure_translates_to_parameter_phrasing(self) -> None:
         summary = self._format(
             "update_and_run_blocks",
@@ -685,19 +672,6 @@ class TestFormatToolResultForUser:
             {"ok": False, "error": "Use the click tool with a CSS selector."},
         )
         assert summary == "Couldn't complete that step."
-
-    def test_loop_detected_marker_in_middle_of_message_is_caught(self) -> None:
-        summary = self._format(
-            "click",
-            {
-                "ok": False,
-                "error": (
-                    "Tool execution failed. LOOP DETECTED: 'click' has been called 3 times "
-                    "consecutively. This tool will not run again."
-                ),
-            },
-        )
-        assert summary == "The agent got stuck retrying the same step — moving on."
 
     def test_playwright_locator_timeout_failure_replaces_selector_dump(self) -> None:
         summary = self._format(
@@ -842,21 +816,21 @@ class TestUserFacingSuccess:
     def test_false_for_unclassified_failure(self) -> None:
         assert user_facing_success({"ok": False, "error": "plain failure"}) is False
 
-    @pytest.mark.parametrize("blocker_kind", ["phase_gated", "missing_required_context", "authority_denied"])
-    def test_true_for_precondition_style_blockers(self, blocker_kind: str) -> None:
+    def test_true_for_authority_redirect(self) -> None:
+        blocker_kind = "authority_denied"
         signal = self._blocker(blocker_kind)
         result = {"ok": False, "error": signal.agent_steering_text}
         assert user_facing_success(result, blocker_signal=signal) is True
 
-    @pytest.mark.parametrize("blocker_kind", ["tool_error", "loop_detected"])
-    def test_false_for_genuine_failure_blockers(self, blocker_kind: str) -> None:
-        """Regression guard: real tool errors and loop-detection halts keep failure affect."""
+    def test_false_for_genuine_tool_error(self) -> None:
+        """Regression guard: real tool errors keep failure affect."""
+        blocker_kind = "tool_error"
         signal = self._blocker(blocker_kind)
         result = {"ok": False, "error": signal.agent_steering_text}
         assert user_facing_success(result, blocker_signal=signal) is False
 
     def test_false_when_blocker_signal_does_not_match_result(self) -> None:
-        signal = self._blocker("phase_gated", steering="unrelated steering text")
+        signal = self._blocker("authority_denied", steering="unrelated steering text")
         result = {"ok": False, "error": "a totally different failure"}
         assert user_facing_success(result, blocker_signal=signal) is False
 
@@ -1131,7 +1105,7 @@ def test_summarize_tool_result_detail_omits_detail_for_reclassified_neutral_redi
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 
     signal = CopilotToolBlockerSignal(
-        blocker_kind="phase_gated",
+        blocker_kind="authority_denied",
         agent_steering_text="internal steering text",
         user_facing_reason="I need to know what page to inspect first.",
         recovery_hint="ask_user_clarifying",
@@ -1266,7 +1240,7 @@ def test_summarize_tool_result_for_credentials_is_unchanged_for_agent_state() ->
 
 
 def test_surgical_edit_success_summary_is_empty_so_the_row_shows_its_label() -> None:
-    for tool_name in ("edit_block", "delete_block", "synthesize_demonstrated_block"):
+    for tool_name in ("edit_block", "delete_block"):
         assert format_tool_result_for_user(tool_name, {"ok": True, "data": {"label": "login_form"}}) == ""
 
 

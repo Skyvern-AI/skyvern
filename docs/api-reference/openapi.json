@@ -286,6 +286,7 @@
                     "mapping": {
                       "task_v1": "#/components/schemas/TaskRunResponse",
                       "task_v2": "#/components/schemas/TaskRunResponse",
+                      "task_v3": "#/components/schemas/TaskRunResponse",
                       "openai_cua": "#/components/schemas/TaskRunResponse",
                       "anthropic_cua": "#/components/schemas/TaskRunResponse",
                       "ui_tars": "#/components/schemas/TaskRunResponse",
@@ -10800,20 +10801,6 @@
             "type": "string",
             "title": "Code"
           },
-          "parameter_keys": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Parameter Keys"
-          },
           "error_code_mapping": {
             "anyOf": [
               {
@@ -10827,6 +10814,20 @@
               }
             ],
             "title": "Error Code Mapping"
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
           },
           "prompt": {
             "anyOf": [
@@ -20656,6 +20657,7 @@
         "enum": [
           "skyvern-1.0",
           "skyvern-2.0",
+          "skyvern-3.0",
           "openai-cua",
           "anthropic-cua",
           "ui-tars",
@@ -20919,6 +20921,7 @@
         "enum": [
           "task_v1",
           "task_v2",
+          "task_v3",
           "workflow_run",
           "openai_cua",
           "anthropic_cua",
@@ -24190,6 +24193,7 @@
             "enum": [
               "task_v1",
               "task_v2",
+              "task_v3",
               "openai_cua",
               "anthropic_cua",
               "ui_tars",

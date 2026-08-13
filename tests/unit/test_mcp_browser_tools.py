@@ -880,14 +880,19 @@ async def test_skyvern_click_intent_only_uses_proactive_ai(monkeypatch: pytest.M
     assert click.await_args.kwargs.get("mode") != "direct"
 
 
-def _action_page(monkeypatch: pytest.MonkeyPatch, *, skyvern_page: bool = False, **methods: AsyncMock) -> None:
-    page = make_skyvern_page(MagicMock()) if skyvern_page else SimpleNamespace(page=MagicMock())
+def _action_page(monkeypatch: pytest.MonkeyPatch, *, skyvern_page: bool = False, **methods: AsyncMock) -> object:
+    page = (
+        make_skyvern_page(MagicMock())
+        if skyvern_page
+        else SimpleNamespace(page=MagicMock(), url="https://example.test/two-factor")
+    )
     if skyvern_page:
         page.evaluate = AsyncMock(return_value=False)
     for name, method in methods.items():
         setattr(page, name, method)
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    return page
 
 
 def _native_option_page(
@@ -2883,6 +2888,38 @@ async def test_navigating_paired_tools_clear_the_ref_map_even_when_navigation_fa
 
 
 @pytest.mark.asyncio
+async def test_navigate_and_screenshot_returns_session_expired_result_for_cdp_4408(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expired_error = RuntimeError(
+        "BrowserType.connect_over_cdp: Target page, context or browser has been closed\n"
+        "Browser logs: session expired\n"
+        "Call log: <ws disconnected> code=4408 reason=session expired"
+    )
+    get_page = AsyncMock(side_effect=expired_error)
+    monkeypatch.setattr(mcp_browser, "get_page", get_page)
+
+    result = await mcp_browser.skyvern_navigate_and_screenshot(url="https://example.test")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.SESSION_EXPIRED
+    assert result["error"]["message"] == "Browser session expired."
+    assert "new browser session" in result["error"]["hint"]
+    get_page.assert_awaited_once_with(session_id=None, cdp_url=None)
+
+
+@pytest.mark.asyncio
+async def test_navigate_and_screenshot_bubbles_non_4408_cdp_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    other_close = RuntimeError("Call log: <ws disconnected> code=4401 reason=session expired")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(side_effect=other_close))
+
+    with pytest.raises(RuntimeError, match="code=4401"):
+        await mcp_browser.skyvern_navigate_and_screenshot(url="https://example.test")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tool_name", "call_kwargs", "expected_steps"),
     [
@@ -3082,6 +3119,27 @@ async def test_wait_for_either_state_names_the_side_that_matched(
     assert result["ok"] is True
     assert result["data"]["matched_selector"] == appears
     assert result["data"]["matched"] == expected
+    assert isinstance(result["data"]["observed_wait_ms"], int)
+    assert result["data"]["source_url"] == "https://example.test/two-factor"
+    assert result["data"]["result_url"] == "https://example.test/two-factor"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_either_state_reports_the_observed_failed_wait_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _either_wait_page(monkeypatch, {"#login": None, "#home": None})
+
+    result = await mcp_browser.skyvern_wait_for_either_state(
+        selector_a="#login",
+        selector_b="#home",
+        timeout=1000,
+    )
+
+    assert result["ok"] is False
+    assert result["data"]["observed_wait_ms"] >= 1000
+    assert result["data"]["source_url"] == "https://example.test/two-factor"
+    assert result["data"]["result_url"] == "https://example.test/two-factor"
 
 
 @pytest.mark.asyncio

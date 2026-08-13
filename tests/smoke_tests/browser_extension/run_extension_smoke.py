@@ -19,6 +19,8 @@ from aiohttp import web
 from fastmcp import Client
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
+from skyvern.browser_extension.broker_client import BrokerClient
+from skyvern.browser_extension.broker_state import broker_paths, read_extension_secret
 from skyvern.browser_extension.protocol import EXTENSION_ID
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime
 from tests.evals.mcp.task import build_mcp_stdio_transport, unwrap_tool_result
@@ -26,6 +28,7 @@ from tests.evals.mcp.task import build_mcp_stdio_transport, unwrap_tool_result
 EXPECTED_EXTENSION_ID = EXTENSION_ID
 TOKEN_ENV = "SKYVERN_BROWSER_EXTENSION_TOKEN"
 PORT_ENV = "SKYVERN_BROWSER_EXTENSION_PORT"
+BROKER_ENV = "SKYVERN_BROWSER_EXTENSION_BROKER"
 SMOKE_TEXT = "Skyvern extension bridge smoke"
 CHECKS = (
     "setup",
@@ -258,16 +261,19 @@ async def _run_mcp_phase(
     fixture_url: str,
     relay_port: int,
     pairing_token: str,
+    legacy_mode: bool,
     report: SmokeReport,
 ) -> None:
+    env_overrides = {
+        PORT_ENV: str(relay_port),
+        # Keep the production SSRF default intact; only this disposable child may reach its loopback fixture.
+        "ALLOWED_HOSTS": json.dumps(["127.0.0.1"]),
+    }
+    if legacy_mode:
+        env_overrides[TOKEN_ENV] = pairing_token
     transport = build_mcp_stdio_transport(
         browser_extension=True,
-        env_overrides={
-            PORT_ENV: str(relay_port),
-            TOKEN_ENV: pairing_token,
-            # Keep the production SSRF default intact; only this disposable child may reach its loopback fixture.
-            "ALLOWED_HOSTS": json.dumps(["127.0.0.1"]),
-        },
+        env_overrides=env_overrides,
     )
     session_created = False
     async with Client(transport, timeout=60) as client:
@@ -394,6 +400,7 @@ async def _cleanup(
     playwright: Playwright | None,
     profile_dir: tempfile.TemporaryDirectory[str] | None,
     evidence_dir: tempfile.TemporaryDirectory[str] | None,
+    broker_port: int | None,
 ) -> list[str]:
     errors: list[str] = []
     cleanup_steps: list[tuple[str, Callable[[], Awaitable[object]]]] = []
@@ -407,6 +414,8 @@ async def _cleanup(
         cleanup_steps.append(("extension runtime", runtime.shutdown))
     if playwright is not None:
         cleanup_steps.append(("playwright", playwright.stop))
+    if broker_port is not None:
+        cleanup_steps.append(("broker daemon", lambda: _stop_broker(broker_port)))
     for label, cleanup_step in cleanup_steps:
         try:
             await cleanup_step()
@@ -421,12 +430,28 @@ async def _cleanup(
     return errors
 
 
-async def run_smoke() -> int:
+async def _stop_broker(port: int) -> None:
+    async def ignore_event(_event: str, _params: dict) -> None:
+        return None
+
+    client = BrokerClient(port, ignore_event, auto_spawn=False, operator=True)
+    try:
+        await client.start()
+        await client.stop_broker()
+    finally:
+        await client.stop()
+
+
+async def run_smoke(*, legacy_mode: bool) -> int:
     report = SmokeReport()
-    pairing_token = secrets.token_urlsafe(32)
+    pairing_token = secrets.token_urlsafe(32) if legacy_mode else None
     previous_token = os.environ.get(TOKEN_ENV)
-    os.environ[TOKEN_ENV] = pairing_token
-    redactions = [pairing_token]
+    if legacy_mode:
+        assert pairing_token is not None
+        os.environ[TOKEN_ENV] = pairing_token
+    else:
+        os.environ.pop(TOKEN_ENV, None)
+    redactions = [pairing_token] if pairing_token is not None else []
     runtime: BrowserExtensionRuntime | None = None
     playwright: Playwright | None = None
     persistent_context: BrowserContext | None = None
@@ -435,11 +460,23 @@ async def run_smoke() -> int:
     profile_dir: tempfile.TemporaryDirectory[str] | None = None
     evidence_dir = tempfile.TemporaryDirectory(prefix="skyvern-extension-smoke-evidence-")
     screenshot_path = (Path(evidence_dir.name) / "smoke_navigate.png").resolve()
+    broker_port: int | None = None
 
     try:
+        if legacy_mode and os.environ.get(BROKER_ENV) != "0":
+            raise RuntimeError(f"legacy smoke requires {BROKER_ENV}=0")
+        if not legacy_mode and BROKER_ENV in os.environ:
+            raise RuntimeError(f"broker-default smoke requires {BROKER_ENV} to be unset")
         port_reservation, relay_port = _reserve_free_port()
         port_reservation.close()
         runtime = await BrowserExtensionRuntime.get_or_start(port=relay_port)
+        if legacy_mode:
+            assert pairing_token is not None
+        else:
+            broker_port = relay_port
+            assert TOKEN_ENV not in os.environ
+            pairing_token = read_extension_secret(broker_paths(relay_port))
+            redactions.append(pairing_token)
         redactions.append(runtime.cdp_ws_url)
         extension_dir = BrowserExtensionRuntime.extension_dir().resolve()
         derived_extension_id = _extension_id_from_manifest(extension_dir)
@@ -464,7 +501,8 @@ async def run_smoke() -> int:
             print(f"WARN extension ID mismatch: expected {EXPECTED_EXTENSION_ID}, discovered {discovered_extension_id}")
         assert discovered_extension_id == EXPECTED_EXTENSION_ID
         extension_id = discovered_extension_id
-        report.pass_check("setup", f"relay port={relay_port}, extension ID={extension_id}")
+        mode = "legacy opt-out" if legacy_mode else "broker default"
+        report.pass_check("setup", f"mode={mode}, relay port={relay_port}, extension ID={extension_id}")
 
         popup_page = await _pair_extension(persistent_context, runtime, extension_id, relay_port, pairing_token)
         assert runtime.extension_connected
@@ -502,6 +540,7 @@ async def run_smoke() -> int:
             fixture_servers.outer_url,
             relay_port,
             pairing_token,
+            legacy_mode,
             report,
         )
     except Exception as exc:
@@ -517,6 +556,7 @@ async def run_smoke() -> int:
             playwright,
             profile_dir,
             evidence_dir,
+            broker_port,
         )
         if cleanup_errors:
             report.fail_check("cleanup", _safe_text("; ".join(cleanup_errors), redactions))
@@ -548,10 +588,11 @@ def _dry_run_helpers() -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the real Chrome extension bridge smoke test")
     parser.add_argument("--dry-run-helpers", action="store_true", help="validate pure-Python helpers only")
+    parser.add_argument("--legacy", action="store_true", help="exercise the explicit broker opt-out path")
     args = parser.parse_args(argv)
     if args.dry_run_helpers:
         return _dry_run_helpers()
-    return asyncio.run(run_smoke())
+    return asyncio.run(run_smoke(legacy_mode=args.legacy))
 
 
 if __name__ == "__main__":

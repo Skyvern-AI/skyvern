@@ -13,16 +13,20 @@ from skyvern.forge.sdk.routes.streaming import cdp_input
 
 
 class _FakeSession:
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, history: dict | None = None) -> None:
         self.name = name
         self.detached = False
         self.sent: list[tuple[str, dict]] = []
+        self.history = history
 
     async def detach(self) -> None:
         self.detached = True
 
-    async def send(self, method: str, params: dict) -> None:
+    async def send(self, method: str, params: dict) -> dict | None:
         self.sent.append((method, params))
+        if method == "Page.getNavigationHistory":
+            return self.history
+        return None
 
 
 class _FakeContext:
@@ -246,3 +250,98 @@ class TestNavigateEvent:
 
         assert page.goto_calls == ["https://example.org/redirect", "about:blank"]
         assert websocket.sent_json == [{"kind": "navigate-error", "reason": "blocked"}]
+
+
+def _history(current_index: int, *urls: str) -> dict:
+    return {
+        "currentIndex": current_index,
+        "entries": [{"id": i, "url": url} for i, url in enumerate(urls)],
+    }
+
+
+def _dispatched(session: _FakeSession) -> list[tuple[str, dict]]:
+    return [call for call in session.sent if call[0] != "Page.getNavigationHistory"]
+
+
+class TestHistoryNavigation:
+    """SKY-13724: the live-view browser chrome drives back/forward/reload over the same
+    cdp_input socket, behind the same take-control gate, and re-validates the history entry
+    it is about to replay rather than trusting that everything in the back stack was safe."""
+
+    @pytest.mark.asyncio
+    async def test_back_navigates_to_the_previous_entry(self) -> None:
+        session = _FakeSession("s", history=_history(1, "https://example.org/one", "https://example.org/two"))
+        input_session = _FakeInputSession(session)
+        channel = SimpleNamespace(interactor="user", client_id="c1")
+        websocket = _FakeWebSocket([json.dumps({"type": "goBackEvent"})])
+
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
+
+        assert _dispatched(session) == [("Page.navigateToHistoryEntry", {"entryId": 0})]
+        assert websocket.sent_json == []
+
+    @pytest.mark.asyncio
+    async def test_forward_navigates_to_the_next_entry(self) -> None:
+        session = _FakeSession("s", history=_history(0, "https://example.org/one", "https://example.org/two"))
+        input_session = _FakeInputSession(session)
+        channel = SimpleNamespace(interactor="user", client_id="c1")
+        websocket = _FakeWebSocket([json.dumps({"type": "goForwardEvent"})])
+
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
+
+        assert _dispatched(session) == [("Page.navigateToHistoryEntry", {"entryId": 1})]
+
+    @pytest.mark.asyncio
+    async def test_reload_reloads_rather_than_replaying_a_history_entry(self) -> None:
+        session = _FakeSession("s", history=_history(0, "https://example.org/one"))
+        input_session = _FakeInputSession(session)
+        channel = SimpleNamespace(interactor="user", client_id="c1")
+        websocket = _FakeWebSocket([json.dumps({"type": "reloadEvent"})])
+
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
+
+        assert _dispatched(session) == [("Page.reload", {})]
+
+    @pytest.mark.asyncio
+    async def test_back_at_the_start_of_history_is_a_no_op(self) -> None:
+        """The frontend leaves the buttons enabled, so the end-of-stack check has to live
+        here; walking off the end must not raise and must not close the input channel."""
+        session = _FakeSession("s", history=_history(0, "https://example.org/one"))
+        input_session = _FakeInputSession(session)
+        channel = SimpleNamespace(interactor="user", client_id="c1")
+        websocket = _FakeWebSocket([json.dumps({"type": "goBackEvent"})])
+
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
+
+        assert _dispatched(session) == []
+        assert websocket.sent_json == []
+        assert websocket.closed is None
+
+    @pytest.mark.asyncio
+    async def test_refuses_to_replay_a_blocked_entry_left_in_the_back_stack(self) -> None:
+        """A destination blocked mid-redirect resets the page but stays in the history, so
+        going back would re-request it. Uses the real validate_navigation_destination (no
+        monkeypatch): drop the guard from _dispatch_history_event and this goes red."""
+        session = _FakeSession(
+            "s",
+            history=_history(1, "http://169.254.169.254/latest/meta-data/", "https://example.org/two"),
+        )
+        input_session = _FakeInputSession(session)
+        channel = SimpleNamespace(interactor="user", client_id="c1")
+        websocket = _FakeWebSocket([json.dumps({"type": "goBackEvent"})])
+
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
+
+        assert _dispatched(session) == []
+        assert websocket.sent_json == [{"kind": "navigate-error", "reason": "blocked"}]
+
+    @pytest.mark.asyncio
+    async def test_dropped_when_not_in_control(self) -> None:
+        session = _FakeSession("s", history=_history(1, "https://example.org/one", "https://example.org/two"))
+        input_session = _FakeInputSession(session)
+        channel = SimpleNamespace(interactor="agent", client_id="c1")
+        websocket = _FakeWebSocket([json.dumps({"type": "goBackEvent"})])
+
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
+
+        assert session.sent == []

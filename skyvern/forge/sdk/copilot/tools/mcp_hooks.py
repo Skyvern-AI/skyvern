@@ -3,19 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import time
+import uuid
+from collections.abc import Mapping
 from typing import Any
 
 import structlog
 
-from skyvern.config import settings
-from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
-from skyvern.forge.sdk.copilot.build_phase import (
-    BuildPhase,
-    advance_to_composing,
-)
-from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_control_state_expression
 from skyvern.forge.sdk.copilot.config import (
     BlockAuthoringPolicy,
@@ -24,30 +18,20 @@ from skyvern.forge.sdk.copilot.config import (
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url, load_credentials
 from skyvern.forge.sdk.copilot.enforcement import (
-    _requested_output_labels_by_path,
-    requested_output_extraction_plan,
     requested_output_paths_for_derivation,
-    unbound_requested_output_paths_for_designation,
 )
-from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
-from skyvern.forge.sdk.copilot.output_designation_resolution import (
-    RESOLUTION_PROMPT_TEMPLATE,
-    coerce_resolution,
-    designation_opportunity,
-    render_candidates,
-    render_requested_paths,
-)
+from skyvern.forge.sdk.copilot.output_extraction_plan import unbound_candidate_relations
+from skyvern.forge.sdk.copilot.reached_download_target import download_claim_helper_contract
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     live_page_credentials_admissible,
     resolve_credential_for_live_page,
 )
 from skyvern.forge.sdk.copilot.request_slots import is_canonical_request_slot_path
-from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction
+from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction, ScoutedSelectorCandidate
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values
-from skyvern.forge.sdk.copilot.typed_value_policy import safe_typed_default_value, should_reject_type_text_value
 from skyvern.forge.sdk.schemas.credentials import Credential
 
 from ._shared import (
@@ -56,7 +40,6 @@ from ._shared import (
     _fallback_page_info,
 )
 from .banned_blocks import (
-    _CODE_ONLY_SELECTOR_ACTION_TOOLS,
     _CODE_ONLY_TARGET_EVIDENCE_KEYS,
     _code_only_browser_schema_guidance,
     _code_only_browser_unavailable_summary,
@@ -67,40 +50,33 @@ from .banned_blocks import (
     _record_code_native_pending_capability,
     _render_block_policy_detail,
 )
-from .completion import _maybe_run_completion_verification_from_page_observation
 from .page_observation import (
     _record_composition_page_observation,
     _resolve_url_title,
 )
 from .scouting import (
-    _PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS,
-    _actionable_targets_for_result,
+    _arm_scout_download_listener,
     _arm_scout_popup_listener,
+    _attach_evaluate_page_facts,
+    _attach_scout_observation_step,
     _attach_scout_page_summary,
     _capture_post_interaction_screenshot,
     _capture_scout_ambiguity,
-    _capture_scout_dynamic_row,
     _capture_scout_role_name,
+    _capture_scout_selector_candidates,
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
-    _click_affordance_target_identities,
     _consume_scout_source_url,
-    _mark_page_inspected,
     _mark_pending_browser_interaction_observation,
     _maybe_attach_observed_download_target,
     _maybe_attach_observed_render_target,
-    _maybe_attach_reached_download_target,
     _prenav_ambiguity_for_selector,
-    _prenav_dynamic_row_for_selector,
     _prenav_role_name_for_selector,
+    _record_scout_trajectory_fact,
     _record_scouted_interaction,
     _register_scout_interaction_observation,
-    _reset_evaluate_tracker,
     _resolve_scout_role_name,
     _scout_session_download_names,
-    _selector_live_match_count,
-    _steer_evaluate_result,
-    account_no_progress_interaction_click,
 )
 
 LOG = structlog.get_logger()
@@ -113,6 +89,39 @@ def _selector_from_tool_data(data: dict[str, Any], *, prefer_resolved_when_empty
         resolved_selector = data.get("resolved_selector")
         selector = resolved_selector if isinstance(resolved_selector, str) else ""
     return selector.strip()
+
+
+def _selector_candidates_from_tool_data(data: dict[str, Any]) -> list[ScoutedSelectorCandidate]:
+    """Return every selector identity the browser tool produced, without choosing among them."""
+    candidates: list[ScoutedSelectorCandidate] = []
+    raw_candidates = data.get("selector_candidates")
+    if isinstance(raw_candidates, list):
+        for raw_candidate in raw_candidates:
+            if not isinstance(raw_candidate, dict):
+                continue
+            selector = str(raw_candidate.get("selector") or "").strip()
+            source = str(raw_candidate.get("source") or "browser").strip()
+            if selector and not any(candidate["selector"] == selector for candidate in candidates):
+                candidates.append({"selector": selector, "source": source})
+    for key, source in (("selector", "requested"), ("resolved_selector", "resolved")):
+        value = data.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        selector = value.strip()
+        if any(candidate["selector"] == selector for candidate in candidates):
+            continue
+        candidates.append({"selector": selector, "source": source})
+    return candidates
+
+
+def _merge_selector_candidates(
+    observed: list[ScoutedSelectorCandidate], pending: list[ScoutedSelectorCandidate] | None
+) -> list[ScoutedSelectorCandidate]:
+    merged = list(pending or [])
+    for candidate in observed:
+        if not any(item["selector"] == candidate["selector"] for item in merged):
+            merged.append(candidate)
+    return merged
 
 
 def _effective_target_text(selector: str, role: str = "", accessible_name: str = "") -> str:
@@ -198,15 +207,6 @@ async def _validate_block_pre_hook(
     if not isinstance(block_type, str):
         return None
     normalized = normalize_copilot_block_type_alias(block_type.strip().lower())
-    if normalized == "code":
-        return {
-            "ok": False,
-            "error": (
-                "CODE-ONLY CODE VALIDATION BLOCKED: do not use validate_block for `code` blocks, dummy code "
-                "blocks, or probe code blocks in code-only browser mode. validate real code blocks through "
-                "update_and_run_blocks."
-            ),
-        }
     policy_entry = _copilot_block_policy(normalized, ctx)
     if policy_entry is None:
         return None
@@ -240,36 +240,97 @@ async def _get_block_schema_post_hook(
             ctx.code_only_code_schema_seen = True
             data["code_only_note"] = _code_only_browser_unavailable_summary()
             data["code_only_guidance"] = _code_only_browser_schema_guidance()
-            demonstrated = _demonstrated_step_sources(ctx)
+            data["download_claim_helper_contract"] = download_claim_helper_contract()
+            demonstrated = _demonstrated_step_facts(ctx)
             if demonstrated:
                 data["demonstrated_steps"] = demonstrated
     return result
 
 
-def _demonstrated_step_sources(ctx: AgentContext) -> str:
-    """The steps already performed on the page, synthesized into source to build from.
+_MODEL_SCOUT_FACT_KEYS = (
+    "tool_name",
+    "selector",
+    "selector_candidates",
+    "selector_match_count",
+    "role",
+    "accessible_name",
+    "role_name_match_count",
+    "source_url",
+    "result_url",
+    "observed_effects",
+    "observed_wait_ms",
+    "observation_step",
+    "input_id",
+    "value",
+    "typed_length",
+    "key",
+    "control_readonly",
+    "control_disabled",
+    "control_value_satisfied",
+    "observed_hidden",
+    "observed_disabled",
+    "ambiguous",
+    "input_correspondences",
+    "credential_id",
+    "credential_name",
+    "credential_field",
+    "element_fingerprint_id",
+    "element_fingerprint_name",
+    "element_fingerprint_type",
+    "element_fingerprint_placeholder",
+    "element_fingerprint_label",
+    "element_fingerprint_test_id",
+    "element_fingerprint_tag",
+    "read_expression",
+    "read_output_path",
+    "read_output_path_source",
+    "read_result_shape",
+    "read_result_value",
+    "trajectory_index",
+    # Marks an entry hydrated from a prior turn's record. Without it the model reads retained
+    # history as something it just did on the page in front of it.
+    "carried",
+)
 
-    Invoked exactly as the post-authoring judge invokes it, so the agent reads the source its draft
-    will be compared against rather than a laxer variant of it.
-    """
+_MODEL_SCOUT_NULLABLE_FACT_KEYS = (
+    "selector_candidates",
+    "selector_match_count",
+    "role",
+    "accessible_name",
+    "role_name_match_count",
+    "source_url",
+    "result_url",
+    "observed_effects",
+    "observation_step",
+    "input_id",
+)
+
+
+def _demonstrated_step_facts(ctx: AgentContext) -> list[dict[str, Any]]:
+    """Ordered, factual scout input for the acting model; never synthesized browser source."""
     if not ctx.scout_trajectory:
-        return ""
-    try:
-        synthesized = synthesize_code_block(
-            list(ctx.scout_trajectory),
-            strict_selectors=True,
-            reached_download_target=ctx.reached_download_target,
-        )
-    except Exception:
-        LOG.warning("copilot_demonstrated_steps_synthesis_failed", exc_info=True)
-        return ""
-    if synthesized is None:
-        return ""
-    if synthesized.diagnostics.truncated:
-        # Presenting a capped spine as the whole demonstration is how a step goes missing and comes
-        # back as a correction, which is the round-trip this exists to remove.
-        return f"{synthesized.code}\n# NOTE: trajectory truncated — later demonstrated steps are not shown above.\n"
-    return synthesized.code
+        return []
+    facts = []
+    for interaction in ctx.scout_trajectory:
+        interaction_mapping: Mapping[str, Any] = interaction
+        fact = {key: interaction_mapping[key] for key in _MODEL_SCOUT_FACT_KEYS if key in interaction_mapping}
+        for key in _MODEL_SCOUT_NULLABLE_FACT_KEYS:
+            fact.setdefault(key, None)
+        facts.append(fact)
+    secrets = registered_scrub_values(ctx)
+
+    def scrub(value: Any) -> Any:
+        if isinstance(value, str):
+            for secret in secrets:
+                value = value.replace(secret, "[REDACTED_SECRET]")
+            return redact_raw_secrets_for_prompt(value)
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        if isinstance(value, dict):
+            return {key: scrub(item) for key, item in value.items()}
+        return value
+
+    return [scrub(fact) for fact in facts]
 
 
 def _code_only_pre_run_results_error(ctx: CopilotContext) -> dict[str, Any] | None:
@@ -277,11 +338,7 @@ def _code_only_pre_run_results_error(ctx: CopilotContext) -> dict[str, Any] | No
         return None
     if ctx.workflow_persisted or ctx.update_workflow_called:
         return None
-    for value in (
-        ctx.pending_reconciliation_run_id,
-        ctx.last_run_blocks_workflow_run_id,
-        ctx.last_successful_run_blocks_workflow_run_id,
-    ):
+    for value in (ctx.last_run_blocks_workflow_run_id, ctx.last_successful_run_blocks_workflow_run_id):
         if isinstance(value, str) and value:
             return None
     return {
@@ -304,53 +361,11 @@ async def _evaluate_pre_hook(
     ctx.pending_scout_read_expression = None
     ctx.pending_scout_read_output_path = None
     raw_expression = params.get("expression")
-    expr = raw_expression.lower() if isinstance(raw_expression, str) else ""
-    if ".click()" in expr or ".click(" in expr:
-        return {
-            "ok": False,
-            "error": "Do not use evaluate to click elements. Use the 'click' tool with a CSS selector instead.",
-        }
     if isinstance(raw_expression, str) and raw_expression.strip():
         ctx.pending_scout_read_expression = raw_expression
         raw_output_path = params.get("output_path")
         if isinstance(raw_output_path, str) and raw_output_path.strip():
             ctx.pending_scout_read_output_path = raw_output_path.strip()
-    return None
-
-
-def _code_only_deterministic_targeting_error(tool_name: str) -> str:
-    return (
-        f"In code-only browser mode, {tool_name} requires a CSS/XPath selector for page mutations "
-        "after the reusable workflow has been verified. Use evaluate, screenshots, or page inspection "
-        "to derive a selector, then retry with selector only."
-    )
-
-
-def _code_only_selector_action_requires_deterministic_target(ctx: AgentContext) -> bool:
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return False
-    if not getattr(ctx, "workflow_persisted", False):
-        return False
-    return bool(getattr(ctx, "last_full_workflow_test_ok", False))
-
-
-def _strip_intent_for_code_only_selector_action(
-    params: dict[str, Any],
-    ctx: AgentContext,
-    *,
-    tool_name: str,
-) -> dict[str, Any] | None:
-    if not _code_only_selector_action_requires_deterministic_target(ctx):
-        return None
-    if tool_name not in _CODE_ONLY_SELECTOR_ACTION_TOOLS:
-        return None
-    selector = params.get("selector")
-    if isinstance(selector, str) and selector.strip():
-        if "intent" in params:
-            params["intent"] = None
-        return None
-    if params.get("intent"):
-        return {"ok": False, "error": _code_only_deterministic_targeting_error(tool_name)}
     return None
 
 
@@ -368,49 +383,33 @@ def _code_only_has_target_page_evidence(data: object) -> bool:
     return False
 
 
-_JQUERY_SELECTOR_RE = re.compile(r":(?:contains|eq|first|last|gt|lt|nth|visible|hidden|checked)\s*\(", re.IGNORECASE)
-
-
 async def _click_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    # Cleared up front so an early return below (deterministic result, jQuery reject, no selector)
+    # Cleared up front so an early return below (deterministic result or no selector)
     # cannot leave a prior click's stash for this click's post-hook to consume.
     ctx.pending_scout_role_name = None
+    ctx.pending_scout_role_name_match_count = None
     ctx.pending_scout_click_selector = None
     ctx.pending_scout_ambiguous = None
-    ctx.pending_scout_dynamic_row = None
+    ctx.pending_scout_selector_match_count = None
+    ctx.pending_scout_selector_candidates = None
     ctx.pending_scout_download_snapshot = None
+    ctx.pending_scout_download = False
     ctx.pending_scout_popup = None
     ctx.pending_scout_popup_content_type = None
     await _capture_scout_source_url(ctx)
-    deterministic_result = _strip_intent_for_code_only_selector_action(params, ctx, tool_name="click")
-    if deterministic_result is not None:
-        return deterministic_result
     selector = params.get("selector", "")
     if not selector:
         return None
     ctx.pending_scout_click_selector = selector if isinstance(selector, str) else None
-    if _JQUERY_SELECTOR_RE.search(selector):
-        return {
-            "ok": False,
-            "error": (
-                f"Invalid selector: {selector!r}. "
-                "jQuery pseudo-selectors like :contains(), :eq(), :first, :visible are NOT valid CSS. "
-                "Use standard CSS selectors instead. Examples: "
-                "nth-of-type() instead of :eq(), "
-                "[data-attr] or tag.class for filtering, "
-                "or use the 'evaluate' tool with JS: "
-                "document.querySelectorAll('button').forEach("
-                "b => {{ if (b.textContent.includes('Download')) b.click() }})"
-            ),
-        }
     await _capture_scout_role_name(ctx, selector)
+    await _capture_scout_selector_candidates(ctx, selector)
     await _capture_scout_ambiguity(ctx, selector)
     if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        await _capture_scout_dynamic_row(ctx, selector)
         ctx.pending_scout_download_snapshot = await _scout_session_download_names(ctx)
+        await _arm_scout_download_listener(ctx)
         await _arm_scout_popup_listener(ctx)
     return None
 
@@ -420,32 +419,32 @@ async def _type_text_pre_hook(
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
     await _capture_scout_source_url(ctx)
-    ctx.pending_scout_typed_value = None
+    ctx.pending_scout_role_name = None
+    ctx.pending_scout_role_name_match_count = None
+    ctx.pending_scout_selector_match_count = None
+    ctx.pending_scout_selector_candidates = None
+    ctx.pending_scout_input_value = None
     text = params.get("text")
     selector = str(params.get("selector") or "")
-    intent = str(params.get("intent") or "")
     # A value already registered as a credential is known to be secret, so it is rejected on that
     # fact rather than on whether it looks secret — a real password need not, and this one reached a
     # plaintext username field because it did not.
     typed_is_registered_secret = isinstance(text, str) and bool(text) and text in set(registered_scrub_values(ctx))
-    if typed_is_registered_secret or should_reject_type_text_value(value=text, selector=selector, intent=intent):
+    if typed_is_registered_secret:
         return {
             "ok": False,
             "error": (
-                "type_text cannot type raw credentials, secrets, OTP/TOTP codes, API keys, tokens, or "
-                "password-like values. Use fill_credential_field with the saved credential and the "
-                "field it belongs in, rather than typing the value into a field yourself."
+                "type_text cannot type an exact value already registered as a secret. Use "
+                "fill_credential_field with the saved credential and the field it belongs in, rather "
+                "than typing that registered value into a field yourself."
             ),
         }
     if isinstance(text, str) and text:
-        ctx.pending_scout_typed_value = text
-    result = _strip_intent_for_code_only_selector_action(params, ctx, tool_name="type_text")
-    if result is not None:
-        # Non-None means the deterministic targeting guard is rejecting the
-        # tool call before browser execution; there will be no post-hook to
-        # consume this value.
-        ctx.pending_scout_typed_value = None
-    return result
+        ctx.pending_scout_input_value = text
+    await _capture_scout_role_name(ctx, selector)
+    await _capture_scout_selector_candidates(ctx, selector)
+    await _capture_scout_ambiguity(ctx, selector)
+    return None
 
 
 async def _select_option_pre_hook(
@@ -454,11 +453,15 @@ async def _select_option_pre_hook(
 ) -> dict[str, Any] | None:
     ctx.pending_scout_ambiguous = None
     ctx.pending_scout_reanchor = None
+    ctx.pending_scout_role_name = None
+    ctx.pending_scout_role_name_match_count = None
+    ctx.pending_scout_selector_match_count = None
+    ctx.pending_scout_selector_candidates = None
     await _capture_scout_source_url(ctx)
-    result = _strip_intent_for_code_only_selector_action(params, ctx, tool_name="select_option")
-    if result is None:
-        await _capture_scout_ambiguity(ctx, params.get("selector", ""))
-    return result
+    await _capture_scout_role_name(ctx, params.get("selector", ""))
+    await _capture_scout_selector_candidates(ctx, params.get("selector", ""))
+    await _capture_scout_ambiguity(ctx, params.get("selector", ""))
+    return None
 
 
 async def _press_key_pre_hook(
@@ -466,7 +469,17 @@ async def _press_key_pre_hook(
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
     await _capture_scout_source_url(ctx)
-    return _strip_intent_for_code_only_selector_action(params, ctx, tool_name="press_key")
+    ctx.pending_scout_role_name = None
+    ctx.pending_scout_role_name_match_count = None
+    ctx.pending_scout_ambiguous = None
+    ctx.pending_scout_reanchor = None
+    ctx.pending_scout_selector_match_count = None
+    ctx.pending_scout_selector_candidates = None
+    if params.get("selector"):
+        await _capture_scout_role_name(ctx, params.get("selector"))
+        await _capture_scout_selector_candidates(ctx, params.get("selector"))
+        await _capture_scout_ambiguity(ctx, params.get("selector"))
+    return None
 
 
 async def _bind_login_credential_for_observed_url(ctx: AgentContext, url: str, result: dict[str, Any]) -> None:
@@ -530,9 +543,16 @@ async def _navigate_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
+    source_url = _consume_scout_source_url(ctx)
     if result.get("ok"):
         data = result.pop("data", {})
         result["url"] = data.get("url", "")
+        _record_scouted_interaction(
+            ctx,
+            tool_name="navigate_browser",
+            source_url=source_url,
+            result_url=result["url"],
+        )
         await _bind_login_credential_for_observed_url(ctx, result["url"], result)
         result["next_step"] = (
             "Page loaded, and a screenshot of it is attached. Use evaluate or "
@@ -540,12 +560,41 @@ async def _navigate_post_hook(
             "before responding."
         )
         await _capture_post_interaction_screenshot(ctx)
-        if (
-            _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
-            and isinstance(ctx, CopilotContext)
-            and ctx.build_phase in {BuildPhase.INITIAL, BuildPhase.DISCOVERING}
-        ):
-            advance_to_composing(ctx, reason="code_only_browser_navigation_succeeded")
+    return result
+
+
+async def _navigate_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    await _capture_scout_source_url(ctx)
+    return None
+
+
+async def _wait_for_either_state_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return result
+    selector_a = data.get("selector_a")
+    selector_b = data.get("selector_b")
+    candidates: list[ScoutedSelectorCandidate] = [
+        {"selector": selector, "source": source}
+        for selector, source in ((selector_a, "selector_a"), (selector_b, "selector_b"))
+        if isinstance(selector, str) and selector
+    ]
+    _record_scouted_interaction(
+        ctx,
+        tool_name="wait_for_either_state",
+        selector=data.get("matched_selector"),
+        selector_candidates=candidates or None,
+        source_url=data.get("source_url"),
+        result_url=data.get("result_url"),
+        observed_wait_ms=data.get("observed_wait_ms") if isinstance(data.get("observed_wait_ms"), int) else None,
+    )
     return result
 
 
@@ -555,7 +604,6 @@ async def _screenshot_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     if result.get("ok") and result.get("data"):
-        _mark_page_inspected(ctx)
         data = result["data"]
         url, title = await _resolve_url_title(raw, ctx)
         _record_composition_page_observation(ctx, source_tool="get_browser_screenshot", url=url, title=title)
@@ -578,18 +626,21 @@ async def _click_post_hook(
     source_url = _consume_scout_source_url(ctx)
     pending_role_name = ctx.pending_scout_role_name
     ctx.pending_scout_role_name = None
+    pending_role_name_match_count = getattr(ctx, "pending_scout_role_name_match_count", None)
+    ctx.pending_scout_role_name_match_count = None
     pending_ambiguous = ctx.pending_scout_ambiguous
     ctx.pending_scout_ambiguous = None
-    pending_reanchor = ctx.pending_scout_reanchor
+    pending_selector_match_count = getattr(ctx, "pending_scout_selector_match_count", None)
+    ctx.pending_scout_selector_match_count = None
+    pending_selector_candidates = getattr(ctx, "pending_scout_selector_candidates", None)
+    ctx.pending_scout_selector_candidates = None
     ctx.pending_scout_reanchor = None
-    pending_dynamic_row = ctx.pending_scout_dynamic_row
-    ctx.pending_scout_dynamic_row = None
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        pending_dynamic_row = None
-    attempted_selector = ctx.pending_scout_click_selector
     ctx.pending_scout_click_selector = None
     if result.get("ok") and result.get("data"):
         data = result["data"]
+        selector_candidates = _merge_selector_candidates(
+            _selector_candidates_from_tool_data(data), pending_selector_candidates
+        )
         selector = _selector_from_tool_data(data, prefer_resolved_when_empty=True)
         url, title = await _resolve_url_title(raw, ctx)
         _mark_pending_browser_interaction_observation(ctx, tool_name="click", url=url)
@@ -600,26 +651,46 @@ async def _click_post_hook(
         }
         await _bind_login_credential_for_observed_url(ctx, url, result)
         navigated = bool(source_url) and bool(url) and source_url != url
-        role, accessible_name = await _resolve_scout_role_name(ctx, selector, allow_browser_read=not navigated)
-        if navigated and not (role and accessible_name):
-            role, accessible_name = _prenav_role_name_for_selector(pending_role_name, selector)
+        role, accessible_name = _prenav_role_name_for_selector(pending_role_name, selector)
+        if not (role and accessible_name):
+            role, accessible_name = await _resolve_scout_role_name(ctx, selector, allow_browser_read=not navigated)
         ambiguous = _prenav_ambiguity_for_selector(pending_ambiguous, selector)
-        dynamic_row_evidence = _prenav_dynamic_row_for_selector(pending_dynamic_row, selector, source_url)
-        if ambiguous:
-            role, accessible_name = _prenav_role_name_for_selector(pending_reanchor, selector)
+        selector_match_count = (
+            pending_selector_match_count[1]
+            if isinstance(pending_selector_match_count, tuple)
+            and len(pending_selector_match_count) == 2
+            and pending_selector_match_count[0] == selector
+            else None
+        )
+        role_name_match_count = (
+            pending_role_name_match_count[3]
+            if isinstance(pending_role_name_match_count, tuple)
+            and len(pending_role_name_match_count) == 4
+            and pending_role_name_match_count[:3] == (selector, role, accessible_name)
+            else None
+        )
         result["data"]["effective_target"] = _effective_target_text(selector, role, accessible_name)
         _record_scouted_interaction(
             ctx,
             tool_name="click",
             selector=selector,
+            selector_candidates=selector_candidates,
+            selector_match_count=selector_match_count,
             source_url=source_url,
+            result_url=url,
             role=role,
             accessible_name=accessible_name,
+            role_name_match_count=role_name_match_count,
             ambiguous=ambiguous,
-            dynamic_row_evidence=dynamic_row_evidence,
         )
         observation_step, page_evidence = await _register_scout_interaction_observation(
             ctx, tool_name="click", selector=selector, source_url=source_url, url=url
+        )
+        _attach_scout_observation_step(
+            ctx,
+            tool_name="click",
+            selector=selector,
+            observation_step=observation_step,
         )
         if observation_step is not None:
             result["observation_step"] = observation_step
@@ -631,44 +702,8 @@ async def _click_post_hook(
             await _maybe_attach_observed_render_target(ctx, result, selector=selector, url=url)
         if page_evidence is not None:
             _attach_scout_page_summary(result, page_evidence)
-            if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-                await _maybe_attach_reached_download_target(ctx, result, url=url, page_evidence=page_evidence)
-    account_no_progress_interaction_click(ctx, result)
-    try:
-        await _attach_reperception_targets_on_non_advancing_click(result, raw, ctx, attempted_selector)
-    except Exception:
-        LOG.warning("copilot_click_reperception_attach_failed", exc_info=True)
     await _capture_post_interaction_screenshot(ctx)
     return result
-
-
-_SETTLE_GROUNDED_TARGETS_INSTRUCTION = (
-    "The page updated after your click; click one of the grounded targets below instead of re-evaluating."
-)
-
-
-def _grounded_actionable_targets(parsed: dict[str, Any] | None) -> list[dict[str, str]]:
-    if parsed is None:
-        return []
-    return _actionable_targets_for_result(_click_affordance_target_identities(parsed))
-
-
-def _attach_actionable_targets(result: dict[str, Any], targets: list[dict[str, str]], *, settle_steer: bool) -> None:
-    if not targets:
-        return
-    container = result.get("data")
-    if not isinstance(container, dict):
-        container = {}
-        result["data"] = container
-    container["actionable_targets"] = targets
-    if settle_steer:
-        container["next_action"] = "click"
-        container["next_action_reason"] = _SETTLE_GROUNDED_TARGETS_INSTRUCTION
-    LOG.info(
-        "copilot_click_grounded_targets_attached",
-        target_count=len(targets),
-        via="settle" if settle_steer else "reperception",
-    )
 
 
 async def _safe_composition_evidence(ctx: AgentContext, url: str, *, timeout_seconds: float) -> dict[str, Any] | None:
@@ -683,88 +718,6 @@ async def _safe_composition_evidence(ctx: AgentContext, url: str, *, timeout_sec
         )
     except Exception:
         return None
-
-
-async def _click_failure_warrants_settle(
-    ctx: AgentContext, attempted_selector: str | None, *, timeout_seconds: float
-) -> bool:
-    """Pay the bounded settle only for a precondition-gated control: the attempted selector resolves to
-    a live element now (exists-but-was-not-actionable). A zero-match invented selector, or one that can
-    no longer be read, never warrants it, so the common invented-selector path stays fast."""
-    match_count = await _selector_live_match_count(ctx, attempted_selector, timeout_seconds=timeout_seconds)
-    return match_count is not None and match_count >= 1
-
-
-async def _settle_grounded_targets_on_pending_update(
-    ctx: AgentContext,
-    *,
-    url: str,
-    attempted_selector: str | None,
-) -> list[dict[str, str]]:
-    """Bounded re-probe of the side-effect-free extractor until a precondition-gated control's
-    grounded targets appear (a just-issued AJAX populated the page) or the settle deadline expires."""
-    deadline = time.monotonic() + settings.COPILOT_CLICK_SETTLE_DEADLINE_SECONDS
-
-    def _remaining_budget(default: float) -> float:
-        return min(default, max(0.0, deadline - time.monotonic()))
-
-    warrants_budget = _remaining_budget(_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS)
-    if warrants_budget <= 0:
-        return []
-    if not await _click_failure_warrants_settle(ctx, attempted_selector, timeout_seconds=warrants_budget):
-        return []
-    probes_run = 0
-    for _ in range(max(0, settings.COPILOT_CLICK_SETTLE_MAX_PROBES)):
-        sleep_budget = _remaining_budget(settings.COPILOT_CLICK_SETTLE_DELAY_SECONDS)
-        if sleep_budget <= 0 and time.monotonic() >= deadline:
-            break
-        await asyncio.sleep(sleep_budget)
-        probe_budget = _remaining_budget(settings.COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS)
-        if probe_budget <= 0:
-            break
-        probes_run += 1
-        targets = _grounded_actionable_targets(await _safe_composition_evidence(ctx, url, timeout_seconds=probe_budget))
-        if targets:
-            LOG.info("copilot_click_settle_reprobe", warranted=True, probes_run=probes_run, target_count=len(targets))
-            return targets
-    LOG.info("copilot_click_settle_reprobe", warranted=True, probes_run=probes_run, target_count=0)
-    return []
-
-
-async def _attach_reperception_targets_on_non_advancing_click(
-    result: dict[str, Any],
-    raw: dict[str, Any],
-    ctx: AgentContext,
-    attempted_selector: str | None,
-) -> None:
-    """Re-perceive after a click that did not advance the build (a zero-match failure or a
-    successful-but-hollow observe), so the next attempt copies a grounded selector instead of
-    re-emitting an invented one. Side-effect-free parse: the no-progress counter and
-    last_scout_act_observe_outcome are settled by the caller and left untouched."""
-    ok = bool(result.get("ok"))
-    non_advancing = (not ok) or ctx.last_scout_act_observe_outcome == "hollow"
-    if not non_advancing:
-        return
-    existing = result.get("data")
-    if isinstance(existing, dict) and existing.get("actionable_targets"):
-        return
-    if ok:
-        immediate = _grounded_actionable_targets(ctx.last_scout_act_observe_packet)
-        if immediate:
-            _attach_actionable_targets(result, immediate, settle_steer=False)
-            return
-    url, _ = await _resolve_url_title(raw, ctx)
-    if not url:
-        return
-    parsed = await _safe_composition_evidence(
-        ctx, url, timeout_seconds=settings.COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS
-    )
-    targets = _grounded_actionable_targets(parsed)
-    if targets:
-        _attach_actionable_targets(result, targets, settle_steer=False)
-        return
-    settled = await _settle_grounded_targets_on_pending_update(ctx, url=url, attempted_selector=attempted_selector)
-    _attach_actionable_targets(result, settled, settle_steer=True)
 
 
 _TYPE_READBACK_SETTLE_SECONDS = 0.3
@@ -900,10 +853,21 @@ async def _type_text_post_hook(
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
     source_url = _consume_scout_source_url(ctx)
-    pending_typed_value = ctx.pending_scout_typed_value
-    ctx.pending_scout_typed_value = None
+    pending_role_name = getattr(ctx, "pending_scout_role_name", None)
+    ctx.pending_scout_role_name = None
+    pending_role_name_match_count = getattr(ctx, "pending_scout_role_name_match_count", None)
+    ctx.pending_scout_role_name_match_count = None
+    pending_selector_match_count = getattr(ctx, "pending_scout_selector_match_count", None)
+    ctx.pending_scout_selector_match_count = None
+    pending_selector_candidates = getattr(ctx, "pending_scout_selector_candidates", None)
+    ctx.pending_scout_selector_candidates = None
+    pending_input_value = ctx.pending_scout_input_value
+    ctx.pending_scout_input_value = None
     if result.get("ok") and result.get("data"):
         data = result["data"]
+        selector_candidates = _merge_selector_candidates(
+            _selector_candidates_from_tool_data(data), pending_selector_candidates
+        )
         selector = _selector_from_tool_data(data)
         typed_length = data.get("text_length", 0)
         url, _ = await _resolve_url_title(raw, ctx)
@@ -927,30 +891,37 @@ async def _type_text_post_hook(
             return landing_failure
         _mark_pending_browser_interaction_observation(ctx, tool_name="type_text", url=url)
         role, accessible_name = await _resolve_scout_role_name(ctx, selector)
+        if not (role and accessible_name):
+            role, accessible_name = _prenav_role_name_for_selector(pending_role_name, selector)
+        selector_match_count = (
+            pending_selector_match_count[1]
+            if isinstance(pending_selector_match_count, tuple)
+            and len(pending_selector_match_count) == 2
+            and pending_selector_match_count[0] == selector
+            else None
+        )
+        role_name_match_count = (
+            pending_role_name_match_count[3]
+            if isinstance(pending_role_name_match_count, tuple)
+            and len(pending_role_name_match_count) == 4
+            and pending_role_name_match_count[:3] == (selector, role, accessible_name)
+            else None
+        )
         value_landed = (
             isinstance(typed_length, int)
             and typed_length > 0
-            and isinstance(pending_typed_value, str)
-            and len(pending_typed_value) == typed_length
+            and isinstance(pending_input_value, str)
+            and len(pending_input_value) == typed_length
         )
-        typed_value = (
-            safe_typed_default_value(
-                pending_typed_value,
-                selector=selector,
-                role=role,
-                accessible_name=accessible_name,
-            )
-            if value_landed
-            else None
-        )
-        raw_typed_value = pending_typed_value if value_landed and isinstance(pending_typed_value, str) else ""
-        if is_readonly_or_disabled and isinstance(pending_typed_value, str):
+        input_id = f"input_{uuid.uuid4().hex}" if value_landed else ""
+        input_value = pending_input_value if value_landed and isinstance(pending_input_value, str) else ""
+        if is_readonly_or_disabled and isinstance(pending_input_value, str):
             settled_value = field_value
-            if settled_value is not None and settled_value != pending_typed_value:
+            if settled_value is not None and settled_value != pending_input_value:
                 await asyncio.sleep(_TYPE_READBACK_SETTLE_SECONDS)
                 settled_value = await _read_scout_field_value(ctx, selector)
             control_value_satisfied: bool | None = (
-                settled_value == pending_typed_value if settled_value is not None else None
+                settled_value == pending_input_value if settled_value is not None else None
             )
         else:
             control_value_satisfied = None
@@ -958,18 +929,28 @@ async def _type_text_post_hook(
             ctx,
             tool_name="type_text",
             selector=selector,
+            selector_candidates=selector_candidates,
+            selector_match_count=selector_match_count,
             source_url=source_url,
+            result_url=url,
             typed_length=typed_length,
-            typed_value=typed_value or "",
-            raw_typed_value=raw_typed_value,
+            input_id=input_id,
+            input_value=input_value,
             role=role,
             accessible_name=accessible_name,
+            role_name_match_count=role_name_match_count,
             control_readonly=control_readonly,
             control_disabled=control_disabled,
             control_value_satisfied=control_value_satisfied,
         )
         observation_step, page_evidence = await _register_scout_interaction_observation(
             ctx, tool_name="type_text", selector=selector, source_url=source_url, url=url
+        )
+        _attach_scout_observation_step(
+            ctx,
+            tool_name="type_text",
+            selector=selector,
+            observation_step=observation_step,
         )
         if observation_step is not None:
             result["observation_step"] = observation_step
@@ -1029,15 +1010,15 @@ def _record_scouted_read(
     data: dict[str, Any],
     url: str,
     declared_output_path: str | None = None,
-) -> None:
+) -> ScoutedInteraction | None:
     """Keep a read the scout proved on the live page so authoring replays it instead of guessing a
     locator for a value it has already seen. A structured result is kept as readily as a scalar: the
     shape is what a later binding needs. Naming never gates keeping the evidence."""
     result = data.get("result")
     if not expression or result is None or result == "":
-        return
+        return None
     if isinstance(result, (list, dict)) and not result:
-        return
+        return None
     output_path = "output.scouted_read"
     witnessed = _witnessed_scalar_value(result)
     policy = ctx.request_policy
@@ -1086,7 +1067,8 @@ def _record_scouted_read(
         interaction["read_result_value"] = witnessed
     if url:
         interaction["source_url"] = url
-    ctx.scout_trajectory.append(interaction)
+        interaction["result_url"] = url
+    return _record_scout_trajectory_fact(ctx, interaction)
 
 
 def _unread_requested_output_paths(ctx: AgentContext) -> list[str]:
@@ -1109,69 +1091,6 @@ def _unread_requested_output_paths(ctx: AgentContext) -> list[str]:
     return sorted(requested - claimed)
 
 
-async def resolve_requested_output_designation_from_page_evidence(ctx: AgentContext) -> None:
-    """Decide which value this packet shows for a requested output nothing has bound yet.
-
-    Fires on the page evidence rather than on an authoring step, a tool the model chose to call, or
-    a question it happened to ask — all of which can precede the value's render and none of which
-    re-fire after it (SKY-13485). Selecting nothing is a first-class answer: no write is refused and
-    a structurally different packet can offer the decision again.
-    """
-    # tools/__init__ imports this module, so the acceptance helper cannot be imported at top level.
-    from skyvern.forge.sdk.copilot.tools import _accept_requested_output_reads
-
-    if not requested_output_paths_for_derivation(ctx):
-        return
-    opportunity = designation_opportunity(
-        unbound_paths=unbound_requested_output_paths_for_designation(ctx),
-        flow_evidence=ctx.flow_evidence,
-        resolved_fingerprints=ctx.resolved_designation_fingerprints,
-    )
-    if opportunity is None:
-        return
-    handler = await resolve_main_copilot_handler(ctx.workflow_permanent_id, ctx.organization_id)
-    if handler is None:
-        return
-    prompt = prompt_engine.load_prompt(
-        template=RESOLUTION_PROMPT_TEMPLATE,
-        requested_paths=render_requested_paths(opportunity, _requested_output_labels_by_path(ctx)),
-        candidates=render_candidates(opportunity),
-        page_context=opportunity.page_context,
-    )
-    try:
-        raw = await asyncio.wait_for(
-            handler(prompt=prompt, prompt_name=RESOLUTION_PROMPT_TEMPLATE),
-            timeout=settings.COPILOT_OUTPUT_DESIGNATION_TIMEOUT_SECONDS,
-        )
-    except Exception:
-        # Deliberately leaves the fingerprint unrecorded: a judge that timed out decided nothing, and
-        # this page is the only one that can answer for this path.
-        LOG.info("copilot_requested_output_designation_resolution", decision="unavailable", exc_info=True)
-        return
-    reads = coerce_resolution(raw, opportunity)
-    LOG.info(
-        "copilot_requested_output_designation_resolution",
-        decision="selected" if reads else "none",
-        requested_paths=list(opportunity.unbound_paths),
-        candidate_labels=[candidate.label for candidate in opportunity.candidates],
-        selected=[{"output_path": read["output_path"], "candidate_label": read["label"]} for read in reads],
-    )
-    if not reads:
-        # A judged abstention is a decision; the same offer should not be re-asked.
-        ctx.resolved_designation_fingerprints.add(opportunity.fingerprint)
-        return
-    rejected = await _accept_requested_output_reads(ctx, reads, offered_by="page_evidence_resolution")
-    if len(rejected) < len(reads):
-        # Only a designation the live page actually pinned settles this offer. A probe that missed
-        # because the metric ticked between capture and probe left the path unbound, and the
-        # fingerprint excludes values, so recording it here would suppress the tile forever.
-        ctx.resolved_designation_fingerprints.add(opportunity.fingerprint)
-    # Bind now, at the observation that resolved it: reach, completeness and ownership all read the
-    # retained plan, and deriving it later inside imposition let the same trajectory be unowned on
-    # one attempt and owned on the next.
-    requested_output_extraction_plan(ctx)
-
-
 async def _evaluate_post_hook(
     result: dict[str, Any],
     raw: dict[str, Any],
@@ -1180,9 +1099,7 @@ async def _evaluate_post_hook(
     ctx.scout_observation_contract = None
     data = result.get("data")
     if not result.get("ok") or not isinstance(data, dict) or not data:
-        _reset_evaluate_tracker(ctx)
         return result
-    _mark_page_inspected(ctx)
     data.pop("sdk_equivalent", None)
     if "url" not in data:
         url, _ = await _resolve_url_title(raw, ctx)
@@ -1209,16 +1126,14 @@ async def _evaluate_post_hook(
     ctx.pending_scout_read_expression = None
     declared_output_path = ctx.pending_scout_read_output_path
     ctx.pending_scout_read_output_path = None
-    trajectory_len_before = len(ctx.scout_trajectory)
-    _record_scouted_read(
+    recorded = _record_scouted_read(
         ctx,
         expression=read_expression,
         data=data,
         url=url,
         declared_output_path=declared_output_path,
     )
-    if len(ctx.scout_trajectory) > trajectory_len_before:
-        recorded = ctx.scout_trajectory[-1]
+    if recorded is not None:
         LOG.info(
             "copilot_scouted_read_recorded",
             read_result_shape=recorded.get("read_result_shape"),
@@ -1228,44 +1143,34 @@ async def _evaluate_post_hook(
         )
         claimed_path = str(recorded.get("read_output_path") or "")
         if claimed_path.startswith("output.") and not recorded.get("read_result_value"):
-            # The read owns an output the run has to register, but returned a shape holding no single
-            # value, so nothing downstream can say which element on the page carries the answer. Said
-            # as a bare fact it went unacted on six times in one turn while the sibling signal below
-            # carried a hint and was followed, so it names the next call too (SKY-13226).
             data["claimed_output_without_a_single_value"] = claimed_path
-            data["claimed_output_read_hint"] = (
-                f"That expression gathered candidates rather than evaluating to one value, so nothing "
-                f"records what {claimed_path} is. Read the single value on its own — an expression whose "
-                f"result is just that value — and pass output_path={claimed_path} on that call. If you can "
-                f"see the value but not author an expression that returns just it, call "
-                f'inspect_page_for_composition(target_url="current_page") with requested_output_reads naming '
-                f"{claimed_path} and the value as rendered, and the page will pin it."
-            )
+            data["requested_output_designation_capability"] = {
+                "tool": "inspect_page_for_composition",
+                "argument": "requested_output_reads",
+                "page_reference": "current_page",
+                "citation_fields": ["output_path", "value_text", "label"],
+                "effect": "browser verifies the cited rendered value and returns selector candidates with cardinality",
+            }
             LOG.info(
                 "copilot_scouted_read_claimed_output_without_value",
                 read_output_path=claimed_path,
                 read_result_shape=recorded.get("read_result_shape"),
             )
-    await resolve_requested_output_designation_from_page_evidence(ctx)
     unread_requested = _unread_requested_output_paths(ctx)
     if unread_requested:
         data["requested_outputs_still_unread"] = unread_requested
-        data["requested_output_read_hint"] = (
-            "Read each of these values and pass output_path=<the path> on that evaluate call. A read "
-            "that names any other path is kept as exploration and registers no output for the run."
-        )
         LOG.info("copilot_requested_output_unread_after_read", unread=unread_requested)
     if _copilot_block_authoring_policy(
         ctx
     ) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and _code_only_has_target_page_evidence(data):
         ctx.code_only_target_page_evidence_seen = True
-    await _maybe_run_completion_verification_from_page_observation(
-        ctx,
-        url=url,
-        title=title,
-        observed_data=data,
-    )
-    await _steer_evaluate_result(ctx, result, url=url)
+    await _attach_evaluate_page_facts(ctx, result, url=url)
+    if data.get("claimed_output_without_a_single_value"):
+        candidates = unbound_candidate_relations(ctx.flow_evidence)
+        if candidates:
+            data["requested_output_designation_candidates"] = [
+                {"label": label, "value_text": value} for label, value in candidates
+            ]
     await _widen_thin_evaluate_result(ctx, result, url=url)
     return result
 
@@ -1314,12 +1219,22 @@ async def _select_option_post_hook(
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
     source_url = _consume_scout_source_url(ctx)
+    pending_role_name = getattr(ctx, "pending_scout_role_name", None)
+    ctx.pending_scout_role_name = None
+    pending_role_name_match_count = getattr(ctx, "pending_scout_role_name_match_count", None)
+    ctx.pending_scout_role_name_match_count = None
     pending_ambiguous = ctx.pending_scout_ambiguous
     ctx.pending_scout_ambiguous = None
-    pending_reanchor = ctx.pending_scout_reanchor
+    pending_selector_match_count = getattr(ctx, "pending_scout_selector_match_count", None)
+    ctx.pending_scout_selector_match_count = None
+    pending_selector_candidates = getattr(ctx, "pending_scout_selector_candidates", None)
+    ctx.pending_scout_selector_candidates = None
     ctx.pending_scout_reanchor = None
     if result.get("ok") and result.get("data"):
         data = result["data"]
+        selector_candidates = _merge_selector_candidates(
+            _selector_candidates_from_tool_data(data), pending_selector_candidates
+        )
         selector = _selector_from_tool_data(data)
         url, _ = await _resolve_url_title(raw, ctx)
         _mark_pending_browser_interaction_observation(ctx, tool_name="select_option", url=url)
@@ -1328,22 +1243,46 @@ async def _select_option_post_hook(
             "value": data.get("value", ""),
             "url": url,
         }
-        role, accessible_name = await _resolve_scout_role_name(ctx, selector)
+        role, accessible_name = _prenav_role_name_for_selector(pending_role_name, selector)
+        if not (role and accessible_name):
+            role, accessible_name = await _resolve_scout_role_name(ctx, selector)
         ambiguous = _prenav_ambiguity_for_selector(pending_ambiguous, selector)
-        if ambiguous:
-            role, accessible_name = _prenav_role_name_for_selector(pending_reanchor, selector)
+        selector_match_count = (
+            pending_selector_match_count[1]
+            if isinstance(pending_selector_match_count, tuple)
+            and len(pending_selector_match_count) == 2
+            and pending_selector_match_count[0] == selector
+            else None
+        )
+        role_name_match_count = (
+            pending_role_name_match_count[3]
+            if isinstance(pending_role_name_match_count, tuple)
+            and len(pending_role_name_match_count) == 4
+            and pending_role_name_match_count[:3] == (selector, role, accessible_name)
+            else None
+        )
         _record_scouted_interaction(
             ctx,
             tool_name="select_option",
             selector=selector,
+            selector_candidates=selector_candidates,
+            selector_match_count=selector_match_count,
             source_url=source_url,
+            result_url=url,
             value=data.get("value", ""),
             role=role,
             accessible_name=accessible_name,
+            role_name_match_count=role_name_match_count,
             ambiguous=ambiguous,
         )
         observation_step, page_evidence = await _register_scout_interaction_observation(
             ctx, tool_name="select_option", selector=selector, source_url=source_url, url=url
+        )
+        _attach_scout_observation_step(
+            ctx,
+            tool_name="select_option",
+            selector=selector,
+            observation_step=observation_step,
         )
         if observation_step is not None:
             result["observation_step"] = observation_step
@@ -1360,8 +1299,23 @@ async def _press_key_post_hook(
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
     source_url = _consume_scout_source_url(ctx)
+    pending_role_name = getattr(ctx, "pending_scout_role_name", None)
+    ctx.pending_scout_role_name = None
+    pending_role_name_match_count = getattr(ctx, "pending_scout_role_name_match_count", None)
+    ctx.pending_scout_role_name_match_count = None
+    pending_ambiguous = getattr(ctx, "pending_scout_ambiguous", None)
+    ctx.pending_scout_ambiguous = None
+    pending_reanchor = getattr(ctx, "pending_scout_reanchor", None)
+    ctx.pending_scout_reanchor = None
+    pending_selector_match_count = getattr(ctx, "pending_scout_selector_match_count", None)
+    ctx.pending_scout_selector_match_count = None
+    pending_selector_candidates = getattr(ctx, "pending_scout_selector_candidates", None)
+    ctx.pending_scout_selector_candidates = None
     if result.get("ok") and result.get("data"):
         data = result["data"]
+        selector_candidates = _merge_selector_candidates(
+            _selector_candidates_from_tool_data(data), pending_selector_candidates
+        )
         selector = _selector_from_tool_data(data)
         url, _ = await _resolve_url_title(raw, ctx)
         _mark_pending_browser_interaction_observation(ctx, tool_name="press_key", url=url)
@@ -1371,13 +1325,53 @@ async def _press_key_post_hook(
             "url": url,
         }
         await _bind_login_credential_for_observed_url(ctx, url, result)
+        role, accessible_name = _prenav_role_name_for_selector(pending_role_name, selector)
+        if not (role and accessible_name):
+            role, accessible_name = await _resolve_scout_role_name(ctx, selector)
+        ambiguous = _prenav_ambiguity_for_selector(pending_ambiguous, selector)
+        # Consume the optional uniqueness re-anchor without replacing a non-unique observed identity.
+        _prenav_role_name_for_selector(pending_reanchor, selector)
+        role_name_match_count = (
+            pending_role_name_match_count[3]
+            if isinstance(pending_role_name_match_count, tuple)
+            and len(pending_role_name_match_count) == 4
+            and pending_role_name_match_count[:3] == (selector, role, accessible_name)
+            else None
+        )
         _record_scouted_interaction(
             ctx,
             tool_name="press_key",
             selector=selector,
+            selector_candidates=selector_candidates,
+            selector_match_count=(
+                pending_selector_match_count[1]
+                if isinstance(pending_selector_match_count, tuple)
+                and len(pending_selector_match_count) == 2
+                and pending_selector_match_count[0] == selector
+                else None
+            ),
             source_url=source_url,
+            result_url=url,
             key=data.get("key", ""),
+            role=role,
+            accessible_name=accessible_name,
+            role_name_match_count=role_name_match_count,
+            ambiguous=ambiguous,
         )
+        observation_step, page_evidence = await _register_scout_interaction_observation(
+            ctx, tool_name="press_key", selector=selector, source_url=source_url, url=url
+        )
+        _attach_scout_observation_step(
+            ctx,
+            tool_name="press_key",
+            selector=selector,
+            observation_step=observation_step,
+        )
+        if observation_step is not None:
+            result["observation_step"] = observation_step
+            result["data"]["observation_step"] = observation_step
+        if page_evidence is not None:
+            _attach_scout_page_summary(result, page_evidence)
     return result
 
 
@@ -1404,15 +1398,14 @@ _EVALUATE_BASE_DESCRIPTION = (
 )
 # Scout-ACT framing: a download (or row-expand / post-login) affordance exposes its terminal
 # target only once its page is reached. The model reaches that page with navigate/click and
-# observes it here — evaluate cannot click — so the copilot can derive the target and compile
-# the terminal download step.
+# observes it here — evaluate cannot click — so the model can author the terminal download step.
 _EVALUATE_SCOUT_ACT_DESCRIPTION = (
     _EVALUATE_BASE_DESCRIPTION
     + " Some affordances (a download, a row-expand, a post-login area) only expose their target "
     "once the page holding them is reached. Use this tool to OBSERVE that page — it cannot click; "
     "reach the page with the navigate/click tools first. For a download, observe the page that "
-    "exposes the download control rather than authoring the download yourself; the copilot then "
-    "compiles the terminal download step for you."
+    "exposes the download control and capture a stable selector, then author the terminal download "
+    "step from the code-block schema contract."
 )
 
 
@@ -1440,6 +1433,7 @@ def _build_skyvern_mcp_overlays(
             ),
             hide_params=frozenset({"session_id", "cdp_url"}),
             requires_browser=True,
+            pre_hook=_navigate_pre_hook,
             post_hook=_navigate_post_hook,
         ),
         "get_browser_screenshot": SchemaOverlay(
@@ -1564,5 +1558,6 @@ def _build_skyvern_mcp_overlays(
         "wait_for_either_state": SchemaOverlay(
             hide_params=frozenset({"session_id", "cdp_url"}),
             requires_browser=True,
+            post_hook=_wait_for_either_state_post_hook,
         ),
     }

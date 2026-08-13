@@ -47,16 +47,6 @@ def _bounded_runtime_text(value: Any, max_chars: int = _RUNTIME_SUMMARY_MAX_CHAR
     return text[:max_chars]
 
 
-def _runtime_failure_class(reason: str) -> str:
-    reason_lower = reason.lower()
-    if "timeout" in reason_lower and any(token in reason_lower for token in ("locator", "selector", "element")):
-        return "timeout_waiting_for_selector"
-    if "not found" in reason_lower and any(token in reason_lower for token in ("locator", "selector", "element")):
-        return "selector_not_found"
-    normalized = re.sub(r"[^a-z0-9]+", "_", reason_lower).strip("_")
-    return normalized[:80].strip("_") or "runtime_failure"
-
-
 def _missing_key_from_key_error(reason: str) -> str | None:
     match = _KEY_ERROR_RE.search(reason)
     if match is None:
@@ -98,7 +88,6 @@ def _missing_output_dependency_context(
         available_parameter_keys=list(contract.available_binding_keys),
         binding_candidates=available_output_keys,
         runtime_failure_reason=failure_reason,
-        runtime_failure_class=_runtime_failure_class(failure_reason),
         output_dependency_failure_class="missing_prior_block_output",
         missing_output_key=missing_key,
         available_output_keys=available_output_keys,
@@ -268,7 +257,6 @@ def record_pending_runtime_authoring_repair_context(copilot_ctx: Any, result: di
         block_label=block_label,
         reason_code=_RUNTIME_AUTHORING_REASON_CODE,
         runtime_failure_reason=failure_reason,
-        runtime_failure_class=_runtime_failure_class(failure_reason),
         failed_block_status=failed_block_status or None,
         workflow_run_id=run_id,
         repair_instruction=(
@@ -276,11 +264,6 @@ def record_pending_runtime_authoring_repair_context(copilot_ctx: Any, result: di
             "or name path."
         ),
     )
-
-
-def _authority_requires_ask(copilot_ctx: Any) -> bool:
-    authority = getattr(getattr(copilot_ctx, "turn_intent", None), "authority", None)
-    return getattr(authority, "requires_user_input", False) or getattr(authority, "may_update_workflow", True) is False
 
 
 def _policy_allows_runtime_authoring_repair(copilot_ctx: Any) -> bool:
@@ -323,14 +306,10 @@ def _pending_state_has_stop_or_ask_precedence(copilot_ctx: Any, pending: CodeAut
         "skip_reason": pending.runtime_failure_reason,
         "failure_type": pending.runtime_failure_class,
     }
-    if _authority_requires_ask(copilot_ctx):
-        return True
     return _error_text_requires_stop(copilot_ctx, data) or _error_text_requires_ask(data)
 
 
 def _result_has_terminal_or_ask_precedence(copilot_ctx: Any, data: dict[str, Any], result: dict[str, Any]) -> bool:
-    if _authority_requires_ask(copilot_ctx):
-        return True
     if _error_text_requires_stop(copilot_ctx, data, result):
         return True
     if _error_text_requires_ask(data, result):

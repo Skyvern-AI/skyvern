@@ -198,3 +198,21 @@ async def test_sync_statements_include_created_at_filter(monkeypatch: pytest.Mon
         stmt = builder(cutoff)
         sql_text = str(stmt)
         assert "created_at" in sql_text, f"{builder_name} should filter by created_at"
+
+
+@pytest.mark.asyncio
+async def test_tasks_sync_includes_task_v3(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A task_v3 row must be repaired by the catch-up sync like task_v1/CUA rows, or a v3 run whose
+    write-through failed would sit non-terminal in /runs history forever."""
+    mod = _load_task_runs_sync_activity_module(monkeypatch)
+    from datetime import datetime, timezone
+
+    stmt = mod._build_sync_tasks_stmt(datetime.now(timezone.utc))
+    bound_values: list = []
+    for value in stmt.compile().params.values():
+        if isinstance(value, (list, tuple)):
+            bound_values.extend(value)
+        else:
+            bound_values.append(value)
+    assert "task_v3" in bound_values
+    assert "task_v1" in bound_values  # existing types still covered

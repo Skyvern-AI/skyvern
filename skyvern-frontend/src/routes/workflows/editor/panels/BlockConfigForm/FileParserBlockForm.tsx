@@ -29,11 +29,32 @@ function FileParserBlockFormBody({
   blockId: string;
   node: FileParserNode;
 }) {
-  const { fileUrl, fileType, jsonSchema, model } = node.data;
+  const {
+    fileUrl,
+    fileType,
+    jsonSchema,
+    model,
+    continueOnFailure,
+    nextLoopOnFailure,
+  } = node.data;
 
   const value = useMemo(
-    () => ({ fileUrl, fileType, jsonSchema, model }),
-    [fileUrl, fileType, jsonSchema, model],
+    () => ({
+      fileUrl,
+      fileType,
+      jsonSchema,
+      model,
+      continueOnFailure,
+      nextLoopOnFailure,
+    }),
+    [
+      fileUrl,
+      fileType,
+      jsonSchema,
+      model,
+      continueOnFailure,
+      nextLoopOnFailure,
+    ],
   );
   const { commit } = useDebouncedSidebarSave({
     blockId,

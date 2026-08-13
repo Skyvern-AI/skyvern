@@ -106,6 +106,57 @@ def compact_agent_messages_for_llm(
     return aggressive_prune(items) if aggressive_prune is not None else items
 
 
+def pair_tool_calls_with_outputs(
+    items: list[Any],
+    *,
+    on_repair: Callable[[int, int], None] | None = None,
+) -> list[Any]:
+    """Seat every ``function_call_output`` immediately after its own ``function_call``.
+
+    A provider rejects the whole request when a result is separated from its call by a later
+    assistant turn, so the invariant is restored at this shared boundary rather than trusted to
+    each producer. Reordering only: a half with no counterpart is left exactly where it was.
+    """
+    outputs_by_call: dict[str, list[Any]] = {}
+    call_position: dict[str, int] = {}
+    # Calls and outputs may legally interleave within one parallel batch; only a turn-bearing
+    # item between a call and its result is the drift a provider rejects.
+    non_tool_before: list[int] = [0]
+    for index, item in enumerate(items):
+        item_type = get_agent_message_field(item, "type")
+        call_id = get_agent_message_field(item, "call_id")
+        if item_type == "function_call_output" and isinstance(call_id, str) and call_id:
+            outputs_by_call.setdefault(call_id, []).append(item)
+        elif item_type == "function_call" and isinstance(call_id, str):
+            call_position.setdefault(call_id, index)
+        non_tool_before.append(non_tool_before[-1] + (item_type not in ("function_call", "function_call_output")))
+
+    relocating = {call_id: outputs for call_id, outputs in outputs_by_call.items() if call_id in call_position}
+    if not relocating:
+        return items
+
+    position = {id(item): index for index, item in enumerate(items)}
+    drifted = 0
+    repaired: list[Any] = []
+    for index, item in enumerate(items):
+        item_type = get_agent_message_field(item, "type")
+        call_id = get_agent_message_field(item, "call_id")
+        if item_type == "function_call_output" and call_id in relocating:
+            continue
+        repaired.append(item)
+        if item_type != "function_call":
+            continue
+        for output in relocating.get(call_id, ()):
+            start, end = sorted((call_position[call_id], position[id(output)]))
+            if non_tool_before[end] > non_tool_before[start]:
+                drifted += 1
+            repaired.append(output)
+
+    if drifted and on_repair is not None:
+        on_repair(drifted, len(items) - len(repaired))
+    return repaired
+
+
 def sanitize_agent_tool_result_for_llm(
     tool_name: str,
     result: Mapping[str, Any],

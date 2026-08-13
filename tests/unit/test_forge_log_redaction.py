@@ -85,11 +85,17 @@ def test_redacts_in_arbitrary_string_keys() -> None:
     assert out["url"].endswith("token=<redacted>")
 
 
-def test_redacts_a_registered_credential_from_a_log_event() -> None:
-    _register_credential(_FAKE_CREDENTIAL)
-    event = {"event": f'filling #password with "{_FAKE_CREDENTIAL}"', "selector": "#password"}
+def test_defense_in_depth_redactor_only_redacts_registered_long_and_short_credentials() -> None:
+    """Redactor-only coverage, not parity proof for either CodeBlock engine's failure path."""
+    credentials = (_FAKE_CREDENTIAL, "587")
+    for credential in credentials:
+        _register_credential(credential)
+    event = {
+        "event": f'CodeBlock failure contained "{_FAKE_CREDENTIAL}" and PIN "587"',
+        "selector": "#password",
+    }
     out = redact_registered_secrets(None, "info", event)  # type: ignore[arg-type]
-    assert _FAKE_CREDENTIAL not in out["event"]
+    assert all(credential not in out["event"] for credential in credentials)
     assert REDACTED_SECRET_PLACEHOLDER in out["event"]
     assert out["selector"] == "#password"
 

@@ -7,11 +7,13 @@ recorded interaction, or error string.
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any, AsyncIterator
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -19,7 +21,6 @@ from structlog.testing import capture_logs
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot import tools as tools_module
-from skyvern.forge.sdk.copilot.build_phase import _BROWSER_PRIMITIVE_TOOLS
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _ground_user_provided_sites
 from skyvern.forge.sdk.copilot.tools import credential_fill as credential_fill_module
@@ -55,14 +56,16 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         browser_session_id="pbs_1",
         scouted_interactions=[],
         scout_trajectory=[],
-        prior_fill_carry=[],
-        fill_carry_rebound_done=False,
+        prior_carried_trajectory=[],
+        carried_trajectory_rebound_done=False,
         observed_browser_urls=[],
         pending_scout_source_url=None,
         pending_scout_download_snapshot=None,
+        pending_scout_download=False,
+        pending_scout_download_detachers=[],
         pending_scout_popup=None,
         pending_scout_popup_content_type=None,
-        reached_download_target=None,
+        authoring_parameter_binding_snapshot=None,
         pending_browser_interaction_observation=None,
         discovery_mcp_server=None,
         secret_scrub_values=[],
@@ -104,8 +107,12 @@ class TestCredentialFillPolicyGate:
         ctx = _ctx(request_policy=None)
         assert tools_module._credential_fill_prerequisite_error(ctx, "cred_123") is not None
 
-    def test_rejects_when_run_blocks_not_allowed(self) -> None:
+    def test_generic_run_flag_does_not_gate_credential_fill(self) -> None:
         ctx = _ctx(request_policy=_policy(allow_run_blocks=False))
+        assert tools_module._credential_fill_prerequisite_error(ctx, "cred_123") is None
+
+    def test_rejects_raw_secret_turn_at_credential_fill_boundary(self) -> None:
+        ctx = _ctx(request_policy=_policy(raw_secret_detected=True))
         assert tools_module._credential_fill_prerequisite_error(ctx, "cred_123") is not None
 
     def test_rejects_credential_outside_resolved_set(self) -> None:
@@ -395,7 +402,6 @@ def _wire_impl(
     monkeypatch.setattr(credential_fill_module, "_live_working_page_url", fake_url)
     monkeypatch.setattr(scouting_module, "_live_working_page_url", fake_url)
     monkeypatch.setattr(credential_fill_module, "_resolve_scout_role_name", fake_role_name)
-    monkeypatch.setattr(credential_fill_module, "_tool_loop_error", lambda *a, **k: None)
     monkeypatch.setattr(credential_fill_module, "_authority_tool_error", lambda *a, **k: None)
     monkeypatch.setattr(credential_fill_module, "record_tool_step_result_for_ctx", lambda *a, **k: None)
 
@@ -406,6 +412,49 @@ def _wire_impl(
 
 
 class TestFillCredentialFieldImpl:
+    @pytest.mark.asyncio
+    async def test_target_identity_is_captured_before_fill_and_effect_afterward(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        events: list[str] = []
+
+        class OrderedPage(_FakePage):
+            async def fill(self, *args: Any, **kwargs: Any) -> None:
+                events.append("fill")
+                await super().fill(*args, **kwargs)
+
+        page = OrderedPage()
+        _wire_impl(monkeypatch, page)
+
+        async def pre_fact(*_args: Any, **_kwargs: Any) -> int:
+            events.append("pre_fact")
+            return 1
+
+        async def selector_candidates(ctx: Any, _selector: str) -> None:
+            events.append("selector_candidates")
+            ctx.pending_scout_selector_candidates = [{"selector": 'input[name="password"]', "source": "name"}]
+
+        async def post_effect(*_args: Any, **_kwargs: Any) -> None:
+            events.append("post_effect")
+            return None
+
+        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", pre_fact)
+        monkeypatch.setattr(credential_fill_module, "_capture_scout_selector_candidates", selector_candidates)
+        monkeypatch.setattr(credential_fill_module, "_verify_scout_type_landed", post_effect)
+
+        ctx = _ctx()
+        result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+
+        assert result["ok"] is True
+        assert events.index("selector_candidates") < events.index("fill")
+        assert events.index("pre_fact") < events.index("fill") < events.index("post_effect")
+        assert ctx.scout_trajectory[-1]["selector_match_count"] == 1
+        assert ctx.scout_trajectory[-1]["observed_effects"]["value_landed"] is True
+        assert ctx.scout_trajectory[-1]["selector_candidates"] == [
+            {"selector": "#passwordInput", "source": "requested"},
+            {"selector": 'input[name="password"]', "source": "name"},
+        ]
+
     @pytest.mark.asyncio
     async def test_happy_path_fills_and_records_value_free(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
@@ -421,6 +470,8 @@ class TestFillCredentialFieldImpl:
         assert result["data"]["credential_id"] == "cred_123"
         assert result["data"]["field"] == "password"
         assert result["data"]["observation_step"] == 3
+        assert result["data"]["credential_name"] == "authtest simple"
+        assert "credential_parameter" not in result["data"]
         assert _FAKE_PASSWORD not in json.dumps(result)
 
         assert len(ctx.scouted_interactions) == 1
@@ -432,6 +483,28 @@ class TestFillCredentialFieldImpl:
         assert recorded["typed_length"] == len(_FAKE_PASSWORD)
         assert _FAKE_PASSWORD not in json.dumps(recorded)
         assert _FAKE_PASSWORD not in json.dumps(ctx.scout_trajectory)
+
+    @pytest.mark.asyncio
+    async def test_email_otp_scout_failure_returns_only_factual_credential_identity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _FakePage()
+        _wire_impl(monkeypatch, page)
+
+        async def runtime_only_otp(_ctx: Any, _credential_id: str, _field: str) -> tuple[None, str, str]:
+            return None, "authtest simple", "Email OTP requires workflow-run polling."
+
+        monkeypatch.setattr(credential_fill_module, "_resolve_credential_fill_value", runtime_only_otp)
+
+        result = await tools_module._fill_credential_field_impl(_ctx(), "#otp", "cred_123", "totp")
+
+        assert result["ok"] is False
+        assert result["data"] == {
+            "credential_id": "cred_123",
+            "credential_name": "authtest simple",
+            "credential_field": "totp",
+        }
+        assert page.fill_calls == []
 
     @pytest.mark.asyncio
     async def test_fill_error_text_is_scrubbed(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -507,17 +580,6 @@ class TestFillCredentialFieldImpl:
         assert ctx.scouted_interactions == []
 
 
-class TestConsecutiveLoopGuardExemption:
-    def test_three_consecutive_fills_are_not_loop_blocked(self) -> None:
-        ctx = _ctx(consecutive_tool_tracker=[])
-        for field in ("username", "password", "totp"):
-            error = tools_module._tool_loop_error(
-                ctx, "fill_credential_field", {"selector": f"#{field}", "field": field}
-            )
-            assert error is None
-        assert ctx.consecutive_tool_tracker == []
-
-
 class TestToolRegistration:
     def test_tool_is_registered_native(self) -> None:
         names = [tool.name for tool in tools_module.NATIVE_TOOLS]
@@ -529,9 +591,9 @@ class TestToolRegistration:
         assert "server-side" in description
         assert "never" in description
         assert "type_text" in description
-
-    def test_tool_is_phase_gated_as_browser_primitive(self) -> None:
-        assert "fill_credential_field" in _BROWSER_PRIMITIVE_TOOLS
+        assert "code_artifact_metadata.input_bindings" in description
+        assert "credential_parameter.key" not in description
+        assert "credential_parameter.otp_accessor" not in description
 
 
 def _org_credential(
@@ -607,7 +669,7 @@ class TestCredentialFillLivePageAdmission:
         load_mock.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_a_turn_without_run_authority_is_not_reopened_by_the_page(self) -> None:
+    async def test_generic_run_flag_does_not_gate_live_page_credential_evidence(self) -> None:
         error, policy, load_mock = await self._gate(
             credential_id="cred_analytics",
             page_url="https://analytics.example.com/login",
@@ -615,9 +677,9 @@ class TestCredentialFillLivePageAdmission:
             policy=RequestPolicy(allow_run_blocks=False),
         )
 
-        assert error is not None
-        assert policy.resolved_credentials == []
-        load_mock.assert_not_awaited()
+        assert error is None
+        assert [credential.credential_id for credential in policy.resolved_credentials] == ["cred_analytics"]
+        load_mock.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_already_resolved_credential_uses_its_tested_url_without_a_page_read(self) -> None:
@@ -1033,6 +1095,35 @@ class TestCredentialFillLivePageAdmission:
         assert page.fill_calls == [("#user", _FAKE_PASSWORD)]
 
     @pytest.mark.asyncio
+    async def test_parallel_credential_fills_are_serialized_per_copilot_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _FakePage()
+        _wire_impl(monkeypatch, page)
+        ctx = _ctx()
+        active_resolutions = 0
+        maximum_active_resolutions = 0
+
+        async def resolve(_ctx: Any, _credential_id: str, _field: str) -> tuple[str, str, None]:
+            nonlocal active_resolutions, maximum_active_resolutions
+            active_resolutions += 1
+            maximum_active_resolutions = max(maximum_active_resolutions, active_resolutions)
+            await asyncio.sleep(0)
+            active_resolutions -= 1
+            return _FAKE_PASSWORD, "analytics", None
+
+        monkeypatch.setattr(credential_fill_module, "_resolve_credential_fill_value", resolve)
+
+        username, password = await asyncio.gather(
+            tools_module._fill_credential_field_impl(ctx, "#user", "cred_123", "username"),
+            tools_module._fill_credential_field_impl(ctx, "#pass", "cred_123", "password"),
+        )
+
+        assert username["ok"] is True
+        assert password["ok"] is True
+        assert maximum_active_resolutions == 1
+
+    @pytest.mark.asyncio
     async def test_a_refusable_call_never_reads_the_org_credentials(self) -> None:
         """The refusals that need no lookup must not page the credential table in first."""
         policy = RequestPolicy(login_intent=True, email_signin_intent=True, credential_input_kind="none")
@@ -1207,7 +1298,7 @@ class TestObservationSeamCredentialBinding:
         assert policy.resolved_credentials == []
 
     @pytest.mark.asyncio
-    async def test_a_turn_without_run_authority_never_reads_the_live_page(self) -> None:
+    async def test_generic_run_flag_does_not_suppress_live_page_observation(self) -> None:
         policy = RequestPolicy(allow_run_blocks=False)
         ctx = _ctx(request_policy=policy)
         reread = AsyncMock(return_value=(_FIXTURE_LOGIN_URL, ""))
@@ -1215,7 +1306,7 @@ class TestObservationSeamCredentialBinding:
         with patch.object(mcp_hooks_module, "_fallback_page_info", reread):
             await mcp_hooks_module._bind_login_credential_for_observed_url(ctx, "current_page", {"ok": True})
 
-        reread.assert_not_awaited()
+        reread.assert_awaited_once()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("observed_url", ["current_page", "http://[", "http://[::1"])

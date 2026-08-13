@@ -9,12 +9,14 @@ import shutil
 import sys
 import textwrap
 import time
+import unicodedata
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from http import HTTPStatus
 from typing import Any, Literal, TypeVar, cast, overload
 
 import structlog
@@ -104,7 +106,11 @@ from skyvern.forge.sdk.workflow.browser_profile_key import (
     build_workflow_browser_session_storage_key,
     render_browser_profile_key,
 )
-from skyvern.forge.sdk.workflow.context_manager import jinja_sandbox_env, resolve_credential_parameter_binding
+from skyvern.forge.sdk.workflow.context_manager import (
+    WorkflowRunContext,
+    jinja_sandbox_env,
+    resolve_credential_parameter_binding,
+)
 from skyvern.forge.sdk.workflow.credential_fallback import (
     VALID_FALLBACK_TRIGGERS,
     maybe_start_credential_fallback_retry,
@@ -228,6 +234,7 @@ from skyvern.utils.secret_redaction import redact_console_log_bytes, redact_har_
 from skyvern.utils.strings import is_uuid
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
+from skyvern.utils.url_validators import validate_webhook_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_state import BrowserState
@@ -266,6 +273,166 @@ _T3 = TypeVar("_T3")
 _T4 = TypeVar("_T4")
 _T5 = TypeVar("_T5")
 _T6 = TypeVar("_T6")
+
+
+_USER_DEFINED_ERROR_KEYS = {"error_code", "reasoning", "confidence_float", "error_type"}
+
+
+def _strict_user_defined_error_payload(value: Any) -> dict[str, Any] | None:
+    if type(value) is not dict or set(value) != _USER_DEFINED_ERROR_KEYS:
+        return None
+    if (
+        type(value["error_code"]) is not str
+        or not value["error_code"]
+        or value["error_code"] != value["error_code"].strip()
+        or len(value["error_code"]) > 128
+        or type(value["reasoning"]) is not str
+        or not value["reasoning"]
+        or value["reasoning"] != value["reasoning"].strip()
+        or len(value["reasoning"]) > 2000
+        or type(value["confidence_float"]) is not float
+        or not 0 <= value["confidence_float"] <= 1
+        or type(value["error_type"]) is not str
+        or value["error_type"] != "USER_DEFINED_ERROR"
+    ):
+        return None
+    return dict(value)
+
+
+def _merge_workflow_run_errors(
+    task_errors: list[dict[str, Any]],
+    block_errors: list[tuple[str, list[str], str | None, Any, str]],
+    mask_reasoning: Callable[[Any], Any] | None = None,
+    registered_secret_values: Iterable[Any] = (),
+    workflow_run_id: str | None = None,
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    exact_errors: set[tuple[str, str, str, str, str | None]] = set()
+    legacy_positions: dict[tuple[str, str], int] = {}
+    secret_values = sorted(
+        {value for value in registered_secret_values if isinstance(value, str) and value}, key=len, reverse=True
+    )
+
+    def redact_registered_secrets(value: str) -> str:
+        secret_replaced = False
+        for secret in secret_values:
+            if secret in value:
+                value = value.replace(secret, "[redacted]")
+                secret_replaced = True
+        return value or ("[redacted]" if secret_replaced else value)
+
+    def without_category_c(value: str) -> str:
+        return "".join(character for character in value if unicodedata.category(character)[0] != "C")
+
+    def bounded_reasoning(reasoning: Any) -> str:
+        value = reasoning if isinstance(reasoning, str) else str(reasoning)
+        normalized = without_category_c(value)
+        redacted = redact_registered_secrets(normalized)
+        masked = mask_reasoning(redacted) if mask_reasoning is not None else redacted
+        if redacted == normalized and masked == normalized:
+            return value[:2000]
+        return (masked if isinstance(masked, str) else str(masked))[:2000]
+
+    def code_has_no_secrets(code: str, provenance: str, origin: str) -> bool:
+        # Once run context is evicted, pre-existing codes cannot be vetted; new inline and secure
+        # writes reject secret-bearing codes at ingress, bounding this residual to historical rows.
+        normalized = without_category_c(code)
+        is_safe = (mask_reasoning is None or mask_reasoning(normalized) == normalized) and not any(
+            secret in normalized for secret in secret_values
+        )
+        if not is_safe:
+            LOG.warning(
+                "Dropped workflow error row because its code contains a registered secret",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=provenance if provenance != "task" else None,
+                block_label=None,
+                row_origin=origin,
+            )
+        return is_safe
+
+    def signature(error: dict[str, Any]) -> tuple[str, str, str | None]:
+        error_type = error.get("error_type")
+        return (
+            error["error_code"],
+            error.get("reasoning", ""),
+            error_type if isinstance(error_type, str) else None,
+        )
+
+    def append(error: dict[str, Any], provenance: str, kind: str) -> int | None:
+        code = error.get("error_code")
+        if not isinstance(code, str) or not code or len(code) > 128 or len(errors) >= 100:
+            return None
+        if not code_has_no_secrets(code, provenance, kind):
+            return None
+        if "reasoning" in error:
+            error["reasoning"] = bounded_reasoning(error["reasoning"])
+        key = (provenance, kind, *signature(error))
+        if key in exact_errors:
+            return None
+        position = len(errors)
+        errors.append(error)
+        exact_errors.add(key)
+        return position
+
+    for task_error in task_errors:
+        if len(errors) >= 100:
+            break
+        error = dict(task_error)
+        append(error, "task", "legacy")
+
+    for block_id, error_codes, failure_reason, output, block_type in block_errors:
+        if len(errors) >= 100 and not legacy_positions:
+            break
+        block_has_upgrade = any(provenance == block_id for provenance, _ in legacy_positions)
+        if len(errors) >= 100 and not block_has_upgrade:
+            continue
+        # Legitimate ingress emits only a handful of entries, with typed upgrades near the front.
+        # Ignore corrupt/adversarial row data beyond the per-source scan cap.
+        for code in (error_codes or [])[:100]:
+            if len(errors) >= 100:
+                break
+            provenance = (block_id, code)
+            if provenance in legacy_positions:
+                continue
+            position = append(
+                {
+                    "error_code": code,
+                    "reasoning": failure_reason or "",
+                    "confidence_float": 1.0,
+                },
+                block_id,
+                "legacy",
+            )
+            if position is not None:
+                legacy_positions[provenance] = position
+
+        if block_type != BlockType.CODE or type(output) is not dict or type(output.get("errors")) is not list:
+            continue
+        # Persisted typed errors were checked against the manifest at ingress. Do not
+        # re-check here because workflow definitions can drift after a run completes.
+        for candidate in output["errors"][:100]:
+            if len(errors) >= 100 and not any(provenance == block_id for provenance, _ in legacy_positions):
+                break
+            accepted = _strict_user_defined_error_payload(candidate)
+            if accepted is None:
+                continue
+            code = accepted["error_code"]
+            legacy_position = legacy_positions.get((block_id, code))
+            if legacy_position is not None:
+                accepted["reasoning"] = bounded_reasoning(accepted["reasoning"])
+            accepted_signature = (block_id, "typed", *signature(accepted))
+            if accepted_signature in exact_errors:
+                continue
+            if legacy_position is not None:
+                exact_errors.discard((block_id, "legacy", *signature(errors[legacy_position])))
+                errors[legacy_position] = accepted
+                exact_errors.add(accepted_signature)
+                del legacy_positions[(block_id, code)]
+            else:
+                append(accepted, block_id, "typed")
+    return errors
+
+
 _T_OP = TypeVar("_T_OP")
 
 # Failure reason stamped when execute_workflow's body is interrupted before it captures a terminal
@@ -282,6 +449,9 @@ CODE_BLOCK_SESSION_TIMEOUT_MINUTES = 20
 # (max_concurrent_activities=1), so what has to stay bounded is the time pinned, whatever the
 # per-attempt startup deadline happens to be.
 CODE_BLOCK_SESSION_STARTUP_BUDGET_SECONDS = 90.0
+# Bounds the run-end close of an auto-provisioned CodeBlock session so a slow close cannot pin
+# the worker pod; on timeout the session timeout above still reaps the session.
+CODE_BLOCK_SESSION_CLOSE_TIMEOUT_SECONDS = 30.0
 
 # Structured warning emitted when a debug-session run's visible PBS profile is
 # incompatible with the LoginBlock credential's saved profile. Observability
@@ -1820,9 +1990,31 @@ class WorkflowService:
             for parameter in workflow.workflow_definition.parameters
             if isinstance(parameter, (ContextParameter, OutputParameter))
         }
+        at_will_absent_credential_keys = {
+            parameter.key
+            for parameter in workflow.workflow_definition.parameters
+            if isinstance(parameter, WorkflowParameter)
+            and self._is_optional_credential_parameter(parameter)
+            and parameter.key not in parameter_values
+        }
         for parameter in workflow.workflow_definition.parameters:
             credential_id: Any
             if isinstance(parameter, CredentialParameter):
+                if (
+                    parameter.key not in credential_selections
+                    and parameter.credential_id in at_will_absent_credential_keys
+                ):
+                    # At-will credential indirection is not supported for credential
+                    # parameters: without this check the literal parameter key would be
+                    # validated as a credential id, producing a baffling error.
+                    raise SkyvernHTTPException(
+                        message=(
+                            f"Credential parameter '{parameter.key}' references credential parameter"
+                            f" '{parameter.credential_id}', which has no default and was not provided."
+                            " Provide a value for it or set a default credential."
+                        ),
+                        status_code=HTTPStatus.BAD_REQUEST,
+                    )
                 if (
                     parameter.key not in credential_selections
                     and parameter.credential_id in runtime_only_parameter_keys
@@ -2159,6 +2351,10 @@ class WorkflowService:
                 if request_value is None and workflow_parameter.default_value is not None:
                     request_value = workflow_parameter.default_value
                 if self._is_missing_required_value(workflow_parameter, request_value):
+                    # A missing-shaped value for an at-will credential (credential_id type,
+                    # no default) is allowed: the scheduled run proceeds without a credential.
+                    if self._is_optional_credential_parameter(workflow_parameter):
+                        continue
                     missing_parameters.append(workflow_parameter.key)
                     continue
                 if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
@@ -2172,7 +2368,7 @@ class WorkflowService:
                             f"Credential ID must be a string, got {type(workflow_parameter.default_value).__name__}"
                         )
                     credential_ids_to_validate.append(workflow_parameter.default_value)
-            else:
+            elif not self._is_optional_credential_parameter(workflow_parameter):
                 missing_parameters.append(workflow_parameter.key)
 
         if missing_parameters:
@@ -2443,6 +2639,11 @@ class WorkflowService:
                         if request_body_value is None and workflow_parameter.default_value is not None:
                             request_body_value = workflow_parameter.default_value
                         if self._is_missing_required_value(workflow_parameter, request_body_value):
+                            # A missing-shaped value for an at-will credential means "run without a
+                            # credential": no run parameter row is written and the run context
+                            # backfills it as None.
+                            if self._is_optional_credential_parameter(workflow_parameter):
+                                continue
                             missing_parameters.append(workflow_parameter.key)
                             continue
                         if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
@@ -2458,7 +2659,7 @@ class WorkflowService:
                                     f"<non-string value of type {type(workflow_parameter.default_value).__name__}>"
                                 )
                         workflow_parameter_values.append((workflow_parameter, workflow_parameter.default_value))
-                    else:
+                    elif not self._is_optional_credential_parameter(workflow_parameter):
                         missing_parameters.append(workflow_parameter.key)
 
                 if missing_parameters:
@@ -3377,6 +3578,16 @@ class WorkflowService:
         return storage_key
 
     @staticmethod
+    def _is_optional_credential_parameter(workflow_parameter: WorkflowParameter) -> bool:
+        """A credential_id parameter with no default is an at-will credential: absence is
+        allowed and the run proceeds without a credential, mirroring how an input parameter
+        with no default value is treated. A credential with a default keeps requiring one."""
+        return (
+            workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+            and workflow_parameter.default_value is None
+        )
+
+    @staticmethod
     def _is_schedule_input_parameter(workflow_parameter: Any) -> bool:
         """Check whether a parameter is user-configurable input for scheduled runs.
 
@@ -3948,6 +4159,7 @@ class WorkflowService:
             return workflow_run
 
         browser_session = None
+        code_block_browser_session_id: str | None = None
         using_managed_browser_profile = await self._browser_profile_is_managed(
             organization_id=organization.organization_id,
             browser_profile_id=browser_profile_id,
@@ -3999,6 +4211,10 @@ class WorkflowService:
                     need_call_webhook=need_call_webhook,
                 )
                 return workflow_run
+            # A session set here came from the CodeBlock helper — the one session this run owns
+            # and must close at cleanup.
+            if browser_session is not None:
+                code_block_browser_session_id = browser_session.persistent_browser_session_id
 
         if browser_session:
             browser_session_id = browser_session.persistent_browser_session_id
@@ -4047,6 +4263,7 @@ class WorkflowService:
                     browser_session_id=browser_session_id,
                     close_browser_on_completion=close_browser_on_completion,
                     need_call_webhook=need_call_webhook,
+                    code_block_browser_session_id=code_block_browser_session_id,
                 )
                 return workflow_run
             # Start background task to periodically renew the browser session
@@ -4507,6 +4724,7 @@ class WorkflowService:
                 browser_persistence_status=browser_persistence_status,
                 skip_browser_session_write_back=browser_write_back_exhausted,
                 schedule_credential_fallback_retry=not finally_block_set_terminal_outcome,
+                code_block_browser_session_id=code_block_browser_session_id,
             )
 
         return workflow_run
@@ -4707,8 +4925,13 @@ class WorkflowService:
                             script_path=script_path,
                             script_id=script.script_id,
                         )
-            except InProcessScriptExecutionDenied:
-                raise
+            except InProcessScriptExecutionDenied as denial:
+                if denial.fail_closed:
+                    raise
+                # Not logged again here: the gate already emitted the denial with its reason and
+                # full run identity, and one line per denial is what the denial monitor counts.
+                script_blocks_by_label = {}
+                loaded_script_module = None
             except Exception as e:
                 LOG.warning(
                     "Failed to load script blocks, will fallback to normal execution",
@@ -7547,6 +7770,7 @@ class WorkflowService:
         created_by: str | None | object = _UNSET,
         edited_by: str | None | object = _UNSET,
         notify_workflow_saved: bool = True,
+        preserve_completion_contract: bool = True,
     ) -> Workflow:
         if workflow_definition is not None:
             if organization_id is not None:
@@ -7587,6 +7811,7 @@ class WorkflowService:
                 sequential_key=sequential_key,
                 created_by=created_by,
                 edited_by=edited_by,
+                preserve_completion_contract=preserve_completion_contract,
             )
         else:
             updated_workflow = await app.DATABASE.workflows.update_workflow(
@@ -9414,24 +9639,31 @@ class WorkflowService:
             if cap_output_values:
                 outputs = {key: _cap(value, key) for key, value in outputs.items()}
 
-        errors: list[dict[str, Any]] = []
+        task_errors: list[dict[str, Any]] = []
         for task in workflow_run_tasks:
-            errors.extend(task.errors)
+            task_errors.extend(task.errors)
 
         # Also collect block-level error codes (e.g. FILE_PARSER_ERROR) into the
         # same errors array so they appear in the top-level workflow run response,
         # matching the task-level error format. Uses a lightweight query that only
         # fetches blocks with non-null error_codes to avoid a full block load on
         # every status poll.
-        for error_codes, failure_reason in block_errors:
-            for code in error_codes:
-                errors.append(
-                    {
-                        "error_code": code,
-                        "reasoning": failure_reason or "",
-                        "confidence_float": 1.0,
-                    }
-                )
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts.get(workflow_run_id)
+        # Error reasoning is masked before persistence at both inline and secure-host ingress.
+        # A completed run may have evicted its context, so aggregation masking is best-effort defense-in-depth.
+        errors = _merge_workflow_run_errors(
+            task_errors,
+            block_errors,
+            mask_reasoning=(
+                workflow_run_context.mask_secrets_in_data
+                if isinstance(workflow_run_context, WorkflowRunContext)
+                else None
+            ),
+            registered_secret_values=(
+                workflow_run_context.secrets.values() if isinstance(workflow_run_context, WorkflowRunContext) else ()
+            ),
+            workflow_run_id=workflow_run_id,
+        )
 
         parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
 
@@ -9924,6 +10156,7 @@ class WorkflowService:
         browser_persistence_status: WorkflowRunStatus | None = None,
         skip_browser_session_write_back: bool = False,
         schedule_credential_fallback_retry: bool = True,
+        code_block_browser_session_id: str | None = None,
     ) -> None:
         analytics.capture("skyvern-oss-agent-workflow-status", {"status": workflow_run.status})
         # Tear down passkey material in the worker, after the finally block, while the context is still alive.
@@ -10037,6 +10270,42 @@ class WorkflowService:
             # suppress it because replaying the workflow cannot repair post-run cleanup.
             if schedule_credential_fallback_retry:
                 self._schedule_credential_fallback_retry(workflow_run)
+
+            # A session this run auto-created for its CodeBlock has no owner once the run ends;
+            # caller-supplied sessions are deliberately left open. Positional args: the cloud
+            # manager and the OSS protocol disagree on the second parameter's name.
+            if code_block_browser_session_id:
+                try:
+                    has_active_child_run = False
+                    if child_workflow_run_ids:
+                        child_runs = await app.DATABASE.workflow_runs.get_workflow_runs_by_parent_workflow_run_id(
+                            parent_workflow_run_id=workflow_run.workflow_run_id,
+                            organization_id=workflow_run.organization_id,
+                        )
+                        has_active_child_run = any(not child.status.is_final() for child in child_runs)
+                    if has_active_child_run:
+                        # A fire-and-forget child (use_parent_browser_session) may have inherited this
+                        # session; leave it to the session timeout instead of closing it mid-child-run.
+                        LOG.info(
+                            "Skipping CodeBlock browser session close while child workflow runs are active",
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            browser_session_id=code_block_browser_session_id,
+                        )
+                    else:
+                        await asyncio.wait_for(
+                            app.PERSISTENT_SESSIONS_MANAGER.close_session(
+                                workflow_run.organization_id,
+                                code_block_browser_session_id,
+                            ),
+                            timeout=CODE_BLOCK_SESSION_CLOSE_TIMEOUT_SECONDS,
+                        )
+                except Exception:
+                    LOG.warning(
+                        "Failed to close the auto-created CodeBlock browser session",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        browser_session_id=code_block_browser_session_id,
+                        exc_info=True,
+                    )
 
     async def prepare_workflow_webhook(
         self,
@@ -10672,6 +10941,12 @@ class WorkflowService:
             )
         else:
             existing_latest_workflow = None
+
+        if request.webhook_callback_url and (
+            existing_latest_workflow is None
+            or request.webhook_callback_url != existing_latest_workflow.webhook_callback_url
+        ):
+            request.webhook_callback_url = validate_webhook_url(request.webhook_callback_url)
 
         try:
             if existing_latest_workflow:

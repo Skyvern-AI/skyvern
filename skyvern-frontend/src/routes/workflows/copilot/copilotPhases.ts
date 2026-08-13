@@ -221,18 +221,6 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
     (b) => b.state === "running" || b.state === "queued",
   );
   const lastRunOutcome = turn.lastRunOutcome;
-  // The loop demonstrably continued past the failed verdict (a new activity
-  // frame arrived), distinguishing "revising" from "composing the give-up
-  // terminal response". Compares the monotonic activitySeq, not
-  // designActivity.length — the latter plateaus once MAX_DESIGN_ACTIVITY_ENTRIES
-  // is reached, which would otherwise make this comparison never fire again.
-  const redrafting =
-    turn.terminal === null &&
-    !running &&
-    lastRunOutcome !== null &&
-    (lastRunOutcome.verdict === "not_demonstrated" ||
-      lastRunOutcome.verdict === "not_evaluated") &&
-    turn.activitySeq > lastRunOutcome.activitySeqAtVerdict;
 
   const chainActive: CopilotPhaseId = testReached
     ? "test"
@@ -244,9 +232,7 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
       ? null
       : running || lastRunOutcome?.verdict === "evaluating"
         ? "test"
-        : redrafting
-          ? "draft"
-          : chainActive;
+        : chainActive;
 
   const isTerminal = turn.terminal !== null;
   const isCancelled = turn.cancelled === true;
@@ -292,8 +278,7 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
     return "done";
   }
 
-  // Condensed for display only — stubFor/redrafting/activitySeq above all
-  // read the raw explore/draftEntries/test closures, not this map.
+  // Condensed for display only; phase derivation reads the raw activity groups.
   const entriesFor: Record<CopilotPhaseId, ActivityEntry[]> = {
     explore: condenseActivityEntries(explore),
     draft: condenseActivityEntries(draftEntries),
@@ -339,7 +324,7 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
         : "stopped";
     }
     if (anyNotDemonstrated) {
-      // Surface how many test runs the redraft loop actually made — otherwise a
+      // Surface how many test runs the loop actually made — otherwise a
       // 6-run "not confirmed" turn looks identical to a 1-run one. Omit at 1 to
       // keep today's look (meaningful-or-nothing).
       const runs = countToolCalls(turn.designActivity, RUN_TOOLS);

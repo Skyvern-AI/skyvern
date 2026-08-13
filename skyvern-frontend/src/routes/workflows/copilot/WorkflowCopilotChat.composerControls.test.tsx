@@ -245,10 +245,22 @@ describe("WorkflowCopilotChat — S4 composer, copilot_ux_v1 on", () => {
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     const button = screen.getByRole("button", { name: "Stop" });
+    expect(screen.getByTestId("copilot-stop-orbit").className).not.toContain(
+      "paused",
+    );
+    expect((button as HTMLButtonElement).disabled).toBe(false);
+
     await act(async () => {
       fireEvent.click(button);
     });
     await waitFor(() => expect(cancelPost).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("copilot-stop-orbit").className).toContain(
+      "paused",
+    );
+    // Cancelling must stay legible without motion: the button also goes
+    // disabled, which is what dims it under prefers-reduced-motion.
+    const stopping = screen.getByRole("button", { name: "Stopping…" });
+    expect((stopping as HTMLButtonElement).disabled).toBe(true);
     expect(cancelPost).toHaveBeenCalledWith(
       "/workflow/copilot/cancel",
       expect.anything(),

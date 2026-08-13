@@ -30,6 +30,10 @@ You have three ways to connect a client to Skyvern:
 
 If your client appears in the OAuth section below, start there. Otherwise use the API-key setup.
 
+### Narrowing the hosted tool surface
+
+Skyvern Cloud exposes the full MCP tool surface at `https://api.skyvern.com/mcp/` by default. To give a hosted client a narrower tool list, use a scoped URL such as `https://api.skyvern.com/mcp/x/operate`, or keep the normal URL and send `X-Skyvern-Scope: operate`. Supported hosted scopes are `operate`, `build`, `browser`, and `lean`; omit the scope, or use `all`, for the full surface.
+
 ## Option A: Sign in with browser (OAuth)
 
 Supported clients today: **Claude Code**, **Codex CLI**, **Cursor**, **ChatGPT** (custom connector), and other MCP clients that support remote HTTP servers with OAuth. Skyvern Cloud publishes standard MCP OAuth discovery metadata, so supported clients can start browser sign-in without a static `CLIENT_ID` or `CLIENT_SECRET` in your config.
@@ -397,6 +401,7 @@ When you do that, Skyvern will:
 - generate local `SKYVERN_BASE_URL` and `SKYVERN_API_KEY`
 - write `.mcp.json` in the current project when you run inside a repo or app directory
 - pin the MCP command to the active Python interpreter with `python -m skyvern run mcp`
+- let you choose a local stdio tool scope (`all` by default)
 - install bundled Claude Code skills into `.claude/skills/`, including `/qa`
 
 This path stays fully local. Claude Code talks to your local Skyvern server over stdio, so `localhost` targets work directly and you do **not** need Skyvern Cloud, `mcp-remote`, or browser tunneling.
@@ -410,6 +415,16 @@ skyvern run server
 ### Manual local MCP config
 
 If you want to configure your client manually instead of using the wizard, use stdio transport:
+
+The configs below serve the full default tool surface. To narrow an install to one job, append `"--scope", "operate"` (or `build` / `browser` / `lean`) to the `args` array — omitting the flag is identical to `--scope all`.
+
+| Scope | Tools | Use when |
+| --- | ---: | --- |
+| `all` | 114 | Full tool surface; default local dev/QA choice |
+| `operate` | 29 | Run, monitor, and inspect existing automations |
+| `build` | 60 | Author and modify automations |
+| `browser` | 54 | Drive a browser directly |
+| `lean` | 32 | Focused browser surface with direct actions, selector-scoped page reading, and schema-constrained output |
 
 <Tabs>
 <Tab title="Claude Code">
@@ -562,7 +577,7 @@ Private Claude Desktop bundles do not auto-update. Download the latest [`skyvern
 
 ## QA your frontend changes
 
-For the local self-hosted path, use Docker Compose or a Skyvern source checkout, then run `skyvern quickstart` or `skyvern init`, choose `local`, then choose `Claude Code` during the MCP step. That writes local stdio MCP config and installs Claude Code skills, including `/qa`, which reads your git diff, generates browser tests, and runs them against your dev server.
+For the local self-hosted path, use Docker Compose or a Skyvern source checkout, then run `skyvern quickstart` or `skyvern init`, choose `local`, choose the default Skyvern tool scope (`all`), then choose `Claude Code` during the MCP step. That writes local stdio MCP config and installs Claude Code skills, including `/qa`, which reads your git diff, generates browser tests, and runs them against your dev server.
 
 ```bash
 pip install ".[server]"

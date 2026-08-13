@@ -70,3 +70,19 @@ def test_no_reintroduced_literal_set_shapes() -> None:
                 continue
             matches.extend(_collect_expected_set_hits(node, Path("snippet.py"), node.lineno))
         assert matches, f"Expected mutation coverage to fail for {label}"
+
+
+def test_credential_fill_field_set_is_derived_from_the_literal_type() -> None:
+    source_path = (
+        Path(__file__).resolve().parents[5] / "skyvern" / "forge" / "sdk" / "copilot" / "credential_fill_fields.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    assignment = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "CREDENTIAL_FILL_FIELDS"
+    )
+
+    assert ast.unparse(assignment.value) == "frozenset(get_args(CredentialFillField))"

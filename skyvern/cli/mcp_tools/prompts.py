@@ -502,10 +502,10 @@ def extract_data(
 # qa_test
 # ---------------------------------------------------------------------------
 
-# NOTE: The local/stdio QA workflow is maintained in three places — keep all in sync:
-# 1. skyvern/cli/skills/qa/SKILL.md         (bundled with pip package — canonical)
-# 2. .claude/skills/qa/SKILL.md              (project-local copy for this repo)
-# 3. skyvern/cli/mcp_tools/prompts.py        (QA_TEST_CONTENT — this file)
+# NOTE: .agents/skills/qa/SKILL.md is the repository canonical source.
+# Keep both synchronized copies in sync with it:
+# 1. skyvern/cli/skills/qa/SKILL.md  (bundled with the pip package)
+# 2. skyvern/cli/mcp_tools/prompts.py (QA_TEST_CONTENT — this file)
 # The MCP prompt renderer adds a stateless-HTTP variant at runtime for remote
 # connectors, because those clients cannot assume local shell/filesystem/gh access.
 QA_TEST_CONTENT = """\

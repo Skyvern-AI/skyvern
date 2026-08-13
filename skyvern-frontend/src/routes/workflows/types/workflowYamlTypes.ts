@@ -349,6 +349,7 @@ export type CodeBlockYAML = BlockYAMLBase & {
   block_type: "code";
   code: string;
   parameter_keys?: Array<string> | null;
+  error_code_mapping: Record<string, string> | null;
   prompt?: string | null;
   steps?: Array<CodeBlockStep> | null;
 };

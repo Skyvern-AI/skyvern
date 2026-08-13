@@ -1824,14 +1824,22 @@ class WorkflowRunsRepository(BaseRepository):
         self,
         workflow_run_id: str,
         organization_id: str | None = None,
-    ) -> list[tuple[list[str], str | None]]:
-        """Return (error_codes, failure_reason) tuples for blocks with non-null error_codes."""
+    ) -> list[tuple[str, list[str], str | None, Any, str]]:
+        """Return block provenance and error details for errored blocks in stable creation order."""
         async with self.Session() as session:
-            query = select(WorkflowRunBlockModel.error_codes, WorkflowRunBlockModel.failure_reason).filter_by(
-                workflow_run_id=workflow_run_id
-            )
+            query = select(
+                WorkflowRunBlockModel.workflow_run_block_id,
+                WorkflowRunBlockModel.error_codes,
+                WorkflowRunBlockModel.failure_reason,
+                WorkflowRunBlockModel.output,
+                WorkflowRunBlockModel.block_type,
+            ).filter_by(workflow_run_id=workflow_run_id)
             if organization_id is not None:
                 query = query.filter_by(organization_id=organization_id)
             query = query.where(WorkflowRunBlockModel.error_codes.isnot(None))
+            query = query.order_by(WorkflowRunBlockModel.created_at, WorkflowRunBlockModel.workflow_run_block_id)
             rows = (await session.execute(query)).all()
-            return [(row.error_codes, row.failure_reason) for row in rows]
+            return [
+                (row.workflow_run_block_id, row.error_codes, row.failure_reason, row.output, row.block_type)
+                for row in rows
+            ]

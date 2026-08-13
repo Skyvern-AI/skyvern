@@ -21,6 +21,7 @@ from playwright.async_api import Frame, Page
 from skyvern.config import CodeBlockMode, settings
 from skyvern.constants import CUSTOMER_STORAGE_UPLOAD_MAX_BYTES, SKYVERN_ID_ATTR
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem_with_tier
+from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import (
     AzureConfigurationError,
     DisabledBlockExecutionError,
@@ -53,7 +54,7 @@ from skyvern.forge.sdk.schemas.credentials import (
 )
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskStatus
 from skyvern.forge.sdk.services import (
     google_drive_service,
     google_oauth_service,
@@ -64,6 +65,7 @@ from skyvern.forge.sdk.services import (
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
+from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
 from skyvern.utils.email_validation import normalize_identifier_if_email
@@ -85,6 +87,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
     from skyvern.services.otp_service import OTPValue
+    from skyvern.webeye.browser_artifacts import DownloadBinding
 
 LOG = structlog.get_logger()
 
@@ -188,7 +191,10 @@ class ScriptExecutionPolicyDecision:
     allowed: bool
     selection_reason: str
     flag_value: bool | None = None
-    env_force_on: bool = False
+    # Whether a denial must fail the run rather than degrade it. Reserved for integrity verdicts
+    # (ADR-0012 mint-time validation); a rollout verdict sets this False so the run reaches the
+    # agent instead. Defaults closed so a new denial reason has to opt into degrading.
+    fail_closed: bool = True
 
 
 class CopilotCandidateNetworkHop(TypedDict):
@@ -224,6 +230,7 @@ class CodeBlockEngineFailure:
     exception_class: str | None
     failing_line: int | None
     healability_hint: bool | None
+    accepted_user_defined_error: UserDefinedError | None = None
 
 
 @dataclass
@@ -857,6 +864,19 @@ async def _convert_css_shape_to_string(
 
 
 class AgentFunction:
+    # OSS default honors the requested engine; cloud overrides to A/B-route eligible
+    # traffic onto the native task_v3 engine.
+    async def resolve_run_engine(
+        self,
+        *,
+        requested_engine: RunEngine,
+        task: TaskRequest,
+        organization: Organization,
+        task_id: str,
+        ab_eligible: bool = True,
+    ) -> RunEngine:
+        return requested_engine
+
     async def record_run_duration(
         self,
         run_type: str,
@@ -1067,7 +1087,7 @@ class AgentFunction:
         block_label: str | None,
         browser_session_id: str | None,
     ) -> bool:
-        """Whether a workflow CodeBlock run should execute in the secure runner sidecar.
+        """Whether a workflow CodeBlock run should execute in the secure runner.
 
         Gating lives here, at the block-execution call site, rather than inside
         execute_code_block_override so the override only runs the runner. OSS has no
@@ -1116,8 +1136,10 @@ class AgentFunction:
         parameter_values: dict[str, Any],
         credential_parameter_keys: set[str],
         recording_page: RecordingPage | None = None,
+        download_run_id: str | None = None,
+        download_binding: DownloadBinding | None = None,
     ) -> CodeBlockEngineResult | None:
-        """Run a CodeBlock through the secure runner sidecar, or return None for legacy.
+        """Run a CodeBlock through the secure runner, or return None for legacy.
 
         OSS no-op returns None so callers fall through to in-process execution. Cloud
         overrides to dispatch to the runner. Callers must gate on
@@ -2321,7 +2343,6 @@ class AgentFunction:
         resolved = settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE if code_block_mode is None else code_block_mode
         return CopilotConfig(
             block_authoring_policy=block_authoring_policy_from_code_only_mode(resolved),
-            impose_synthesized_code_block=True,
         )
 
     async def get_copilot_config_for_request(

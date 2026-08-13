@@ -52,7 +52,6 @@ const inFlightTurnWithBlock = (block: BlockState): TurnNarrativeState => ({
   ...EMPTY_NARRATIVE,
   turnId: "turn-1",
   turnIndex: 0,
-  mode: "build",
   blocks: [block],
   terminal: null,
   startedAt: "2026-06-10T00:00:00Z",

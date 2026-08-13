@@ -23,7 +23,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     WorkflowTriggerBlock,
     jinja_sandbox_env,
 )
-from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
 
@@ -253,9 +253,11 @@ class TestPayloadJsonSerialization:
         payload: dict[str, Any],
         values: dict[str, Any],
         credential_ids: dict[str, str] | None = None,
+        parameters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         ctx = MagicMock()
         ctx.values = values
+        ctx.parameters = parameters or {}
         ctx.secrets = {}
         ctx.include_secrets_in_templates = False
         ctx.get_block_metadata = MagicMock(return_value={})
@@ -323,6 +325,29 @@ class TestPayloadJsonSerialization:
             credential_ids={"credentialId": "cred_selected"},
         )
         assert result == {"credentialId": "cred_selected"}
+
+    def test_at_will_credential_renders_as_empty_not_none(self) -> None:
+        # An at-will credential (credential_id type, no default) that was not provided has no
+        # resolved id and a None value. Forwarding it must render "" — not the literal "None",
+        # which the child would then try to validate as a credential id.
+        block = _make_block()
+        now = datetime.now(timezone.utc)
+        at_will = WorkflowParameter(
+            workflow_parameter_id="wp_cred",
+            workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+            workflow_id="wf",
+            key="credentialId",
+            default_value=None,
+            created_at=now,
+            modified_at=now,
+        )
+        result = self._render_payload_live(
+            block,
+            {"credentialId": "{{ credentialId }}"},
+            {"credentialId": None},
+            parameters={"credentialId": at_will},
+        )
+        assert result == {"credentialId": ""}
 
     def test_int_value_renders_as_decimal_string(self) -> None:
         block = _make_block()

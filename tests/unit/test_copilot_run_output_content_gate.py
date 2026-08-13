@@ -28,7 +28,6 @@ from skyvern.forge.sdk.copilot.tools import (
     _is_unfinished_run_verification_candidate,
     _record_run_blocks_result,
     _run_blocks_structured_blocker_message,
-    _tool_loop_error,
     run_execution,
 )
 from skyvern.forge.sdk.copilot.tools._shared import _registered_output_parameter_payloads
@@ -601,7 +600,7 @@ def test_terminal_challenge_blocker_preempts_satisfied_completion() -> None:
     assert ctx.completion_criteria_turn_state.fully_satisfied_workflow_yaml is None
 
 
-def test_domain_blocker_run_waits_for_completion_verification_before_success() -> None:
+def test_domain_blocker_run_is_recorded_without_becoming_terminal_ready() -> None:
     result = _domain_blocker_run_result()
     ctx = _ctx(result["data"]["blocks"])
 
@@ -610,11 +609,11 @@ def test_domain_blocker_run_waits_for_completion_verification_before_success() -
 
     _record_run_blocks_result(ctx, result, completion_verification=_no_evidence("c0"))
 
-    assert result["ok"] is False
-    assert ctx.last_test_ok is False
-    assert ctx.last_test_suspicious_success is True
+    assert result["ok"] is True
+    assert ctx.last_test_ok is True
+    assert ctx.last_test_suspicious_success is False
     assert ctx.last_full_workflow_test_ok is False
-    assert "online_account_required" in (ctx.last_test_failure_reason or "")
+    assert ctx.last_test_failure_reason is None
     assert verified_goal_satisfied_context(ctx) is False
 
 
@@ -627,7 +626,7 @@ def test_domain_blocker_run_waits_for_completion_verification_before_success() -
         _no_evidence("c0"),
     ],
 )
-def test_online_account_required_blocker_requires_satisfied_completion_verification(
+def test_online_account_required_blocker_never_uses_interactive_completion_verification(
     completion_verification: CompletionVerificationResult | None,
 ) -> None:
     result = _domain_blocker_run_result()
@@ -638,14 +637,14 @@ def test_online_account_required_blocker_requires_satisfied_completion_verificat
     blocker_payload = result["data"]["blocks"][0]["extracted_data"]
     assert blocker_payload["blocked_by"] == "online_account_required"
     assert blocker_payload["safety_flags"]["no_submission_attempted"] is True
-    assert result["ok"] is False
-    assert ctx.last_test_ok is False
+    assert result["ok"] is True
+    assert ctx.last_test_ok is True
     assert ctx.last_full_workflow_test_ok is False
     assert verified_goal_satisfied_context(ctx) is False
     assert getattr(ctx, "last_good_workflow", None) is None
 
 
-def test_satisfied_completion_overrides_domain_blocker_wording() -> None:
+def test_satisfied_interactive_completion_does_not_override_domain_blocker_fact() -> None:
     result = _domain_blocker_run_result()
     ctx = _ctx(result["data"]["blocks"])
 
@@ -655,8 +654,8 @@ def test_satisfied_completion_overrides_domain_blocker_wording() -> None:
     assert ctx.last_test_ok is True
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_test_failure_reason is None
-    assert ctx.last_full_workflow_test_ok is True
-    assert verified_goal_satisfied_context(ctx) is True
+    assert ctx.last_full_workflow_test_ok is False
+    assert verified_goal_satisfied_context(ctx) is False
 
 
 def test_genuine_success_run_keeps_clean_path() -> None:
@@ -691,7 +690,7 @@ def test_nested_code_output_record_is_meaningful_and_not_suspicious_when_verifie
     assert ctx.last_test_ok is True
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_full_workflow_test_ok is True
-    assert verified_goal_satisfied_context(ctx) is True
+    assert verified_goal_satisfied_context(ctx) is False
 
 
 def test_registered_code_output_parameter_record_is_meaningful() -> None:
@@ -1032,7 +1031,7 @@ async def test_inline_prior_draft_registered_output_identity_uses_snapshot_ids(
     assert [item["output_parameter_id"] for item in data["registered_output_parameter_values"]] == ["op_snapshot"]
 
 
-def test_satisfied_completion_prevents_empty_output_suspicious_success() -> None:
+def test_satisfied_interactive_completion_does_not_make_empty_output_terminal_ready() -> None:
     result = _empty_extraction_run_result()
     ctx = _ctx(result["data"]["blocks"])
 
@@ -1044,11 +1043,12 @@ def test_satisfied_completion_prevents_empty_output_suspicious_success() -> None
     assert ctx.last_test_ok is True
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_test_failure_reason is None
-    assert verified_goal_satisfied_context(ctx) is True
+    assert ctx.last_full_workflow_test_ok is False
+    assert verified_goal_satisfied_context(ctx) is False
     assert ctx.latest_recorded_build_test_outcome is not None
-    assert ctx.latest_recorded_build_test_outcome.verdict == "progress_observed"
-    assert ctx.latest_recorded_build_test_outcome.reason_code == "verified_success"
-    assert ctx.latest_recorded_build_test_outcome.structural_key is not None
+    assert ctx.latest_recorded_build_test_outcome.verdict == "not_authoritative"
+    assert ctx.latest_recorded_build_test_outcome.reason_code == "run_completed_unevaluated"
+    assert ctx.latest_recorded_build_test_outcome.structural_key is None
 
 
 def test_terminal_blocker_does_not_leave_authoritative_prompt_outcome() -> None:
@@ -1072,15 +1072,14 @@ def test_all_null_metadata_goal_fields_are_flagged_as_no_goal_content() -> None:
     assert _run_blocks_structured_blocker_message(result) is None
     _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is True
-    # The candidate gate no longer rejects empty output: a completed run reaches the
-    # judge, which requires positive evidence per criterion. With no verifier verdict
-    # (no criteria) the empty-output floor still marks the run suspicious.
+    # Empty output remains a factual test-readiness floor. It does not invoke an
+    # interactive outcome judge or convert the completed platform run to failure.
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
     _record_run_blocks_result(ctx, result, completion_verification=None)
 
-    assert ctx.last_test_ok is None
-    assert ctx.last_test_suspicious_success is True
+    assert ctx.last_test_ok is True
+    assert ctx.last_test_suspicious_success is False
     assert ctx.last_full_workflow_test_ok is False
     assert getattr(ctx, "last_good_workflow", None) is None
 
@@ -1217,8 +1216,8 @@ def test_candidacy_and_recording_agree_on_all_null_metadata_goal_fields() -> Non
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
     _record_run_blocks_result(ctx, result, completion_verification=None)
-    assert ctx.last_test_ok is None
-    assert ctx.last_test_suspicious_success is True
+    assert ctx.last_test_ok is True
+    assert ctx.last_test_suspicious_success is False
 
 
 def test_empty_goal_collections_without_blocker_are_flagged() -> None:
@@ -1231,8 +1230,8 @@ def test_empty_goal_collections_without_blocker_are_flagged() -> None:
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
     _record_run_blocks_result(ctx, result, completion_verification=None)
-    assert ctx.last_test_ok is None
-    assert ctx.last_test_suspicious_success is True
+    assert ctx.last_test_ok is True
+    assert ctx.last_test_suspicious_success is False
     assert ctx.last_full_workflow_test_ok is False
 
 
@@ -1384,30 +1383,30 @@ def test_metadata_without_terminal_coverage_is_not_an_evidence_block() -> None:
     assert _current_workflow_has_evidence_block(ctx) is False
 
 
-def test_judge_no_evidence_warrants_repair_for_code_only_workflow_with_metadata() -> None:
+def test_interactive_completion_verdict_is_inert_for_nonempty_completed_run() -> None:
     result = _genuine_success_run_result()
     ctx = _ctx(result["data"]["blocks"])
     ctx.code_artifact_metadata = {"search_registry_person": _terminal_metadata_entry()}
 
     _record_run_blocks_result(ctx, result, completion_verification=_no_evidence("c0"))
 
-    assert ctx.last_test_suspicious_success is True
-    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_full_workflow_test_ok is True
 
 
-def test_judge_no_evidence_keeps_building_without_metadata() -> None:
+def test_interactive_completion_verdict_is_inert_without_metadata() -> None:
     result = _genuine_success_run_result()
     ctx = _ctx(result["data"]["blocks"])
 
     _record_run_blocks_result(ctx, result, completion_verification=_no_evidence("c0"))
 
     assert ctx.last_test_suspicious_success is False
-    assert ctx.last_full_workflow_test_ok is False
-    assert getattr(ctx, "last_good_workflow", None) is None
+    assert ctx.last_full_workflow_test_ok is True
+    assert getattr(ctx, "last_good_workflow", None) is not None
     assert "failure_reason" not in result["data"]
 
 
-def test_reached_goal_unfinished_run_is_recognized_when_verifier_fully_satisfied() -> None:
+def test_interactive_completion_verdict_cannot_promote_unfinished_run() -> None:
     result = _run_result([_code_block("submit_request", {"confirmation_number": "WTR-1842-DEMO"})], ok=False)
     ctx = _ctx(result["data"]["blocks"])
 
@@ -1415,10 +1414,10 @@ def test_reached_goal_unfinished_run_is_recognized_when_verifier_fully_satisfied
 
     recorded = _record_run_blocks_result(ctx, result, completion_verification=_satisfied("c0"))
 
-    assert outcome_fully_verified(ctx) is True
+    assert outcome_fully_verified(ctx) is False
     assert recorded is not None
-    assert recorded.verdict == "demonstrated"
-    assert ctx.last_full_workflow_test_ok is True
+    assert recorded.verdict == "not_demonstrated"
+    assert ctx.last_full_workflow_test_ok is False
     assert ctx.last_test_suspicious_success is False
 
 
@@ -1456,8 +1455,8 @@ def test_present_value_upgrade_flips_lone_judge_unknown_to_demonstrated_on_ok_ru
     recorded = _record_run_blocks_result(ctx, result, completion_verification=upgraded)
 
     assert recorded is not None
-    assert recorded.verdict == "demonstrated"
-    assert outcome_fully_verified(ctx) is True
+    assert recorded.verdict == "not_evaluated"
+    assert outcome_fully_verified(ctx) is False
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_full_workflow_test_ok is True
 
@@ -1507,13 +1506,27 @@ def test_repairable_runner_code_injects_no_unrecoverable_category(error_code: st
     assert ctx.last_infrastructure_tool_error is None
 
 
-def test_pre_run_sandbox_refusal_leaves_the_within_turn_guard_disarmed() -> None:
-    result = run_execution._copilot_sandbox_unavailable_result()
-    ctx = _ctx()
+def test_unstructured_failure_prose_leaves_category_consumers_clear() -> None:
+    result = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_test",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "submit_form",
+                    "block_type": "CODE",
+                    "status": "failed",
+                    "failure_reason": "Element not found after waiting for submit",
+                    "error_codes": ["user_code_error"],
+                }
+            ],
+        },
+    }
+    ctx = _ctx(result["data"]["blocks"])
 
     _record_run_blocks_result(ctx, result, completion_verification=None)
 
-    assert result["data"]["workflow_run_id"] is None
-    assert ctx.last_failure_category_top == "UNRECOVERABLE_TOOL_ERROR"
-    assert ctx.last_infrastructure_tool_error is None
-    assert _tool_loop_error(ctx, "edit_block") is None
+    assert result["data"].get("failure_categories") is None
+    assert ctx.last_failure_category_top is None
+    assert ctx.last_test_anti_bot is None

@@ -34,6 +34,11 @@ from openai.types.chat import ChatCompletionChunk
 from openai.types.completion_usage import CompletionUsage
 from openai.types.responses import Response
 
+from skyvern.forge.sdk.api.llm.copilot_model_usage import (
+    CopilotModelUsageEvent,
+    emit_copilot_model_usage,
+    normalize_gen_ai_provider,
+)
 from skyvern.forge.sdk.copilot.cache_envelope import (
     CacheableSystemInstructions,
     ExplicitCacheEnvelope,
@@ -126,23 +131,14 @@ def _is_azure_openai_host(base_url: str) -> bool:
 
 
 def _otel_provider_name(model: str, base_url: str | None) -> str | None:
-    normalized = model.lower()
-    provider, separator, _ = normalized.partition("/")
-    explicit_provider = {
-        "azure": "azure.ai.openai",
-        "openai": "openai",
-        "anthropic": "anthropic",
-        "bedrock": "aws.bedrock",
-        "vertex_ai": "gcp.vertex_ai",
-        "gemini": "gcp.gemini",
-    }.get(provider)
-    if separator and explicit_provider is not None:
-        return explicit_provider
+    _, separator, _ = model.partition("/")
+    if separator:
+        explicit_provider = normalize_gen_ai_provider(None, model)
+        if explicit_provider is not None:
+            return explicit_provider
     if base_url and _is_azure_openai_host(base_url):
         return "azure.ai.openai"
-    if normalized.startswith(("gpt-", "o1", "o3", "o4")):
-        return "openai"
-    return None
+    return normalize_gen_ai_provider(None, model)
 
 
 def _log_model_call_usage(
@@ -156,26 +152,23 @@ def _log_model_call_usage(
         return
 
     billing_model = telemetry.response_model or model
-    fields: dict[str, Any] = {
-        "log_code": "copilot_model_usage",
-        "gen_ai.operation.name": "chat",
-        "gen_ai.request.model": model,
-        "copilot.model_call_index": telemetry.model_call_index,
-        "copilot.cache.mode": telemetry.cache_mode,
-        "copilot.cache.breakpoint_count": telemetry.cache_breakpoint_count,
-    }
-    optional_fields = {
-        "gen_ai.response.model": telemetry.response_model,
-        "copilot.cache.stable_prefix_chars": telemetry.cache_stable_prefix_chars,
-        "gen_ai.usage.input_tokens": telemetry.input_tokens,
-        "gen_ai.usage.output_tokens": telemetry.output_tokens,
-        "gen_ai.usage.cache_read.input_tokens": telemetry.cache_read_tokens,
-        "gen_ai.usage.cache_creation.input_tokens": telemetry.cache_write_tokens,
-        "operation.cost": _model_call_cost(telemetry, billing_model),
-        "gen_ai.provider.name": _otel_provider_name(billing_model, base_url),
-    }
-    fields.update({key: value for key, value in optional_fields.items() if value is not None})
-    LOG.info("Copilot model usage", **fields)
+    emit_copilot_model_usage(
+        CopilotModelUsageEvent(
+            request_model=model,
+            response_model=telemetry.response_model,
+            provider_name=_otel_provider_name(billing_model, base_url),
+            input_tokens=telemetry.input_tokens,
+            output_tokens=telemetry.output_tokens,
+            cache_read_tokens=telemetry.cache_read_tokens,
+            cache_creation_tokens=telemetry.cache_write_tokens,
+            cost=_model_call_cost(telemetry, billing_model),
+            model_call_index=telemetry.model_call_index,
+            cache_mode=telemetry.cache_mode,
+            cache_breakpoint_count=telemetry.cache_breakpoint_count,
+            cache_stable_prefix_chars=telemetry.cache_stable_prefix_chars,
+        ),
+        logger=LOG,
+    )
 
 
 @contextlib.contextmanager
@@ -190,9 +183,13 @@ def model_call_telemetry_scope(
     try:
         yield telemetry
     finally:
-        if model is not None:
-            _log_model_call_usage(telemetry, model, base_url)
-        _current_model_call_telemetry.reset(token)
+        try:
+            if model is not None:
+                _log_model_call_usage(telemetry, model, base_url)
+        except Exception:
+            pass
+        finally:
+            _current_model_call_telemetry.reset(token)
 
 
 class _UsageCapturingStream:

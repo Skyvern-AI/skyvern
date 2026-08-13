@@ -202,13 +202,18 @@ async def test_create_workflow_idempotency_wait_deadline_returns_conflict(
                 raising=False,
             )
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                # The lock deadline under test is WORKFLOW_CREATION_LOCK_TIMEOUT_SECONDS=0
+                # (set above) — the endpoint answers 409 immediately. This outer wait_for is
+                # only a hang guard for a broken deadline path; 1s of wall clock proved too
+                # tight for a loaded CI shard (full-app ASGI + sqlite setup), so keep the
+                # guard generous rather than timing-sensitive.
                 response = await asyncio.wait_for(
                     client.post(
                         "/v1/agents",
                         headers={"Idempotency-Key": "blocked-key"},
                         json=WORKFLOW_CREATE_PAYLOAD,
                     ),
-                    timeout=1,
+                    timeout=10,
                 )
 
         assert response.status_code == 409

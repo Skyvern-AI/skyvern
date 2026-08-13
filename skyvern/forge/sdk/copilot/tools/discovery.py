@@ -18,21 +18,9 @@ except ImportError:  # pragma: no cover — bs4 is a transitive dep but discover
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import CopilotCandidateNetworkHop, CopilotEntrypointCandidate
-from skyvern.forge.sdk.copilot.blocker_signal import (
-    DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
-    CopilotToolBlockerSignal,
-)
-from skyvern.forge.sdk.copilot.build_phase import (
-    DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD,
-    BuildPhase,
-    advance_to_composing,
-    advance_to_discovering,
-)
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
-from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
-from skyvern.forge.sdk.copilot.turn_ownership import TurnClaimant, claim_and_stash_blocker_signal
 
 from ._shared import (
     _DISCOVERY_ANTI_BOT_PATTERNS,
@@ -47,10 +35,6 @@ LOG = structlog.get_logger()
 
 # Build-time entrypoint discovery: navigates and reads pages, returns a
 # candidate URL into the agent's context. Never mutates workflow YAML.
-# Available only during INITIAL / DISCOVERING phases.
-
-_DISCOVERY_PER_CHAT_BUDGET = 3
-_DISCOVERY_PER_TURN_BUDGET = 1
 _DISCOVERY_WALL_CLOCK_SECONDS = 60.0
 _DISCOVERY_STEP_CAP = 8
 _DISCOVERY_EVIDENCE_TRAIL_MAX = 8
@@ -267,9 +251,8 @@ def _discovery_build_result(
     Convention: ``ok=True`` for any *completed* walk — including controlled
     outcomes that report a ``failure_reason`` and ``candidate_url=None``.
     ``ok=False`` is reserved for actual tool errors (MCP unavailable, browser
-    boot failure, internal exception). Matches the existing copilot
-    ``_request_policy_tool_error`` convention so the eval harness counts a
-    controlled failure as a successful tool call.
+    boot failure, internal exception), so the eval harness counts a controlled
+    failure as a successful tool call.
     """
     data: dict[str, Any] = {
         "candidate_url": candidate_url,
@@ -322,7 +305,6 @@ def _record_discovery_resolution_on_ctx(ctx: Any, result: Mapping[str, Any]) -> 
             ctx.resolved_discovery_entrypoint_inspection_baseline = int(
                 getattr(ctx, "page_inspection_calls_this_turn", 0) or 0
             )
-            ctx.discovery_entrypoint_url_question_nudge_count = 0
     # Prior successful candidates remain authoritative over later no-candidate failures.
     elif not getattr(ctx, "resolved_discovery_entrypoint_url", None):
         # No prior candidate and no new one: clear URL state while recording the failure.
@@ -495,7 +477,7 @@ async def _discovery_click_anchor(ctx: CopilotContext, anchor: dict[str, str]) -
             server.call_internal_tool("skyvern_click", {"selector": selector, "selector_mode": "direct"}),
             timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return {"ok": False, "error": f"skyvern_click timed out after {_DISCOVERY_PER_CALL_TIMEOUT_SECONDS:g}s"}
 
 
@@ -521,7 +503,7 @@ async def _discovery_walk(
     current_page_loaded = False
     current_page_title = ""
     retried_deep_link_from_origin = False
-    started = ctx.discovery_started_monotonic or time.monotonic()
+    started = time.monotonic()
     candidate_provenance: dict[str, str | int] | None = None
     navigation_evidence: dict[str, str | bool | list[str] | list[CopilotCandidateNetworkHop]] | None = None
     if entrypoint_candidate is not None:
@@ -828,51 +810,6 @@ async def _discovery_walk(
     )
 
 
-# Only pre-navigation resolution failures advance the streak; scorer-miss reasons
-# consume the per-turn budget so a retry short-circuits and never reaches the threshold.
-_DISCOVERY_ENTRY_RESOLUTION_FAILURE_REASONS = frozenset({"could_not_resolve_site_name"})
-
-
-def _build_discovery_exhausted_escape_signal() -> CopilotToolBlockerSignal:
-    return CopilotToolBlockerSignal(
-        blocker_kind="loop_detected",
-        agent_steering_text=(
-            "STOP: entrypoint resolution failed repeatedly this turn and no web address is available to open. "
-            "This is not repairable by retrying. Ask the user for the target URL."
-        ),
-        user_facing_reason=(
-            "I looked through your messages and the workflow draft but couldn't find a web address to open. "
-            "Tell me the URL of the site you want me to work on and I'll get started."
-        ),
-        recovery_hint="ask_user_clarifying",
-        cleared_by_tools=frozenset(),
-        renders_final_reply=True,
-        internal_reason_code=DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
-        blocked_tool="discover_workflow_entrypoint",
-    )
-
-
-def _emit_discovery_exhausted_escape(copilot_ctx: CopilotContext) -> None:
-    if copilot_ctx.turn_halt is not None:
-        return
-    signal = _build_discovery_exhausted_escape_signal()
-    claim_and_stash_blocker_signal(copilot_ctx, TurnClaimant.GENUINELY_TERMINAL, signal)
-    stash_turn_halt_from_blocker_signal(copilot_ctx, signal, source="discovery")
-
-
-def _maybe_advance_discovery_failure_streak(copilot_ctx: CopilotContext, result: Mapping[str, Any]) -> None:
-    data_payload = result.get("data")
-    data: Mapping[str, Any] = data_payload if isinstance(data_payload, Mapping) else {}
-    if (
-        data.get("failure_reason") not in _DISCOVERY_ENTRY_RESOLUTION_FAILURE_REASONS
-        or copilot_ctx.resolved_discovery_entrypoint_url
-    ):
-        return
-    copilot_ctx.discovery_failure_streak_this_turn += 1
-    if copilot_ctx.discovery_failure_streak_this_turn >= DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD:
-        _emit_discovery_exhausted_escape(copilot_ctx)
-
-
 async def _discover_workflow_entrypoint_impl(
     copilot_ctx: Any,
     site_or_url: str,
@@ -888,7 +825,6 @@ async def _discover_workflow_entrypoint_impl(
     def finish(result: dict[str, Any], *, site_or_url_kind: str | None = None) -> dict[str, Any]:
         _record_discovery_resolution_on_ctx(copilot_ctx, result)
         record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
-        _maybe_advance_discovery_failure_streak(copilot_ctx, result)
         data_payload = result.get("data")
         data = data_payload if isinstance(data_payload, Mapping) else {}
         if isinstance(data_payload, dict) and input_kind == "bare_word":
@@ -931,43 +867,9 @@ async def _discover_workflow_entrypoint_impl(
         )
         return result
 
-    if (
-        copilot_ctx.turn_halt is not None
-        or copilot_ctx.discovery_failure_streak_this_turn >= DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD
-    ):
-        result = _discovery_build_result(
-            candidate_url=None,
-            candidate_form_fields=[],
-            evidence_trail=[],
-            confidence=0.0,
-            failure_reason=DISCOVERY_EXHAUSTED_NO_ENTRY_URL_REASON_CODE,
-        )
-        return finish(result)
-
     authority_error = _authority_tool_error(copilot_ctx, "discover_workflow_entrypoint")
     if authority_error:
         result = {"ok": False, "error": authority_error}
-        return finish(result)
-
-    if copilot_ctx.discovery_calls_this_turn >= _DISCOVERY_PER_TURN_BUDGET:
-        result = _discovery_build_result(
-            candidate_url=None,
-            candidate_form_fields=[],
-            evidence_trail=list(copilot_ctx.discovery_evidence_trail),
-            confidence=0.0,
-            failure_reason="discovery_already_completed_this_turn",
-        )
-        return finish(result)
-
-    cumulative = copilot_ctx.prior_discovery_calls_made + copilot_ctx.discovery_calls_this_turn
-    if cumulative >= _DISCOVERY_PER_CHAT_BUDGET:
-        result = _discovery_build_result(
-            candidate_url=None,
-            candidate_form_fields=[],
-            evidence_trail=[],
-            confidence=0.0,
-            failure_reason="discovery_budget_exhausted_for_chat",
-        )
         return finish(result)
 
     entry_url, kind = _resolve_discovery_entry_url(site_or_url)
@@ -1005,19 +907,6 @@ async def _discover_workflow_entrypoint_impl(
         )
         return finish(result, site_or_url_kind=kind)
 
-    if copilot_ctx.build_phase == BuildPhase.INITIAL:
-        try:
-            advance_to_discovering(copilot_ctx)
-        except ValueError as exc:
-            # Race or unexpected prior advance — proceed without re-transitioning,
-            # but surface the impossible state so it shows up in production logs.
-            LOG.warning(
-                "discover_workflow_entrypoint phase transition to discovering rejected",
-                error=str(exc),
-                build_phase=copilot_ctx.build_phase.value,
-            )
-    copilot_ctx.discovery_calls_this_turn += 1
-
     concrete_homepage_url = _concrete_homepage_entrypoint(entry_url, kind)
     if concrete_homepage_url is not None:
         evidence_trail = [
@@ -1036,14 +925,6 @@ async def _discover_workflow_entrypoint_impl(
             failure_reason=None,
         )
         copilot_ctx.discovery_evidence_trail = list(evidence_trail)
-        try:
-            advance_to_composing(copilot_ctx, reason="discovery_concrete_domain_homepage")
-        except ValueError as exc:
-            LOG.warning(
-                "discover_workflow_entrypoint phase transition to composing rejected",
-                error=str(exc),
-                build_phase=copilot_ctx.build_phase.value,
-            )
         return finish(result, site_or_url_kind=kind)
 
     with copilot_span(
@@ -1051,7 +932,6 @@ async def _discover_workflow_entrypoint_impl(
         data={
             "site_or_url_kind": kind,
             "intent_hint_len": len(intent_hint or ""),
-            "phase_entered": copilot_ctx.build_phase.value,
         },
     ):
         try:
@@ -1115,14 +995,4 @@ async def _discover_workflow_entrypoint_impl(
             rebuilt_data = result.get("data")
             data = rebuilt_data if isinstance(rebuilt_data, dict) else {}
             copilot_ctx.discovery_evidence_trail = list(data.get("evidence_trail", []))
-    if result.get("ok") and data.get("candidate_url"):
-        try:
-            advance_to_composing(copilot_ctx, reason="discovery_returned_candidate")
-        except ValueError as exc:
-            LOG.warning(
-                "discover_workflow_entrypoint phase transition to composing rejected",
-                error=str(exc),
-                build_phase=copilot_ctx.build_phase.value,
-            )
-
     return finish(result, site_or_url_kind=kind)

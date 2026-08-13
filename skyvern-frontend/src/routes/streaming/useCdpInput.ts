@@ -34,8 +34,17 @@ interface UseCdpInputReturn {
     handleKeyUp: (e: React.KeyboardEvent) => void;
   };
   navigate: (url: string) => void;
+  historyNavigate: (action: HistoryAction) => void;
   navigateError: string | null;
 }
+
+export type HistoryAction = "back" | "forward" | "reload";
+
+const HISTORY_EVENT_TYPES: Record<HistoryAction, string> = {
+  back: "goBackEvent",
+  forward: "goForwardEvent",
+  reload: "reloadEvent",
+};
 
 const NAVIGATE_ERROR_MESSAGES: Record<string, string> = {
   blocked: "That destination isn't allowed.",
@@ -384,6 +393,15 @@ export function useCdpInput({
     [interactive, userIsControlling, sendInputEvent],
   );
 
+  const historyNavigate = useCallback(
+    (action: HistoryAction) => {
+      if (!interactive || !userIsControlling) return;
+      setNavigateError(null);
+      sendInputEvent({ type: HISTORY_EVENT_TYPES[action] });
+    },
+    [interactive, userIsControlling, sendInputEvent],
+  );
+
   return {
     userIsControlling,
     setUserIsControlling,
@@ -397,6 +415,7 @@ export function useCdpInput({
       handleKeyUp,
     },
     navigate,
+    historyNavigate,
     navigateError,
   };
 }

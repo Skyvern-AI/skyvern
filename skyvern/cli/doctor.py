@@ -1676,7 +1676,7 @@ async def _wait_for_stream_frame(ws_url: str, timeout_seconds: int) -> str:
             if payload.get("screenshot"):
                 return str(payload.get("format") or "unknown")
             last_status = str(payload.get("status") or payload)
-            if last_status in {"not_found", "timeout", "completed", "failed"}:
+            if last_status in {"not_found", "timeout", "session_expired", "completed", "failed"}:
                 raise RuntimeError(f"stream ended before a frame arrived: {last_status}")
 
 

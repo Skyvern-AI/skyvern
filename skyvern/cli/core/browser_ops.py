@@ -30,6 +30,13 @@ LOG = structlog.get_logger(__name__)
 
 TYPE_PASSWORD_REFUSAL_MESSAGE = "Cannot type into password fields — credentials must not be passed through tool calls"
 COORDINATE_TYPE_TARGET_REFUSAL_MESSAGE = "could not verify the coordinate target; refusing to type"
+OBSERVE_V2_ENV = "SKYVERN_MCP_OBSERVE_V2"
+
+
+def observe_v2_enabled() -> bool:
+    """Return whether the default-off observe v2 experiment is enabled."""
+    return os.getenv(OBSERVE_V2_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
 
 _COORDINATE_PASSWORD_TARGET_JS = """
 () => {
@@ -857,6 +864,28 @@ async ({ scopeSelector, includeValues }) => {
 }
 """
 
+_OBSERVE_PAGE_TEXT_MAX_CHARS = 4000
+# Prefer Chromium's browser-owned loaderId; page evaluation is the fallback. Prefix both with
+# their source: consumers trust only `cdp:` markers for document identity (a hostile page can
+# pin timeOrigin), so a `page:` marker refuses ref durability rather than certifying sameness.
+_OBSERVE_DOCUMENT_ID_JS = "() => String(performance.timeOrigin)"
+_OBSERVE_PAGE_TEXT_JS = rf"""
+({{ scopeSelector }}) => {{
+  const root = scopeSelector ? document.querySelector(scopeSelector) : document.body;
+  // innerText of a non-rendered root degrades to raw descendant text, which would ship
+  // inline <script>/<style> bodies and hidden text to the model. Only rendered roots
+  // contribute page text; a hidden root yields the empty envelope instead.
+  const rendered = !!root && (root.checkVisibility ? root.checkVisibility() : root.getClientRects().length > 0);
+  const text = (rendered ? (root.innerText ?? root.textContent ?? "") : "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return {{
+    content: text.slice(0, {_OBSERVE_PAGE_TEXT_MAX_CHARS}),
+    truncated: text.length > {_OBSERVE_PAGE_TEXT_MAX_CHARS},
+  }};
+}}
+"""
+
 
 _NATIVE_OPTION_TARGET_JS = r"""
 (element) => {
@@ -1019,6 +1048,9 @@ class ObserveResult:
     elements: list[ObservedElement]
     element_count: int
     total_on_page: int
+    page_text: str | None = None
+    page_text_truncated: bool = False
+    document_id: str | None = None
 
 
 def _flatten_a11y_tree(node: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -1132,6 +1164,48 @@ def _merge_dom_observe_elements(
     return merged
 
 
+async def get_observe_document_id(page: Any) -> str | None:
+    """Read the current document revision marker without taking an observe snapshot."""
+    working_frame = getattr(page, "_working_frame", None)
+    target = working_frame if working_frame is not None else page
+    raw_page = getattr(page, "page", page)
+    session_target = working_frame if working_frame is not None else raw_page
+    cdp = getattr(session_target, "_skyvern_observe_cdp_session", None)
+
+    # The session is cached on the page so the marker costs no attach per call; a cached one can be
+    # dead (page closed, target gone), so that case evicts and retries once before falling back.
+    attempts = 2 if cdp is not None else 1
+    for _ in range(attempts):
+        if cdp is None:
+            try:
+                cdp = await raw_page.context.new_cdp_session(session_target)
+            except Exception:
+                break
+            try:
+                session_target._skyvern_observe_cdp_session = cdp
+            except Exception:
+                pass
+        try:
+            frame_tree = await cdp.send("Page.getFrameTree")
+            loader_id = frame_tree.get("frameTree", {}).get("frame", {}).get("loaderId")
+        except Exception:
+            if getattr(session_target, "_skyvern_observe_cdp_session", None) is cdp:
+                try:
+                    delattr(session_target, "_skyvern_observe_cdp_session")
+                except Exception:
+                    pass
+            cdp = None
+            continue
+        if isinstance(loader_id, str):
+            return f"cdp:{loader_id}"
+        break
+    try:
+        value = await target.evaluate(_OBSERVE_DOCUMENT_ID_JS)
+    except Exception:
+        return None
+    return f"page:{value}" if isinstance(value, str) else None
+
+
 async def do_observe(
     page: Any,
     selector: str | None = None,
@@ -1167,6 +1241,9 @@ async def do_observe(
                 RuntimeError("frame is detached"),
             )
     observe_target = working_frame if working_frame is not None else page
+    document_id_before: str | None = None
+    if observe_v2_enabled():
+        document_id_before = await get_observe_document_id(page)
     if working_frame is not None:
         # Legacy page accessibility iframe roots are unreliable; DOM-only avoids cross-document merges.
         snapshot = None
@@ -1188,6 +1265,25 @@ async def do_observe(
         frame_name=working_frame.name if working_frame is not None else None,
         frame_url=working_frame.url if working_frame is not None else None,
     )
+
+    page_text: str | None = None
+    page_text_truncated = False
+    document_id: str | None = None
+    if observe_v2_enabled():
+        try:
+            text_context = await observe_target.evaluate(_OBSERVE_PAGE_TEXT_JS, {"scopeSelector": selector})
+            if isinstance(text_context, dict) and isinstance(text_context.get("content"), str):
+                page_text = text_context["content"]
+                page_text_truncated = text_context.get("truncated") is True
+        except Exception:
+            LOG.debug("Best-effort observe page-text capture failed", exc_info=True)
+        # A same-URL replacement during extraction would tag pre-swap selectors (or page text)
+        # with the replacement document's id, blessing stale evidence. The marker therefore
+        # brackets extraction and text capture: any change, or an unreadable side, refuses
+        # durability instead.
+        document_id_after = await get_observe_document_id(page)
+        if document_id_before is not None and document_id_before == document_id_after:
+            document_id = document_id_after
 
     if interactive_only:
         all_elements = [e for e in all_elements if e.get("role") in INTERACTIVE_ROLES]
@@ -1254,6 +1350,9 @@ async def do_observe(
         elements=observed,
         element_count=len(observed),
         total_on_page=total,
+        page_text=page_text,
+        page_text_truncated=page_text_truncated,
+        document_id=document_id,
     )
 
 

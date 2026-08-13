@@ -83,6 +83,10 @@ class SplitPdfBlock(Block):
             file_url_parameter_value = workflow_run_context.get_value(self.file_url)
             if file_url_parameter_value:
                 self.file_url = extract_file_url_from_block_output(file_url_parameter_value) or file_url_parameter_value
+            else:
+                # Absent optional parameter: fail on the empty URL rather than
+                # treating the literal parameter key as a URL.
+                self.file_url = ""
 
         self.file_url = _render_string(self.file_url)
         self.prompt = _render_string(self.prompt)

@@ -20,7 +20,6 @@ const turnStart = (): WorkflowCopilotTurnStartUpdate => ({
   type: "turn_start",
   turn_id: "turn-1",
   turn_index: 0,
-  mode: "build",
   timestamp: "2026-06-10T00:00:00Z",
 });
 
@@ -97,10 +96,10 @@ describe("applyNarrativeEvent — run_outcome", () => {
       expect(b.outcomeReason).toBe(
         "The search stayed gated by a verification challenge.",
       );
-      expect(b.outcomeRole).toBe("adjudicated");
+      expect(b.outcomeRole).toBe("recorded");
       expect(isBlockOk(b)).toBe(false);
     }
-    expect(s.lastRunOutcome?.role).toBe("adjudicated");
+    expect(s.lastRunOutcome?.role).toBe("recorded");
     expect(notConfirmedOutcome(s)?.verdict).toBe("not_demonstrated");
   });
 
@@ -110,7 +109,7 @@ describe("applyNarrativeEvent — run_outcome", () => {
       runOutcome({
         verdict: "not_demonstrated",
         role: "interim_build_test",
-        reason_code: "outcome_not_demonstrated",
+        reason_code: "no_meaningful_output",
         display_reason: "The workflow still needs its extraction block.",
       }),
     ]);
@@ -269,7 +268,6 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
   const payload = (blocks: Record<string, unknown>[]) => ({
     turnId: "turn-1",
     turnIndex: 0,
-    mode: "build",
     terminal: "response",
     terminalMessage: "Done.",
     startedAt: "2026-06-10T00:00:00Z",
@@ -311,6 +309,19 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
     expect(hydratedRow.outcomeRole).toBe(liveRow.outcomeRole);
     expect(isBlockOk(hydratedRow)).toBe(false);
     expect(isBlockOk(liveRow)).toBe(false);
+  });
+
+  it("round-trips a recorded outcome role across reload", () => {
+    const hydrated = hydrateNarrativeFromPayload(
+      payload([
+        payloadBlock({
+          outcome: "not_evaluated",
+          outcomeRole: "recorded",
+        }),
+      ]),
+    )!;
+
+    expect(hydrated.blocks[0]?.outcomeRole).toBe("recorded");
   });
 
   it("hydrates rows without outcome keys exactly as before", () => {
@@ -417,7 +428,6 @@ describe("notConfirmedOutcome — envelope-first", () => {
       lastRunOutcome: {
         verdict: "demonstrated",
         displayReason: null,
-        activitySeqAtVerdict: 3,
       },
     });
     expect(outcome).toEqual({
@@ -455,7 +465,6 @@ describe("notConfirmedOutcome — envelope-first", () => {
       lastRunOutcome: {
         verdict: "not_demonstrated",
         displayReason: "Stale pointer.",
-        activitySeqAtVerdict: 1,
       },
     });
     expect(outcome).toBeNull();
@@ -468,7 +477,6 @@ describe("notConfirmedOutcome — envelope-first", () => {
       lastRunOutcome: {
         verdict: "not_demonstrated",
         displayReason: "Legacy pointer reason.",
-        activitySeqAtVerdict: 1,
       },
     });
     expect(outcome).toEqual({

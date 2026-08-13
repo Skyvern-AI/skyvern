@@ -27,6 +27,7 @@ import pytest
 import yaml
 
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.tools import (
     _COPILOT_BANNED_BLOCK_TYPES,
     _banned_block_reject_message,
@@ -41,6 +42,7 @@ from skyvern.forge.sdk.copilot.tools.banned_blocks import (
     _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES,
     CopilotBlockPolicyStatus,
     _code_only_browser_authoring_prompt,
+    _code_only_browser_schema_guidance,
 )
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _validate_block_pre_hook
 from skyvern.schemas.runs import ProxyLocation
@@ -76,6 +78,7 @@ def _ctx(prior_yaml: str | None = None) -> MagicMock:
     ctx.organization_id = "o_test"
     ctx.code_authoring_guardrail_reject_count = 0
     ctx.recorded_build_test_outcome_history = []
+    ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
     return ctx
 
 
@@ -264,8 +267,49 @@ def test_code_only_authoring_prompt_requires_idempotent_credential_login() -> No
     assert "await solve_captcha(page)" in prompt
     assert "platform-managed verification challenge" in prompt
     assert "await <credential_key>.otp()" in prompt
+    assert "Do not read `email_inbox`" in prompt
+    assert "split or parse message bodies" in prompt
+    assert '`{"otp_submitted": True}`' in prompt
+    assert "invalid or rejected code" in prompt
+    assert "unique visible selector" in prompt
+    assert "Never use a broad text locator" in prompt
+    assert "scoped locator" in prompt
+    assert "including `page.get_by_text(...)`" in prompt
+    assert "resolves at the moment it is awaited" in prompt
+    assert "not pre-materialized" in prompt
+    assert "tightest validity window" in prompt
+    assert "crossing a block boundary" in prompt
+    assert "output binding and latency" in prompt
+    assert "Later authenticated actions remain separate" in prompt
+    assert "focused Code blocks" in prompt
+    assert "await that anchor with a bounded timeout" not in prompt
+    assert "Transient disappearance of the OTP field" in prompt
+    assert "If scouting has not observed a unique authenticated anchor, do not return authentication success" in prompt
     assert "Do not treat disappearance of the" in prompt
     assert "login fields as proof of authentication" in prompt
+
+
+def test_code_only_schema_guidance_uses_the_runtime_otp_contract() -> None:
+    guidance = "\n".join(_code_only_browser_schema_guidance())
+
+    assert "await <key>.otp()" in guidance
+    assert "Do not read `email_inbox`" in guidance
+    assert "split or parse message bodies" in guidance
+    assert '`{"otp_submitted": True}`' in guidance
+    assert "authenticated-page anchor" in guidance
+    assert "unique visible selector" in guidance
+    assert "Never use a broad text locator" in guidance
+    assert "including `page.get_by_text(...)`" in guidance
+    assert "resolves at the moment it is awaited" in guidance
+    assert "not pre-materialized" in guidance
+    assert "tightest validity window" in guidance
+    assert "crossing a block boundary adds output binding and latency" in guidance
+    assert "Later authenticated actions remain separate focused Code blocks" in guidance
+    assert "await that anchor with a bounded timeout" not in guidance
+    assert "Transient disappearance of the OTP field" in guidance
+    assert (
+        "If scouting has not observed a unique authenticated anchor, do not return authentication success" in guidance
+    )
 
 
 @pytest.mark.parametrize("block_type", ["task", "task_v2"])
@@ -276,9 +320,9 @@ async def test_standard_validate_block_pre_hook_preserves_existing_behavior(bloc
     assert result is None
 
 
-@pytest.mark.parametrize("block_type", _CODE_ONLY_UNAVAILABLE + ("code", " LOGIN ", "BROWSER_TASK"))
+@pytest.mark.parametrize("block_type", _CODE_ONLY_UNAVAILABLE + (" LOGIN ", "BROWSER_TASK"))
 @pytest.mark.asyncio
-async def test_code_only_validate_block_pre_hook_rejects_unavailable_or_probe_types(
+async def test_code_only_validate_block_pre_hook_rejects_unavailable_types(
     block_type: str, code_only_ctx: MagicMock
 ) -> None:
     result = await _validate_block_pre_hook(
@@ -288,10 +332,17 @@ async def test_code_only_validate_block_pre_hook_rejects_unavailable_or_probe_ty
 
     assert result is not None
     assert result["ok"] is False
-    if block_type.strip().lower() == "code":
-        assert "validate real code blocks through update_and_run_blocks" in result["error"]
-    else:
-        assert "not available in the workflow copilot" in result["error"]
+    assert "not available in the workflow copilot" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_code_only_validate_block_pre_hook_allows_code_validation(code_only_ctx: MagicMock) -> None:
+    result = await _validate_block_pre_hook(
+        {"block_json": '{"block_type": "code", "label": "candidate", "code": "return {}"}'},
+        code_only_ctx,
+    )
+
+    assert result is None
 
 
 @pytest.mark.parametrize("block_type", _CODE_ONLY_HELPERS)
@@ -359,16 +410,12 @@ async def test_validate_block_pre_hook_strips_stray_alias_without_clobbering_blo
 
 
 @pytest.mark.asyncio
-async def test_validate_block_pre_hook_normalizes_alias_before_code_only_gate(code_only_ctx: MagicMock) -> None:
-    """Normalization must run before the code-only policy gate so a `code` block
-    passed under the wrong key is still rejected (not crashed)."""
+async def test_validate_block_pre_hook_normalizes_code_alias_without_refusing(code_only_ctx: MagicMock) -> None:
     params = {"block": '{"block_type": "code", "label": "x", "code": "pass"}'}
 
     result = await _validate_block_pre_hook(params, code_only_ctx)
 
-    assert result is not None
-    assert result["ok"] is False
-    assert "validate real code blocks through update_and_run_blocks" in result["error"]
+    assert result is None
     assert params["block_json"]
     assert "block" not in params
 
@@ -767,23 +814,20 @@ def test_pre_hook_and_post_emission_reject_share_constant() -> None:
     assert hasattr(tools_module, "_banned_block_reject_message")
 
 
-def test_schema_guidance_teaches_a_no_wait_branch_between_two_page_states() -> None:
-    # A `wait_for` on a branch that may legitimately be absent spends its whole timeout proving the
-    # absence, and every repair attempt pays it again.
+def test_schema_guidance_keeps_post_login_wait_ceiling_model_owned() -> None:
+    # The entry wait compares two mutually exclusive states, so it can carry a concrete cold-load
+    # ceiling. Once the model has observed the site's actual post-login transition, the server must
+    # not replace that evidence with a fixed shorter timeout in either authoring surface.
     from skyvern.forge.sdk.copilot.tools.banned_blocks import _code_only_browser_schema_guidance
 
     guidance = " ".join(_code_only_browser_schema_guidance())
+    authoring_prompt = _code_only_browser_authoring_prompt()
 
     assert ".or_(" in guidance
     assert "visible=true" in guidance
     assert "is_visible()" in guidance or "count()" in guidance
-
-    entry_ceiling = re.search(r"entry wait[^.]*?timeout=(\d+)(?!\d)", guidance)
-    later_ceiling = re.search(r"later wait[^.]*?timeout=(\d+)(?!\d)", guidance)
-    assert entry_ceiling and later_ceiling
-    assert int(entry_ceiling.group(1)) > int(later_ceiling.group(1))
-
-    example_ceiling = re.search(
-        r"\.or_\([^)]*\)\.first\.wait_for\([^)]*timeout=(\d+)(?!\d)", _code_only_browser_authoring_prompt()
-    )
-    assert example_ceiling and example_ceiling.group(1) == entry_ceiling.group(1)
+    assert "timeout=90000" in guidance
+    assert "timeout=30000" not in guidance
+    assert 'authenticated_anchor.wait_for(state="visible", timeout=' not in authoring_prompt
+    assert "After the submit action, await that anchor" not in guidance
+    assert "and then\n  wait for the authenticated anchor" not in authoring_prompt

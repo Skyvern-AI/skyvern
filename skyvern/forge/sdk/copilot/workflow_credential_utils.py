@@ -20,7 +20,12 @@ def parse_workflow_yaml(workflow_yaml: str) -> Any:
 
 
 def url_origin(url: str) -> str | None:
-    parsed = urlparse(url if "://" in url else f"https://{url}")
+    try:
+        parsed = urlparse(url if "://" in url else f"https://{url}")
+    except ValueError:
+        # A bracket `urlparse` cannot read as an IPv6 literal raises. Redaction runs this over
+        # arbitrary text, where declining collapses the span to `[URL]` and raising loses the scrub.
+        return None
     if not parsed.netloc or not parsed.hostname:
         return None
     host = parsed.hostname.lower()

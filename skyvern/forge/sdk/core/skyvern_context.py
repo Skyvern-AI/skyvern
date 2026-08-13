@@ -264,8 +264,8 @@ class SkyvernContext:
     # Per-step prompt token breakdown (SKY-9718). Written by prompt-build sites
     # (prompt_engine.load_prompt_with_elements_tracked + the cached extract-action
     # path in agent.py); read + cleared by the LLM API handler when emitting the
-    # "LLM API handler duration metrics" log so html_token_count / html_pct land
-    # alongside the existing input_tokens / llm_cost on the same row.
+    # "LLM API handler duration metrics" log so the locally-counted prompt size
+    # lands alongside the provider's input_tokens / llm_cost on the same row.
     last_prompt_breakdown: dict[str, Any] | None = None
 
     # Deferred file chooser listener — survives across steps so a popup-intercepted upload

@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from skyvern.config import settings
+from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
 from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CODE_BLOCK_TAB_OPEN_FAILURE_REASON, CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
@@ -432,9 +433,9 @@ class TestBuildSafeVars:
         assert "float" in safe_vars
         assert safe_vars["float"] is float
 
-    def test_builtins_is_empty(self) -> None:
+    def test_builtins_mapping_is_minimal(self) -> None:
         safe_vars = CodeBlock.build_safe_vars()
-        assert safe_vars["__builtins__"] == {}
+        assert set(safe_vars["__builtins__"]) == {"__build_class__", "__name__"}
 
     def test_expected_builtins_present(self) -> None:
         safe_vars = CodeBlock.build_safe_vars()
@@ -1798,3 +1799,98 @@ class TestCodeBlockLegacyTotpRegression:
         assert result.success is True
         assert output_value == {"visible": "ok"}
         assert _CREDENTIAL_KEY not in output_value
+
+
+# ---------------------------------------------------------------------------
+# class statements — runtime sandbox support
+# ---------------------------------------------------------------------------
+
+
+class TestClassStatementsAtRuntime:
+    """Plain ``class`` statements execute in the sandbox; exotic class heads do not."""
+
+    @staticmethod
+    def _run(code: str, parameters: dict | None = None):
+        fn = TestGenerateAsyncUserFunctionIntegration._exec_user_code(code, parameters=parameters)
+        return asyncio.run(fn())
+
+    def test_plain_class_definition_executes(self) -> None:
+        result = self._run("class Point:\n    pass\np = Point()\nkind = str(p is not None)")
+        assert result["kind"] == "True"
+
+    def test_class_with_init_and_method(self) -> None:
+        code = (
+            "class Counter:\n"
+            "    def __init__(self, start):\n"
+            "        self.value = start\n"
+            "    def bump(self):\n"
+            "        self.value = self.value + 1\n"
+            "        return self.value\n"
+            "c = Counter(41)\n"
+            "answer = c.bump()\n"
+        )
+        assert self._run(code)["answer"] == 42
+
+    def test_subclass_of_allowlisted_type(self) -> None:
+        code = (
+            "class Registry(dict):\n"
+            "    def put(self, key, value):\n"
+            "        self[key] = value\n"
+            "        return len(self)\n"
+            "r = Registry()\n"
+            "count = r.put('a', 1)\n"
+        )
+        assert self._run(code)["count"] == 1
+
+    def test_custom_exception_subclass_raises(self) -> None:
+        code = (
+            "class RetryNeeded(Exception):\n"
+            "    pass\n"
+            "caught = False\n"
+            "try:\n"
+            "    raise RetryNeeded('again')\n"
+            "except Exception:\n"
+            "    caught = True\n"
+        )
+        assert self._run(code)["caught"] is True
+
+    def test_explicit_metaclass_is_rejected_at_runtime(self) -> None:
+        with pytest.raises(RuntimeError, match="class definitions"):
+            self._run("class Weird(metaclass=dict):\n    pass")
+
+    def test_explicit_metaclass_none_is_rejected_at_runtime(self) -> None:
+        with pytest.raises(RuntimeError, match="class definitions"):
+            self._run("class Weird(metaclass=None):\n    pass")
+
+    def test_class_head_keyword_is_rejected_at_runtime(self) -> None:
+        with pytest.raises(RuntimeError, match="class definitions"):
+            self._run("class Weird(dict, extra=1):\n    pass")
+
+
+class TestIsSafeCodeClassStatements:
+    """Preflight admits exactly what the runtime can execute: plain classes yes, class-head keywords no."""
+
+    def test_plain_class_is_admitted(self) -> None:
+        CodeBlock.is_safe_code("class Point:\n    pass")
+
+    def test_subclass_is_admitted(self) -> None:
+        CodeBlock.is_safe_code("class Registry(dict):\n    pass")
+
+    def test_metaclass_keyword_is_rejected(self) -> None:
+        with pytest.raises(InsecureCodeDetected, match="class definitions"):
+            CodeBlock.is_safe_code("class Weird(metaclass=dict):\n    pass")
+
+    def test_other_class_head_keyword_is_rejected(self) -> None:
+        with pytest.raises(InsecureCodeDetected, match="class definitions"):
+            CodeBlock.is_safe_code("class Weird(dict, extra=1):\n    pass")
+
+    def test_double_star_class_head_is_rejected(self) -> None:
+        with pytest.raises(InsecureCodeDetected, match="class definitions"):
+            CodeBlock.is_safe_code("kw = {}\nclass Weird(**kw):\n    pass")
+
+    def test_bare_build_class_name_stays_blocked(self) -> None:
+        with pytest.raises(InsecureCodeDetected, match="private"):
+            CodeBlock.is_safe_code("__build_class__(len, 'X')")
+
+    def test_script_path_keeps_metaclass_support(self) -> None:
+        is_safe_script_code("class Weird(metaclass=type):\n    pass")

@@ -334,6 +334,28 @@ async def test_failed_action_skip_remaining_controls_duplicate_element_retry(
 
 
 @pytest.mark.asyncio
+async def test_freetext_mismatch_failure_stops_duplicate_element_submit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression (SKY-13631 review): a free-text mismatch failure from the heal seam must terminally stop the
+    # batch even when a queued Submit targets the SAME element id (the duplicate-element-id branch). The heal
+    # builds its failures through _freetext_mismatch_failure, which sets skip_remaining_actions=True, so the
+    # loop marks the step failed and returns instead of continuing into the duplicate Submit.
+    from skyvern.exceptions import FreeTextInputMismatch
+    from skyvern.webeye.actions.handler import _freetext_mismatch_failure
+
+    input_action, submit = _click("node-1"), _click("node-1")  # same element id -> duplicate linked node
+    failure = _freetext_mismatch_failure(FreeTextInputMismatch(element_id="node-1", intended_length=30))
+    handler = AsyncMock(return_value=[failure])
+    rig = make_agent_step_rig(monkeypatch, parsed_actions=[input_action, submit], action_handler=handler)
+
+    step, output = await rig.run()
+
+    assert step.status == StepStatus.failed
+    assert handler.await_count == 1  # the duplicate Submit was NOT dispatched
+    assert output.actions_and_results is not None
+    assert [action for action, _ in output.actions_and_results] == [input_action]
+
+
+@pytest.mark.asyncio
 async def test_skip_remaining_actions_stops_batch_but_step_completes(monkeypatch: pytest.MonkeyPatch) -> None:
     first, second = _click("node-1"), _click("node-2")
     handler = AsyncMock(return_value=[ActionResult(success=True, skip_remaining_actions=True)])

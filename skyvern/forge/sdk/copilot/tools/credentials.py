@@ -166,35 +166,6 @@ def _credential_id_misbinding_findings(workflow_yaml: str | None) -> list[dict[s
     return findings
 
 
-def _credential_id_misbinding_error_message(findings: list[dict[str, str]]) -> str:
-    grouped: dict[tuple[str, str], list[str]] = {}
-    for finding in findings:
-        key = (finding["location"], finding["credential_id"])
-        grouped.setdefault(key, []).append(finding["field"])
-
-    location_lines: list[str] = []
-    for (location, credential_id), fields in grouped.items():
-        unique_fields = list(dict.fromkeys(fields))
-        joined = ", ".join(f"`{field}`" for field in unique_fields)
-        scope = "workflow parameter" if location == _MISBINDING_WORKFLOW_LOCATION else f"block `{location}`"
-        location_lines.append(f"- `{credential_id}` in {scope} field(s): {joined}")
-    body = "\n".join(location_lines)
-
-    return (
-        "A credential ID is sitting in workflow fields that do not resolve it, so at runtime the agent types "
-        "the literal ID into the page instead of the stored username/password:\n"
-        f"{body}\n"
-        "Fix BOTH halves before retrying:\n"
-        "1. Bind the credential once: add a `credential` parameter (or a `workflow` parameter with "
-        "`workflow_parameter_type: credential_id` and the ID in `default_value`) and reference its key from the "
-        "login block's `parameter_keys`.\n"
-        "2. Delete the credential ID string from every field listed above. `navigation_goal`, "
-        "`complete_criterion`, `terminate_criterion` and similar fields are plain-language instructions — they "
-        "must describe the outcome without naming the credential ID. Do NOT relocate the literal ID into another "
-        "prose or list field; only the credential parameter slot may hold it."
-    )
-
-
 def _missing_credential_reference_tool_error(missing_credential_ids: list[str]) -> str:
     formatted_ids = ", ".join(f"`{credential_id}`" for credential_id in missing_credential_ids)
     id_word = "ID" if len(missing_credential_ids) == 1 else "IDs"
@@ -306,7 +277,7 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
             "data": {
                 "status": "denied",
                 "reference": reference,
-                "next_action": "Ask the user to provide the exact saved credential name in this turn.",
+                "reason": "canonical_user_request_missing",
             },
         }
 
@@ -320,41 +291,27 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
     matches = list(matches_by_id.values())
     literal_reference = bool(credential_reference_spans(policy.canonical_user_message, reference))
     typed_resume = _reference_is_typed_resume(reference, policy)
-    typed_credential_targets = (
-        set(ctx.turn_intent.target_entities.get("credential", [])) if ctx.turn_intent is not None else set()
-    )
-    if reference not in grounded_references and not typed_resume and (matches or not literal_reference):
+    # The agent owns natural-language interpretation. This boundary verifies only
+    # objective provenance and identity: the proposed exact reference must be a
+    # complete saved reference in the literal current turn. It deliberately does
+    # not implement a second English policy language beside the agent.
+    if not typed_resume and reference not in grounded_references and (matches or not literal_reference):
         return {
             "ok": False,
             "data": {
                 "status": "denied",
                 "reference": reference,
-                "next_action": "Ask the user to provide the exact saved credential name in this turn.",
-            },
-        }
-    if not typed_resume and reference not in typed_credential_targets:
-        return {
-            "ok": False,
-            "data": {
-                "status": "denied",
-                "reference": reference,
-                "next_action": "Ask the user to affirm the exact saved credential name to use.",
+                "reason": "reference_not_literal_in_current_user_turn",
             },
         }
     if len(matches) != 1:
         status = "not_found" if not matches else "ambiguous"
-        next_action = (
-            "Ask the user to verify the exact saved credential name."
-            if status == "not_found"
-            else "Ask the user to choose a credential ID because multiple saved credentials have that exact name."
-        )
         return {
             "ok": False,
             "data": {
                 "status": status,
                 "reference": reference,
                 "candidates": [_serialize_credential(credential) for credential in matches],
-                "next_action": next_action,
             },
         }
 
@@ -370,7 +327,6 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
             "status": "resolved",
             "reference": reference,
             "credential": _serialize_credential(credential),
-            "next_action": "Use this credential ID only through credential-aware tools.",
         },
     }
 
