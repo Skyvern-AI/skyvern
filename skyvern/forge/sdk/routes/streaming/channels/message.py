@@ -27,11 +27,6 @@ from websockets.exceptions import ConnectionClosedError
 from skyvern.forge.sdk.routes.streaming.channels.execution import execution_for_message_channel
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import ExfiltratedEvent, ExfiltrationChannel
 from skyvern.forge.sdk.routes.streaming.payload_limits import MAX_CLIPBOARD_PASTE_BYTES
-from skyvern.forge.sdk.routes.streaming.registries import (
-    add_message_channel,
-    del_message_channel,
-    get_vnc_channel,
-)
 from skyvern.forge.sdk.routes.streaming.verify import (
     loop_verify_browser_session,
     loop_verify_workflow_run,
@@ -39,6 +34,11 @@ from skyvern.forge.sdk.routes.streaming.verify import (
     verify_workflow_run,
 )
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession
+from skyvern.forge.sdk.streaming.registries import (
+    add_message_channel,
+    del_message_channel,
+    get_vnc_channel,
+)
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.services.browser_recording.session_registry import interpretation_registry
 from skyvern.services.browser_recording.types import RecordingDraftStep, RecordingInterpretationUpdate
