@@ -601,9 +601,15 @@ def _org_credential(
     name: str,
     tested_url: str | None,
     credential_type: CredentialType = CredentialType.PASSWORD,
+    *,
+    totp_type: TotpType = TotpType.NONE,
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        credential_id=credential_id, name=name, tested_url=tested_url, credential_type=credential_type
+        credential_id=credential_id,
+        name=name,
+        tested_url=tested_url,
+        credential_type=credential_type,
+        totp_type=totp_type,
     )
 
 
@@ -1197,6 +1203,39 @@ class TestObservationSeamCredentialBinding:
         assert result["resolved_login_credential_id"] == "cred_analytics"
         assert result["resolved_login_credential_name"] == "analytics"
         assert "candidate_login_credentials" not in result
+
+    @pytest.mark.asyncio
+    async def test_live_page_resolution_surfaces_secret_safe_totp_metadata(self) -> None:
+        policy = RequestPolicy()
+        ctx = _ctx(request_policy=policy)
+        fake_totp_identifier = "fake-otp-channel@example.test"
+        fake_current_otp = "987654"
+        credential = _org_credential(
+            "cred_analytics",
+            "analytics",
+            _FIXTURE_LOGIN_URL,
+            totp_type=TotpType.AUTHENTICATOR,
+        )
+        credential.username = _FAKE_USERNAME
+        credential.password = _FAKE_PASSWORD
+        credential.totp = _FAKE_TOTP_SEED
+        credential.totp_identifier = fake_totp_identifier
+        credential.current_otp = fake_current_otp
+
+        result, _ = await self._observe_navigate(
+            ctx,
+            _FIXTURE_LOGIN_URL,
+            [credential],
+        )
+
+        assert result["resolved_login_credential_totp_type"] == "authenticator"
+        serialized = json.dumps(result)
+        assert "tested_url" not in serialized
+        assert _FAKE_USERNAME not in serialized
+        assert _FAKE_PASSWORD not in serialized
+        assert _FAKE_TOTP_SEED not in serialized
+        assert fake_totp_identifier not in serialized
+        assert fake_current_otp not in serialized
 
     @pytest.mark.asyncio
     async def test_the_surfaced_id_passes_the_fill_gate_without_user_confirmation(self) -> None:

@@ -2,6 +2,19 @@ export type StudioPaneId = "copilot" | "editor" | "browser" | "overview";
 
 // "edit" = no run in URL; "run" = run present, no block label; null = block-iterate (never learned).
 export type StudioLayoutClass = "edit" | "run";
+export type CopilotPaneSelection = {
+  open: boolean;
+  index: number | undefined;
+};
+
+// Copilot has one selection for live editing and one for inspected runs.
+// Block-run labels do not create a third context.
+export function copilotContextForSearch(search: string): StudioLayoutClass {
+  const params = new URLSearchParams(search);
+  return params.get("wr") !== null || params.get("active") !== null
+    ? "run"
+    : "edit";
+}
 
 export function layoutClassForSearch(search: string): StudioLayoutClass | null {
   const params = new URLSearchParams(search);
@@ -214,6 +227,23 @@ export function withPaneClosed(
   id: StudioPaneId,
 ): StudioPaneId[] {
   return panes.filter((p) => p !== id);
+}
+export function withCopilotSelection(
+  panes: readonly StudioPaneId[],
+  selection: CopilotPaneSelection | undefined,
+): StudioPaneId[] {
+  if (selection === undefined) {
+    return [...panes];
+  }
+  if (!selection.open) {
+    return withPaneClosed(panes, "copilot");
+  }
+  const currentIndex = panes.indexOf("copilot");
+  const targetIndex =
+    selection.index ?? (currentIndex === -1 ? panes.length : currentIndex);
+  const next = withPaneClosed(panes, "copilot");
+  next.splice(Math.min(Math.max(targetIndex, 0), next.length), 0, "copilot");
+  return next;
 }
 
 // Commas are legal unencoded in query values and parse back identically; keep

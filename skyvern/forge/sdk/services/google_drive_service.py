@@ -34,6 +34,7 @@ _DRIVE_FILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 _DEFAULT_BACKOFF_SECONDS = 1.0
 _RATE_LIMIT_403_REASONS = frozenset({"ratelimitexceeded", "userratelimitexceeded"})
+_sleep = asyncio.sleep
 
 
 class GoogleDriveAPIError(RuntimeError):
@@ -404,7 +405,7 @@ async def run_chunked_resumable_upload(
                             code="resumable_upload_failed",
                             message="Google Drive resumable upload failed after exhausting resume attempts",
                         ) from None
-                    await asyncio.sleep(_compute_backoff(attempts, None))
+                    await _sleep(_compute_backoff(attempts, None))
                     continue
                 probe_first = False
             else:
@@ -447,7 +448,7 @@ async def run_chunked_resumable_upload(
                             code="resumable_upload_failed",
                             message="Google Drive resumable upload made no progress after exhausting resume attempts",
                         ) from None
-                    await asyncio.sleep(_compute_backoff(attempts, None))
+                    await _sleep(_compute_backoff(attempts, None))
                 continue
             _raise_unexpected_resumable_status(response.status_code)
 
@@ -477,7 +478,7 @@ async def _post_multipart_with_retry(
                     code="upstream_unavailable",
                     message=f"Google Drive upload connection failure: {exc}",
                 ) from exc
-            await asyncio.sleep(_compute_backoff(attempt, None))
+            await _sleep(_compute_backoff(attempt, None))
             continue
         except (httpx.TransportError, httpx.TimeoutException) as exc:
             raise GoogleDriveAPIError(
@@ -510,7 +511,7 @@ async def _post_resumable_initiate_with_retry(
                     code="upstream_unavailable",
                     message=f"Google Drive resumable upload connection failure: {exc}",
                 ) from exc
-            await asyncio.sleep(_compute_backoff(attempt, None))
+            await _sleep(_compute_backoff(attempt, None))
             continue
         except (httpx.TransportError, httpx.TimeoutException) as exc:
             raise GoogleDriveAPIError(
@@ -668,7 +669,7 @@ async def _get_download_metadata_with_retry(
             if not is_retryable_resumable_response(response.status_code, response.text) or attempt == max_attempts:
                 return response
             retry_after = response.headers.get("Retry-After")
-        await asyncio.sleep(_compute_backoff(attempt, retry_after))
+        await _sleep(_compute_backoff(attempt, retry_after))
     raise AssertionError("Drive download metadata retry loop exited without a response")
 
 
@@ -769,10 +770,10 @@ async def download_file(
                             code="upstream_unavailable",
                             message=f"Google Drive download transport failure after {max_attempts} attempts: {exc}",
                         ) from exc
-                    await asyncio.sleep(_compute_backoff(attempt, None))
+                    await _sleep(_compute_backoff(attempt, None))
                     continue
                 if retry_response:
-                    await asyncio.sleep(_compute_backoff(attempt, retry_after))
+                    await _sleep(_compute_backoff(attempt, retry_after))
                     continue
                 break
             else:
