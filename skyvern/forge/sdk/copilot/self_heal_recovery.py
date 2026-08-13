@@ -20,7 +20,6 @@ from skyvern.forge.sdk.copilot.turn_origin import HealAdoptionFailed, TurnOrigin
 from skyvern.utils.strings import escape_code_fences
 
 if TYPE_CHECKING:
-    from skyvern.forge.sdk.copilot.turn_intent import TurnIntent
     from skyvern.forge.sdk.experimentation.llm_prompt_config import LLMAPIHandler
 
 LOG = structlog.get_logger()
@@ -82,32 +81,6 @@ class SelfHealRecoveryResult:
     performed_mutation: bool = False
     scout_trajectory: list[ScoutedInteraction] = field(default_factory=list)
     failure_note: str | None = None
-
-
-def _runtime_self_heal_intent() -> TurnIntent:
-    from skyvern.forge.sdk.copilot.turn_intent import (
-        TurnIntent,
-        TurnIntentAuthority,
-        TurnIntentExpectedOutput,
-        TurnIntentMode,
-        TurnIntentReasonCode,
-    )
-
-    authority = TurnIntentAuthority(
-        may_update_workflow=False,
-        may_run_blocks=False,
-        may_answer_without_mutation=True,
-        requires_user_input=False,
-        may_read_run_context=False,
-    )
-    return TurnIntent(
-        mode=TurnIntentMode.BUILD,
-        user_goal="runtime self-heal recovery",
-        authority=authority,
-        expected_output=TurnIntentExpectedOutput.EXPLANATION,
-        reason_codes=[TurnIntentReasonCode.REQUEST_POLICY_DERIVED],
-        confidence=1.0,
-    )
 
 
 def _self_heal_recovery_prompt(goal: str) -> str:
@@ -368,7 +341,6 @@ async def run_self_heal_recovery(
         injected_browser_state=browser_state,
         heal_workflow_run_id=workflow_run_id,
     )
-    ctx.turn_intent = _runtime_self_heal_intent()
 
     copilot_config = app.AGENT_FUNCTION.get_copilot_config() or CopilotConfig()
     copilot_config.max_turns = min(copilot_config.max_turns, max_actions + 1)

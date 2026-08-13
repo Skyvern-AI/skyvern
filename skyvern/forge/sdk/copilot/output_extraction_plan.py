@@ -814,11 +814,11 @@ def _plan_from_entry(
 
 
 def value_designation_probe_expression(value_text: str, label: str) -> str:
-    """In-browser probe resolving a value the model read off the page into a pinned element.
+    """In-browser probe resolving a value the model read off the page into element facts.
 
     The model designates what it can see — the rendered value, and the label it sits under — and the
-    page resolves that to a selector. Asking the model for markup instead made it author selectors it
-    had no way to verify (SKY-13226).
+    page returns every selector representation it can verify against that element. The model still
+    chooses which representation to author (SKY-13226, ADR-0028).
     """
     target = json.dumps(value_text)
     anchor = json.dumps(label)
@@ -831,11 +831,15 @@ def value_designation_probe_expression(value_text: str, label: str) -> str:
         " if ((el.innerText || '').trim() !== target) return false;"
         " return !Array.from(el.children).some((c) => (c.innerText || '').trim() === target); });"
         " if (!matches.length) return { error: 'text-not-found' };"
-        " if (matches.length > 1 && label) { const scoped = matches.filter((el) => {"
+        " if (label) { const labelNodes = Array.from(document.querySelectorAll('body *')).filter((el) => {"
+        " if (!visible(el) || (el.innerText || '').trim() !== label) return false;"
+        " return !Array.from(el.children).some((c) => (c.innerText || '').trim() === label); });"
+        " const scoped = matches.filter((el) => labelNodes.some((labelNode) => {"
         " let node = el.parentElement, hops = 0;"
-        " while (node && hops < 4) { if ((node.innerText || '').includes(label)) return true;"
-        " node = node.parentElement; hops++; } return false; });"
-        " if (scoped.length) matches = scoped; }"
+        " while (node && node !== document.body && hops < 4) {"
+        " if (node.contains(labelNode)) return true; node = node.parentElement; hops++; } return false; }));"
+        " if (!scoped.length) return { error: 'label-not-associated', text: target, url: location.href };"
+        " matches = scoped; }"
         " if (matches.length > 1) return { error: 'text-ambiguous', visible_count: matches.length,"
         " text: target, url: location.href };"
         " const chosen = matches[0];"
@@ -844,27 +848,40 @@ def value_designation_probe_expression(value_text: str, label: str) -> str:
         " const unique = (sel) => { try { const found = document.querySelectorAll(sel);"
         " return found.length === 1 && found[0] === chosen; } catch (e) { return false; } };"
         " const tag = chosen.tagName.toLowerCase();"
-        " const candidates = [];"
-        " if (chosen.id) candidates.push('#' + CSS.escape(chosen.id));"
+        " const proposed = [];"
+        " if (chosen.id) proposed.push('#' + CSS.escape(chosen.id));"
+        " for (const name of ['data-testid', 'data-test', 'data-attr', 'aria-label']) {"
+        " const value = chosen.getAttribute(name); if (value) proposed.push(tag + '[' + name + '='"
+        " + JSON.stringify(value) + ']'); }"
         " const classes = Array.from(chosen.classList || []).slice(0, 3)"
         ".map((c) => '.' + CSS.escape(c)).join('');"
-        " if (classes) candidates.push(tag + classes);"
+        " if (classes) proposed.push(tag + classes);"
         " let selector = '';"
-        " for (const candidate of candidates) { if (unique(candidate)) { selector = candidate; break; } }"
-        " if (!selector) { const parts = []; let cur = chosen;"
+        " for (const candidate of proposed) { if (unique(candidate)) { selector = candidate; break; } }"
+        " const parts = []; let cur = chosen;"
         " while (cur && cur.nodeType === 1 && cur !== document.body) {"
         " const parent = cur.parentElement; if (!parent) break;"
         " const index = Array.prototype.indexOf.call(parent.children, cur) + 1;"
         " parts.unshift(cur.tagName.toLowerCase() + ':nth-child(' + index + ')');"
         " if (parent.id) { parts.unshift('#' + CSS.escape(parent.id));"
         " cur = null; break; } cur = parent; }"
-        " selector = parts[0] && parts[0].charAt(0) === '#'"
-        " ? parts.join(' > ') : 'body > ' + parts.join(' > '); }"
+        " const structural = parts[0] && parts[0].charAt(0) === '#'"
+        " ? parts.join(' > ') : 'body > ' + parts.join(' > ');"
+        " if (structural) proposed.push(structural);"
+        " const selectorCandidates = [];"
+        " for (const candidate of proposed) {"
+        " if (!candidate || selectorCandidates.some((item) => item.selector === candidate)) continue;"
+        " let found = []; try { found = Array.from(document.querySelectorAll(candidate)); } catch (e) { continue; }"
+        " const candidatePosition = found.indexOf(chosen);"
+        " if (candidatePosition >= 0) selectorCandidates.push({ selector: candidate,"
+        " match_count: found.length, position: candidatePosition }); }"
+        " if (!selectorCandidates.length) return { error: 'path-unstable', text: target, url: location.href };"
+        " if (!selector) selector = selectorCandidates[selectorCandidates.length - 1].selector;"
         " const all = Array.from(document.querySelectorAll(selector));"
         " const position = all.indexOf(chosen);"
         " if (position < 0) return { error: 'path-unstable', text: target, url: location.href };"
         " return { selector: selector, match_count: all.length, position: position, text: target,"
-        " url: location.href }; })()"
+        " selector_candidates: selectorCandidates, url: location.href }; })()"
     )
 
 

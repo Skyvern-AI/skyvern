@@ -5,6 +5,7 @@ import json
 import secrets
 from collections.abc import Coroutine
 from functools import partial
+from typing import Any, Protocol
 
 import structlog
 from aiohttp import WSMsgType, web
@@ -13,7 +14,6 @@ from skyvern.browser_extension.errors import BrowserExtensionError, ExtensionReq
 from skyvern.browser_extension.protocol import is_cdp_method_allowed
 from skyvern.browser_extension.relay import _MAX_WS_MESSAGE_BYTES
 from skyvern.browser_extension.target_registry import VirtualTargetRegistry
-from skyvern.browser_extension.transport import ExtensionTransport
 
 LOG = structlog.get_logger()
 
@@ -54,8 +54,14 @@ _ROOT_TARGET_GATE_METHODS = {
 }
 
 
+class _ExtensionRelay(Protocol):
+    scoped_tabs: list[dict[str, Any]]
+
+    async def request(self, op: str, args: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]: ...
+
+
 class ExtensionCdpAdapter:
-    def __init__(self, registry: VirtualTargetRegistry, relay: ExtensionTransport) -> None:
+    def __init__(self, registry: VirtualTargetRegistry, relay: _ExtensionRelay) -> None:
         self._registry = registry
         self._relay = relay
         self._capability = secrets.token_urlsafe(32)

@@ -19,9 +19,6 @@ from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_workflow_block_goals
-from skyvern.forge.sdk.copilot.build_phase import (
-    BuildPhase,
-)
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
@@ -905,74 +902,6 @@ def _seed_for_frontier(
         if label in verified_outputs:
             seed.setdefault(label, verified_outputs[label])
     return labels_to_execute, seed, frontier
-
-
-_MAX_INCREMENTAL_PAGE_FRONTIER_LABELS = 2
-_PAGE_CHANGING_FRONTIER_BLOCK_TYPES: frozenset[str] = frozenset(
-    {
-        BlockType.ACTION.value,
-        BlockType.FILE_DOWNLOAD.value,
-        BlockType.FILE_UPLOAD.value,
-        BlockType.LOGIN.value,
-        BlockType.NAVIGATION.value,
-    }
-)
-
-
-def _frontier_block_type_names(labels: list[str], workflow_definition: object | None) -> list[str]:
-    by_label = _blocks_by_label(workflow_definition)
-    type_names: list[str] = []
-    for label in labels:
-        block = by_label.get(label)
-        if block is None:
-            continue
-        type_name = _block_type_name(block)
-        if type_name:
-            type_names.append(type_name)
-    return type_names
-
-
-def _frontier_has_several_page_changing_stages(labels: list[str], workflow_definition: object | None) -> bool:
-    type_names = _frontier_block_type_names(labels, workflow_definition)
-    if len(type_names) <= _MAX_INCREMENTAL_PAGE_FRONTIER_LABELS:
-        return False
-    page_changing_count = sum(1 for type_name in type_names if type_name in _PAGE_CHANGING_FRONTIER_BLOCK_TYPES)
-    return page_changing_count >= 2 or (page_changing_count >= 1 and len(type_names) >= 4)
-
-
-def _frontier_includes_required_runtime_anchor(block_labels: list[str], labels_to_execute: list[str]) -> bool:
-    if not block_labels or len(labels_to_execute) <= len(block_labels):
-        return False
-    return labels_to_execute[-len(block_labels) :] == block_labels
-
-
-def _frontier_run_size_error(
-    copilot_ctx: object,
-    block_labels: list[str],
-    labels_to_execute: list[str],
-    workflow_definition: object | None,
-) -> str | None:
-    if len(labels_to_execute) <= _MAX_INCREMENTAL_PAGE_FRONTIER_LABELS:
-        return None
-    if _frontier_includes_required_runtime_anchor(block_labels, labels_to_execute):
-        return None
-    if getattr(copilot_ctx, "build_phase", None) not in (BuildPhase.COMPOSING, BuildPhase.TESTING):
-        return None
-    if not _frontier_has_several_page_changing_stages(labels_to_execute, workflow_definition):
-        return None
-
-    suggested = labels_to_execute[:_MAX_INCREMENTAL_PAGE_FRONTIER_LABELS]
-    remaining = labels_to_execute[_MAX_INCREMENTAL_PAGE_FRONTIER_LABELS:]
-    return (
-        f"{INTERNAL_VALIDATION_FAILURE_PREFIX}this browser test frontier is too long for a multi-stage "
-        "page-changing workflow. Keep the same complete workflow YAML, but shrink only the "
-        f"block_labels argument to the next 1-2 unverified labels: {suggested!r}. "
-        "If a prior run already advanced the browser, inspect that reached page "
-        '(inspect_page_for_composition(target_url="current_page")) to ground the next labels in '
-        "what is actually there rather than shrinking the frontier blind. "
-        f"Do not remove later blocks from the YAML; test them after this frontier succeeds. "
-        f"Deferred labels: {remaining!r}. Requested labels: {block_labels!r}."
-    )
 
 
 def _workflow_with_runtime_block_goal_context(workflow: Workflow, ctx: CopilotContext) -> Workflow:

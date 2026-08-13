@@ -96,6 +96,10 @@ class LLMConfig(LLMConfigBase):
     max_completion_tokens: int | None = None
     temperature: float | None = _DEFAULT_TEMPERATURE
     reasoning_effort: str | None = None
+    # When True, reasoning_effort is a deliberate per-config pin that the
+    # thinking-budget optimization leaves alone. Only honored on the generic branch;
+    # Gemini and Anthropic still apply their own thinking-budget shapes.
+    pin_reasoning_effort: bool = False
 
     def __post_init__(self) -> None:
         _resolve_generation_defaults(self, self.max_tokens, self.temperature)
@@ -151,6 +155,11 @@ class LLMRouterConfig(LLMConfigBase):
     max_completion_tokens: int | None = None
     reasoning_effort: str | None = None
     temperature: float | None = _DEFAULT_TEMPERATURE
+    # When True, reasoning_effort is a deliberate per-config pin that the
+    # thinking-budget optimization leaves alone. Only honored on the generic branch;
+    # Gemini and Anthropic still apply their own thinking-budget shapes.
+    # Appended last so no existing field's positional slot shifts.
+    pin_reasoning_effort: bool = False
 
     def __post_init__(self) -> None:
         _resolve_generation_defaults(self, self.max_tokens, self.temperature)

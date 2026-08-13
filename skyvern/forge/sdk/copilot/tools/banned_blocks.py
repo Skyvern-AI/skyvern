@@ -5,6 +5,7 @@ from enum import StrEnum
 from typing import Any
 
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
+from skyvern.forge.sdk.copilot.code_block_synthesis import credential_otp_authoring_guidance
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -224,13 +225,15 @@ def _code_only_browser_schema_guidance() -> list[str]:
         _code_only_browser_validation_guidance(),
         "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
         "Wait for the value the block returns, not for a URL or a navigation. A page reaches its final URL while it is still rendering, so a URL check passes before the value exists and a navigation wait fails on a page that has already arrived.",
-        "Deciding which of two page states you are in costs no wait: wait once on `a.or_(b).first`, then branch with `is_visible()` or `count()`. Build each side to match only visible elements — `page.locator('#x >> visible=true')` — because `.first` is the first match in DOM order, not the first to become visible, so a hidden sign-in form that precedes the signed-in view captures the wait and spends the whole ceiling. That combined entry wait is the only one that gets a long ceiling — give it `timeout=90000`, because a cold first load can hydrate for a minute and the wait returns the instant either state appears, so a fast page pays nothing for the generous window. Do not reuse that ceiling anywhere else: every later wait gets a short one such as `timeout=30000`, because a `wait_for` on a branch that may legitimately be absent spends its whole timeout proving the absence, and every repair attempt pays it again.",
+        "Deciding which of two page states you are in costs no wait: wait once on `a.or_(b).first`, then branch with `is_visible()` or `count()`. Build each side to match only visible elements — `page.locator('#x >> visible=true')` — because `.first` is the first match in DOM order, not the first to become visible, so a hidden sign-in form that precedes the signed-in view captures the wait and spends the whole ceiling. Give that combined entry wait `timeout=90000`, because a cold first load can hydrate for a minute and the wait returns the instant either state appears, so a fast page pays nothing for the generous window.",
         "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username and <key>.password, and use await <key>.otp() for authenticator, email, or SMS one-time codes. Never put literal secret values in code; scout credential fields with fill_credential_field.",
+        credential_otp_authoring_guidance("<key>"),
     ]
 
 
 def _code_only_browser_authoring_prompt() -> str:
     pending = "\n".join(f"- {detail}" for detail in _code_only_browser_pending_details())
+    otp_guidance = credential_otp_authoring_guidance("<credential_key>")
     return f"""
 ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE
 
@@ -241,7 +244,6 @@ Rules:
 - Allowed non-browser helper blocks remain available: `conditional`, `for_loop`,
   `while_loop`, `send_email`, S3/Google Sheets helpers, file parsers, and triggers.
 - {_code_only_browser_validation_guidance()}
-- Do not call `get_run_results` before a real workflow run exists.
 
 Code-native capabilities still pending plumbing:
 {pending}
@@ -270,10 +272,8 @@ Runtime facts:
   covers a cold first load whose hydration lands well after Playwright's default, and the
   combined wait still returns the instant either state appears. Waiting on the
   login form by itself spends the entire timeout proving it is absent whenever the
-  session is already authenticated. That long ceiling belongs to the entry wait alone.
-  After submit, wait for a logged-in page anchor on a short ceiling —
-  `await authenticated_anchor.wait_for(state="visible", timeout=30000)` — instead of
-  relying only on `networkidle`.
+  session is already authenticated. After submit, use the scouting trajectory to reach and
+  observe a logged-in page anchor instead of relying only on `networkidle`.
 - After a credentialed login submit or navigation commit, call
   `await solve_captcha(page)` before waiting for post-login anchors. This helper
   owns any platform-managed verification challenge; do not locate or interact
@@ -281,9 +281,8 @@ Runtime facts:
 - After challenge handling, wait for either the observed one-time-code field or
   a real authenticated-page anchor. If an OTP field appears, fill it with
   `await <credential_key>.otp()`, submit it with the exact control the scout
-  demonstrated (its recorded selector and label, never a guessed one), and then
-  wait for the authenticated anchor. Do not treat disappearance of the
-  login fields as proof of authentication.
+  demonstrated (its recorded selector and label, never a guessed one). {otp_guidance}
+  Do not treat disappearance of the login fields as proof of authentication.
 - Return JSON-safe structured data plus visible evidence text for records, totals,
   confirmations, and identifiers.
 - For an extraction-intent `code` block, propose a typed `extraction_schema` (named

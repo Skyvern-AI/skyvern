@@ -132,6 +132,28 @@ def _backend_env_load_candidates(intent: EnvIntent) -> tuple[Path, ...]:
     return tuple(paths)
 
 
+def read_backend_env_value(
+    name: str,
+    *,
+    intent: EnvIntent | str = EnvIntent.AUTO,
+) -> str | None:
+    """Read one effective backend env value without mutating the process environment."""
+    if name in os.environ:
+        return os.environ[name]
+
+    from dotenv import dotenv_values  # noqa: PLC0415
+
+    value: str | None = None
+    normalized_intent = _normalize_env_intent(intent)
+    for candidate in _backend_env_load_candidates(normalized_intent):
+        if not candidate.exists():
+            continue
+        candidate_value = dotenv_values(candidate).get(name)
+        if candidate_value is not None:
+            value = candidate_value
+    return value
+
+
 def load_backend_env_files(
     *,
     intent: EnvIntent | str = EnvIntent.AUTO,

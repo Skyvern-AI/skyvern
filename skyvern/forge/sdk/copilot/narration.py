@@ -109,7 +109,6 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "fill_credential_field": "Entering saved credentials",
     "edit_block": "Editing block",
     "delete_block": "Deleting block",
-    "synthesize_demonstrated_block": "Building a block from the recorded steps",
 }
 
 # Tools whose label names the block they operate on, read from the tool's own

@@ -37,6 +37,8 @@ _ACTION_DATA_KEEP_NONE_KEYS = frozenset(
     {
         ("skyvern_browser_session_get", "recording_url"),
         ("skyvern_browser_session_close", "recording_url"),
+        # None is the terminal page marker; the client needs it to stop paginating.
+        ("skyvern_page", "cursor_next"),
     }
 )
 
@@ -48,6 +50,7 @@ def set_concise_responses(enabled: bool) -> None:
 
 class ErrorCode:
     NO_ACTIVE_BROWSER = "NO_ACTIVE_BROWSER"
+    SESSION_EXPIRED = "SESSION_EXPIRED"
     BROWSER_NOT_FOUND = "BROWSER_NOT_FOUND"
     SELECTOR_NOT_FOUND = "SELECTOR_NOT_FOUND"
     ACTION_FAILED = "ACTION_FAILED"

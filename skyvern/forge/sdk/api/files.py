@@ -172,6 +172,8 @@ async def fetch_file_bytes(
     filename: str | None = None,
     allowed_redirect_origin: str | None = None,
     authorize_request_hop: RedirectHopAuthorizer[GuardedFileFetchHopResult],
+    download_scope: str | None = None,
+    approved_initial_url: str | None = None,
 ) -> GuardedFileResponse:
     """Fetch a bounded HTTP file through the validated, pinned, per-hop authorization seam.
 
@@ -224,7 +226,13 @@ async def fetch_file_bytes(
 
             result = await authorize_request_hop_once(
                 authorize_request_hop,
-                RedirectHopAuthorization(source_url=source_url, target_url=current_url, method="GET"),
+                RedirectHopAuthorization(
+                    source_url=source_url,
+                    target_url=current_url,
+                    method="GET",
+                    download_scope=download_scope,
+                    initial_url=approved_initial_url,
+                ),
                 dispatch,
             )
             if isinstance(result, GuardedFileResponse):
@@ -240,7 +248,6 @@ async def fetch_file_bytes(
                 None,
                 current_url,
                 next_url,
-                strip_cross_origin_credentials=True,
             )
             source_url, current_url = current_url, next_url
 
@@ -450,7 +457,6 @@ async def download_file(
                     None,
                     current_url,
                     next_url,
-                    strip_cross_origin_credentials=True,
                 )
                 source_url, current_url = current_url, next_url
             raise SkyvernHTTPException(

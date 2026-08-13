@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import pathlib
 import platform
@@ -37,6 +38,7 @@ from playwright.async_api import (
 from skyvern.config import settings
 from skyvern.constants import (
     BROWSER_DOWNLOAD_TIMEOUT,
+    SAVE_DOWNLOADED_FILES_TIMEOUT,
     SKYVERN_DIR,
 )
 from skyvern.exceptions import (
@@ -46,9 +48,14 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory, resolve_run_download_id
 from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
-from skyvern.forge.sdk.core.http_request_authorization import deny_unenrolled_redirect_hop
+from skyvern.forge.sdk.core.http_request_authorization import (
+    RunScopedRedirectHopAuthorizer,
+    deny_unenrolled_redirect_hop,
+)
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, get_tzinfo_from_proxy
+from skyvern.webeye.attach_only import forbid
+from skyvern.webeye.attach_only import is_enforcing as attach_only_enforcing
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding, VideoArtifact
 from skyvern.webeye.browser_engine import BrowserEngineBootstrapError
 from skyvern.webeye.cdp_connection import (
@@ -481,12 +488,31 @@ async def rebind_download_dir(browser: Browser | None, run_id: str | None, *, pa
     rebound_interceptors = 0
     monitor_owns_binding = False
     for context in rebind_contexts:
-        interceptor: CDPDownloadInterceptor | None = getattr(context, "_skyvern_cdp_download_interceptor", None)
-        if interceptor is not None:
-            interceptor.set_download_dir(download_dir)
-            rebound_interceptors += 1
-            if interceptor.is_monitoring_browser_downloads():
-                monitor_owns_binding = True
+        bind_lock = getattr(context, "_skyvern_cdp_download_interceptor_bind_lock", None)
+        if not isinstance(bind_lock, asyncio.Lock):
+            bind_lock = asyncio.Lock()
+            context._skyvern_cdp_download_interceptor_bind_lock = bind_lock  # type: ignore[attr-defined]
+        async with bind_lock:
+            interceptor: CDPDownloadInterceptor | None = getattr(context, "_skyvern_cdp_download_interceptor", None)
+            if interceptor is not None:
+                try:
+                    async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                        async with interceptor.settle_browser_downloads():
+                            pass
+                    interceptor.rebind_download_scope(
+                        download_dir=download_dir,
+                        redirect_hop_authorizer=RunScopedRedirectHopAuthorizer(run_id),
+                    )
+                    context._skyvern_download_run_id = run_id  # type: ignore[attr-defined]
+                    rebound_interceptors += 1
+                    if interceptor.is_monitoring_browser_downloads():
+                        monitor_owns_binding = True
+                except BaseException:
+                    # Once this attempt owns the binding, any failed settlement or rotation must
+                    # revoke the old authority before adoption callers can retain the context.
+                    interceptor.invalidate_download_scope()
+                    context._skyvern_download_run_id = None  # type: ignore[attr-defined]
+                    raise
 
     setdownloadbehavior_applied = False
     if monitor_owns_binding:
@@ -713,7 +739,17 @@ class BrowserContextFactory:
                 await _capture_seed_profile_state(browser_context, browser_artifacts, kwargs)
             if settings.BROWSER_LOGS_ENABLED:
                 set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
-            set_popup_video_listener(browser_context=browser_context, browser_artifacts=browser_artifacts)
+            # Gated on the process MODE, not the browser type. The earlier version keyed on
+            # is_attach_only_browser_type(settings.BROWSER_TYPE) and justified it with "an attached
+            # browser was configured by whoever launched it, so recording could only no-op" -- which
+            # is false: Playwright records video on a context IT created over connect_over_cdp
+            # regardless of who launched the browser. That gate therefore dropped video for every
+            # process using an attach-capable BROWSER_TYPE, and since this listener is the only
+            # producer of video_artifacts it took the main page's recording with it, not just popups.
+            # The thing that genuinely cannot record is the attach-only worker, which is what
+            # is_enforcing() names.
+            if not attach_only_enforcing():
+                set_popup_video_listener(browser_context=browser_context, browser_artifacts=browser_artifacts)
             set_download_file_listener(browser_context=browser_context, **kwargs)
             set_dialog_handler(browser_context=browser_context)
             route_handlers_allowed = None
@@ -754,6 +790,26 @@ class BrowserContextFactory:
                 raise e
 
             raise UnknownErrorWhileCreatingBrowserContext(browser_type, e) from e
+
+
+def _forbidden_in_attach_only_worker(what: str) -> Callable[[Any], Any]:
+    """Mark a browser creator that starts a process, so an attach-only worker fails rather than tries.
+
+    The startup check already refuses a launching BROWSER_TYPE, but a creator can also be reached
+    through a runtime override or a compliance-driven degrade. This is the second line: by the time
+    one of these is called the worker has no browser binary to launch anyway, and a named failure is
+    far cheaper to diagnose than whatever the missing executable produces.
+    """
+
+    def decorate(creator: Any) -> Any:
+        @functools.wraps(creator)
+        async def guarded(*args: Any, **kwargs: Any) -> Any:
+            forbid(what)
+            return await creator(*args, **kwargs)
+
+        return guarded
+
+    return decorate
 
 
 def _is_display_server_error(error: Exception) -> bool:
@@ -836,6 +892,7 @@ def _is_chrome_running() -> bool:
     return False
 
 
+@_forbidden_in_attach_only_worker("a local headless Chromium launch")
 async def _create_headless_chromium(
     playwright: Playwright,
     proxy_location: ProxyLocationInput = None,
@@ -932,6 +989,7 @@ async def _create_headless_chromium(
     return browser_context, browser_artifacts, None
 
 
+@_forbidden_in_attach_only_worker("a local headful Chromium launch")
 async def _create_headful_chromium(
     playwright: Playwright,
     proxy_location: ProxyLocationInput = None,

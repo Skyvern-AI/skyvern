@@ -7,10 +7,10 @@ description: "Run smoke tests against a deployed or local app based on your git 
 
 Read the diff, classify changes, start the app, and run targeted smoke tests via Skyvern browser tools with Chrome DevTools MCP as fallback.
 
-<!-- NOTE: This content is maintained in two places — keep in sync:
-     1. skyvern/cli/skills/smoke-test/SKILL.md  (bundled with pip — canonical)
-     2. .claude/skills/smoke-test/SKILL.md       (project-local copy)
-     Steps 1-4 are copied from skyvern/cli/skills/qa/SKILL.md.
+<!-- NOTE: .agents/skills/smoke-test/SKILL.md is the repository canonical source.
+     Keep the synchronized bundled copy in sync with it:
+     skyvern/cli/skills/smoke-test/SKILL.md
+     Steps 1-4 are copied from .agents/skills/qa/SKILL.md.
      If you fix bugs in /qa's diff-reading, classification, or app startup,
      mirror those fixes here. -->
 

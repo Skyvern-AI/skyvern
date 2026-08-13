@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 
 from skyvern.browser_extension.errors import BrowserExtensionError
-from skyvern.browser_extension.protocol import PROTOCOL_VERSION
+from skyvern.browser_extension.protocol import LEGACY_PROTOCOL_VERSION
 
 _TOKEN_ENV = "SKYVERN_BROWSER_EXTENSION_TOKEN"
 
@@ -102,7 +102,7 @@ def _publish_token(token_path: Path, token: str) -> str:
 def build_challenge() -> tuple[str, str]:
     server_nonce = _b64url(secrets.token_bytes(32))
     challenge = json.dumps(
-        {"v": PROTOCOL_VERSION, "type": "auth.challenge", "serverNonce": server_nonce}, separators=(",", ":")
+        {"v": LEGACY_PROTOCOL_VERSION, "type": "auth.challenge", "serverNonce": server_nonce}, separators=(",", ":")
     )
     return server_nonce, challenge
 
@@ -121,6 +121,54 @@ def verify_ext_proof(token: str, server_nonce: str, client_nonce: str, proof: st
     expected_proof = compute_ext_proof(token, server_nonce, client_nonce)
     try:
         return hmac.compare_digest(expected_proof, proof)
+    except TypeError:
+        return False
+
+
+def hash_recovery_secret(recovery_secret: str) -> str:
+    """Return the non-credential journal representation from spec-v3.md lines 57-63."""
+    return hashlib.sha256(f"skyvern-recovery-v1|{recovery_secret}".encode()).hexdigest()
+
+
+def compute_client_proof(
+    recovery_secret: str,
+    server_nonce: str,
+    client_nonce: str,
+    client_id: str,
+    broker_generation: int,
+) -> str:
+    message = f"skyvern-client-v1|{server_nonce}|{client_nonce}|{client_id}|{broker_generation}"
+    return _compute_proof(recovery_secret, message)
+
+
+def compute_broker_proof(
+    recovery_secret: str,
+    client_nonce: str,
+    server_nonce: str,
+    client_id: str,
+    broker_generation: int,
+) -> str:
+    message = f"skyvern-broker-v1|{client_nonce}|{server_nonce}|{client_id}|{broker_generation}"
+    return _compute_proof(recovery_secret, message)
+
+
+def verify_client_proof(
+    recovery_secret: str,
+    server_nonce: str,
+    client_nonce: str,
+    client_id: str,
+    broker_generation: int,
+    proof: str,
+) -> bool:
+    expected = compute_client_proof(
+        recovery_secret,
+        server_nonce,
+        client_nonce,
+        client_id,
+        broker_generation,
+    )
+    try:
+        return hmac.compare_digest(expected, proof)
     except TypeError:
         return False
 

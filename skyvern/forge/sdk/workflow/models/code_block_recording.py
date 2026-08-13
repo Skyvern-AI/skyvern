@@ -28,6 +28,16 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 
+def _page_closed(page: Page) -> bool | None:
+    # Separates "page was already gone" from "page was alive but hung" — a screenshot TimeoutError
+    # alone cannot tell them apart. Must not raise: the caller is an except handler whose remaining
+    # work still has to persist the action row.
+    try:
+        return page.is_closed()
+    except Exception:
+        return None
+
+
 class CodeBlockActionRecording:
     """Records the page operations of one CodeBlock execution and persists them against a container task."""
 
@@ -114,11 +124,12 @@ class CodeBlockActionRecording:
                     workflow_run_block_id=self._workflow_run_block_id, organization_id=self._organization_id
                 )
             run_block = self._workflow_run_block
-            screenshot = await self._page.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
+            screenshot = await self._page.screenshot(timeout=settings.CODE_BLOCK_RECORDING_SCREENSHOT_TIMEOUT_MS)
         except Exception:
             LOG.warning(
                 "Code block screenshot capture failed",
                 workflow_run_block_id=self._workflow_run_block_id,
+                page_closed=_page_closed(self._page),
                 exc_info=True,
             )
         else:

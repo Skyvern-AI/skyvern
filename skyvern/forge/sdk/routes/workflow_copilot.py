@@ -27,14 +27,16 @@ from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityT
 from skyvern.forge.sdk.copilot.agent import run_copilot_agent
 from skyvern.forge.sdk.copilot.attribution import is_copilot_born_initial_write, resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
-from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_steps
+from skyvern.forge.sdk.copilot.code_block_steps import (
+    apply_derived_code_block_steps,
+    bind_referenced_parameters_in_yaml,
+)
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.context import (
     AgentResult,
     ProposalDisposition,
     TurnNarrativePayload,
     adopt_model_authored_context,
-    render_loaded_result_context_for_prompt,
     sanitize_global_llm_context_for_prompt,
 )
 from skyvern.forge.sdk.copilot.credential_pause import (
@@ -461,7 +463,6 @@ def _make_error_narrative_payload(turn_id: str | None, turn_index: int | None, m
     return {
         "turnId": turn_id,
         "turnIndex": turn_index if turn_index is not None else 0,
-        "mode": "unknown",
         "designStarted": False,
         "designEnded": True,
         "draft": None,
@@ -529,6 +530,7 @@ def _finalized_terminal_envelope(
             proposal_present=proposal_present,
         )
         payload = finalized.model_dump(mode="json")
+        telemetry_payload = finalized.model_dump(mode="json", exclude={"run_output_report"})
     except Exception:
         LOG.warning("copilot terminal envelope finalization failed", exc_info=True)
         return None
@@ -538,7 +540,7 @@ def _finalized_terminal_envelope(
     )
     LOG.info(
         "copilot_terminal_envelope",
-        **payload,
+        **telemetry_payload,
         response_type=response_type,
         envelope_response_kind=payload.get("response_kind"),
         reason_in_reply=reason_in_reply,
@@ -992,6 +994,9 @@ async def _finalise_normal_turn(
                 organization_id=organization_id,
                 workflow_id=chat_request.workflow_id,
                 staged_workflow=agent_result.staged_workflow,
+                clear_persisted_completion_contract=bool(
+                    getattr(agent_result, "clear_persisted_completion_contract", False)
+                ),
             )
         except Exception:
             # Undo any mid-turn degraded write so a failed commit fails the turn
@@ -1100,6 +1105,7 @@ async def _commit_staged_workflow(
     organization_id: str,
     workflow_id: str,
     staged_workflow: Workflow | None,
+    clear_persisted_completion_contract: bool = False,
 ) -> None:
     """Overwrite the current workflow version in place (auto-accept path).
 
@@ -1138,6 +1144,7 @@ async def _commit_staged_workflow(
         sequential_key=staged_workflow.sequential_key,
         created_by=created_by_stamp,
         edited_by="copilot",
+        preserve_completion_contract=not clear_persisted_completion_contract,
     )
 
 
@@ -1194,6 +1201,7 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
         sequential_key=original_workflow.sequential_key,
         created_by=original_workflow.created_by,
         edited_by=original_workflow.edited_by,
+        preserve_completion_contract=False,
     )
 
 
@@ -1334,14 +1342,13 @@ async def copilot_call_llm(
     # Render user prompt (untrusted content, each variable in code fences)
     # Escape triple backticks to prevent code fence breakout
     prompt_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
-    loaded_result_context = render_loaded_result_context_for_prompt(prompt_global_llm_context)
     user_prompt = prompt_engine.load_prompt(
         template="workflow-copilot-user",
         workflow_yaml=escape_code_fences(chat_request.workflow_yaml or ""),
         user_message=escape_code_fences(chat_request.message),
         chat_history=escape_code_fences(chat_history_text),
         global_llm_context=escape_code_fences(prompt_global_llm_context),
-        loaded_result_context=escape_code_fences(loaded_result_context),
+        loaded_result_context="",
         debug_run_info=escape_code_fences(debug_run_info_text),
     )
 
@@ -1411,6 +1418,10 @@ async def copilot_call_llm(
         llm_workflow_yaml = default_data_write_continue_on_failure(
             action_data.get("workflow_yaml", ""), chat_request.workflow_yaml
         )
+        # The conversion seam binds a block's declared parameters into its parameter_keys against
+        # a copy that does not leave it, so bind here too: this text is what Accept saves, and an
+        # unbound copy would give the saved block no value for a parameter its code reads.
+        llm_workflow_yaml = bind_referenced_parameters_in_yaml(llm_workflow_yaml)
         applied_workflow_yaml = llm_workflow_yaml
         try:
             updated_workflow = await _process_workflow_yaml(
@@ -1441,6 +1452,7 @@ async def copilot_call_llm(
                 ),
                 chat_request.workflow_yaml,
             )
+            corrected_workflow_yaml = bind_referenced_parameters_in_yaml(corrected_workflow_yaml)
             updated_workflow = await _process_workflow_yaml(
                 workflow_id=chat_request.workflow_id,
                 workflow_permanent_id=chat_request.workflow_permanent_id,
@@ -1496,14 +1508,13 @@ async def _auto_correct_workflow_yaml(
     )
 
     prompt_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
-    loaded_result_context = render_loaded_result_context_for_prompt(prompt_global_llm_context)
     user_prompt = prompt_engine.load_prompt(
         template="workflow-copilot-user",
         workflow_yaml=escape_code_fences(workflow_yaml),
         user_message=escape_code_fences(f"Workflow YAML parsing failed, please fix it: {failure_reason}"),
         chat_history=escape_code_fences(_format_chat_history(new_chat_history)),
         global_llm_context=escape_code_fences(prompt_global_llm_context),
-        loaded_result_context=escape_code_fences(loaded_result_context),
+        loaded_result_context="",
         debug_run_info=escape_code_fences(debug_run_info_text),
     )
 
@@ -1720,6 +1731,7 @@ async def _new_copilot_chat_post(
         terminal_frame_emitted = False
         cancel_watcher: asyncio.Task[None] | None = None
         current_code_available = False
+        turn_index = 0
         effective_mode = _effective_copilot_composer_mode(chat_request, uses_v2=True)
         prior_turn_outcome: TurnOutcome | None = None
 

@@ -112,6 +112,7 @@ ClarificationReason = Literal[
     "workflow_credential_inputs_unbound",
     "login_credentials_unresolved",
     "signin_email_unresolved",
+    "safety_screen_unavailable",
 ]
 RawSecretHandling = Literal["none", "block", "redacted_draft"]
 RawSecretSafetyStatus = Literal["not_run", "clean", "detected", "blocked"]
@@ -125,15 +126,17 @@ RawSecretSafetyFailureKind = Literal[
     "invalid_citation",
 ]
 _RAW_SECRET_SAFETY_PROMPT_NAME = "workflow-copilot-raw-secret-safety"
-_RAW_SECRET_SAFETY_BLOCKED_TURN = "[INPUT_BLOCKED_BY_SECRET_SAFETY]"
+_RAW_SECRET_SAFETY_UNAVAILABLE_TURN = "[INPUT_UNAVAILABLE_SAFETY_SCREEN_INCOMPLETE]"
+_REDACTED_SECRET_PLACEHOLDER = "[REDACTED_SECRET]"
 
 
 class RawSecretSafetyVerdict(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # Tolerates unknown keys: a cosmetic schema drift in a model-generated blob must not
+    # cost the user their turn, and the security-relevant fields are validated regardless.
+    model_config = ConfigDict(extra="ignore")
 
     version: Literal["1"]
     state: Literal["clean", "detected"]
-    handling: RawSecretHandling
     citations: list[str]
 
 
@@ -143,6 +146,7 @@ class _RawSecretSafetyScreen:
     canonical_user_message: str
     handling: RawSecretHandling = "none"
     citation_count: int = 0
+    exonerated_citation_count: int = 0
     failure_kind: RawSecretSafetyFailureKind = "none"
     latency_ms: float = 0.0
 
@@ -163,15 +167,15 @@ def _validate_raw_secret_safety_verdict(
     screened_user_message: str,
 ) -> RawSecretSafetyFailureKind:
     if verdict.state == "clean":
-        if verdict.handling != "none" or verdict.citations:
+        if verdict.citations:
             return "contradictory_verdict"
         return "none"
-    if verdict.handling == "none" or not verdict.citations:
+    if not verdict.citations:
         return "contradictory_verdict"
     if len(set(verdict.citations)) != len(verdict.citations) or any(not citation for citation in verdict.citations):
         return "contradictory_verdict"
     if any(
-        citation == "[REDACTED_SECRET]"
+        citation == _REDACTED_SECRET_PLACEHOLDER
         or not _verify_raw_secret_evidence(citation, original_user_message)
         or citation not in screened_user_message
         for citation in verdict.citations
@@ -180,28 +184,111 @@ def _validate_raw_secret_safety_verdict(
     return "none"
 
 
+def _screen_unavailable(
+    failure_kind: RawSecretSafetyFailureKind,
+    latency_ms: float = 0.0,
+) -> _RawSecretSafetyScreen:
+    return _RawSecretSafetyScreen(
+        status="blocked",
+        canonical_user_message=_RAW_SECRET_SAFETY_UNAVAILABLE_TURN,
+        handling="block",
+        failure_kind=failure_kind,
+        latency_ms=latency_ms,
+    )
+
+
+async def _saved_credential_ids(citations: list[str], organization_id: str) -> set[str]:
+    candidate_ids = [citation for citation in citations if citation.startswith("cred_")]
+    if not candidate_ids:
+        return set()
+    credentials = await app.DATABASE.credentials.get_credentials_by_ids(
+        candidate_ids,
+        organization_id=organization_id,
+    )
+    return {credential.credential_id for credential in credentials}
+
+
+async def _exonerate_saved_credential_citations(citations: list[str], organization_id: str) -> list[str]:
+    """Drop citations that are verified IDs of credentials this org already saved.
+
+    Credential names are user-controlled and can equal real secret material, so equality with a
+    saved name cannot make a cited span safe. Generated credential IDs are non-secret identifiers;
+    the database lookup verifies that a cited ID belongs to this organization before exonerating it.
+    """
+    try:
+        credential_ids = await _saved_credential_ids(citations, organization_id)
+    except Exception:
+        LOG.warning(
+            "raw-secret safety saved-credential exoneration lookup failed",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return citations
+    return [citation for citation in citations if citation not in credential_ids]
+
+
+_MIN_RAW_SECRET_EVIDENCE_CHARS = 4
+
+
+def _raw_secret_evidence_spans(evidence: str | None, user_message: str) -> list[tuple[int, int]]:
+    if not evidence or len(evidence) < _MIN_RAW_SECRET_EVIDENCE_CHARS:
+        return []
+    message = user_message or ""
+    spans: list[tuple[int, int]] = []
+    start = 0
+    while True:
+        index = message.find(evidence, start)
+        if index < 0:
+            return spans
+        end = index + len(evidence)
+        before = message[index - 1] if index else ""
+        after = message[end] if end < len(message) else ""
+        before_is_boundary = not before or before.isspace() or before in "([{\"'"
+        after_is_boundary = (
+            not after or after.isspace() or after in ")]\"}'" or (not evidence[-1].isalnum() and after in ".,;:?")
+        )
+        if before_is_boundary and after_is_boundary:
+            spans.append((index, end))
+        start = index + 1
+
+
+def _redact_cited_secrets(message: str, citations: list[str]) -> str:
+    spans = sorted(
+        (span for citation in citations for span in _raw_secret_evidence_spans(citation, message)),
+        key=lambda span: (span[0], span[1]),
+    )
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in merged:
+        pieces.extend((message[cursor:start], _REDACTED_SECRET_PLACEHOLDER))
+        cursor = end
+    pieces.append(message[cursor:])
+    return "".join(pieces)
+
+
 async def _screen_raw_secret_safety(
     user_message: str,
     handler: LLMAPIHandler | None,
+    *,
+    organization_id: str,
 ) -> _RawSecretSafetyScreen:
     deterministic_safe_message = redact_raw_secrets_for_prompt(user_message)
     if handler is None:
-        return _RawSecretSafetyScreen(
-            status="blocked",
-            canonical_user_message=_RAW_SECRET_SAFETY_BLOCKED_TURN,
-            failure_kind="missing_handler",
-        )
+        return _screen_unavailable("missing_handler")
     try:
         prompt = prompt_engine.load_prompt(
             template=_RAW_SECRET_SAFETY_PROMPT_NAME,
             user_message=escape_code_fences(deterministic_safe_message),
         )
     except Exception:
-        return _RawSecretSafetyScreen(
-            status="blocked",
-            canonical_user_message=_RAW_SECRET_SAFETY_BLOCKED_TURN,
-            failure_kind="malformed_output",
-        )
+        return _screen_unavailable("malformed_output")
 
     started_at = time.monotonic()
     try:
@@ -209,61 +296,48 @@ async def _screen_raw_secret_safety(
             handler(prompt=prompt, prompt_name=_RAW_SECRET_SAFETY_PROMPT_NAME),
             timeout=settings.COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS,
         )
-    except asyncio.TimeoutError:
-        return _RawSecretSafetyScreen(
-            status="blocked",
-            canonical_user_message=_RAW_SECRET_SAFETY_BLOCKED_TURN,
-            failure_kind="timeout",
-            latency_ms=(time.monotonic() - started_at) * 1000,
-        )
+    except TimeoutError:
+        return _screen_unavailable("timeout", (time.monotonic() - started_at) * 1000)
     except Exception as exc:
         LOG.warning("raw-secret safety provider failed", exception_type=type(exc).__name__)
-        return _RawSecretSafetyScreen(
-            status="blocked",
-            canonical_user_message=_RAW_SECRET_SAFETY_BLOCKED_TURN,
-            failure_kind="provider_error",
-            latency_ms=(time.monotonic() - started_at) * 1000,
-        )
+        return _screen_unavailable("provider_error", (time.monotonic() - started_at) * 1000)
 
     latency_ms = (time.monotonic() - started_at) * 1000
     verdict = _raw_secret_safety_verdict(raw)
     if verdict is None:
-        return _RawSecretSafetyScreen(
-            status="blocked",
-            canonical_user_message=_RAW_SECRET_SAFETY_BLOCKED_TURN,
-            failure_kind="malformed_output",
-            latency_ms=latency_ms,
-        )
+        return _screen_unavailable("malformed_output", latency_ms)
     failure_kind = _validate_raw_secret_safety_verdict(
         verdict,
         original_user_message=user_message,
         screened_user_message=deterministic_safe_message,
     )
     if failure_kind != "none":
-        return _RawSecretSafetyScreen(
-            status="blocked",
-            canonical_user_message=_RAW_SECRET_SAFETY_BLOCKED_TURN,
-            failure_kind=failure_kind,
-            latency_ms=latency_ms,
-        )
+        return _screen_unavailable(failure_kind, latency_ms)
 
     if verdict.state == "detected":
-        # A model citation proves that some secret material exists, but it cannot prove that a
-        # cited substring covers the complete value (especially for whitespace-bearing secrets).
-        # Discard the entire turn rather than persist a partially redacted remainder.
+        cited = await _exonerate_saved_credential_citations(verdict.citations, organization_id)
+        exonerated = len(verdict.citations) - len(cited)
+        if cited:
+            return _RawSecretSafetyScreen(
+                status="detected",
+                canonical_user_message=_redact_cited_secrets(deterministic_safe_message, cited),
+                handling="redacted_draft",
+                citation_count=len(cited),
+                exonerated_citation_count=exonerated,
+                latency_ms=latency_ms,
+            )
         return _RawSecretSafetyScreen(
-            status="detected",
-            canonical_user_message=_RAW_SECRET_SAFETY_BLOCKED_TURN,
-            handling="block",
-            citation_count=len(verdict.citations),
+            status="clean",
+            canonical_user_message=deterministic_safe_message,
+            handling="none",
+            exonerated_citation_count=exonerated,
             latency_ms=latency_ms,
         )
 
-    deterministic_detected = deterministic_safe_message != user_message
     return _RawSecretSafetyScreen(
-        status="detected" if deterministic_detected else "clean",
+        status="clean",
         canonical_user_message=deterministic_safe_message,
-        handling="redacted_draft" if deterministic_detected else "none",
+        handling="none",
         citation_count=len(verdict.citations),
         latency_ms=latency_ms,
     )
@@ -273,9 +347,10 @@ _VALID_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(get_arg
 # Only deterministic post-resolution code may mint these; a classifier emission would
 # skip the concrete-target and credential-reachability checks the reason stands for.
 _DETERMINISTIC_ONLY_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(
-    {"login_credentials_unresolved", "signin_email_unresolved"}
+    {"login_credentials_unresolved", "signin_email_unresolved", "safety_screen_unavailable"}
 )
-# Gates guardrails.py's deferred-draft tool authority — narrower than the prompt set below.
+# Concrete credential states for which the combined update-and-run tool persists
+# the draft but cannot start a browser run.
 CREDENTIAL_DEFERRED_DRAFT_REASONS: frozenset[ClarificationReason] = frozenset(
     {"workflow_credential_inputs_unbound", "credential_name_unresolved"}
 )
@@ -320,6 +395,10 @@ RAW_SECRET_QUESTION = (
     "Store the credential in the Skyvern Credentials UI and reply with its exact saved credential name or a credential ID beginning with cred_. "
     f"{_CREDENTIALS_UI_DIRECTIONS} "
     f"{RAW_SECRET_REFUSAL_SENTINEL}."
+)
+SAFETY_SCREEN_UNAVAILABLE_QUESTION = (
+    "I couldn't finish safety screening on that message, so I never read it. "
+    "That's a problem on my side, not something wrong with what you sent — please send it again."
 )
 _SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX = "Which saved credential should I use? Please provide the exact credential name or a credential ID beginning with cred_."
 _SAVED_CREDENTIAL_NAME_QUESTION = f"{_SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
@@ -747,6 +826,7 @@ class RequestPolicy:
     raw_secret_safety_status: RawSecretSafetyStatus = "not_run"
     raw_secret_safety_failure_kind: RawSecretSafetyFailureKind = "none"
     raw_secret_safety_citation_count: int = 0
+    raw_secret_safety_exonerated_citation_count: int = 0
     raw_secret_safety_latency_ms: float = 0.0
     clarification_reason: ClarificationReason = "none"
     # `clarification_reason` cannot say this on its own: credential_name_unresolved is also raised
@@ -817,6 +897,7 @@ class RequestPolicy:
             "raw_secret_safety_status": self.raw_secret_safety_status,
             "raw_secret_safety_failure_kind": self.raw_secret_safety_failure_kind,
             "raw_secret_safety_citation_count": self.raw_secret_safety_citation_count,
+            "raw_secret_safety_exonerated_citation_count": self.raw_secret_safety_exonerated_citation_count,
             "raw_secret_safety_latency_ms": round(self.raw_secret_safety_latency_ms, 3),
             "classifier_status": self.classifier_status,
             "classifier_failure_kind": self.classifier_failure_kind,
@@ -893,35 +974,13 @@ class RequestPolicy:
 
     def prompt_summary(self) -> str:
         lines = [
-            f"testing_intent: {self.testing_intent}",
-            f"authoring_intent: {self.authoring_intent}",
             f"credential_input_kind: {self.credential_input_kind}",
-            f"clarification_reason: {self.clarification_reason}",
-            f"allow_update_workflow: {self.allow_update_workflow}",
-            f"allow_run_blocks: {self.allow_run_blocks}",
-            f"allow_missing_credentials_in_draft: {self.allow_missing_credentials_in_draft}",
             f"raw_secret_handling: {self.raw_secret_handling}",
-            f"classifier_status: {self.classifier_status}",
-            f"completion_contract_status: {self.completion_contract_status}",
         ]
-        if self.completion_contract:
-            lines.append(f"completion_contract: {self.completion_contract}")
         if self.raw_secret_detected:
             lines.append(f"raw_secret_detected: {self.raw_secret_detected}")
         if self.resolved_signin_email:
             lines.append(f"resolved_signin_email: {self.resolved_signin_email}")
-        graded_criteria = self.graded_completion_criteria()
-        requested_output_path_literals = sorted(
-            {
-                criterion.output_path
-                for criterion in graded_criteria
-                if criterion.output_path and criterion.level != "definition"
-            }
-            | floor_rekeyed_requested_output_paths(graded_criteria)
-        )
-        if requested_output_path_literals:
-            lines.append("requested_output_paths:")
-            lines += [f"- {path}" for path in requested_output_path_literals]
         validation_classification_criteria = [
             criterion
             for criterion in self.graded_completion_criteria()
@@ -950,22 +1009,10 @@ class RequestPolicy:
     def trust_floor_summary(self) -> str:
         return "\n".join(
             [
-                f"testing_intent: {self.testing_intent}",
                 f"credential_input_kind: {self.credential_input_kind}",
-                f"clarification_reason: {self.clarification_reason}",
-                f"allow_update_workflow: {self.allow_update_workflow}",
-                f"allow_run_blocks: {self.allow_run_blocks}",
-                f"allow_missing_credentials_in_draft: {self.allow_missing_credentials_in_draft}",
                 f"raw_secret_handling: {self.raw_secret_handling}",
-                f"classifier_status: {self.classifier_status}",
             ]
         )
-
-
-def request_policy_has_present_completion_contract(request_policy: RequestPolicy | None) -> bool:
-    if request_policy is None:
-        return False
-    return request_policy.completion_contract_status == "present" or bool(request_policy.completion_criteria)
 
 
 def floor_rekeyed_requested_output_paths(
@@ -1233,33 +1280,8 @@ def _raw_secret_detected(text: str) -> bool:
     return any(pattern.search(text or "") for pattern in RAW_SECRET_PATTERNS) or contains_email_password_pair(text)
 
 
-_MIN_RAW_SECRET_EVIDENCE_CHARS = 4
-
-
 def _verify_raw_secret_evidence(evidence: str | None, user_message: str) -> bool:
-    if not evidence or len(evidence) < _MIN_RAW_SECRET_EVIDENCE_CHARS:
-        return False
-    message = user_message or ""
-    if evidence not in message:
-        return False
-    has_secret_shape = any(c.isdigit() or (not c.isalnum() and not c.isspace()) for c in evidence)
-    if not has_secret_shape:
-        return False
-    start = 0
-    while True:
-        index = message.find(evidence, start)
-        if index < 0:
-            return False
-        end = index + len(evidence)
-        before = message[index - 1] if index else ""
-        after = message[end] if end < len(message) else ""
-        before_is_boundary = not before or before.isspace() or before in "([{\"'"
-        after_is_boundary = (
-            not after or after.isspace() or after in ")]\"}'" or (not evidence[-1].isalnum() and after in ".,;:?")
-        )
-        if before_is_boundary and after_is_boundary:
-            return True
-        start = index + 1
+    return bool(_raw_secret_evidence_spans(evidence, user_message))
 
 
 def _coerce_clarification_reason(value: Any) -> ClarificationReason:
@@ -4083,7 +4105,7 @@ def live_page_credentials_admissible(policy: RequestPolicy) -> bool:
     Callers that must pay for evidence — a browser read, a credential load — check this first so a
     turn that could never admit does not buy the evidence to decide it.
     """
-    return not policy.raw_secret_detected and policy.allow_run_blocks
+    return not policy.raw_secret_detected
 
 
 def _live_page_url_abstains(
@@ -4440,13 +4462,11 @@ async def _build_request_policy_bootstrap(
             exc_info=True,
         )
 
-    # The literal is already absent from server-owned provenance. TurnIntent must still
-    # authorize DRAFT_ONLY before the compatibility projector permits an update.
+    # The literal is already absent from server-owned provenance. RequestPolicy keeps
+    # the safety-approved redacted draft update-only and prevents a browser run.
     if policy.raw_secret_detected:
         policy.allow_run_blocks = False
-        redacted_draft_candidate = (
-            policy.raw_secret_handling == "redacted_draft" and policy.user_response_policy != "ask_clarification"
-        )
+        redacted_draft_candidate = policy.raw_secret_handling == "redacted_draft"
         policy.allow_missing_credentials_in_draft = redacted_draft_candidate
         policy.credential_draft_deferred_explicitly = redacted_draft_candidate
 
@@ -4502,27 +4522,30 @@ async def build_request_policy_trust_floor(
     prior_user_messages: Sequence[WorkflowCopilotChatHistoryMessage] = (),
 ) -> RequestPolicy:
     del config
-    safety = await _screen_raw_secret_safety(user_message, handler)
+    safety = await _screen_raw_secret_safety(user_message, handler, organization_id=organization_id)
     credential_ids = _credential_ids(user_message)
     raw_secret_present = safety.status == "detected"
-    safety_blocked = safety.status == "blocked" or (raw_secret_present and safety.handling == "block")
+    # Only an unavailable screen withholds the turn. A screen that ran and cited redacts what it
+    # cited and continues update-only, so a detection never costs the user the rest of their turn.
+    safety_blocked = safety.status == "blocked"
     policy = RequestPolicy(
         authoring_intent="author_now",
         credential_input_kind=("raw_secret" if raw_secret_present else "credential_id" if credential_ids else "none"),
         credential_refs=credential_ids,
         raw_secret_detected=raw_secret_present,
-        # A safety-approved redacted draft still needs DRAFT_ONLY authority before mutation.
-        raw_secret_handling=safety.handling if raw_secret_present else "block" if safety_blocked else "none",
+        # The safety screen owns the redacted-draft transition.
+        raw_secret_handling=safety.handling,
         raw_secret_safety_status=safety.status,
         raw_secret_safety_failure_kind=safety.failure_kind,
         raw_secret_safety_citation_count=safety.citation_count,
+        raw_secret_safety_exonerated_citation_count=safety.exonerated_citation_count,
         raw_secret_safety_latency_ms=safety.latency_ms,
         requires_user_clarification=safety_blocked,
         allow_update_workflow=not safety_blocked,
         allow_run_blocks=not safety_blocked,
         user_response_policy="ask_clarification" if safety_blocked else "proceed",
-        clarification_reason="raw_secret" if safety_blocked else "none",
-        clarification_question=RAW_SECRET_QUESTION if safety_blocked else None,
+        clarification_reason="safety_screen_unavailable" if safety_blocked else "none",
+        clarification_question=SAFETY_SCREEN_UNAVAILABLE_QUESTION if safety_blocked else None,
         classifier_status="not_run",
         completion_contract_status="absent",
         canonical_user_message=safety.canonical_user_message,
@@ -4541,6 +4564,8 @@ async def build_request_policy_trust_floor(
         status=policy.raw_secret_safety_status,
         failure_kind=policy.raw_secret_safety_failure_kind,
         citation_count=policy.raw_secret_safety_citation_count,
+        exonerated_citation_count=policy.raw_secret_safety_exonerated_citation_count,
+        handling=policy.raw_secret_handling,
         latency_ms=round(policy.raw_secret_safety_latency_ms, 3),
     )
     return policy

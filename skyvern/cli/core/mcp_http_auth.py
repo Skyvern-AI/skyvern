@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
@@ -66,6 +67,8 @@ _DEFAULT_REMOTE_BASE_URL = "https://api.skyvern.com"
 _MCP_REALM = "mcp"
 _RESOURCE_CLAIM_KEYS = ("resource",)
 _TOKEN_CLOCK_SKEW_SECONDS = 60.0
+_SCOPED_RESOURCE_SUFFIX_RE = re.compile(r"/x/[a-z0-9_-]+$")
+_scoped_mcp_resources_enabled = False
 
 _OrgEntitiesGetter = Callable[[str, str], Awaitable[list[Any]]]
 _OrgAuthTokenGetter = Callable[[str, OrganizationAuthTokenType], Awaitable[Any | None]]
@@ -176,14 +179,24 @@ def _validate_token_issuer(payload: dict[str, object], expected_issuer: str) -> 
         raise HTTPException(status_code=401, detail="Token issuer is not valid for this MCP resource")
 
 
-def _normalize_resource(resource: str) -> str:
-    """Strip a trailing slash so audience / resource comparisons are slash-agnostic.
+def set_scoped_mcp_resources_enabled(enabled: bool) -> None:
+    global _scoped_mcp_resources_enabled
+    _scoped_mcp_resources_enabled = enabled
 
-    Centralized here so ``_validate_token_audience``,
-    ``_validate_token_resource_claims``, and any future validator apply the
-    same normalization rule to both sides of the comparison.
+
+def _normalize_resource(resource: str) -> str:
+    """Normalize MCP resource URI variants before auth comparisons.
+
+    Strip trailing slashes. When the deployment also mounts scoped MCP routing,
+    structurally strip one trailing ``/x/<segment>`` suffix before comparing.
+    Scope-name validation stays with the cloud router / shared cloud normalizer;
+    OSS streamable HTTP does not serve those routes, so scoped resources stay
+    distinct unless explicitly enabled by the host app.
     """
-    return resource.rstrip("/")
+    normalized = resource.rstrip("/")
+    if _scoped_mcp_resources_enabled:
+        return _SCOPED_RESOURCE_SUFFIX_RE.sub("", normalized)
+    return normalized
 
 
 def _validate_token_audience(payload: dict[str, object], expected_resource: str) -> None:
@@ -201,8 +214,8 @@ def _validate_token_audience(payload: dict[str, object], expected_resource: str)
     else:
         audiences = []
 
-    # Slash-agnostic compare: tokens whose `aud` was minted against either
-    # `.../mcp` or `.../mcp/` validate against either expected form.
+    # Resource compare: tokens whose `aud` was minted against canonical or
+    # scoped MCP URL variants validate against either expected form.
     expected_norm = _normalize_resource(expected_resource)
     if not any(_normalize_resource(a) == expected_norm for a in audiences):
         raise HTTPException(status_code=401, detail="Token audience is not valid for this MCP resource")

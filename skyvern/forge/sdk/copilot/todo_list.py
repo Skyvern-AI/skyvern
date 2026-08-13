@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from collections.abc import Set as AbstractSet
 from typing import Any
 
@@ -10,10 +10,6 @@ import structlog
 
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
-from skyvern.forge.sdk.copilot.turn_intent import (
-    REGISTERED_DOWNLOAD_OUTPUT_PATH,
-    turn_intent_authorizes_registered_download,
-)
 
 LOG = structlog.get_logger(__name__)
 
@@ -29,7 +25,7 @@ def _credential_fill_page_keys(ctx: AgentContext) -> set[str] | None:
     keys: set[str] = set()
     fills = 0
     entries: list[dict[str, Any]] = [dict(interaction) for interaction in ctx.scout_trajectory]
-    entries.extend(entry for entry in ctx.prior_fill_carry if isinstance(entry, dict))
+    entries.extend(entry for entry in ctx.prior_carried_trajectory if isinstance(entry, dict))
     for entry in entries:
         if entry.get("tool_name") != "fill_credential_field":
             continue
@@ -122,7 +118,7 @@ def _outputs_line(ctx: AgentContext) -> str | None:
 
 
 def _interactions_line(ctx: AgentContext) -> str | None:
-    if ctx.scout_trajectory or ctx.prior_fill_carry or _interaction_reached_page_keys(ctx):
+    if ctx.scout_trajectory or ctx.prior_carried_trajectory or _interaction_reached_page_keys(ctx):
         return None
     return "The site has not been acted on yet (0 interactions recorded)"
 
@@ -155,51 +151,7 @@ def unmet_action_deliverable_criteria_from(
 
 def unmet_action_deliverable_criteria(ctx: AgentContext) -> list[CompletionCriterion]:
     minted = _minted_criteria(ctx)
-    unmet = unmet_action_deliverable_criteria_from(minted, _inapplicable_criterion_ids(ctx))
-    if unmet or any(
-        "registered_download" in (criterion.deliverable_kind, criterion.declared_deliverable_kind)
-        and criterion.level == "run"
-        for criterion in minted
-    ):
-        return unmet
-    if not turn_intent_authorizes_registered_download(getattr(ctx, "turn_intent", None)):
-        return []
-    if _registered_download_delivered(ctx):
-        return []
-    return [
-        CompletionCriterion(
-            id="__copilot_turn_intent_registered_download__",
-            outcome="the requested file is registered as a browser download",
-            deliverable_kind="registered_download",
-            declared_deliverable_kind="registered_download",
-            output_path=REGISTERED_DOWNLOAD_OUTPUT_PATH,
-        )
-    ]
-
-
-def _registered_download_delivered(ctx: AgentContext) -> bool:
-    # Offline replay probes deliberately use a lightweight context that omits optional
-    # runtime-evidence carriers until they are observed.
-    reached = getattr(ctx, "reached_download_target", None)
-    if reached is not None and getattr(reached, "already_registered", False):
-        return True
-    output_maps = (
-        getattr(ctx, "verified_terminal_block_outputs", None),
-        getattr(ctx, "verified_block_outputs", None),
-    )
-    count_keys = ("downloaded_file_count", "downloaded_file_url_count", "downloaded_file_artifact_count")
-    for outputs in output_maps:
-        if not isinstance(outputs, Mapping):
-            continue
-        for payload in outputs.values():
-            if not isinstance(payload, Mapping) or payload.get("download_registered") is not True:
-                continue
-            if any(
-                isinstance(payload.get(key), int) and not isinstance(payload.get(key), bool) and payload.get(key, 0) > 0
-                for key in count_keys
-            ):
-                return True
-    return False
+    return unmet_action_deliverable_criteria_from(minted, _inapplicable_criterion_ids(ctx))
 
 
 def render_todo_list(ctx: AgentContext) -> str | None:

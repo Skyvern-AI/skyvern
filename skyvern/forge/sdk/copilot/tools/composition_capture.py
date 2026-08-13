@@ -8,7 +8,6 @@ from urllib.parse import urlparse
 
 import structlog
 
-from skyvern.forge.sdk.copilot.build_test_outcome import maybe_satisfy_recorded_outcome_grounding_requirement
 from skyvern.forge.sdk.copilot.challenge_evidence import challenge_evidence_unsettled
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION as _COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
@@ -43,16 +42,12 @@ from ._shared import (
     _workflow_verification_evidence,
 )
 from .blockers import _allows_post_run_current_page_inspection_budget_bypass
-from .completion import (
-    _maybe_run_completion_verification_from_page_observation,
-)
 from .discovery import _resolve_discovery_entry_url
 from .guardrails import _authority_tool_error
 from .mcp_hooks import _bind_login_credential_for_observed_url
 from .scouting import (
     _clear_pending_browser_interaction_observation,
     _consume_pending_browser_interaction_observation,
-    _mark_page_inspected,
     _mark_post_run_page_observed,
     solve_challenge_when_evidence_settles,
 )
@@ -701,19 +696,6 @@ async def _inspect_page_for_composition_impl(
     if bypass_budget_for_post_run_current_page:
         copilot_ctx.post_run_current_page_inspection_workflow_run_id = run_id
     finalize_runtime_authoring_repair_context_from_page_observation(copilot_ctx)
-    maybe_satisfy_recorded_outcome_grounding_requirement(copilot_ctx)
-    if (
-        isinstance(run_id, str)
-        and run_id
-        and getattr(copilot_ctx, "post_run_page_observation_after_failed_test", False)
-    ):
-        page_title = evidence.get("page_title")
-        await _maybe_run_completion_verification_from_page_observation(
-            copilot_ctx,
-            url=str(evidence.get("current_url") or current_url or ""),
-            title=page_title if isinstance(page_title, str) else "",
-            observed_data=evidence,
-        )
     earned_interaction = False
     if use_current_page and not run_id:
         earned_interaction = _consume_pending_browser_interaction_observation(
@@ -729,7 +711,6 @@ async def _inspect_page_for_composition_impl(
     observation_step = _append_flow_evidence(copilot_ctx, evidence, reached_via=reached_via)
     if observation_step is None:
         LOG.warning("copilot_flow_evidence_append_failed_no_trajectory")
-    _mark_page_inspected(copilot_ctx)
     # Surface the reached page at the top level so the model registers that the
     # inspection already navigated there and does not re-issue navigate_browser.
     current_url = evidence.get("current_url") or evidence.get("inspected_url") or ""

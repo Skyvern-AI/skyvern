@@ -113,6 +113,33 @@ def _add_entrypoint(logger: logging.Logger, method_name: str, event_dict: EventD
     return event_dict
 
 
+# Datadog intake preprocessing derives the log's severity/message/host/service/source from
+# these reserved attribute names, so a domain kwarg like status="completed" becomes the
+# log's severity (`c*` → critical). Renamed at the render seam only: `context.log` (the S3
+# run artifact), the folded `msg` text, and the console renderer keep the authored names.
+# `severity` is here because it sits between `status` and `level` in Datadog's status-attribute
+# list, so stripping only `status` would promote it to the severity source. `msg` is
+# deliberately absent: this runs after EventRenamer has moved the real message there, so
+# renaming it would strip the message off every line.
+RESERVED_LOG_KEY_RENAMES: dict[str, str] = {
+    "status": "event_status",
+    "severity": "event_severity",
+    "message": "event_message",
+    "host": "event_host",
+    "hostname": "event_hostname",
+    "service": "event_service",
+    "source": "event_source",
+}
+
+
+def escape_reserved_log_keys(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    for key, renamed in RESERVED_LOG_KEY_RENAMES.items():
+        if key in event_dict:
+            # setdefault: an explicitly authored `event_*` kwarg wins over the rename.
+            event_dict.setdefault(renamed, event_dict.pop(key))
+    return event_dict
+
+
 def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
     """
     A custom processor to add key-value pairs to the 'msg' field.
@@ -622,6 +649,7 @@ def setup_logger() -> None:
                 # so it could only re-walk every structured kwarg a second time.
                 redact_bearer_tokens,
                 redact_registered_secrets,
+                *([escape_reserved_log_keys] if settings.JSON_LOGGING else []),
                 renderer,
             ],
         )

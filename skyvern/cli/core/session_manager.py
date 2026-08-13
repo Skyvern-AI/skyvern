@@ -33,6 +33,24 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class ObserveV2State:
+    page_key: tuple[int, int | None, str, str | None] | None = None
+    document_id: str | None = None
+    params: dict[str, Any] = field(default_factory=dict)
+    refs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    next_ref: int = 0
+    host_budgets: dict[str, int] = field(default_factory=dict)
+
+    def reset_refs(self) -> None:
+        """Clear per-document ref data while preserving host budgets across navigation."""
+        self.page_key = None
+        self.document_id = None
+        self.params = {}
+        self.refs = {}
+        self.next_ref = 0
+
+
+@dataclass
 class SessionState:
     browser: SkyvernBrowser | None = None
     context: BrowserContext | None = None
@@ -68,6 +86,8 @@ class SessionState:
     _working_frame: Frame | None = None
     _observed_refs: dict[str, dict[str, Any]] = field(default_factory=dict)
     _observed_refs_generation: int = 0
+    # Local fallback when no cloud/CDP/extension browser-session identity is available.
+    _observe_v2_state: ObserveV2State = field(default_factory=ObserveV2State)
 
     def get_response_body(self, request_id: int) -> str | None:
         """Public accessor for cached response bodies (keyed by request_id)."""
@@ -96,6 +116,7 @@ _copilot_sessions: dict[tuple[str, str], SessionState] = {}
 _SESSION_REF_STORE_MAX = 64
 _session_ref_maps: dict[tuple[str | None, str, str, str | None], dict[str, Any]] = {}
 _session_ref_generations: dict[tuple[str | None, str, str, str | None], int] = {}
+_observe_v2_states: dict[tuple[str | None, str, str, str | None], ObserveV2State] = {}
 _session_ref_generation_counter = itertools.count(1)
 # Identity tokens instead of id(): a GC'd page's id() can be reused by a new
 # page, making a stale snapshot look valid. Tokens are never reissued.
@@ -156,6 +177,24 @@ def _session_ref_key(
     if resolved_cdp_url:
         return (organization_id, "cdp", resolved_cdp_url, api_key_hash)
     return None
+
+
+def get_observe_v2_state(
+    *,
+    session_id: str | None = None,
+    cdp_url: str | None = None,
+) -> ObserveV2State:
+    """Return observe-v2 state keyed exactly like the legacy per-browser ref map."""
+    state = get_current_session()
+    if key := _session_ref_key(state, session_id=session_id, cdp_url=cdp_url):
+        observe_state = _observe_v2_states.pop(key, None)
+        if observe_state is None:
+            observe_state = ObserveV2State()
+        _observe_v2_states[key] = observe_state
+        while len(_observe_v2_states) > _SESSION_REF_STORE_MAX:
+            _observe_v2_states.pop(next(iter(_observe_v2_states)))
+        return observe_state
+    return state._observe_v2_state
 
 
 def session_ref_generation(
@@ -234,11 +273,20 @@ def clear_session_ref_map(
     state = get_current_session()
     if key := _session_ref_key(state, session_id=session_id, cdp_url=cdp_url):
         _session_ref_maps.pop(key, None)
+        observe_state = _observe_v2_states.pop(key, None)
+        if observe_state is None:
+            observe_state = ObserveV2State()
+        else:
+            observe_state.reset_refs()
+        _observe_v2_states[key] = observe_state
+        while len(_observe_v2_states) > _SESSION_REF_STORE_MAX:
+            _observe_v2_states.pop(next(iter(_observe_v2_states)))
         _session_ref_generations[key] = next(_session_ref_generation_counter)
         while len(_session_ref_generations) > _SESSION_REF_STORE_MAX:
             _session_ref_generations.pop(next(iter(_session_ref_generations)))
     else:
         state._observed_refs = {}
+        state._observe_v2_state.reset_refs()
         state._observed_refs_generation = next(_session_ref_generation_counter)
 
 
@@ -441,6 +489,10 @@ async def resolve_browser(
     Cleanup is done via explicit skyvern_browser_session_close() call. For scripts that need
     guaranteed cleanup, use the browser_session() context manager instead.
     """
+    # _session_ref_key must prefer session_id so raw cdp_url callers share refs with this normalized context.
+    if cdp_url and cdp_url.startswith("pbs_") and not session_id:
+        session_id, cdp_url = cdp_url, None
+
     skyvern = get_skyvern()
     current = get_current_session()
 

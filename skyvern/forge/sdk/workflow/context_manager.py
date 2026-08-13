@@ -172,6 +172,20 @@ class WorkflowRunContext:
             workflow_run_context.parameters[parameter.key] = parameter
             workflow_run_context.values[parameter.key] = run_parameter.value
 
+        # An at-will credential (credential_id type, no default) that was not provided has
+        # no run-parameter row (the value column is NOT NULL), so backfill it as explicit
+        # None: blocks and templates referencing it must resolve instead of raising KeyError.
+        if workflow is not None:
+            for definition_parameter in workflow.workflow_definition.parameters:
+                if (
+                    isinstance(definition_parameter, WorkflowParameter)
+                    and definition_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+                    and definition_parameter.default_value is None
+                    and definition_parameter.key not in workflow_run_context.values
+                ):
+                    workflow_run_context.parameters[definition_parameter.key] = definition_parameter
+                    workflow_run_context.values[definition_parameter.key] = None
+
         for output_parameter in workflow_output_parameters:
             if output_parameter.key in workflow_run_context.parameters:
                 raise OutputParameterKeyCollisionError(output_parameter.key)

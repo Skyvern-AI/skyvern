@@ -2,6 +2,7 @@ import {
   BRIDGE_ALARM_NAME,
   DEFAULT_BRIDGE_PORT,
   ERROR_CODES,
+  LEGACY_PROTOCOL_VERSION,
   MESSAGE_TYPES,
   PROTOCOL_VERSION,
   ProtocolError,
@@ -76,9 +77,10 @@ async function signHmac(key, message) {
 }
 
 export class BridgeConnection {
-  constructor({ onRequest, onAuthenticated, onStateChange }) {
+  constructor({ onRequest, onAuthenticated, onReset, onStateChange }) {
     this.onRequest = onRequest;
     this.onAuthenticated = onAuthenticated;
+    this.onReset = onReset;
     this.onStateChange = onStateChange;
     this.socket = null;
     this.authenticated = false;
@@ -96,6 +98,7 @@ export class BridgeConnection {
     this.clientNonce = null;
     this.serverNonce = null;
     this.hmacKey = null;
+    this.messageQueue = Promise.resolve();
 
     chrome.alarms.onAlarm.addListener((alarm) => {
       if (alarm.name === BRIDGE_ALARM_NAME) {
@@ -214,7 +217,19 @@ export class BridgeConnection {
     });
     socket.addEventListener("message", (event) => {
       if (generation === this.connectionGeneration) {
-        void this.handleMessage(event.data);
+        const handling = this.messageQueue
+          .catch(() => undefined)
+          .then(() => {
+            if (
+              generation !== this.connectionGeneration ||
+              this.socket !== socket
+            ) {
+              return undefined;
+            }
+            return this.handleMessage(event.data);
+          });
+        this.messageQueue = handling;
+        void handling;
       }
     });
     socket.addEventListener("error", () => {
@@ -245,7 +260,14 @@ export class BridgeConnection {
       return;
     }
 
-    if (message?.v !== PROTOCOL_VERSION || typeof message.type !== "string") {
+    const legacyChallenge =
+      !this.authenticated &&
+      message?.v === LEGACY_PROTOCOL_VERSION &&
+      message?.type === MESSAGE_TYPES.AUTH_CHALLENGE;
+    if (
+      (message?.v !== PROTOCOL_VERSION && !legacyChallenge) ||
+      typeof message.type !== "string"
+    ) {
       this.failConnection("The local bridge protocol is incompatible.");
       return;
     }
@@ -264,6 +286,49 @@ export class BridgeConnection {
       }
       if (message.type === MESSAGE_TYPES.REQUEST) {
         await this.handleRequest(message);
+        return;
+      }
+      if (message.type === MESSAGE_TYPES.EXTENSION_RESET) {
+        if (
+          typeof message.epoch !== "string" ||
+          message.epoch.length === 0 ||
+          !Number.isInteger(message.generation) ||
+          message.generation < 0
+        ) {
+          this.failConnection(
+            "The local bridge sent an invalid reset request.",
+          );
+          return;
+        }
+        const result = await this.onReset(message.epoch, message.generation);
+        if (result === null || result === undefined) {
+          return;
+        }
+        if (
+          typeof result.executed !== "boolean" ||
+          typeof result.ok !== "boolean" ||
+          !Number.isInteger(result.failedTabCount) ||
+          result.failedTabCount < 0 ||
+          (!result.executed && !result.ok) ||
+          (result.ok && result.failedTabCount !== 0) ||
+          (!result.ok && result.failedTabCount === 0)
+        ) {
+          this.failConnection(
+            "The local bridge reset returned an invalid result.",
+          );
+          return;
+        }
+        const ack = {
+          v: PROTOCOL_VERSION,
+          type: MESSAGE_TYPES.EXTENSION_RESET_ACK,
+          epoch: message.epoch,
+          generation: message.generation,
+          ok: result.ok,
+        };
+        if (!result.ok) {
+          ack.failedTabCount = result.failedTabCount;
+        }
+        this.sendRaw(ack);
         return;
       }
       this.failConnection("The local bridge sent an unexpected message.");

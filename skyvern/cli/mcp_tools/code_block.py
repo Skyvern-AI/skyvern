@@ -12,7 +12,6 @@ from skyvern.forge.sdk.copilot.code_block_preflight import (
     CodeBlockPreflightDiagnostic,
     author_time_code_block_diagnostics,
     preflight_code_block,
-    sandbox_unresolved_name_diagnostics,
 )
 from skyvern.forge.sdk.copilot.code_block_security import (
     CodeBlockSecurityError,
@@ -62,8 +61,8 @@ async def skyvern_code_block_lint(
     """Lint a Workflow Copilot `code` block with the copilot's own deterministic gates.
 
     Runs CodeBlock.is_safe_code(), the security denylist
-    (page.request/page.context), the sandbox unresolved-name analysis,
-    static preflight, and author-time AST diagnostics. Returns a structured pass/fail result.
+    (page.request/page.context), static preflight, and author-time AST diagnostics.
+    Returns a structured pass/fail result.
     No browser session or API call required.
     """
     action = "skyvern_code_block_lint"
@@ -72,11 +71,10 @@ async def skyvern_code_block_lint(
     code_safety_errors = _code_safety_errors(code)
     security_errors = author_time_code_security_errors(label=label, code=code)
     preflight = preflight_code_block(code, parameter_keys=keys)
-    sandbox = sandbox_unresolved_name_diagnostics(code, parameter_keys=keys)
     author_time = author_time_code_block_diagnostics(code)
 
     # Author-time diagnostics stay advisory and are deliberately excluded from ok.
-    ok = not (code_safety_errors or security_errors or preflight or sandbox)
+    ok = not (code_safety_errors or security_errors or preflight)
     return make_result(
         action,
         ok=ok,
@@ -85,7 +83,6 @@ async def skyvern_code_block_lint(
             "code_safety_errors": code_safety_errors,
             "security_errors": [_serialize_security_error(error) for error in security_errors],
             "preflight_diagnostics": [_serialize_diagnostic(diagnostic) for diagnostic in preflight],
-            "sandbox_diagnostics": [_serialize_diagnostic(diagnostic) for diagnostic in sandbox],
             "author_time_diagnostics": [_serialize_diagnostic(diagnostic) for diagnostic in author_time],
         },
         warnings=[diagnostic.message for diagnostic in author_time],
@@ -95,7 +92,7 @@ async def skyvern_code_block_lint(
             else make_error(
                 ErrorCode.INVALID_INPUT,
                 "Code block failed copilot lint gates",
-                "Fix the listed security/preflight/sandbox issues before persisting the block",
+                "Fix the listed security or preflight issues before persisting the block",
             )
         ),
     )
@@ -107,7 +104,7 @@ async def skyvern_code_block_synthesize(
         Field(
             description=(
                 "JSON array of captured interaction objects (the scout trajectory). Each object has "
-                "tool_name plus selector/source_url/role/accessible_name/typed_value/value/key as "
+                "tool_name plus selector/source_url/role/accessible_name/typed_length/value/key as "
                 "applicable. Provide this or session_id, not both."
             )
         ),
