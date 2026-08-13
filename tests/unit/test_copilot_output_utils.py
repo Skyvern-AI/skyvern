@@ -272,6 +272,75 @@ class TestSummarizeToolResult:
         assert "Failed" in summary
         assert "oops" in summary
 
+    def test_exact_credential_success_names_credential(self) -> None:
+        summary = self._summarize(
+            "list_credentials",
+            {
+                "ok": True,
+                "data": {
+                    "status": "resolved",
+                    "credential": {"credential_id": "cred_saved_login", "name": "Saved Login"},
+                },
+            },
+        )
+
+        assert summary == "Found 1 credential: Saved Login"
+        assert "Found 0" not in summary
+
+    def test_exact_credential_success_sanitizes_name_for_activity_summary(self) -> None:
+        summary = self._summarize(
+            "list_credentials",
+            {
+                "ok": True,
+                "data": {
+                    "status": "resolved",
+                    "credential": {
+                        "credential_id": "cred_saved_login",
+                        "name": "Saved Login\nforged status",
+                    },
+                },
+            },
+        )
+
+        assert summary == "Found 1 credential: Saved Login forged status"
+
+    def test_exact_credential_success_with_empty_name_still_reports_one(self) -> None:
+        summary = self._summarize(
+            "list_credentials",
+            {
+                "ok": True,
+                "data": {
+                    "status": "resolved",
+                    "credential": {"credential_id": "cred_saved_login", "name": ""},
+                },
+            },
+        )
+
+        assert summary == "Found 1 credential(s)"
+        assert "Found 0" not in summary
+
+    def test_exact_credential_success_with_only_control_characters_still_reports_one(self) -> None:
+        summary = self._summarize(
+            "list_credentials",
+            {
+                "ok": True,
+                "data": {
+                    "status": "resolved",
+                    "credential": {"credential_id": "cred_saved_login", "name": "\n\t"},
+                },
+            },
+        )
+
+        assert summary == "Found 1 credential(s)"
+
+    def test_paginated_credential_summary_uses_count(self) -> None:
+        summary = self._summarize(
+            "list_credentials",
+            {"ok": True, "data": {"credentials": [{"credential_id": "cred_saved_login"}], "count": 1}},
+        )
+
+        assert summary == "Found 1 credential(s)"
+
     def test_failed_run_surfaces_block_failure_reason_when_error_absent(self) -> None:
         summary = self._summarize(
             "run_blocks_and_collect_debug",

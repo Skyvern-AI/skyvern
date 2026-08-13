@@ -5,15 +5,15 @@ import pytest
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, build_request_policy_trust_floor
-from skyvern.forge.sdk.copilot.tools.credentials import _list_credentials
+from skyvern.forge.sdk.copilot.tools.credentials import _list_credentials, _serialize_credential
 from skyvern.forge.sdk.schemas.credentials import CredentialType
 
 
-def _cred(name: str, credential_id: str) -> SimpleNamespace:
+def _cred(name: str, credential_id: str, *, tested_url: str | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         name=name,
         credential_id=credential_id,
-        tested_url=None,
+        tested_url=tested_url,
         credential_type=CredentialType.PASSWORD,
         username="user@example.test",
         totp_type=None,
@@ -319,3 +319,87 @@ async def test_list_credentials_discovery_does_not_grant_authority(monkeypatch: 
     assert policy.resolved_credentials == []
     assert policy.current_turn_named_credential_ids == set()
     assert [item.credential_id for item in policy.discovered_credentials] == ["cred_one"]
+
+
+@pytest.mark.parametrize("tested_url", ["https://portal.example.test/login", None])
+def test_serialize_credential_includes_tested_url(tested_url: str | None) -> None:
+    serialized = _serialize_credential(_cred("Saved Login", "cred_saved_login", tested_url=tested_url))
+
+    assert "tested_url" in serialized
+    assert serialized["tested_url"] == tested_url
+
+
+@pytest.mark.asyncio
+async def test_list_credentials_exact_result_includes_tested_url() -> None:
+    credential = _cred(
+        "Saved Login",
+        "cred_saved_login",
+        tested_url="https://portal.example.test/login",
+    )
+    policy = RequestPolicy(canonical_user_message=f"Use {credential.credential_id}")
+
+    with patch(
+        "skyvern.forge.sdk.copilot.tools.credentials.load_credentials",
+        AsyncMock(return_value=[credential]),
+    ):
+        result = await _list_credentials({"exact_reference": credential.credential_id}, _ctx(policy))
+
+    assert result["data"]["credential"]["tested_url"] == credential.tested_url
+
+
+@pytest.mark.asyncio
+async def test_list_credentials_page_includes_null_tested_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    credential = _cred("Saved Login", "cred_saved_login")
+    get_credentials = AsyncMock(return_value=[credential])
+    database = SimpleNamespace(credentials=SimpleNamespace(get_credentials=get_credentials))
+    policy = RequestPolicy(canonical_user_message="List my credentials")
+
+    monkeypatch.setattr(object.__getattribute__(app, "_inst"), "DATABASE", database, raising=False)
+    result = await _list_credentials({}, _ctx(policy))
+
+    assert result["data"]["credentials"][0]["tested_url"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("params", "expected_page", "expected_page_size"),
+    [
+        ({"page": 0}, 1, 10),
+        ({"page_size": 0}, 1, 10),
+        ({"page_size": -1}, 1, 1),
+    ],
+)
+async def test_list_credentials_normalizes_pagination(
+    monkeypatch: pytest.MonkeyPatch,
+    params: dict[str, int],
+    expected_page: int,
+    expected_page_size: int,
+) -> None:
+    get_credentials = AsyncMock(return_value=[])
+    database = SimpleNamespace(credentials=SimpleNamespace(get_credentials=get_credentials))
+    policy = RequestPolicy(canonical_user_message="List my credentials")
+
+    monkeypatch.setattr(object.__getattribute__(app, "_inst"), "DATABASE", database, raising=False)
+    result = await _list_credentials(params, _ctx(policy))
+
+    get_credentials.assert_awaited_once_with(
+        organization_id="org-1",
+        page=expected_page,
+        page_size=expected_page_size,
+    )
+    assert result["data"]["page"] == expected_page
+    assert result["data"]["page_size"] == expected_page_size
+    assert result["data"]["has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_credentials_nonempty_full_page_reports_more_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    credential = _cred("Saved Login", "cred_saved_login")
+    get_credentials = AsyncMock(return_value=[credential])
+    database = SimpleNamespace(credentials=SimpleNamespace(get_credentials=get_credentials))
+    policy = RequestPolicy(canonical_user_message="List my credentials")
+
+    monkeypatch.setattr(object.__getattribute__(app, "_inst"), "DATABASE", database, raising=False)
+    result = await _list_credentials({"page_size": 1}, _ctx(policy))
+
+    assert result["data"]["has_more"] is True

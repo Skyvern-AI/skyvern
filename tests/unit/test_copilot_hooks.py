@@ -15,6 +15,7 @@ from structlog.testing import capture_logs
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.context import StructuredContext
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import (
@@ -177,6 +178,33 @@ async def test_on_tool_end_list_credentials_records_resolved_ids() -> None:
         {"credential_id": "cred_amazon", "name": "Amazon"},
         {"credential_id": "cred_quicken", "name": "Quicken Classic"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_exact_credential_preserves_identity_for_structured_context() -> None:
+    ctx = _FakeContext()
+    hooks = CopilotRunHooks(ctx)
+
+    output = _mcp_text_output(
+        {
+            "ok": True,
+            "data": {
+                "status": "resolved",
+                "credential": {"credential_id": "cred_saved_login", "name": "Saved Login"},
+            },
+        }
+    )
+    await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("list_credentials"), output)
+
+    structured_context = StructuredContext()
+    structured_context.merge_turn_summary(ctx.tool_activity)
+
+    assert ctx.tool_activity[0]["credentials"] == [{"credential_id": "cred_saved_login", "name": "Saved Login"}]
+    assert structured_context.credentials_checked[-1].model_dump() == {
+        "credential_name": "Saved Login",
+        "credential_id": "cred_saved_login",
+        "found": True,
+    }
 
 
 @pytest.mark.asyncio

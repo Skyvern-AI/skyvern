@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, Block, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.schemas.workflows import BlockResult, BlockStatus
@@ -106,6 +107,25 @@ class TestDescriptionSkippedOnLoopIterations:
             _setup_mocks(mock_app)
 
             await block.execute_safe(workflow_run_id="wr_1", current_index=5)
+
+            mock_gen_desc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_description_in_script_mode(self) -> None:
+        block = _make_block()
+
+        with (
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch(
+                "skyvern.forge.sdk.workflow.models.block.skyvern_context.current",
+                return_value=SkyvernContext(script_mode=True),
+            ),
+            patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
+            patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock) as mock_gen_desc,
+        ):
+            _setup_mocks(mock_app)
+
+            await block.execute_safe(workflow_run_id="wr_1")
 
             mock_gen_desc.assert_not_called()
 

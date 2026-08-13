@@ -16,7 +16,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _mark_pending_browser_interaction_observation,
 )
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
-from skyvern.forge.sdk.schemas.credentials import CredentialType
+from skyvern.forge.sdk.schemas.credentials import CredentialType, TotpType
 
 
 def _ctx() -> CopilotContext:
@@ -648,6 +648,7 @@ async def test_inspecting_a_login_page_binds_the_credential_that_page_vouches_fo
             name="analytics",
             tested_url="https://analytics.example.test/login",
             credential_type=CredentialType.PASSWORD,
+            totp_type=TotpType.NONE,
         )
     ]
 
