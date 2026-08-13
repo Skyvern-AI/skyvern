@@ -23,6 +23,14 @@ from tests.unit._fingerprint_expectations import expected_fingerprint
 MODULE = "skyvern.services.script_service"
 
 
+class _AsyncioProxy:
+    def __init__(self, sleep_attr):
+        self.sleep = sleep_attr
+
+    def __getattr__(self, name):
+        return getattr(asyncio, name)
+
+
 @pytest.fixture(autouse=True)
 def _keyed_fingerprint(fingerprint_secret_key: str) -> str:
     return fingerprint_secret_key
@@ -916,13 +924,10 @@ async def test_cached_download_waits_for_all_files_before_dispatch(setup, tmp_pa
             dispatch_files.assert_not_awaited()
             refs["update_block"].assert_not_awaited()
 
+        sleep = AsyncMock(side_effect=assert_partial_state_not_settled)
         with (
             patch.object(FileDownloadBlock, "_dispatch_files_to_storage", autospec=True) as dispatch_files,
-            patch(
-                f"{MODULE}.asyncio.sleep",
-                new_callable=AsyncMock,
-                side_effect=assert_partial_state_not_settled,
-            ) as sleep,
+            patch(f"{MODULE}.asyncio", _AsyncioProxy(sleep)),
         ):
             await download(
                 prompt="Download reports",
@@ -936,6 +941,7 @@ async def test_cached_download_waits_for_all_files_before_dispatch(setup, tmp_pa
         sleep.assert_awaited_once()
         dispatch_files.assert_awaited_once()
         assert dispatch_files.await_args.kwargs["files_to_upload"] == [first_complete, second_complete]
+        refs["storage"].save_downloaded_files.assert_awaited_once()
         assert refs["update_block"].await_args.args[1].value == "completed"
     finally:
         _cleanup(refs)
@@ -955,17 +961,6 @@ async def test_poll_passes_immediately_with_complete_file(setup, tmp_path):
         from skyvern.services.script_service import download
 
         sleep_mock = AsyncMock()
-
-        # Patching `script_service.asyncio.sleep` directly mutates the shared
-        # asyncio module, so a stray sleep from any in-process code lands on
-        # the mock and breaks `assert_not_called`. Swap script_service's
-        # asyncio reference for a proxy that intercepts only `sleep`.
-        class _AsyncioProxy:
-            def __init__(self, sleep_attr):
-                self.sleep = sleep_attr
-
-            def __getattr__(self, name):
-                return getattr(asyncio, name)
 
         with patch(f"{MODULE}.asyncio", _AsyncioProxy(sleep_mock)):
             await download(prompt="Download invoice", label="test_block")
