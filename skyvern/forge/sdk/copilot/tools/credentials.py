@@ -249,6 +249,7 @@ def _serialize_credential(credential: Credential) -> dict[str, Any]:
         "credential_id": credential.credential_id,
         "name": credential.name,
         "credential_type": str(credential.credential_type),
+        "tested_url": credential.tested_url,
     }
     if credential.username:
         entry["username"] = credential.username
@@ -338,8 +339,8 @@ async def _list_credentials(params: dict[str, Any], ctx: AgentContext) -> dict[s
             return {"ok": False, "error": "exact_reference must be a non-empty exact saved name or credential ID"}
         return await _resolve_exact_credential(exact_reference, ctx)
 
-    page = params.get("page", 1)
-    page_size = min(params.get("page_size", 10), 50)
+    page = max(1, params.get("page", 1))
+    page_size = min(max(1, params.get("page_size") or 10), 50)
     credentials = await app.DATABASE.credentials.get_credentials(
         organization_id=ctx.organization_id,
         page=page,

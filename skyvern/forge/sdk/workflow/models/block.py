@@ -1169,11 +1169,9 @@ class Block(BaseModel, abc.ABC):
             )
             workflow_run_block_id = workflow_run_block.workflow_run_block_id
 
-            # generate the description for the workflow run block asynchronously
-            # Skip for subsequent for-loop iterations (current_index > 0) — the block
-            # definition is identical across iterations and each iteration gets a fresh
-            # model_copy(deep=True), so instance-level caching doesn't survive.
-            if current_index is None or current_index == 0:
+            current_context = skyvern_context.current()
+            # Script-mode descriptions are cosmetic; loop iterations reuse the first description.
+            if not (current_context and current_context.script_mode) and (current_index is None or current_index == 0):
                 asyncio.create_task(
                     self._generate_workflow_run_block_description(workflow_run_block_id, organization_id)
                 )

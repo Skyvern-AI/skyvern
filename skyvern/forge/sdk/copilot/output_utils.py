@@ -554,6 +554,15 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
             return f"Updated the workflow and ran it: {status}"
         return "Updated the workflow and ran it"
     if tool_name == "list_credentials":
+        if data.get("status") == "resolved":
+            credential = data.get("credential")
+            if isinstance(credential, dict):
+                name = credential.get("name")
+                if isinstance(name, str) and name:
+                    safe_name = sanitize_block_label_for_display(name)
+                    if safe_name:
+                        return f"Found 1 credential: {safe_name}"
+                return "Found 1 credential(s)"
         return f"Found {data.get('count', 0)} credential(s)"
     if tool_name == "list_integrations":
         return f"Found {data.get('count', 0)} connected integration(s)"

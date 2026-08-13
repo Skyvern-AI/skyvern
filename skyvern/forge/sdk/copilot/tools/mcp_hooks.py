@@ -528,6 +528,7 @@ async def _bind_login_credential_for_observed_url(ctx: AgentContext, url: str, r
         credential = record.candidates[0]
         result["resolved_login_credential_id"] = credential.credential_id
         result["resolved_login_credential_name"] = credential.name
+        result["resolved_login_credential_totp_type"] = str(credential.totp_type)
         # The observation may name a placeholder while the match ran against the page read after it,
         # so the page the credential was matched on is reported rather than left to be inferred.
         result["resolved_login_page_url"] = url
