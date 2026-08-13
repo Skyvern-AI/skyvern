@@ -27,14 +27,16 @@ function CodeBlockBlockFormBody({
   node: CodeBlockNode;
 }) {
   const { code, parameterKeys, prompt } = node.data;
+  const errorCodeMapping = node.data.errorCodeMapping ?? "null";
 
   const value = useMemo(
     () => ({
       code,
       parameterKeys,
+      errorCodeMapping,
       prompt,
     }),
-    [code, parameterKeys, prompt],
+    [code, parameterKeys, errorCodeMapping, prompt],
   );
   const { commit } = useDebouncedSidebarSave({
     blockId,

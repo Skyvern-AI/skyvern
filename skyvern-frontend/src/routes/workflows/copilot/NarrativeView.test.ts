@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { shouldShowFixCard } from "./cards/FixCard";
+import { getReviewGateVerdict } from "./cards/ReviewGateCard";
 import { derivePhases } from "./copilotPhases";
 import {
   ActivityEntry,
@@ -35,7 +36,6 @@ const turnStart = (
   type: "turn_start",
   turn_id: "turn-1",
   turn_index: 0,
-  mode: "build",
   timestamp: "2026-05-25T00:00:00Z",
   ...overrides,
 });
@@ -127,21 +127,15 @@ const errorUpdate = (
 });
 
 describe("applyNarrativeEvent — turn_start", () => {
-  it("seeds turnId/turnIndex/mode from an empty narrative", () => {
+  it("seeds turnId/turnIndex from an empty narrative", () => {
     const next = applyNarrativeEvent(EMPTY_NARRATIVE, turnStart());
     expect(next.turnId).toBe("turn-1");
     expect(next.turnIndex).toBe(0);
-    expect(next.mode).toBe("build");
     expect(next.designStarted).toBe(false);
     expect(next.designEnded).toBe(false);
     expect(next.blocks).toEqual([]);
     expect(next.draft).toBeNull();
     expect(next.terminal).toBeNull();
-  });
-
-  it("falls back to 'unknown' mode when an empty mode is sent", () => {
-    const next = applyNarrativeEvent(EMPTY_NARRATIVE, turnStart({ mode: "" }));
-    expect(next.mode).toBe("unknown");
   });
 
   it("resets prior turn state when a new turn_start arrives mid-stream", () => {
@@ -153,15 +147,11 @@ describe("applyNarrativeEvent — turn_start", () => {
       s,
       blockProgress({ block_label: "block_one", status: "running" }),
     );
-    s = applyNarrativeEvent(
-      s,
-      turnStart({ turn_id: "t2", turn_index: 1, mode: "edit" }),
-    );
+    s = applyNarrativeEvent(s, turnStart({ turn_id: "t2", turn_index: 1 }));
 
     expect(s).toMatchObject({
       turnId: "t2",
       turnIndex: 1,
-      mode: "edit",
       blocks: [],
       draft: null,
       designStarted: false,
@@ -704,7 +694,6 @@ describe("applyNarrativeEvent — terminal", () => {
         narrative_payload: {
           turnId: "turn-1",
           turnIndex: 0,
-          mode: "build",
           designStarted: true,
           designEnded: true,
           draft: null,
@@ -747,7 +736,6 @@ describe("applyNarrativeEvent — terminal", () => {
         narrative_payload: {
           turnId: "turn-1",
           turnIndex: 0,
-          mode: "diagnose",
           designStarted: true,
           designEnded: true,
           draft: null,
@@ -821,7 +809,6 @@ describe("effectiveMode", () => {
   it("reports build when classifier said unknown but blocks were drafted from empty prior", () => {
     const s: TurnNarrativeState = {
       ...EMPTY_NARRATIVE,
-      mode: "unknown",
       draft: { blockCount: 2, blockLabels: ["a", "b"], summary: null },
       terminal: "response",
     };
@@ -831,7 +818,6 @@ describe("effectiveMode", () => {
   it("reports edit when prior_block_count > 0 and turn drafted blocks", () => {
     const s: TurnNarrativeState = {
       ...EMPTY_NARRATIVE,
-      mode: "unknown",
       draft: { blockCount: 2, blockLabels: ["a", "b"], summary: null },
       terminal: "response",
       priorBlockCount: 2,
@@ -842,41 +828,34 @@ describe("effectiveMode", () => {
   it("reports clarify when classifier said draft_only but no blocks were drafted", () => {
     const s: TurnNarrativeState = {
       ...EMPTY_NARRATIVE,
-      mode: "draft_only",
       draft: null,
       terminal: "response",
     };
     expect(effectiveMode(s)).toBe("clarify");
   });
 
-  it("preserves docs_answer / diagnose / refuse when terminal has no blocks", () => {
-    for (const mode of ["docs_answer", "diagnose", "refuse"]) {
+  it("derives docs_answer / diagnose / refuse from the response kind when there are no blocks", () => {
+    for (const [responseKind, expected] of [
+      ["answer", "docs_answer"],
+      ["diagnose", "diagnose"],
+      ["refuse", "refuse"],
+    ] as const) {
       const s: TurnNarrativeState = {
         ...EMPTY_NARRATIVE,
-        mode,
+        responseKind,
         terminal: "response",
       };
-      expect(effectiveMode(s)).toBe(mode);
+      expect(effectiveMode(s)).toBe(expected);
     }
   });
 
   it("reports clarify when backend classified the response as ASK_QUESTION", () => {
     const s: TurnNarrativeState = {
       ...EMPTY_NARRATIVE,
-      mode: "diagnose",
       responseType: "ASK_QUESTION",
       terminal: "response",
     };
     expect(effectiveMode(s)).toBe("clarify");
-  });
-
-  it("falls back to classifier mode while turn is still in-flight (no terminal)", () => {
-    const s: TurnNarrativeState = {
-      ...EMPTY_NARRATIVE,
-      mode: "build",
-      terminal: null,
-    };
-    expect(effectiveMode(s)).toBe("build");
   });
 });
 
@@ -912,7 +891,6 @@ const reproClarifyPayload = (
 ): Record<string, unknown> => ({
   turnId: "turn-repro",
   turnIndex: 0,
-  mode: "build",
   responseType: "REPLY",
   cancelled: false,
   proposalDisposition: "no_proposal",
@@ -948,7 +926,6 @@ const buildTurn = (
   overrides: Partial<TurnNarrativeState> = {},
 ): TurnNarrativeState => ({
   ...EMPTY_NARRATIVE,
-  mode: "build",
   terminal: "response",
   ...overrides,
 });
@@ -960,12 +937,11 @@ const draft3 = {
 };
 
 describe("hydrateNarrativeFromPayload — terminal adjudication fields", () => {
-  it("hydrates responseKind and verifiedSuccess from the payload", () => {
+  it("hydrates responseKind without inventing an authoring success stamp", () => {
     const turn = hydrateNarrativeFromPayload(
-      reproClarifyPayload({ responseKind: "build", verifiedSuccess: true }),
+      reproClarifyPayload({ responseKind: "build" }),
     );
     expect(turn?.responseKind).toBe("build");
-    expect(turn?.verifiedSuccess).toBe(true);
   });
 
   it("hydrates the answer response kind from persisted payloads", () => {
@@ -978,25 +954,22 @@ describe("hydrateNarrativeFromPayload — terminal adjudication fields", () => {
   it("treats absent fields as null", () => {
     const turn = hydrateNarrativeFromPayload(reproClarifyPayload());
     expect(turn?.responseKind).toBeNull();
-    expect(turn?.verifiedSuccess).toBeNull();
   });
 
-  it("treats unknown responseKind and non-boolean verifiedSuccess as absent", () => {
+  it("treats an unknown responseKind as absent", () => {
     const turn = hydrateNarrativeFromPayload(
       reproClarifyPayload({
         responseKind: "celebrate",
-        verifiedSuccess: "yes",
       }),
     );
     expect(turn?.responseKind).toBeNull();
-    expect(turn?.verifiedSuccess).toBeNull();
   });
 });
 
 describe("computeTurnSummary — typed terminal adjudication", () => {
   it("renders the loop-guard clarify repro as a Question, not a green built-and-tested claim", () => {
     const turn = hydrateNarrativeFromPayload(
-      reproClarifyPayload({ responseKind: "clarify", verifiedSuccess: false }),
+      reproClarifyPayload({ responseKind: "clarify" }),
     );
     expect(turn).toBeDefined();
     const summary = computeTurnSummary(turn!);
@@ -1010,11 +983,9 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       buildTurn({
         responseKind: "clarify",
         responseType: "REPLY",
-        verifiedSuccess: false,
         lastRunOutcome: {
           verdict: "not_demonstrated",
           displayReason: "The run never reached the target page.",
-          activitySeqAtVerdict: 3,
         },
       }),
     );
@@ -1028,12 +999,10 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       buildTurn({
         responseKind: "clarify",
         responseType: "REPLY",
-        verifiedSuccess: false,
         lastRunOutcome: {
           verdict: "not_demonstrated",
           role: "interim_build_test",
           displayReason: "The workflow still needs its extraction block.",
-          activitySeqAtVerdict: 3,
         },
       }),
     );
@@ -1047,7 +1016,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       buildTurn({
         responseKind: "clarify",
         responseType: "REPLY",
-        verifiedSuccess: false,
         blocks: [
           {
             ...summaryBlock("open_search"),
@@ -1068,12 +1036,10 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       buildTurn({
         responseKind: "clarify",
         responseType: "REPLY",
-        verifiedSuccess: false,
         lastRunOutcome: {
           verdict: "not_demonstrated",
           role: "adjudicated",
           displayReason: "The goal was not demonstrated.",
-          activitySeqAtVerdict: 3,
         },
       }),
     );
@@ -1087,7 +1053,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       buildTurn({
         responseKind: "clarify",
         responseType: "REPLY",
-        verifiedSuccess: false,
         terminalEnvelope: {
           runVerdict: "not_demonstrated",
           runDisplayReason: "The final run did not demonstrate the goal.",
@@ -1096,7 +1061,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
           verdict: "not_demonstrated",
           role: "interim_build_test",
           displayReason: "The workflow still needs its extraction block.",
-          activitySeqAtVerdict: 3,
         },
         blocks: [
           {
@@ -1116,7 +1080,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     const turn = hydrateNarrativeFromPayload(
       reproClarifyPayload({
         responseKind: "clarify",
-        verifiedSuccess: false,
         blocks: [
           {
             ...reproBlock("open_registry_find_registrant"),
@@ -1146,11 +1109,9 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       buildTurn({
         responseKind: "clarify",
         responseType: "ASK_QUESTION",
-        verifiedSuccess: false,
         lastRunOutcome: {
           verdict: "not_demonstrated",
           displayReason: "The run never reached the target page.",
-          activitySeqAtVerdict: 3,
         },
       }),
     );
@@ -1164,7 +1125,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       reproClarifyPayload({
         responseKind: "clarify",
         responseType: "ASK_QUESTION",
-        verifiedSuccess: false,
         blocks: [
           {
             ...reproBlock("open_registry_find_registrant"),
@@ -1195,7 +1155,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       proposalDisposition: "no_proposal",
       responseKind: "build",
       responseType: "ASK_QUESTION",
-      verifiedSuccess: true,
     });
     const summary = computeTurnSummary(turn);
     expect(summary.headline).toBe("Question");
@@ -1214,7 +1173,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       proposalDisposition: "review_untested",
       responseKind: "build",
       responseType: "ASK_QUESTION",
-      verifiedSuccess: true,
     });
     const summary = computeTurnSummary(turn);
     expect(summary.headline).toBe("Draft needs review");
@@ -1228,7 +1186,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       proposalDisposition: "no_proposal",
       responseKind: "build",
       responseType: "REPLY",
-      verifiedSuccess: true,
     });
     const summary = computeTurnSummary(turn);
     expect(summary.headline).toBe("Built and tested the workflow");
@@ -1240,7 +1197,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     const summary = computeTurnSummary(
       buildTurn({
         responseKind: "clarify",
-        verifiedSuccess: false,
       }),
     );
     expect(summary.headline).toBe("Question");
@@ -1252,7 +1208,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     const turn = hydrateNarrativeFromPayload(
       reproClarifyPayload({
         responseKind: "clarify",
-        verifiedSuccess: false,
       }),
     )!;
     expect(turn.lastRunOutcome).toBeNull();
@@ -1267,7 +1222,7 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
 
   it("keeps the factual stats line on an adjudicated clarify build turn", () => {
     const turn = hydrateNarrativeFromPayload(
-      reproClarifyPayload({ responseKind: "clarify", verifiedSuccess: false }),
+      reproClarifyPayload({ responseKind: "clarify" }),
     )!;
     const summary = computeTurnSummary(turn);
     expect(summary.stats).toEqual(["15:02", "3 blocks ran", "3 new"]);
@@ -1277,7 +1232,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     const turn = hydrateNarrativeFromPayload(
       reproClarifyPayload({
         responseKind: "clarify",
-        verifiedSuccess: false,
         priorBlockCount: 2,
       }),
     )!;
@@ -1296,9 +1250,7 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
   ] as const)(
     "maps non-build kind %s to %s with qa accent",
     (kind, headline) => {
-      const summary = computeTurnSummary(
-        buildTurn({ responseKind: kind, verifiedSuccess: false }),
-      );
+      const summary = computeTurnSummary(buildTurn({ responseKind: kind }));
       expect(summary.headline).toBe(headline);
       expect(summary.accent).toBe("qa");
       expect(summary.glyph).toBe("✦");
@@ -1311,7 +1263,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         draft: draft3,
         proposalDisposition: "no_proposal",
         responseKind: "build",
-        verifiedSuccess: true,
       }),
     );
     expect(summary.headline).toBe("Built and tested the workflow");
@@ -1325,35 +1276,29 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         draft: draft3,
         priorBlockCount: 2,
         responseKind: "build",
-        verifiedSuccess: true,
       }),
     );
     expect(summary.headline).toBe("Applied edits and re-tested");
     expect(summary.accent).toBe("ok");
   });
 
-  it("renders a verdict-authorized draftless turn as a completed run", () => {
-    const summary = computeTurnSummary(
-      buildTurn({ responseKind: "build", verifiedSuccess: true }),
-    );
-    expect(summary.headline).toBe("Completed the run");
-    expect(summary.accent).toBe("ok");
+  it("does not infer a completed run from a build response kind alone", () => {
+    const summary = computeTurnSummary(buildTurn({ responseKind: "build" }));
+    expect(summary.headline).toBe("Question");
   });
 
-  it("ignores the prose question heuristic when a typed verdict authorizes success", () => {
+  it("keeps the prose question heuristic without a run fact", () => {
     const summary = computeTurnSummary(
       buildTurn({
         draft: draft3,
         terminalMessage: "Could you provide feedback on the result?",
         responseKind: "build",
-        verifiedSuccess: true,
       }),
     );
-    expect(summary.headline).toBe("Built and tested the workflow");
-    expect(summary.accent).toBe("ok");
+    expect(summary.headline).toBe("Question");
   });
 
-  it("renders a clean built-unverified run as ran, not stopped", () => {
+  it("renders a clean completed build from its block lifecycle", () => {
     const summary = computeTurnSummary(
       buildTurn({
         draft: draft3,
@@ -1364,15 +1309,14 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         ],
         proposalDisposition: "auto_applicable",
         responseKind: "build",
-        verifiedSuccess: false,
       }),
     );
-    expect(summary.headline).toBe("Built and ran the workflow");
+    expect(summary.headline).toBe("Built and tested the workflow");
     expect(summary.accent).toBe("ok");
     expect(summary.glyph).toBe("✓");
   });
 
-  it("renders a clean built-unverified edit as ran, not re-tested", () => {
+  it("renders a clean completed edit from its block lifecycle", () => {
     const summary = computeTurnSummary(
       buildTurn({
         draft: draft3,
@@ -1383,40 +1327,19 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         ],
         priorBlockCount: 2,
         responseKind: "build",
-        verifiedSuccess: false,
       }),
     );
-    expect(summary.headline).toBe("Applied edits and ran the workflow");
+    expect(summary.headline).toBe("Applied edits and re-tested");
     expect(summary.accent).toBe("ok");
     expect(summary.glyph).toBe("✓");
   });
 
   it.each([
-    [buildTurn({ responseKind: "build", verifiedSuccess: false }), "Stopped"],
-    [
-      buildTurn({
-        draft: draft3,
-        proposalDisposition: "auto_applicable",
-        responseKind: "build",
-        verifiedSuccess: false,
-      }),
-      "Stopped",
-    ],
-    [
-      buildTurn({
-        draft: draft3,
-        priorBlockCount: 2,
-        responseKind: "build",
-        verifiedSuccess: false,
-      }),
-      "Stopped",
-    ],
     [
       buildTurn({
         draft: draft3,
         proposalDisposition: "review_untested",
         responseKind: "build",
-        verifiedSuccess: false,
       }),
       "Draft needs review",
     ],
@@ -1425,7 +1348,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         draft: draft3,
         proposalDisposition: "review_tested",
         responseKind: "build",
-        verifiedSuccess: false,
       }),
       "Workflow ready for review",
     ],
@@ -1439,6 +1361,21 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     },
   );
 
+  it("surfaces a tested proposal for review even when the turn ends in a question", () => {
+    const askTurn = buildTurn({
+      draft: draft3,
+      proposalDisposition: "review_tested",
+      responseKind: "clarify",
+      responseType: "ASK_QUESTION",
+      terminalMessage: "Is that output format okay?",
+    });
+
+    expect(computeTurnSummary(askTurn, { uxV1: true }).headline).toBe(
+      "Workflow ready for review",
+    );
+    expect(getReviewGateVerdict(askTurn, null)).toBe("tested");
+  });
+
   it("a failed block still renders Run halted even with a verdict-authorized success", () => {
     const summary = computeTurnSummary(
       buildTurn({
@@ -1448,7 +1385,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
           summaryBlock("block_two", "failed"),
         ],
         responseKind: "build",
-        verifiedSuccess: true,
       }),
     );
     expect(summary.headline).toBe("Run halted");
@@ -1463,7 +1399,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         draft: draft3,
         proposalDisposition: "review_untested",
         responseKind: "build",
-        verifiedSuccess: true,
       }),
     );
     expect(summary.headline).toBe("Stopped with a draft");
@@ -1533,7 +1468,6 @@ describe("computeTurnSummary — uxV1 disposition-first reorder (SKY-12136)", ()
       buildTurn({
         responseKind: "clarify",
         responseType: "ASK_QUESTION",
-        verifiedSuccess: false,
       }),
       { uxV1: true },
     );
@@ -1549,10 +1483,9 @@ describe("computeTurnSummary — uxV1 disposition-first reorder (SKY-12136)", ()
   ] as const)(
     "leaves %s as %s under uxV1 — only the clarify/Question case renames",
     (kind, headline) => {
-      const summary = computeTurnSummary(
-        buildTurn({ responseKind: kind, verifiedSuccess: false }),
-        { uxV1: true },
-      );
+      const summary = computeTurnSummary(buildTurn({ responseKind: kind }), {
+        uxV1: true,
+      });
       expect(summary.headline).toBe(headline);
       expect(summary.accent).toBe("qa");
     },
@@ -1565,7 +1498,6 @@ describe("computeTurnSummary — uxV1 disposition-first reorder (SKY-12136)", ()
         draft: draft3,
         proposalDisposition: "review_untested",
         responseKind: "build",
-        verifiedSuccess: true,
       }),
       { uxV1: true },
     );
@@ -1589,7 +1521,6 @@ describe("hydrateHistoryNarrative — persisted turn_outcome graft", () => {
       response_kind: "clarify",
     })!;
     expect(turn.responseKind).toBe("clarify");
-    expect(turn.verifiedSuccess).toBeNull();
     const summary = computeTurnSummary(turn);
     expect(summary.headline).toBe("Question");
     expect(summary.accent).toBe("qa");
@@ -1597,7 +1528,7 @@ describe("hydrateHistoryNarrative — persisted turn_outcome graft", () => {
 
   it("keeps the payload's own responseKind over the graft", () => {
     const turn = hydrateHistoryNarrative(
-      reproClarifyPayload({ responseKind: "refuse", verifiedSuccess: false }),
+      reproClarifyPayload({ responseKind: "refuse" }),
       { response_kind: "clarify" },
     )!;
     expect(turn.responseKind).toBe("refuse");
@@ -1608,7 +1539,6 @@ describe("hydrateHistoryNarrative — persisted turn_outcome graft", () => {
       response_kind: "build",
     })!;
     expect(turn.responseKind).toBe("build");
-    expect(turn.verifiedSuccess).toBeNull();
     const summary = computeTurnSummary(turn);
     expect(summary.headline).toBe("Built and tested the workflow");
     expect(summary.accent).toBe("ok");
@@ -1637,24 +1567,21 @@ describe("applyNarrativeEvent — terminal adjudication on live frames", () => {
         message: "I'm stuck retrying the same step.",
         narrative_payload: reproClarifyPayload({
           responseKind: "clarify",
-          verifiedSuccess: false,
         }),
       }),
     );
     expect(s.responseKind).toBe("clarify");
-    expect(s.verifiedSuccess).toBe(false);
     expect(computeTurnSummary(s).headline).toBe("Question");
   });
 
   it("leaves both fields null on frames from an older backend", () => {
     const s = applyNarrativeEvent(EMPTY_NARRATIVE, response());
     expect(s.responseKind).toBeNull();
-    expect(s.verifiedSuccess).toBeNull();
   });
 });
 
 describe("humanizeJudgeText", () => {
-  // Verbatim shape of completion.py::_outcome_unverified_reason.
+  // Legacy backend display text still needs to render safely while old events remain in history.
   const JUDGE_REASON =
     "The run completed but did not demonstrate the goal outcome(s). " +
     "Missing evidence: the number of Customer Agents is known. " +
@@ -1792,7 +1719,6 @@ describe("a user stop renders as stopped, never as a failure", () => {
     const turn = hydrateNarrativeFromPayload({
       turnId: "turn-1",
       turnIndex: 0,
-      mode: "build",
       designStarted: true,
       designEnded: true,
       draft: null,
@@ -1829,7 +1755,6 @@ describe("a real cancel's backend payload still renders neutrally", () => {
   const cancelledPayload = () => ({
     turnId: "turn-1",
     turnIndex: 0,
-    mode: "build",
     designStarted: true,
     designEnded: true,
     draft: null,
@@ -1890,6 +1815,44 @@ describe("a real cancel's backend payload still renders neutrally", () => {
     expect(summary.glyph).not.toBe("✓");
     expect(summary.accent).not.toBe("ok");
   });
+
+  // The labels a cancel actually carried before the relabel: the payload surface
+  // wrote "build" through the terminal-reason arm, and "answer" without one.
+  it.each(["build", "answer"] as const)(
+    "renders a blockless cancel identically whether it is labelled %s or recover",
+    (priorKind) => {
+      const summaryFor = (responseKind: "build" | "answer" | "recover") =>
+        computeTurnSummary(
+          buildTurn({ cancelled: true, blocks: [], draft: null, responseKind }),
+          { uxV1: true },
+        );
+
+      expect(summaryFor(priorKind)).toEqual(summaryFor("recover"));
+      expect(summaryFor("recover").headline).toBe("Stopped");
+      expect(summaryFor("recover").stats).toEqual(summaryFor(priorKind).stats);
+    },
+  );
+
+  it.each(["build", "answer"] as const)(
+    "renders a cancel that kept a draft identically whether it is labelled %s or recover",
+    (priorKind) => {
+      const summaryFor = (responseKind: "build" | "answer" | "recover") =>
+        computeTurnSummary(
+          buildTurn({
+            cancelled: true,
+            blocks: [],
+            draft: draft3,
+            proposalDisposition: "review_untested",
+            responseKind,
+          }),
+          { uxV1: true },
+        );
+
+      expect(summaryFor(priorKind)).toEqual(summaryFor("recover"));
+      expect(summaryFor("recover").headline).toBe("Stopped with a draft");
+      expect(summaryFor("recover").accent).toBe("qa");
+    },
+  );
 
   it("still renders a genuine error turn as a failure", () => {
     const turn = hydrateNarrativeFromPayload({

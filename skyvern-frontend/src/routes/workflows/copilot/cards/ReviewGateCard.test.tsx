@@ -17,7 +17,6 @@ const turn = (
   ...EMPTY_NARRATIVE,
   turnId: "turn-1",
   turnIndex: 0,
-  mode: "build",
   designStarted: true,
   designEnded: true,
   draft: {

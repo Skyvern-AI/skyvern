@@ -6,9 +6,8 @@ const FAILURE_OPEN = "[FAILURE]";
 const FAILURE_CLOSE = "[/FAILURE]";
 
 /**
- * Seed message for "Fix with Copilot" on a failed run. Leads with "diagnose" so
- * the turn-intent classifier leans toward diagnosis rather than a rebuild; the
- * run itself is grounded separately via the bridged workflow_run_id.
+ * Seed message for "Fix with Copilot" on a failed run. The run itself is
+ * grounded separately via the bridged workflow_run_id.
  *
  * The failure reason is server-sourced but can echo page/model content, so it is
  * fenced as data and its closing tag is neutralized — it must never break out of

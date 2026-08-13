@@ -88,6 +88,7 @@ import {
 import {
   getLoginCredentialInputs,
   getRotatingCredentialIds,
+  isAtWillCredentialParameter,
 } from "./runWorkflowCredentials";
 import { useCredentialsQuery } from "./hooks/useCredentialsQuery";
 import { visitWorkflowBlocks } from "./workflowBlockUtils";
@@ -912,6 +913,9 @@ function RunWorkflowForm({
                           value === undefined ||
                           value === ""
                         ) {
+                          if (isAtWillCredentialParameter(parameter)) {
+                            return;
+                          }
                           return "Warning: you left this field empty";
                         }
                       },
@@ -1083,6 +1087,12 @@ function RunWorkflowForm({
                         ) {
                           return "This field is required";
                         }
+                        return;
+                      }
+
+                      // An at-will credential (credential_id, no default) may be left
+                      // empty: the run proceeds without a credential.
+                      if (isAtWillCredentialParameter(parameter)) {
                         return;
                       }
 

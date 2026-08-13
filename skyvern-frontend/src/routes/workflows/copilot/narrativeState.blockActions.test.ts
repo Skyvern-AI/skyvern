@@ -18,7 +18,6 @@ const turnStart = (): WorkflowCopilotTurnStartUpdate => ({
   type: "turn_start",
   turn_id: "turn-1",
   turn_index: 0,
-  mode: "build",
   timestamp: "2026-06-10T00:00:00Z",
 });
 
@@ -239,7 +238,6 @@ describe("applyNarrativeEvent — client_block_actions", () => {
       narrative_payload: {
         turnId: "turn-1",
         turnIndex: 0,
-        mode: "build",
         terminal: "response",
         blocks: [
           {
@@ -305,7 +303,6 @@ describe("applyNarrativeEvent — client_block_actions", () => {
       narrative_payload: {
         turnId: "turn-1",
         turnIndex: 0,
-        mode: "build",
         terminal: "response",
         blocks: [
           {
@@ -372,7 +369,6 @@ describe("applyNarrativeEvent — client_block_actions", () => {
       narrative_payload: {
         turnId: "turn-1",
         turnIndex: 0,
-        mode: "build",
         terminal: "response",
         blocks: [dupBlock, { ...dupBlock }],
       },
@@ -393,7 +389,6 @@ describe("applyNarrativeEvent — client_block_actions", () => {
     narrative_payload: {
       turnId: "turn-1",
       turnIndex: 0,
-      mode: "build",
       terminal: "response",
       blocks: [
         {
@@ -500,7 +495,6 @@ describe("hydrateNarrativeFromPayload — client_block_actions fields", () => {
     const hydrated = hydrateNarrativeFromPayload({
       turnId: "turn-1",
       turnIndex: 0,
-      mode: "build",
       terminal: "response",
       blocks: [
         {

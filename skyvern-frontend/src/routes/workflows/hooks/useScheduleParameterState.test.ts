@@ -114,6 +114,26 @@ describe("getScheduleParameterValidationResult", () => {
   test("returns the validation errors and invalid status", () => {
     const workflowParameters: ReadonlyArray<Parameter> = [
       makeWorkflowParam({
+        key: "count",
+        workflow_parameter_type: "integer",
+      }),
+    ];
+
+    expect(
+      getScheduleParameterValidationResult(workflowParameters, {
+        count: "",
+      }),
+    ).toEqual({
+      errors: {
+        count: "Required",
+      },
+      isValid: false,
+    });
+  });
+
+  test("treats a no-default credential parameter as at-will (not required)", () => {
+    const workflowParameters: ReadonlyArray<Parameter> = [
+      makeWorkflowParam({
         key: "credential",
         workflow_parameter_type: "credential_id",
       }),
@@ -124,10 +144,8 @@ describe("getScheduleParameterValidationResult", () => {
         credential: "",
       }),
     ).toEqual({
-      errors: {
-        credential: "Required",
-      },
-      isValid: false,
+      errors: {},
+      isValid: true,
     });
   });
 

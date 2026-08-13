@@ -20,7 +20,6 @@ import {
   ChevronDownIcon,
   CheckIcon,
   ArrowUpIcon,
-  StopIcon,
 } from "@radix-ui/react-icons";
 import { createPortal } from "react-dom";
 import { stringify as convertToYAML } from "yaml";
@@ -209,6 +208,9 @@ function defaultCodeBlockRequestOverride(
 // to a tone-adaptive monochrome silhouette so both read flat on the dark UI.
 const ASK_GLYPH = "\u275D\uFE0E";
 const BUILD_GLYPH = "\uD83D\uDC09";
+
+const STOP_ORBIT_GRADIENT =
+  "conic-gradient(from 0deg, rgba(120,170,255,.08) 0deg, rgba(120,170,255,.08) 120deg, rgba(150,195,255,.55) 250deg, #dbeaff 330deg, rgba(120,170,255,.08) 360deg)";
 
 function isPictographic(glyph: string): boolean {
   try {
@@ -2983,6 +2985,7 @@ export function WorkflowCopilotChat({
     queuedPrompt.reason === "live_browser" &&
     !messages.some((message) => message.id === queuedPrompt.id),
   );
+  const showsStopGlyph = isStopping || (isLoading && !hasComposerText);
   const morphButtonLabel = isStopping
     ? "Stopping…"
     : waitingOnQueueOnly
@@ -3700,7 +3703,7 @@ export function WorkflowCopilotChat({
               queuedPrompt
                 ? "Type to replace the queued message…"
                 : isLoading
-                  ? "Type a message to send next…"
+                  ? "Type to queue a message…"
                   : isWaitingForLiveBrowser
                     ? "Type a prompt to send when ready..."
                     : copilotUxV1Enabled && copilotV2Enabled
@@ -3748,16 +3751,38 @@ export function WorkflowCopilotChat({
                   }
                   aria-label={morphButtonLabel}
                   className={cn(
-                    "flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
-                    isStopping || (isLoading && !hasComposerText)
-                      ? "bg-slate-elevation4 text-foreground hover:bg-slate-elevation3"
+                    "group/stop relative flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.92] disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
+                    showsStopGlyph
+                      ? "bg-slate-elevation3"
                       : "bg-cta text-cta-foreground hover:bg-cta-hover",
                   )}
                 >
-                  {isStopping ? (
-                    <ReloadIcon className="h-3.5 w-3.5 animate-spin" />
-                  ) : isLoading && !hasComposerText ? (
-                    <StopIcon className="h-3 w-3" />
+                  {showsStopGlyph ? (
+                    <>
+                      <span
+                        aria-hidden
+                        data-testid="copilot-stop-orbit"
+                        className={cn(
+                          "absolute -inset-[50%] animate-copilot-stop-orbit motion-reduce:hidden",
+                          isStopping && "paused",
+                        )}
+                        style={{
+                          background: STOP_ORBIT_GRADIENT,
+                          filter: "blur(1.5px)",
+                          willChange: "transform",
+                        }}
+                      />
+                      <span
+                        aria-hidden
+                        className="absolute inset-0 hidden bg-[rgba(150,195,255,0.55)] motion-reduce:block"
+                      />
+                      <span
+                        aria-hidden
+                        className="absolute inset-[2px] flex items-center justify-center rounded-md bg-slate-elevation3 transition-colors group-hover/stop:bg-slate-elevation5"
+                      >
+                        <span className="h-[11.5px] w-[11.5px] rounded-[2.3px] bg-foreground" />
+                      </span>
+                    </>
                   ) : (
                     <ArrowUpIcon className="h-4 w-4" />
                   )}

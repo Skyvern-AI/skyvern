@@ -41,7 +41,6 @@ const turn = (
   ...EMPTY_NARRATIVE,
   turnId: "turn-1",
   turnIndex: 0,
-  mode: "build",
   designStarted: true,
   ...overrides,
 });
@@ -449,40 +448,6 @@ describe("derivePhases — SKY-12969 code-only incremental build (concurrent dra
     expect(phase(derivePhases(hydrated), "draft").status).toBe("done");
   });
 
-  it("AC2 regression: a failed-verify redraft still re-activates Draft exactly as today", () => {
-    // The 11970 redraft beat re-activates Draft from activitySeq vs the
-    // verdict snapshot, independent of any draft artifact.
-    const t = turn({
-      terminal: null,
-      designEnded: true,
-      authoringCount: 1,
-      activitySeq: 3,
-      draft: OFFER,
-      blocks: [block({ state: "completed" })],
-      lastRunOutcome: {
-        verdict: "not_demonstrated",
-        displayReason: "outcome not confirmed",
-        activitySeqAtVerdict: 2,
-      },
-      designActivity: [
-        entry({ id: "1", kind: "tool_call", toolName: "navigate_browser" }),
-        entry({
-          id: "2",
-          kind: "tool_call",
-          toolName: "update_and_run_blocks",
-        }),
-        entry({
-          id: "3",
-          kind: "tool_call",
-          toolName: "inspect_current_workflow",
-        }),
-      ],
-    });
-    const rows = derivePhases(t);
-    expect(phase(rows, "draft").status).toBe("active");
-    expect(phase(rows, "test").status).toBe("done");
-  });
-
   it("AC1/parity: a cancelled terminal with authoring evidence but an aged-out activity list still resolves Explore done, Draft stopped", () => {
     // The reducer grafts the uncapped authoringCount across the terminal swap;
     // the derivation must honor it so an authoring turn whose sole authoring
@@ -615,217 +580,6 @@ describe("shouldArmDraftingGapTimer", () => {
   });
 });
 
-describe("derivePhases — redraft re-activation (SKY-11970 pin)", () => {
-  it("THE PIN: a not_demonstrated verdict followed by new activity re-activates Draft, not Test", () => {
-    const t = turn({
-      terminal: null,
-      designEnded: true,
-      authoringCount: 1,
-      activitySeq: 3,
-      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
-      blocks: [block({ state: "completed" })],
-      lastRunOutcome: {
-        verdict: "not_demonstrated",
-        role: "interim_build_test",
-        displayReason: "outcome not confirmed",
-        activitySeqAtVerdict: 2,
-      },
-      designActivity: [
-        entry({ id: "1", kind: "tool_call", toolName: "navigate_browser" }),
-        entry({
-          id: "2",
-          kind: "tool_call",
-          toolName: "update_and_run_blocks",
-        }),
-        entry({
-          id: "3",
-          kind: "tool_call",
-          toolName: "inspect_current_workflow",
-        }),
-      ],
-    });
-    const rows = derivePhases(t);
-    expect(phase(rows, "draft").status).toBe("active");
-    expect(phase(rows, "test").status).toBe("done");
-  });
-
-  it("REGRESSION PIN: the failed run's own guaranteed trailing tool_result does NOT falsely trigger redrafting (Codex catch)", () => {
-    // update_and_run_blocks emits run_outcome (the verdict) from inside the
-    // tool, then its own tool_result fires right after as the call closes —
-    // that tool_result is not new agent work and must not look like one.
-    const t = turn({
-      terminal: null,
-      designEnded: true,
-      authoringCount: 1,
-      activitySeq: 2, // unchanged: the trailing tool_result never bumped it
-      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
-      blocks: [block({ state: "completed" })],
-      lastRunOutcome: {
-        verdict: "not_demonstrated",
-        displayReason: "outcome not confirmed",
-        activitySeqAtVerdict: 2,
-      },
-      designActivity: [
-        entry({ id: "1", kind: "tool_call", toolName: "navigate_browser" }),
-        entry({
-          id: "2",
-          kind: "tool_call",
-          toolName: "update_and_run_blocks",
-        }),
-        entry({
-          id: "3",
-          kind: "tool_result",
-          toolName: "update_and_run_blocks",
-          success: false,
-        }),
-      ],
-    });
-    const rows = derivePhases(t);
-    expect(phase(rows, "test").status).toBe("active");
-    expect(phase(rows, "draft").status).not.toBe("active");
-  });
-
-  it("REGRESSION PIN: a background narration reporting the failed run does NOT falsely trigger redrafting (Codex catch)", () => {
-    // schedule_narration in streaming_adapter.py can fire right after the
-    // failed run's own tool_result, independent of any real revision.
-    const t = turn({
-      terminal: null,
-      designEnded: true,
-      authoringCount: 1,
-      activitySeq: 2, // unchanged: narration never bumps it
-      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
-      blocks: [block({ state: "completed" })],
-      lastRunOutcome: {
-        verdict: "not_demonstrated",
-        displayReason: "outcome not confirmed",
-        activitySeqAtVerdict: 2,
-      },
-      designActivity: [
-        entry({ id: "1", kind: "tool_call", toolName: "navigate_browser" }),
-        entry({
-          id: "2",
-          kind: "tool_call",
-          toolName: "update_and_run_blocks",
-        }),
-        entry({
-          id: "3",
-          kind: "narration",
-          text: "The run didn't confirm the goal was met.",
-        }),
-      ],
-    });
-    const rows = derivePhases(t);
-    expect(phase(rows, "test").status).toBe("active");
-    expect(phase(rows, "draft").status).not.toBe("active");
-  });
-
-  it("REGRESSION PIN: redraft detection survives the MAX_DESIGN_ACTIVITY_ENTRIES eviction cap (Codex catch)", () => {
-    // designActivity is capped at 50 entries (appendCapped), so its length
-    // plateaus at 50 forever once full — a length-based comparison would
-    // never detect further activity. activitySeq is uncapped and keeps
-    // counting, so redrafting still fires.
-    const cappedActivity = Array.from({ length: 50 }, (_, i) =>
-      entry({ id: `e${i}`, kind: "narration" }),
-    );
-    const t = turn({
-      terminal: null,
-      designEnded: true,
-      authoringCount: 1,
-      activitySeq: 53,
-      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
-      blocks: [block({ state: "completed" })],
-      lastRunOutcome: {
-        verdict: "not_demonstrated",
-        displayReason: "outcome not confirmed",
-        activitySeqAtVerdict: 50,
-      },
-      designActivity: cappedActivity,
-    });
-    expect(phase(derivePhases(t), "draft").status).toBe("active");
-  });
-
-  it("a running block after the redraft flips active back to Test (cyclic accordion)", () => {
-    const t = turn({
-      terminal: null,
-      designEnded: true,
-      authoringCount: 2,
-      activitySeq: 3,
-      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
-      blocks: [block({ state: "running", endedAt: null })],
-      lastRunOutcome: {
-        verdict: "not_demonstrated",
-        displayReason: "outcome not confirmed",
-        activitySeqAtVerdict: 2,
-      },
-      designActivity: [
-        entry({ id: "1", kind: "tool_call", toolName: "navigate_browser" }),
-        entry({
-          id: "2",
-          kind: "tool_call",
-          toolName: "update_and_run_blocks",
-        }),
-        entry({ id: "3", kind: "narration" }),
-      ],
-    });
-    expect(phase(derivePhases(t), "test").status).toBe("active");
-  });
-
-  it("an evaluating verdict keeps Test active, never Draft", () => {
-    const t = turn({
-      terminal: null,
-      designEnded: true,
-      authoringCount: 1,
-      activitySeq: 2,
-      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
-      blocks: [block({ state: "completed" })],
-      lastRunOutcome: {
-        verdict: "evaluating",
-        displayReason: null,
-        activitySeqAtVerdict: 2,
-      },
-      designActivity: [
-        entry({ id: "1", kind: "tool_call", toolName: "navigate_browser" }),
-        entry({
-          id: "2",
-          kind: "tool_call",
-          toolName: "update_and_run_blocks",
-        }),
-      ],
-    });
-    expect(phase(derivePhases(t), "test").status).toBe("active");
-  });
-
-  it("a failed verdict with no new activity since (still composing the terminal reply) stays active on Test, not Draft", () => {
-    // activitySeq === activitySeqAtVerdict: no frame has arrived since the
-    // verdict, so this can't yet be distinguished from the agent composing
-    // its give-up terminal response — redrafting requires proof.
-    const t = turn({
-      terminal: null,
-      designEnded: true,
-      authoringCount: 1,
-      activitySeq: 2,
-      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
-      blocks: [block({ state: "completed" })],
-      lastRunOutcome: {
-        verdict: "not_demonstrated",
-        displayReason: "outcome not confirmed",
-        activitySeqAtVerdict: 2,
-      },
-      designActivity: [
-        entry({ id: "1", kind: "tool_call", toolName: "navigate_browser" }),
-        entry({
-          id: "2",
-          kind: "tool_call",
-          toolName: "update_and_run_blocks",
-        }),
-      ],
-    });
-    const rows = derivePhases(t);
-    expect(phase(rows, "test").status).toBe("active");
-    expect(phase(rows, "draft").status).not.toBe("active");
-  });
-});
-
 describe("derivePhases — test-run count on the not-confirmed stub (SKY-11339)", () => {
   const notConfirmedTurn = (
     runToolNames: string[],
@@ -847,7 +601,7 @@ describe("derivePhases — test-run count on the not-confirmed stub (SKY-11339)"
       ),
     });
 
-  it("surfaces the run count on a multi-run redraft loop (else 6 runs read as 1)", () => {
+  it("surfaces the run count when the workflow was tested multiple times", () => {
     const rows = derivePhases(
       notConfirmedTurn([
         "update_and_run_blocks",
