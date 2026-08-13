@@ -437,7 +437,7 @@ class TestHandleMultiFieldTotpSequence:
             patch("skyvern.webeye.actions.handler.skyvern_context.ensure_context", return_value=context),
             patch("skyvern.webeye.actions.handler.parse_totp_config", return_value=fake_totp),
             patch("skyvern.webeye.actions.handler.time.time", return_value=44),
-            patch("skyvern.webeye.actions.handler.asyncio.sleep", new_callable=AsyncMock) as sleep_mock,
+            patch("skyvern.webeye.actions.handler._totp_window_sleep", new_callable=AsyncMock) as sleep_mock,
         ):
             result = await _handle_multi_field_totp_sequence(
                 {"action_index": 5, "totp_secret": "otpauth://totp/example?secret=abc"},
