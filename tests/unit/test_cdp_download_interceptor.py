@@ -17,7 +17,7 @@ import pytest
 from structlog.testing import capture_logs
 
 import skyvern.webeye.cdp_download_interceptor as mod
-from skyvern.forge.sdk.core.http_request_authorization import deny_unenrolled_redirect_hop
+from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
 from skyvern.webeye.cdp_download_interceptor import (
     CDPDownloadInterceptor,
     _is_stale_interception_error,
@@ -60,6 +60,114 @@ def test_constructor_rejects_missing_required_collaborator(
             network_egress_monitor=network_egress_monitor,
             redirect_hop_authorizer=redirect_hop_authorizer,
         )
+
+
+@pytest.mark.asyncio
+async def test_ownership_only_context_binding_does_not_install_page_listener() -> None:
+    interceptor = _make_interceptor()
+    context = MagicMock()
+    context._skyvern_cdp_download_interceptor = None
+
+    await interceptor.bind_to_context(context, enable_page_interception=False)
+
+    assert context._skyvern_cdp_download_interceptor is interceptor
+    assert interceptor._page_context is context
+    assert interceptor._page_listener is None
+    assert interceptor._accepting_pages is False
+    context.on.assert_not_called()
+
+
+def test_successful_scope_rebind_restores_installed_browser_monitor(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(
+        output_dir=str(tmp_path / "prior"),
+        redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("prior"),
+    )
+    interceptor._browser_session = MagicMock()
+    interceptor._browser_download_listener = MagicMock()
+    assert interceptor.download_scope == "prior"
+
+    interceptor.invalidate_download_scope()
+    assert interceptor._accepting_browser_downloads is False
+    assert interceptor.download_scope is None
+
+    interceptor.rebind_download_scope(
+        download_dir=str(tmp_path / "next"),
+        redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("next"),
+    )
+
+    assert interceptor._accepting_browser_downloads is True
+    assert interceptor.download_scope == "next"
+
+
+def test_invalidated_scope_cannot_publish_in_flight_artifact(tmp_path: Path) -> None:
+    output_dir = tmp_path / "prior"
+    interceptor = _make_interceptor(
+        output_dir=str(output_dir),
+        redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("prior"),
+    )
+    interceptor.set_download_dir(str(output_dir))
+    prior_generation = interceptor._artifact_scope_generation
+    save_path = output_dir / "late.pdf"
+
+    interceptor.invalidate_download_scope()
+
+    with pytest.raises(mod._DownloadScopeInvalidated):
+        interceptor._atomically_write_bytes(save_path, b"late prior-run bytes", prior_generation)
+    assert not save_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_rotated_scope_does_not_capture_event_admitted_under_prior_scope(tmp_path: Path) -> None:
+    prior_dir = tmp_path / "prior"
+    next_dir = tmp_path / "next"
+    interceptor = _make_interceptor(
+        output_dir=str(prior_dir),
+        redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("prior"),
+    )
+    prior_generation = interceptor._artifact_scope_generation
+    interceptor.rebind_download_scope(
+        download_dir=str(next_dir),
+        redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("next"),
+    )
+    cdp_session = MagicMock()
+    cdp_session.send = AsyncMock()
+    raw_headers = [
+        {"name": "Content-Disposition", "value": 'attachment; filename="late.pdf"'},
+        {"name": "Content-Type", "value": "application/pdf"},
+    ]
+
+    await interceptor._handle_download(
+        cdp_session,
+        "request-1",
+        "https://example.test/late.pdf",
+        mod._parse_headers(raw_headers),
+        200,
+        raw_headers,
+        prior_generation,
+    )
+
+    cdp_session.send.assert_awaited_once_with(
+        "Fetch.continueResponse",
+        {"requestId": "request-1"},
+    )
+    assert not list(prior_dir.glob("*.pdf"))
+    assert not list(next_dir.glob("*.pdf"))
+
+
+@pytest.mark.asyncio
+async def test_browser_download_event_metadata_is_redacted_from_logs() -> None:
+    interceptor = _make_interceptor()
+    interceptor._browser_context = MagicMock()
+    secret_url = "blob:https://example.test/customer-secret-token"
+    secret_filename = "customer-account-1234.pdf"
+
+    with capture_logs() as logs:
+        await interceptor._handle_browser_download({"url": secret_url, "suggestedFilename": secret_filename})
+
+    rendered_logs = repr(logs)
+    assert secret_url not in rendered_logs
+    assert secret_filename not in rendered_logs
+    assert "suggested_filename_fp" in rendered_logs
 
 
 class TestIsDownloadResponse:
@@ -1120,7 +1228,9 @@ class TestCDPDownloadInterceptorProxyAuth:
             listeners["Fetch.authRequired"]({"requestId": "auth"})
             await asyncio.sleep(0)
 
-        request_handler.assert_awaited_once_with({"requestId": "request"}, cdp_session)
+        request_handler.assert_awaited_once_with(
+            {"requestId": "request"}, cdp_session, interceptor._artifact_scope_generation
+        )
         auth_handler.assert_awaited_once_with({"requestId": "auth"}, cdp_session)
         assert not interceptor._accepting_browser_downloads
         assert interceptor._browser_download_listener is None
@@ -1896,6 +2006,120 @@ class TestDataUrlDownloadCapture:
         assert not interceptor._browser_download_tasks
 
     @pytest.mark.asyncio
+    async def test_browser_download_handlers_are_serialized(self) -> None:
+        interceptor = _make_interceptor()
+        interceptor._accepting_browser_downloads = True
+        first_started = asyncio.Event()
+        release = asyncio.Event()
+        active = 0
+        max_active = 0
+
+        async def paused_download(_url: str, _filename: str, _artifact_scope_generation: int) -> None:
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            first_started.set()
+            await release.wait()
+            active -= 1
+
+        with patch.object(interceptor, "_download_url_directly", side_effect=paused_download):
+            interceptor._schedule_browser_download_handler(
+                {"url": "https://example.com/one", "suggestedFilename": "one"}
+            )
+            await first_started.wait()
+            interceptor._schedule_browser_download_handler(
+                {"url": "https://example.com/two", "suggestedFilename": "two"}
+            )
+            await asyncio.sleep(0)
+            assert max_active == 1
+            release.set()
+            async with interceptor.settle_browser_downloads():
+                pass
+
+        assert not interceptor._browser_download_tasks
+
+    @pytest.mark.asyncio
+    async def test_queued_browser_event_keeps_its_pre_rotation_scope_generation(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(
+            output_dir=str(tmp_path / "prior"),
+            redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("prior"),
+        )
+        interceptor._accepting_browser_downloads = True
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        admitted_generations: list[int] = []
+
+        async def serialized_handler(_event: dict[str, Any], artifact_scope_generation: int) -> None:
+            admitted_generations.append(artifact_scope_generation)
+            if len(admitted_generations) == 1:
+                first_started.set()
+                await release_first.wait()
+
+        prior_generation = interceptor._artifact_scope_generation
+        with patch.object(interceptor, "_handle_browser_download_serialized", side_effect=serialized_handler):
+            interceptor._schedule_browser_download_handler({"url": "https://example.test/first"})
+            await first_started.wait()
+            interceptor._schedule_browser_download_handler({"url": "https://example.test/queued"})
+            interceptor.rebind_download_scope(
+                download_dir=str(tmp_path / "next"),
+                redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("next"),
+            )
+            release_first.set()
+            async with interceptor.settle_browser_downloads():
+                pass
+
+        assert admitted_generations == [prior_generation, prior_generation]
+        assert interceptor._artifact_scope_generation != prior_generation
+
+    @pytest.mark.asyncio
+    async def test_browser_download_handler_queue_is_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        interceptor = _make_interceptor()
+        interceptor._accepting_browser_downloads = True
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def paused_handler(_event: dict[str, Any]) -> None:
+            started.set()
+            await release.wait()
+
+        monkeypatch.setattr(mod, "MAX_PENDING_BROWSER_DOWNLOAD_TASKS", 1)
+        with patch.object(interceptor, "_handle_browser_download", side_effect=paused_handler):
+            interceptor._schedule_browser_download_handler({"url": "https://example.com/one"})
+            await started.wait()
+            interceptor._schedule_browser_download_handler({"url": "https://example.com/two"})
+            assert len(interceptor._browser_download_tasks) == 1
+            release.set()
+            async with interceptor.settle_browser_downloads():
+                pass
+
+        assert not interceptor._browser_download_tasks
+
+    @pytest.mark.asyncio
+    async def test_browser_download_handler_queue_has_a_byte_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        interceptor = _make_interceptor()
+        interceptor._accepting_browser_downloads = True
+        started = asyncio.Event()
+        release = asyncio.Event()
+        first_event = {"url": "https://example.com/one"}
+
+        async def paused_handler(_event: dict[str, Any]) -> None:
+            started.set()
+            await release.wait()
+
+        monkeypatch.setattr(mod, "MAX_PENDING_BROWSER_DOWNLOAD_EVENT_BYTES", len(first_event["url"]) + 1)
+        with patch.object(interceptor, "_handle_browser_download", side_effect=paused_handler):
+            interceptor._schedule_browser_download_handler(first_event)
+            await started.wait()
+            interceptor._schedule_browser_download_handler({"url": "https://example.com/two"})
+            assert len(interceptor._browser_download_tasks) == 1
+            assert interceptor._pending_browser_download_event_bytes == len(first_event["url"])
+            release.set()
+            async with interceptor.settle_browser_downloads():
+                pass
+
+        assert interceptor._pending_browser_download_event_bytes == 0
+
+    @pytest.mark.asyncio
     async def test_settle_browser_downloads_drains_event_admitted_inside_context(self, tmp_path: Path) -> None:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._accepting_browser_downloads = True
@@ -1921,6 +2145,33 @@ class TestDataUrlDownloadCapture:
             await asyncio.wait_for(collecting, timeout=2)
 
         assert (tmp_path / "late.txt").read_text() == "data:text/plain,late"
+        assert not interceptor._browser_download_tasks
+
+    @pytest.mark.asyncio
+    async def test_settle_browser_downloads_waits_for_browser_event_after_action_returns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        interceptor = _make_interceptor()
+        interceptor._browser_session = MagicMock()
+        interceptor._accepting_browser_downloads = True
+        handled = asyncio.Event()
+        delayed_admission: asyncio.Task[None] | None = None
+
+        async def handler(_event: dict[str, Any]) -> None:
+            handled.set()
+
+        async def admit_after_action() -> None:
+            await asyncio.sleep(0.01)
+            interceptor._schedule_browser_download_handler({"url": "https://example.com/late"})
+
+        monkeypatch.setattr(mod, "BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS", 0.05)
+        with patch.object(interceptor, "_handle_browser_download", side_effect=handler):
+            async with interceptor.settle_browser_downloads():
+                delayed_admission = asyncio.create_task(admit_after_action())
+
+        assert delayed_admission is not None
+        await delayed_admission
+        assert handled.is_set()
         assert not interceptor._browser_download_tasks
 
     @pytest.mark.asyncio
@@ -2429,7 +2680,7 @@ class TestDataUrlDownloadCapture:
         release = asyncio.Event()
         session = MagicMock(send=AsyncMock())
 
-        async def paused_handler(event: dict[str, Any], cdp_session: Any) -> None:
+        async def paused_handler(event: dict[str, Any], cdp_session: Any, _artifact_scope_generation: int) -> None:
             assert cdp_session is session
             started.set()
             await release.wait()
@@ -2524,6 +2775,8 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
             headers={"Cookie": "session=cookie-secret"},
             filename="report.pdf",
             authorize_request_hop=authorizer,
+            download_scope=None,
+            approved_initial_url="https://site.example/report.pdf?sig=secret",
         )
         assert (tmp_path / "report.pdf").read_bytes() == b"private report"
 
@@ -2576,13 +2829,13 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
         assert "exception-secret" not in serialized_logs
 
     @pytest.mark.asyncio
-    async def test_unenrolled_hop_authorizer_is_reported_as_unenrolled(self, tmp_path: Path) -> None:
+    async def test_run_scoped_hop_authorizer_fetches_without_unenrolled_drop(self, tmp_path: Path) -> None:
         interceptor = _make_interceptor(
             output_dir=str(tmp_path),
-            redirect_hop_authorizer=deny_unenrolled_redirect_hop,
+            redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("wr_download"),
         )
         interceptor._browser_context = self._context()
-        guarded_fetch = AsyncMock(side_effect=AssertionError("unenrolled authorization must not reach the fetch seam"))
+        guarded_fetch = self._guarded_fetch(b"%PDF-1.7 report", "application/pdf", "report.pdf")
 
         with (
             patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True),
@@ -2590,11 +2843,17 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
         ):
             await interceptor._download_url_directly("https://site.example/report.pdf?sig=url-secret", "report.pdf")
 
-        guarded_fetch.assert_not_awaited()
-        assert list(tmp_path.iterdir()) == []
-        assert [log["event"] for log in logs] == [
-            "Redirect hop authorization is unenrolled for this browser session, dropping direct download"
-        ]
+        guarded_fetch.assert_awaited_once()
+        assert guarded_fetch.await_args.kwargs["download_scope"] == "wr_download"
+        assert guarded_fetch.await_args.kwargs["approved_initial_url"] == (
+            "https://site.example/report.pdf?sig=url-secret"
+        )
+        assert (tmp_path / "report.pdf").read_bytes() == b"%PDF-1.7 report"
+        assert not any(
+            log.get("event")
+            == "Redirect hop authorization is unenrolled for this browser session, dropping direct download"
+            for log in logs
+        )
         assert "url-secret" not in repr(logs)
 
     @pytest.mark.asyncio

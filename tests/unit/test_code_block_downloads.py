@@ -10,8 +10,10 @@ Covers the three acceptance behaviors:
 """
 
 import asyncio
+import hashlib
 import os
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -24,11 +26,13 @@ from skyvern.exceptions import (
     IllegitCompleteScriptTermination,
     ScriptTerminationException,
 )
+from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
 from skyvern.forge.sdk.copilot.reached_download_target import (
     block_output_has_registered_download,
     code_is_download_intent,
 )
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.utils import downloaded_file_count_from_output
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -42,6 +46,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 
 
 def _output_parameter(key: str) -> OutputParameter:
@@ -100,8 +105,8 @@ def _wire_block_runtime(
     *,
     values: dict[str, object] | None = None,
     workflow: SimpleNamespace | None = None,
-) -> None:
-    page = SimpleNamespace()
+) -> SimpleNamespace:
+    page = SimpleNamespace(context=SimpleNamespace(), url="https://example.test/")
     browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=page), browser_artifacts=BrowserArtifacts())
     monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", AsyncMock(return_value=browser_state))
 
@@ -110,12 +115,14 @@ def _wire_block_runtime(
         workflow=workflow,
         workflow_permanent_id="wpid_test",
         workflow_id="w_test",
+        secrets={},
         get_value=lambda key: (values or {}).get(key),
         mask_secrets_in_data=lambda data, mask="*****": data,
     )
     monkeypatch.setattr(CodeBlock, "get_workflow_run_context", lambda self, workflow_run_id: context)
     monkeypatch.setattr(CodeBlock, "format_potential_template_parameters", lambda self, workflow_run_context: None)
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock())
+    return page
 
 
 def _wire_secure_runner(
@@ -147,6 +154,32 @@ def _write_run_download(
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, filename), "wb") as handle:
         handle.write(content)
+
+
+def _arm_delayed_download(
+    page: SimpleNamespace,
+    download_root: str,
+    execution_finished: asyncio.Event,
+) -> asyncio.Event:
+    interceptor = CDPDownloadInterceptor(
+        output_dir=os.path.join(download_root, "wr_1"),
+        network_egress_monitor=BrowserNetworkEgressMonitor.unenrolled(),
+        redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("wr_1"),
+    )
+    page.context._skyvern_cdp_download_interceptor = interceptor
+    transfer_finished = asyncio.Event()
+
+    async def land_after_execution() -> None:
+        await execution_finished.wait()
+        await asyncio.sleep(0)
+        _write_run_download(download_root)
+        transfer_finished.set()
+
+    interceptor._browser_download_generation += 1
+    task = asyncio.create_task(land_after_execution())
+    interceptor._browser_download_tasks.add(task)
+    task.add_done_callback(interceptor._browser_download_done)
+    return transfer_finished
 
 
 def _persisted_output() -> object:
@@ -200,6 +233,143 @@ async def test_code_block_registers_downloads_into_output(
     assert output["downloaded_files"] == [file_info.model_dump()]
     assert output["downloaded_file_urls"] == [file_info.url]
     assert output["downloaded_file_artifact_ids"] == ["a_dl_1"]
+
+
+@pytest.mark.asyncio
+async def test_adopted_in_process_download_settles_and_registers(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+    payload = b"%PDF-1.4 statement"
+    checksum = hashlib.sha256(payload).hexdigest()
+    file_info = FileInfo(
+        url="https://api.example.com/v1/artifacts/a_dl_1/content?artifact_name=invoice.pdf",
+        filename="invoice.pdf",
+        checksum=checksum,
+        file_size=len(payload),
+        artifact_id="a_dl_1",
+    )
+    execution_finished = asyncio.Event()
+
+    async def save_downloaded_files(**_kwargs: object) -> None:
+        assert transfer_finished.is_set()
+        run_dir = os.path.join(_isolated_download_path, "wr_1")
+        assert os.listdir(run_dir) == ["invoice.pdf"]
+        with open(os.path.join(run_dir, "invoice.pdf"), "rb") as handle:
+            stored_bytes = handle.read()
+        assert stored_bytes == payload
+        assert hashlib.sha256(stored_bytes).hexdigest() == checksum
+        assert len(stored_bytes) == file_info.file_size
+
+    _fake_storage_app(
+        monkeypatch,
+        save=save_downloaded_files,
+        get=AsyncMock(side_effect=[[], [file_info]]),
+    )
+    page = _wire_block_runtime(monkeypatch)
+    block = CodeBlock(
+        label="download_invoice",
+        code="saved = 'ok'",
+        output_parameter=_output_parameter("code_out"),
+    )
+    transfer_finished = _arm_delayed_download(page, _isolated_download_path, execution_finished)
+    execute_user_function = CodeBlock.execute_user_function_with_timeout
+
+    async def execute_and_mark_finished(user_function, timeout_seconds):
+        try:
+            return await execute_user_function(user_function, timeout_seconds)
+        finally:
+            execution_finished.set()
+
+    monkeypatch.setattr(CodeBlock, "execute_user_function_with_timeout", staticmethod(execute_and_mark_finished))
+
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is True
+    assert downloaded_file_count_from_output(result.output_parameter_value) == 1
+    assert result.output_parameter_value["downloaded_files"] == [file_info.model_dump()]
+
+
+@pytest.mark.asyncio
+async def test_in_process_settlement_timeout_preserves_success_and_registers(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+    save_downloaded_files = AsyncMock()
+    _fake_storage_app(monkeypatch, save=save_downloaded_files, get=AsyncMock(return_value=[]))
+    _wire_block_runtime(monkeypatch)
+
+    @asynccontextmanager
+    async def never_settles(_browser_context: object):
+        await asyncio.Event().wait()
+        yield
+
+    monkeypatch.setattr(block_module, "settle_browser_downloads_for_context", never_settles)
+    monkeypatch.setattr(block_module, "SAVE_DOWNLOADED_FILES_TIMEOUT", 0.01)
+    monkeypatch.setattr(CodeBlock, "execute_user_function_with_timeout", AsyncMock(return_value={"ok": True}))
+
+    block = CodeBlock(
+        label="code_download",
+        code="saved = 'ok'",
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await asyncio.wait_for(
+        block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1"),
+        timeout=1,
+    )
+
+    assert result.success is True
+    assert result.output_parameter_value["ok"] is True
+    save_downloaded_files.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_adopted_in_process_declared_error_settles_before_failure_registration(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+    file_info = FileInfo(
+        url="https://api.example.com/v1/artifacts/a_dl_1/content?artifact_name=invoice.pdf",
+        filename="invoice.pdf",
+        checksum="deadbeef",
+        file_size=len(b"%PDF-1.4 statement"),
+        artifact_id="a_dl_1",
+    )
+    execution_finished = asyncio.Event()
+
+    async def save_downloaded_files(**_kwargs: object) -> None:
+        assert transfer_finished.is_set()
+
+    _fake_storage_app(
+        monkeypatch,
+        save=save_downloaded_files,
+        get=AsyncMock(side_effect=[[], [file_info]]),
+    )
+    page = _wire_block_runtime(monkeypatch)
+    block = CodeBlock(
+        label="download_invoice",
+        code="raise ErrorCode('report_unavailable', 'report generation failed')",
+        output_parameter=_output_parameter("code_out"),
+        error_code_mapping={"report_unavailable": "The report could not be generated"},
+    )
+    transfer_finished = _arm_delayed_download(page, _isolated_download_path, execution_finished)
+    execute_user_function = CodeBlock.execute_user_function_with_timeout
+
+    async def execute_and_mark_finished(user_function, timeout_seconds):
+        try:
+            return await execute_user_function(user_function, timeout_seconds)
+        finally:
+            execution_finished.set()
+
+    monkeypatch.setattr(CodeBlock, "execute_user_function_with_timeout", staticmethod(execute_and_mark_finished))
+
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is False
+    assert result.failure_reason == "report generation failed"
+    assert result.error_codes == ["report_unavailable"]
+    assert downloaded_file_count_from_output(result.output_parameter_value) == 1
+    assert result.output_parameter_value["downloaded_files"] == [file_info.model_dump()]
 
 
 @pytest.mark.asyncio
@@ -1785,3 +1955,32 @@ async def test_secure_runner_bound_output_reaches_the_block_row(
     assert row_output["downloaded_file_urls"] == [file_info.url]
     assert block_output_has_registered_download(row_output) is True
     assert row_output == result.output_parameter_value
+
+
+def test_authored_registration_keys_are_dropped_one_level_down_too() -> None:
+    """The completion grader reads a nested ``output`` mapping as well as the root, so a claim
+    parked one level down reads as a registration just as convincingly as one at the root."""
+    forged = {
+        "output": {
+            "downloaded_files": [{"filename": "invoice.pdf"}],
+            "downloaded_file_urls": ["file:///tmp/invoice.pdf"],
+            "kept": "value",
+        },
+        "note": "model wrote these itself",
+    }
+
+    bound = block_module.bind_downloaded_files_to_output(forged, [])
+
+    assert bound["output"] == {"kept": "value"}
+    assert bound["note"] == "model wrote these itself"
+    assert block_output_has_registered_download(bound["output"]) is False
+    assert block_output_has_registered_download(bound) is False
+
+
+def test_nested_schema_placeholders_survive_the_drop() -> None:
+    """An empty or None field is schema a template may dereference, not a claim to drop."""
+    schema_only = {"output": {"downloaded_files": [], "downloaded_file_urls": None, "kept": "value"}}
+
+    bound = block_module.bind_downloaded_files_to_output(schema_only, [])
+
+    assert bound["output"] == {"downloaded_files": [], "downloaded_file_urls": None, "kept": "value"}

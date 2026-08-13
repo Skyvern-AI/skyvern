@@ -4,6 +4,7 @@ from typer.testing import CliRunner
 
 from skyvern.cli import mcp
 from skyvern.cli.commands import cli_app
+from skyvern.cli.setup_commands import MCPToolScope
 
 
 def test_setup_mcp_local_claude_code_uses_local_stdio(monkeypatch) -> None:
@@ -24,6 +25,7 @@ def test_setup_mcp_local_claude_code_uses_local_stdio(monkeypatch) -> None:
             "dry_run": False,
             "yes": True,
             "local": True,
+            "scope": MCPToolScope.all,
             "use_python_path": True,
             "url": None,
             "project": False,
@@ -33,6 +35,23 @@ def test_setup_mcp_local_claude_code_uses_local_stdio(monkeypatch) -> None:
             "browser_remote_debugging_url": None,
         }
     ]
+
+
+def test_setup_mcp_local_interactive_prompt_passes_scope(monkeypatch) -> None:
+    answers = iter([True, False, False, False])
+    calls: list[dict] = []
+
+    monkeypatch.setattr("skyvern.cli.setup_commands.sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("skyvern.cli.setup_commands.Prompt.ask", lambda *args, **kwargs: "build")
+    monkeypatch.setattr("skyvern.cli.mcp.Confirm.ask", lambda *args, **kwargs: next(answers))
+    monkeypatch.setattr("skyvern.cli.mcp.setup_claude", lambda **kwargs: (_ for _ in ()).throw(AssertionError))
+    monkeypatch.setattr("skyvern.cli.mcp.setup_cursor", lambda **kwargs: (_ for _ in ()).throw(AssertionError))
+    monkeypatch.setattr("skyvern.cli.mcp.setup_windsurf", lambda **kwargs: (_ for _ in ()).throw(AssertionError))
+    monkeypatch.setattr("skyvern.cli.mcp.setup_claude_code", lambda **kwargs: calls.append(kwargs))
+
+    mcp.setup_mcp(local=True)
+
+    assert calls[0]["scope"] == "build"
 
 
 def test_init_callback_passes_plain_database_string(monkeypatch) -> None:

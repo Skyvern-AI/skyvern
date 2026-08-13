@@ -13,6 +13,8 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     BlockEditError,
     apply_block_edit,
     delete_block_from_workflow,
+    stored_block_code,
+    stored_workflow_yaml,
 )
 
 _WORKFLOW = """title: Lookup
@@ -71,6 +73,46 @@ class TestAnchoredCodeEdit:
         assert "open_portal" in str(exc.value) and "read_total" in str(exc.value)
 
 
+class TestStoredBlockCode:
+    """What a surface must show the model so its next anchor is not written against a stale copy."""
+
+    def test_returns_the_text_an_anchor_is_matched_against(self) -> None:
+        code = stored_block_code(_WORKFLOW, "read_total")
+        assert code is not None
+        applied = apply_block_edit(_WORKFLOW, "read_total", expected_code=code, replacement_code='return {"total": 1}')
+        assert 'return {"total": 1}' in applied
+
+    def test_follows_the_rewrite_a_repair_cycle_applied(self) -> None:
+        rewritten = _WORKFLOW.replace('"#total"', '"#grand-total"')
+        ctx = SimpleNamespace(last_workflow_yaml=rewritten, workflow_yaml=_WORKFLOW)
+        code = stored_block_code(stored_workflow_yaml(ctx), "read_total")
+        assert code is not None and "#grand-total" in code
+        assert '#total"' not in code
+
+    def test_falls_back_to_the_turns_draft_before_any_write(self) -> None:
+        ctx = SimpleNamespace(last_workflow_yaml=None, workflow_yaml=_WORKFLOW)
+        assert stored_block_code(stored_workflow_yaml(ctx), "open_portal") is not None
+
+    @pytest.mark.parametrize(
+        ("stored", "label"),
+        [
+            (_WORKFLOW, "ghost"),
+            (_WORKFLOW, ""),
+            ("{{ not yaml", "read_total"),
+            ("", "read_total"),
+            (_WORKFLOW.replace("      code: |\n        total", "      x: |\n        total"), "read_total"),
+        ],
+    )
+    def test_says_nothing_rather_than_guessing(self, stored: str, label: str) -> None:
+        assert stored_block_code(stored, label) is None
+
+    def test_a_duplicated_label_resolves_to_nothing(self) -> None:
+        """apply_block_edit refuses a duplicated label, so showing one of the two would be a copy no
+        edit can be anchored against."""
+        duplicated = _WORKFLOW + _WORKFLOW.split("blocks:\n")[1]
+        assert stored_block_code(duplicated, "read_total") is None
+
+
 class TestFieldEdit:
     def test_sets_only_the_named_fields(self) -> None:
         out = apply_block_edit(_WORKFLOW, "open_portal", fields={"continue_on_failure": True})
@@ -95,49 +137,3 @@ class TestDelete:
         once = delete_block_from_workflow(_WORKFLOW, "read_total")
         with pytest.raises(BlockEditError):
             delete_block_from_workflow(once, "read_total")
-
-
-class TestWholeWorkflowSubmissionIsSteeredToBlockEdits:
-    """A repair that re-sends every block to change some of them is the cycle SKY-13133 exists to
-    stop. Structural changes still need the whole workflow, since edit_block only reaches blocks
-    that already exist — so the discriminator is whether the set of labels changed."""
-
-    @staticmethod
-    def _ctx(stored: str) -> SimpleNamespace:
-        return SimpleNamespace(last_workflow_yaml=stored, workflow_yaml=stored)
-
-    def test_content_only_change_is_steered(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _submission_only_changes_existing_blocks
-
-        changed = _WORKFLOW.replace('"#total"', '"#grand-total"')
-        assert _submission_only_changes_existing_blocks(self._ctx(_WORKFLOW), changed) is True
-
-    def test_adding_a_block_still_goes_through(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _submission_only_changes_existing_blocks
-
-        added = (
-            _WORKFLOW
-            + """    - block_type: code
-      label: save_result
-      code: |
-        return {"saved": True}
-"""
-        )
-        assert _submission_only_changes_existing_blocks(self._ctx(_WORKFLOW), added) is False
-
-    def test_removing_a_block_still_goes_through(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _submission_only_changes_existing_blocks
-
-        removed = delete_block_from_workflow(_WORKFLOW, "read_total")
-        assert _submission_only_changes_existing_blocks(self._ctx(_WORKFLOW), removed) is False
-
-    def test_first_draft_is_never_steered(self) -> None:
-        """There is nothing to edit on the creating turn, so the whole workflow is the only option."""
-        from skyvern.forge.sdk.copilot.tools import _submission_only_changes_existing_blocks
-
-        assert _submission_only_changes_existing_blocks(self._ctx(""), _WORKFLOW) is False
-
-    def test_unparseable_input_is_never_steered(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _submission_only_changes_existing_blocks
-
-        assert _submission_only_changes_existing_blocks(self._ctx(_WORKFLOW), "{{ not yaml") is False

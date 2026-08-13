@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 from unittest.mock import AsyncMock, MagicMock, call
@@ -11,6 +12,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy.sql.elements import BindParameter
 
+from skyvern.exceptions import DownloadFileMaxSizeExceeded
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
@@ -108,6 +110,406 @@ def test_google_drive_extract_folder_id_rejects_non_folder_url() -> None:
 def test_google_drive_extract_folder_id_rejects_non_google_folder_url() -> None:
     with pytest.raises(ValueError, match=r"https://\*\.google\.com"):
         google_drive_service.extract_folder_id("https://attacker.example.com/folders/folder_123")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("file_123", "file_123"),
+        ("https://drive.google.com/file/d/file_123/view?usp=sharing", "file_123"),
+    ],
+)
+def test_google_drive_extract_file_id(value: str, expected: str) -> None:
+    assert google_drive_service.extract_file_id(value) == expected
+
+
+def test_google_drive_extract_file_reference_preserves_resource_key() -> None:
+    reference = google_drive_service.extract_file_reference(
+        "https://drive.google.com/file/d/file_123/view?resourcekey=resource_key_123"
+    )
+
+    assert reference.file_id == "file_123"
+    assert reference.resource_key == "resource_key_123"
+
+
+def test_google_drive_extract_file_id_rejects_non_drive_host() -> None:
+    with pytest.raises(ValueError, match="drive.google.com"):
+        google_drive_service.extract_file_id("https://attacker.example.com/file/d/file_123/view")
+
+
+@pytest.mark.asyncio
+async def test_google_drive_downloads_private_file_with_bearer_token(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+    payload = b"private-drive"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.headers["Authorization"] == "Bearer at-1"
+        assert request.headers["X-Goog-Drive-Resource-Keys"] == "file_123/resource_key_123"
+        if request.url.params.get("alt") == "media" and request.url.params.get("redirected") != "true":
+            return httpx.Response(
+                307,
+                headers={
+                    "Location": (
+                        "https://www.googleapis.com/drive/v3/files/file_123"
+                        "?alt=media&supportsAllDrives=true&redirected=true"
+                    )
+                },
+            )
+        if request.url.params.get("alt") == "media":
+            return httpx.Response(200, content=payload, headers={"Content-Length": str(len(payload))})
+        return httpx.Response(
+            200,
+            json={
+                "id": "file_123",
+                "name": "../private report.pdf",
+                "mimeType": "application/pdf",
+                "size": str(len(payload)),
+            },
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+    output_dir = tmp_path / "downloads"
+
+    downloaded_path = await google_drive_service.download_file(
+        access_token="at-1",
+        file_id="file_123",
+        resource_key="resource_key_123",
+        output_dir=str(output_dir),
+        max_size_mb=1,
+    )
+
+    assert Path(downloaded_path) == output_dir / "private report.pdf"
+    assert Path(downloaded_path).read_bytes() == payload
+    assert len(requests) == 3
+    assert requests[0].url.params["fields"] == "id,name,mimeType,size"
+    assert requests[0].url.params["supportsAllDrives"] == "true"
+    assert requests[1].url.params["alt"] == "media"
+    assert requests[1].url.params["supportsAllDrives"] == "true"
+    assert requests[2].url.params["redirected"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_strips_bearer_token_on_cross_origin_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+    payload = b"private-drive"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "drive.usercontent.google.com":
+            assert "Authorization" not in request.headers
+            return httpx.Response(200, content=payload)
+
+        assert request.headers["Authorization"] == "Bearer at-1"
+        if request.url.params.get("alt") == "media":
+            return httpx.Response(
+                302,
+                headers={"Location": "https://drive.usercontent.google.com/download?id=file_123"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "file_123",
+                "name": "private.pdf",
+                "mimeType": "application/pdf",
+                "size": str(len(payload)),
+            },
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    downloaded_path = await google_drive_service.download_file(
+        access_token="at-1",
+        file_id="file_123",
+        output_dir=str(tmp_path / "downloads"),
+        max_size_mb=1,
+    )
+
+    assert Path(downloaded_path).read_bytes() == payload
+    assert [request.url.host for request in requests] == [
+        "www.googleapis.com",
+        "www.googleapis.com",
+        "drive.usercontent.google.com",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_retries_transient_metadata_and_media_responses(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    attempts = {"metadata": 0, "media": 0}
+    sleep = AsyncMock()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        request_type = "media" if request.url.params.get("alt") == "media" else "metadata"
+        attempts[request_type] += 1
+        if attempts[request_type] == 1:
+            return httpx.Response(
+                503 if request_type == "metadata" else 429,
+                json={"error": {"code": 503, "message": "retry"}},
+                headers={"Retry-After": "0"},
+            )
+        if request_type == "media":
+            return httpx.Response(200, content=b"private-drive")
+        return httpx.Response(
+            200,
+            json={
+                "id": "file_123",
+                "name": "private.pdf",
+                "mimeType": "application/pdf",
+            },
+        )
+
+    monkeypatch.setattr(google_drive_service.settings, "GOOGLE_DRIVE_API_MAX_RETRIES", 3)
+    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep)
+    _install_google_drive_transport(monkeypatch, handler)
+
+    downloaded_path = await google_drive_service.download_file(
+        access_token="at-1",
+        file_id="file_123",
+        output_dir=str(tmp_path / "downloads"),
+        max_size_mb=1,
+    )
+
+    assert Path(downloaded_path).read_bytes() == b"private-drive"
+    assert attempts == {"metadata": 2, "media": 2}
+    assert sleep.await_args_list == [call(0.0), call(0.0)]
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_retries_transient_transport_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    attempts = {"metadata": 0, "media": 0}
+    sleep = AsyncMock()
+
+    class FailingBody(httpx.AsyncByteStream):
+        def __init__(self, request: httpx.Request) -> None:
+            self.request = request
+
+        async def __aiter__(self) -> Any:
+            yield b"stale-partial-bytes"
+            raise httpx.ReadTimeout("transient Drive failure", request=self.request)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        request_type = "media" if request.url.params.get("alt") == "media" else "metadata"
+        attempts[request_type] += 1
+        if request_type == "metadata" and attempts[request_type] == 1:
+            raise httpx.ConnectError("transient Drive failure", request=request)
+        if request_type == "media" and attempts[request_type] == 1:
+            return httpx.Response(200, request=request, stream=FailingBody(request))
+        if request_type == "media":
+            return httpx.Response(200, content=b"private-drive")
+        return httpx.Response(
+            200,
+            json={
+                "id": "file_123",
+                "name": "private.pdf",
+                "mimeType": "application/pdf",
+            },
+        )
+
+    monkeypatch.setattr(google_drive_service.settings, "GOOGLE_DRIVE_API_MAX_RETRIES", 3)
+    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep)
+    _install_google_drive_transport(monkeypatch, handler)
+
+    downloaded_path = await google_drive_service.download_file(
+        access_token="at-1",
+        file_id="file_123",
+        output_dir=str(tmp_path / "downloads"),
+        max_size_mb=1,
+    )
+
+    assert Path(downloaded_path).read_bytes() == b"private-drive"
+    assert attempts == {"metadata": 2, "media": 2}
+    assert sleep.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_stops_after_retry_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    attempts = 0
+    sleep = AsyncMock()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            503,
+            json={"error": {"code": 503, "message": "still unavailable"}},
+            headers={"Retry-After": "0"},
+        )
+
+    monkeypatch.setattr(google_drive_service.settings, "GOOGLE_DRIVE_API_MAX_RETRIES", 2)
+    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep)
+    _install_google_drive_transport(monkeypatch, handler)
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await google_drive_service.download_file(
+            access_token="at-1",
+            file_id="file_123",
+            output_dir=str(tmp_path / "downloads"),
+            max_size_mb=1,
+        )
+
+    assert exc_info.value.status == 503
+    assert attempts == 2
+    sleep.assert_awaited_once_with(0.0)
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_uses_unique_name_for_sanitized_collision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    names = {
+        "file_a": "Q4 (final).pdf",
+        "file_b": "Q4 final.pdf",
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        file_id = request.url.path.rsplit("/", 1)[-1]
+        if request.url.params.get("alt") == "media":
+            return httpx.Response(200, content=file_id.encode())
+        return httpx.Response(
+            200,
+            json={
+                "id": file_id,
+                "name": names[file_id],
+                "mimeType": "application/pdf",
+            },
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+    output_dir = tmp_path / "downloads"
+
+    first_path = await google_drive_service.download_file(
+        access_token="at-1",
+        file_id="file_a",
+        output_dir=str(output_dir),
+        max_size_mb=1,
+    )
+    second_path = await google_drive_service.download_file(
+        access_token="at-1",
+        file_id="file_b",
+        output_dir=str(output_dir),
+        max_size_mb=1,
+    )
+
+    assert Path(first_path).name == "Q4 final.pdf"
+    assert Path(second_path).name == "Q4 final (1).pdf"
+    assert Path(first_path).read_bytes() == b"file_a"
+    assert Path(second_path).read_bytes() == b"file_b"
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_reports_native_document_as_not_downloadable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "native_123",
+                "name": "Native document",
+                "mimeType": "application/vnd.google-apps.document",
+            },
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await google_drive_service.download_file(
+            access_token="at-1",
+            file_id="native_123",
+            output_dir=str(tmp_path / "downloads"),
+            max_size_mb=1,
+        )
+
+    assert exc_info.value.code == "fileNotDownloadable"
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_rejects_declared_oversize_before_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "file_123",
+                "name": "large.bin",
+                "mimeType": "application/octet-stream",
+                "size": str(2 * 1024 * 1024),
+            },
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+    output_dir = tmp_path / "downloads"
+
+    with pytest.raises(DownloadFileMaxSizeExceeded):
+        await google_drive_service.download_file(
+            access_token="at-1",
+            file_id="file_123",
+            output_dir=str(output_dir),
+            max_size_mb=1,
+        )
+
+    assert len(requests) == 1
+    assert not output_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_removes_partial_file_when_stream_exceeds_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = b"x" * (1024 * 1024 + 1)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("alt") == "media":
+            return httpx.Response(200, content=payload)
+        return httpx.Response(
+            200,
+            json={
+                "id": "file_123",
+                "name": "large.bin",
+                "mimeType": "application/octet-stream",
+            },
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+    output_dir = tmp_path / "downloads"
+
+    with pytest.raises(DownloadFileMaxSizeExceeded):
+        await google_drive_service.download_file(
+            access_token="at-1",
+            file_id="file_123",
+            output_dir=str(output_dir),
+            max_size_mb=1,
+        )
+
+    assert output_dir.exists()
+    assert list(output_dir.iterdir()) == []
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import textwrap
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -25,10 +26,15 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     _normalize_copilot_yaml,
     _prior_copilot_workflow_yaml,
     _proposal_disposition,
+    _should_commit_staged_workflow,
     _should_restore_persisted_workflow,
     _workflow_copilot_ingress_log_fields,
 )
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamResponseUpdate
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatMessage,
+    WorkflowCopilotChatSender,
+    WorkflowCopilotStreamResponseUpdate,
+)
 from skyvern.schemas.runs import ProxyLocation
 
 
@@ -92,6 +98,31 @@ class TestShouldRestorePersistedWorkflow:
 
         assert _should_restore_persisted_workflow(True, agent_result) is True
         assert _should_restore_persisted_workflow(False, agent_result) is True
+
+
+class TestShouldCommitStagedWorkflow:
+    def test_tested_proposal_from_a_question_turn_stays_pending_under_auto_accept(self) -> None:
+        ask_result = _agent_result(
+            persisted=False,
+            proposal_disposition="review_tested",
+            updated_workflow=MagicMock(),
+            has_staged_proposal=True,
+        )
+
+        assert _effective_auto_accept(True, ask_result) is False
+        assert _should_commit_staged_workflow(True, ask_result) is False
+
+    def test_auto_applicable_proposal_still_commits_under_auto_accept(self) -> None:
+        reply_result = _agent_result(
+            persisted=False,
+            proposal_disposition="auto_applicable",
+            updated_workflow=MagicMock(),
+            has_staged_proposal=True,
+        )
+
+        assert _effective_auto_accept(True, reply_result) is True
+        assert _should_commit_staged_workflow(True, reply_result) is True
+        assert _should_commit_staged_workflow(False, reply_result) is False
 
 
 class TestEffectiveAutoAccept:
@@ -446,3 +477,57 @@ async def test_ensure_terminal_frame_swallows_send_exception() -> None:
 async def test_ensure_terminal_frame_swallows_send_cancellation() -> None:
     stream = _FakeStream(raise_on_send=asyncio.CancelledError())
     await _ensure_terminal_frame(stream, already_emitted=False)  # type: ignore[arg-type]
+
+
+def _persisted_message(narrative_payload: dict[str, Any]) -> WorkflowCopilotChatMessage:
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    return WorkflowCopilotChatMessage(
+        workflow_copilot_chat_message_id="wccm_1",
+        workflow_copilot_chat_id="wcc_1",
+        sender=WorkflowCopilotChatSender.AI,
+        content="reply",
+        narrative_payload=narrative_payload,  # type: ignore[arg-type]
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def _non_error_narrative_payload() -> dict[str, Any]:
+    """The shape the acting path builds — every key it actually supplies, and nothing else."""
+    return {
+        "turnId": "turn_1",
+        "turnIndex": 0,
+        "designStarted": True,
+        "designEnded": True,
+        "draft": None,
+        "blocks": [],
+        "terminal": "done",
+        "terminalMessage": None,
+        "narrativeSummary": "answered",
+        "priorBlockCount": None,
+        "designActivity": [],
+        "startedAt": None,
+        "endedAt": None,
+    }
+
+
+def test_non_error_narrative_payload_survives_persistence_validation() -> None:
+    """Every required TurnNarrativePayload key must have a live supplier.
+
+    A required key whose only supplier was deleted passes type checking and every test that
+    stubs persistence, then raises on both write and read at the Pydantic boundary, halting
+    every turn. Grade the real boundary, not a stub.
+    """
+    message = _persisted_message(_non_error_narrative_payload())
+
+    assert message.narrative_payload is not None
+    assert message.narrative_payload["turnId"] == "turn_1"
+
+
+def test_narrative_payload_tolerates_keys_persisted_before_the_field_was_removed() -> None:
+    legacy = _non_error_narrative_payload() | {"mode": "build"}
+
+    message = _persisted_message(legacy)
+
+    assert message.narrative_payload is not None
+    assert "mode" not in message.narrative_payload

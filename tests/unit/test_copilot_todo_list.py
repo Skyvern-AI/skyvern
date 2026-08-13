@@ -66,7 +66,7 @@ def test_read_only_page_observations_do_not_complete_login() -> None:
 
 def test_login_completed_via_interaction_reached_page() -> None:
     ctx = make_copilot_ctx(request_policy=_login_policy())
-    ctx.prior_fill_carry = [
+    ctx.prior_carried_trajectory = [
         {"tool_name": "fill_credential_field", "source_url": "https://example.com/login", "credential_id": "cred-1"}
     ]
     ctx.prior_observed_acted_pages = [{"url": "https://example.com/dashboard", "reached_via": "interaction"}]

@@ -1,128 +1,176 @@
 from __future__ import annotations
 
-import json
+import asyncio
+import struct
 
 import pytest
 
-from skyvern.browser_extension.auth import compute_ext_proof, compute_server_proof
-from skyvern.browser_extension.broker.protocol import (
-    BROKER_FRAME_VERSION,
-    build_broker_challenge,
-    build_broker_nonce,
-    build_error_frame,
-    build_event_frame,
-    build_request_frame,
-    build_response_frame,
-    build_state_frame,
-    compute_broker_client_proof,
-    compute_broker_server_proof,
-    is_valid_broker_nonce,
-    parse_broker_frame,
-    verify_broker_client_proof,
+from skyvern.browser_extension import broker_protocol
+from skyvern.browser_extension.auth import (
+    compute_broker_proof,
+    compute_client_proof,
+    hash_recovery_secret,
+    verify_client_proof,
 )
-from skyvern.browser_extension.errors import BrowserExtensionError
+from skyvern.browser_extension.broker_protocol import (
+    BROKER_GENERATION,
+    BROKER_PROTOCOL_VERSION,
+    decode_frame,
+    encode_frame,
+    new_nonce,
+    peer_uid_from_transport,
+    read_frame,
+    redact,
+    request_frame,
+    response_frame,
+)
+from skyvern.browser_extension.errors import BrowserExtensionBrokerError
 
-TOKEN = "broker-protocol-test-token"
+
+def test_length_prefixed_json_round_trip() -> None:
+    frame = request_frame("request-1", "broker.status")
+
+    encoded = encode_frame(frame)
+
+    assert struct.unpack("!I", encoded[:4])[0] == len(encoded) - 4
+    assert decode_frame(encoded[4:]) == frame
 
 
-def test_broker_proofs_do_not_interchange_with_extension_proofs() -> None:
-    server_nonce = build_broker_nonce()
-    client_nonce = build_broker_nonce()
+@pytest.mark.asyncio
+async def test_declared_frame_budget_is_rejected_before_payload_read() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(struct.pack("!I", 9_000))
 
-    broker_proof = compute_broker_client_proof(TOKEN, server_nonce, client_nonce)
-    extension_proof = compute_ext_proof(TOKEN, server_nonce, client_nonce)
+    with pytest.raises(BrowserExtensionBrokerError, match="FRAME_TOO_LARGE"):
+        await read_frame(reader, max_size=8_192)
 
-    assert broker_proof != extension_proof
-    assert verify_broker_client_proof(TOKEN, server_nonce, client_nonce, broker_proof)
-    assert not verify_broker_client_proof(TOKEN, server_nonce, client_nonce, extension_proof)
-    assert compute_broker_server_proof(TOKEN, client_nonce, server_nonce) != compute_server_proof(
-        TOKEN, client_nonce, server_nonce
+
+@pytest.mark.asyncio
+async def test_declared_bytes_are_reserved_before_payload_read() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(struct.pack("!I", 100))
+
+    with pytest.raises(BrowserExtensionBrokerError, match="RESOURCE_LIMIT"):
+        await read_frame(reader, reserve=lambda _size: False)
+
+
+@pytest.mark.asyncio
+async def test_large_control_declaration_is_rejected_from_canonical_prefix_before_body_read() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(struct.pack("!I", 1024 * 1024) + b'{"v":1,"type":"pong","padding":')
+
+    with pytest.raises(BrowserExtensionBrokerError, match="FRAME_TOO_LARGE"):
+        await read_frame(
+            reader,
+            max_size=32 * 1024 * 1024,
+            control_size=64 * 1024,
+            large_request_op="extension.request",
+        )
+
+
+@pytest.mark.asyncio
+async def test_large_extension_request_is_admitted_by_canonical_prefix() -> None:
+    frame = request_frame("large-1", "extension.request", {"padding": "x" * (64 * 1024)})
+    encoded = encode_frame(frame)
+    reader = asyncio.StreamReader()
+    reader.feed_data(encoded)
+
+    decoded, size = await read_frame(
+        reader,
+        max_size=32 * 1024 * 1024,
+        control_size=64 * 1024,
+        large_request_op="extension.request",
     )
 
-
-def test_broker_client_proof_is_bound_to_both_nonces_and_the_token() -> None:
-    server_nonce = build_broker_nonce()
-    client_nonce = build_broker_nonce()
-    proof = compute_broker_client_proof(TOKEN, server_nonce, client_nonce)
-
-    assert not verify_broker_client_proof("other-token", server_nonce, client_nonce, proof)
-    assert not verify_broker_client_proof(TOKEN, build_broker_nonce(), client_nonce, proof)
-    assert not verify_broker_client_proof(TOKEN, server_nonce, build_broker_nonce(), proof)
+    assert decoded == frame
+    assert size == len(encoded) - 4
 
 
-@pytest.mark.parametrize(
-    "nonce",
-    ["", "not base64!", "c2hvcnQ", build_broker_nonce() + "=", build_broker_nonce()[:-1]],
-)
-def test_only_a_full_length_urlsafe_nonce_is_accepted(nonce: str) -> None:
-    assert not is_valid_broker_nonce(nonce)
+@pytest.mark.asyncio
+async def test_large_extension_response_is_admitted_only_for_pending_operation() -> None:
+    frame = response_frame("large-1", {"padding": "x" * (64 * 1024)})
+    encoded = encode_frame(frame)
+    reader = asyncio.StreamReader()
+    reader.feed_data(encoded)
 
-
-def test_a_generated_nonce_is_accepted() -> None:
-    assert is_valid_broker_nonce(build_broker_nonce())
-
-
-def test_challenge_carries_a_fresh_nonce_every_time() -> None:
-    first_nonce, first_frame = build_broker_challenge()
-    second_nonce, _ = build_broker_challenge()
-
-    assert first_nonce != second_nonce
-    assert first_frame == {"v": BROKER_FRAME_VERSION, "type": "auth.challenge", "serverNonce": first_nonce}
-
-
-def test_request_and_response_frames_round_trip() -> None:
-    request = parse_broker_frame(
-        json.dumps(build_request_frame("r-1", "tabs.create", {"url": "https://example.test"}, 12.5)),
-        from_client=True,
+    decoded, _size = await read_frame(
+        reader,
+        max_size=32 * 1024 * 1024,
+        control_size=64 * 1024,
+        large_response_ids={"large-1"},
+        large_event="extension.event",
     )
-    assert request.request_id == "r-1"
-    assert request.op == "tabs.create"
-    assert request.args == {"url": "https://example.test"}
-    assert request.timeout_seconds == pytest.approx(12.5)
 
-    ok = parse_broker_frame(json.dumps(build_response_frame("r-1", {"tabId": 7})), from_client=False)
-    assert ok.ok is True
-    assert ok.result == {"tabId": 7}
-
-    failed = parse_broker_frame(json.dumps(build_error_frame("r-1", "TAB_NOT_SCOPED", "nope")), from_client=False)
-    assert failed.ok is False
-    assert failed.error_code == "TAB_NOT_SCOPED"
-    assert failed.error_message == "nope"
+    assert decoded == frame
 
 
-def test_event_and_state_frames_round_trip() -> None:
-    event = parse_broker_frame(json.dumps(build_event_frame("scope.tabAdded", {"tabId": 5})), from_client=False)
-    assert event.event == "scope.tabAdded"
-    assert event.params == {"tabId": 5}
+@pytest.mark.asyncio
+async def test_large_broker_heartbeat_is_rejected_before_body_read() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(struct.pack("!I", 1024 * 1024) + b'{"v":1,"type":"ping","padding":')
 
-    state = parse_broker_frame(
-        json.dumps(build_state_frame(True, [{"tabId": 5, "url": "", "title": ""}, {"tabId": "bad"}])),
-        from_client=False,
+    with pytest.raises(BrowserExtensionBrokerError, match="FRAME_TOO_LARGE"):
+        await read_frame(
+            reader,
+            max_size=32 * 1024 * 1024,
+            control_size=64 * 1024,
+            large_response_ids=set(),
+            large_event="extension.event",
+        )
+
+
+def test_enrollment_proofs_use_distinct_mutual_contexts() -> None:
+    secret = "recovery-secret-sentinel"
+    server_nonce = new_nonce()
+    client_nonce = new_nonce()
+    client_id = "client-id"
+    client_proof = compute_client_proof(secret, server_nonce, client_nonce, client_id, BROKER_GENERATION)
+    broker_proof = compute_broker_proof(secret, client_nonce, server_nonce, client_id, BROKER_GENERATION)
+
+    assert verify_client_proof(
+        secret,
+        server_nonce,
+        client_nonce,
+        client_id,
+        BROKER_GENERATION,
+        client_proof,
     )
-    assert state.extension_connected is True
-    assert state.scoped_tabs == [{"tabId": 5, "url": "", "title": ""}]
+    assert client_proof != broker_proof
+    assert secret not in hash_recovery_secret(secret)
 
 
-def test_each_direction_only_accepts_its_own_frame_kinds() -> None:
-    with pytest.raises(BrowserExtensionError, match="Unknown broker frame type"):
-        parse_broker_frame(json.dumps(build_response_frame("r-1", {})), from_client=True)
-    with pytest.raises(BrowserExtensionError, match="Unknown broker frame type"):
-        parse_broker_frame(json.dumps(build_request_frame("r-1", "tabs.list", {}, 1.0)), from_client=False)
+def test_redaction_removes_all_sensitive_material_recursively() -> None:
+    sentinel = "must-not-survive"
+    value = {
+        "v": BROKER_PROTOCOL_VERSION,
+        "token": sentinel,
+        "pairingUrl": sentinel,
+        "args": {"proof": sentinel, "params": {"url": sentinel}},
+        "safe": "status",
+    }
+
+    redacted = redact(value)
+
+    assert sentinel not in repr(redacted)
+    assert isinstance(redacted, dict)
+    assert redacted["safe"] == "status"
 
 
-@pytest.mark.parametrize(
-    "raw",
-    [
-        "not json",
-        json.dumps([1, 2, 3]),
-        json.dumps({"v": 2, "type": "ping"}),
-        json.dumps({"v": 1, "type": "unknown"}),
-        json.dumps({"v": 1, "type": "request", "id": "", "op": "tabs.list", "args": {}, "timeoutMs": 1}),
-        json.dumps({"v": 1, "type": "request", "id": "r", "op": "tabs.list", "args": {}, "timeoutMs": 0}),
-        json.dumps({"v": 1, "type": "request", "id": "r", "op": "tabs.list", "args": [], "timeoutMs": 1}),
-        json.dumps({"v": 1, "type": "client.hello", "protocol": "1", "pid": 1}),
-    ],
-)
-def test_malformed_frames_are_rejected(raw: str) -> None:
-    with pytest.raises(BrowserExtensionError):
-        parse_broker_frame(raw, from_client=True)
+def test_peer_uid_supports_getpeereid_only_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    class TransportSocket:
+        def fileno(self) -> int:
+            return 41
+
+    class RawSocket:
+        def getpeereid(self) -> tuple[int, int]:
+            return 1234, 5678
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.delattr(broker_protocol.socket, "SO_PEERCRED", raising=False)
+    monkeypatch.delattr(broker_protocol.socket, "LOCAL_PEERCRED", raising=False)
+    monkeypatch.setattr(broker_protocol.os, "dup", lambda _fd: 42)
+    monkeypatch.setattr(broker_protocol.socket, "socket", lambda *, fileno: RawSocket())
+
+    assert peer_uid_from_transport(TransportSocket()) == 1234

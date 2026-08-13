@@ -12,6 +12,7 @@ import pytest
 
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.schemas.self_heal import HealSkipReason
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 
@@ -35,6 +36,7 @@ class FakeWorkflowRunContext:
     workflow_run_id = "wrid_test"
     browser_session_id = None
     workflow_run_outputs: list[object] = []
+    workflow = None
 
     def get_block_metadata(self, label: str | None) -> dict[str, object]:
         return {}
@@ -133,9 +135,11 @@ async def test_undeclared_error_code_fails_closed(monkeypatch: pytest.MonkeyPatc
     assert result.status == BlockStatus.failed
     assert result.error_codes == []
     assert result.output_parameter_value is None
-    assert "NOT_IN_MANIFEST" not in (result.failure_reason or "") or "should not be trusted" in (
-        result.failure_reason or ""
+    assert result.failure_reason == (
+        "Failed to execute code block. Reason: ErrorCode is not declared in the effective error_code_mapping"
     )
+    assert "NOT_IN_MANIFEST" not in result.failure_reason
+    assert "should not be trusted" not in result.failure_reason
 
 
 @pytest.mark.asyncio
@@ -152,23 +156,37 @@ async def test_error_code_raise_with_no_manifest_fails_closed(monkeypatch: pytes
     assert result.status == BlockStatus.failed
     assert result.error_codes == []
     assert result.output_parameter_value is None
+    assert result.failure_reason == (
+        "Failed to execute code block. Reason: ErrorCode is not declared in the effective error_code_mapping"
+    )
 
 
 @pytest.mark.asyncio
 async def test_declared_error_code_skips_self_heal(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AC5: a declared typed raise must not be routed through self-heal."""
+    """AC5: a declared typed raise records a non-healable skip without attempting repair."""
     monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
-    heal_mock = AsyncMock(side_effect=AssertionError("self-heal should not be attempted for a declared ErrorCode"))
+
+    async def resolve_failure_with_heal(**kwargs: object):
+        return await kwargs["build_failure_result"]()  # type: ignore[operator]
+
+    resolver_mock = AsyncMock(side_effect=resolve_failure_with_heal)
+    heal_attempt_mock = AsyncMock(side_effect=AssertionError("self-heal attempt must not run"))
+    monkeypatch.setattr(CodeBlock, "_attempt_self_heal", heal_attempt_mock)
     block = CodeBlock(
         label="healable_login_block",
         code="raise ErrorCode('LOGIN_FAILED', 'could not find the login button')",
         output_parameter=_output_parameter("heal_output"),
         error_code_mapping={"LOGIN_FAILED": "the login form could not be located"},
     )
-    result = await _run_code_block(monkeypatch, block, self_heal_mock=heal_mock)
+    result = await _run_code_block(monkeypatch, block, self_heal_mock=resolver_mock)
 
     assert result.success is False
-    heal_mock.assert_not_called()
+    # SKY-13668 fail-closed contract: use the resolver for skip bookkeeping, but never attempt heal.
+    resolver_mock.assert_awaited_once()
+    classification = resolver_mock.await_args.kwargs["classification"]
+    assert classification.healable is False
+    assert classification.skip_reason is HealSkipReason.user_defined_error
+    heal_attempt_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

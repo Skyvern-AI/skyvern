@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -26,7 +27,7 @@ _TEST_BASE_URL = "http://testserver"
 
 
 @pytest.fixture(autouse=True)
-def _reset_auth_context() -> None:
+def _reset_auth_context() -> Iterator[None]:
     client_mod._api_key_override.set(None)
     session_manager._current_session.set(None)
     session_manager._global_session = None
@@ -40,6 +41,11 @@ def _reset_auth_context() -> None:
     mcp_http_auth._API_KEY_CACHE_MAX_SIZE = 1024
     mcp_http_auth._MAX_VALIDATION_RETRIES = 2
     mcp_http_auth._RETRY_DELAY_SECONDS = 0.0  # no delay in tests
+    mcp_http_auth.set_scoped_mcp_resources_enabled(False)
+    try:
+        yield
+    finally:
+        mcp_http_auth.set_scoped_mcp_resources_enabled(False)
 
 
 async def _echo_request_context(request: Request) -> JSONResponse:
@@ -556,6 +562,41 @@ def test_validate_token_audience_tolerates_trailing_slash_mismatch() -> None:
     )
 
 
+def test_validate_token_audience_rejects_scoped_resource_suffix_by_default() -> None:
+    with pytest.raises(HTTPException, match="Token audience is not valid for this MCP resource"):
+        mcp_http_auth._validate_token_audience(
+            {"aud": ["https://api.skyvern.com/mcp/x/operate"]},
+            "https://api.skyvern.com/mcp",
+        )
+
+
+def test_validate_token_audience_tolerates_scoped_resource_suffix_when_enabled() -> None:
+    mcp_http_auth.set_scoped_mcp_resources_enabled(True)
+    mcp_http_auth._validate_token_audience(
+        {"aud": ["https://api.skyvern.com/mcp/x/operate"]},
+        "https://api.skyvern.com/mcp",
+    )
+    mcp_http_auth._validate_token_audience(
+        {"aud": ["https://api.skyvern.com/mcp"]},
+        "https://api.skyvern.com/mcp/x/operate",
+    )
+
+
+@pytest.mark.parametrize(
+    "audience",
+    [
+        "https://evil.example/mcp/x/operate",
+        "https://api.skyvern.com/mcp/x/../admin",
+        "https://api.skyvern.com/mcp/x//operate",
+        "https://api.skyvern.com/mcp/x/OPERATE",
+        "https://api.skyvern.com/mcp/x/a/x/b",
+    ],
+)
+def test_validate_token_audience_rejects_invalid_scoped_resource_suffix(audience: str) -> None:
+    with pytest.raises(HTTPException, match="Token audience is not valid for this MCP resource"):
+        mcp_http_auth._validate_token_audience({"aud": [audience]}, "https://api.skyvern.com/mcp")
+
+
 def test_validate_token_resource_claim_tolerates_trailing_slash_mismatch() -> None:
     # Same normalization applies to the RFC 8707 `resource` claim.
     mcp_http_auth._validate_token_resource_claims(
@@ -565,6 +606,26 @@ def test_validate_token_resource_claim_tolerates_trailing_slash_mismatch() -> No
     mcp_http_auth._validate_token_resource_claims(
         {"resource": "https://api.skyvern.com/mcp"},
         "https://api.skyvern.com/mcp/",
+    )
+
+
+def test_validate_token_resource_claim_rejects_scoped_resource_suffix_by_default() -> None:
+    with pytest.raises(HTTPException, match="Token resource is not valid for this MCP resource"):
+        mcp_http_auth._validate_token_resource_claims(
+            {"resource": "https://api.skyvern.com/mcp/x/browser/"},
+            "https://api.skyvern.com/mcp",
+        )
+
+
+def test_validate_token_resource_claim_tolerates_scoped_resource_suffix_when_enabled() -> None:
+    mcp_http_auth.set_scoped_mcp_resources_enabled(True)
+    mcp_http_auth._validate_token_resource_claims(
+        {"resource": "https://api.skyvern.com/mcp/x/browser/"},
+        "https://api.skyvern.com/mcp",
+    )
+    mcp_http_auth._validate_token_resource_claims(
+        {"resource": "https://api.skyvern.com/mcp"},
+        "https://api.skyvern.com/mcp/x/browser/",
     )
 
 

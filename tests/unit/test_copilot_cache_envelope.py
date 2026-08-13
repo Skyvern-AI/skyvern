@@ -173,5 +173,5 @@ def test_system_prompt_places_datetime_and_runtime_context_after_breakpoint(
     assert prompt.cache_namespace == "wcc_one"
     assert prompt.stable_prefix == base_prompt.stable_prefix
     assert base_prompt.dynamic_suffix in prompt.dynamic_suffix
-    assert "REQUEST POLICY" in prompt.dynamic_suffix
+    assert "TURN SAFETY AND REQUEST CONTEXT" in prompt.dynamic_suffix
     assert str(prompt) == prompt.stable_prefix + prompt.dynamic_suffix

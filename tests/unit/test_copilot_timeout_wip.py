@@ -32,6 +32,7 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairDecision,
     VerificationResult,
 )
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind
 
 
 def _ctx(
@@ -306,7 +307,7 @@ class TestBuildTimeoutExitResult:
         assert result.proposal_disposition == "auto_applicable"
         assert result.user_response == _TIMEOUT_REPLY_DEFAULT
 
-    def test_verified_terminal_state_preserves_tested_proposal_on_timeout(self) -> None:
+    def test_interactive_completion_verdict_cannot_preserve_tested_proposal_on_timeout(self) -> None:
         wf = MagicMock(name="wf")
         ctx = _ctx(
             last_workflow=wf,
@@ -323,10 +324,10 @@ class TestBuildTimeoutExitResult:
 
         result = _build_timeout_exit_result(ctx, global_llm_context=None)
 
-        assert result.updated_workflow is wf
-        assert result.workflow_yaml == "version: '1.0'"
+        assert result.updated_workflow is None
+        assert result.workflow_yaml is None
         assert result.proposal_disposition == "auto_applicable"
-        assert result.user_response == _TIMEOUT_REPLY_TESTED
+        assert result.user_response == _TIMEOUT_REPLY_DEFAULT
         assert result.clear_proposed_workflow is False
 
     def test_stale_latch_without_judge_verdict_does_not_preserve_proposal(self) -> None:
@@ -740,3 +741,44 @@ class TestTimeoutExitNamesTimeAndDraftState:
 
         assert "ran out of time" in result.user_response
         assert "did not verify" not in result.user_response
+
+
+class TestCancelExitIsRecordedAsAStopNotAQuestion:
+    @pytest.mark.parametrize("state_kind", ["no_workflow", "untested", "passing_test"])
+    def test_mid_agent_cancel_persists_recover(self, state_kind: str) -> None:
+        ctx, _ = _state_ctx(state_kind)
+
+        result = _build_cancel_exit_result(ctx, global_llm_context=None)
+
+        assert result.cancelled is True
+        assert result.turn_outcome is not None
+        assert result.turn_outcome.terminal_reason == "cancel"
+        assert result.turn_outcome.response_kind is ResponseKind.RECOVER
+        assert result.turn_outcome.response_kind is not ResponseKind.CLARIFY
+
+    @pytest.mark.parametrize("state_kind", ["no_workflow", "untested", "passing_test"])
+    def test_cancel_payload_and_outcome_agree(self, state_kind: str) -> None:
+        ctx, _ = _state_ctx(state_kind)
+
+        result = _build_cancel_exit_result(ctx, global_llm_context=None)
+
+        assert result.narrative_payload is not None
+        assert result.turn_outcome is not None
+        assert result.narrative_payload["responseKind"] == result.turn_outcome.response_kind.value
+
+    @pytest.mark.parametrize(
+        ("builder", "terminal_reason"),
+        [
+            pytest.param(_build_timeout_exit_result, "timeout", id="timeout"),
+            pytest.param(_build_max_turns_exit_result, "max_turns", id="max_turns"),
+            pytest.param(_build_unexpected_error_exit_result, "unexpected_error", id="unexpected_error"),
+        ],
+    )
+    def test_other_turn_end_exits_keep_clarify(self, builder, terminal_reason: str) -> None:
+        ctx, _ = _state_ctx("untested")
+
+        result = builder(ctx, global_llm_context=None)
+
+        assert result.turn_outcome is not None
+        assert result.turn_outcome.terminal_reason == terminal_reason
+        assert result.turn_outcome.response_kind is ResponseKind.CLARIFY

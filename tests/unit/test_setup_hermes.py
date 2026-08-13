@@ -130,6 +130,15 @@ def test_setup_hermes_local_uses_legacy_env_when_cloud_scope_exists(
     assert entry["env"]["SKYVERN_BASE_URL"] == "http://localhost:8000"
 
 
+def test_setup_hermes_local_scope_operate_writes_stdio_args(hermes_home: Path) -> None:
+    result = runner.invoke(setup_app, ["hermes", "--local", "--scope", "operate", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    data = _load_yaml_config(hermes_home / "config.yaml")
+    assert data is not None
+    assert data["mcp_servers"]["skyvern"]["args"] == ["-m", "skyvern", "run", "mcp", "--scope", "operate"]
+
+
 def test_setup_hermes_local_does_not_pair_cloud_key_with_legacy_url(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

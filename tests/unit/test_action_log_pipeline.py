@@ -512,7 +512,6 @@ def test_replay_trajectory_entry_remains_byte_identical(monkeypatch: pytest.Monk
             "selector": "#search",
             "source_url": "https://example.test/catalog?session=__redacted__&q=widgets",
             "typed_length": 6,
-            "typed_value": "widget",
         },
     )
 

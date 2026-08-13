@@ -39,8 +39,19 @@ async def test_clean_code_block_lints_ok() -> None:
     assert result["data"]["code_safety_errors"] == []
     assert result["data"]["security_errors"] == []
     assert result["data"]["preflight_diagnostics"] == []
-    assert result["data"]["sandbox_diagnostics"] == []
+    assert "sandbox_diagnostics" not in result["data"]
     assert result["data"]["author_time_diagnostics"] == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_runtime_name_and_builtin_exception_are_not_lint_failures() -> None:
+    result = await skyvern_code_block_lint(
+        code="try:\n    value = unavailable_at_runtime\nexcept ValueError:\n    value = None",
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["lint_ok"] is True
+    assert "sandbox_diagnostics" not in result["data"]
 
 
 @pytest.mark.asyncio
@@ -77,22 +88,6 @@ async def test_page_request_is_blocked_by_security_denylist() -> None:
     assert result["ok"] is False
     assert result["data"]["lint_ok"] is False
     assert _has_security_error(result, reason_code="AUTHOR_PAGE_REQUEST")
-
-
-@pytest.mark.asyncio
-async def test_undefined_name_is_caught_by_sandbox_analyzer() -> None:
-    result = await skyvern_code_block_lint(code="x = undefined_thing + 1\nreturn {}")
-
-    assert result["ok"] is False
-    assert result["data"]["lint_ok"] is False
-    assert _has_diagnostic(result, section="sandbox_diagnostics", code="SANDBOX_UNRESOLVED_NAME")
-
-
-@pytest.mark.asyncio
-async def test_parameter_key_is_treated_as_defined_by_sandbox_analyzer() -> None:
-    result = await skyvern_code_block_lint(code="x = query + 1\nreturn {}", parameter_keys=["query"])
-
-    assert not any("query" in diagnostic["message"] for diagnostic in result["data"]["sandbox_diagnostics"])
 
 
 @pytest.mark.asyncio

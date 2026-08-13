@@ -42,7 +42,6 @@ from skyvern.forge.sdk.copilot.tools import (
     _fallback_page_info,
     _progress_marker,
     _read_progress_sources,
-    _tool_loop_error,
     _watchdog_error_message,
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
@@ -492,25 +491,3 @@ def test_any_quiet_block_requested_empty_labels_returns_false() -> None:
 # specifically about the LLM-facing STRING, which previously said "timed out"
 # and read as a retry-invite when combined with LLM priors.
 # ---------------------------------------------------------------------------
-
-
-def test_reconciliation_guard_message_does_not_say_timed_out() -> None:
-    """The reconciliation guard message is what the LLM reads on the *next*
-    block-running tool call after a watchdog exit. The stagnation/ceiling/
-    unfinalized error messages all purge "timed out"; the guard message must
-    match, otherwise the phrase leaks right back in and the regression is
-    only cosmetic."""
-    ctx = SimpleNamespace(
-        consecutive_tool_tracker=[],
-        repeated_action_fingerprint_streak_count=0,
-        last_test_non_retriable_nav_error=None,
-        pending_reconciliation_run_id="wr_guarded",
-        output_contract_actuation_by_signature={},
-        output_contract_actuation_count_by_signature={},
-        output_contract_armed_directive_fingerprint_by_signature={},
-    )
-    msg = _tool_loop_error(ctx, "update_and_run_blocks")
-    assert isinstance(msg, str)
-    assert "timed out" not in msg.lower()
-    assert "wr_guarded" in msg
-    assert "get_run_results" in msg

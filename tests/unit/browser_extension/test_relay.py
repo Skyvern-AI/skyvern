@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import json
 import secrets
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
@@ -26,7 +27,14 @@ class RelayHarness:
         self.events: list[tuple[str, dict]] = []
         self.event_received = asyncio.Event()
         self.disconnect_called = asyncio.Event()
-        self.server = ExtensionRelayServer(TOKEN, 0, self.on_event, self.on_disconnect)
+        self.pairing_completed = asyncio.Event()
+        self.server = ExtensionRelayServer(
+            TOKEN,
+            0,
+            self.on_event,
+            self.on_disconnect,
+            on_pairing_complete=self.on_pairing_complete,
+        )
 
     async def on_event(self, event: str, params: dict) -> None:
         self.events.append((event, params))
@@ -34,6 +42,9 @@ class RelayHarness:
 
     async def on_disconnect(self) -> None:
         self.disconnect_called.set()
+
+    async def on_pairing_complete(self) -> None:
+        self.pairing_completed.set()
 
 
 @pytest_asyncio.fixture
@@ -65,12 +76,68 @@ def interactive_pairing_headers(harness: RelayHarness) -> dict[str, str]:
     }
 
 
+@pytest.mark.asyncio
+async def test_v2_reset_control_without_listener() -> None:
+    events: list[tuple[str, dict]] = []
+
+    async def on_event(event: str, params: dict) -> None:
+        events.append((event, params))
+
+    class WebSocket:
+        closed = False
+
+        def __init__(self) -> None:
+            self.frames: list[dict] = []
+
+        async def send_json(self, frame: dict) -> None:
+            self.frames.append(frame)
+
+    relay = ExtensionRelayServer(TOKEN, 0, on_event)
+    websocket = WebSocket()
+    relay._websocket = websocket  # type: ignore[assignment]
+    relay.extension_protocol_version = 2
+    relay.scoped_tabs = [{"tabId": 17}]
+
+    assert await relay.send_reset("daemon-epoch", 4)
+    assert websocket.frames == [{"v": 2, "type": "extension.reset", "epoch": "daemon-epoch", "generation": 4}]
+    await relay._handle_text_frame(
+        websocket,  # type: ignore[arg-type]
+        '{"v":2,"type":"extension.reset_ack","epoch":"daemon-epoch","generation":4,"ok":true}',
+    )
+    assert relay.scoped_tabs == []
+    assert events == [
+        (
+            "extension.reset_ack",
+            {"epoch": "daemon-epoch", "generation": 4, "ok": True, "failedTabCount": 0},
+        )
+    ]
+
+    relay.scoped_tabs = [{"tabId": 19}]
+    await relay._handle_text_frame(
+        websocket,  # type: ignore[arg-type]
+        '{"v":2,"type":"extension.reset_ack","epoch":"daemon-epoch","generation":4,"ok":true}',
+    )
+    assert relay.scoped_tabs == [{"tabId": 19}]
+
+    assert await relay.send_reset("daemon-epoch", 5)
+    await relay._handle_text_frame(
+        websocket,  # type: ignore[arg-type]
+        '{"v":2,"type":"extension.reset_ack","epoch":"daemon-epoch","generation":5,"ok":false,"failedTabCount":1}',
+    )
+    assert relay.scoped_tabs == [{"tabId": 19}]
+    assert events[-1] == (
+        "extension.reset_ack",
+        {"epoch": "daemon-epoch", "generation": 5, "ok": False, "failedTabCount": 1},
+    )
+
+
 async def authenticate(
     session: ClientSession,
     harness: RelayHarness,
     *,
     origin: str | None = "chrome-extension://abcdefghijklmnop",
     send_hello: bool = True,
+    protocol_version: int = 1,
 ) -> ClientWebSocketResponse:
     headers = {"Origin": origin} if origin is not None else None
     websocket = await session.ws_connect(relay_url(harness), headers=headers)
@@ -78,7 +145,7 @@ async def authenticate(
     client_nonce = secrets.token_urlsafe(32)
     await websocket.send_json(
         {
-            "v": 1,
+            "v": protocol_version,
             "type": "auth.proof",
             "clientNonce": client_nonce,
             "proof": compute_ext_proof(TOKEN, challenge["serverNonce"], client_nonce),
@@ -86,18 +153,21 @@ async def authenticate(
     )
     auth_ok = await websocket.receive_json()
     assert auth_ok == {
-        "v": 1,
+        "v": protocol_version,
         "type": "auth.ok",
         "serverProof": compute_server_proof(TOKEN, client_nonce, challenge["serverNonce"]),
     }
     if send_hello:
         event_count = len(harness.events)
+        hello_params: dict[str, object] = {"extensionVersion": "1.0.0", "scopedTabs": []}
+        if protocol_version >= 2:
+            hello_params["protocolVersion"] = protocol_version
         await websocket.send_json(
             {
-                "v": 1,
+                "v": protocol_version,
                 "type": "event",
                 "event": "extension.hello",
-                "params": {"extensionVersion": "1.0.0", "scopedTabs": []},
+                "params": hello_params,
             }
         )
 
@@ -144,6 +214,7 @@ async def test_pair_begin_claim_happy_path_and_pair_page_never_contains_token(
         assert claim.status == 200
         assert claim.headers["Cache-Control"] == "no-store"
         assert await claim.json() == {"v": 1, "port": relay_harness.server.bound_port, "token": TOKEN}
+        assert relay_harness.pairing_completed.is_set()
 
 
 @pytest.mark.asyncio
@@ -166,6 +237,23 @@ async def test_bare_pair_page_requires_authenticated_pairing_request(
         )
         assert begin.status == 403
         assert relay_harness.server._pairing_nonce is None
+
+
+@pytest.mark.asyncio
+async def test_broker_owned_relay_disables_replayable_pair_begin() -> None:
+    server = ExtensionRelayServer(TOKEN, 0, AsyncMock(), control_pairing_only=True)
+    await server.start()
+    try:
+        async with ClientSession() as session:
+            response = await session.post(
+                f"http://127.0.0.1:{server.bound_port}/pair/begin",
+                json={"v": 1, "proof": pair_begin_proof(TOKEN)},
+            )
+            assert response.status == 404
+            assert await response.json() == {"error": "broker_control_required"}
+            assert server._pairing_nonce is None
+    finally:
+        await server.stop()
 
 
 def test_interactive_pairing_source_accepts_canonical_default_http_port() -> None:
@@ -338,6 +426,45 @@ async def test_authentication_and_hello_update_scoped_tabs(relay_harness: RelayH
 
 
 @pytest.mark.asyncio
+async def test_v2_reset_control_frame_round_trip(relay_harness: RelayHarness) -> None:
+    async with ClientSession() as session:
+        websocket = await authenticate(session, relay_harness, protocol_version=2)
+        relay_harness.event_received.clear()
+
+        assert await relay_harness.server.send_reset("daemon-epoch", 9)
+        assert await websocket.receive_json() == {
+            "v": 2,
+            "type": "extension.reset",
+            "epoch": "daemon-epoch",
+            "generation": 9,
+        }
+        relay_harness.server.scoped_tabs = [{"tabId": 17}]
+        await websocket.send_json(
+            {"v": 2, "type": "extension.reset_ack", "epoch": "daemon-epoch", "generation": 9, "ok": True}
+        )
+        await asyncio.wait_for(relay_harness.event_received.wait(), 1)
+
+        assert relay_harness.server.scoped_tabs == []
+        assert relay_harness.events[-1] == (
+            "extension.reset_ack",
+            {"epoch": "daemon-epoch", "generation": 9, "ok": True, "failedTabCount": 0},
+        )
+
+        relay_harness.server.scoped_tabs = [{"tabId": 19}]
+        event_count = len(relay_harness.events)
+        await websocket.send_json(
+            {"v": 2, "type": "extension.reset_ack", "epoch": "daemon-epoch", "generation": 9, "ok": True}
+        )
+
+        async def duplicate_processed() -> None:
+            while len(relay_harness.events) == event_count:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(duplicate_processed(), 1)
+        assert relay_harness.server.scoped_tabs == [{"tabId": 19}]
+
+
+@pytest.mark.asyncio
 async def test_wrong_proof_is_closed_with_4403(relay_harness: RelayHarness) -> None:
     async with ClientSession() as session:
         websocket = await session.ws_connect(relay_url(relay_harness))
@@ -459,6 +586,31 @@ async def test_request_response_error_and_timeout_paths(relay_harness: RelayHarn
             await timeout_task
         assert timeout_info.value.code == "INTERNAL"
         assert timeout_info.value.message == "extension request timed out: tabs.list"
+
+
+@pytest.mark.asyncio
+async def test_broker_request_timeout_retains_terminal_fence_until_response() -> None:
+    server = ExtensionRelayServer(TOKEN, 0, AsyncMock(), control_pairing_only=True)
+
+    class WebSocket:
+        closed = False
+
+        async def send_json(self, _frame: dict) -> None:
+            return None
+
+    server._websocket = WebSocket()  # type: ignore[assignment]
+    server._connected_event.set()
+
+    with pytest.raises(ExtensionRequestError, match="timed out"):
+        await server.request("tabs.list", {}, timeout=0.01, retain_until_terminal=True)
+
+    assert server.pending_request_count == 1
+    request_id = next(iter(server._pending))
+    await server._handle_text_frame(
+        server._websocket,
+        json.dumps({"v": 1, "type": "response", "id": request_id, "ok": True, "result": {}}),
+    )
+    assert server.pending_request_count == 0
 
 
 @pytest.mark.asyncio

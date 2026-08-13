@@ -10,13 +10,6 @@ from skyvern.forge.sdk.copilot.agent import _store_turn_context_packet_on_contex
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs
-from skyvern.forge.sdk.copilot.turn_intent import (
-    RequiredContextKey,
-    TurnIntent,
-    TurnIntentAuthority,
-    TurnIntentExpectedOutput,
-    TurnIntentMode,
-)
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
@@ -34,21 +27,14 @@ def _history(*pairs: tuple[str, str]) -> list[WorkflowCopilotChatHistoryMessage]
     ]
 
 
-def test_edit_turn_includes_workflow_proposal_and_transcript_context() -> None:
-    intent = TurnIntent(
-        mode=TurnIntentMode.EDIT,
-        required_context=[RequiredContextKey.CURRENT_WORKFLOW, RequiredContextKey.LATEST_ASSISTANT_PROPOSAL],
-        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
-        expected_output=TurnIntentExpectedOutput.WORKFLOW_UPDATE,
-    )
-
+def test_turn_includes_workflow_proposal_and_transcript_context() -> None:
     packet = TurnContextAssembler().assemble(
         TurnContextInputs(
-            turn_intent=intent,
             request_policy=RequestPolicy(),
             user_message="Update the first block",
             workflow_yaml="workflow_definition:\n  blocks: []",
             chat_history=_history(("user", "Build a workflow"), ("ai", "Drafted v1")),
+            debug_run_info_text="Block Label: block_1",
         )
     )
 
@@ -57,119 +43,41 @@ def test_edit_turn_includes_workflow_proposal_and_transcript_context() -> None:
     assert packet.proposal_context is not None
     assert packet.proposal_context.latest_assistant_proposal == "Drafted v1"
     assert packet.transcript_context.latest_assistant_turn == "Drafted v1"
-    assert packet.omissions == []
+    assert [omission.context_key for omission in packet.omissions] == ["credential_metadata"]
 
 
-def test_repeated_reply_context_attached_when_assistant_repeats() -> None:
-    from skyvern.forge.sdk.copilot.turn_intent import TurnIntentReasonCode
-    from skyvern.forge.sdk.copilot.turn_outcome import build_minimal_turn_outcome
-    from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind
-
-    answer = "The file is stored as an artifact in the Artifacts section of the run results page."
-    outcome = build_minimal_turn_outcome(answer, response_kind=ResponseKind.DIAGNOSE)
-    history = [
-        WorkflowCopilotChatHistoryMessage(
-            sender=WorkflowCopilotChatSender.USER,
-            content="where is my file",
-            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        ),
-        WorkflowCopilotChatHistoryMessage(
-            sender=WorkflowCopilotChatSender.AI,
-            content=answer,
-            turn_outcome=outcome,
-            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        ),
-        WorkflowCopilotChatHistoryMessage(
-            sender=WorkflowCopilotChatSender.USER,
-            content="i cannot see it",
-            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        ),
-        WorkflowCopilotChatHistoryMessage(
-            sender=WorkflowCopilotChatSender.AI,
-            content=answer,
-            turn_outcome=outcome,
-            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        ),
-    ]
+def test_answer_shaped_turn_still_receives_workflow_and_run_context() -> None:
     packet = TurnContextAssembler().assemble(
         TurnContextInputs(
-            turn_intent=TurnIntent(
-                mode=TurnIntentMode.UNKNOWN,
-                reason_codes=[TurnIntentReasonCode.USER_NON_PROGRESS],
-            ),
             request_policy=RequestPolicy(),
-            user_message="i still cannot see it",
-            chat_history=history,
+            user_message="What is a loop block?",
+            workflow_yaml="workflow_definition:\n  blocks:\n    - label: block_1",
+            debug_run_info_text="Failure Reason: timeout",
         )
     )
 
-    assert packet.repeated_reply_context is not None
-    assert outcome.normalized_reply_signature in packet.repeated_reply_context.blocked_signatures
-    assert "repeated_reply_detected" in packet.repeated_reply_context.rendered_summary
-    trace = packet.to_trace_data()
-    assert "repeated_reply_context" in trace["sections"]
+    assert packet.workflow_context is not None
+    assert packet.run_context is not None
+    assert "Failure Reason: timeout" in packet.run_context.summary
 
 
-def test_repeated_reply_context_omitted_without_repeat() -> None:
+def test_run_context_missing_is_reported_as_an_omission() -> None:
     packet = TurnContextAssembler().assemble(
         TurnContextInputs(
-            turn_intent=TurnIntent(mode=TurnIntentMode.UNKNOWN),
-            request_policy=RequestPolicy(),
-            user_message="where is my file",
-            chat_history=_history(("user", "build a workflow"), ("ai", "Drafted v1")),
-        )
-    )
-
-    assert packet.repeated_reply_context is None
-    trace = packet.to_trace_data()
-    assert "repeated_reply_context" not in trace["sections"]
-    assert trace["repeated_reply_count"] == 0
-
-
-def test_diagnose_turn_includes_run_context_or_reports_missing() -> None:
-    available = TurnContextAssembler().assemble(
-        TurnContextInputs(
-            turn_intent=TurnIntent(
-                mode=TurnIntentMode.DIAGNOSE,
-                required_context=[RequiredContextKey.LATEST_RUN_RESULT],
-                expected_output=TurnIntentExpectedOutput.RUN_RESULT,
-            ),
-            request_policy=RequestPolicy(),
-            user_message="Why did the run fail?",
-            debug_run_info_text="Block Label: block_1\nFailure Reason: timeout",
-        )
-    )
-    missing = TurnContextAssembler().assemble(
-        TurnContextInputs(
-            turn_intent=TurnIntent(
-                mode=TurnIntentMode.DIAGNOSE,
-                required_context=[RequiredContextKey.LATEST_RUN_RESULT],
-                expected_output=TurnIntentExpectedOutput.RUN_RESULT,
-            ),
             request_policy=RequestPolicy(),
             user_message="Diagnose the failure",
+            workflow_yaml="workflow_definition:\n  blocks: []",
         )
     )
 
-    assert available.run_context is not None
-    assert "Failure Reason: timeout" in available.run_context.summary
-    assert available.omissions == []
-    assert missing.run_context is None
-    assert missing.omissions[0].context_key == RequiredContextKey.LATEST_RUN_RESULT
-    assert missing.omissions[0].reason == "unavailable"
+    assert packet.run_context is None
+    assert [omission.context_key for omission in packet.omissions] == ["latest_run_result", "credential_metadata"]
+    assert packet.omissions[0].reason == "unavailable"
 
 
 def test_raw_secrets_are_redacted_across_context_packet() -> None:
     packet = TurnContextAssembler().assemble(
         TurnContextInputs(
-            turn_intent=TurnIntent(
-                mode=TurnIntentMode.EDIT,
-                required_context=[
-                    RequiredContextKey.CURRENT_WORKFLOW,
-                    RequiredContextKey.LATEST_ASSISTANT_PROPOSAL,
-                    RequiredContextKey.LATEST_RUN_RESULT,
-                ],
-            ),
             request_policy=RequestPolicy(),
             user_message="Use password: hunter2",
             workflow_yaml="navigation_goal: use password=hunter2 and token=sk-abcdefghijklmnopqrstuvwxyz1234567890",
@@ -184,73 +92,26 @@ def test_raw_secrets_are_redacted_across_context_packet() -> None:
     assert "[REDACTED_SECRET]" in dumped
 
 
-def test_docs_answer_turn_does_not_pull_workflow_or_run_context() -> None:
-    packet = TurnContextAssembler().assemble(
-        TurnContextInputs(
-            turn_intent=TurnIntent(
-                mode=TurnIntentMode.ANSWER,
-                required_context=[RequiredContextKey.DOCS_CONTEXT],
-            ),
-            request_policy=RequestPolicy(),
-            user_message="What is a loop block?",
-            workflow_yaml="workflow_definition:\n  blocks:\n    - label: block_1",
-            debug_run_info_text="Failure Reason: hidden",
-        )
-    )
-
-    assert packet.docs_context is not None
-    assert packet.workflow_context is None
-    assert packet.run_context is None
-
-
-def test_browser_state_required_context_reports_not_implemented_omission() -> None:
-    packet = TurnContextAssembler().assemble(
-        TurnContextInputs(
-            turn_intent=TurnIntent(
-                mode=TurnIntentMode.EDIT,
-                required_context=[RequiredContextKey.CURRENT_WORKFLOW, RequiredContextKey.BROWSER_STATE],
-            ),
-            request_policy=RequestPolicy(),
-            user_message="Continue in the open browser",
-            workflow_yaml="workflow_definition:\n  blocks: []",
-        )
-    )
-
-    assert packet.workflow_context is not None
-    browser_state_omissions = [
-        omission for omission in packet.omissions if omission.context_key == RequiredContextKey.BROWSER_STATE
-    ]
-    assert len(browser_state_omissions) == 1
-    assert browser_state_omissions[0].reason == "not_implemented"
-
-
 def test_size_budget_truncates_and_reports_omission() -> None:
     packet = TurnContextAssembler(workflow_char_budget=24).assemble(
         TurnContextInputs(
-            turn_intent=TurnIntent(
-                mode=TurnIntentMode.EDIT,
-                required_context=[RequiredContextKey.CURRENT_WORKFLOW],
-            ),
             request_policy=RequestPolicy(),
             user_message="Update it",
             workflow_yaml="workflow_definition:\n  blocks:\n    - label: very_long_block_label",
+            debug_run_info_text="Block Label: block_1",
         )
     )
 
     assert packet.workflow_context is not None
     assert packet.workflow_context.truncated is True
     assert len(packet.workflow_context.yaml) <= 24
-    assert packet.omissions[0].context_key == RequiredContextKey.CURRENT_WORKFLOW
+    assert packet.omissions[0].context_key == "current_workflow"
     assert packet.omissions[0].reason == "truncated_to_budget"
 
 
 def test_credential_context_contains_safe_metadata_only() -> None:
     packet = TurnContextAssembler().assemble(
         TurnContextInputs(
-            turn_intent=TurnIntent(
-                mode=TurnIntentMode.BUILD,
-                required_context=[RequiredContextKey.CREDENTIAL_METADATA],
-            ),
             request_policy=RequestPolicy(
                 credential_input_kind="credential_id",
                 credential_refs=["cred_safe"],
@@ -289,18 +150,9 @@ _WORKFLOW_V2 = _WORKFLOW_V1 + (
 )
 
 
-def _change_intent() -> TurnIntent:
-    return TurnIntent(
-        mode=TurnIntentMode.EDIT,
-        required_context=[RequiredContextKey.CURRENT_WORKFLOW, RequiredContextKey.WORKFLOW_CHANGE],
-        authority=TurnIntentAuthority(may_update_workflow=True),
-    )
-
-
 def test_workflow_change_context_reports_user_edit() -> None:
     packet = TurnContextAssembler().assemble(
         TurnContextInputs(
-            turn_intent=_change_intent(),
             request_policy=RequestPolicy(),
             user_message="I added a block, does this look right?",
             workflow_yaml=_WORKFLOW_V2,
@@ -315,28 +167,19 @@ def test_workflow_change_context_reports_user_edit() -> None:
 
 
 @pytest.mark.parametrize(
-    ("turn_intent", "workflow_yaml", "prior_workflow_yaml", "user_message"),
+    ("workflow_yaml", "prior_workflow_yaml", "user_message"),
     [
-        pytest.param(_change_intent(), _WORKFLOW_V1, _WORKFLOW_V1, "Still broken, fix it", id="unchanged"),
-        pytest.param(_change_intent(), _WORKFLOW_V1, "", "Build me a workflow", id="first_turn"),
-        pytest.param(
-            TurnIntent(mode=TurnIntentMode.EDIT, required_context=[RequiredContextKey.CURRENT_WORKFLOW]),
-            _WORKFLOW_V2,
-            _WORKFLOW_V1,
-            "Update it",
-            id="not_required",
-        ),
+        pytest.param(_WORKFLOW_V1, _WORKFLOW_V1, "Still broken, fix it", id="unchanged"),
+        pytest.param(_WORKFLOW_V1, "", "Build me a workflow", id="first_turn"),
     ],
 )
 def test_workflow_change_context_is_none(
-    turn_intent: TurnIntent,
     workflow_yaml: str,
     prior_workflow_yaml: str,
     user_message: str,
 ) -> None:
     packet = TurnContextAssembler().assemble(
         TurnContextInputs(
-            turn_intent=turn_intent,
             request_policy=RequestPolicy(),
             user_message=user_message,
             workflow_yaml=workflow_yaml,
@@ -348,7 +191,7 @@ def test_workflow_change_context_is_none(
     assert packet.to_trace_data()["workflow_change_kind"] is None
 
 
-def test_shadow_attachment_stores_packet_on_copilot_context() -> None:
+def test_attachment_stores_packet_on_copilot_context() -> None:
     ctx = CopilotContext(
         organization_id="org-1",
         workflow_id="wf-1",
@@ -356,10 +199,6 @@ def test_shadow_attachment_stores_packet_on_copilot_context() -> None:
         workflow_yaml="",
         browser_session_id=None,
         stream=MagicMock(),
-        turn_intent=TurnIntent(
-            mode=TurnIntentMode.EDIT,
-            required_context=[RequiredContextKey.CURRENT_WORKFLOW],
-        ),
     )
 
     _store_turn_context_packet_on_context(

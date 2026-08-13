@@ -411,6 +411,51 @@ async def test_resolve_browser_classifies_explicit_cloud_session_localhost_reach
 
 
 @pytest.mark.asyncio
+async def test_resolve_browser_classifies_bare_browser_session_id_from_cdp_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_manager.settings, "ENV", "prod")
+    browser = MagicMock()
+    fake_skyvern = MagicMock()
+    fake_skyvern.connect_to_cloud_browser_session = AsyncMock(return_value=browser)
+    fake_skyvern.connect_to_browser_over_cdp = AsyncMock()
+    monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
+
+    resolved_browser, context = await session_manager.resolve_browser(cdp_url="pbs_123")
+
+    assert resolved_browser is browser
+    assert context == BrowserContext(mode="cloud_session", session_id="pbs_123", can_access_localhost=False)
+    fake_skyvern.connect_to_cloud_browser_session.assert_awaited_once_with("pbs_123")
+    fake_skyvern.connect_to_browser_over_cdp.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cdp_url",
+    [
+        "http://127.0.0.1:9222",
+        "wss://browser.test/devtools/browser/pbs_123",
+    ],
+)
+async def test_resolve_browser_keeps_cdp_urls_on_direct_attach_path(
+    monkeypatch: pytest.MonkeyPatch,
+    cdp_url: str,
+) -> None:
+    browser = MagicMock()
+    fake_skyvern = MagicMock()
+    fake_skyvern.connect_to_cloud_browser_session = AsyncMock()
+    fake_skyvern.connect_to_browser_over_cdp = AsyncMock(return_value=browser)
+    monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
+
+    resolved_browser, context = await session_manager.resolve_browser(cdp_url=cdp_url)
+
+    assert resolved_browser is browser
+    assert context == BrowserContext(mode="cdp", cdp_url=cdp_url)
+    fake_skyvern.connect_to_browser_over_cdp.assert_awaited_once_with(cdp_url)
+    fake_skyvern.connect_to_cloud_browser_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("organization_id", "api_key"),
     [(None, "sk_copilot_org"), ("org_copilot", "sk_other_org")],

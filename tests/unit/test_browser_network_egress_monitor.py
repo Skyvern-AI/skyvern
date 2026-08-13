@@ -424,3 +424,64 @@ async def test_consumed_approval_replay_and_capacity_invalidate(monkeypatch: pyt
     with pytest.raises(RuntimeError, match="capacity"):
         await run_with_consumed_effect(open_once)
     assert second.invalidation_reason is BrowserNetworkDenialReason.APPROVAL_CAPACITY_EXHAUSTED
+
+
+@pytest.mark.asyncio
+async def test_observing_monitor_registers_interception_and_never_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SKY-13810: an observing monitor is enrolled by run-scoped authority alone, so
+    request-interceptor registration succeeds without the monitor owning context routing —
+    and it can never deny, whatever the authorization verdict would have been."""
+    monitor = BrowserNetworkEgressMonitor.observing("https://run.example/start")
+    logger = Mock()
+    monkeypatch.setattr("skyvern.forge.sdk.browser_network_egress_monitor.LOG", logger)
+
+    monitor.register_active_request_interceptor(page=(page := _Page()), owner=(owner := object()))
+
+    # Every verdict that would fail closed under enforcement: off-authority origin, passive
+    # resource with no causal epoch, and an unarmed document.
+    assert monitor.authorize_request(
+        method="GET", url="https://cdn.other.example/a.png", resource_type="image", frame=object()
+    )
+    assert monitor.authorize_request(
+        method="GET", url="https://run.example/a.png", resource_type="image", frame=object()
+    )
+    assert monitor.authorize_request(
+        method="POST", url="https://run.example/submit", resource_type="document", frame=object()
+    )
+    # Reason plus origin, because the deny set cannot be measured from the reason alone; sampled
+    # because nothing opens a causal epoch yet, so this is one line per request.
+    assert [
+        (call.kwargs["reason"], call.kwargs["origin"], call.kwargs["sampling"]) for call in logger.info.call_args_list
+    ] == [
+        (BrowserNetworkDenialReason.ORIGIN_NOT_AUTHORIZED, "https://cdn.other.example", True),
+        (BrowserNetworkDenialReason.CAUSAL_EPOCH_REQUIRED, "https://run.example", True),
+        (BrowserNetworkDenialReason.FRESH_APPROVAL_REQUIRED, "https://run.example", True),
+    ]
+    logger.warning.assert_not_called()
+
+    monitor.unregister_active_request_interceptor(page=page, owner=owner)
+    # An invalidated observing monitor still cannot block; nothing degrades into a closed door.
+    monitor.invalidate()
+    assert monitor.authorize_request(
+        method="GET", url="https://run.example/a.png", resource_type="image", frame=object()
+    )
+
+
+@pytest.mark.asyncio
+async def test_observing_monitor_refuses_context_routing_and_unusable_run_urls() -> None:
+    """Observation and enforcement are exclusive: an observing monitor must never install the
+    deny-by-default context route, and a run with no canonical origin yields no authority."""
+    monitor = BrowserNetworkEgressMonitor.observing("https://run.example")
+    with pytest.raises(RuntimeError, match="never owns context routing"):
+        await monitor.install(_Context())  # type: ignore[arg-type]
+    # A refused install must not promote it into an enforcing monitor: the authority it mints is
+    # a reporting ceiling, never something a later enforcement seam can read as a live grant.
+    assert monitor.authorize_request(
+        method="GET", url="https://cdn.other.example/a.png", resource_type="image", frame=object()
+    )
+
+    for unusable in (None, "", "not a url", "file:///etc/passwd"):
+        degraded = BrowserNetworkEgressMonitor.observing(unusable)
+        assert degraded.invalidation_reason is BrowserNetworkDenialReason.UNENROLLED
+        with pytest.raises(RuntimeError, match="cannot be registered"):
+            degraded.register_active_request_interceptor(page=_Page(), owner=object())

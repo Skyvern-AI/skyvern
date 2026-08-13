@@ -522,6 +522,208 @@ def test_response_routing_metadata_is_string_or_none(response: object, expected:
     assert api_handler_factory._response_routing_metadata(response) == expected
 
 
+def test_copilot_model_usage_extraction_preserves_response_model_for_malformed_usage() -> None:
+    class BrokenResponse:
+        model = "gpt-4.1"
+
+        @property
+        def usage(self) -> None:
+            raise RuntimeError("malformed usage")
+
+    event = api_handler_factory._copilot_model_usage_event(
+        BrokenResponse(),
+        request_model="gpt-4",
+        provider_name="openai",
+        cost=None,
+        prompt_name="workflow-copilot-narration",
+    )
+
+    assert event.log_fields() == {
+        "log_code": "copilot_model_usage",
+        "gen_ai.operation.name": "chat",
+        "gen_ai.request.model": "gpt-4",
+        "gen_ai.response.model": "gpt-4.1",
+        "gen_ai.provider.name": "openai",
+        "copilot.prompt_name": "workflow-copilot-narration",
+    }
+
+
+def test_copilot_model_usage_logging_failure_cannot_fail_a_completed_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+    logger = MagicMock()
+    logger.info.side_effect = RuntimeError("logger unavailable")
+    logger.warning.side_effect = RuntimeError("logger unavailable")
+    monkeypatch.setattr(api_handler_factory, "LOG", logger)
+
+    api_handler_factory._emit_copilot_model_usage_for_response(
+        FakeLLMResponse("gpt-4.1"),
+        request_model="gpt-4",
+        prompt_name="workflow-copilot-narration",
+        cost=None,
+    )
+
+
+def test_copilot_model_usage_metadata_failure_cannot_fail_a_completed_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenResponse:
+        @property
+        def provider(self) -> str:
+            raise RuntimeError("bad provider metadata")
+
+    logger = DummyLogger()
+    monkeypatch.setattr(api_handler_factory, "LOG", logger)
+
+    api_handler_factory._emit_copilot_model_usage_for_response(
+        BrokenResponse(),
+        request_model="gpt-4",
+        prompt_name="workflow-copilot-narration",
+        cost=None,
+    )
+
+    assert any(event == "Failed to emit Copilot model usage" for event, _ in logger.warnings)
+
+
+def _stub_successful_llm_caller(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    parse_error: Exception | None = None,
+) -> tuple[LLMCaller, DummyLogger]:
+    llm_config = LLMConfig(
+        model_name="gpt-4",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+    )
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(
+        api_handler_factory,
+        "llm_messages_builder_with_history",
+        AsyncMock(return_value=[{"role": "user", "content": "test"}]),
+    )
+    response = FakeLLMResponse("openai/gpt-4.1")
+    response.provider = "openai"
+    response.usage.prompt_tokens = 7
+    response.usage.completion_tokens = 3
+    response.usage.prompt_tokens_details.cached_tokens = 0
+    response.usage.prompt_tokens_details.cache_write_tokens = 2
+    caller = LLMCaller("TEST_LLM_CALLER_USAGE")
+    monkeypatch.setattr(caller, "_dispatch_llm_call", AsyncMock(return_value=response))
+    monkeypatch.setattr(
+        caller,
+        "get_call_stats",
+        AsyncMock(
+            return_value=api_handler_factory.LLMCallStats(
+                input_tokens=7,
+                output_tokens=3,
+                cached_tokens=0,
+                reasoning_tokens=0,
+                llm_cost=0.25,
+                llm_cost_available=True,
+            )
+        ),
+    )
+    artifact_manager = MagicMock()
+    artifact_manager.bulk_create_artifacts = AsyncMock()
+    monkeypatch.setattr(api_handler_factory.app, "ARTIFACT_MANAGER", artifact_manager)
+    if parse_error is None:
+        monkeypatch.setattr(api_handler_factory, "parse_api_response", lambda *args: {"actions": []})
+    else:
+        monkeypatch.setattr(api_handler_factory, "parse_api_response", MagicMock(side_effect=parse_error))
+    logger = DummyLogger()
+    monkeypatch.setattr(api_handler_factory, "LOG", logger)
+    return caller, logger
+
+
+@pytest.mark.asyncio
+async def test_llm_caller_emits_one_copilot_model_usage_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    caller, logger = _stub_successful_llm_caller(monkeypatch)
+
+    result = await caller.call(prompt="test", prompt_name="workflow-copilot-page-evidence-vision")
+
+    usage_events = [fields for _, fields in logger.events if fields.get("log_code") == "copilot_model_usage"]
+    assert result == {"actions": []}
+    assert usage_events == [
+        {
+            "log_code": "copilot_model_usage",
+            "gen_ai.operation.name": "chat",
+            "gen_ai.request.model": "gpt-4",
+            "gen_ai.response.model": "openai/gpt-4.1",
+            "gen_ai.provider.name": "openai",
+            "gen_ai.usage.input_tokens": 7,
+            "gen_ai.usage.output_tokens": 3,
+            "gen_ai.usage.cache_read.input_tokens": 0,
+            "gen_ai.usage.cache_creation.input_tokens": 2,
+            "operation.cost": 0.25,
+            "copilot.prompt_name": "workflow-copilot-page-evidence-vision",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_llm_caller_emits_usage_when_final_response_parsing_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller, logger = _stub_successful_llm_caller(monkeypatch, parse_error=ValueError("invalid response"))
+
+    with pytest.raises(ValueError, match="invalid response"):
+        await caller.call(prompt="test", prompt_name="workflow-copilot-page-evidence-vision")
+
+    usage_events = [fields for _, fields in logger.events if fields.get("log_code") == "copilot_model_usage"]
+    assert len(usage_events) == 1
+    assert usage_events[0]["operation.cost"] == 0.25
+    assert usage_events[0]["copilot.prompt_name"] == "workflow-copilot-page-evidence-vision"
+
+
+@pytest.mark.asyncio
+async def test_llm_caller_emits_usage_before_call_stats_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    caller, logger = _stub_successful_llm_caller(monkeypatch)
+    monkeypatch.setattr(caller, "get_call_stats", AsyncMock(side_effect=RuntimeError("bad usage metadata")))
+
+    with pytest.raises(RuntimeError, match="bad usage metadata"):
+        await caller.call(prompt="test", prompt_name="workflow-copilot-page-evidence-vision")
+
+    usage_events = [fields for _, fields in logger.events if fields.get("log_code") == "copilot_model_usage"]
+    assert len(usage_events) == 1
+    assert usage_events[0]["gen_ai.usage.input_tokens"] == 7
+    assert "operation.cost" not in usage_events[0]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_call_stats_treats_missing_cache_read_tokens_as_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm_config = LLMConfig(
+        model_name="claude-sonnet-4-6",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+    )
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    caller = LLMCaller("ANTHROPIC_TEST")
+    response = api_handler_factory.AnthropicMessage.model_validate(
+        {
+            "id": "msg_test",
+            "content": [],
+            "model": "claude-sonnet-4-6",
+            "role": "assistant",
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "type": "message",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_input_tokens": None,
+            },
+        }
+    )
+
+    stats = await caller.get_call_stats(response)
+
+    assert stats.cached_tokens == 0
+    assert stats.llm_cost == pytest.approx((3.0 * 100 + 15.0 * 10) / 1_000_000)
+
+
 @pytest.mark.asyncio
 async def test_cached_content_not_added_for_non_gemini(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that cached_content is NOT added to non-Gemini models like GPT-4."""
@@ -1799,7 +2001,9 @@ def _stub_content_filter_rescue(
 
 
 @pytest.mark.asyncio
-async def test_content_filter_rescue_flag_routes_to_configured_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_copilot_model_usage_content_filter_rescue_counts_blocked_primary_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """With CONTENT_FILTER_RESCUE_LLM_NAME set, a Gemini content_filter block must be retried on
     the configured llm_key's handler instead of the hardcoded first non-Gemini fallback group,
     and the flag must be evaluated with run-level distinct_id + org/wpid properties (SKY-11766)."""
@@ -1814,13 +2018,15 @@ async def test_content_filter_rescue_flag_routes_to_configured_handler(monkeypat
     provider, router_calls = _stub_content_filter_rescue(
         monkeypatch, llm_key="TEST_RESCUE_FLAG_SET", variant="RESCUE_KEY", rescue_handler=fake_rescue_handler
     )
+    logger = DummyLogger()
+    monkeypatch.setattr(api_handler_factory, "LOG", logger)
 
     handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_FLAG_SET")
-    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
+    result = await handler(prompt='{"actions": []}', prompt_name="workflow-copilot-future-call")
 
     assert result == {"actions": ["rescued"]}
     assert captured["prompt"] == '{"actions": []}'
-    assert captured["prompt_name"] == "check-user-goal"
+    assert captured["prompt_name"] == "workflow-copilot-future-call"
     assert "parameters" not in captured or captured["parameters"] is None, (
         "rescue handler must derive parameters from its own llm_config, not inherit Gemini's"
     )
@@ -1832,6 +2038,9 @@ async def test_content_filter_rescue_flag_routes_to_configured_handler(monkeypat
     assert feature_name == "CONTENT_FILTER_RESCUE_LLM_NAME"
     assert distinct_id == "wr_test"
     assert properties == {"organization_id": "o_test", "workflow_permanent_id": "wpid_test"}
+    usage_events = [fields for _, fields in logger.events if fields.get("log_code") == "copilot_model_usage"]
+    assert len(usage_events) == 1
+    assert usage_events[0]["gen_ai.response.model"] == "gemini-3.1-flash-lite-preview"
 
 
 @pytest.mark.asyncio
@@ -2065,9 +2274,9 @@ def test_completion_cost_halves_vertex_flex(monkeypatch: pytest.MonkeyPatch) -> 
     standard = SimpleNamespace(_hidden_params={"provider_specific_fields": {"traffic_type": "ON_DEMAND"}})
     no_meta = SimpleNamespace(_hidden_params={})
 
-    assert LLMAPIHandlerFactory._completion_cost(flex) == pytest.approx(0.05)
-    assert LLMAPIHandlerFactory._completion_cost(standard) == pytest.approx(0.10)
-    assert LLMAPIHandlerFactory._completion_cost(no_meta) == pytest.approx(0.10)
+    assert LLMAPIHandlerFactory._completion_cost_or_none(flex) == pytest.approx(0.05)
+    assert LLMAPIHandlerFactory._completion_cost_or_none(standard) == pytest.approx(0.10)
+    assert LLMAPIHandlerFactory._completion_cost_or_none(no_meta) == pytest.approx(0.10)
 
 
 def test_completion_cost_halves_long_context_openai_direct_gpt5_6_flex(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2097,10 +2306,10 @@ def test_completion_cost_halves_long_context_openai_direct_gpt5_6_flex(monkeypat
         _hidden_params={"litellm_model_name": "gpt-5.6-luna"},
     )
 
-    assert LLMAPIHandlerFactory._completion_cost(long_context_flex) == pytest.approx(0.05)
-    assert LLMAPIHandlerFactory._completion_cost(short_prompt_flex) == pytest.approx(0.10)
-    assert LLMAPIHandlerFactory._completion_cost(azure_long_context_flex) == pytest.approx(0.10)
-    assert LLMAPIHandlerFactory._completion_cost(standard_tier_long_context) == pytest.approx(0.10)
+    assert LLMAPIHandlerFactory._completion_cost_or_none(long_context_flex) == pytest.approx(0.05)
+    assert LLMAPIHandlerFactory._completion_cost_or_none(short_prompt_flex) == pytest.approx(0.10)
+    assert LLMAPIHandlerFactory._completion_cost_or_none(azure_long_context_flex) == pytest.approx(0.10)
+    assert LLMAPIHandlerFactory._completion_cost_or_none(standard_tier_long_context) == pytest.approx(0.10)
 
 
 def test_completion_cost_returns_zero_when_litellm_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2109,7 +2318,7 @@ def test_completion_cost_returns_zero_when_litellm_raises(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(litellm, "completion_cost", _raise)
     resp = SimpleNamespace(_hidden_params={"provider_specific_fields": {"traffic_type": "ON_DEMAND_FLEX"}})
-    assert LLMAPIHandlerFactory._completion_cost(resp) == 0.0
+    assert LLMAPIHandlerFactory._completion_cost_or_none(resp) is None
 
 
 @pytest.mark.asyncio
@@ -2428,3 +2637,75 @@ async def test_extra_body_from_litellm_params_reaches_completion(monkeypatch: py
     await handler(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
 
     assert completion_params["extra_body"] == {"reasoning_effort": "high"}
+
+
+# ---------------------------------------------------------------------------
+# LLMCaller router-config support (SKY: v3 / direct-call engines can use fallback/flex groups)
+# ---------------------------------------------------------------------------
+
+
+def test_llmcaller_builds_router_for_router_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    router_config = _gemini_3_flash_router()
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: router_config)
+    monkeypatch.setattr(api_handler_factory, "_LLMCALLER_ROUTER_CACHE", {})
+    sentinel = MagicMock(name="litellm_router")
+    monkeypatch.setattr(api_handler_factory, "_build_litellm_router", lambda cfg: sentinel)
+
+    caller = LLMCaller("GEMINI_3_FLASH_WITH_FALLBACK")
+
+    assert caller._router is sentinel
+    assert caller._router_model_group == router_config.main_model_group
+
+
+def test_llmcaller_no_router_for_direct_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        api_handler_factory.LLMConfigRegistry, "get_config", lambda _: _custom_llm_config("openai/example-model")
+    )
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+
+    caller = LLMCaller("SOME_DIRECT_KEY")
+
+    assert caller._router is None
+    assert caller._router_model_group is None
+
+
+@pytest.mark.asyncio
+async def test_llmcaller_dispatches_router_config_through_router(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression: a router config used to crash LLMCaller (no .litellm_params on the config, and a
+    # bare group name handed to litellm.acompletion). It must now dispatch through the Router with
+    # model=main_model_group.
+    router_config = _gemini_3_flash_router()
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: router_config)
+    monkeypatch.setattr(api_handler_factory, "_LLMCALLER_ROUTER_CACHE", {})
+    fake_router = MagicMock(name="litellm_router")
+    fake_router.acompletion = AsyncMock(return_value="ROUTED")
+    monkeypatch.setattr(api_handler_factory, "_build_litellm_router", lambda cfg: fake_router)
+    monkeypatch.setattr(api_handler_factory, "_validate_custom_llm_api_base", AsyncMock())
+
+    caller = LLMCaller("GEMINI_3_FLASH_WITH_FALLBACK")
+    result = await caller._dispatch_llm_call(messages=[{"role": "user", "content": "hi"}], tools=None)
+
+    assert result == "ROUTED"
+    fake_router.acompletion.assert_awaited_once()
+    assert fake_router.acompletion.await_args.kwargs["model"] == router_config.main_model_group
+
+
+def test_llmcaller_router_is_cached_across_instances(monkeypatch: pytest.MonkeyPatch) -> None:
+    # v3 builds one LLMCaller per run; routers must be shared by key (one redis pool), not rebuilt.
+    router_config = _gemini_3_flash_router()
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: router_config)
+    monkeypatch.setattr(api_handler_factory, "_LLMCALLER_ROUTER_CACHE", {})
+    build_calls: list[object] = []
+
+    def _fake_build(_cfg: object) -> MagicMock:
+        built = MagicMock(name="litellm_router")
+        build_calls.append(built)
+        return built
+
+    monkeypatch.setattr(api_handler_factory, "_build_litellm_router", _fake_build)
+
+    first = LLMCaller("GEMINI_3_FLASH_WITH_FALLBACK")
+    second = LLMCaller("GEMINI_3_FLASH_WITH_FALLBACK")
+
+    assert first._router is second._router
+    assert len(build_calls) == 1
