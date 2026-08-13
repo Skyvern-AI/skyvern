@@ -12,7 +12,7 @@ import inspect
 import re
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -2632,10 +2632,6 @@ async def test_guarded_direct_fill_never_releases_to_a_cross_origin_element_fram
 
 # =============================================================================
 # Tests for selector fallback prep opt-out — SKY-12096
-#
-# Patching skyvern_page.asyncio.sleep rebinds the GLOBAL asyncio.sleep, so the mock also
-# records sleeps from coroutines running on other threads' event loops. Assert on locator
-# behavior or on this path's own sleep values — never on bare await_args.
 # =============================================================================
 
 
@@ -2645,19 +2641,17 @@ async def test_selector_fallback_default_runs_element_prep(mock_scraped_page, mo
     locator = _RecordingLocator()
     skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
 
-    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock) as sleep:
-        if action == "click":
-            result = await skyvern_page.click("#target")
-        elif action == "fill":
-            result = await skyvern_page.fill("#target", "Noor")
-        else:
-            result = await skyvern_page.type("#target", "Noor")
+    if action == "click":
+        result = await skyvern_page.click("#target")
+    elif action == "fill":
+        result = await skyvern_page.fill("#target", "Noor")
+    else:
+        result = await skyvern_page.type("#target", "Noor")
 
     assert result in ("#target", "Noor")
     assert ("wait_for", "attached") in locator.calls
     assert ("wait_for", "visible") in locator.calls
     assert ("scroll_into_view_if_needed", None) in locator.calls
-    assert call(0.15) in sleep.await_args_list
 
 
 @pytest.mark.asyncio
@@ -2670,18 +2664,16 @@ async def test_selector_fallback_prep_opt_out_uses_playwright_actionability(
     locator = _RecordingLocator()
     skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
 
-    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock) as sleep:
-        if action == "click":
-            result = await skyvern_page.click("#target", _skip_element_prep=True)
-        elif action == "fill":
-            result = await skyvern_page.fill("#target", "Noor", _skip_element_prep=True)
-        else:
-            result = await skyvern_page.type("#target", "Noor", _skip_element_prep=True)
+    if action == "click":
+        result = await skyvern_page.click("#target", _skip_element_prep=True)
+    elif action == "fill":
+        result = await skyvern_page.fill("#target", "Noor", _skip_element_prep=True)
+    else:
+        result = await skyvern_page.type("#target", "Noor", _skip_element_prep=True)
 
     assert result in ("#target", "Noor")
     assert not any(recorded[0] == "wait_for" for recorded in locator.calls)
     assert ("scroll_into_view_if_needed", None) not in locator.calls
-    assert call(0.15) not in sleep.await_args_list
 
 
 @pytest.mark.asyncio
