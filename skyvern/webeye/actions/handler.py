@@ -208,6 +208,15 @@ from skyvern.webeye.utils.page import (
 
 LOG = structlog.get_logger()
 
+
+async def _totp_window_sleep(delay: float) -> None:
+    await asyncio.sleep(delay)
+
+
+async def _upload_settle_sleep(delay: float) -> None:
+    await asyncio.sleep(delay)
+
+
 UPLOAD_PENDING_FOLLOWUP_MESSAGE = "Upload is not complete yet. Continue the upload flow."
 
 DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE = (
@@ -5037,7 +5046,7 @@ async def _handle_multi_field_totp_sequence(
                 totp=current_totp,
             )
 
-            await asyncio.sleep(wait_seconds)
+            await _totp_window_sleep(wait_seconds)
 
             LOG.debug(
                 "6th digit: Finished waiting, TOTP is now valid",
@@ -6124,7 +6133,7 @@ async def _wait_for_upload_processing(page: Page, engine_selection: BrowserEngin
     try:
         # Settle delay: let the page react to the file-input change and mount
         # upload UI (spinner, progress bar, XHR) before polling for readiness.
-        await asyncio.sleep(0.5)
+        await _upload_settle_sleep(0.5)
         skyvern_frame = await SkyvernFrame.create_instance(page, engine_selection=engine_selection)
         await skyvern_frame.wait_for_page_ready(
             loading_indicator_timeout_ms=3000,
