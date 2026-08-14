@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
+from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids
 from skyvern.forge.sdk.routes.workflow_copilot import (
     _blockless_submission_fallback,
     _effective_auto_accept,
@@ -26,6 +27,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     _normalize_copilot_yaml,
     _prior_copilot_workflow_yaml,
     _proposal_disposition,
+    _run_grant_workflow_yaml,
     _should_commit_staged_workflow,
     _should_restore_persisted_workflow,
     _workflow_copilot_ingress_log_fields,
@@ -35,6 +37,12 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
     WorkflowCopilotStreamResponseUpdate,
 )
+from skyvern.forge.sdk.workflow.models.parameter import (
+    OutputParameter,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import ProxyLocation
 
 
@@ -531,3 +539,76 @@ def test_narrative_payload_tolerates_keys_persisted_before_the_field_was_removed
 
     assert message.narrative_payload is not None
     assert "mode" not in message.narrative_payload
+
+
+def _credential_bound_workflow(credential_id: str) -> Any:
+    """A saved workflow row whose login block binds ``credential_id``."""
+    parameter = WorkflowParameter(
+        parameter_type="workflow",
+        workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+        key="login_credential",
+        workflow_parameter_id="wp_1",
+        workflow_id="w_1",
+        default_value=credential_id,
+        created_at=datetime.now(timezone.utc),
+        modified_at=datetime.now(timezone.utc),
+    )
+    return Workflow(
+        workflow_id="w_1",
+        organization_id="o_1",
+        title="saved",
+        workflow_permanent_id="wpid_1",
+        version=1,
+        proxy_location=ProxyLocation.NONE,
+        is_saved_task=False,
+        workflow_definition=WorkflowDefinition(
+            parameters=[parameter],
+            blocks=[
+                {
+                    "label": "login",
+                    "block_type": "login",
+                    "url": "https://example.com/login",
+                    "parameter_keys": ["login_credential"],
+                    "output_parameter": OutputParameter(
+                        output_parameter_id="op_1",
+                        key="login_output",
+                        workflow_id="w_1",
+                        created_at=datetime.now(timezone.utc),
+                        modified_at=datetime.now(timezone.utc),
+                    ),
+                }
+            ],
+        ),
+        created_at=datetime.now(timezone.utc),
+        modified_at=datetime.now(timezone.utc),
+    )
+
+
+def test_run_grant_yaml_carries_the_saved_rows_credential() -> None:
+    grant_yaml = _run_grant_workflow_yaml(_credential_bound_workflow("cred_saved"))
+
+    assert grant_yaml is not None
+    assert workflow_credential_ids(grant_yaml) == {"cred_saved"}
+
+
+def test_run_grant_yaml_ignores_a_binding_that_exists_only_on_the_submitted_canvas() -> None:
+    """The authority boundary: the grant reads the workflow row, never the submission.
+
+    A copilot proposal sits on the canvas until the user accepts it, so the next turn resubmits
+    it as a non-empty ``workflow_yaml``. If that ever reached the grant, a binding the model
+    staged would authorize its own run.
+    """
+    saved_row = _credential_bound_workflow("cred_saved")
+    # What the frontend would submit next turn: the canvas, still showing a staged proposal.
+    submitted_canvas_yaml = _run_grant_workflow_yaml(_credential_bound_workflow("cred_staged_by_model"))
+    assert submitted_canvas_yaml is not None
+    assert workflow_credential_ids(submitted_canvas_yaml) == {"cred_staged_by_model"}
+
+    grant_yaml = _run_grant_workflow_yaml(saved_row)
+
+    assert grant_yaml is not None
+    assert workflow_credential_ids(grant_yaml) == {"cred_saved"}
+
+
+def test_run_grant_yaml_is_none_when_the_row_has_no_blocks() -> None:
+    assert _run_grant_workflow_yaml(None) is None
