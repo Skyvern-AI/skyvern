@@ -52,7 +52,7 @@ How to work:
 - Before calling finish with status=completed, re-check with `observe` that every required field holds its intended value and the only remaining step is the final submit; fix anything missing first. Call `finish(status, reason, extracted_output)` when the goal is achieved (completed) or impossible/blocked (failed/terminated).
 
 Rules:
-- Use ONLY the values provided in the task. Never invent data.
+- Fill fields from the task's data and satisfy required fields rather than failing over a missing value: prefer the provided values, and for an ordinary required field with no exact value, enter the most reasonable value you can. Do not invent sensitive or identifying values (government IDs, financial details, or legal/eligibility attestations); if one of those is required and not provided, stop and report it rather than guessing. Leave optional fields blank when you have no basis to fill them.
 - Do not submit forms or take irreversible actions unless the goal explicitly instructs it."""
 
 
@@ -61,7 +61,7 @@ def _build_user_prompt(goal: str, parameters: dict[str, Any] | None, starting_ur
     if starting_url:
         parts.append(f"\nYou start on: {starting_url}")
     if parameters:
-        parts.append("\nData to use (only these values):\n" + json.dumps(parameters, indent=2, default=str))
+        parts.append("\nData provided for this task:\n" + json.dumps(parameters, indent=2, default=str))
     return "\n".join(parts)
 
 
