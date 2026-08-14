@@ -36,6 +36,53 @@ _ORPHANED_TASK_MESSAGE = "Task exception was never retrieved"
 _TARGET_CLOSED_ERROR_TYPE = "TargetClosedError"
 _CHANNEL_COLLECTED_ERROR = "The object has been collected to prevent unbounded heap growth"
 
+# Production collection splits records at the observed 75 KiB boundary. Keep JSON
+# below that boundary so one application event remains one Datadog event.
+MAX_JSON_LOG_BYTES = 64 * 1024
+_OVERSIZED_LOG_VALUE_CHARS = 4 * 1024
+_OVERSIZED_LOG_METADATA_CHARS = 512
+_OVERSIZED_LOG_FIELDS = (
+    "msg",
+    "timestamp",
+    "level",
+    "logger",
+    "entrypoint",
+    "env",
+    "version",
+    "event_status",
+    "event_severity",
+    "event_message",
+    "event_host",
+    "event_hostname",
+    "event_service",
+    "event_source",
+    "pathname",
+    "filename",
+    "module",
+    "func_name",
+    "lineno",
+    "request_id",
+    "organization_id",
+    "organization_name",
+    "step_id",
+    "task_id",
+    "run_id",
+    "workflow_id",
+    "workflow_run_id",
+    "workflow_permanent_id",
+    "task_v2_id",
+    "browser_session_id",
+    "copilot_session_id",
+    "browser_container_ip",
+    "browser_container_task_arn",
+    "error",
+    "error_type",
+    "error_category",
+    "exception_hash",
+    "exception",
+)
+_JSON_RENDERER = structlog.processors.JSONRenderer()
+
 
 class _DriverPipeNoiseFilter(logging.Filter):
     """Drop asyncio's orphaned-task/future noise from a torn-down Playwright driver/target.
@@ -116,7 +163,7 @@ def _add_entrypoint(logger: logging.Logger, method_name: str, event_dict: EventD
 # Datadog intake preprocessing derives the log's severity/message/host/service/source from
 # these reserved attribute names, so a domain kwarg like status="completed" becomes the
 # log's severity (`c*` → critical). Renamed at the render seam only: `context.log` (the S3
-# run artifact), the folded `msg` text, and the console renderer keep the authored names.
+# run artifact) and the console renderer keep the authored names.
 # `severity` is here because it sits between `status` and `level` in Datadog's status-attribute
 # list, so stripping only `status` would promote it to the severity source. `msg` is
 # deliberately absent: this runs after EventRenamer has moved the real message there, so
@@ -140,10 +187,8 @@ def escape_reserved_log_keys(logger: logging.Logger, method_name: str, event_dic
     return event_dict
 
 
-def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
-    """
-    A custom processor to add key-value pairs to the 'msg' field.
-    """
+def add_log_context(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    """Add request and process context without copying structured values into ``msg``."""
     # Add context to the log
     context = skyvern_context.current()
     if context:
@@ -180,22 +225,80 @@ def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: Ev
     event_dict["env"] = settings.ENV
     event_dict["version"] = __version__
 
-    if method_name not in ["info", "warning", "error", "critical", "exception"]:
-        # Only modify the log for these log levels
-        return event_dict
-
-    # Assuming 'event' or 'msg' is the field to update
-    msg_field = event_dict.get("msg", "")
-
-    # Add key-value pairs
-    kv_pairs = {k: v for k, v in event_dict.items() if k not in ["msg", "timestamp", "level", "sampling"]}
-    if kv_pairs:
-        additional_info = ", ".join(f"{k}={v}" for k, v in kv_pairs.items())
-        msg_field += f" | {additional_info}"
-
-    event_dict["msg"] = msg_field
-
     return event_dict
+
+
+def _truncate_log_value(value: Any, max_chars: int) -> Any:
+    if value is None or isinstance(value, (bool, float)):
+        return value
+    if isinstance(value, int):
+        value = int(value)
+    text = value if isinstance(value, str) else str(value)
+    if isinstance(value, int) and len(text) <= max_chars:
+        return value
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}... [truncated]"
+
+
+def render_bounded_json(logger: logging.Logger, method_name: str, event_dict: EventDict) -> str:
+    """Render one valid JSON record below the collector's observed split boundary."""
+    rendered = _JSON_RENDERER(logger, method_name, event_dict)
+    # JSONRenderer's default serializer escapes non-ASCII characters, so character
+    # length is also the emitted UTF-8 byte length without allocating another copy.
+    original_size_bytes = len(rendered)
+    if original_size_bytes <= MAX_JSON_LOG_BYTES:
+        return rendered
+
+    bounded = {
+        key: _truncate_log_value(
+            event_dict[key],
+            _OVERSIZED_LOG_VALUE_CHARS if key in {"msg", "exception"} else _OVERSIZED_LOG_METADATA_CHARS,
+        )
+        for key in _OVERSIZED_LOG_FIELDS
+        if key in event_dict
+    }
+    omitted_fields = sorted(str(key)[:128] for key in event_dict if key not in bounded)
+    bounded.update(
+        {
+            "log_truncated": True,
+            "original_size_bytes": original_size_bytes,
+            "omitted_field_count": len(omitted_fields),
+            "omitted_fields": omitted_fields[:50],
+        }
+    )
+    rendered = _JSON_RENDERER(logger, method_name, bounded)
+    if len(rendered) <= MAX_JSON_LOG_BYTES:
+        return rendered
+
+    # Unusual escaped/control-heavy metadata can expand during JSON encoding. Keep a
+    # minimal correlated record rather than emitting another line the collector splits.
+    minimal = {
+        key: _truncate_log_value(bounded[key], 256 if key == "msg" else 128)
+        for key in _OVERSIZED_LOG_FIELDS
+        if key in bounded and key != "exception"
+    }
+    minimal.update(
+        {
+            "log_truncated": True,
+            "original_size_bytes": original_size_bytes,
+            "omitted_field_count": sum(1 for key in event_dict if key not in minimal),
+        }
+    )
+    rendered = _JSON_RENDERER(logger, method_name, minimal)
+    if len(rendered) <= MAX_JSON_LOG_BYTES:
+        return rendered
+    return _JSON_RENDERER(
+        logger,
+        method_name,
+        {
+            "msg": "Oversized log record",
+            "level": _truncate_log_value(event_dict.get("level"), 32),
+            "log_truncated": True,
+            "original_size_bytes": original_size_bytes,
+            "omitted_field_count": len(event_dict),
+        },
+    )
 
 
 def redact_registered_secrets(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
@@ -210,8 +313,7 @@ def redact_registered_secrets(logger: logging.Logger, method_name: str, event_di
         return event_dict
 
     def scrub(node: Any) -> Any:
-        # Nested values are folded into `msg` by add_kv_pairs_to_msg further down the chain, so a
-        # secret carried only inside a nested kwarg reaches the log line unless we recurse here.
+        # Structured nested values are rendered in full, so recurse before JSON serialization.
         if isinstance(node, str):
             for secret in secrets:
                 if secret in node:
@@ -249,7 +351,7 @@ def redact_sensitive_event_fields(logger: logging.Logger, method_name: str, even
 
     Reuses the shared field redactor so structured kwargs such as
     ``headers={"Authorization": ...}``, ``payload={...}``, or ``response_body={...}``
-    are masked before ``add_kv_pairs_to_msg`` folds them into the rendered line.
+    are masked before JSON serialization.
     Top-level keys whose name is sensitive are masked outright; every other
     non-string value is redacted recursively — models, tuples and sets included,
     since the formatter renders those in full too. Plain string values are left to
@@ -562,7 +664,7 @@ def setup_logger() -> None:
     _entrypoint = _get_entrypoint()
 
     # logging.config.dictConfig(logging_config)
-    renderer = structlog.processors.JSONRenderer() if settings.JSON_LOGGING else CustomConsoleRenderer()
+    renderer = render_bounded_json if settings.JSON_LOGGING else CustomConsoleRenderer()
     additional_processors = (
         [
             redact_bearer_tokens,
@@ -573,7 +675,7 @@ def setup_logger() -> None:
             compact_action_objects,
             redact_sensitive_event_fields,
             structlog.processors.EventRenamer("msg"),
-            add_kv_pairs_to_msg,
+            add_log_context,
             structlog.processors.CallsiteParameterAdder(
                 {
                     structlog.processors.CallsiteParameter.PATHNAME,
@@ -616,9 +718,9 @@ def setup_logger() -> None:
     )
     # Foreign stdlib records never run the structlog chain above, so without these two a
     # record reaches Datadog with an empty message (its remapper reads `msg`, not `event`)
-    # and no `organization_id` to group on. Order matters: `add_kv_pairs_to_msg` reads `msg`.
+    # and no `organization_id` to group on.
     foreign_msg_chain: list[Processor] = (
-        [structlog.processors.EventRenamer("msg"), add_kv_pairs_to_msg] if settings.JSON_LOGGING else []
+        [structlog.processors.EventRenamer("msg"), add_log_context] if settings.JSON_LOGGING else []
     )
 
     handler = logging.StreamHandler()
