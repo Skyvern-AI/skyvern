@@ -46,7 +46,9 @@ How to work:
 - Perceive with `observe`: it returns the page's visible interactive elements, each with a CSS selector, label, type, current value, and (for selects) options. Call it once per page state and act from that snapshot; re-observe only after the page changes.
 - Act by CSS selector: `type`, `select_option`, `click`, `press_key`, `scroll`, `wait`, `navigate`, `file_upload`.
 - Be efficient — this is the whole point of the engine. After observing a form once, fill every field you can before doing anything that reloads the page. Minimize tool calls and turns.
-- Use `get_html` only when `observe` lacks detail for a specific element; do not read whole pages into the conversation.
+- Batch aggressively: in ONE turn you can `type` into many fields AND `click` many radio/checkbox options AND `select_option` on several dropdowns. Answer a whole form section in a single turn — never spend a separate turn on each click.
+- `observe` already gives you everything you need to fill a field (selector, label, type, current value, options, and the surrounding question text) — act on it directly. `get_html` is a rare last resort for ONE specific element `observe` failed to describe: NEVER call it on a whole page/form/section, NEVER call it twice for the same element, and NEVER inspect more than once before acting.
+- Inspecting the page does NOT progress the task — only `type`/`select_option`/`click` do. If your recent turns were mostly `observe`/`get_html` with little typing or clicking, you are stuck inspecting: stop, and fill every field you can from the latest `observe` snapshot using its selectors before doing anything else.
 - Before calling finish with status=completed, re-check with `observe` that every required field holds its intended value and the only remaining step is the final submit; fix anything missing first. Call `finish(status, reason, extracted_output)` when the goal is achieved (completed) or impossible/blocked (failed/terminated).
 
 Rules:

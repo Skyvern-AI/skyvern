@@ -63,6 +63,7 @@ class _FakePage:
                         "selector": "#agree",
                         "label": "I agree",
                         "checked": False,
+                        "group": "Consent: I agree to the terms and privacy policy",
                     },
                 ],
             }
@@ -162,6 +163,16 @@ async def test_observe_renders_checkbox_checked_state() -> None:
     tools = build_browser_tools(_FakePage())
     r = await _tool(tools, "observe").handler({})
     assert "#agree" in r.content and "checked=" in r.content
+
+
+@pytest.mark.asyncio
+async def test_observe_renders_group_context() -> None:
+    # Controls whose meaning lives in surrounding text (radio/checkbox groups, weak labels) carry a
+    # `group` field with the question text, so the agent can answer without fetching raw HTML.
+    tools = build_browser_tools(_FakePage())
+    r = await _tool(tools, "observe").handler({})
+    assert "group=" in r.content
+    assert "Consent: I agree to the terms" in r.content
 
 
 @pytest.mark.asyncio

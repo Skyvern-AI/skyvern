@@ -30,6 +30,7 @@ _OBSERVE_JS = r"""
   const els = document.querySelectorAll(q);
   const out = [];
   let i = 0;
+  let lastGroup = '';
   for (const el of els) {
     const r = el.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) continue;
@@ -48,6 +49,17 @@ _OBSERVE_JS = r"""
     if (el.type === 'checkbox' || el.type === 'radio') rec.checked = !!el.checked;
     else if (el.getAttribute('role') === 'checkbox' || el.getAttribute('role') === 'radio') rec.checked = el.getAttribute('aria-checked') === 'true';
     if (el.getAttribute('aria-required') === 'true' || el.required) rec.required = true;
+    // Attach the surrounding question/group text for controls whose meaning lives in nearby
+    // non-interactive text (radio/checkbox groups, weakly-labeled fields) so the agent can answer
+    // without fetching raw HTML. Deduped against the previous element to keep grouped options compact.
+    const isChoice = el.type === 'checkbox' || el.type === 'radio' || el.getAttribute('role') === 'checkbox' || el.getAttribute('role') === 'radio';
+    if (isChoice || label.length < 3) {
+      const g = el.closest('fieldset,[role=group],li,dd,.form-group,[class*="question"],[class*="field"]');
+      if (g) {
+        const gt = (g.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 200);
+        if (gt && gt.length > label.length && gt !== lastGroup) { rec.group = gt; lastGroup = gt; }
+      }
+    }
     out.push(rec);
     if (++i > 250) break;
   }
@@ -97,6 +109,8 @@ def build_browser_tools(
                 extra += f" checked={e['checked']}"
             if e.get("required"):
                 extra += " *required"
+            if e.get("group"):
+                extra += f" group={e['group']!r}"
             lines.append(
                 f"[{e['selector']}] {e['tag']}{('/' + e['type']) if e.get('type') else ''} {e.get('label', '')!r}{extra}"
             )
