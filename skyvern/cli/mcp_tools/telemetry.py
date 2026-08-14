@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Callable
 from contextlib import suppress
@@ -11,6 +12,7 @@ from fastmcp.server.dependencies import get_http_request
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 
 from skyvern import analytics
+from skyvern.cli.core.perception_telemetry import MCPPerceptionCounters, perception_counters_scope
 
 LOG = structlog.get_logger(__name__)
 
@@ -142,9 +144,10 @@ def _capture_mcp_event(
     ok: bool,
     tool_name: str | None = None,
     prompt_name: str | None = None,
-    error: Exception | None = None,
+    error: BaseException | None = None,
     duration_ms: float | None = None,
     response_bytes: int | None = None,
+    perception_counters: MCPPerceptionCounters | None = None,
 ) -> None:
     request = _resolve_http_request()
     organization_id = _resolve_organization_id(request)
@@ -179,6 +182,8 @@ def _capture_mcp_event(
         data["duration_ms"] = duration_ms
     if response_bytes is not None:
         data["response_bytes"] = response_bytes
+    if perception_counters is not None:
+        data.update(perception_counters.event_fields())
 
     analytics.capture(
         event_name,
@@ -249,36 +254,39 @@ class MCPTelemetryMiddleware(Middleware):
     ) -> Any:
         tool_name = getattr(context.message, "name", None)
         start = time.perf_counter()
-        try:
-            result = await call_next(context)
-        except Exception as exc:
+        with perception_counters_scope() as counters:
+            try:
+                result = await call_next(context)
+            except (Exception, asyncio.CancelledError) as exc:
+                duration_ms = (time.perf_counter() - start) * 1000
+                # Failed and cancelled calls produce no MCP content, so response_bytes is only emitted for results.
+                with suppress(Exception, asyncio.CancelledError):
+                    _capture_mcp_event(
+                        "mcp_tool_call",
+                        operation="tools/call",
+                        context=context,
+                        ok=False,
+                        tool_name=tool_name,
+                        error=exc,
+                        duration_ms=duration_ms,
+                        perception_counters=counters,
+                    )
+                raise
+
             duration_ms = (time.perf_counter() - start) * 1000
-            # Exceptions do not produce MCP content, so response_bytes is only emitted for returned results.
+            response_bytes = sum(_content_text_bytes(content) for content in (getattr(result, "content", None) or []))
             with suppress(Exception):
                 _capture_mcp_event(
                     "mcp_tool_call",
                     operation="tools/call",
                     context=context,
-                    ok=False,
+                    ok=_resolve_tool_call_ok(result),
                     tool_name=tool_name,
-                    error=exc,
                     duration_ms=duration_ms,
+                    response_bytes=response_bytes,
+                    perception_counters=counters,
                 )
-            raise
-
-        duration_ms = (time.perf_counter() - start) * 1000
-        response_bytes = sum(_content_text_bytes(content) for content in (getattr(result, "content", None) or []))
-        with suppress(Exception):
-            _capture_mcp_event(
-                "mcp_tool_call",
-                operation="tools/call",
-                context=context,
-                ok=_resolve_tool_call_ok(result),
-                tool_name=tool_name,
-                duration_ms=duration_ms,
-                response_bytes=response_bytes,
-            )
-        return result
+            return result
 
     async def on_list_tools(
         self,

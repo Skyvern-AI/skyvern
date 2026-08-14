@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal
 
 import structlog
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -25,6 +25,7 @@ from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.utils.page import JS_FUNCTION_DEFS, SkyvernFrame
 
 from .guards import CREDENTIAL_HINT, GuardError, validate_wait_until
+from .perception_telemetry import track_perception_probe
 
 LOG = structlog.get_logger(__name__)
 
@@ -849,6 +850,15 @@ async ({ scopeSelector, includeValues }) => {
       .map((element) => {
         const tag = element.tagName.toLowerCase();
         const item = { role: roleFor(element), name: text(element), tag, selector: cssPath(element) };
+        const safeIdRefs = (attribute) => (element.getAttribute(attribute) || "")
+          .split(/\s+/)
+          .filter((value) => /^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$/.test(value))
+          .slice(0, 8)
+          .join(" ");
+        const ariaControls = safeIdRefs("aria-controls");
+        const ariaOwns = safeIdRefs("aria-owns");
+        if (ariaControls) item.aria_controls = ariaControls;
+        if (ariaOwns) item.aria_owns = ariaOwns;
         if (includeValues === true && !isPassword(element) && ["input", "textarea", "select", "option"].includes(tag)) {
           item.value = element.value || element.getAttribute("value") || "";
         }
@@ -1027,6 +1037,8 @@ class ObservedElement:
     selector: str | None = None
     value: str | None = None
     options: list[str] | None = None
+    aria_controls: str | None = None
+    aria_owns: str | None = None
     match_index: int = 0
     needs_disambiguation: bool = False
 
@@ -1091,13 +1103,14 @@ async def _get_dom_observe_elements(
             raise ObserveFrameError(frame_name, frame_url or "", RuntimeError("frame does not support evaluate"))
         return []
     try:
-        async with asyncio.timeout(_DOM_SCAN_TIMEOUT_SECONDS):
-            if await evaluate(_DOMUTILS_INTERACTABILITY_READY_JS) is not True:
-                await evaluate(JS_FUNCTION_DEFS)
-            result = await evaluate(
-                _OBSERVE_INTERACTABLES_JS,
-                {"scopeSelector": selector, "includeValues": include_values},
-            )
+        async with track_perception_probe(evaluate_page_scan=True):
+            async with asyncio.timeout(_DOM_SCAN_TIMEOUT_SECONDS):
+                if await evaluate(_DOMUTILS_INTERACTABILITY_READY_JS) is not True:
+                    await evaluate(JS_FUNCTION_DEFS)
+                result = await evaluate(
+                    _OBSERVE_INTERACTABLES_JS,
+                    {"scopeSelector": selector, "includeValues": include_values},
+                )
     except Exception as exc:
         if frame_name is not None:
             raise ObserveFrameError(frame_name, frame_url or "", exc) from exc
@@ -1152,6 +1165,10 @@ def _merge_dom_observe_elements(
                         existing["value"] = dom_element["value"]
                     if dom_element.get("options") and not existing.get("children"):
                         existing["options"] = dom_element.get("options")
+                    if dom_element.get("aria_controls"):
+                        existing["aria_controls"] = dom_element["aria_controls"]
+                    if dom_element.get("aria_owns"):
+                        existing["aria_owns"] = dom_element["aria_owns"]
                     matched_existing = True
                     if dom_selector:
                         selector_seen.add(dom_selector)
@@ -1176,18 +1193,16 @@ async def get_observe_document_id(page: Any) -> str | None:
     # dead (page closed, target gone), so that case evicts and retries once before falling back.
     attempts = 2 if cdp is not None else 1
     for _ in range(attempts):
-        if cdp is None:
-            try:
-                cdp = await raw_page.context.new_cdp_session(session_target)
-            except Exception:
-                break
-            try:
-                session_target._skyvern_observe_cdp_session = cdp
-            except Exception:
-                pass
         try:
-            frame_tree = await cdp.send("Page.getFrameTree")
-            loader_id = frame_tree.get("frameTree", {}).get("frame", {}).get("loaderId")
+            async with track_perception_probe():
+                if cdp is None:
+                    cdp = await raw_page.context.new_cdp_session(session_target)
+                    try:
+                        session_target._skyvern_observe_cdp_session = cdp
+                    except Exception:
+                        pass
+                frame_tree = await cdp.send("Page.getFrameTree")
+                loader_id = frame_tree.get("frameTree", {}).get("frame", {}).get("loaderId")
         except Exception:
             if getattr(session_target, "_skyvern_observe_cdp_session", None) is cdp:
                 try:
@@ -1200,7 +1215,8 @@ async def get_observe_document_id(page: Any) -> str | None:
             return f"cdp:{loader_id}"
         break
     try:
-        value = await target.evaluate(_OBSERVE_DOCUMENT_ID_JS)
+        async with track_perception_probe():
+            value = await target.evaluate(_OBSERVE_DOCUMENT_ID_JS)
     except Exception:
         return None
     return f"page:{value}" if isinstance(value, str) else None
@@ -1240,10 +1256,11 @@ async def do_observe(
                 working_frame.url,
                 RuntimeError("frame is detached"),
             )
-    observe_target = working_frame if working_frame is not None else page
     document_id_before: str | None = None
     if observe_v2_enabled():
         document_id_before = await get_observe_document_id(page)
+
+    observe_target = working_frame if working_frame is not None else page
     if working_frame is not None:
         # Legacy page accessibility iframe roots are unreliable; DOM-only avoids cross-document merges.
         snapshot = None
@@ -1271,7 +1288,8 @@ async def do_observe(
     document_id: str | None = None
     if observe_v2_enabled():
         try:
-            text_context = await observe_target.evaluate(_OBSERVE_PAGE_TEXT_JS, {"scopeSelector": selector})
+            async with track_perception_probe(evaluate_page_scan=True):
+                text_context = await observe_target.evaluate(_OBSERVE_PAGE_TEXT_JS, {"scopeSelector": selector})
             if isinstance(text_context, dict) and isinstance(text_context.get("content"), str):
                 page_text = text_context["content"]
                 page_text_truncated = text_context.get("truncated") is True
@@ -1331,6 +1349,8 @@ async def do_observe(
                 selector=elem.get("selector"),
                 value=elem.get("value"),
                 options=elem.get("options") or _extract_options(elem),
+                aria_controls=elem.get("aria_controls"),
+                aria_owns=elem.get("aria_owns"),
                 match_index=match_index,
                 needs_disambiguation=full_group_size[key] > 1,
             )
@@ -1343,6 +1363,12 @@ async def do_observe(
             raise ObserveFrameError(working_frame.name, working_frame.url, exc) from exc
     else:
         title = await page.title()
+
+    if observe_v2_enabled() and document_id is not None:
+        # Extend the bracket over the title read: a swap landing after extraction but before
+        # return refuses durability the same way — degrade to None, never publish torn identity.
+        if await get_observe_document_id(page) != document_id:
+            document_id = None
 
     return ObserveResult(
         url=working_frame.url if working_frame is not None else page.url,
@@ -1369,6 +1395,9 @@ def serialize_elements(elements: list[ObservedElement]) -> list[dict[str, Any]]:
             "value": e.value,
             "options": e.options,
         }
+        if observe_v2_enabled():
+            fields["aria_controls"] = e.aria_controls
+            fields["aria_owns"] = e.aria_owns
         if e.needs_disambiguation:
             fields["match_index"] = e.match_index
         result.append({k: v for k, v in fields.items() if k in _ELEMENT_KEEP_ALWAYS or (v is not None and v != "")})
@@ -1459,7 +1488,8 @@ async def do_execute(
     dispatch_fn: Any,
     steps: list[ExecuteStep],
     stop_on_error: bool = True,
-    on_ref_map_update: Callable[[dict[str, dict[str, Any]]], bool] | None = None,
+    on_ref_map_update: Callable[[dict[str, dict[str, Any]]], bool | Awaitable[bool]] | None = None,
+    fail_on_ref_map_rejection: bool = False,
 ) -> ExecuteResult:
     """Execute a sequence of deterministic browser operations in one batch.
 
@@ -1490,14 +1520,16 @@ async def do_execute(
         try:
             result = await dispatch_fn(step, ref_map)
             # DESIGN-4: Each observe REPLACES the entire ref_map (not merges).
-            # If session publication rejects the snapshot (a concurrent navigation
-            # invalidated it), the batch must not act on it either.
             if step.tool == "observe" and result and "elements" in result:
                 new_map = ref_map_from_elements(result["elements"])
-                if on_ref_map_update is None or on_ref_map_update(new_map):
-                    ref_map = new_map
+                if on_ref_map_update is None:
+                    accepted = True
                 else:
-                    ref_map = {}
+                    publication = on_ref_map_update(new_map)
+                    accepted = publication if isinstance(publication, bool) else await publication
+                if not accepted and fail_on_ref_map_rejection:
+                    raise RuntimeError("observe_snapshot_superseded: ref publication was rejected")
+                ref_map = new_map if accepted else {}
 
             wall_ms = int((time.monotonic() - t0) * 1000)
             results.append(StepResult(step=i, tool=step.tool, ok=True, wall_ms=wall_ms, data=result))
