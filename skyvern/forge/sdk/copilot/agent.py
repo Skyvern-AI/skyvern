@@ -270,6 +270,7 @@ class RequestPolicyGuardrailInputs:
     workflow_run_id: str | None = None
     browser_session_id: str | None = None
     fix_origin: bool = False
+    persisted_workflow_yaml: str | None = None
     stored_completion_criteria: StoredCriteriaSnapshot | None = None
     # Unlike chat_history_messages, this is not truncated to the prompt window: a site is grounded
     # by the user having written it, which does not expire when the message leaves that window.
@@ -3396,6 +3397,7 @@ def _build_copilot_input_guardrails(
                 handler=policy_inputs.request_policy_handler,
                 config=getattr(ctx, "copilot_config", None) if isinstance(ctx, CopilotContext) else None,
                 prior_user_messages=policy_inputs.prior_user_messages,
+                persisted_workflow_yaml=policy_inputs.persisted_workflow_yaml,
             )
             if isinstance(ctx, CopilotContext):
                 _store_request_policy_on_context(
@@ -3708,6 +3710,7 @@ async def run_copilot_agent(
     stored_completion_criteria: StoredCriteriaSnapshot | None = None,
     prior_turn_outcome: TurnOutcome | None = None,
     persist_canonical_user_message: Callable[[str], Awaitable[None]] | None = None,
+    persisted_workflow_yaml: str | None = None,
 ) -> AgentResult:
     # One id per turn — passed to every downstream AgentResult and
     # CopilotContext so the envelope and terminal frames correlate. The
@@ -3749,6 +3752,7 @@ async def run_copilot_agent(
                     stored_completion_criteria=stored_completion_criteria,
                     prior_turn_outcome=prior_turn_outcome,
                     persist_canonical_user_message=persist_canonical_user_message,
+                    persisted_workflow_yaml=persisted_workflow_yaml,
                 )
                 return result
             except Exception as exc:
@@ -3825,6 +3829,7 @@ async def _run_copilot_turn_impl(
     stored_completion_criteria: StoredCriteriaSnapshot | None = None,
     prior_turn_outcome: TurnOutcome | None = None,
     persist_canonical_user_message: Callable[[str], Awaitable[None]] | None = None,
+    persisted_workflow_yaml: str | None = None,
 ) -> AgentResult:
     copilot_config = config or CopilotConfig(security_rules=security_rules)
     # Protect historical rows created before canonical safe-turn persistence existed. A semantic
@@ -3933,6 +3938,7 @@ async def _run_copilot_turn_impl(
         workflow_run_id=getattr(chat_request, "workflow_run_id", None),
         browser_session_id=getattr(chat_request, "browser_session_id", None),
         fix_origin=getattr(chat_request, "fix_origin", False),
+        persisted_workflow_yaml=persisted_workflow_yaml,
         stored_completion_criteria=stored_completion_criteria,
     )
     request_policy_guardrails = _build_copilot_input_guardrails(

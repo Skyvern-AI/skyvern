@@ -63,6 +63,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     TRANSCRIPT_ANCHOR_CHAR_CAP,
     CompletionCriterion,
     RequestPolicy,
+    _build_request_policy_bootstrap,
     build_classifier_fallback_floor,
     build_transcript_context,
     is_fallback_floor_criterion,
@@ -77,7 +78,10 @@ from skyvern.forge.sdk.copilot.tools.completion import (
     _completion_verification_criteria,
     _completion_verification_from_run_result,
 )
-from skyvern.forge.sdk.copilot.tools.credentials import _credential_run_approval_error
+from skyvern.forge.sdk.copilot.tools.credentials import (
+    _credential_run_approval_error,
+    _extract_credential_ids_for_labels,
+)
 from skyvern.forge.sdk.copilot.turn_context import TranscriptContext, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_halt import (
     CopilotTurnHalt,
@@ -87,13 +91,14 @@ from skyvern.forge.sdk.copilot.turn_halt import (
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
-from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_blocks
+from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_blocks, workflow_credential_ids
 from skyvern.forge.sdk.routes.workflow_copilot import CHAT_HISTORY_CONTEXT_MESSAGES
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
+from skyvern.utils.yaml_loader import safe_load_no_dates
 from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
 from tests.unit.copilot_test_helpers import make_verified_goal_contract as _verified_goal_contract
 
@@ -1176,6 +1181,7 @@ class TestRequestPolicyInputGuardrail:
             handler=policy_inputs.request_policy_handler,
             config=None,
             prior_user_messages=policy_inputs.prior_user_messages,
+            persisted_workflow_yaml=None,
         )
 
     @pytest.mark.asyncio
@@ -3107,6 +3113,165 @@ workflow_definition:
         assert error is not None
         assert "unapproved_credential_reference" in error
         assert "cred_X" in error
+
+    def test_saved_workflow_binding_is_not_unapproved_for_a_run(self) -> None:
+        saved_yaml = """
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: login_credential
+      default_value: cred_bound
+  blocks:
+    - label: login
+      block_type: login
+      url: https://example.com/login
+      parameter_keys:
+        - login_credential
+"""
+        policy = RequestPolicy(
+            resolved_credentials=[],
+            persisted_workflow_credential_ids=sorted(workflow_credential_ids(saved_yaml)),
+        )
+        assert policy.persisted_workflow_credential_ids == ["cred_bound"]
+
+        assert _credential_run_approval_error(["cred_bound"], policy) is None
+        assert policy.resolved_credentials == []
+
+    def test_credential_added_this_turn_stays_unapproved_for_a_run(self) -> None:
+        policy = RequestPolicy(
+            resolved_credentials=[],
+            persisted_workflow_credential_ids=["cred_bound"],
+        )
+
+        error = _credential_run_approval_error(["cred_bound", "cred_added_this_turn"], policy)
+        assert error is not None
+        assert "unapproved_credential_reference" in error
+        assert "cred_added_this_turn" in error
+        assert "cred_bound" not in error
+
+    def test_turn_start_snapshot_does_not_follow_the_workflow_through_the_turn(self) -> None:
+        workflow_yaml = """
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: login_credential
+      default_value: cred_bound
+{extra_parameter}  blocks:
+    - label: login
+      block_type: login
+      url: https://example.com/login
+      parameter_keys:
+        - login_credential
+"""
+        policy = RequestPolicy(
+            resolved_credentials=[],
+            persisted_workflow_credential_ids=sorted(workflow_credential_ids(workflow_yaml.format(extra_parameter=""))),
+        )
+
+        this_turn_ids = sorted(
+            workflow_credential_ids(
+                workflow_yaml.format(
+                    extra_parameter="""    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: added_credential
+      default_value: cred_added_this_turn
+"""
+                )
+            )
+        )
+        assert this_turn_ids == ["cred_added_this_turn", "cred_bound"]
+        assert policy.persisted_workflow_credential_ids == ["cred_bound"]
+
+        error = _credential_run_approval_error(this_turn_ids, policy)
+        assert error is not None
+        assert "unapproved_credential_reference" in error
+        assert "cred_added_this_turn" in error
+
+    def test_chat_mentioned_credential_stays_unapproved_without_a_workflow_binding(self) -> None:
+        policy = RequestPolicy(
+            resolved_credentials=[],
+            persisted_workflow_credential_ids=[],
+            credential_refs=["cred_mentioned"],
+        )
+
+        error = _credential_run_approval_error(["cred_mentioned"], policy)
+        assert error is not None
+        assert "unapproved_credential_reference" in error
+        assert "cred_mentioned" in error
+
+    def test_saved_binding_holds_when_the_run_executes_no_credentialed_block(self) -> None:
+        # SKY-14047 scopes the ids a run demands approval for to the blocks that will execute, so a
+        # turn adding one block and testing only that block presents an empty executing slice. The
+        # binding's authority comes from the saved workflow, not from that slice.
+        policy = RequestPolicy(
+            resolved_credentials=[],
+            persisted_workflow_credential_ids=["cred_bound"],
+        )
+
+        assert _credential_run_approval_error(["cred_bound"], policy) is None
+
+    def test_binding_staged_by_an_unaccepted_proposal_approves_nothing(self) -> None:
+        # The submitted YAML is the live canvas, which still shows a proposal the user never
+        # accepted, so on the next turn it comes back non-empty carrying the model's binding.
+        # Only the saved workflow grants a run, so the staged id is not authority.
+        policy = RequestPolicy(
+            resolved_credentials=[],
+            existing_workflow_credential_ids=["cred_staged_by_model"],
+            persisted_workflow_credential_ids=[],
+        )
+
+        error = _credential_run_approval_error(["cred_staged_by_model"], policy)
+        assert error is not None
+        assert "unapproved_credential_reference" in error
+        assert "cred_staged_by_model" in error
+
+    @pytest.mark.asyncio
+    async def test_mutating_the_workflow_mid_turn_does_not_approve_the_injected_credential(self) -> None:
+        turn_start_yaml = """
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: login_credential
+      default_value: cred_bound
+  blocks:
+    - label: login
+      block_type: login
+      url: https://example.com/login
+      parameter_keys:
+        - login_credential
+"""
+        policy = await _build_request_policy_bootstrap(
+            user_message="add a step and test run it",
+            workflow_yaml=turn_start_yaml,
+            chat_history=[],
+            global_llm_context="",
+            organization_id="o_test",
+            persisted_workflow_yaml=turn_start_yaml,
+        )
+        assert policy.persisted_workflow_credential_ids == ["cred_bound"]
+
+        mutated_definition = safe_load_no_dates(turn_start_yaml)["workflow_definition"]
+        mutated_definition["parameters"].append(
+            {
+                "parameter_type": "workflow",
+                "workflow_parameter_type": "credential_id",
+                "key": "injected_credential",
+                "default_value": "cred_injected_mid_turn",
+            }
+        )
+        mutated_definition["blocks"][0]["parameter_keys"].append("injected_credential")
+
+        definition_ids = _extract_credential_ids_for_labels(mutated_definition, ["login"])
+        assert "cred_injected_mid_turn" in definition_ids
+
+        error = _credential_run_approval_error(definition_ids, policy)
+        assert error is not None
+        assert "unapproved_credential_reference" in error
+        assert "cred_injected_mid_turn" in error
+        assert "cred_bound" not in error
 
     @pytest.mark.asyncio
     async def test_missing_tool_credential_reference_returns_blocking_error(self, monkeypatch) -> None:

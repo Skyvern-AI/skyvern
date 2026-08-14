@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 from urllib.parse import urlparse
 
@@ -39,6 +39,11 @@ def url_origin(url: str) -> str | None:
     # Keep scheme in the origin. http:// and https:// are different security
     # contexts, so crossing between them is treated as scope broadening.
     return f"{parsed.scheme.lower()}://{netloc}"
+
+
+def saved_credential_ids(candidates: Iterable[str]) -> set[str]:
+    # Saved credential IDs are issued with the cred_ prefix; skip anything else defensively.
+    return {candidate for candidate in candidates if isinstance(candidate, str) and candidate.startswith("cred_")}
 
 
 def credential_params(parameters: Any) -> dict[str, str]:
