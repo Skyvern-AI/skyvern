@@ -15,11 +15,21 @@ import pytest
 
 from skyvern.config import settings
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
-from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
-from skyvern.forge.sdk.workflow.models.block import CODE_BLOCK_TAB_OPEN_FAILURE_REASON, CodeBlock
-from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected, MissingJinjaVariables
+from skyvern.forge.sdk.workflow.models.block import (
+    CODE_BLOCK_TAB_OPEN_FAILURE_REASON,
+    BranchEvaluationContext,
+    CodeBlock,
+)
+from skyvern.forge.sdk.workflow.models.parameter import (
+    OutputParameter,
+    ParameterType,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 # ---------------------------------------------------------------------------
 # is_safe_code — rejection tests
@@ -1894,3 +1904,87 @@ class TestIsSafeCodeClassStatements:
 
     def test_script_path_keeps_metaclass_support(self) -> None:
         is_safe_script_code("class Weird(metaclass=type):\n    pass")
+
+
+class TestCodeBlockTemplateSecretScoping:
+    """Template data carries secrets only for credential parameters the block declares (SKY-14047),
+    mirroring the execution namespace, so a block cannot render another block's credential."""
+
+    DECLARED_KEY = "declared_cred"
+    UNDECLARED_KEY = "other_cred"
+
+    @staticmethod
+    def _workflow_parameter(key: str) -> WorkflowParameter:
+        now = datetime.now(timezone.utc)
+        return WorkflowParameter(
+            workflow_parameter_id=f"wp_{key}",
+            workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+            workflow_id="w_test",
+            key=key,
+            created_at=now,
+            modified_at=now,
+        )
+
+    def _block(self) -> CodeBlock:
+        now = datetime.now(timezone.utc)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="scoping_output",
+            description="",
+            output_parameter_id="op_scoping",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        )
+        return CodeBlock(
+            label="scoped_code",
+            code="value = 'ok'",
+            output_parameter=output_parameter,
+            parameters=[self._workflow_parameter(self.DECLARED_KEY)],
+        )
+
+    def _context(self) -> FakeWorkflowRunContext:
+        return FakeWorkflowRunContext(
+            values={
+                self.DECLARED_KEY: {"context": "login", "username": "ph_u1", "password": "ph_p1"},
+                self.UNDECLARED_KEY: {"context": "other", "username": "ph_u2", "password": "ph_p2"},
+            },
+            secrets={
+                "ph_u1": "alice",
+                "ph_p1": "declared-secret",
+                "ph_u2": "bob",
+                "ph_p2": "undeclared-secret",
+            },
+            include_secrets_in_templates=True,
+        )
+
+    def test_declared_credential_renders_real_values(self) -> None:
+        rendered = self._block().format_block_parameter_template_from_workflow_run_context(
+            "{{ declared_cred_real_password }}|{{ declared_cred.username }}", self._context()
+        )
+        assert rendered == "declared-secret|alice"
+
+    def test_undeclared_credential_never_renders_its_secret(self) -> None:
+        try:
+            rendered = self._block().format_block_parameter_template_from_workflow_run_context(
+                "{{ other_cred_real_password }}", self._context()
+            )
+        except MissingJinjaVariables:
+            return
+        assert "undeclared-secret" not in rendered
+
+    def test_undeclared_credential_dict_stays_placeholder(self) -> None:
+        rendered = self._block().format_block_parameter_template_from_workflow_run_context(
+            "{{ other_cred.password }}", self._context()
+        )
+        assert rendered == "ph_p2"
+
+    def test_branch_evaluation_template_data_merges_no_undeclared_secrets(self) -> None:
+        template_data = BranchEvaluationContext(
+            workflow_run_context=self._context(), block_label="cond"
+        ).build_template_data()
+
+        assert "ph_p1" not in template_data
+        assert "ph_p2" not in template_data
+        assert not any(key.endswith("_real_password") for key in template_data)
+        assert template_data[self.UNDECLARED_KEY]["password"] == "ph_p2"

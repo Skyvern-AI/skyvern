@@ -6,6 +6,7 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -69,6 +70,8 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOTS_PROMPT_NAME
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
+from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
+from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.completion import (
     _authored_output_contract_criteria,
     _completion_verification_criteria,
@@ -84,6 +87,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
+from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_blocks
 from skyvern.forge.sdk.routes.workflow_copilot import CHAT_HISTORY_CONTEXT_MESSAGES
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -3215,6 +3219,8 @@ class TestRunBlocksCredentialApproval:
         *,
         parameters: list[dict[str, object]] | None = None,
         blocks: list[dict[str, object]] | None = None,
+        output_labels: set[str] | None = None,
+        finally_block_label: str | None = None,
     ) -> SimpleNamespace:
         workflow_parameters = parameters
         if workflow_parameters is None and credential_id is not None:
@@ -3226,13 +3232,17 @@ class TestRunBlocksCredentialApproval:
                     "default_value": credential_id,
                 }
             ]
+        known_labels = output_labels or {"login"}
+        workflow_definition: dict[str, object] = {
+            "parameters": workflow_parameters or [],
+            "blocks": blocks or [{"label": "login"}],
+        }
+        if finally_block_label is not None:
+            workflow_definition["finally_block_label"] = finally_block_label
         return SimpleNamespace(
             workflow_id="wf-1",
-            workflow_definition={
-                "parameters": workflow_parameters or [],
-                "blocks": blocks or [{"label": "login"}],
-            },
-            get_output_parameter=lambda label: SimpleNamespace(label=label) if label == "login" else None,
+            workflow_definition=workflow_definition,
+            get_output_parameter=lambda label: SimpleNamespace(label=label) if label in known_labels else None,
         )
 
     @staticmethod
@@ -3473,6 +3483,280 @@ class TestRunBlocksCredentialApproval:
         assert result["error"] == "Organization not found"
         database.credentials.get_credentials_by_ids.assert_awaited_once_with(["cred_resolved"], organization_id="org-1")
         database.organizations.get_organization.assert_awaited_once_with(organization_id="org-1")
+
+
+class TestRunBlocksCredentialApprovalFrontierScope:
+    CREDENTIAL_ID = "cred_frontier_login"
+
+    EXPANDED_LOGIN_BLOCK: dict[str, object] = {
+        "label": "login",
+        "block_type": "login",
+        "url": "https://app.example.com/",
+        "parameters": [
+            {
+                "parameter_type": "workflow",
+                "workflow_parameter_type": "credential_id",
+                "key": "credentials",
+                "default_value": CREDENTIAL_ID,
+            }
+        ],
+    }
+
+    PARAMETER_KEY_LOGIN_BLOCK: dict[str, object] = {
+        "label": "login",
+        "block_type": "login",
+        "url": "https://app.example.com/",
+        "parameter_keys": ["credentials"],
+    }
+
+    CODE_BLOCK: dict[str, object] = {"label": "check_page_health", "block_type": "code"}
+
+    @classmethod
+    def _workflow(
+        cls,
+        blocks: list[dict[str, object]],
+        *,
+        output_labels: set[str],
+        finally_block_label: str | None = None,
+    ) -> SimpleNamespace:
+        return TestRunBlocksCredentialApproval._workflow(
+            parameters=[
+                {
+                    "parameter_type": "workflow",
+                    "workflow_parameter_type": "credential_id",
+                    "key": "credentials",
+                    "default_value": cls.CREDENTIAL_ID,
+                }
+            ],
+            blocks=blocks,
+            output_labels=output_labels,
+            finally_block_label=finally_block_label,
+        )
+
+    @staticmethod
+    async def _run(monkeypatch, workflow: SimpleNamespace, block_labels: list[str], **db_kwargs) -> tuple:
+        database = TestRunBlocksCredentialApproval._db(workflow=workflow, **db_kwargs)
+        monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(
+                prepare_workflow=AsyncMock(side_effect=AssertionError("prepare_workflow called")),
+                execute_workflow=AsyncMock(side_effect=AssertionError("execute_workflow called")),
+            ),
+        )
+        result = await _run_blocks_and_collect_debug(
+            {"block_labels": block_labels, "parameters": {}},
+            _ctx(request_policy=RequestPolicy(resolved_credentials=[])),
+        )
+        return result, database
+
+    @pytest.mark.asyncio
+    async def test_credential_free_frontier_raises_no_unapproved_credential_error(self, monkeypatch) -> None:
+        workflow = self._workflow(
+            [self.EXPANDED_LOGIN_BLOCK, self.CODE_BLOCK],
+            output_labels={"login", "check_page_health"},
+        )
+        result, database = await self._run(
+            monkeypatch,
+            workflow,
+            ["check_page_health"],
+            credentials=[SimpleNamespace(credential_id=self.CREDENTIAL_ID)],
+            organization_lookup=None,
+        )
+
+        assert "unapproved_credential_reference" not in (result.get("error") or "")
+        assert result["error"] == "Organization not found"
+        database.credentials.get_credentials_by_ids.assert_awaited_once_with(
+            [self.CREDENTIAL_ID], organization_id="org-1"
+        )
+
+    @pytest.mark.asyncio
+    async def test_expanded_block_credential_in_frontier_is_unapproved(self, monkeypatch) -> None:
+        workflow = self._workflow(
+            [self.EXPANDED_LOGIN_BLOCK, self.CODE_BLOCK],
+            output_labels={"login", "check_page_health"},
+        )
+        result, _ = await self._run(monkeypatch, workflow, ["login", "check_page_health"])
+
+        assert result["ok"] is False
+        assert "unapproved_credential_reference" in result["error"]
+        assert self.CREDENTIAL_ID in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_parameter_key_block_credential_in_frontier_is_unapproved(self, monkeypatch) -> None:
+        workflow = self._workflow(
+            [self.PARAMETER_KEY_LOGIN_BLOCK, self.CODE_BLOCK],
+            output_labels={"login", "check_page_health"},
+        )
+        result, _ = await self._run(monkeypatch, workflow, ["login", "check_page_health"])
+
+        assert result["ok"] is False
+        assert "unapproved_credential_reference" in result["error"]
+        assert self.CREDENTIAL_ID in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_parameter_key_block_credential_outside_frontier_is_not_unapproved(self, monkeypatch) -> None:
+        workflow = self._workflow(
+            [self.PARAMETER_KEY_LOGIN_BLOCK, self.CODE_BLOCK],
+            output_labels={"login", "check_page_health"},
+        )
+        result, _ = await self._run(
+            monkeypatch,
+            workflow,
+            ["check_page_health"],
+            credentials=[SimpleNamespace(credential_id=self.CREDENTIAL_ID)],
+            organization_lookup=None,
+        )
+
+        assert result["error"] == "Organization not found"
+
+    @pytest.mark.asyncio
+    async def test_frontier_code_block_declaring_the_login_credential_is_unapproved(self, monkeypatch) -> None:
+        workflow = self._workflow(
+            [
+                self.PARAMETER_KEY_LOGIN_BLOCK,
+                {"label": "check_page_health", "block_type": "code", "parameter_keys": ["credentials"]},
+            ],
+            output_labels={"login", "check_page_health"},
+        )
+        result, _ = await self._run(monkeypatch, workflow, ["check_page_health"])
+
+        assert result["ok"] is False
+        assert "unapproved_credential_reference" in result["error"]
+        assert self.CREDENTIAL_ID in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_direct_block_credential_id_in_frontier_is_unapproved(self, monkeypatch) -> None:
+        workflow = self._workflow(
+            [
+                {"label": "login", "block_type": "google_sheets_read", "credential_id": self.CREDENTIAL_ID},
+                self.CODE_BLOCK,
+            ],
+            output_labels={"login", "check_page_health"},
+        )
+        result, _ = await self._run(monkeypatch, workflow, ["login"])
+
+        assert result["ok"] is False
+        assert "unapproved_credential_reference" in result["error"]
+        assert self.CREDENTIAL_ID in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_credential_inside_executing_loop_child_is_unapproved(self, monkeypatch) -> None:
+        workflow = self._workflow(
+            [
+                {"label": "iterate", "block_type": "for_loop", "loop_blocks": [self.EXPANDED_LOGIN_BLOCK]},
+                self.CODE_BLOCK,
+            ],
+            output_labels={"iterate", "check_page_health"},
+        )
+        result, _ = await self._run(monkeypatch, workflow, ["iterate"])
+
+        assert result["ok"] is False
+        assert "unapproved_credential_reference" in result["error"]
+        assert self.CREDENTIAL_ID in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_credential_on_finally_block_outside_frontier_is_unapproved(self, monkeypatch) -> None:
+        workflow = self._workflow(
+            [self.CODE_BLOCK, self.EXPANDED_LOGIN_BLOCK],
+            output_labels={"login", "check_page_health"},
+            finally_block_label="login",
+        )
+        result, _ = await self._run(monkeypatch, workflow, ["check_page_health"])
+
+        assert result["ok"] is False
+        assert "unapproved_credential_reference" in result["error"]
+        assert self.CREDENTIAL_ID in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_frontier_label_falls_back_to_whole_document_unapproved_ids(self, monkeypatch) -> None:
+        workflow = TestRunBlocksCredentialApproval._workflow(
+            parameters=[
+                {
+                    "parameter_type": "workflow",
+                    "workflow_parameter_type": "credential_id",
+                    "key": "credentials",
+                    "default_value": self.CREDENTIAL_ID,
+                }
+            ],
+            blocks=[self.EXPANDED_LOGIN_BLOCK, self.CODE_BLOCK],
+            output_labels={"login", "check_page_health", "drifted_label"},
+        )
+        result, _ = await self._run(monkeypatch, workflow, ["check_page_health", "drifted_label"])
+
+        assert result["ok"] is False
+        assert "unapproved_credential_reference" in result["error"]
+        assert self.CREDENTIAL_ID in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_unclaimed_top_level_credential_parameter_stays_unapproved(self, monkeypatch) -> None:
+        workflow = self._workflow([self.CODE_BLOCK], output_labels={"check_page_health"})
+        result, _ = await self._run(monkeypatch, workflow, ["check_page_health"])
+
+        assert result["ok"] is False
+        assert "unapproved_credential_reference" in result["error"]
+        assert self.CREDENTIAL_ID in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_existence_check_still_sees_credentials_outside_the_frontier(self, monkeypatch) -> None:
+        workflow = self._workflow(
+            [self.EXPANDED_LOGIN_BLOCK, self.CODE_BLOCK],
+            output_labels={"login", "check_page_health"},
+        )
+        result, database = await self._run(monkeypatch, workflow, ["check_page_health"], credentials=[])
+
+        assert result["ok"] is False
+        assert "not found in this organization" in result["error"]
+        assert self.CREDENTIAL_ID in result["error"]
+        database.credentials.get_credentials_by_ids.assert_awaited_once_with(
+            [self.CREDENTIAL_ID], organization_id="org-1"
+        )
+
+
+class TestWorkflowBlocksSelectedLabels:
+    PARSED: dict[str, Any] = {
+        "workflow_definition": {
+            "blocks": [
+                {"label": "first", "block_type": "code"},
+                {
+                    "label": "iterate",
+                    "block_type": "for_loop",
+                    "loop_blocks": [
+                        {"label": "nested_login", "block_type": "login"},
+                        {
+                            "label": "nested_branch",
+                            "branch_conditions": [
+                                {"condition": "c", "blocks": [{"label": "deep", "block_type": "code"}]}
+                            ],
+                        },
+                    ],
+                },
+                {"label": "last", "block_type": "code"},
+            ]
+        }
+    }
+
+    def test_selected_labels_none_is_identical_to_the_unscoped_walk(self) -> None:
+        assert workflow_blocks(self.PARSED, selected_labels=None) == workflow_blocks(self.PARSED)
+        assert [block["label"] for block in workflow_blocks(self.PARSED)] == [
+            "first",
+            "iterate",
+            "nested_login",
+            "nested_branch",
+            "deep",
+            "last",
+        ]
+
+    def test_selected_block_drags_its_descendants(self) -> None:
+        labels = [block["label"] for block in workflow_blocks(self.PARSED, selected_labels={"iterate"})]
+
+        assert labels == ["iterate", "nested_login", "nested_branch", "deep"]
+
+    def test_unselected_ancestor_still_yields_a_selected_descendant(self) -> None:
+        labels = [block["label"] for block in workflow_blocks(self.PARSED, selected_labels={"deep"})]
+
+        assert labels == ["deep"]
 
 
 class TestResponseTypeClassificationRuleReachesAgent:

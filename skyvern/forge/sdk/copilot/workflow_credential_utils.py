@@ -94,42 +94,47 @@ def credential_param_ids(parameters: Any) -> dict[str, set[str]]:
     return out
 
 
-def workflow_blocks(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+def workflow_blocks(parsed: dict[str, Any], selected_labels: set[str] | None = None) -> list[dict[str, Any]]:
+    """With `selected_labels`, collect only blocks whose label is in the set plus their
+    descendants — a selected `for_loop` drags its `loop_blocks` in, since loop children are
+    not themselves named in an executing label set."""
     workflow_definition = parsed.get("workflow_definition")
     if not isinstance(workflow_definition, dict):
         return []
 
     collected: list[dict[str, Any]] = []
 
-    def visit_branch(branch: dict[str, Any]) -> None:
+    def visit_branch(branch: dict[str, Any], inherited: bool) -> None:
         for key in _NESTED_BLOCK_LIST_KEYS:
-            visit(branch.get(key))
+            visit(branch.get(key), inherited)
         for branch_key in _BRANCH_LIST_KEYS:
             branches = branch.get(branch_key)
             if not isinstance(branches, list):
                 continue
             for nested_branch in branches:
                 if isinstance(nested_branch, dict):
-                    visit_branch(nested_branch)
+                    visit_branch(nested_branch, inherited)
 
-    def visit(blocks: Any) -> None:
+    def visit(blocks: Any, inherited: bool) -> None:
         if not isinstance(blocks, list):
             return
         for block in blocks:
             if not isinstance(block, dict):
                 continue
-            collected.append(block)
+            selected = inherited or selected_labels is None or block.get("label") in selected_labels
+            if selected:
+                collected.append(block)
             for key in _NESTED_BLOCK_LIST_KEYS:
-                visit(block.get(key))
+                visit(block.get(key), selected)
             for branch_key in _BRANCH_LIST_KEYS:
                 branches = block.get(branch_key)
                 if not isinstance(branches, list):
                     continue
                 for branch in branches:
                     if isinstance(branch, dict):
-                        visit_branch(branch)
+                        visit_branch(branch, selected)
 
-    visit(workflow_definition.get("blocks"))
+    visit(workflow_definition.get("blocks"), False)
     return collected
 
 

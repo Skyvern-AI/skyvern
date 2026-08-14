@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Collection
 from typing import Any
 
 import structlog
@@ -14,7 +15,11 @@ from skyvern.forge.sdk.copilot.credential_resolution import (
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
-from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_blocks
+from skyvern.forge.sdk.copilot.workflow_credential_utils import (
+    block_credential_ids,
+    credential_param_ids,
+    workflow_blocks,
+)
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -90,6 +95,39 @@ def _extract_credential_ids_from_workflow_definition(workflow_definition: Any) -
     for block in workflow_blocks({"workflow_definition": definition}):
         found.extend(_extract_credential_ids_from_workflow_parameters(block.get("parameters")))
         found.extend(_extract_credential_ids_from_tool_value(block.get("credential_id")))
+    return list(dict.fromkeys(found))
+
+
+def _extract_credential_ids_for_labels(workflow_definition: Any, labels: Collection[str]) -> list[str]:
+    """Credential IDs reachable from the blocks named by `labels` and their descendants, plus any
+    top-level credential parameter no block claims; falls back to the whole-document set when the
+    label set is empty or a label does not resolve. Sound only while the runtime exposes a
+    credential solely to blocks that declare it (WorkflowRunContext.credential_template_entries)."""
+    definition = _workflow_definition_as_dict(workflow_definition)
+    selected_labels = set(labels)
+    if not selected_labels:
+        return _extract_credential_ids_from_workflow_definition(definition)
+
+    parsed = {"workflow_definition": definition}
+    selected_blocks = workflow_blocks(parsed, selected_labels=selected_labels)
+    if selected_labels - {block.get("label") for block in selected_blocks}:
+        return _extract_credential_ids_from_workflow_definition(definition)
+
+    credential_params_by_key = credential_param_ids(definition.get("parameters"))
+
+    def block_ids(block: dict[str, Any]) -> list[str]:
+        return _extract_credential_ids_from_workflow_parameters(block.get("parameters")) + sorted(
+            block_credential_ids(block, credential_params_by_key)
+        )
+
+    claimed_by_any_block = {credential_id for block in workflow_blocks(parsed) for credential_id in block_ids(block)}
+    found = [
+        credential_id
+        for credential_id in _extract_credential_ids_from_workflow_parameters(definition.get("parameters"))
+        if credential_id not in claimed_by_any_block
+    ]
+    for block in selected_blocks:
+        found.extend(block_ids(block))
     return list(dict.fromkeys(found))
 
 
