@@ -2563,6 +2563,49 @@ async def _persist_completion_tab_screenshots(browser_state: BrowserState, thoug
     return captured
 
 
+def _parse_task_v2_summary_response(resp: Any) -> tuple[str | None, Any]:
+    """Extract (description, output) from a task_v2_summary reply, tolerating envelope
+    non-compliance.
+
+    The summary prompt requires a {"description", "output"} envelope, but when the user
+    goal defines its own output contract the model sometimes follows that contract
+    instead, emitting the deliverable at the top level of the reply. In that case the
+    reply itself IS the output; dropping it loses the run's extracted_information
+    (SKY-14004). The recovered payload keeps every data key — including a user-schema
+    "description" — so a goal-defined contract survives verbatim; only null envelope
+    slots are dropped.
+
+    The LLM handler runs with force_dict=True, so non-dict replies cannot reach this
+    parser in production; they are handled defensively.
+    """
+    if not isinstance(resp, dict):
+        return None, None
+    description = resp.get("description")
+    if not isinstance(description, str):
+        description = None
+    output = resp.get("output")
+    if output is None:
+        # Data beyond a compliant envelope: any key besides "output", except a
+        # "description" holding the envelope's string (or null) slot. A non-str,
+        # non-null "description" is user data, not the envelope.
+        has_payload = any(
+            key != "description" or (value is not None and not isinstance(value, str))
+            for key, value in resp.items()
+            if key != "output"
+        )
+        if has_payload:
+            output = {
+                key: value
+                for key, value in resp.items()
+                if key != "output" and not (key == "description" and value is None)
+            }
+            LOG.info(
+                "Recovered task_v2 summary output from non-envelope response",
+                recovered_keys=sorted(output.keys()),
+            )
+    return description, output
+
+
 async def _generate_task_v2_deliverable(
     task_v2: TaskV2,
     task_history: list[dict],
@@ -2597,8 +2640,7 @@ async def _generate_task_v2_deliverable(
     )
     LOG.info("Task v2 summary response", task_v2_summary_resp=task_v2_summary_resp, is_partial=is_partial)
 
-    summary_description = task_v2_summary_resp.get("description")
-    summarized_output = task_v2_summary_resp.get("output")
+    summary_description, summarized_output = _parse_task_v2_summary_response(task_v2_summary_resp)
     await app.DATABASE.observer.update_thought(
         thought_id=thought.observer_thought_id,
         organization_id=task_v2.organization_id,
