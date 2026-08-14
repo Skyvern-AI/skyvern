@@ -993,6 +993,49 @@ def test_session_ref_lookup_is_scoped_to_authenticated_organization() -> None:
         assert session_manager.get_session_ref("e0", session_id=session_id, page_key=page_key) is None
 
 
+def test_observe_ref_generations_remain_monotonic_after_clear() -> None:
+    session_manager.set_current_session(session_manager.SessionState())
+
+    first = session_manager.begin_session_ref_publication()
+    session_manager.clear_session_ref_map(generation=first)
+    second = session_manager.begin_session_ref_publication()
+
+    assert second > first
+
+
+def test_older_publication_cannot_commit_after_newer_reservation() -> None:
+    session_manager.set_current_session(session_manager.SessionState())
+    page_key = (1, None, "https://example.com", None)
+
+    older = session_manager.begin_session_ref_publication()
+    newer = session_manager.begin_session_ref_publication()
+
+    assert not session_manager.replace_session_ref_map({"e0": {"tag": "button"}}, generation=older, page_key=page_key)
+    assert session_manager.replace_session_ref_map({"e1": {"tag": "input"}}, generation=newer, page_key=page_key)
+    assert session_manager.session_ref_generation() > newer
+
+
+def test_mutation_invalidation_clears_v2_refs_but_preserves_monotonic_ids() -> None:
+    state = session_manager.SessionState()
+    state._observe_v2_state.refs = {"e0": {"tag": "button"}}
+    state._observe_v2_state.next_ref = 7
+    session_manager.set_current_session(state)
+    page_key = (1, None, "https://example.com", None)
+    generation = session_manager.begin_session_ref_publication()
+    assert session_manager.replace_session_ref_map(
+        {"e0": {"tag": "button"}},
+        generation=generation,
+        page_key=page_key,
+    )
+
+    invalidated_generation = session_manager.invalidate_session_ref_map()
+
+    assert invalidated_generation > generation
+    assert session_manager.get_session_ref("e0", page_key=page_key) is None
+    assert state._observe_v2_state.refs == {}
+    assert state._observe_v2_state.next_ref == 7
+
+
 # ---------------------------------------------------------------------------
 # Tests for stateless HTTP mode session creation
 # ---------------------------------------------------------------------------

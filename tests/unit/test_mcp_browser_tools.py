@@ -2785,14 +2785,22 @@ async def test_write_grid_rejects_oversize_row_before_session(monkeypatch: pytes
         ),
     ],
 )
-async def test_navigating_paired_tools_clear_the_ref_map_around_navigation(
+async def test_navigating_paired_tools_invalidate_refs_around_navigation(
     monkeypatch: pytest.MonkeyPatch, tool_name: str, extra_kwargs: dict[str, object]
 ) -> None:
-    """Parity with skyvern_navigate: a prior observe's refs must not survive a navigation.
+    """Parity with skyvern_navigate: prior refs cannot survive navigation.
 
-    Cleared before AND after, because a failed goto can still partially replace the document.
+    Invalidate before AND after, because a failed goto can partially replace the
+    document and a concurrent observe can publish while navigation is in flight.
     """
     _sdk_equivalent_page(monkeypatch)
+    events: list[str] = []
+
+    async def navigate(*_args: object, **_kwargs: object) -> NavigateResult:
+        events.append("navigate")
+        return NavigateResult(url="https://example.test", title="Example", load_state="load")
+
+    monkeypatch.setattr(mcp_browser, "do_navigate", AsyncMock(side_effect=navigate))
     monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
     monkeypatch.setattr(mcp_browser, "do_extract", AsyncMock(return_value=SimpleNamespace(extracted={"value": 1})))
     monkeypatch.setattr(
@@ -2800,13 +2808,13 @@ async def test_navigating_paired_tools_clear_the_ref_map_around_navigation(
         "save_artifact",
         Mock(return_value=Artifact(kind="screenshot", path="/tmp/shot.png", mime="image/png", bytes=3)),
     )
-    clear = Mock()
-    monkeypatch.setattr(mcp_browser, "clear_session_ref_map", clear)
+    invalidate = Mock(side_effect=lambda **_kwargs: events.append("invalidate"))
+    monkeypatch.setattr(mcp_browser, "invalidate_session_ref_map", invalidate)
 
     result = await getattr(mcp_browser, tool_name)(url="https://example.test", **extra_kwargs)
 
     assert result["ok"] is True, result
-    assert clear.call_count == 2
+    assert events == ["invalidate", "navigate", "invalidate"]
 
 
 @pytest.mark.asyncio
@@ -2873,18 +2881,24 @@ async def test_navigating_paired_tools_surface_the_degraded_load_state(
 
 
 @pytest.mark.asyncio
-async def test_navigating_paired_tools_clear_the_ref_map_even_when_navigation_fails(
+async def test_navigating_paired_tools_invalidate_refs_even_when_navigation_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _sdk_equivalent_page(monkeypatch)
-    monkeypatch.setattr(mcp_browser, "do_navigate", AsyncMock(side_effect=RuntimeError("net::ERR_ABORTED")))
-    clear = Mock()
-    monkeypatch.setattr(mcp_browser, "clear_session_ref_map", clear)
+    events: list[str] = []
+
+    async def fail_navigation(*_args: object, **_kwargs: object) -> NavigateResult:
+        events.append("navigate")
+        raise RuntimeError("net::ERR_ABORTED")
+
+    monkeypatch.setattr(mcp_browser, "do_navigate", AsyncMock(side_effect=fail_navigation))
+    invalidate = Mock(side_effect=lambda **_kwargs: events.append("invalidate"))
+    monkeypatch.setattr(mcp_browser, "invalidate_session_ref_map", invalidate)
 
     result = await mcp_browser.skyvern_navigate_and_screenshot(url="https://example.test")
 
     assert result["ok"] is False
-    assert clear.call_count == 2
+    assert events == ["invalidate", "navigate", "invalidate"]
 
 
 @pytest.mark.asyncio
