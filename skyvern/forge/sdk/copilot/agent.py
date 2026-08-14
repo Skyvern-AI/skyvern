@@ -198,11 +198,12 @@ WORKFLOW_KNOWLEDGE_BASE_PATH = (
 _COPILOT_TURN_SPAN_NAME = "copilot.turn"
 
 
-def _render_code_only_browser_authoring_prompt() -> str:
+def _render_code_only_browser_authoring_prompt(ctx: CopilotContext | None = None) -> str:
     from skyvern.forge.sdk.copilot.tools.banned_blocks import _code_only_browser_authoring_prompt
 
+    settled_block_types = ctx.code_only_settled_block_types if isinstance(ctx, CopilotContext) else frozenset()
     return (
-        _code_only_browser_authoring_prompt()
+        _code_only_browser_authoring_prompt(settled_block_types)
         + "\n\nWhen a SYNTHESIZED CODE BLOCK is offered to you, it already encodes the page\n"
         "interactions you scouted as deterministic Playwright. Persist that block VERBATIM\n"
         "via update_workflow / update_and_run_blocks — do not rewrite, reorder, or\n"
@@ -597,8 +598,6 @@ def _build_system_prompt(
         # suffix, so its complete rendered prompt is safe to mark stable.
         stable_prefix = prompt_with_boundary
         dynamic_suffix = ""
-    if not answer_only and copilot_config.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        dynamic_suffix = f"{dynamic_suffix}\n\n{_render_code_only_browser_authoring_prompt()}"
     return CacheableSystemInstructions(stable_prefix, dynamic_suffix)
 
 
@@ -1024,6 +1023,8 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + _code_authoring_repair_context_prompt(ctx)
             + todo_list_prompt(ctx)
         )
+        if config.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+            dynamic_context = f"{dynamic_context}\n\n{_render_code_only_browser_authoring_prompt(ctx)}"
         if isinstance(base_system_prompt, CacheableSystemInstructions):
             return CacheableSystemInstructions(
                 base_system_prompt.stable_prefix,

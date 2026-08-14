@@ -39,7 +39,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     gradeable_completion_criteria,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
-from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
     DiagnosisRepairContract,
@@ -2902,10 +2902,22 @@ class TestCredentialRefusalReachesAgent:
         assert "redacted from the outbound client stream" not in prompt
 
     def test_code_only_prompt_renders_policy_table_and_helper_validation_guidance(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _build_system_prompt
-
         config = CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
-        prompt = _build_system_prompt("", config=config)
+        prompt = agent_module._build_dynamic_system_prompt(tool_usage_guide="", config=config)(
+            SimpleNamespace(
+                context=CopilotContext(
+                    organization_id="o_test",
+                    workflow_id="w_test",
+                    workflow_permanent_id="wpid_test",
+                    workflow_yaml="",
+                    browser_session_id=None,
+                    stream=SimpleNamespace(),
+                    workflow_copilot_chat_id="wcc_test",
+                    request_policy=RequestPolicy(),
+                )
+            ),
+            None,
+        )
 
         assert "ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE" in prompt
         assert "credential-typed code" in prompt

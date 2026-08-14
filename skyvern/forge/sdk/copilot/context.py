@@ -807,11 +807,18 @@ class CopilotContext(AgentContext):
     turn_started_at: str | None = None
     turn_ended_at: str | None = None
 
+    # Block types the workflow already carried when the turn opened. Tools reassign
+    # ``workflow_yaml`` mid-turn, so this must never be recomputed from it.
+    code_only_settled_block_types: frozenset[str] = field(init=False, default=frozenset())
+
     def __post_init__(self) -> None:
         parent_post_init = getattr(super(), "__post_init__", None)
         if callable(parent_post_init):
             parent_post_init()
         from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+        from skyvern.forge.sdk.copilot.tools.banned_blocks import _extract_existing_code_only_pending_block_types
+
+        self.code_only_settled_block_types = _extract_existing_code_only_pending_block_types(self.workflow_yaml)
 
         if isinstance(self.last_run_outcome, RecordedRunOutcome):
             super().__setattr__("terminal_envelope_run_outcomes", [self.last_run_outcome])
