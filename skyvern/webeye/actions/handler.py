@@ -106,7 +106,7 @@ from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
-from skyvern.forge.sdk.core.http_request_authorization import RedirectHopAuthorizer
+from skyvern.forge.sdk.core.http_request_authorization import RedirectHopAuthorizer, deny_unenrolled_redirect_hop
 from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener, ensure_context
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
@@ -972,6 +972,8 @@ async def _close_eager_capture_then_teardown_retention(
 async def _adopted_session_download_binding(
     download: Download,
     active_page: Page,
+    *,
+    download_binding: DownloadBinding = DownloadBinding.RUN_DIR,
 ) -> AsyncIterator[tuple[Any, "RedirectHopAuthorizer[GuardedFileFetchHopResult]", str | None]]:
     """Lease the exact context binding that owns an adopted-session download."""
     download_page = download.page
@@ -980,6 +982,14 @@ async def _adopted_session_download_binding(
     download_context = download_page.context
     if download_context is not active_page.context:
         raise RuntimeError("Adopted-session download page context does not match the active page context")
+
+    if download_binding == DownloadBinding.SESSION_DIR:
+        # A provider-owned remote binding never has an interceptor to lease: the creator that stamps
+        # SESSION_DIR binds none, and every download-dir rebind — the only other installer of the
+        # ownership lock — is skipped for this binding. Its branches forbid URL replay anyway, so
+        # deny the hop rather than yielding an authority nothing here can honour.
+        yield None, deny_unenrolled_redirect_hop, None
+        return
 
     try:
         bind_lock = download_context._skyvern_cdp_download_interceptor_bind_lock  # type: ignore[attr-defined]
@@ -3948,13 +3958,19 @@ class ActionHandler:
                                         _remaining_download_wait_seconds(),
                                     )
                                 )
-                                async with _adopted_session_download_binding(captured_download, page) as (
+                                async with _adopted_session_download_binding(
+                                    captured_download,
+                                    page,
+                                    download_binding=resolved_download_binding,
+                                ) as (
                                     download_interceptor,
                                     authorize_request_hop,
                                     download_scope,
                                 ):
-                                    cookie_header = await download_interceptor._cookie_header_for_url(
-                                        captured_download.url
+                                    cookie_header = (
+                                        await download_interceptor._cookie_header_for_url(captured_download.url)
+                                        if download_interceptor is not None
+                                        else None
                                     )
                                     request_headers = {"Cookie": cookie_header} if cookie_header else {}
                                     saved_path = await _save_adopted_session_download(
