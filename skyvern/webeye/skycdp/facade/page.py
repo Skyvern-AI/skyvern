@@ -31,7 +31,7 @@ from skyvern.webeye.skycdp.facade.dialogs import Dialog
 from skyvern.webeye.skycdp.facade.elements import ElementHandle, JSHandle, wait_for
 from skyvern.webeye.skycdp.facade.evaluation import RemoteHandle, evaluate
 from skyvern.webeye.skycdp.facade.input import Keyboard, Mouse
-from skyvern.webeye.skycdp.facade.locator import FrameLocator, Locator
+from skyvern.webeye.skycdp.facade.locator import _QUERY_ALL_JS, FrameLocator, Locator
 from skyvern.webeye.skycdp.facade.network import dispatch
 from skyvern.webeye.skycdp.facade.network_events import NetworkObserver
 from skyvern.webeye.skycdp.facade.routing import RouteHandler, RouteTable, URLMatcher
@@ -130,7 +130,7 @@ class Frame:
     async def query_selector_indexed(self, selector: str, index: int) -> ElementHandle | None:
         handle = await evaluate(
             self.session,
-            "(spec) => document.querySelectorAll(spec.selector)[spec.index] || null",
+            f"(spec) => {{ {_QUERY_ALL_JS} return __queryAll(document, spec.selector)[spec.index] || null; }}",
             {"selector": selector, "index": index},
             context_id=await self._context_id(),
             by_value=False,
@@ -159,7 +159,9 @@ class Frame:
         return ElementHandle(self, handle)
 
     async def query_selector_all(self, selector: str) -> list[ElementHandle]:
-        total = int(await self.evaluate("(s) => document.querySelectorAll(s).length", selector))
+        total = int(
+            await self.evaluate(f"(s) => {{ {_QUERY_ALL_JS} return __queryAll(document, s).length; }}", selector)
+        )
         found = []
         for index in range(total):
             handle = await self.query_selector_indexed(selector, index)

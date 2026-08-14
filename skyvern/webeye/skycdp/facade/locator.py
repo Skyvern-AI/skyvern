@@ -56,28 +56,68 @@ class FrameLocator:
         return frame
 
 
+# Selector resolution mirrors the xpath-vs-css split of Playwright's engine for the shapes
+# Skyvern's DOM layer emits: `xpath=`-, `//`-, and `..`-prefixed steps are XPath, everything else
+# is CSS. (Playwright's other engines -- `text=`, `:visible`, `>>` chains -- still fail loudly as
+# invalid CSS here.) Three Playwright behaviors are deliberately copied: a leading `/` is
+# rewritten relative when the root is an element, so chained absolute paths stay inside their
+# scope instead of silently escaping to the document; XPath results keep only element nodes, so a
+# `..` hop onto an attribute/text/shadow-root node vanishes instead of impersonating an element;
+# and the CSS branch pierces open shadow roots -- including when the root itself is the host,
+# which dom.py's interactive-descendant guards rely on because they fail open on count 0. Shadow
+# matches are appended after their host root's own matches, a document-order approximation that is
+# exact for the unique-match selectors (`[unique_id=...]`, ids) the DOM layer emits.
+_QUERY_ALL_JS = """
+const __queryAll = (root, selector) => {
+  const explicit = selector.startsWith('xpath=');
+  if (explicit || selector.startsWith('//') || selector.startsWith('..')) {
+    let xp = explicit ? selector.slice('xpath='.length) : selector;
+    if (xp.startsWith('/') && root.nodeType !== 9) xp = '.' + xp;
+    const doc = root.nodeType === 9 ? root : root.ownerDocument;
+    const it = doc.evaluate(xp, root, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+    const out = [];
+    for (let i = 0; i < it.snapshotLength; i++) {
+      const n = it.snapshotItem(i);
+      if (n && n.nodeType === 1) out.push(n);
+    }
+    return out;
+  }
+  const out = [];
+  const visit = (r) => {
+    for (const el of r.querySelectorAll(selector)) out.push(el);
+    if (r.nodeType === 1 && r.shadowRoot) visit(r.shadowRoot);
+    for (const el of r.querySelectorAll('*')) {
+      if (el.shadowRoot) visit(el.shadowRoot);
+    }
+  };
+  visit(root);
+  return out;
+};
+"""
+
 # Walks a locator chain inside the page: each step queries within the previous step's matches, and a
 # step carrying an index narrows to exactly that match (negative counts from the end) before the next
 # step runs. Returning either the count or one element from the same walk keeps the two consistent.
-_RESOLVE_JS = """
-(spec) => {
+_RESOLVE_JS = f"""
+(spec) => {{
+  {_QUERY_ALL_JS}
   let current = [document];
-  for (const step of spec.steps) {
+  for (const step of spec.steps) {{
     let next = [];
-    for (const root of current) {
-      next = next.concat(Array.from(root.querySelectorAll(step.selector)));
-    }
+    for (const root of current) {{
+      next = next.concat(__queryAll(root, step.selector));
+    }}
     next = Array.from(new Set(next));
-    if (step.index !== null && step.index !== undefined) {
+    if (step.index !== null && step.index !== undefined) {{
       const at = step.index < 0 ? next.length + step.index : step.index;
       next = at >= 0 && at < next.length ? [next[at]] : [];
-    }
+    }}
     current = next;
-  }
+  }}
   if (spec.mode === 'count') return current.length;
   const at = spec.index < 0 ? current.length + spec.index : spec.index;
   return current[at] || null;
-}
+}}
 """
 
 

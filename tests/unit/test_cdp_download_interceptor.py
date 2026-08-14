@@ -17,6 +17,7 @@ import pytest
 from structlog.testing import capture_logs
 
 import skyvern.webeye.cdp_download_interceptor as mod
+from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
 from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
 from skyvern.webeye.cdp_download_interceptor import (
     CDPDownloadInterceptor,
@@ -1429,6 +1430,85 @@ class TestCDPDownloadInterceptorProxyAuth:
         await interceptor._handle_auth_required(event, cdp_session)
         second_call = cdp_session.send.call_args
         assert second_call.args[1]["authChallengeResponse"]["response"] == "CancelAuth"
+
+
+class TestDownloadsOnlyInterception:
+    """An explicitly unenrolled egress monitor marks a flow that does no request mediation (the
+    vendor-attach browsers). Download interception must still come up for those pages instead of
+    aborting setup, while every ambiguous monitor state keeps failing closed (SKY-14066)."""
+
+    def _page_with_session(self) -> tuple[MagicMock, MagicMock]:
+        cdp_session = MagicMock()
+        cdp_session.send = AsyncMock()
+        page = MagicMock(url="about:blank")
+        page.is_closed.return_value = False
+        page.context.new_cdp_session = AsyncMock(return_value=cdp_session)
+        return page, cdp_session
+
+    @pytest.mark.asyncio
+    async def test_unenrolled_monitor_enables_downloads_only(self) -> None:
+        monitor = BrowserNetworkEgressMonitor.unenrolled()
+        interceptor = _make_interceptor(output_dir="/tmp/test_downloads", network_egress_monitor=monitor)
+        page, cdp_session = self._page_with_session()
+
+        await interceptor.enable_for_page(page)
+
+        cdp_session.send.assert_called_once_with(
+            "Fetch.enable",
+            {"patterns": [{"requestStage": "Response"}], "handleAuthRequests": False},
+        )
+        assert interceptor._cdp_sessions == [cdp_session]
+
+    @pytest.mark.asyncio
+    async def test_unenrolled_monitor_with_proxy_auth_keeps_request_stage(self) -> None:
+        monitor = BrowserNetworkEgressMonitor.unenrolled()
+        interceptor = _make_interceptor(
+            output_dir="/tmp/test_downloads",
+            proxy_username="user",
+            proxy_password="pass",
+            network_egress_monitor=monitor,
+        )
+        page, cdp_session = self._page_with_session()
+
+        await interceptor.enable_for_page(page)
+
+        cdp_session.send.assert_called_once_with(
+            "Fetch.enable",
+            {
+                "patterns": [{"requestStage": "Response"}, {"urlPattern": "*", "requestStage": "Request"}],
+                "handleAuthRequests": True,
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_request_stage_passes_through_without_mediation(self) -> None:
+        monitor = BrowserNetworkEgressMonitor.unenrolled()
+        interceptor = _make_interceptor(
+            output_dir="/tmp/test_downloads",
+            proxy_username="user",
+            proxy_password="pass",
+            network_egress_monitor=monitor,
+        )
+        page, cdp_session = self._page_with_session()
+        await interceptor.enable_for_page(page)
+        cdp_session.send.reset_mock()
+
+        event = {"requestId": "req-1", "request": {"method": "GET", "url": "https://example.com/"}}
+        await interceptor._handle_request_paused(event, cdp_session, interceptor._artifact_scope_generation)
+
+        cdp_session.send.assert_awaited_once_with("Fetch.continueRequest", {"requestId": "req-1"})
+
+    @pytest.mark.asyncio
+    async def test_enforcing_uninstalled_monitor_still_fails_closed(self) -> None:
+        # Not invalidated, not installed: an enforcing monitor mid-setup is ambiguous, and
+        # silently downgrading it to downloads-only would drop mediation. It must stay loud.
+        monitor = BrowserNetworkEgressMonitor()
+        interceptor = _make_interceptor(output_dir="/tmp/test_downloads", network_egress_monitor=monitor)
+        page, cdp_session = self._page_with_session()
+
+        with pytest.raises(RuntimeError):
+            await interceptor.enable_for_page(page)
+        cdp_session.send.assert_awaited_with("Fetch.disable")
 
 
 class TestStaleInterceptionRace:

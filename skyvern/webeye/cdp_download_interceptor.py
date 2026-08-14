@@ -42,6 +42,7 @@ from playwright.async_api import Browser, BrowserContext, CDPSession, Page
 
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, BROWSER_INTERCEPTOR_DISABLE_TIMEOUT
 from skyvern.forge.sdk.api import files as file_api
+from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkDenialReason
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.http_request_authorization import (
     RunScopedRedirectHopAuthorizer,
@@ -628,6 +629,7 @@ class CDPDownloadInterceptor:
         self._cdp_sessions: list[CDPSession] = []
         self._active_request_interceptors: dict[CDPSession, tuple[Page, Callable[[Page], None]]] = {}
         self._enrolling_pages: list[Page] = []
+        self._mediates_requests = True
         self._enabled = False
         self._download_index = 0
         # Track auth attempts per requestId to prevent infinite retry loops
@@ -795,13 +797,22 @@ class CDPDownloadInterceptor:
         if has_proxy_auth:
             cdp_session.on("Fetch.authRequired", lambda event: self._on_auth_required(event, cdp_session))
 
+        # A monitor explicitly constructed unenrolled marks a flow with no request mediation at
+        # all (vendor-attach browsers); download interception still has to come up there, so it
+        # runs Response-stage only. Only that exact state downgrades: an enforcing monitor in any
+        # other state (including mid-setup) must keep the loud registration failure below, because
+        # silently skipping registration would drop mediation the flow was promised.
+        self._mediates_requests = (
+            self._network_egress_monitor.invalidation_reason is not BrowserNetworkDenialReason.UNENROLLED
+        )
+
         # Request-stage interception is the last boundary before browser credentials go on the
-        # wire. It is mandatory even without proxy auth; the active request must consume the
-        # monitor's exact one-shot slot before Fetch.continueRequest can dispatch it.
-        patterns: list[dict[str, str]] = [
-            {"requestStage": "Response"},
-            {"urlPattern": "*", "requestStage": "Request"},
-        ]
+        # wire. When mediating, it is mandatory even without proxy auth; the active request must
+        # consume the monitor's exact one-shot slot before Fetch.continueRequest can dispatch it.
+        # Without mediation it is only needed to receive proxy auth challenges.
+        patterns: list[dict[str, str]] = [{"requestStage": "Response"}]
+        if self._mediates_requests or has_proxy_auth:
+            patterns.append({"urlPattern": "*", "requestStage": "Request"})
 
         try:
             await cdp_session.send(
@@ -811,7 +822,8 @@ class CDPDownloadInterceptor:
                     "handleAuthRequests": has_proxy_auth,
                 },
             )
-            self._network_egress_monitor.register_active_request_interceptor(page=page, owner=self)
+            if self._mediates_requests:
+                self._network_egress_monitor.register_active_request_interceptor(page=page, owner=self)
 
             def close_listener(closed_page: Page) -> None:
                 # This listener is bound to `page`, so a close event carrying any other page means
@@ -1691,6 +1703,9 @@ class CDPDownloadInterceptor:
             # Request stage: authorize before continueRequest can put browser credentials on the
             # wire. A missing, failed, or negative collaborator is unenrolled and fails closed.
             if response_status is None:
+                if not self._mediates_requests:
+                    await cdp_session.send("Fetch.continueRequest", {"requestId": request_id})
+                    return
                 request = event.get("request", {})
                 try:
                     monitor = self._network_egress_monitor
