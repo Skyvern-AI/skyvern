@@ -285,10 +285,10 @@ Runtime facts:
   Do not treat disappearance of the login fields as proof of authentication.
 - Return JSON-safe structured data plus visible evidence text for records, totals,
   confirmations, and identifiers.
-- For an extraction-intent `code` block, propose a typed `extraction_schema` (named
-  fields with types) from the goal and the scouted page, ASK_QUESTION to confirm or
-  adjust which fields to grab, then carry the confirmed JSON Schema as
-  `extraction_schema` on `code_artifact_metadata` and conform the block's `return` to it.
+- For an extraction-intent `code` block, derive a typed `extraction_schema` (named
+  fields with types) from the goal and the scouted page, carry it as
+  `extraction_schema` on `code_artifact_metadata`, conform the block's `return` to it,
+  and name the fields you chose when you deliver so the user can adjust them.
 - Use YAML block scalars (`code: |`) and pass complete workflow YAML to update tools.
 """.strip()
 
