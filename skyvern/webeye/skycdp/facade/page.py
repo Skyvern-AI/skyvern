@@ -592,8 +592,34 @@ class Page:
         return self._network.take_document_response()
 
     async def reload(self, *, timeout: float | None = None, wait_until: str = "load") -> None:
-        await self._session.send("Page.reload", {})
-        await self.wait_for_load_state("load", timeout=timeout)
+        # Page.reload keeps the URL, so wait_for_load_state cannot be trusted here: its readyState poll
+        # reads the pre-reload document -- still the frame's registered execution context and already
+        # "complete" -- and returns before the new document exists (the load-count-1->1 parity gap).
+        # The new document's execution context is only registered as the reload commits, so wait for
+        # the load event that fires *after* this reload's own main-frame commit; that load, unlike the
+        # poll, cannot be satisfied until the re-created document is in place.
+        seconds = seconds_from_ms(timeout, DEFAULT_NAVIGATION_TIMEOUT_MS)
+        loop = asyncio.get_running_loop()
+        committed: asyncio.Future[None] = loop.create_future()
+        loaded: asyncio.Future[None] = loop.create_future()
+
+        def on_navigated(frame: Frame) -> None:
+            if frame.frame_id == self._main_frame_id and not committed.done():
+                committed.set_result(None)
+
+        def on_loaded(_: dict) -> None:
+            if committed.done() and not loaded.done():
+                loaded.set_result(None)
+
+        self.on("framenavigated", on_navigated)
+        self._session.on("Page.loadEventFired", on_loaded)
+        try:
+            await self._session.send("Page.reload", {})
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(loaded, seconds)
+        finally:
+            self.remove_listener("framenavigated", on_navigated)
+            self._session.off("Page.loadEventFired", on_loaded)
 
     async def go_back(self, *, timeout: float | None = None, wait_until: str = "load") -> None:
         await self._navigate_history(-1)
