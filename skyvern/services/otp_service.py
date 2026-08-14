@@ -31,10 +31,18 @@ LOG = structlog.get_logger()
 
 _RAW_OTP_REPARSE_LIMIT = 3
 
+# How far before its call a magic_link() poll may look. A link's email is often sent while the
+# triggering click is still settling, so a strict call-time anchor filters out the very link the
+# poll awaits; a spent link from earlier in the run only re-surfaces inside this interval.
+MAGIC_LINK_ANCHOR_GRACE = timedelta(seconds=60)
+
 
 @dataclass
 class RawOTPVerificationContext:
     misses: set[tuple[str, OTPType]] = field(default_factory=set)
+    # Types that were present but rejected for not matching expected_otp_type; lets a caller
+    # that times out say which kind of OTP did arrive instead of only that none matched.
+    observed_otp_types: set[OTPType] = field(default_factory=set)
 
 
 _MFA_PARAMETER_KEY_HINTS = ("mfa", "otp", "verification")
@@ -168,6 +176,15 @@ def _verbatim_otp_value(content: str, otp_type: OTPType | None, llm_value: str |
     if len(scored) > 1 and scored[1][0] == scored[0][0]:
         return None
     return scored[0][1]
+
+
+def looks_like_magic_link(content: str) -> bool:
+    """Whether a message body is a bare sign-in link, decided without an LLM call.
+
+    Used only to explain a wrong-verb timeout: an enforced parse returns None rather than the
+    other OTP type, so the type that did arrive is otherwise unrecoverable.
+    """
+    return bool(_BARE_URL_PATTERN.match(content.strip()))
 
 
 async def parse_otp_login(
@@ -561,7 +578,14 @@ async def poll_otp_value(
     totp_identifier: str | None = None,
     created_after: datetime | None = None,
     expected_otp_type: OTPType | None = None,
+    email_context: EmailOTPVerificationContext | None = None,
+    raw_context: RawOTPVerificationContext | None = None,
 ) -> OTPValue | None:
+    """Poll until an OTP of ``expected_otp_type`` arrives or the wall-clock budget expires.
+
+    A caller that cancels this early (``asyncio.wait_for``) can pass its own contexts and then
+    read ``observed_otp_types`` off them to report which kind of OTP did arrive.
+    """
     timeout = timedelta(minutes=settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
     start_datetime = datetime.utcnow()
     timeout_datetime = start_datetime + timeout
@@ -576,8 +600,8 @@ async def poll_otp_value(
     consecutive_failures = 0
     last_error_reason: str | None = None
     org_token: OrganizationAuthToken | None = None
-    email_otp_context = EmailOTPVerificationContext()
-    raw_otp_context = RawOTPVerificationContext()
+    email_otp_context = email_context if email_context is not None else EmailOTPVerificationContext()
+    raw_otp_context = raw_context if raw_context is not None else RawOTPVerificationContext()
     while True:
         await asyncio.sleep(10)
         if datetime.utcnow() > timeout_datetime:
@@ -856,6 +880,7 @@ async def _get_otp_value_from_db(
             stored_otp_value = OTPValue(value=parsed_row.code, type=parsed_row.otp_type)
             if expected_otp_type is None or stored_otp_value.get_otp_type() == expected_otp_type:
                 return stored_otp_value
+            context.observed_otp_types.add(stored_otp_value.get_otp_type())
             if not parsed_row.content:
                 continue
         if expected_otp_type is None:
@@ -885,6 +910,8 @@ async def _get_otp_value_from_db(
             return None
         if otp_value is None or otp_value.get_otp_type() != expected_otp_type:
             context.misses.add(cache_key)
+            if otp_value is not None:
+                context.observed_otp_types.add(otp_value.get_otp_type())
             continue
         if is_raw:
             await app.DATABASE.otp.promote_raw_otp_code(

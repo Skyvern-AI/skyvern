@@ -192,6 +192,15 @@ class SkyvernPage(Page):
     ) -> str:
         return value
 
+    async def magic_link(
+        self,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+    ) -> None:
+        # Raises rather than no-opping like the value helpers above: a silent return would let a
+        # script continue past a sign-in that never happened.
+        raise NotImplementedError("Magic link sign-in is not supported outside server context")
+
     def _is_secret_reference(self, value: str) -> bool:
         return False
 
