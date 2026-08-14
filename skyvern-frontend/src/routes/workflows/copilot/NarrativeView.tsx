@@ -1283,6 +1283,7 @@ interface DetailViewProps {
   onCollapse: (() => void) | null;
   onBlockSelect?: (label: string) => void;
   uxV1?: boolean;
+  workingRowActive?: boolean;
 }
 
 function DetailView({
@@ -1290,6 +1291,7 @@ function DetailView({
   onCollapse,
   onBlockSelect,
   uxV1,
+  workingRowActive,
 }: DetailViewProps) {
   const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
   const hasBlocks = turn.blocks.length > 0;
@@ -1360,7 +1362,7 @@ function DetailView({
         </div>
       ) : null}
 
-      {!hasBlocks && !designStarted && !turn.terminal ? (
+      {!hasBlocks && !designStarted && !turn.terminal && !workingRowActive ? (
         <div className="pl-9 text-[12px] italic text-muted-foreground dark:text-slate-500">
           Working…
         </div>
@@ -1381,12 +1383,14 @@ interface NarrativeViewProps {
   turn: TurnNarrativeState;
   onBlockSelect?: (blockLabel: string) => void;
   uxV1?: boolean;
+  workingRowActive?: boolean;
 }
 
 export function NarrativeView({
   turn,
   onBlockSelect,
   uxV1,
+  workingRowActive,
 }: NarrativeViewProps) {
   const summary = useMemo(
     () => computeTurnSummary(turn, { uxV1 }),
@@ -1415,6 +1419,7 @@ export function NarrativeView({
       onCollapse={isComplete ? () => setUserRolled(true) : null}
       onBlockSelect={onBlockSelect}
       uxV1={uxV1}
+      workingRowActive={workingRowActive}
     />
   );
 }
