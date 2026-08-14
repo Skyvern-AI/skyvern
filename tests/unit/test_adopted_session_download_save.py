@@ -15,13 +15,17 @@ import base64
 from collections.abc import Awaitable, Callable
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
-from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
+from skyvern.forge.sdk.core.http_request_authorization import (
+    RunScopedRedirectHopAuthorizer,
+    deny_unenrolled_redirect_hop,
+)
 from skyvern.webeye.actions.handler import (
     _adopted_session_download_binding,
     _EagerAdoptedBlobCapture,
@@ -1022,6 +1026,39 @@ async def test_adopted_session_download_binding_blocks_scope_rotation_until_rele
 
     await asyncio.wait_for(rebinding, timeout=1)
     assert interceptor.download_scope == "next_run"
+
+
+@pytest.mark.asyncio
+async def test_adopted_session_download_binding_skips_the_lease_for_a_provider_owned_binding() -> None:
+    """A provider-owned remote context carries neither the interceptor nor its ownership lock: the
+    creator that stamps SESSION_DIR binds no interceptor, and every download-dir rebind skips it."""
+    page = _page_with_refetch()
+    page.context = SimpleNamespace()
+    download = _download()
+    download.page = page
+
+    async with _adopted_session_download_binding(download, page, download_binding=DownloadBinding.SESSION_DIR) as (
+        bound_interceptor,
+        authorize_request_hop,
+        download_scope,
+    ):
+        assert bound_interceptor is None
+        assert authorize_request_hop is deny_unenrolled_redirect_hop
+        assert download_scope is None
+
+
+@pytest.mark.asyncio
+async def test_adopted_session_download_binding_still_demands_the_lease_for_a_run_dir_binding() -> None:
+    """The skip is scoped to the provider-owned binding; a run-dir context that lost its lock is
+    still a real defect and must not be waved through."""
+    page = _page_with_refetch()
+    page.context = SimpleNamespace()
+    download = _download()
+    download.page = page
+
+    with pytest.raises(RuntimeError, match="interceptor ownership lock"):
+        async with _adopted_session_download_binding(download, page):
+            pass
 
 
 @pytest.mark.asyncio
