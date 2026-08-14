@@ -239,7 +239,8 @@ async def _get_block_schema_post_hook(
         if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and block_type == "code":
             ctx.code_only_code_schema_seen = True
             data["code_only_note"] = _code_only_browser_unavailable_summary()
-            data["code_only_guidance"] = _code_only_browser_schema_guidance()
+            settled_block_types = ctx.code_only_settled_block_types if isinstance(ctx, CopilotContext) else frozenset()
+            data["code_only_guidance"] = _code_only_browser_schema_guidance(settled_block_types)
             data["download_claim_helper_contract"] = download_claim_helper_contract()
             demonstrated = _demonstrated_step_facts(ctx)
             if demonstrated:
