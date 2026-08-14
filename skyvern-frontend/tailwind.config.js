@@ -141,6 +141,10 @@ export default {
         "copilot-stop-orbit": {
           to: { transform: "rotate(1turn)" },
         },
+        "copilot-verb-shimmer": {
+          from: { backgroundPosition: "180% 0" },
+          to: { backgroundPosition: "-80% 0" },
+        },
         glow: {
           "0%, 100%": { boxShadow: "0 0 8px 2px rgba(234, 179, 8, 0.3)" },
           "50%": { boxShadow: "0 0 24px 8px rgba(234, 179, 8, 0.6)" },
@@ -169,6 +173,7 @@ export default {
         "collapsible-up-fade":
           "collapsible-up-fade 0.22s cubic-bezier(0.22, 1, 0.36, 1)",
         "copilot-stop-orbit": "copilot-stop-orbit 3s linear infinite",
+        "copilot-verb-shimmer": "copilot-verb-shimmer 2.4s linear infinite",
         glow: "glow 2.5s ease-in-out infinite",
         "analytics-pulse": "analytics-pulse-ring 0.6s ease-out 1",
         "copilot-row-flash-success": "copilot-row-flash-success 0.6s ease-out",

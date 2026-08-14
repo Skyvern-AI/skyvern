@@ -73,6 +73,7 @@ import {
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
 import { shouldArmDraftingGapTimer } from "./copilotPhases";
 import { InstantAckPlaceholder, NarrativeView } from "./NarrativeView";
+import { CopilotWorkingStatus } from "./CopilotWorkingStatus";
 import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
 import { DiffCard, shouldShowDiffCard } from "./cards/DiffCard";
@@ -2952,7 +2953,9 @@ export function WorkflowCopilotChat({
       ? null
       : queuedPromptWaitingStatus
     : isLoading
-      ? "Copilot is working. Your next send will wait for the next turn."
+      ? copilotUxV1Enabled && copilotV2Enabled
+        ? null
+        : "Copilot is working. Your next send will wait for the next turn."
       : isWaitingForLiveBrowser
         ? "Live browser is starting. Your next send will wait until it connects."
         : null;
@@ -2973,6 +2976,11 @@ export function WorkflowCopilotChat({
   const gateActionable =
     Boolean(proposedWorkflow) && !isLoading && !isLoadingHistory;
   const hasComposerText = inputValue.trim().length > 0;
+  // The cycling verb row plus the stop button's orbiting ring carry the
+  // working state, so the prose status line and the queued chip stand down.
+  const showWorkingRow = Boolean(
+    copilotUxV1Enabled && copilotV2Enabled && isLoading,
+  );
   // A live_browser-reason queued prompt parks with no active turn to stop, so
   // an empty composer's morph button would render as a guaranteed no-op "Send".
   // With text typed it does act — it rewrites the parked prompt.
@@ -3217,6 +3225,7 @@ export function WorkflowCopilotChat({
                       turn={message.narrative}
                       onBlockSelect={onBlockSelect}
                       uxV1={copilotUxV1Enabled}
+                      workingRowActive={showWorkingRow}
                     />
                     {showReviewGate ? (
                       <ReviewGateCard
@@ -3542,6 +3551,7 @@ export function WorkflowCopilotChat({
                   turn={narrative}
                   onBlockSelect={onBlockSelect}
                   uxV1={copilotUxV1Enabled}
+                  workingRowActive={showWorkingRow}
                 />
                 {copilotUxV1Enabled &&
                 !isLoadingHistory &&
@@ -3654,7 +3664,14 @@ export function WorkflowCopilotChat({
             pending · Review
           </button>
         ) : null}
-        {copilotUxV1Enabled &&
+        {showWorkingRow ? (
+          <CopilotWorkingStatus
+            queued={Boolean(queuedPrompt)}
+            onDismissQueued={restoreQueuedPromptToComposer}
+          />
+        ) : null}
+        {!showWorkingRow &&
+        copilotUxV1Enabled &&
         copilotV2Enabled &&
         queuedPrompt &&
         (queuedPrompt.reason === "working" || queuedBubbleOrphaned) ? (
@@ -3673,7 +3690,7 @@ export function WorkflowCopilotChat({
             </button>
           </div>
         ) : null}
-        {inputStatusText ? (
+        {inputStatusText && !showWorkingRow ? (
           <div
             className="mb-2 text-xs text-muted-foreground"
             aria-live="polite"

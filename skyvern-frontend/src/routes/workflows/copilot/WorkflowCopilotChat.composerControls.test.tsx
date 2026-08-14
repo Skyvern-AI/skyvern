@@ -7,6 +7,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { COPILOT_WORKING_VERBS } from "./workingVerbs";
 
 import {
   FeatureFlagContext,
@@ -285,13 +286,31 @@ describe("WorkflowCopilotChat — S4 composer, copilot_ux_v1 on", () => {
 
     // Queued, not sent as a second concurrent turn.
     expect(postStreaming).toHaveBeenCalledTimes(1);
-    expect(screen.getByText("Queued")).toBeTruthy();
-    // Exactly one status line — the Queued chip, not also the legacy
-    // aria-live text line (browserStatusText is suppressed under S4 so the
-    // two don't announce the same status twice).
+    // The queue now rides in the working row's pill; the standalone chip and
+    // the legacy prose status line are both gone, so the state is stated once.
+    expect(screen.getByText(/1 message queued/)).toBeTruthy();
+    expect(screen.queryByText("Queued")).toBeNull();
     expect(
-      screen.getAllByText("Queued — sends when this turn finishes."),
-    ).toHaveLength(1);
+      screen.queryByText("Queued — sends when this turn finishes."),
+    ).toBeNull();
+  });
+
+  it("shows a cycling Skyvern verb instead of the prose working line", async () => {
+    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    const row = screen.getByTestId("copilot-working-status");
+    expect(
+      COPILOT_WORKING_VERBS.some((verb) =>
+        row.textContent?.includes(`${verb}…`),
+      ),
+    ).toBe(true);
+    expect(
+      screen.queryByText(
+        "Copilot is working. Your next send will wait for the next turn.",
+      ),
+    ).toBeNull();
   });
 
   it("disables the morph button (not a dead-looking Send) while a prompt waits on the live browser", async () => {
