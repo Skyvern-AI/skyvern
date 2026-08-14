@@ -749,6 +749,72 @@ def apply_block_edit(
     return yaml.safe_dump(parsed, sort_keys=False)
 
 
+def _merge_new_workflow_parameters(parsed: dict[str, Any], parameters: list[Any]) -> None:
+    definition = parsed["workflow_definition"]
+    existing = definition.get("parameters")
+    if not isinstance(existing, list):
+        existing = []
+    declared = {str(p.get("key") or "") for p in existing if isinstance(p, dict)}
+    for parameter in parameters:
+        if not isinstance(parameter, dict):
+            raise BlockEditError("Each entry in parameters must be a mapping with a key.")
+        key = str(parameter.get("key") or "")
+        if not key:
+            raise BlockEditError("Each entry in parameters needs a key.")
+        # Declaring is additive only: a key the workflow already has keeps its current definition.
+        if key in declared:
+            continue
+        existing.append(parameter)
+        declared.add(key)
+    definition["parameters"] = existing
+
+
+def add_block_to_workflow(
+    stored_yaml: str,
+    after_label: str,
+    block_yaml: str,
+    *,
+    parameters: list[Any] | None = None,
+) -> str:
+    """Splice one new block in after ``after_label`` and return the whole workflow.
+
+    The predecessor hands its ``next_block_label`` to the new block and points at it instead, so the
+    chain stays intact without the model retyping the blocks it is not changing.
+    """
+    try:
+        parsed = safe_load_no_dates(stored_yaml)
+    except Exception as exc:
+        raise BlockEditError(f"The stored workflow is not parseable: {exc}") from exc
+    blocks = _workflow_blocks(parsed)
+    if blocks is None:
+        raise BlockEditError("The stored workflow has no workflow_definition.blocks to edit.")
+    predecessor = _block_by_label(blocks, after_label)
+
+    try:
+        new_block = safe_load_no_dates(block_yaml)
+    except Exception as exc:
+        raise BlockEditError(f"block_yaml is not parseable: {exc}") from exc
+    if not isinstance(new_block, dict):
+        raise BlockEditError("block_yaml must be a single block mapping.")
+    new_label = str(new_block.get("label") or "")
+    if not new_label:
+        raise BlockEditError("The new block needs a label.")
+    known = sorted(str(b.get("label") or "") for b in blocks if isinstance(b, dict))
+    if new_label in known:
+        raise BlockEditError(
+            f"A block labelled {new_label!r} already exists. The workflow has: {', '.join(known)}. "
+            "Use edit_block to change it, or give the new block a different label."
+        )
+
+    new_block["next_block_label"] = predecessor.get("next_block_label")
+    predecessor["next_block_label"] = new_label
+    blocks.insert(blocks.index(predecessor) + 1, new_block)
+
+    if parameters:
+        _merge_new_workflow_parameters(parsed, parameters)
+    return yaml.safe_dump(parsed, sort_keys=False)
+
+
 def delete_block_from_workflow(stored_yaml: str, label: str) -> str:
     """Remove one block by label and return the whole workflow.
 

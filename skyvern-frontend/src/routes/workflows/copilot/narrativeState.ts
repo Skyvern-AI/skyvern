@@ -434,6 +434,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   list_credentials: "Checking saved credentials",
   fill_credential_field: "Entering saved credentials",
   edit_block: "Editing block",
+  add_block: "Adding block",
   delete_block: "Deleting block",
   synthesize_demonstrated_block: "Building a block from the recorded steps",
 };

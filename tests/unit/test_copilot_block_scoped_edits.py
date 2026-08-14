@@ -8,9 +8,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
+from skyvern.forge.sdk.copilot.tools.workflow_update import _code_block_safety_errors
 from skyvern.forge.sdk.copilot.workflow_yaml import (
     BlockEditError,
+    add_block_to_workflow,
     apply_block_edit,
     delete_block_from_workflow,
     stored_block_code,
@@ -118,6 +121,124 @@ class TestFieldEdit:
         out = apply_block_edit(_WORKFLOW, "open_portal", fields={"continue_on_failure": True})
         assert "continue_on_failure: true" in out
         assert "read_total" in out
+
+
+def _blocks(workflow: str) -> dict[str, dict]:
+    parsed = yaml.safe_load(workflow)
+    return {b["label"]: b for b in parsed["workflow_definition"]["blocks"]}
+
+
+_NEW_BLOCK = """block_type: code
+label: check_pages
+code: |
+  for path in page_paths:
+      await page.goto(path)
+"""
+
+
+class TestAddBlock:
+    def test_splices_after_the_named_block_and_relinks_the_chain(self) -> None:
+        out = add_block_to_workflow(_WORKFLOW, "open_portal", _NEW_BLOCK)
+        blocks = _blocks(out)
+        assert blocks["open_portal"]["next_block_label"] == "check_pages"
+        assert blocks["check_pages"]["next_block_label"] == "read_total", (
+            "the new block must inherit what its predecessor pointed at, or the chain is cut"
+        )
+
+    def test_leaves_every_other_block_byte_identical(self) -> None:
+        """The property the whole design turns on: adding must not re-decide a block that already works."""
+        before, after = _blocks(_WORKFLOW), _blocks(add_block_to_workflow(_WORKFLOW, "open_portal", _NEW_BLOCK))
+        assert after["read_total"] == before["read_total"]
+        predecessor = dict(after["open_portal"])
+        assert predecessor.pop("next_block_label") == "check_pages"
+        assert predecessor == {k: v for k, v in before["open_portal"].items() if k != "next_block_label"}
+
+    def test_appending_after_the_last_block_leaves_the_new_block_terminal(self) -> None:
+        blocks = _blocks(add_block_to_workflow(_WORKFLOW, "read_total", _NEW_BLOCK))
+        assert blocks["read_total"]["next_block_label"] == "check_pages"
+        assert blocks["check_pages"]["next_block_label"] is None
+
+    def test_a_duplicate_label_is_refused_and_names_what_exists(self) -> None:
+        with pytest.raises(BlockEditError) as exc:
+            add_block_to_workflow(_WORKFLOW, "open_portal", "block_type: code\nlabel: read_total\ncode: x\n")
+        assert "already exists" in str(exc.value)
+        assert "open_portal" in str(exc.value) and "read_total" in str(exc.value)
+
+    def test_an_unknown_after_label_names_what_exists(self) -> None:
+        with pytest.raises(BlockEditError) as exc:
+            add_block_to_workflow(_WORKFLOW, "ghost", _NEW_BLOCK)
+        assert "open_portal" in str(exc.value) and "read_total" in str(exc.value)
+
+    def test_a_block_without_a_label_is_refused(self) -> None:
+        with pytest.raises(BlockEditError):
+            add_block_to_workflow(_WORKFLOW, "open_portal", "block_type: code\ncode: x\n")
+
+    @pytest.mark.parametrize("block_yaml", ["{{ not yaml", "- a\n- b\n"])
+    def test_block_yaml_must_be_one_block_mapping(self, block_yaml: str) -> None:
+        with pytest.raises(BlockEditError):
+            add_block_to_workflow(_WORKFLOW, "open_portal", block_yaml)
+
+
+class TestAddBlockParameters:
+    """A new block and the parameter it reads have to land in one write, or the saved workflow cannot run."""
+
+    def test_declares_the_new_parameter_alongside_the_block(self) -> None:
+        out = add_block_to_workflow(
+            _WORKFLOW,
+            "open_portal",
+            _NEW_BLOCK,
+            parameters=[{"key": "page_paths", "parameter_type": "workflow", "workflow_parameter_type": "json"}],
+        )
+        parsed = yaml.safe_load(out)
+        assert [p["key"] for p in parsed["workflow_definition"]["parameters"]] == ["page_paths"]
+        assert "check_pages" in _blocks(out)
+
+    def test_an_already_declared_key_keeps_its_current_definition(self) -> None:
+        """Editing existing parameters is out of scope, so a repeated key must not be redefined."""
+        workflow = _WORKFLOW.replace(
+            "workflow_definition:\n",
+            "workflow_definition:\n  parameters:\n  - key: page_paths\n    parameter_type: workflow\n",
+        )
+        out = add_block_to_workflow(
+            workflow, "open_portal", _NEW_BLOCK, parameters=[{"key": "page_paths", "parameter_type": "credential"}]
+        )
+        parameters = yaml.safe_load(out)["workflow_definition"]["parameters"]
+        assert parameters == [{"key": "page_paths", "parameter_type": "workflow"}]
+
+    def test_a_parameter_without_a_key_is_refused(self) -> None:
+        with pytest.raises(BlockEditError):
+            add_block_to_workflow(_WORKFLOW, "open_portal", _NEW_BLOCK, parameters=[{"parameter_type": "workflow"}])
+
+
+class TestAddBlockRunsTheSameAuthorTimeChecks:
+    """add_block composes a whole workflow server-side and persists it through the shared path, so it
+    cannot be a way around a check a whole-document write must satisfy."""
+
+    _UNSAFE = 'block_type: code\nlabel: exfiltrate\ncode: |\n  await page.request.get("https://example.test/x")\n'
+
+    def test_unsafe_code_added_this_way_still_trips_the_code_safety_reject(self) -> None:
+        spliced = add_block_to_workflow(_WORKFLOW, "read_total", self._UNSAFE)
+
+        errors = _code_block_safety_errors(spliced, _WORKFLOW)
+
+        assert [e.reason_code for e in errors] == ["AUTHOR_PAGE_REQUEST"]
+
+    def test_it_trips_exactly_what_the_whole_document_write_trips(self) -> None:
+        spliced = add_block_to_workflow(_WORKFLOW, "read_total", self._UNSAFE)
+        retyped = yaml.safe_load(_WORKFLOW)
+        retyped["workflow_definition"]["blocks"].append(yaml.safe_load(self._UNSAFE))
+        whole_document = yaml.safe_dump(retyped, sort_keys=False)
+
+        assert [e.reason_code for e in _code_block_safety_errors(spliced, _WORKFLOW)] == [
+            e.reason_code for e in _code_block_safety_errors(whole_document, _WORKFLOW)
+        ]
+
+    def test_the_untouched_blocks_are_not_re_checked(self) -> None:
+        """The gate is label-scoped against the prior workflow, so a purely additive splice presents
+        exactly one changed block."""
+        spliced = add_block_to_workflow(_WORKFLOW, "read_total", _NEW_BLOCK)
+
+        assert _code_block_safety_errors(spliced, _WORKFLOW) == []
 
 
 class TestDelete:

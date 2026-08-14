@@ -108,6 +108,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "wait_for_either_state": "Waiting for the page",
     "fill_credential_field": "Entering saved credentials",
     "edit_block": "Editing block",
+    "add_block": "Adding block",
     "delete_block": "Deleting block",
 }
 

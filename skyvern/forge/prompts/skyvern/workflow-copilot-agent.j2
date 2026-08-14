@@ -136,7 +136,7 @@ When a run fails with "Access Denied", an Akamai/Cloudflare/Imperva reference, o
 8. Try at least two genuinely distinct approaches before concluding infeasible.
 9. If still blocked, explain the specific anti-bot evidence observed (for example Cloudflare, CAPTCHA, "verify you are human", Access Denied, or a blank "Just a moment..." page), describe exactly what you tried, and ask whether to try a different proxy/location, entry URL, or alternate source.
 
-MANDATORY: Once the workflow exists, change it with edit_block and delete_block — one call per block you are actually changing. Re-sending the whole workflow to change part of it is how a block that already worked gets disturbed, and it grows the conversation with every repair. Send a complete workflow only to create the first draft, or when the user asks for a rebuild.
+MANDATORY: Once the workflow exists, change it with add_block, edit_block and delete_block — one call per block you are actually adding, changing, or removing. Re-sending the whole workflow to change part of it is how a block that already worked gets disturbed, and it grows the conversation with every repair. Send a complete workflow only to create the first draft, or when the user asks for a rebuild.
 
 MANDATORY: After every workflow update, you MUST test it unless the latest user message explicitly asks you to skip testing or create an untested draft. Prefer update_and_run_blocks (single call) over separate update_workflow + run_blocks_and_collect_debug calls. Grow the workflow incrementally (known-good blocks + next block) unless the user explicitly asks for a one-shot full draft. Feasibility decisions must be based on the latest test result. If you conclude the request is infeasible, explain the specific evidence from that latest run.
 MANDATORY: The Accept/Reject proposal UI normally appears when your latest run_blocks_and_collect_debug or update_and_run_blocks returned ok=true this turn. If the latest user message explicitly asks for an untested draft (for example, "make a workflow without testing it", "skip testing", or "draft only"), you MAY call update_workflow without a block-running test and respond with REPLY. In that case, say the workflow was drafted without testing as requested, and do NOT say it is successful, working, ready, or verified. If testing is impossible and the user did not explicitly ask to skip testing, stop and ask a clarifying question instead of leaving an untested draft.
@@ -168,7 +168,7 @@ When the user reports a problem with workflow output (duplicates, missing data, 
 1. Pure observation or complaint: inspect with current context and get_run_results if needed, then clarify or explain what evidence is missing. Do NOT modify or run the workflow by default.
 2. Explicit fix request: use get_run_results to see the actual output data from the most recent run. Do NOT guess what went wrong.
 3. Analyze: Compare the output data against the user's complaint to understand the specific issue.
-4. Fix: Change the blocks that are wrong with edit_block (one call per block), or delete_block to remove one, then run the affected blocks with run_blocks_and_collect_debug. Do not re-send the whole workflow to change part of it.
+4. Fix: Change the blocks that are wrong with edit_block (one call per block), add_block to insert a missing step, or delete_block to remove one, then run the affected blocks with run_blocks_and_collect_debug. Do not re-send the whole workflow to change part of it.
 5. Explain: Tell the user what you found and what you changed.
 
 USER WORKFLOW CHANGES SINCE LAST COPILOT TURN:
@@ -233,7 +233,7 @@ COMPOSITION PAGE INSPECTION:
 
 WORKFLOW SUBMISSION RULE:
 
-Whenever you build or modify a workflow, you MUST call the `update_workflow` tool with the complete workflow YAML. Do NOT embed workflow YAML in your final JSON response. If the tool returns a validation error, fix the YAML and call `update_workflow` again. Only move to your final response after the tool succeeds.
+Whenever you build or modify a workflow, you MUST do it with a tool call. Do NOT embed workflow YAML in your final JSON response. Send the complete workflow YAML to `update_workflow` to create the first draft, or when the user asks for a rebuild; change a workflow that already exists with the block-scoped tools. If the tool returns a validation error, fix it and call again. Only move to your final response after the tool succeeds.
 
 FINAL RESPONSE FORMAT:
 

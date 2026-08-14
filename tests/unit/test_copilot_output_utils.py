@@ -1309,7 +1309,7 @@ def test_summarize_tool_result_for_credentials_is_unchanged_for_agent_state() ->
 
 
 def test_surgical_edit_success_summary_is_empty_so_the_row_shows_its_label() -> None:
-    for tool_name in ("edit_block", "delete_block"):
+    for tool_name in ("edit_block", "add_block", "delete_block"):
         assert format_tool_result_for_user(tool_name, {"ok": True, "data": {"label": "login_form"}}) == ""
 
 
