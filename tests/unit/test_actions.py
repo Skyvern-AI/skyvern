@@ -1,4 +1,5 @@
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -25,6 +26,7 @@ from skyvern.webeye.actions.actions import (
     Action,
     ActionStatus,
     ClickAction,
+    ClickContext,
     ClosePageAction,
     ExtractAction,
     GotoUrlAction,
@@ -819,3 +821,65 @@ def test_tab_actions_registered_for_db_hydration() -> None:
 
     assert ACTION_TYPE_TO_CLASS[ActionType.NEW_TAB] is NewTabAction
     assert ACTION_TYPE_TO_CLASS[ActionType.SWITCH_TAB] is SwitchTabAction
+
+
+# ---------------------------------------------------------------------------
+# ClickContext.desired_state — level-triggered toggle intent (SKY-13916)
+# ---------------------------------------------------------------------------
+
+_CLICK_PROMPT_DIR = Path(__file__).parent.parent.parent / "skyvern" / "forge" / "prompts" / "skyvern"
+
+
+def test_click_context_desired_state_defaults_to_none() -> None:
+    assert ClickContext().desired_state is None
+    assert ClickContext(single_option_click=True).desired_state is None
+
+
+@pytest.mark.parametrize("desired_state", [True, False, None])
+def test_click_action_parse_roundtrips_desired_state(desired_state: bool | None) -> None:
+    action = parse_action(
+        action={
+            "action_type": "CLICK",
+            "element_id": "e1",
+            "reasoning": "toggle the control",
+            "click_context": {"single_option_click": False, "desired_state": desired_state},
+        },
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, ClickAction)
+    assert action.click_context is not None
+    assert action.click_context.desired_state is desired_state
+
+
+def test_click_action_parse_legacy_without_click_context_is_none() -> None:
+    action = parse_action(
+        action={"action_type": "CLICK", "element_id": "e1", "reasoning": "click the button"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, ClickAction)
+    assert action.click_context is None
+
+
+def test_click_action_parse_legacy_click_context_without_desired_state_is_none() -> None:
+    action = parse_action(
+        action={
+            "action_type": "CLICK",
+            "element_id": "e1",
+            "reasoning": "click the option",
+            "click_context": {"single_option_click": True},
+        },
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, ClickAction)
+    assert action.click_context is not None
+    assert action.click_context.desired_state is None
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["extract-action.j2", "extract-action-static.j2", "single-click-action.j2"],
+)
+def test_desired_state_documented_in_click_prompts(template: str) -> None:
+    # The planner prompts and the cached single-click re-derivation prompt must offer
+    # desired_state so the deterministic setup guard can read level-triggered toggle intent.
+    assert "desired_state" in (_CLICK_PROMPT_DIR / template).read_text()

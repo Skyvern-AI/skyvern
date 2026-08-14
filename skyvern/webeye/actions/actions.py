@@ -103,6 +103,10 @@ class InputOrSelectContext(BaseModel):
 class ClickContext(BaseModel):
     thought: str | None = None
     single_option_click: bool | None = None
+    # Level-triggered toggle intent set by the planner: True = leave the control
+    # selected/checked/on, False = leave it unselected/unchecked/off, None = ordinary
+    # edge-triggered click. Old persisted actions and absent field decode to None.
+    desired_state: bool | None = None
 
 
 class Action(BaseModel):

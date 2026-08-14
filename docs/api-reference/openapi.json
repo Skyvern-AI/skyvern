@@ -10461,6 +10461,17 @@
               }
             ],
             "title": "Single Option Click"
+          },
+          "desired_state": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Desired State"
           }
         },
         "type": "object",

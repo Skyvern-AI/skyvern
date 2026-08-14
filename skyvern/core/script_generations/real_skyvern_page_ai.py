@@ -48,6 +48,7 @@ from skyvern.webeye.actions.actions import (
     UploadFileAction,
 )
 from skyvern.webeye.actions.handler import (
+    ActionHandler,
     get_actual_value_of_parameter_if_secret,
     handle_click_action,
     handle_hover_action,
@@ -275,26 +276,47 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     task, step.step_id, step.order, self.scraped_page, json_response.get("actions", [])
                 )
                 action = cast(ClickAction, actions[0])
-                result = await handle_click_action(action, self.page, self.scraped_page, task, step)
-                if result and result[-1].success is False:
-                    raise SkyvernActionFailed(result[-1].exception_message or "Click action returned success=False")
+
+                # Run the registered click setup (e.g. the selected-state guard) the
+                # same way ActionHandler._handle_action does, so this cached AI-click
+                # path can't re-toggle an already-selected control. There, any nonempty
+                # setup result is terminal: a failure raises, and any other result means
+                # the setup already stood in for the click, so suppress the physical one.
+                setup_suppressed_click = False
+                setup = ActionHandler.get_setup_for_action_type(action.action_type)
+                if setup is not None:
+                    setup_results = await setup(action, self.page, self.scraped_page, task, step)
+                    if setup_results:
+                        if setup_results[-1].success is False:
+                            raise SkyvernActionFailed(
+                                setup_results[-1].exception_message or "Click action setup returned success=False"
+                            )
+                        setup_suppressed_click = True
+
+                if not setup_suppressed_click:
+                    result = await handle_click_action(action, self.page, self.scraped_page, task, step)
+                    if result and result[-1].success is False:
+                        raise SkyvernActionFailed(result[-1].exception_message or "Click action returned success=False")
                 xpath = action.get_xpath()
                 selector = f"xpath={xpath}" if xpath else selector
 
                 # Record element-level fallback episode for the script reviewer (code_v2 only).
                 # This fires when a cached script's selector failed (or was missing) and
                 # ai_click succeeded. The episode gives the reviewer the AI-found action data
-                # so it can write a proper selector.
-                await self._record_element_fallback_episode(
-                    context=context,
-                    action_type="click",
-                    failed_selector=failed_selector,
-                    intention=intention,
-                    action=action,
-                    block_label=block_label,
-                    recoverable_marker_id=recoverable_marker_id,
-                    v3_parent_episode_id=v3_parent_episode_id,
-                )
+                # so it can write a proper selector. A setup-suppressed click was a deliberate
+                # no-op (e.g. the control already held the desired state), not a selector miss,
+                # so it must not record a corrective episode.
+                if not setup_suppressed_click:
+                    await self._record_element_fallback_episode(
+                        context=context,
+                        action_type="click",
+                        failed_selector=failed_selector,
+                        intention=intention,
+                        action=action,
+                        block_label=block_label,
+                        recoverable_marker_id=recoverable_marker_id,
+                        v3_parent_episode_id=v3_parent_episode_id,
+                    )
 
                 return selector
         except SkyvernActionFailed:

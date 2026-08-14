@@ -3503,6 +3503,13 @@ class ActionHandler:
         cls._setup_action_types[action_type] = handler
 
     @classmethod
+    def get_setup_for_action_type(
+        cls,
+        action_type: ActionType,
+    ) -> Callable[[Action, Page, ScrapedPage, Task, Step], Awaitable[list[ActionResult]]] | None:
+        return cls._setup_action_types.get(action_type)
+
+    @classmethod
     def register_teardown_for_action_type(
         cls,
         action_type: ActionType,
@@ -4550,6 +4557,252 @@ async def _retarget_disabled_element_for_click(
     return child_element
 
 
+def _parse_aria_boolean(value: str | None) -> bool | None:
+    """Interpret an ARIA boolean-state string. Returns True/False only for an exact "true"/"false"
+    (case-insensitive, trimmed); anything else -- absent, "mixed", malformed -- returns None so the
+    caller treats the state as unreadable and falls open to an ordinary click."""
+    if value is None:
+        return None
+    normalized = value.strip().casefold()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    return None
+
+
+async def _is_single_select_option_highlight(element: SkyvernElement) -> bool:
+    """True when a live aria-selected="true" belongs to a single-select option, where ARIA treats it
+    as the pre-commit keyboard highlight rather than committed state (mirrors
+    _custom_select_matched_state_confirms_pre_click): explicit role=option with no
+    aria-multiselectable="true" ancestor-or-self. In a multiselectable container aria-selected is
+    committed, so this returns False and the value stays readable."""
+    if (await element.get_attr("role", mode="dynamic") or "").strip().casefold() != "option":
+        return False
+    multiselectable = element.get_locator().locator("xpath=ancestor-or-self::*[@aria-multiselectable][1]")
+    if await multiselectable.count() == 0:
+        return True
+    return (await multiselectable.get_attribute("aria-multiselectable") or "").strip().casefold() != "true"
+
+
+async def _resolve_live_selected_state(element: SkyvernElement) -> bool | None:
+    """Read one generic, live observable of a control's selected/checked state, or None when no
+    boolean observable is readable (unknown control, malformed value, or a detached/unreadable
+    element) so the caller falls open to an ordinary click. Native checkbox/radio inputs report
+    through is_checked(); other controls expose an exact aria-checked/aria-pressed/aria-selected
+    boolean read live. Role only chooses which observable to read and whether a bare aria-selected
+    value is trustworthy; it never implies desired intent."""
+    try:
+        if element.get_tag_name() == "input":
+            input_type = (await element.get_attr("type") or "").strip().casefold()
+            if input_type in ("checkbox", "radio"):
+                return await element.is_checked()
+            return None
+        for aria_attr in ("aria-checked", "aria-pressed", "aria-selected"):
+            parsed = _parse_aria_boolean(await element.get_attr(aria_attr, mode="dynamic"))
+            if parsed is None:
+                continue
+            if aria_attr == "aria-selected" and parsed and await _is_single_select_option_highlight(element):
+                # A single-select option's aria-selected="true" is a keyboard highlight, not committed
+                # state, so leave it unreadable and let the physical click commit the selection.
+                return None
+            return parsed
+        return None
+    except Exception:
+        LOG.debug("Failed to read live selected state; continuing with an ordinary click", element_id=element.get_id())
+        return None
+
+
+async def _get_associated_checkbox_label_locator(element: SkyvernElement) -> Locator | None:
+    ancestor_label_locator = element.get_locator().locator("xpath=ancestor::label[1]")
+    if await ancestor_label_locator.count() > 0:
+        return ancestor_label_locator
+
+    input_id = await element.get_attr("id", mode="dynamic")
+    if not input_id:
+        return None
+
+    explicit_label_locator = element.get_frame().locator(f"label[for={json.dumps(input_id)}]")
+    if await explicit_label_locator.count() > 0:
+        return explicit_label_locator.first
+
+    return None
+
+
+async def _set_native_checkbox_state(element: SkyvernElement, should_check: bool) -> bool:
+    """Drive a native checkbox/radio input to ``should_check`` and report whether the final state
+    matches. Sets through the input, falling back to a visible associated label when the input is
+    hidden/non-actionable (skipping a label that forwards its click to an interactive descendant)."""
+    locator = element.get_locator()
+    try:
+        if await locator.is_checked(timeout=settings.BROWSER_ACTION_TIMEOUT_MS) == should_check:
+            return True
+    except Exception:
+        # Keep moving: check()/uncheck() are state-setting operations for actionable inputs,
+        # and the label fallback below verifies the final state for hidden inputs.
+        LOG.warning("Failed to read checkbox state before setting it", element_id=element.get_id(), exc_info=True)
+
+    try:
+        if should_check:
+            await element.check()
+        else:
+            await element.uncheck()
+        return True
+    except Exception:
+        LOG.warning(
+            "Failed to set checkbox state through input, trying associated label",
+            element_id=element.get_id(),
+            should_check=should_check,
+            exc_info=True,
+        )
+
+    label_locator = await _get_associated_checkbox_label_locator(element)
+    if label_locator is None:
+        return False
+
+    try:
+        if not await label_locator.is_visible():
+            return False
+        if await SkyvernElement._label_click_forwards_to_descendant(label_locator, fail_closed=True):
+            LOG.warning(
+                "Associated checkbox label contains an interactive descendant",
+                element_id=element.get_id(),
+                should_check=should_check,
+            )
+            return False
+        await label_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        return await locator.is_checked(timeout=settings.BROWSER_ACTION_TIMEOUT_MS) == should_check
+    except Exception:
+        LOG.warning(
+            "Failed to set checkbox state through associated label",
+            element_id=element.get_id(),
+            should_check=should_check,
+            exc_info=True,
+        )
+        return False
+
+
+_LABEL_CONTROL_STATE_JS = r"""
+(el) => {
+    const control = el.control;
+    if (!control) return null;
+    if (!el.hasAttribute("for")) {
+        const controls = Array.from(
+            el.querySelectorAll("button, input, meter, output, progress, select, textarea")
+        ).filter((c) => !(c instanceof HTMLInputElement && c.type === "hidden"));
+        if (controls.length !== 1 || control !== controls[0]) return null;
+    }
+    if (control instanceof HTMLInputElement && (control.type === "checkbox" || control.type === "radio")) {
+        return control.checked;
+    }
+    return null;
+}
+"""
+
+
+async def _read_label_control_state(label: SkyvernElement) -> bool | None:
+    """Read the live checked state of a label's bound control the way browser label activation
+    resolves it, via the browser's own ``HTMLLabelElement.control``. For an explicit ``for=`` label
+    the id-referenced labelable element is used directly (a for= label never falls back to
+    descendants); for an implicit label the single labelable descendant at any depth or visibility
+    (no scraped-interactability filter) is cross-checked against ``el.control``. Returns None -- fall
+    open -- when no control resolves, when an implicit label has zero or several labelable descendants
+    or the browser disagrees with the unique candidate, when the control is not a native
+    checkbox/radio, or when the read fails. State is read in-page rather than via a mapped
+    SkyvernElement because a display:none control is never scraped and has no unique_id."""
+    try:
+        state = await _evaluate_element_scoped(label, _LABEL_CONTROL_STATE_JS)
+    except Exception:
+        LOG.debug(
+            "Failed to read label control state; continuing with an ordinary click",
+            element_id=label.get_id(),
+        )
+        return None
+    return state if isinstance(state, bool) else None
+
+
+async def _resolve_effective_click_state(element: SkyvernElement, dom: DomUtil) -> bool | None:
+    """Live selected/checked state of the control a click on ``element`` actually toggles: the
+    element's own observable, or, for a <label>, its spec-bound control (mapped explicit for=
+    control first, else the in-page label.control read). None = unreadable; callers fall open."""
+    if element.get_tag_name() != "label":
+        return await _resolve_live_selected_state(element)
+    control = await element.find_label_for(dom)
+    if control is not None:
+        return await _resolve_live_selected_state(control)
+    return await _read_label_control_state(element)
+
+
+async def _apply_label_desired_click_state(
+    action: actions.ClickAction, label: SkyvernElement, desired_state: bool, dom: DomUtil
+) -> list[ActionResult] | None:
+    """A <label> click forwards activation to its spec-bound control, so observe that control's
+    live state rather than the label's (labels carry no checked/selected observable). Suppress the
+    redundant click when the bound control already holds the desired state; on a mismatch, or when
+    no bound control resolves or its state is unreadable, fall through to a single ordinary label
+    click, whose forwarding performs the one toggle. The control is resolved deterministically via
+    the spec-defined association (explicit for=-id, else the wrapped labelable descendant read
+    in-page); state is never driven through the label."""
+    control_state = await _resolve_effective_click_state(label, dom)
+    if control_state is None:
+        LOG.info("Label click has no readable bound-control state, continuing the normal click", action=action)
+        return None
+    if control_state == desired_state:
+        LOG.info(
+            "Label's bound control already in the desired state, suppressing the redundant click",
+            action=action,
+            desired_state=desired_state,
+        )
+        return [ActionAbort()]
+    LOG.info(
+        "Label's bound control differs from the desired state, continuing with a single normal click",
+        action=action,
+        desired_state=desired_state,
+    )
+    return None
+
+
+async def _apply_desired_click_state(
+    action: actions.ClickAction, element: SkyvernElement, desired_state: bool, dom: DomUtil
+) -> list[ActionResult] | None:
+    """Drive a selectable control to an explicit terminal state idempotently. Returns
+    [ActionAbort()] to suppress the physical click -- when the control already matches the desired
+    state, or after a native checkbox/radio is set here -- or None to fall through to a single
+    ordinary click when the live state is unreadable (fail open) or a custom control must be clicked
+    once to change. Never converts an explicit desired_state=False into a check."""
+    if element.get_tag_name() == "label":
+        return await _apply_label_desired_click_state(action, element, desired_state, dom)
+    live_state = await _resolve_live_selected_state(element)
+    if live_state is None:
+        LOG.info("No readable selected state, continuing the normal click", action=action)
+        return None
+    if live_state == desired_state:
+        LOG.info(
+            "Control already in the desired state, suppressing the redundant click",
+            action=action,
+            desired_state=desired_state,
+        )
+        return [ActionAbort()]
+    if element.get_tag_name() == "input":
+        input_type = (await element.get_attr("type") or "").strip().casefold()
+        if input_type == "radio" and not desired_state:
+            # A radio can't be turned off by clicking it -- only selecting another radio in the
+            # group clears it -- so skip the doomed uncheck() and let a single ordinary click run.
+            LOG.info("A radio can't be unchecked in place, continuing with a single normal click", action=action)
+            return None
+        LOG.info("Setting the native control to the desired state", action=action, desired_state=desired_state)
+        if await _set_native_checkbox_state(element, should_check=desired_state):
+            return [ActionAbort()]
+        LOG.warning("Failed to set the native control to the desired state, continuing the normal click", action=action)
+        return None
+    LOG.info(
+        "Custom control differs from the desired state, continuing with a single normal click",
+        action=action,
+        desired_state=desired_state,
+    )
+    return None
+
+
 @traced(name="skyvern.agent.action.click")
 async def handle_click_action(
     action: actions.ClickAction,
@@ -4611,6 +4864,17 @@ async def handle_click_action(
     # Wait after getting element to allow any dynamic changes
     await asyncio.sleep(get_wait_time(wait_config, "post_click_delay", default=0.3))
 
+    # Level-triggered toggle intent (ClickContext.desired_state) is resolved here, with the live
+    # element in hand and before any physical click: suppress a redundant click when the control
+    # already holds the desired state, drive a native checkbox/radio to it, or fall through to a
+    # single ordinary click for a custom-control mismatch or an unreadable state.
+    if action.click_context is not None and action.click_context.desired_state is not None:
+        desired_state_result = await _apply_desired_click_state(
+            action, skyvern_element, action.click_context.desired_state, dom
+        )
+        if desired_state_result is not None:
+            return desired_state_result
+
     # dynamically validate the attr, since it could change into enabled after the previous actions
     if await skyvern_element.is_disabled(dynamic=True):
         child = await _retarget_disabled_element_for_click(
@@ -4620,6 +4884,15 @@ async def handle_click_action(
         )
         if child is not None:
             skyvern_element = child
+            # Retarget moved the click to the descendant that will actually receive it, so re-run
+            # the same guard on the child: the pre-retarget pass observed the (unreadable) wrapper
+            # and fell open, and without this the retargeted child could still be re-toggled.
+            if action.click_context is not None and action.click_context.desired_state is not None:
+                desired_state_result = await _apply_desired_click_state(
+                    action, skyvern_element, action.click_context.desired_state, dom
+                )
+                if desired_state_result is not None:
+                    return desired_state_result
         elif not await SkyvernElement.wait_until_enabled(skyvern_element):
             LOG.warning(
                 "Try to click on a disabled element",
