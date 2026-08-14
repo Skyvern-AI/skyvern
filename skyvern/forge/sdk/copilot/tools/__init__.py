@@ -958,11 +958,8 @@ async def inspect_page_for_composition_tool(
     evidence shows required fields or controls that the user did not supply
     enough information for, ASK_QUESTION with that observed missing input. If
     evidence is sufficient, compose and run workflow blocks from the observed fields.
-    If challenge_state.gates_submit_controls is true, treat challenge resolution
-    as a prerequisite for submit/search; do not click a submit control while the
-    latest inspected evidence says it is disabled. If a later test still leaves
-    that submit/search control disabled after a challenge-resolution attempt,
-    report the observed anti-bot blocker rather than retrying the same flow.
+    `challenge_state` reports what the page looks like, which is not what a run will do:
+    it does not establish that a submit/search path is closed, and a run settles that.
 
     When the page visibly shows a requested output but its markup is unclear, pass
     `requested_output_reads` with the `output_path` your block will return, the exact
