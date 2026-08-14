@@ -50,7 +50,6 @@ from skyvern.forge.sdk.copilot.secret_redaction import (
     contains_email_password_pair,
     redact_raw_secrets_for_prompt,
 )
-from skyvern.forge.sdk.copilot.signin_email import is_email_address
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     URL_CANDIDATE_RE,
@@ -86,7 +85,6 @@ _CLASSIFICATION_RESPONSE_FIELDS = {
     "credential_input_kind",
     "credential_refs",
     "login_page_urls",
-    "login_intent",
     "requires_user_clarification",
     "completion_contract",
     "completion_criteria",
@@ -111,7 +109,6 @@ ClarificationReason = Literal[
     "missing_target_context",
     "workflow_credential_inputs_unbound",
     "login_credentials_unresolved",
-    "signin_email_unresolved",
     "safety_screen_unavailable",
 ]
 RawSecretHandling = Literal["none", "block", "redacted_draft"]
@@ -347,7 +344,7 @@ _VALID_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(get_arg
 # Only deterministic post-resolution code may mint these; a classifier emission would
 # skip the concrete-target and credential-reachability checks the reason stands for.
 _DETERMINISTIC_ONLY_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(
-    {"login_credentials_unresolved", "signin_email_unresolved", "safety_screen_unavailable"}
+    {"login_credentials_unresolved", "safety_screen_unavailable"}
 )
 # Concrete credential states for which the combined update-and-run tool persists
 # the draft but cannot start a browser run.
@@ -788,13 +785,6 @@ class RequestPolicy:
     credential_input_kind: str = "none"
     credential_refs: list[str] = field(default_factory=list)
     login_page_urls: list[str] = field(default_factory=list)
-    login_intent: bool = False
-    # Sign-in that identifies the user by email address instead of a stored password, so
-    # resolving *which address* is the whole credential question — there is no password to find.
-    email_signin_intent: bool = False
-    signin_email_candidates: list[str] = field(default_factory=list)
-    resolved_signin_email: str | None = None
-    resolved_signin_host: str | None = None
     requires_user_clarification: bool = False
     allow_update_workflow: bool = True
     allow_run_blocks: bool = True
@@ -869,9 +859,6 @@ class RequestPolicy:
             "testing_intent": self.testing_intent,
             "authoring_intent": self.authoring_intent,
             "credential_input_kind": self.credential_input_kind,
-            "login_intent": self.login_intent,
-            "email_signin_intent": self.email_signin_intent,
-            "signin_email_resolved": bool(self.resolved_signin_email),
             "clarification_reason": self.clarification_reason,
             "allow_update_workflow": self.allow_update_workflow,
             "allow_run_blocks": self.allow_run_blocks,
@@ -979,8 +966,6 @@ class RequestPolicy:
         ]
         if self.raw_secret_detected:
             lines.append(f"raw_secret_detected: {self.raw_secret_detected}")
-        if self.resolved_signin_email:
-            lines.append(f"resolved_signin_email: {self.resolved_signin_email}")
         validation_classification_criteria = [
             criterion
             for criterion in self.graded_completion_criteria()
@@ -1258,10 +1243,6 @@ def build_transcript_context(
 
 def _clean_list(values: list[Any]) -> list[str]:
     return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
-
-
-def _clean_email_list(values: list[Any]) -> list[str]:
-    return [value for value in _clean_list(values) if is_email_address(value)]
 
 
 def _credential_ids(text: str) -> list[str]:
@@ -2603,9 +2584,6 @@ def _classification_from_raw(
         credential_input_kind=credential_input_kind if credential_input_kind in _KINDS else "none",
         credential_refs=_clean_list(raw.get("credential_refs") or []),
         login_page_urls=_clean_list(raw.get("login_page_urls") or []),
-        login_intent=bool(raw.get("login_intent")),
-        email_signin_intent=bool(raw.get("email_signin_intent")),
-        signin_email_candidates=_clean_email_list(raw.get("signin_email_candidates") or []),
         requires_user_clarification=bool(raw.get("requires_user_clarification")),
         completion_contract=completion_contract or None,
         completion_criteria=completion_criteria,
@@ -4008,10 +3986,6 @@ def credential_candidate_label(credential: Credential) -> str:
     return f"{credential.name} (`{credential.credential_id}`)"
 
 
-def _is_passwordless_email_signin(policy: RequestPolicy) -> bool:
-    return policy.login_intent and policy.email_signin_intent
-
-
 def _ground_user_provided_sites(
     policy: RequestPolicy,
     user_message: str,
@@ -4149,21 +4123,6 @@ async def _resolve_live_page_credentials(
     """Ask the live page which saved credentials it vouches for, or None when a precondition declines."""
     if not live_page_credentials_admissible(policy) or not page_url:
         return None
-    if _is_passwordless_email_signin(policy):
-        # Turn-start resolution excludes this shape from every URL tier because a site that signs in
-        # by emailed link has no password question to put to the user, so admitting one here would
-        # fill a password the user said the account does not have.
-        if _live_page_log_allowed(policy, page_url, seam, "passwordless_declined"):
-            LOG.info(
-                "copilot credential live-page admission",
-                outcome="passwordless_declined",
-                seam=seam,
-                organization_id=organization_id,
-                credential_id=credential_id,
-                page_url=loggable_origin(page_url),
-            )
-        return None
-
     return resolve_by_url(
         await (load_org_credentials() if load_org_credentials else _load_credentials(organization_id)),
         [page_url],
