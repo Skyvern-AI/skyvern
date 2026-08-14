@@ -837,6 +837,9 @@ class RequestPolicy:
     user_site_url_sources: dict[str, int] = field(default_factory=dict)
     credential_ask_candidate_ids: list[str] = field(default_factory=list)
     existing_workflow_credential_ids: list[str] = field(default_factory=list)
+    # Read from the saved workflow row, never from the submitted YAML. The submission is the live
+    # canvas, which carries a copilot proposal the user has not accepted, so it cannot grant a run.
+    persisted_workflow_credential_ids: list[str] = field(default_factory=list)
     # Sorted at the trace/JSON boundary; YAML traversal uses sets.
     existing_workflow_credential_origins: dict[str, list[str]] = field(default_factory=dict)
     classifier_status: str = "not_run"
@@ -4388,6 +4391,7 @@ async def _build_request_policy_bootstrap(
     global_llm_context: str,
     organization_id: str,
     prior_user_messages: Sequence[WorkflowCopilotChatHistoryMessage] = (),
+    persisted_workflow_yaml: str | None = None,
     _preclassified_policy: RequestPolicy | None = None,
 ) -> RequestPolicy:
     """Build the deterministic request safety record without model-backed policy inference."""
@@ -4403,6 +4407,7 @@ async def _build_request_policy_bootstrap(
         completion_contract_status="absent",
         canonical_user_message=(redact_raw_secrets_for_prompt(user_message) if raw_secret_present else user_message),
     )
+    policy.persisted_workflow_credential_ids = sorted(workflow_credential_ids(persisted_workflow_yaml or ""))
     policy.existing_workflow_credential_ids = sorted(workflow_credential_ids(workflow_yaml))
     policy.existing_workflow_credential_origins = {
         credential_id: sorted(origins) for credential_id, origins in workflow_credential_origins(workflow_yaml).items()
@@ -4479,6 +4484,7 @@ async def build_request_policy_trust_floor(
     handler: LLMAPIHandler | None,
     config: CopilotConfig | None = None,
     prior_user_messages: Sequence[WorkflowCopilotChatHistoryMessage] = (),
+    persisted_workflow_yaml: str | None = None,
 ) -> RequestPolicy:
     del config
     safety = await _screen_raw_secret_safety(user_message, handler, organization_id=organization_id)
@@ -4516,6 +4522,7 @@ async def build_request_policy_trust_floor(
         global_llm_context=global_llm_context,
         organization_id=organization_id,
         prior_user_messages=prior_user_messages,
+        persisted_workflow_yaml=persisted_workflow_yaml,
         _preclassified_policy=policy,
     )
     LOG.info(

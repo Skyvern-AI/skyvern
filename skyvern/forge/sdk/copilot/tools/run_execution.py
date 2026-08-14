@@ -1607,12 +1607,10 @@ async def _run_blocks_and_collect_debug(
             tool_credential_ids + _extract_credential_ids_from_workflow_definition(workflow.workflow_definition)
         )
     )
-    approval_credential_ids = list(
-        dict.fromkeys(
-            tool_credential_ids
-            + _extract_credential_ids_for_labels(workflow.workflow_definition, labels_that_may_execute)
-        )
+    definition_credential_ids = _extract_credential_ids_for_labels(
+        workflow.workflow_definition, labels_that_may_execute
     )
+    approval_credential_ids = list(dict.fromkeys(tool_credential_ids + definition_credential_ids))
     credential_approval_error = _credential_run_approval_error(
         approval_credential_ids,
         getattr(ctx, "request_policy", None),

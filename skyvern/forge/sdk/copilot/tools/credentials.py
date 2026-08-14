@@ -18,6 +18,7 @@ from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     block_credential_ids,
     credential_param_ids,
+    saved_credential_ids,
     workflow_blocks,
 )
 from skyvern.forge.sdk.schemas.credentials import Credential
@@ -226,14 +227,22 @@ def _unapproved_credential_reference_tool_error(unapproved_credential_ids: list[
     )
 
 
+def _saved_workflow_credential_ids(request_policy: RequestPolicy) -> set[str]:
+    # Read from the saved workflow row at turn start. Deliberately not the submitted YAML: that is the
+    # live canvas, which carries a copilot proposal until the user accepts or rejects it, so a binding
+    # the model staged would come back as authority on the next turn.
+    return saved_credential_ids(request_policy.persisted_workflow_credential_ids)
+
+
 def _approved_run_credential_ids(request_policy: RequestPolicy | None) -> set[str]:
     if request_policy is None:
         return set()
-    return {
+    resolved = {
         credential.credential_id
         for credential in request_policy.resolved_credentials
         if isinstance(getattr(credential, "credential_id", None), str)
     }
+    return resolved | _saved_workflow_credential_ids(request_policy)
 
 
 def _credential_run_approval_error(credential_ids: list[str], request_policy: RequestPolicy | None) -> str | None:

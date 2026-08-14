@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     block_credential_ids,
     credential_param_ids,
     parse_workflow_yaml,
+    saved_credential_ids,
     url_origin,
     workflow_blocks,
     workflow_credential_ids_from_parsed,
@@ -853,12 +854,7 @@ def _allowed_unresolved_credential_ids(request_policy: RequestPolicy) -> set[str
 
 
 def _existing_workflow_credential_ids(request_policy: RequestPolicy) -> set[str]:
-    # Saved credential IDs are issued with the cred_ prefix; skip anything else defensively.
-    return {
-        credential_id
-        for credential_id in request_policy.existing_workflow_credential_ids
-        if isinstance(credential_id, str) and credential_id.startswith("cred_")
-    }
+    return saved_credential_ids(request_policy.existing_workflow_credential_ids)
 
 
 def _existing_workflow_broadens_credential_scope(

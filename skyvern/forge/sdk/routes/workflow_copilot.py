@@ -1622,6 +1622,20 @@ def _strip_runtime_block_fields(block: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
+def _run_grant_workflow_yaml(workflow: Workflow | None) -> str | None:
+    """The YAML the pre-dispatch credential gate may grant a run from.
+
+    Derived only from the stored workflow row. The submitted YAML is the live canvas and carries
+    copilot proposals the user has not accepted, so it must never reach this value.
+    """
+    if workflow is None:
+        return None
+    definition = workflow.workflow_definition
+    if definition is None or not definition.blocks:
+        return None
+    return _workflow_to_copilot_yaml(workflow)
+
+
 def _workflow_to_copilot_yaml(workflow: Workflow) -> str:
     workflow_data = workflow.model_dump(mode="json", exclude_none=True)
     workflow_definition = deepcopy(workflow_data.get("workflow_definition") or {})
@@ -1938,10 +1952,7 @@ async def _new_copilot_chat_post(
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow not found")
 
             chat_request.workflow_id = original_workflow.workflow_id
-            persisted_workflow_yaml: str | None = None
-            persisted_definition = original_workflow.workflow_definition
-            if persisted_definition is not None and persisted_definition.blocks:
-                persisted_workflow_yaml = _workflow_to_copilot_yaml(original_workflow)
+            persisted_workflow_yaml = _run_grant_workflow_yaml(original_workflow)
 
             _ensure_copilot_workflow_yaml(
                 chat_request,
@@ -2072,6 +2083,7 @@ async def _new_copilot_chat_post(
                     stored_completion_criteria=None,
                     prior_turn_outcome=prior_turn_outcome,
                     persist_canonical_user_message=persist_canonical_user_message,
+                    persisted_workflow_yaml=persisted_workflow_yaml,
                 )
 
             agent_result.turn_outcome = _with_current_copilot_code_mode_metadata(
