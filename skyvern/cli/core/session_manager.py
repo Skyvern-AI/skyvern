@@ -42,12 +42,11 @@ class ObserveV2State:
     host_budgets: dict[str, int] = field(default_factory=dict)
 
     def reset_refs(self) -> None:
-        """Clear per-document ref data while preserving host budgets across navigation."""
+        """Clear per-document refs while preserving monotonic ref IDs and host budgets."""
         self.page_key = None
         self.document_id = None
         self.params = {}
         self.refs = {}
-        self.next_ref = 0
 
 
 @dataclass
@@ -156,6 +155,18 @@ def _generation_for(key: tuple[str | None, str, str, str | None]) -> int:
     return generation
 
 
+def _advance_generation_for(key: tuple[str | None, str, str, str | None]) -> int:
+    generation = next(_session_ref_generation_counter)
+    # Pop-then-reinsert: an advance is activity, so it must LRU-touch the key -
+    # FIFO eviction would drop the longest-lived (often busiest) session and a
+    # freshly minted generation would break its in-flight reservation.
+    _session_ref_generations.pop(key, None)
+    _session_ref_generations[key] = generation
+    while len(_session_ref_generations) > _SESSION_REF_STORE_MAX:
+        _session_ref_generations.pop(next(iter(_session_ref_generations)))
+    return generation
+
+
 def _session_ref_key(
     state: SessionState,
     *,
@@ -210,6 +221,38 @@ def session_ref_generation(
     return state._observed_refs_generation
 
 
+def begin_session_ref_publication(
+    *,
+    session_id: str | None = None,
+    cdp_url: str | None = None,
+) -> int:
+    """Reserve a unique generation for one in-flight ref publication."""
+    state = get_current_session()
+    if key := _session_ref_key(state, session_id=session_id, cdp_url=cdp_url):
+        return _advance_generation_for(key)
+    state._observed_refs_generation = next(_session_ref_generation_counter)
+    return state._observed_refs_generation
+
+
+def invalidate_session_ref_map(
+    *,
+    session_id: str | None = None,
+    cdp_url: str | None = None,
+) -> int:
+    """Invalidate published refs while retaining v2 budgets and monotonic ref IDs."""
+    state = get_current_session()
+    if key := _session_ref_key(state, session_id=session_id, cdp_url=cdp_url):
+        _session_ref_maps.pop(key, None)
+        observe_state = _observe_v2_states.get(key)
+        if observe_state is not None:
+            observe_state.reset_refs()
+        return _advance_generation_for(key)
+    state._observed_refs = {}
+    state._observe_v2_state.reset_refs()
+    state._observed_refs_generation = next(_session_ref_generation_counter)
+    return state._observed_refs_generation
+
+
 def replace_session_ref_map(
     ref_map: dict[str, dict[str, Any]],
     *,
@@ -217,12 +260,19 @@ def replace_session_ref_map(
     cdp_url: str | None = None,
     generation: int | None = None,
     page_key: tuple[int, int | None, str, str | None] | None = None,
+    advance_on_commit: bool = True,
 ) -> bool:
     """Replace the session's ref snapshot (never merge). Returns False if discarded.
 
-    When ``generation`` is given, the snapshot is discarded if the registry was
-    cleared after that generation was captured — the observe raced a navigation
-    or context switch and describes a replaced document.
+    A supplied generation is a publication reservation. The snapshot is discarded
+    if a newer operation has reserved or invalidated the registry; an accepted
+    commit advances the generation so work captured before the commit cannot
+    mutate the published snapshot afterward.
+
+    Legacy (pre-v2) publications pass ``advance_on_commit=False``: their generation
+    is a plain read, so the CAS refuses snapshots that raced an invalidation
+    (navigation/clear) while overlapping publications keep last-completer-wins -
+    exactly the pre-reservation contract.
     """
     state = get_current_session()
     snapshot: dict[str, Any] = {"page_key": page_key, "refs": dict(ref_map)}
@@ -232,10 +282,14 @@ def replace_session_ref_map(
         _session_ref_maps[key] = snapshot
         while len(_session_ref_maps) > _SESSION_REF_STORE_MAX:
             _session_ref_maps.pop(next(iter(_session_ref_maps)))
+        if advance_on_commit:
+            _advance_generation_for(key)
     else:
         if generation is not None and generation != state._observed_refs_generation:
             return False
         state._observed_refs = snapshot
+        if advance_on_commit:
+            state._observed_refs_generation = next(_session_ref_generation_counter)
     return True
 
 
@@ -269,9 +323,13 @@ def clear_session_ref_map(
     *,
     session_id: str | None = None,
     cdp_url: str | None = None,
-) -> None:
+    generation: int | None = None,
+) -> bool:
+    """Clear refs, unless a newer publication reservation superseded this caller."""
     state = get_current_session()
     if key := _session_ref_key(state, session_id=session_id, cdp_url=cdp_url):
+        if generation is not None and generation != _generation_for(key):
+            return False
         _session_ref_maps.pop(key, None)
         observe_state = _observe_v2_states.pop(key, None)
         if observe_state is None:
@@ -281,13 +339,17 @@ def clear_session_ref_map(
         _observe_v2_states[key] = observe_state
         while len(_observe_v2_states) > _SESSION_REF_STORE_MAX:
             _observe_v2_states.pop(next(iter(_observe_v2_states)))
-        _session_ref_generations[key] = next(_session_ref_generation_counter)
-        while len(_session_ref_generations) > _SESSION_REF_STORE_MAX:
-            _session_ref_generations.pop(next(iter(_session_ref_generations)))
+        _advance_generation_for(key)
     else:
+        if generation is not None and generation != session_ref_generation(
+            session_id=session_id,
+            cdp_url=cdp_url,
+        ):
+            return False
         state._observed_refs = {}
         state._observe_v2_state.reset_refs()
         state._observed_refs_generation = next(_session_ref_generation_counter)
+    return True
 
 
 def register_copilot_session(session_id: str, state: SessionState, *, organization_id: str) -> None:

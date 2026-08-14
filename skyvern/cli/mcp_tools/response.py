@@ -31,6 +31,7 @@ LOG = structlog.get_logger(__name__)
 # the MCP envelope (jsonrpc wrapper, content-block metadata) that the FastMCP
 # serializer adds on top of our dict.
 MCP_MAX_RESPONSE_CHARS = 140_000
+MCP_MAX_RESPONSE_BYTES = 140_000
 
 # When truncation envelope wraps an oversize payload, preserve identifier-like
 # keys (`*_id`) from the original dict so the caller retains enough context to
@@ -51,6 +52,10 @@ _TRUNCATION_HINT = (
     "Response exceeded the ~150k-char Claude tool-result limit. "
     "Narrow the query (add filters, reduce page size, request specific fields) or paginate."
 )
+_TRUNCATION_BYTE_HINT = (
+    "Response exceeded the 140k-byte aggregate MCP response limit. "
+    "Narrow the query (add filters, reduce page size, request specific fields) or paginate."
+)
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -66,6 +71,14 @@ def _response_size(data: Any) -> int:
     """
     try:
         return len(json.dumps(data, ensure_ascii=False, default=str))
+    except (TypeError, ValueError):
+        return sys.maxsize
+
+
+def _response_size_bytes(data: Any) -> int:
+    """Return the UTF-8 byte length of the JSON-serialized response."""
+    try:
+        return len(json.dumps(data, ensure_ascii=False, default=str).encode())
     except (TypeError, ValueError):
         return sys.maxsize
 
@@ -128,43 +141,25 @@ def _preserved_screenshot_artifact(value: Any) -> dict[str, Any] | None:
     return None
 
 
-def truncate_response(data: Any, *, max_chars: int = MCP_MAX_RESPONSE_CHARS) -> Any:
-    """Return `data` unchanged if under `max_chars`; otherwise wrap in a truncation envelope.
-
-    Envelope shape (explicit so the model cannot miss truncation):
-        {
-          "_truncated": True,
-          "_original_chars": <serialized size>,
-          "_max_chars": <limit>,
-          "_hint": "...",
-          "ok": <original "ok" if present>,
-          "error": <original "error" if present, bounded to 2k chars>,
-          "<key>_id": <preserved identifier field if present>,
-          ...
-        }
-
-    Non-dict responses that overflow are wrapped too (rare, but possible if a
-    tool returns a list or string). From dict payloads, top-level keys
-    `ok`/`error` plus any `*_id` identifier fields (bounded to 10 keys of up to
-    256 chars each) are preserved; the oversized data is otherwise dropped.
-    Identifier preservation keeps workflow/run/session IDs in the envelope so
-    the caller can re-query or paginate without losing its place.
-
-    Contract: the returned payload is always `<= max_chars` when serialized.
-    Pathological inputs (e.g. a `error` field containing a full stack trace or
-    HTML dump larger than the cap) are defended against by (a) capping `error`
-    at `_MAX_PRESERVED_ERROR_CHARS` and (b) a final re-measure that falls back
-    to a metadata-only envelope if the assembled payload is still over.
-    """
-    size = _response_size(data)
-    if size <= max_chars:
+def _truncate_response_to_limit(
+    data: Any,
+    *,
+    size_fn: Callable[[Any], int],
+    max_size: int,
+    unit: str,
+    hint: str,
+) -> Any:
+    size = size_fn(data)
+    if size <= max_size:
         return data
 
+    original_key = f"_original_{unit}"
+    max_key = f"_max_{unit}"
     envelope: dict[str, Any] = {
         "_truncated": True,
-        "_original_chars": size,
-        "_max_chars": max_chars,
-        "_hint": _TRUNCATION_HINT,
+        original_key: size,
+        max_key: max_size,
+        "_hint": hint,
     }
     if isinstance(data, dict):
         if "ok" in data:
@@ -197,19 +192,37 @@ def truncate_response(data: Any, *, max_chars: int = MCP_MAX_RESPONSE_CHARS) -> 
                 "hint": "Use the saved screenshot artifact path, or retry with inline=false.",
             }
 
-    # Final safety net: if the preserved fields combined still blow past the
-    # cap (extremely unlikely given the per-field caps above, but possible if
-    # a caller passes a tiny `max_chars`), drop them and emit a metadata-only
-    # envelope. Guarantees the module's "always under max_chars" contract.
-    if _response_size(envelope) > max_chars:
+    if size_fn(envelope) > max_size:
         return {
             "_truncated": True,
-            "_original_chars": size,
-            "_max_chars": max_chars,
-            "_hint": _TRUNCATION_HINT,
+            original_key: size,
+            max_key: max_size,
+            "_hint": hint,
             "_envelope_rewrapped": True,
         }
     return envelope
+
+
+def truncate_response(data: Any, *, max_chars: int = MCP_MAX_RESPONSE_CHARS) -> Any:
+    """Cap a response by JSON-serialized characters, preserving the existing envelope contract."""
+    return _truncate_response_to_limit(
+        data,
+        size_fn=_response_size,
+        max_size=max_chars,
+        unit="chars",
+        hint=_TRUNCATION_HINT,
+    )
+
+
+def truncate_response_bytes(data: Any, *, max_bytes: int = MCP_MAX_RESPONSE_BYTES) -> Any:
+    """Cap a response by aggregate UTF-8 JSON bytes."""
+    return _truncate_response_to_limit(
+        data,
+        size_fn=_response_size_bytes,
+        max_size=max_bytes,
+        unit="bytes",
+        hint=_TRUNCATION_BYTE_HINT,
+    )
 
 
 def size_capped(fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[Any]]:
@@ -244,7 +257,9 @@ def size_capped(fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[Any]]:
 
 
 __all__ = [
+    "MCP_MAX_RESPONSE_BYTES",
     "MCP_MAX_RESPONSE_CHARS",
     "size_capped",
     "truncate_response",
+    "truncate_response_bytes",
 ]
