@@ -68,11 +68,23 @@ def test_coerce_scopes_accepts_strings_and_iterables() -> None:
 def test_google_oauth_scope_profiles_are_exact() -> None:
     assert google_oauth_service.GOOGLE_SHEETS_SCOPES == (
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.file",
         "https://www.googleapis.com/auth/drive.metadata.readonly",
     )
     assert google_oauth_service.GOOGLE_GMAIL_SCOPES == ("https://www.googleapis.com/auth/gmail.readonly",)
     assert google_oauth_service.GOOGLE_DRIVE_SCOPES == ("https://www.googleapis.com/auth/drive",)
+
+
+def test_sheets_credentials_granted_drive_file_still_satisfy_the_sheets_profile() -> None:
+    """Credentials consented before drive.file left the profile must keep working without reconsent."""
+    granted_with_drive_file = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/drive.metadata.readonly",
+    ]
+    assert google_oauth_service.has_required_scopes(
+        granted_with_drive_file,
+        google_oauth_service.GOOGLE_SHEETS_SCOPES,
+    )
 
 
 def test_google_drive_scope_profile_uses_full_drive_scope_for_folder_uploads() -> None:
