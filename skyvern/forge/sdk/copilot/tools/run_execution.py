@@ -149,6 +149,7 @@ from .composition_capture import (
 from .credentials import (
     _credential_ids_validation_error,
     _credential_run_approval_error,
+    _extract_credential_ids_for_labels,
     _extract_credential_ids_from_tool_value,
     _extract_credential_ids_from_workflow_definition,
 )
@@ -1602,14 +1603,20 @@ async def _run_blocks_and_collect_debug(
         selected_labels=set(labels_that_may_execute),
     )
 
+    tool_credential_ids = _extract_credential_ids_from_tool_value(params.get("parameters") or {})
     credential_ids = list(
         dict.fromkeys(
-            _extract_credential_ids_from_tool_value(params.get("parameters") or {})
-            + _extract_credential_ids_from_workflow_definition(workflow.workflow_definition)
+            tool_credential_ids + _extract_credential_ids_from_workflow_definition(workflow.workflow_definition)
+        )
+    )
+    approval_credential_ids = list(
+        dict.fromkeys(
+            tool_credential_ids
+            + _extract_credential_ids_for_labels(workflow.workflow_definition, labels_that_may_execute)
         )
     )
     credential_approval_error = _credential_run_approval_error(
-        credential_ids,
+        approval_credential_ids,
         getattr(ctx, "request_policy", None),
     )
     if credential_approval_error is not None:

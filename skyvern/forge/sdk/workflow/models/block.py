@@ -885,44 +885,15 @@ class Block(BaseModel, abc.ABC):
             include_secrets = False
 
         if include_secrets:
-            template_data.update(workflow_run_context.secrets)
-
-            # Create easier-to-access entries for credentials
-            # Look for credential parameters and create real_username/real_password entries
-            # First collect all credential parameters to avoid modifying dict during iteration
-            credential_params = []
-            for key, value in list(template_data.items()):
-                if isinstance(value, dict) and "context" in value:
-                    # PASSWORD credential: has username and password
-                    if "username" in value and "password" in value:
-                        credential_params.append((key, value))
-                    # SECRET credential: has secret_value
-                    elif "secret_value" in value:
-                        credential_params.append((key, value))
-
-            # Now add the real_username/real_password entries
-            for key, value in credential_params:
-                username_secret_id = value.get("username", "")
-                password_secret_id = value.get("password", "")
-
-                # Get the actual values from the secrets
-                real_username = template_data.get(username_secret_id, "")
-                real_password = template_data.get(password_secret_id, "")
-
-                # Add easier-to-access entries
-                template_data[f"{key}_real_username"] = real_username
-                template_data[f"{key}_real_password"] = real_password
-
-                if is_safe_block_for_secrets:
-                    resolved_credential = value.copy()
-                    for credential_field, credential_placeholder in value.items():
-                        if credential_field == "context":
-                            continue
-                        secret_value = workflow_run_context.get_original_secret_value_or_none(credential_placeholder)
-                        if secret_value is not None:
-                            resolved_credential[credential_field] = secret_value
-                    resolved_credential.pop("context", None)
-                    template_data[key] = resolved_credential
+            # parameters is declared per block type, not on the Block base; get_all_parameters
+            # is not a plain accessor (some overrides resolve run context) so read the field.
+            declared_parameters: list[PARAMETER_TYPE] = getattr(self, "parameters", None) or []
+            declared_keys = [parameter.key for parameter in declared_parameters if parameter.key]
+            template_data.update(
+                workflow_run_context.credential_template_entries(
+                    declared_keys, resolve_credential_dicts=is_safe_block_for_secrets
+                )
+            )
 
         if self.label in template_data:
             current_value = template_data[self.label]
@@ -12425,6 +12396,18 @@ class BranchEvaluationContext:
 
         return snapshot
 
+    def _declared_parameter_keys(self) -> list[str]:
+        ctx = self.workflow_run_context
+        workflow = ctx.workflow if ctx is not None else None
+        if workflow is None or workflow.workflow_definition is None:
+            return []
+        for block in get_all_blocks(workflow.workflow_definition.blocks):
+            if block.label == self.block_label:
+                # parameters is declared per block type, not on the Block base
+                parameters = getattr(block, "parameters", None) or []
+                return [parameter.key for parameter in parameters if parameter.key]
+        return []
+
     def build_template_data(self) -> dict[str, Any]:
         """Build Jinja template data mirroring block parameter rendering context."""
         if self.workflow_run_context is None:
@@ -12439,20 +12422,9 @@ class BranchEvaluationContext:
         ctx = self.workflow_run_context
         template_data = ctx.values.copy()
         if ctx.include_secrets_in_templates:
-            template_data.update(ctx.secrets)
-
-            credential_params: list[tuple[str, dict[str, Any]]] = []
-            for key, value in template_data.items():
-                if isinstance(value, dict) and "context" in value and "username" in value and "password" in value:
-                    credential_params.append((key, value))
-
-            for key, value in credential_params:
-                username_secret_id = value.get("username", "")
-                password_secret_id = value.get("password", "")
-                real_username = template_data.get(username_secret_id, "")
-                real_password = template_data.get(password_secret_id, "")
-                template_data[f"{key}_real_username"] = real_username
-                template_data[f"{key}_real_password"] = real_password
+            template_data.update(
+                ctx.credential_template_entries(self._declared_parameter_keys(), resolve_credential_dicts=False)
+            )
 
         if self.block_label:
             block_reference_data: dict[str, Any] = ctx.get_block_metadata(self.block_label)
