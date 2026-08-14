@@ -1114,8 +1114,12 @@ class AgentFunction:
         organization_id: str | None,
         workflow_permanent_id: str | None = None,
         workflow_id: str | None = None,
+        pin_verdict: bool = False,
     ) -> bool:
         """Whether a run containing a CodeBlock should get an auto-provisioned browser session.
+
+        ``pin_verdict`` asks the resolver to freeze an authoritative verdict onto the run, and is
+        for the caller whose routing decision depends on it. OSS has nothing to pin.
 
         The secure CodeBlock runner brokers page operations against a live persistent browser
         session, so a run that has a CodeBlock but no caller-supplied session needs one created
@@ -1123,6 +1127,15 @@ class AgentFunction:
         consult the same env/flag gate as should_use_codeblock_runner.
         """
         return False
+
+    async def pin_secure_runner_verdict(self, *, workflow_run_id: str, enabled: bool) -> None:
+        """Record the secure-runner verdict a run was routed on, so later gates honor it.
+
+        OSS no-op: with no runner there is no routing decision to keep consistent. Cloud overrides
+        to store it on the run, because the publisher and the gates that consume the verdict run in
+        different processes and would otherwise re-resolve a rollout flag that moved in between.
+        """
+        return None
 
     async def execute_code_block_override(
         self,
