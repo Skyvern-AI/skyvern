@@ -17,6 +17,7 @@ def _cred(name: str, credential_id: str, *, tested_url: str | None = None) -> Si
         credential_type=CredentialType.PASSWORD,
         username="user@example.test",
         totp_type=None,
+        totp_identifier=None,
         card_last4=None,
         card_brand=None,
         secret_label=None,

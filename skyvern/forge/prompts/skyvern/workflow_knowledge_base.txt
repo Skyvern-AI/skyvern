@@ -435,6 +435,8 @@ error_code_mapping: {}          # Optional: Custom error codes
 max_retries: 0                  # Optional: Retry attempts
 max_steps_per_run: null         # Optional: Step limit
 parameter_keys: []              # Required: Should include credential parameters
+totp_identifier: <email_addr>   # Optional: Email or phone for inbox-integration OTP (no saved credential required)
+totp_verification_url: <url>    # Optional: URL where the TOTP code must be entered
 complete_criterion: null        # Optional: Completion condition
 terminate_criterion: null       # Optional: Termination condition
 complete_verification: true     # Optional: Verify successful login
@@ -444,10 +446,11 @@ Use Cases:
 - Handle 2FA/TOTP authentication
 - Manage credential-protected workflows
 - Session initialization
+- Passwordless email-code sign-in (using totp_identifier with an active Gmail/Outlook connection)
 
 Important Notes:
-- Credentials should be stored as parameters (credential, bitwarden_login_credential, etc.)
-- TOTP is automatically handled if the credential parameter has TOTP configured
+- **Credential-bound TOTP:** Credentials should be stored as parameters (credential, bitwarden_login_credential, etc.). TOTP is automatically handled if the credential parameter has TOTP configured (totp_type: authenticator/email/text).
+- **Identifier-based TOTP:** For passwordless email-code sign-in, set totp_identifier to the email address and ensure an active Gmail or Outlook connection exists for that mailbox. No saved credential is required. The system will automatically poll the connected mailbox for the verification code.
 
 Example:
 workflow_definition:
@@ -466,6 +469,13 @@ workflow_definition:
       workflow_parameter_type: credential_id
       key: my_credentials
       default_value: "cred_uuid_here"
+
+Login Goal Authoring Guidance for Email-Code Flows:
+
+For passwordless email-code sign-in (using totp_identifier with a connected Gmail/Outlook inbox):
+- **Completion condition:** Anchor to the logged-in state, not the code screen. Set complete_criterion to recognize a post-login page or URL pattern (e.g., "Current URL is 'https://example.com/dashboard' or page contains 'Welcome'"). Do NOT use 'a code field is now visible' or 'user pressed Enter' as a completion condition, as these occur mid-flow.
+- **Code entry as agent action:** The login block automatically detects code fields and enters codes fetched from the connected inbox. Phrase the goal as the agent's own work: "Enter the verification code sent to the email" is sufficient; avoid stating the code fetch itself as a separate user action.
+- **Magic-link alternatives:** If the challenge screen offers "Use another method" or similar, prefer an email-code path over a magic link. Magic links often redirect, and the system may lose sync with the redirect target. An email code, once typed, offers a simple, synchronous path to completion.
 
 ** VALIDATION BLOCK (validation) **
 
