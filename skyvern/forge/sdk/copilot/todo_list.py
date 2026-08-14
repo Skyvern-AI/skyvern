@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from collections.abc import Set as AbstractSet
-from typing import Any
 
 import structlog
 
@@ -20,28 +19,8 @@ def _page_key(url: object) -> str | None:
     return url.strip().split("#", 1)[0].rstrip("/")
 
 
-def _credential_fill_page_keys(ctx: AgentContext) -> set[str] | None:
-    """Pages where a credential fill happened, or None when no fill has happened at all."""
-    keys: set[str] = set()
-    fills = 0
-    entries: list[dict[str, Any]] = [dict(interaction) for interaction in ctx.scout_trajectory]
-    entries.extend(entry for entry in ctx.prior_carried_trajectory if isinstance(entry, dict))
-    for entry in entries:
-        if entry.get("tool_name") != "fill_credential_field":
-            continue
-        fills += 1
-        key = _page_key(entry.get("source_url"))
-        if key:
-            keys.add(key)
-    return keys if fills else None
-
-
 def _interaction_reached_page_keys(ctx: AgentContext) -> set[str]:
-    """Pages reached by actually interacting, not just looking — the only evidence that counts as login progress.
-
-    Heuristic ceiling: any interaction-reached page off the fill page counts, so a non-submit
-    navigation (e.g. a forgot-password link) can suppress the login line without a real login.
-    """
+    """Pages reached by actually interacting, not just looking."""
     keys: set[str] = set()
     for page in ctx.prior_observed_acted_pages:
         if isinstance(page, dict) and page.get("reached_via") == "interaction":
@@ -59,18 +38,6 @@ def _interaction_reached_page_keys(ctx: AgentContext) -> set[str]:
         if key:
             keys.add(key)
     return keys
-
-
-def _login_line(ctx: AgentContext) -> str | None:
-    policy = ctx.request_policy
-    if not isinstance(policy, RequestPolicy) or not policy.login_intent or not policy.resolved_credentials:
-        return None
-    fill_pages = _credential_fill_page_keys(ctx)
-    if fill_pages is None:
-        return "Login: credential resolved but login not yet attempted"
-    if _interaction_reached_page_keys(ctx) - fill_pages:
-        return None
-    return "Login: credential resolved but login not completed (no page reached by interaction yet)"
 
 
 def _minted_criteria(ctx: AgentContext) -> list[CompletionCriterion]:
@@ -155,9 +122,10 @@ def unmet_action_deliverable_criteria(ctx: AgentContext) -> list[CompletionCrite
 
 
 def render_todo_list(ctx: AgentContext) -> str | None:
-    lines = [line for line in (_login_line(ctx), _outputs_line(ctx)) if line]
-    if not lines:
+    outputs = _outputs_line(ctx)
+    if not outputs:
         return None
+    lines = [outputs]
     interactions = _interactions_line(ctx)
     if interactions:
         lines.append(interactions)

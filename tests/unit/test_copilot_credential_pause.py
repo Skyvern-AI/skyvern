@@ -1523,7 +1523,6 @@ def test_credential_pause_resolution_defaults_credential_to_none() -> None:
 def _blocked_login_policy() -> RequestPolicy:
     """A policy shaped the way build_request_policy leaves an unresolved login ask."""
     return RequestPolicy(
-        login_intent=True,
         clarification_reason="login_credentials_unresolved",
         clarification_question="Connect a saved credential to sign in.",
         requires_user_clarification=True,
@@ -1552,7 +1551,7 @@ def test_reason_fires_on_unresolved_login_credentials() -> None:
 
 def test_reason_does_not_fire_for_a_login_ask_that_resolved_to_a_credential() -> None:
     ctx = make_copilot_context()
-    ctx.request_policy = RequestPolicy(login_intent=True, clarification_reason="none")
+    ctx.request_policy = RequestPolicy(clarification_reason="none")
 
     assert credential_pause_module.credential_pause_reason(ctx) is None
 
@@ -1566,7 +1565,6 @@ def _card_answerable_policy(
 ) -> RequestPolicy:
     """A disambiguation ask the credential card can answer: a different reason to the login ask."""
     return RequestPolicy(
-        login_intent=True,
         clarification_reason=clarification_reason,
         clarification_question=clarification_question,
         requires_user_clarification=True,

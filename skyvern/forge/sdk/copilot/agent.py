@@ -82,7 +82,6 @@ from skyvern.forge.sdk.copilot.context import (
     finalize_observation_context,
     parsed_ask_refs,
     record_approved_credentials_in_global_llm_context,
-    record_signin_email_in_global_llm_context,
     sanitize_global_llm_context_for_prompt,
 )
 from skyvern.forge.sdk.copilot.credential_pause import credential_pause_reason, preflight_credential_pause
@@ -1014,10 +1013,7 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + "\n```\nThis block contains safety and request facts, not permission or a mandatory next action. "
             + "If `raw_secret_handling` is `redacted_draft`, build only from the redacted request, do not run "
             + "blocks, and tell the user to store the redacted secret as a saved credential before testing. "
-            + "If `resolved_credentials` are present, use those `credential_id` values. "
-            + "If `resolved_signin_email` is present, that address signs in: bind it to the workflow as a "
-            + "workflow input parameter with that value as the default, so the saved workflow can be re-run "
-            + "under a different address, and do not ask for a saved password credential for that login."
+            + "If `resolved_credentials` are present, use those `credential_id` values."
             + _runtime_verification_evidence_prompt(ctx)
             + _recorded_build_test_outcome_prompt(ctx)
             + _code_authoring_repair_context_prompt(ctx)
@@ -1402,12 +1398,7 @@ def _make_agent_result(
     normal translate-result, missing-SDK fallback, unexpected-error fallback).
     """
     final_context = (
-        record_signin_email_in_global_llm_context(
-            ctx,
-            record_approved_credentials_in_global_llm_context(
-                ctx, finalize_observation_context(ctx, global_llm_context)
-            ),
-        )
+        record_approved_credentials_in_global_llm_context(ctx, finalize_observation_context(ctx, global_llm_context))
         if ctx is not None
         else global_llm_context
     )

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
@@ -251,12 +251,6 @@ class StructuredContext(BaseModel):
         ]
 
     entrypoint_url: str | None = None
-    # Passwordless sign-in identity, carried so a follow-up turn the classifier reads as an
-    # ordinary login does not fall back to demanding a password the site does not have.
-    # Scoped by host: reusing it anywhere else would suppress the password ask on a site
-    # that never established it was passwordless.
-    signin_email: str = ""
-    signin_email_host: str = ""
 
     def to_json_str(self) -> str:
         payload = self.model_dump(mode="json")
@@ -511,35 +505,13 @@ def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_c
     return sc.to_json_str()
 
 
-def record_signin_email_in_global_llm_context(ctx: CopilotContext, raw_context: str | None) -> str | None:
-    policy = ctx.request_policy
-    if policy is None or not policy.resolved_signin_email or not policy.resolved_signin_host:
-        return raw_context
-    sc = StructuredContext.from_json_str(raw_context)
-    if sc.signin_email == policy.resolved_signin_email and sc.signin_email_host == policy.resolved_signin_host:
-        return raw_context
-    sc.signin_email = policy.resolved_signin_email
-    sc.signin_email_host = policy.resolved_signin_host
-    return sc.to_json_str()
-
-
-def prior_signin_email_from_context(raw_context: str | None, hosts: Collection[str]) -> str:
-    """The carried address, only when this turn targets the host it was resolved for."""
-    sc = StructuredContext.from_json_str(raw_context)
-    if not sc.signin_email or sc.signin_email_host not in hosts:
-        return ""
-    return sc.signin_email
-
-
 def adopt_model_authored_context(trusted_raw: str | None, model_raw: object) -> StructuredContext:
     """Take the model's context but keep the server-owned fields server-owned.
 
     Approval is recorded only from server-resolved credentials; an entry the model
     supplied would be promoted into `resolved_credentials` on the next turn and clear
     the unapproved-credential gate for a credential the user never named. Membership
-    of the org is not evidence the user named it. A model-authored `signin_email` is the
-    same promotion in the other gate: it marks the next turn passwordless and suppresses
-    the password-credential ask for a site that does need one.
+    of the org is not evidence the user named it.
 
     `carried_trajectory` is the record of what the browser was observed doing, so an
     entry the model wrote would enter the factual record as an observation nothing made.
@@ -557,8 +529,6 @@ def adopt_model_authored_context(trusted_raw: str | None, model_raw: object) -> 
     elif isinstance(model_raw, str):
         structured = StructuredContext.from_json_str(model_raw)
     structured.approved_credentials = list(trusted.approved_credentials)
-    structured.signin_email = trusted.signin_email
-    structured.signin_email_host = trusted.signin_email_host
     structured.carried_trajectory = [dict(entry) for entry in trusted.carried_trajectory]
     return structured
 
