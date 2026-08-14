@@ -254,6 +254,8 @@ def _serialize_credential(credential: Credential) -> dict[str, Any]:
     if credential.username:
         entry["username"] = credential.username
         entry["totp_type"] = str(credential.totp_type) if credential.totp_type else None
+        if credential.totp_identifier:
+            entry["totp_identifier"] = credential.totp_identifier
     elif credential.card_last4:
         entry["card_last_four"] = credential.card_last4
         entry["card_brand"] = credential.card_brand

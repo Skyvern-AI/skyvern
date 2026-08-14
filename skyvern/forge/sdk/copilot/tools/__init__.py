@@ -509,8 +509,8 @@ async def list_credentials_tool(
 @function_tool(name_override="list_integrations")
 async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     """List the organization's connected Google and Microsoft accounts (metadata only —
-    never tokens). Each entry has `connection_id`, `provider`, `name`, `state`, and
-    `scopes_granted`.
+    never tokens). Each entry has `connection_id`, `provider`, `name`, `state`,
+    `email_address`, and `scopes_granted`.
 
     These are OAuth connections made on the Integrations page, NOT the stored
     login credentials returned by `list_credentials` — the two lists are disjoint,
@@ -940,12 +940,17 @@ async def fill_credential_field_tool(
     This tool only fills; it never clicks or submits. Each successful fill is
     recorded as a scouted interaction with the credential identity and field.
 
-    In model-authored code blocks, one-time codes must use
-    `await <parameter_key>.otp()` so authenticator, email, and SMS OTP sources
-    all resolve at runtime. Choose and declare the workflow parameter key, then
-    cite the observed `credential_id` and `credential_field` in
-    `code_artifact_metadata.input_bindings`; use that declared parameter in the
-    authored code rather than guessing a key or reading an inbox integration.
+    In model-authored code blocks, one-time codes resolve via two paths:
+    **credential-bound:** `await <parameter_key>.otp()` for a saved credential whose
+    totp_type is authenticator, email, or text — sources are specified at credential
+    creation. **identifier-based:** `await otp("<address>")` for passwordless email-code
+    sign-in, where the code lands in a connected Gmail or Outlook inbox and address is
+    a bare email (no saved credential required). For the credential-bound path, choose and
+    declare the workflow parameter key, then cite the observed `credential_id` and
+    `credential_field` in `code_artifact_metadata.input_bindings`; use that declared
+    parameter in the authored code. For the identifier-based path, pass only the email
+    address string to `otp()` and ensure an active Gmail or Outlook connection exists
+    for that mailbox.
     """
     result = await _fill_credential_field_impl(ctx.context, selector, credential_id, field)
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
