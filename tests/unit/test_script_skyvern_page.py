@@ -2954,6 +2954,125 @@ async def test_get_or_create_browser_state_does_not_record_session_on_acquire_fa
     assert ctx.browser_session_id is None  # requested session not recorded because the attach failed
 
 
+class TestScriptSkyvernPageMagicLink:
+    """SKY-14056: the generated-script sign-in-link verb."""
+
+    @staticmethod
+    def _install(monkeypatch, polled):
+        """Wire a ScriptSkyvernPage whose page records navigations and fills."""
+        from skyvern.core.script_generations import script_skyvern_page as module
+
+        state: dict = {"navigations": [], "fills": [], "rendered": [], "polled_with": {}}
+
+        async def fake_goto(url, **kwargs):
+            state["navigations"].append(url)
+            return None
+
+        async def fake_fill(*args, **kwargs):
+            state["fills"].append(args)
+
+        async def fake_poll(**kwargs):
+            state["polled_with"].update(kwargs)
+            return polled
+
+        def fake_render(value):
+            state["rendered"].append(value)
+            return value
+
+        monkeypatch.setattr(module, "poll_otp_value", fake_poll)
+        monkeypatch.setattr(module, "render_template", fake_render)
+        monkeypatch.setattr(module.settings, "ALLOWED_HOSTS", ["portal.example.com"])
+
+        page = SimpleNamespace(goto=fake_goto, fill=fake_fill)
+        script_page = ScriptSkyvernPage.__new__(ScriptSkyvernPage)
+        script_page.page = page
+        return script_page, state
+
+    @staticmethod
+    def _with_context():
+        from skyvern.forge.sdk.core import skyvern_context
+
+        skyvern_context.set(skyvern_context.SkyvernContext(organization_id="org_1", workflow_run_id="wr_1"))
+        return skyvern_context
+
+    @pytest.mark.asyncio
+    async def test_navigates_to_the_polled_link_without_filling_it(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.schemas.totp_codes import OTPType
+        from skyvern.services.otp_service import OTPValue
+
+        link = "https://portal.example.com/verify?token=" + "s" * 400
+        script_page, state = self._install(monkeypatch, OTPValue(value=link, type=OTPType.MAGIC_LINK))
+
+        ctx = self._with_context()
+        try:
+            await script_page.magic_link(totp_identifier="inbox@example.com")
+        finally:
+            ctx.reset()
+
+        assert state["polled_with"]["expected_otp_type"] is OTPType.MAGIC_LINK
+        assert state["navigations"] == [link]
+        assert state["fills"] == []
+        # The anchor sits one grace interval behind now (naive UTC), so an email that landed
+        # while the triggering click was still settling stays visible to the poll.
+        from datetime import datetime, timezone
+
+        from skyvern.services.otp_service import MAGIC_LINK_ANCHOR_GRACE
+
+        anchor = state["polled_with"]["created_after"]
+        assert anchor.tzinfo is None
+        expected_anchor = datetime.now(timezone.utc).replace(tzinfo=None) - MAGIC_LINK_ANCHOR_GRACE
+        assert abs((anchor - expected_anchor).total_seconds()) < 30
+
+    @pytest.mark.asyncio
+    async def test_a_returned_one_time_code_is_reported_not_navigated_to(self, monkeypatch) -> None:
+        """A configured webhook answers without honouring expected_otp_type."""
+        from skyvern.forge.sdk.schemas.totp_codes import OTPType
+        from skyvern.services.otp_service import OTPValue
+
+        script_page, state = self._install(monkeypatch, OTPValue(value="123456", type=OTPType.TOTP))
+
+        ctx = self._with_context()
+        try:
+            with pytest.raises(RuntimeError, match="totp"):
+                await script_page.magic_link(totp_identifier="inbox@example.com")
+        finally:
+            ctx.reset()
+
+        assert state["navigations"] == []
+
+    @pytest.mark.asyncio
+    async def test_the_link_never_goes_through_render_template(self, monkeypatch) -> None:
+        """The polled URL is opaque; rendering it would corrupt or expand its token."""
+        from skyvern.forge.sdk.schemas.totp_codes import OTPType
+        from skyvern.services.otp_service import OTPValue
+
+        link = "https://portal.example.com/verify?token={{ not_a_template }}"
+        script_page, state = self._install(monkeypatch, OTPValue(value=link, type=OTPType.MAGIC_LINK))
+
+        ctx = self._with_context()
+        try:
+            await script_page.magic_link(totp_identifier="inbox@example.com")
+        finally:
+            ctx.reset()
+
+        assert state["navigations"] == [link]
+        assert link not in state["rendered"]
+        assert "inbox@example.com" in state["rendered"]
+
+    @pytest.mark.asyncio
+    async def test_no_identifier_fails_closed_before_polling(self, monkeypatch) -> None:
+        script_page, state = self._install(monkeypatch, None)
+
+        ctx = self._with_context()
+        try:
+            with pytest.raises(RuntimeError, match="identifier"):
+                await script_page.magic_link()
+        finally:
+            ctx.reset()
+
+        assert state["polled_with"] == {}
+
+
 class TestAiClickRunsRegisteredClickSetup:
     """SKY-13916: the cached-script AI click path must run the registered
     ActionHandler setup for the click action before dispatching the physical
