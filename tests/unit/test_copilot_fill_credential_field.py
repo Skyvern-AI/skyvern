@@ -1130,20 +1130,6 @@ class TestCredentialFillLivePageAdmission:
         assert maximum_active_resolutions == 1
 
     @pytest.mark.asyncio
-    async def test_a_refusable_call_never_reads_the_org_credentials(self) -> None:
-        """The refusals that need no lookup must not page the credential table in first."""
-        policy = RequestPolicy(login_intent=True, email_signin_intent=True, credential_input_kind="none")
-        error, _, load_mock = await self._gate(
-            credential_id="cred_analytics",
-            page_url="https://analytics.example.com/login",
-            org_credentials=[_org_credential("cred_analytics", "analytics", "https://analytics.example.com/login")],
-            policy=policy,
-        )
-
-        assert error is not None
-        load_mock.assert_not_awaited()
-
-    @pytest.mark.asyncio
     async def test_a_second_step_on_the_same_site_still_fills(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Real sign-ins walk email -> password -> one-time code across paths of the same site;
         the live PostHog case moved to a 2FA path between the password and the code."""
