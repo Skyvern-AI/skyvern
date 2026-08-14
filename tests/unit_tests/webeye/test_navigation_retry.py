@@ -5,10 +5,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import structlog.testing
 
 from skyvern.exceptions import BlockedHost, BlockedNavigationDestination, FailedToNavigateToUrl, UnresolvableHost
 from skyvern.webeye.navigation import (
     navigate_with_retry,
+    redact_url_secrets,
     revalidate_redirect_chain,
     validate_navigation_destination,
 )
@@ -483,3 +485,137 @@ async def test_revalidate_redirect_chain_tolerates_a_response_without_a_request(
     await revalidate_redirect_chain(SimpleNamespace(request=None), calls.append)
 
     assert calls == []
+
+
+def test_redact_url_secrets_keeps_only_scheme_and_host() -> None:
+    assert redact_url_secrets("https://portal.example.com/verify/abc?token=xyz#frag") == (
+        "https://portal.example.com/<redacted>"
+    )
+    assert redact_url_secrets("https://portal.example.com:8443/verify?token=xyz") == (
+        "https://portal.example.com:8443/<redacted>"
+    )
+    assert redact_url_secrets("not a url") == "<redacted>"
+
+
+def test_redact_url_secrets_drops_basic_auth_credentials() -> None:
+    """netloc carries user:password@; a redactor must not republish it."""
+    redacted = redact_url_secrets("https://tok:s3cret@portal.example.com/verify?token=xyz")
+
+    assert "s3cret" not in redacted
+    assert "tok" not in redacted
+    assert redacted == "https://portal.example.com/<redacted>"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_secret_destination_does_not_report_the_real_url() -> None:
+    """A self-hosted portal's link can legitimately resolve to a private host."""
+    secret = "http://127.0.0.1/verify?token=super-secret-token-value"
+
+    async def navigate(strategy: str) -> object:
+        raise AssertionError("must not navigate to a blocked destination")
+
+    async def settle() -> None:
+        return None
+
+    with structlog.testing.capture_logs() as logs:
+        with pytest.raises(BlockedNavigationDestination) as excinfo:
+            await navigate_with_retry(
+                navigate=navigate,
+                url=secret,
+                retry_times=2,
+                settle=settle,
+                log_url=redact_url_secrets(secret),
+            )
+
+    assert "super-secret-token-value" not in str(excinfo.value)
+    assert "super-secret-token-value" not in repr(logs)
+    # The chained cause would carry the original message into any rendered traceback.
+    assert excinfo.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_log_url_keeps_the_real_url_out_of_logs_and_the_failure_reason() -> None:
+    """A sign-in link is a bearer credential: navigate to it, but never log or report it."""
+    secret = "https://portal.example.com/verify?token=super-secret-token-value"
+
+    async def navigate(strategy: str) -> object:
+        # Playwright names the destination in its own message, so the secret arrives via the
+        # error text as well as the url field.
+        raise RuntimeError(f"Page.goto: net::ERR_CONNECTION_REFUSED at {secret}")
+
+    async def settle() -> None:
+        return None
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    with structlog.testing.capture_logs() as logs:
+        with pytest.raises(FailedToNavigateToUrl) as excinfo:
+            await navigate_with_retry(
+                navigate=navigate,
+                url=secret,
+                retry_times=2,
+                settle=settle,
+                sleep=no_sleep,
+                log_url=redact_url_secrets(secret),
+            )
+
+    assert "super-secret-token-value" not in str(excinfo.value)
+    assert "super-secret-token-value" not in repr(logs)
+    # The host still reaches the operator, so a failure stays diagnosable.
+    assert any("portal.example.com" in repr(entry) for entry in logs)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_redirect_hop_is_redacted_for_a_secret_caller() -> None:
+    """The hop that gets refused is a different URL than the one requested; redact that one."""
+    secret = "https://portal.example.com/verify?token=super-secret-token-value"
+    # A literal loopback address is refused before DNS, unlike the hostnames the suite's
+    # autouse fixture resolves to a public address.
+    hop = "http://127.0.0.1/r?dest=internal&session=hop-secret-value"
+
+    async def navigate(strategy: str) -> object:
+        return SimpleNamespace(request=SimpleNamespace(url=hop, redirected_from=None))
+
+    async def settle() -> None:
+        return None
+
+    with structlog.testing.capture_logs() as logs:
+        with pytest.raises(BlockedNavigationDestination) as excinfo:
+            await navigate_with_retry(
+                navigate=navigate,
+                url=secret,
+                retry_times=2,
+                settle=settle,
+                log_url=redact_url_secrets(secret),
+            )
+
+    assert "hop-secret-value" not in str(excinfo.value)
+    assert "hop-secret-value" not in repr(logs)
+    assert "super-secret-token-value" not in str(excinfo.value)
+    # The refused hop's host still identifies what was blocked.
+    assert "127.0.0.1" in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_navigation_still_targets_the_real_url_when_a_display_url_is_given() -> None:
+    secret = "https://portal.example.com/verify?token=super-secret-token-value"
+    navigated: list[str] = []
+
+    async def navigate(strategy: str) -> object:
+        navigated.append(secret)
+        return None
+
+    async def settle() -> None:
+        return None
+
+    await navigate_with_retry(
+        navigate=navigate,
+        url=secret,
+        retry_times=1,
+        settle=settle,
+        log_url=redact_url_secrets(secret),
+    )
+
+    assert navigated == [secret]
