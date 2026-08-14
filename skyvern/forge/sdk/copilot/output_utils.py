@@ -698,6 +698,7 @@ _USER_FACING_EMPTY_SUCCESS_TOOLS: frozenset[str] = frozenset(
         # The server-authored display label already names the operation and its
         # target block; a bare "OK" summary would render instead of it.
         "edit_block",
+        "add_block",
         "delete_block",
     }
 )

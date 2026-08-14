@@ -33,9 +33,16 @@ from skyvern.forge.sdk.copilot.output_utils import (
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
-from skyvern.forge.sdk.copilot.workflow_yaml import BlockEditError
+from skyvern.forge.sdk.copilot.workflow_yaml import (
+    BlockEditError,
+)
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _process_workflow_yaml
-from skyvern.forge.sdk.copilot.workflow_yaml import apply_block_edit, delete_block_from_workflow, stored_workflow_yaml
+from skyvern.forge.sdk.copilot.workflow_yaml import (
+    add_block_to_workflow,
+    apply_block_edit,
+    delete_block_from_workflow,
+    stored_workflow_yaml,
+)
 
 from ._shared import _COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS
 from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS as _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
@@ -295,15 +302,30 @@ async def update_workflow_tool(
     return json.dumps(sanitized)
 
 
-async def _persist_block_scoped_edit(copilot_ctx: Any, tool_name: str, workflow_yaml: str, arguments: dict) -> str:
+async def _persist_block_scoped_edit(
+    copilot_ctx: Any,
+    tool_name: str,
+    workflow_yaml: str,
+    arguments: dict,
+    *,
+    code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
+    block_observation_refs: list[BlockObservationRef] | None = None,
+) -> str:
     """Send a server-composed workflow through the normal persistence path.
 
     The model never sends the whole workflow, but the saved result still goes through every
     author-time check, so a block edit cannot slip past what a full submission must satisfy.
     """
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
+    params: dict[str, Any] = {"workflow_yaml": workflow_yaml}
+    if code_artifact_metadata is not None:
+        params["code_artifact_metadata"] = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
+        params["raw_code_artifact_metadata"] = code_artifact_metadata
+    if block_observation_refs is not None:
+        params["block_observation_refs"] = normalize_block_observation_refs(block_observation_refs)
+        params["raw_block_observation_refs"] = block_observation_refs
     with copilot_span(tool_name, data={"yaml_length": len(workflow_yaml)}):
-        result = await _update_workflow({"workflow_yaml": workflow_yaml}, copilot_ctx)
+        result = await _update_workflow(params, copilot_ctx)
         _record_workflow_update_result(copilot_ctx, result, prior_definition)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
         if result.get("ok") is False:
@@ -355,6 +377,55 @@ async def edit_block_tool(
         record_tool_step_result_for_ctx(copilot_ctx, "edit_block", arguments, result)
         return json.dumps(result)
     return await _persist_block_scoped_edit(copilot_ctx, "edit_block", workflow_yaml, arguments)
+
+
+@function_tool(name_override="add_block", strict_mode=False)
+async def add_block_tool(
+    ctx: RunContextWrapper,
+    after_label: str,
+    block_yaml: str,
+    parameters: list[dict[str, Any]] | None = None,
+    code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
+    block_observation_refs: list[BlockObservationRef] | None = None,
+) -> str:
+    """Add one new block after an existing one, leaving every other block exactly as it is.
+
+    Prefer this over update_and_run_blocks whenever you are adding to a workflow that already exists:
+    you send only the new block, so the blocks that already work cannot be disturbed and the workflow
+    is not retyped. `after_label` must name a block that exists; the new block is linked in directly
+    after it and inherits what that block pointed at.
+
+    Pass `block_yaml` as a single block mapping including its `label`. Declare any new top-level
+    workflow parameters the block reads in `parameters` — a new block and the parameter it consumes
+    have to land in the same call, or the workflow is briefly saved in a state that cannot run. For a
+    code block pass its `code_artifact_metadata` row here too, since a brand-new block has none yet.
+
+    To change a block that already exists use edit_block; to remove one use delete_block.
+    """
+    copilot_ctx = ctx.context
+    arguments = {"after_label": after_label, "parameters": parameters}
+    authority_error = _authority_tool_error(copilot_ctx, "add_block")
+    if authority_error:
+        return json.dumps({"ok": False, "error": authority_error})
+    try:
+        workflow_yaml = add_block_to_workflow(
+            _stored_workflow_yaml(copilot_ctx),
+            after_label,
+            block_yaml,
+            parameters=parameters,
+        )
+    except BlockEditError as exc:
+        result = {"ok": False, "error": str(exc)}
+        record_tool_step_result_for_ctx(copilot_ctx, "add_block", arguments, result)
+        return json.dumps(result)
+    return await _persist_block_scoped_edit(
+        copilot_ctx,
+        "add_block",
+        workflow_yaml,
+        arguments,
+        code_artifact_metadata=code_artifact_metadata,
+        block_observation_refs=block_observation_refs,
+    )
 
 
 @function_tool(name_override="delete_block")
@@ -959,6 +1030,7 @@ async def fill_credential_field_tool(
 NATIVE_TOOLS = [
     update_workflow_tool,
     edit_block_tool,
+    add_block_tool,
     delete_block_tool,
     list_credentials_tool,
     list_integrations_tool,
