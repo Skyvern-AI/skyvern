@@ -120,7 +120,7 @@ def test_credential_redaction_tolerates_non_string_values() -> None:
 
 
 def test_redacts_a_credential_nested_inside_a_kwarg() -> None:
-    """add_kv_pairs_to_msg folds nested kwargs into the rendered line, so recursion is required."""
+    """Nested kwargs are serialized, so registered secrets must be redacted recursively."""
     _register_credential(_FAKE_CREDENTIAL)
     event = {
         "event": "tool call",

@@ -111,15 +111,13 @@ def test_msg_and_error_kwargs_are_deliberately_not_renamed(
     assert "event_error" not in payload
 
 
-def test_native_json_log_keeps_authored_names_in_rendered_msg(
+def test_native_json_log_does_not_duplicate_structured_fields_in_msg(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # The human-readable line keeps the authored kwarg name; only the queryable
-    # JSON attribute is escaped.
     monkeypatch.setattr(settings, "JSON_LOGGING", True)
     payload = _native_json_payload(capsys, status="completed")
 
-    assert "status=completed" in payload["msg"]
+    assert payload["msg"] == "Wrote the final state"
 
 
 def test_foreign_record_extra_reserved_keys_renamed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -139,14 +137,13 @@ def test_explicit_escaped_kwarg_wins_over_renamed_reserved_key(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # If a call site ever passes both, the explicit `event_status` is the intentional one;
-    # the reserved key is still stripped so it cannot reach intake. Both values remain
-    # visible in the folded `msg` text.
+    # the reserved key is still stripped so it cannot reach intake.
     monkeypatch.setattr(settings, "JSON_LOGGING", True)
     payload = _native_json_payload(capsys, status="completed", event_status="explicit")
 
     assert payload["event_status"] == "explicit"
     assert "status" not in payload
-    assert "status=completed" in payload["msg"]
+    assert payload["msg"] == "Wrote the final state"
 
 
 def test_console_mode_keeps_authored_keys(monkeypatch: pytest.MonkeyPatch) -> None:
