@@ -1,15 +1,18 @@
 import { ChevronDownIcon, MagicWandIcon } from "@radix-ui/react-icons";
-import { useReactFlow } from "@xyflow/react";
+import { useNodes, useReactFlow } from "@xyflow/react";
 import { useMemo, useState } from "react";
 import type { Extension } from "@uiw/react-codemirror";
 
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInputSet } from "@/components/WorkflowBlockInputSet";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { jinjaHighlight } from "@/routes/workflows/components/jinjaHighlight";
 import { lineHighlight } from "@/routes/workflows/components/lineHighlight";
+import { analyzeCodeBlockErrorCodes } from "@/routes/workflows/editor/codeBlockErrorCodeDiagnostics";
+import { ErrorCodeMappingEditor } from "@/routes/workflows/editor/ErrorCodeMappingEditor";
 import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
 import type { CodeBlockStep } from "@/routes/workflows/types/workflowTypes";
 import { getCodeStepPlainText } from "@/routes/workflows/workflowBlockUtils";
@@ -18,6 +21,8 @@ import { deepEqualStringArrays } from "@/util/equality";
 import { cn } from "@/util/utils";
 
 import { type AppNode, isWorkflowBlockNode } from "..";
+import { errorMappingExampleValue } from "../types";
+import { isStartNode } from "../StartNode/types";
 import { CodeBlockPlainCard } from "./CodeBlockPlainCard";
 import { getStepLabel } from "./stepPresentation";
 import { CodeBlockViewToggle, type CodeBlockView } from "./CodeBlockViewToggle";
@@ -33,6 +38,13 @@ function formatStepLines(step: CodeBlockStep): string {
   }
   return `L${step.line_start}-${step.line_end}`;
 }
+
+function raisedLineText(lines: Array<number>): string {
+  return `raised on ${lines.length === 1 ? "line" : "lines"} ${lines.join(", ")}`;
+}
+
+const MAX_RENDERED_ERROR_CODE_DIAGNOSTICS = 50;
+const MAX_RENDERED_MALFORMED_LINE_NUMBERS = 20;
 
 function CodeBlockEditor({ blockId }: { blockId: string }) {
   const rf = useReactFlow<AppNode>();
@@ -50,7 +62,9 @@ function CodeBlockEditorBody({
   blockId: string;
   node: CodeBlockNode;
 }) {
+  const nodes = useNodes<AppNode>();
   const data = node.data;
+  const errorCodeMapping = data.errorCodeMapping ?? "null";
   const { editable } = data;
   const update = useUpdate<CodeBlockNodeData>({ id: blockId, editable });
   const scopeReadOnly = useWorkflowScopeReadOnly();
@@ -95,6 +109,38 @@ function CodeBlockEditorBody({
     editable &&
     !scopeReadOnly;
   const hasGenerated = steps.length > 0;
+  const workflowStartNode = nodes
+    .filter(isStartNode)
+    .find((candidate) => "errorCodeMapping" in candidate.data);
+  const workflowErrorCodeMapping =
+    workflowStartNode && "errorCodeMapping" in workflowStartNode.data
+      ? workflowStartNode.data.errorCodeMapping
+      : null;
+
+  const effectiveManifest = useMemo(() => {
+    let blockMapping: Record<string, string> | null = null;
+    try {
+      const parsed = JSON.parse(errorCodeMapping) as unknown;
+      if (
+        parsed !== null &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed)
+      ) {
+        blockMapping = parsed as Record<string, string>;
+      }
+    } catch {
+      // The JSON editor owns parse diagnostics; synchronization stays advisory.
+    }
+    const merged = {
+      ...(workflowErrorCodeMapping ?? {}),
+      ...(blockMapping ?? {}),
+    };
+    return Object.keys(merged).length > 0 ? merged : null;
+  }, [errorCodeMapping, workflowErrorCodeMapping]);
+  const diagnostics = useMemo(
+    () => analyzeCodeBlockErrorCodes(data.code, effectiveManifest),
+    [data.code, effectiveManifest],
+  );
 
   const goalField = (
     <div className="space-y-2">
@@ -159,6 +205,102 @@ function CodeBlockEditorBody({
         }}
         values={new Set(data.parameterKeys ?? [])}
       />
+    </div>
+  );
+
+  const hasDiagnostics =
+    diagnostics.declaredAndRaised.length > 0 ||
+    diagnostics.declaredButUnused.length > 0 ||
+    diagnostics.raisedButUndeclared.length > 0 ||
+    diagnostics.malformedLines.length > 0;
+  const diagnosticRows = [
+    ...diagnostics.declaredAndRaised.map(({ code, lines }) => ({
+      key: `declared-raised-${code}`,
+      text: `${code} — ${raisedLineText(lines)}`,
+    })),
+    ...diagnostics.declaredButUnused.map((code) => ({
+      key: `declared-unused-${code}`,
+      text: `${code} — declared, not raised`,
+    })),
+    ...diagnostics.raisedButUndeclared.map(({ code, lines }) => ({
+      key: `raised-undeclared-${code}`,
+      text: `${code} — ${raisedLineText(lines)}, not declared`,
+    })),
+    ...(diagnostics.malformedLines.length > 0
+      ? [
+          {
+            key: "malformed",
+            text: `Malformed/nonliteral ErrorCode raises (ErrorCode cannot be imported or aliased) — ${
+              diagnostics.malformedLines.length === 1 ? "line" : "lines"
+            } ${diagnostics.malformedLines
+              .slice(0, MAX_RENDERED_MALFORMED_LINE_NUMBERS)
+              .join(", ")}${
+              diagnostics.malformedLines.length >
+              MAX_RENDERED_MALFORMED_LINE_NUMBERS
+                ? ` … and ${diagnostics.malformedLines.length - MAX_RENDERED_MALFORMED_LINE_NUMBERS} more`
+                : ""
+            }`,
+          },
+        ]
+      : []),
+  ];
+  const hiddenDiagnosticCount = Math.max(
+    0,
+    diagnosticRows.length - MAX_RENDERED_ERROR_CODE_DIAGNOSTICS,
+  );
+  const errorCodeMappingField = (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <Label className="text-xs font-normal text-tertiary-foreground">
+          Error Messages
+        </Label>
+        <div className="w-52">
+          <Switch
+            aria-label="Enable Error Messages"
+            checked={errorCodeMapping !== "null"}
+            disabled={!editable || scopeReadOnly}
+            onCheckedChange={(checked) =>
+              update({
+                errorCodeMapping: checked
+                  ? JSON.stringify(errorMappingExampleValue, null, 2)
+                  : "null",
+              })
+            }
+          />
+        </div>
+      </div>
+      {errorCodeMapping !== "null" && (
+        <ErrorCodeMappingEditor
+          label={data.label}
+          value={errorCodeMapping}
+          onChange={(value) => update({ errorCodeMapping: value })}
+          readOnly={!editable || scopeReadOnly}
+        />
+      )}
+      <p className="text-xs text-muted-foreground">
+        The manifest declares public error codes and their conditions. Python
+        controls when they fire.
+      </p>
+      {hasDiagnostics && (
+        <div
+          aria-label="Error message synchronization status"
+          className="rounded border border-border px-2 py-1.5 text-[10px] text-muted-foreground"
+        >
+          <div className="font-medium text-tertiary-foreground">
+            Python synchronization
+          </div>
+          <ul className="mt-1 space-y-0.5">
+            {diagnosticRows
+              .slice(0, MAX_RENDERED_ERROR_CODE_DIAGNOSTICS)
+              .map(({ key, text }) => (
+                <li key={key}>{text}</li>
+              ))}
+            {hiddenDiagnosticCount > 0 && (
+              <li>+{hiddenDiagnosticCount} more</li>
+            )}
+          </ul>
+        </div>
+      )}
     </div>
   );
 
@@ -235,6 +377,7 @@ function CodeBlockEditorBody({
           <Label className="text-xs text-tertiary-foreground">Code Input</Label>
           {codeEditorElement}
         </div>
+        {errorCodeMappingField}
       </div>
     );
   }
@@ -253,6 +396,7 @@ function CodeBlockEditorBody({
             generating={isGenerating}
             onStop={requestCancel}
           />
+          {errorCodeMappingField}
         </>
       ) : (
         <>
@@ -264,6 +408,7 @@ function CodeBlockEditorBody({
             </Label>
             {codeEditorElement}
           </div>
+          {errorCodeMappingField}
         </>
       )}
     </div>

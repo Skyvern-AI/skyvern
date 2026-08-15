@@ -132,7 +132,6 @@ async def test_browser_actions_round_trip_through_trajectory_get_and_synthesize(
             "tool_name": "type_text",
             "selector": "#search",
             "source_url": "https://example.com/results",
-            "typed_value": "widget",
             "typed_length": 6,
         },
         {

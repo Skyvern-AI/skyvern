@@ -306,6 +306,8 @@ class WorkflowRunsRepository(BaseRepository):
         waiting_for_verification_code: bool | None = None,
         verification_code_identifier: str | None = None,
         verification_code_polling_started_at: datetime | None = None,
+        # Sentinel-guarded because False is a meaningful pin, not "leave unchanged".
+        secure_runner_pinned: bool | None | object = _UNSET,
         browser_profile_id: str | None | object = _UNSET,
         browser_seed_source: str | None | object = _UNSET,
         browser_sink_profile_id: str | None | object = _UNSET,
@@ -396,6 +398,8 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.sequential_credential_id = sequential_credential_id
                 if ai_fallback is not None:
                     workflow_run.ai_fallback = ai_fallback
+                if secure_runner_pinned is not _UNSET:
+                    workflow_run.secure_runner_pinned = secure_runner_pinned
                 if depends_on_workflow_run_id:
                     workflow_run.depends_on_workflow_run_id = depends_on_workflow_run_id
                 if browser_session_id:
@@ -919,6 +923,19 @@ class WorkflowRunsRepository(BaseRepository):
             if workflow_run := (await session.scalars(get_workflow_run_query)).first():
                 return convert_to_workflow_run(workflow_run)
             return None
+
+    async def get_secure_runner_pin(self, workflow_run_id: str, organization_id: str | None = None) -> bool | None:
+        """The secure-runner verdict frozen onto this run, or None when it carries no pin.
+
+        Selects the column rather than the run because ``WorkflowRun`` is a published API schema:
+        carrying an internal rollout verdict on it would document the field as part of the public
+        contract. None covers both "no such run" and "no pin", which the caller treats alike.
+        """
+        async with self.Session() as session:
+            query = select(WorkflowRunModel.secure_runner_pinned).filter_by(workflow_run_id=workflow_run_id)
+            if organization_id:
+                query = query.filter_by(organization_id=organization_id)
+            return await session.scalar(query)
 
     async def get_run(self, run_id: str, organization_id: str | None = None) -> WorkflowRun | None:
         """Alias satisfying the RunReader protocol."""
@@ -1824,14 +1841,22 @@ class WorkflowRunsRepository(BaseRepository):
         self,
         workflow_run_id: str,
         organization_id: str | None = None,
-    ) -> list[tuple[list[str], str | None]]:
-        """Return (error_codes, failure_reason) tuples for blocks with non-null error_codes."""
+    ) -> list[tuple[str, list[str], str | None, Any, str]]:
+        """Return block provenance and error details for errored blocks in stable creation order."""
         async with self.Session() as session:
-            query = select(WorkflowRunBlockModel.error_codes, WorkflowRunBlockModel.failure_reason).filter_by(
-                workflow_run_id=workflow_run_id
-            )
+            query = select(
+                WorkflowRunBlockModel.workflow_run_block_id,
+                WorkflowRunBlockModel.error_codes,
+                WorkflowRunBlockModel.failure_reason,
+                WorkflowRunBlockModel.output,
+                WorkflowRunBlockModel.block_type,
+            ).filter_by(workflow_run_id=workflow_run_id)
             if organization_id is not None:
                 query = query.filter_by(organization_id=organization_id)
             query = query.where(WorkflowRunBlockModel.error_codes.isnot(None))
+            query = query.order_by(WorkflowRunBlockModel.created_at, WorkflowRunBlockModel.workflow_run_block_id)
             rows = (await session.execute(query)).all()
-            return [(row.error_codes, row.failure_reason) for row in rows]
+            return [
+                (row.workflow_run_block_id, row.error_codes, row.failure_reason, row.output, row.block_type)
+                for row in rows
+            ]

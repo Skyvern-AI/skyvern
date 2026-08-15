@@ -34,7 +34,6 @@ from skyvern.exceptions import (
     InProcessScriptExecutionDenied,
     ScriptNotFound,
     ScriptTerminationException,
-    StepTerminationError,
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
@@ -916,16 +915,17 @@ async def _update_workflow_block(
                             updated_task,
                             step_for_billing,
                         )
-                except StepTerminationError as billing_error:
+                except Exception as billing_error:
                     LOG.warning(
                         "Cached step billing failed; marking workflow block as failed.",
                         organization_id=context.organization_id,
                         task_id=task_id,
                         step_id=step_id,
-                        error=str(billing_error),
+                        error_type=type(billing_error).__name__,
+                        exc_info=True,
                     )
                     status = BlockStatus.failed
-                    failure_reason = str(billing_error)
+                    failure_reason = "Cached step billing failed."
                     final_output = None
         else:
             # Non-task blocks (conditionals, etc.) — preserve the output as-is.
@@ -3097,12 +3097,15 @@ async def ensure_in_process_script_execution_allowed(
     if decision.allowed:
         return
 
-    LOG.error(
+    # A degradable denial leaves the run to the agent, so it is not an error condition; keeping it
+    # off ERROR also keeps the fail-closed lines above distinguishable in the denial monitor.
+    log_denial = LOG.error if decision.fail_closed else LOG.warning
+    log_denial(
         "script.in_process_execution_denied",
         seam=seam,
         selection_reason=decision.selection_reason,
         flag_value=decision.flag_value,
-        env_force_on=decision.env_force_on,
+        fail_closed=decision.fail_closed,
         organization_id=organization_id,
         workflow_run_id=workflow_run_id,
         workflow_permanent_id=workflow_permanent_id,
@@ -3113,6 +3116,7 @@ async def ensure_in_process_script_execution_allowed(
     raise InProcessScriptExecutionDenied(
         seam=seam,
         selection_reason=decision.selection_reason,
+        fail_closed=decision.fail_closed,
     )
 
 

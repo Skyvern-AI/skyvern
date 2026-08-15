@@ -16,10 +16,15 @@ const PAIRING_CONFIRM_PATH = "pairing_confirm.html";
 let debuggerRouter;
 let pendingPairingOffer = null;
 let pairingOfferQueue = Promise.resolve();
+let resetQueue = Promise.resolve();
+let lastResetEpoch = null;
+let lastResetGeneration = -1;
+let lastResetOk = null;
 
 const bridge = new BridgeConnection({
   onRequest: (op, args) => dispatchRequest(op, args),
   onAuthenticated: () => sendHello(),
+  onReset: (epoch, generation) => enqueueReset(epoch, generation),
   onStateChange: () => updateActionState(),
 });
 
@@ -63,9 +68,43 @@ async function dispatchRequest(op, args) {
 
 async function sendHello() {
   bridge.sendEvent(EVENTS.EXTENSION_HELLO, {
+    protocolVersion: PROTOCOL_VERSION,
     extensionVersion: chrome.runtime.getManifest().version,
     scopedTabs: await tabScope.helloTabs(),
   });
+}
+
+function enqueueReset(epoch, generation) {
+  const reset = resetQueue
+    .catch(() => undefined)
+    .then(async () => {
+      if (
+        epoch === lastResetEpoch &&
+        generation === lastResetGeneration &&
+        lastResetOk === true
+      ) {
+        return { executed: false, ok: true, failedTabCount: 0 };
+      }
+      if (epoch === lastResetEpoch && generation < lastResetGeneration) {
+        return null;
+      }
+      await tabScope.prepareForReset();
+      try {
+        const { failedTabCount } = await debuggerRouter.reset();
+        const ok = failedTabCount === 0;
+        if (ok) {
+          await tabScope.reset();
+        }
+        lastResetEpoch = epoch;
+        lastResetGeneration = generation;
+        lastResetOk = ok;
+        return { executed: true, ok, failedTabCount };
+      } finally {
+        tabScope.finishReset();
+      }
+    });
+  resetQueue = reset;
+  return reset;
 }
 
 async function updateActionState() {

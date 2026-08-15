@@ -1,7 +1,15 @@
-import { ReloadIcon, StopIcon } from "@radix-ui/react-icons";
+import { Cross2Icon, ReloadIcon } from "@radix-ui/react-icons";
 import { useEffect, useState } from "react";
-import { Outlet, useLocation, useParams } from "react-router-dom";
+import {
+  NavLink,
+  Outlet,
+  useLocation,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
+
+import { cn } from "@/util/utils";
 
 import { getClient } from "@/api/AxiosClient";
 import { Badge } from "@/components/ui/badge";
@@ -18,8 +26,13 @@ import {
 } from "@/components/ui/dialog";
 import { BrowserStream } from "@/components/BrowserStream";
 import { BrowserIcon } from "@/components/icons/BrowserIcon";
-import { SwitchBarNavigation } from "@/components/SwitchBarNavigation";
 import { Toaster } from "@/components/ui/toaster";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useCloseBrowserSessionMutation } from "@/routes/browserSessions/hooks/useCloseBrowserSessionMutation";
 import { SaveSessionAsBrowserProfileDialog } from "@/routes/browserProfiles/SaveSessionAsBrowserProfileDialog";
@@ -57,6 +70,48 @@ const BROWSER_SESSION_STATUS_BADGE_VARIANT: Record<
   created: "secondary",
 };
 
+const TAB_OPTIONS = [
+  { label: "Stream", to: "stream" },
+  { label: "Recordings", to: "recordings" },
+  { label: "Downloads", to: "downloads" },
+  { label: "Timeline", to: "timeline" },
+  { label: "Runs", to: "runs" },
+];
+
+function BrowserTabStrip({
+  options,
+}: {
+  options: { label: string; to: string }[];
+}) {
+  const [searchParams] = useSearchParams();
+  return (
+    // Scrolls rather than clips: on a short pane the window narrows to the preview,
+    // and the five tabs plus the docked controls stop fitting around ~540px.
+    <div className="flex min-w-0 items-end gap-0.5 overflow-x-auto">
+      {options.map((option) => (
+        <NavLink
+          key={option.to}
+          to={`${option.to}?${searchParams.toString()}`}
+          replace
+          className={({ isActive }) =>
+            cn(
+              "flex-shrink-0 rounded-t-md px-3 py-1.5 text-sm",
+              "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-slate-500",
+              isActive
+                ? // Same surface as the toolbar directly beneath, so the active tab
+                  // reads as fused to the window rather than sitting on top of it.
+                  "bg-slate-800 text-foreground"
+                : "text-slate-400 hover:bg-slate-800/50 hover:text-foreground",
+            )
+          }
+        >
+          {option.label}
+        </NavLink>
+      ))}
+    </div>
+  );
+}
+
 function BrowserSession() {
   const { browserSessionId } = useParams();
   const location = useLocation();
@@ -64,7 +119,12 @@ function BrowserSession() {
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [isSaveProfileDialogOpen, setIsSaveProfileDialogOpen] = useState(false);
   const [vncFailed, setVncFailed] = useState(false);
+  const [previewWidth, setPreviewWidth] = useState<number | null>(null);
   const { browserStreamingMode } = useBrowserStreamingMode();
+
+  // Only the Stream tab has a preview to size the window against; the other tabs
+  // hold tables and want the whole pane.
+  const windowWidth = activeTab === "stream" ? previewWidth : null;
 
   useEffect(() => {
     setVncFailed(false);
@@ -131,7 +191,17 @@ function BrowserSession() {
 
   return (
     <div className="h-screen w-full gap-4 p-6">
-      <div className="flex h-full w-full flex-col items-start justify-start gap-2">
+      {/* One window: the tab strip is its title bar, the stream's own toolbar sits
+          directly beneath, and both track the preview's width on the Stream tab. */}
+      <div
+        className={cn(
+          "mx-auto flex h-full min-w-0 max-w-full flex-col items-stretch justify-start",
+          // Switching off Stream snaps the window from the preview's width to the
+          // full pane; easing it reads as the window opening out rather than a jump.
+          "transition-[width] duration-200 ease-out motion-reduce:transition-none",
+        )}
+        style={windowWidth ? { width: windowWidth } : undefined}
+      >
         <div className="flex w-full flex-shrink-0 flex-row items-center justify-between p-4">
           <div className="flex w-full flex-row items-center justify-start gap-2">
             <div className="text-xl">Browser Session</div>
@@ -177,34 +247,40 @@ function BrowserSession() {
           </div>
         </div>
 
-        {/* Tab Navigation */}
-        <div className="flex w-full items-center justify-start gap-2">
-          <SwitchBarNavigation
-            options={[
-              { label: "Stream", to: "stream" },
-              { label: "Recordings", to: "recordings" },
-              { label: "Downloads", to: "downloads" },
-              { label: "Timeline", to: "timeline" },
-              { label: "Runs", to: "runs" },
-            ]}
-          />
+        {/* Title bar: section tabs left, session controls docked right. Controls come
+            after every tab in the DOM so keyboard order stays tabs-then-actions. */}
+        <div className="flex w-full flex-shrink-0 items-center gap-2 rounded-t-lg border border-b-0 bg-slate-900 px-2 pt-1">
+          <BrowserTabStrip options={TAB_OPTIONS} />
 
           {browserSessionId && browserSession?.status === "running" && (
-            <div className="ml-auto flex items-center gap-2">
+            <div className="ml-auto flex flex-shrink-0 items-center gap-1 pb-1">
               <Button
-                variant="default"
+                variant="ghost"
+                size="sm"
+                className="h-7 px-2 text-xs text-slate-300 hover:text-foreground"
                 onClick={() => setIsSaveProfileDialogOpen(true)}
               >
-                <BrowserIcon className="mr-2 h-4 w-4" />
+                <BrowserIcon className="mr-1.5 h-3.5 w-3.5" />
                 Save Profile
               </Button>
               <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
-                <DialogTrigger asChild>
-                  <Button variant="destructive">
-                    <StopIcon className="mr-2 h-4 w-4" />
-                    Stop
-                  </Button>
-                </DialogTrigger>
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <DialogTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          aria-label="Close browser session"
+                          className="h-7 w-7 text-slate-300 hover:bg-red-500/15 hover:text-red-300"
+                        >
+                          <Cross2Icon className="h-3.5 w-3.5" />
+                        </Button>
+                      </DialogTrigger>
+                    </TooltipTrigger>
+                    <TooltipContent>Close</TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
                 <DialogContent>
                   <DialogHeader>
                     <DialogTitle>Are you sure?</DialogTitle>
@@ -236,8 +312,9 @@ function BrowserSession() {
           )}
         </div>
 
-        {/* Tab Content */}
-        <div className="relative min-h-0 w-full flex-1 rounded-lg border p-4">
+        {/* No top border: the active tab shares the toolbar's surface, so a seam here
+            would cut the tab off from the window it belongs to. */}
+        <div className="relative min-h-0 w-full flex-1 overflow-hidden rounded-b-lg border border-t-0">
           <div
             className="absolute left-0 top-0 z-10 flex h-full w-full items-center justify-center"
             style={{
@@ -251,6 +328,7 @@ function BrowserSession() {
                 interactive={true}
                 showControlButtons={true}
                 enableUrlInput={true}
+                onFrameWidthChange={setPreviewWidth}
               />
             )}
             {!isCdpMode &&

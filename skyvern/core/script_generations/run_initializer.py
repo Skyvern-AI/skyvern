@@ -137,6 +137,9 @@ async def setup(
                 parameter = parameters_in_workflow_context[key]
                 if parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                     parameters[key] = workflow_run_context.values[key]
+        # An absent at-will credential needs no backfill here: RunContext wraps parameters in
+        # SafeParameters, so generated code indexing context.parameters[key] already resolves a
+        # missing key to None without a KeyError.
         context.script_run_parameters.update(parameters)
 
     # Pre-extract structured values from all parameters (1 LLM call max, cached for entire run)

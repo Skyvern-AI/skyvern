@@ -66,6 +66,7 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
     fake_app_module.DATABASE.tasks.get_last_task_for_workflow_run = AsyncMock()
     fake_app_module.DATABASE.workflow_runs.get_workflow_run = AsyncMock()
+    fake_app_module.DATABASE.workflow_runs.get_secure_runner_pin = AsyncMock(return_value=None)
     fake_app_module.DATABASE.observer.get_workflow_run_block = AsyncMock()
     fake_app_module.DATABASE.tasks.get_task = AsyncMock()
     fake_app_module.DATABASE.tasks.update_task = AsyncMock()

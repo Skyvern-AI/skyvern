@@ -204,6 +204,7 @@ from skyvern.schemas.workflows import (
 )
 from skyvern.services import block_service, run_service, task_v1_service, task_v2_service, workflow_service
 from skyvern.services.pdf_import_service import pdf_import_service
+from skyvern.utils.url_validators import validate_webhook_url
 from skyvern.utils.yaml_loader import format_yaml_error, safe_load_no_dates
 from skyvern.webeye.actions.actions import Action
 
@@ -272,6 +273,8 @@ async def run_task(
     x_api_key: Annotated[str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TaskRunResponse:
+    if run_request.webhook_url:
+        run_request.webhook_url = validate_webhook_url(run_request.webhook_url)
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
@@ -279,6 +282,7 @@ async def run_task(
     skyvern_ctx = skyvern_context.current()
     # Per-request distinct_id makes the TTLCache effectively single-use here; that's the
     # price of true %-rollout randomization on a flag that's only checked once per request.
+    forced_to_v1 = False
     force_task_v1_distinct_id = (
         skyvern_ctx.request_id if skyvern_ctx and skyvern_ctx.request_id else current_org.organization_id
     )
@@ -306,6 +310,7 @@ async def run_task(
             **log_extra,
         )
         run_request.engine = RunEngine.skyvern_v1
+        forced_to_v1 = True
         if not run_request.max_steps or run_request.max_steps > cap:
             run_request.max_steps = cap
 
@@ -315,7 +320,7 @@ async def run_task(
         model=run_request.model,
     )
 
-    if run_request.engine in CUA_ENGINES or run_request.engine == RunEngine.skyvern_v1:
+    if run_request.engine in CUA_ENGINES or run_request.engine in (RunEngine.skyvern_v1, RunEngine.skyvern_v3):
         # The V1 / CUA task engines build a legacy TaskRequest that carries no browser-memory controls,
         # so these run-level fields would silently no-op. Reject them explicitly rather than accept-and-
         # ignore; skyvern_v2 honors both via initialize_task_v2. V1/CUA parity is deferred (SKY-12644).
@@ -371,10 +376,11 @@ async def run_task(
             browser_address=run_request.browser_address,
         )
         try:
-            task_v1_response = await task_v1_service.run_task(
+            task_v1_response, resolved_engine = await task_v1_service.run_task(
                 task=task_v1_request,
                 organization=current_org,
                 engine=run_request.engine,
+                ab_routing_eligible=not forced_to_v1,
                 x_max_steps_override=run_request.max_steps,
                 x_api_key=x_api_key,
                 request=request,
@@ -386,15 +392,19 @@ async def run_task(
             span = trace.get_current_span()
             if span and task_v1_response.task_id:
                 span.set_attribute("task_id", task_v1_response.task_id)
+        # Report the run_type that will actually execute: the A/B hook may reroute a default
+        # request to v3, so derive from the resolved engine, not the original request engine.
         run_type = RunType.task_v1
-        if run_request.engine == RunEngine.openai_cua:
+        if resolved_engine == RunEngine.openai_cua:
             run_type = RunType.openai_cua
-        elif run_request.engine == RunEngine.anthropic_cua:
+        elif resolved_engine == RunEngine.anthropic_cua:
             run_type = RunType.anthropic_cua
-        elif run_request.engine == RunEngine.ui_tars:
+        elif resolved_engine == RunEngine.ui_tars:
             run_type = RunType.ui_tars
-        elif run_request.engine == RunEngine.yutori_navigator:
+        elif resolved_engine == RunEngine.yutori_navigator:
             run_type = RunType.yutori_navigator
+        elif resolved_engine == RunEngine.skyvern_v3:
+            run_type = RunType.task_v3
         # build the task run response
         return TaskRunResponse(
             run_id=task_v1_response.task_id,
@@ -572,6 +582,8 @@ async def run_workflow(
     x_max_steps_override: Annotated[int | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
+    if workflow_run_request.webhook_url:
+        workflow_run_request.webhook_url = validate_webhook_url(workflow_run_request.webhook_url)
     analytics.capture("skyvern-oss-run-workflow")
     current_org = caller.organization
     await PermissionCheckerFactory.get_instance().check(
@@ -3579,7 +3591,7 @@ async def run_task_v1(
     )
 
     try:
-        created_task = await task_v1_service.run_task(
+        created_task, _ = await task_v1_service.run_task(
             task=task,
             organization=current_org,
             x_max_steps_override=x_max_steps_override,
@@ -4382,6 +4394,8 @@ async def run_workflow_legacy(
     x_max_steps_override: Annotated[int | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> RunWorkflowResponse:
+    if workflow_request.webhook_callback_url:
+        workflow_request.webhook_callback_url = validate_webhook_url(workflow_request.webhook_callback_url)
     analytics.capture("skyvern-oss-agent-workflow-execute")
     current_org = caller.organization
     context = skyvern_context.ensure_context()
@@ -5346,6 +5360,9 @@ async def update_organization(
     org_update: OrganizationUpdate,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Organization:
+    if org_update.webhook_callback_url and org_update.webhook_callback_url != current_org.webhook_callback_url:
+        org_update.webhook_callback_url = validate_webhook_url(org_update.webhook_callback_url)
+
     # Validate the per-org artifact URL expiry against the same bounds the
     # signing helper clamps to. Reject out-of-range values at the API edge so
     # users see a clear 400 instead of a silently clamped value persisting in

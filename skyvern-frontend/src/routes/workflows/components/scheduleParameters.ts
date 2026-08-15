@@ -3,6 +3,7 @@ import {
   type Parameter,
   type WorkflowParameter,
 } from "@/routes/workflows/types/workflowTypes";
+import { isAtWillCredentialParameter } from "@/routes/workflows/runWorkflowCredentials";
 
 /**
  * Mirror of `_is_schedule_input_parameter` in
@@ -18,10 +19,15 @@ export function isScheduleParameter(
 /**
  * A workflow parameter is "required" iff it has no default value. The form
  * validators block submission until every required parameter has a value;
- * parameters with defaults can be left blank and the backend will fall back
- * to the default at execution time (see service.py:582-583).
+ * parameters with defaults can be left blank and the backend falls back to the
+ * default at execution time (see service.py:582-583). A credential_id parameter
+ * with no default is an at-will credential: it is not required and resolves to
+ * null (the run proceeds without a credential).
  */
 export function isRequired(parameter: WorkflowParameter): boolean {
+  if (isAtWillCredentialParameter(parameter)) {
+    return false;
+  }
   return (
     parameter.default_value === null || parameter.default_value === undefined
   );

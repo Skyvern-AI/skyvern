@@ -19,14 +19,17 @@ from skyvern.exceptions import (
     InvalidCredentialId,
     InvalidWorkflowParameter,
     MissingValueForParameter,
+    SkyvernHTTPException,
     WorkflowRunParameterPersistenceError,
 )
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenCreditCardDataParameter,
     BitwardenLoginCredentialParameter,
+    CredentialParameter,
     WorkflowParameter,
     WorkflowParameterType,
 )
@@ -359,6 +362,147 @@ async def test_setup_workflow_run_raises_on_missing_required_parameters() -> Non
 
     service.create_workflow_run_parameters.assert_not_awaited()
     service.mark_workflow_run_as_failed.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_allows_missing_at_will_credential() -> None:
+    """A credential_id parameter with no default and no value is skipped instead of raising."""
+    at_will_cred = _make_workflow_parameter("credential", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID)
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[at_will_cred])
+
+    request = WorkflowRequestBody(data={})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=[])
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    mock_app.DATABASE.credentials.get_credentials_by_ids.assert_not_awaited()
+    service.create_workflow_run_parameters.assert_not_awaited()
+    service.mark_workflow_run_as_failed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_treats_blank_value_as_absent_for_at_will_credential() -> None:
+    """A blank credential id for a no-default credential counts as absent, not as a lookup."""
+    at_will_cred = _make_workflow_parameter("credential", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID)
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[at_will_cred])
+
+    request = WorkflowRequestBody(data={"credential": "   "})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=[])
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    mock_app.DATABASE.credentials.get_credentials_by_ids.assert_not_awaited()
+    service.create_workflow_run_parameters.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_still_validates_provided_credential_for_at_will_parameter() -> None:
+    """Providing a non-empty invalid credential id must still 400, even for a no-default credential."""
+    at_will_cred = _make_workflow_parameter("credential", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID)
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[at_will_cred])
+
+    request = WorkflowRequestBody(data={"credential": "cred_missing"})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=[])
+
+        with pytest.raises(InvalidCredentialId) as exc_info:
+            await service.setup_workflow_run(
+                request_id="req_test",
+                workflow_request=request,
+                workflow_permanent_id="wpid_test",
+                organization=organization,
+            )
+
+    assert "cred_missing" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_credential_with_default_uses_default() -> None:
+    """A credential with a default keeps today's fall-back-to-default behavior when omitted."""
+    with_default_cred = _make_workflow_parameter(
+        "credential",
+        workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+        default_value="cred_id_0",
+    )
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[with_default_cred])
+
+    request = WorkflowRequestBody(data={})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
+            return_value=[SimpleNamespace(credential_id="cred_id_0")]
+        )
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    mock_app.DATABASE.credentials.get_credentials_by_ids.assert_awaited_once()
+    service.create_workflow_run_parameters.assert_awaited_once()
+    _, kwargs = service.create_workflow_run_parameters.call_args
+    assert kwargs["workflow_parameter_values"] == [(with_default_cred, "cred_id_0")]
+
+
+@pytest.mark.asyncio
+async def test_resolve_sequential_credential_rejects_binding_to_at_will_credential() -> None:
+    """A CredentialParameter whose credential_id references a no-default, unprovided credential
+    parameter must fail with a clear error instead of validating the literal key as an id."""
+    now = datetime.now(tz=timezone.utc)
+    at_will_param = _make_workflow_parameter("opt_cred", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID)
+    credential_parameter = CredentialParameter(
+        credential_parameter_id="cp_test",
+        workflow_id="wf_test",
+        key="portal_credential",
+        credential_id="opt_cred",
+        created_at=now,
+        modified_at=now,
+    )
+    workflow = SimpleNamespace(
+        workflow_definition=WorkflowDefinition(blocks=[], parameters=[credential_parameter, at_will_param]),
+    )
+    organization = Organization(
+        organization_id="org_test", organization_name="Test Org", created_at=now, modified_at=now
+    )
+
+    service = WorkflowService()
+    with pytest.raises(SkyvernHTTPException, match="has no default and was not provided"):
+        await service._resolve_sequential_credential_id(
+            workflow=workflow,  # type: ignore[arg-type]
+            workflow_run=SimpleNamespace(workflow_run_id="wr_test"),  # type: ignore[arg-type]
+            organization=organization,
+            parameter_values={},
+            credential_selections={},
+        )
 
 
 def _setup_log_calls(mock_log: object, level: str) -> list:

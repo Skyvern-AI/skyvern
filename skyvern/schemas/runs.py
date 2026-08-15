@@ -66,7 +66,7 @@ from skyvern.schemas.run_enums import (  # noqa: F401
     RunType,
 )
 from skyvern.utils.secret_headers import mask_header_values
-from skyvern.utils.url_validators import validate_browser_host, validate_url
+from skyvern.utils.url_validators import WebhookUrl, validate_browser_host, validate_url
 
 MAX_SEARCH_FETCH_LIMIT = 1000
 _BROWSER_ADDRESS_ADAPTER = TypeAdapter(AnyHttpUrl | WebsocketUrl)
@@ -76,13 +76,14 @@ BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY = "browser_address_is_server_assigne
 # union preserves enum instances when runtime Literals use the enum members.
 if TYPE_CHECKING:
     TaskRunTypeField: TypeAlias = Literal[
-        "task_v1", "task_v2", "openai_cua", "anthropic_cua", "ui_tars", "yutori_navigator"
+        "task_v1", "task_v2", "task_v3", "openai_cua", "anthropic_cua", "ui_tars", "yutori_navigator"
     ]
     WorkflowRunTypeField: TypeAlias = Literal["workflow_run"]
 else:
     TaskRunTypeField = Literal[
         RunType.task_v1,
         RunType.task_v2,
+        RunType.task_v3,
         RunType.openai_cua,
         RunType.anthropic_cua,
         RunType.ui_tars,
@@ -457,6 +458,10 @@ class WorkflowRunRequest(BaseModel):
 
 
 class BlockRunRequest(WorkflowRunRequest):
+    webhook_url: WebhookUrl | None = Field(
+        default=None,
+        description="URL to send workflow status updates to after the run finishes.",
+    )
     block_labels: list[str] = Field(
         description="Labels of the blocks to execute",
         examples=["block_1", "block_2"],

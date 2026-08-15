@@ -10,11 +10,9 @@ from typing import Any
 import structlog
 from agents import function_tool
 from agents.run_context import RunContextWrapper
+from typing_extensions import TypedDict
 
 from skyvern.forge import app as app
-from skyvern.forge.sdk.copilot.build_phase import (
-    advance_to_testing,
-)
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error as composition_page_evidence_error,
 )
@@ -25,7 +23,6 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 from skyvern.forge.sdk.copilot.composition_evidence import workflow_target_url as workflow_target_url
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
-from skyvern.forge.sdk.copilot.output_designation_resolution import RequestedOutputRead
 from skyvern.forge.sdk.copilot.output_extraction_plan import value_designation_probe_expression
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY as _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
@@ -33,14 +30,19 @@ from skyvern.forge.sdk.copilot.output_utils import (
 from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
 )
-from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
-from skyvern.forge.sdk.copilot.workflow_yaml import BlockEditError
+from skyvern.forge.sdk.copilot.workflow_yaml import (
+    BlockEditError,
+)
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _process_workflow_yaml
-from skyvern.forge.sdk.copilot.workflow_yaml import apply_block_edit, delete_block_from_workflow
-from skyvern.utils.yaml_loader import safe_load_no_dates
+from skyvern.forge.sdk.copilot.workflow_yaml import (
+    add_block_to_workflow,
+    apply_block_edit,
+    delete_block_from_workflow,
+    stored_workflow_yaml,
+)
 
 from ._shared import _COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS
 from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS as _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
@@ -65,32 +67,16 @@ from .banned_blocks import _detect_new_banned_blocks as _detect_new_banned_block
 from .banned_blocks import _record_banned_block_reject_span as _record_banned_block_reject_span
 from .blockers import _active_block_run_budget_seconds as _active_block_run_budget_seconds
 from .blockers import _analyze_run_blocks as _analyze_run_blocks
-from .blockers import _build_loop_blocker_signal as _build_loop_blocker_signal
-from .blockers import _last_run_has_terminal_anti_bot_blocker as _last_run_has_terminal_anti_bot_blocker
-from .blockers import _per_tool_budget_problem_rerun_signal as _per_tool_budget_problem_rerun_signal
-from .blockers import _post_budget_terminal_challenge_signal as _post_budget_terminal_challenge_signal
-from .blockers import _post_run_terminal_challenge_reason as _post_run_terminal_challenge_reason
-from .blockers import (
-    _record_per_tool_budget_problem_blocks_from_results,
-)
 from .blockers import _run_blocks_structured_blocker_message as _run_blocks_structured_blocker_message
-from .blockers import (
-    _tool_loop_error,
-)
 from .blockers import _trusted_post_drain_status as _trusted_post_drain_status
 from .completion import _build_run_evidence_snapshot as _build_run_evidence_snapshot
 from .completion import _completion_verification_handler as _completion_verification_handler
 from .completion import _is_outcome_evidence_candidate as _is_outcome_evidence_candidate
 from .completion import _is_unfinished_run_verification_candidate as _is_unfinished_run_verification_candidate
-from .completion import _maybe_run_completion_verification as _maybe_run_completion_verification
 from .completion import (
     _maybe_run_completion_verification_from_page_observation as _maybe_run_completion_verification_from_page_observation,
 )
-from .completion import _outcome_failure_warrants_repair as _outcome_failure_warrants_repair
-from .completion import _outcome_unverified_reason as _outcome_unverified_reason
-from .completion import (
-    _tool_visible_result_after_completion_verification,
-)
+from .completion import _stamp_turn_budget_on_result as _stamp_turn_budget_on_result
 from .composition_capture import _capture_composition_evidence as _capture_composition_evidence
 from .composition_capture import (
     _composition_evidence_after_navigation_failure as _composition_evidence_after_navigation_failure,
@@ -108,7 +94,6 @@ from .credential_fill import (
     _fill_credential_field_impl,
 )
 from .credential_fill import _resolve_credential_fill_value as _resolve_credential_fill_value
-from .credentials import _credential_id_misbinding_error_message as _credential_id_misbinding_error_message
 from .credentials import _credential_id_misbinding_findings as _credential_id_misbinding_findings
 from .credentials import _credential_reference_validation_error as _credential_reference_validation_error
 from .credentials import _extract_credential_ids_from_tool_value as _extract_credential_ids_from_tool_value
@@ -117,8 +102,6 @@ from .credentials import (
     _list_credentials,
 )
 from .discovery import _DISCOVERY_NAVIGATION_FALLBACK_CONFIDENCE as _DISCOVERY_NAVIGATION_FALLBACK_CONFIDENCE
-from .discovery import _DISCOVERY_PER_CHAT_BUDGET as _DISCOVERY_PER_CHAT_BUDGET
-from .discovery import _DISCOVERY_PER_TURN_BUDGET as _DISCOVERY_PER_TURN_BUDGET
 from .discovery import _DISCOVERY_STEP_CAP as _DISCOVERY_STEP_CAP
 from .discovery import _discover_workflow_entrypoint_impl as _discover_workflow_entrypoint_impl
 from .discovery import _discovery_anchor_score as _discovery_anchor_score
@@ -137,7 +120,6 @@ from .frontier import _SKYVERN_TEMPLATE_CONTEXT_ROOTS as _SKYVERN_TEMPLATE_CONTE
 from .frontier import _TEMPLATE_BUILTIN_ROOTS as _TEMPLATE_BUILTIN_ROOTS
 from .frontier import _detect_stale_block_metadata as _detect_stale_block_metadata
 from .frontier import _find_invalidated_labels as _find_invalidated_labels
-from .frontier import _frontier_run_size_error as _frontier_run_size_error
 from .frontier import _get_prior_workflow as _get_prior_workflow
 from .frontier import _get_prior_workflow_definition as _get_prior_workflow_definition
 from .frontier import _invalidate_verified_state_on_edit as _invalidate_verified_state_on_edit
@@ -153,23 +135,18 @@ from .frontier import (
 from .guardrails import (
     _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL,
     _authority_tool_error,
+    _credential_deferred_draft_requires_skipped_run,
 )
 from .guardrails import _parameter_binding_invariant_error as _parameter_binding_invariant_error
 from .guardrails import (
-    _request_policy_allows_credential_deferred_draft,
-    _request_policy_allows_update_and_skip_run,
+    _update_and_run_requires_skipped_run,
 )
-from .guardrails import _turn_intent_tool_error as _turn_intent_tool_error
 from .integrations import (
     _list_integrations,
 )
 from .mcp_hooks import _build_skyvern_mcp_overlays as _build_skyvern_mcp_overlays
 from .mcp_hooks import _click_post_hook as _click_post_hook
 from .mcp_hooks import _click_pre_hook as _click_pre_hook
-from .mcp_hooks import (
-    _code_only_pre_run_results_error,
-    _demonstrated_step_sources,
-)
 from .mcp_hooks import _evaluate_post_hook as _evaluate_post_hook
 from .mcp_hooks import _get_block_schema_post_hook as _get_block_schema_post_hook
 from .mcp_hooks import _get_block_schema_pre_hook as _get_block_schema_pre_hook
@@ -180,9 +157,6 @@ from .mcp_hooks import _select_option_post_hook as _select_option_post_hook
 from .mcp_hooks import _type_text_post_hook as _type_text_post_hook
 from .mcp_hooks import _verify_scout_type_landed as _verify_scout_type_landed
 from .mcp_hooks import get_skyvern_mcp_alias_map as get_skyvern_mcp_alias_map
-from .mcp_hooks import (
-    resolve_requested_output_designation_from_page_evidence,
-)
 from .page_observation import _record_composition_page_observation as _record_composition_page_observation
 from .page_observation import _resolve_url_title as _resolve_url_title
 from .run_execution import RUN_BLOCKS_STAGNATION_WINDOW_SECONDS as RUN_BLOCKS_STAGNATION_WINDOW_SECONDS
@@ -194,12 +168,7 @@ from .run_execution import _composition_anti_bot_reason as _composition_anti_bot
 from .run_execution import _detect_non_retriable_nav_error as _detect_non_retriable_nav_error
 from .run_execution import (
     _diagnosis_repair_tool_error,
-    _frontier_run_size_result,
     _get_run_results,
-)
-from .run_execution import _mark_pending_reconciliation_run as _mark_pending_reconciliation_run
-from .run_execution import (
-    _maybe_clear_reconciliation_flag,
 )
 from .run_execution import _progress_marker as _progress_marker
 from .run_execution import _read_progress_sources as _read_progress_sources
@@ -224,7 +193,6 @@ from .scouting import (
     _consume_pending_browser_interaction_observation as _consume_pending_browser_interaction_observation,
 )
 from .scouting import _consume_scout_source_url as _consume_scout_source_url
-from .scouting import _mark_page_inspected as _mark_page_inspected
 from .scouting import _mark_pending_browser_interaction_observation as _mark_pending_browser_interaction_observation
 from .scouting import _mark_post_run_page_observed as _mark_post_run_page_observed
 from .scouting import _prenav_ambiguity_for_selector as _prenav_ambiguity_for_selector
@@ -237,18 +205,11 @@ from .workflow_update import BlockObservationRef as BlockObservationRef
 from .workflow_update import CodeArtifactMetadata as CodeArtifactMetadata
 from .workflow_update import _code_artifact_metadata_as_tool_argument as _code_artifact_metadata_as_tool_argument
 from .workflow_update import _code_block_safety_errors as _code_block_safety_errors
-from .workflow_update import (
-    _impose_output_contract_envelope_after_steering as _impose_output_contract_envelope_after_steering,
-)
 from .workflow_update import _normalize_code_artifact_metadata as _normalize_code_artifact_metadata
 from .workflow_update import _record_workflow_proxy_location_span as _record_workflow_proxy_location_span
 from .workflow_update import _record_workflow_update_result as _record_workflow_update_result
-from .workflow_update import _scaffold_metadata_contract_for_update as _scaffold_metadata_contract_for_update
 from .workflow_update import _update_workflow as _update_workflow
 from .workflow_update import carry_author_time_findings as carry_author_time_findings
-from .workflow_update import (
-    consume_output_contract_advisory_grant_for_run_result as consume_output_contract_advisory_grant_for_run_result,
-)
 
 LOG = structlog.get_logger()
 
@@ -313,10 +274,7 @@ async def update_workflow_tool(
         "block_observation_refs": normalized_block_observation_refs,
         "code_artifact_metadata": serialized_code_artifact_metadata,
     }
-    loop_error = _tool_loop_error(copilot_ctx, "update_workflow", arguments)
-    if loop_error:
-        return json.dumps({"ok": False, "error": loop_error})
-    credential_deferred_draft = _request_policy_allows_credential_deferred_draft(copilot_ctx)
+    credential_deferred_draft = _credential_deferred_draft_requires_skipped_run(copilot_ctx)
 
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
@@ -344,15 +302,30 @@ async def update_workflow_tool(
     return json.dumps(sanitized)
 
 
-async def _persist_block_scoped_edit(copilot_ctx: Any, tool_name: str, workflow_yaml: str, arguments: dict) -> str:
+async def _persist_block_scoped_edit(
+    copilot_ctx: Any,
+    tool_name: str,
+    workflow_yaml: str,
+    arguments: dict,
+    *,
+    code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
+    block_observation_refs: list[BlockObservationRef] | None = None,
+) -> str:
     """Send a server-composed workflow through the normal persistence path.
 
     The model never sends the whole workflow, but the saved result still goes through every
     author-time check, so a block edit cannot slip past what a full submission must satisfy.
     """
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
+    params: dict[str, Any] = {"workflow_yaml": workflow_yaml}
+    if code_artifact_metadata is not None:
+        params["code_artifact_metadata"] = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
+        params["raw_code_artifact_metadata"] = code_artifact_metadata
+    if block_observation_refs is not None:
+        params["block_observation_refs"] = normalize_block_observation_refs(block_observation_refs)
+        params["raw_block_observation_refs"] = block_observation_refs
     with copilot_span(tool_name, data={"yaml_length": len(workflow_yaml)}):
-        result = await _update_workflow({"workflow_yaml": workflow_yaml}, copilot_ctx)
+        result = await _update_workflow(params, copilot_ctx)
         _record_workflow_update_result(copilot_ctx, result, prior_definition)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
         if result.get("ok") is False:
@@ -361,44 +334,7 @@ async def _persist_block_scoped_edit(copilot_ctx: Any, tool_name: str, workflow_
 
 
 def _stored_workflow_yaml(copilot_ctx: Any) -> str:
-    latest = getattr(copilot_ctx, "last_workflow_yaml", None)
-    if isinstance(latest, str) and latest.strip():
-        return latest
-    stored = getattr(copilot_ctx, "workflow_yaml", None)
-    return stored if isinstance(stored, str) else ""
-
-
-def _submission_only_changes_existing_blocks(copilot_ctx: Any, workflow_yaml: str) -> bool:
-    """Whether a whole-workflow submission changes nothing structural.
-
-    Same labels in, same labels out means the model is editing block contents through a tool that
-    re-sends every block. Adding or removing a block is structural and still needs the whole
-    workflow, since edit_block only reaches blocks that already exist.
-    """
-    stored = _stored_workflow_yaml(copilot_ctx)
-    if not stored.strip() or not workflow_yaml.strip():
-        return False
-    try:
-        before = safe_load_no_dates(stored)
-        after = safe_load_no_dates(workflow_yaml)
-    except Exception:
-        return False
-
-    def labels(parsed: Any) -> set[str] | None:
-        if not isinstance(parsed, dict):
-            return None
-        definition = parsed.get("workflow_definition")
-        if not isinstance(definition, dict):
-            return None
-        blocks = definition.get("blocks")
-        if not isinstance(blocks, list):
-            return None
-        return {str(b.get("label") or "") for b in blocks if isinstance(b, dict)}
-
-    before_labels, after_labels = labels(before), labels(after)
-    if before_labels is None or after_labels is None or not after_labels:
-        return False
-    return before_labels == after_labels
+    return stored_workflow_yaml(copilot_ctx)
 
 
 @function_tool(name_override="edit_block", strict_mode=False)
@@ -425,9 +361,6 @@ async def edit_block_tool(
     """
     copilot_ctx = ctx.context
     arguments = {"label": label, "fields": fields, "has_code_edit": expected_code is not None}
-    loop_error = _tool_loop_error(copilot_ctx, "edit_block", arguments)
-    if loop_error:
-        return json.dumps({"ok": False, "error": loop_error})
     authority_error = _authority_tool_error(copilot_ctx, "edit_block")
     if authority_error:
         return json.dumps({"ok": False, "error": authority_error})
@@ -446,6 +379,55 @@ async def edit_block_tool(
     return await _persist_block_scoped_edit(copilot_ctx, "edit_block", workflow_yaml, arguments)
 
 
+@function_tool(name_override="add_block", strict_mode=False)
+async def add_block_tool(
+    ctx: RunContextWrapper,
+    after_label: str,
+    block_yaml: str,
+    parameters: list[dict[str, Any]] | None = None,
+    code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
+    block_observation_refs: list[BlockObservationRef] | None = None,
+) -> str:
+    """Add one new block after an existing one, leaving every other block exactly as it is.
+
+    Prefer this over update_and_run_blocks whenever you are adding to a workflow that already exists:
+    you send only the new block, so the blocks that already work cannot be disturbed and the workflow
+    is not retyped. `after_label` must name a block that exists; the new block is linked in directly
+    after it and inherits what that block pointed at.
+
+    Pass `block_yaml` as a single block mapping including its `label`. Declare any new top-level
+    workflow parameters the block reads in `parameters` — a new block and the parameter it consumes
+    have to land in the same call, or the workflow is briefly saved in a state that cannot run. For a
+    code block pass its `code_artifact_metadata` row here too, since a brand-new block has none yet.
+
+    To change a block that already exists use edit_block; to remove one use delete_block.
+    """
+    copilot_ctx = ctx.context
+    arguments = {"after_label": after_label, "parameters": parameters}
+    authority_error = _authority_tool_error(copilot_ctx, "add_block")
+    if authority_error:
+        return json.dumps({"ok": False, "error": authority_error})
+    try:
+        workflow_yaml = add_block_to_workflow(
+            _stored_workflow_yaml(copilot_ctx),
+            after_label,
+            block_yaml,
+            parameters=parameters,
+        )
+    except BlockEditError as exc:
+        result = {"ok": False, "error": str(exc)}
+        record_tool_step_result_for_ctx(copilot_ctx, "add_block", arguments, result)
+        return json.dumps(result)
+    return await _persist_block_scoped_edit(
+        copilot_ctx,
+        "add_block",
+        workflow_yaml,
+        arguments,
+        code_artifact_metadata=code_artifact_metadata,
+        block_observation_refs=block_observation_refs,
+    )
+
+
 @function_tool(name_override="delete_block")
 async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
     """Remove one block from the workflow by label.
@@ -455,9 +437,6 @@ async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
     """
     copilot_ctx = ctx.context
     arguments = {"label": label}
-    loop_error = _tool_loop_error(copilot_ctx, "delete_block", arguments)
-    if loop_error:
-        return json.dumps({"ok": False, "error": loop_error})
     authority_error = _authority_tool_error(copilot_ctx, "delete_block")
     if authority_error:
         return json.dumps({"ok": False, "error": authority_error})
@@ -470,41 +449,53 @@ async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
     return await _persist_block_scoped_edit(copilot_ctx, "delete_block", workflow_yaml, arguments)
 
 
+class RequestedOutputRead(TypedDict):
+    """A requested output and the exact label/value the model sees on the current page."""
+
+    output_path: str
+    value_text: str
+    label: str
+
+
 _MAX_REQUESTED_OUTPUT_READS = 8
 
-# Probe outcomes that located the designated value without resolving it to a single element.
-_DESIGNATION_ERRORS_THAT_SAW_THE_VALUE = frozenset({"text-ambiguous", "path-unstable"})
 
-
-async def _validate_requested_output_reads(
-    copilot_ctx: AgentContext, reads: list[RequestedOutputRead]
+async def _verify_requested_output_reads(
+    copilot_ctx: CopilotContext,
+    reads: list[RequestedOutputRead],
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    """Resolve each designated value against the live page; keep what pins, report what does not."""
-    validated: list[dict[str, Any]] = []
-    rejected: list[dict[str, str]] = []
-    server = copilot_ctx.discovery_mcp_server
+    """Verify model-designated rendered values and return page facts without retaining a plan."""
+    verified: list[dict[str, Any]] = []
+    unverified: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
     if len(reads) > _MAX_REQUESTED_OUTPUT_READS:
-        rejected.append({"output_path": "", "error": f"only the first {_MAX_REQUESTED_OUTPUT_READS} reads were probed"})
+        unverified.append({"output_path": "", "reason": f"only-first-{_MAX_REQUESTED_OUTPUT_READS}-reads-verified"})
     for read in reads[:_MAX_REQUESTED_OUTPUT_READS]:
-        raw_path = str(read.get("output_path") or "")
+        raw_path = str(read.get("output_path") or "").strip()
+        output_path = raw_path if raw_path.startswith("output.") else f"output.{raw_path}"
         value_text = str(read.get("value_text") or "").strip()
         label = str(read.get("label") or "").strip()
-        # The model designates by the output's own name; "output." is our internal path prefix.
-        output_path = raw_path if raw_path.startswith("output.") else f"output.{raw_path}"
         if not raw_path or not value_text:
-            rejected.append({"output_path": raw_path, "error": "malformed"})
+            unverified.append({"output_path": raw_path, "reason": "malformed"})
             continue
+        if output_path in seen_paths:
+            unverified.append({"output_path": output_path, "reason": "duplicate-output-path"})
+            continue
+        seen_paths.add(output_path)
+        server = copilot_ctx.discovery_mcp_server
         if server is None:
-            rejected.append({"output_path": output_path, "error": "no-browser"})
+            unverified.append({"output_path": output_path, "reason": "no-browser"})
             continue
-        expression = value_designation_probe_expression(value_text, label)
         try:
             raw = await asyncio.wait_for(
-                server.call_internal_tool("skyvern_evaluate", {"expression": expression}),
+                server.call_internal_tool(
+                    "skyvern_evaluate",
+                    {"expression": value_designation_probe_expression(value_text, label)},
+                ),
                 timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
             )
         except Exception:
-            rejected.append({"output_path": output_path, "error": "probe-failed"})
+            unverified.append({"output_path": output_path, "reason": "probe-failed"})
             continue
         payload = (raw.get("data") or {}).get("result") if isinstance(raw, dict) and raw.get("ok") else None
         if isinstance(payload, str):
@@ -513,108 +504,41 @@ async def _validate_requested_output_reads(
             except (TypeError, ValueError):
                 payload = None
         if not isinstance(payload, dict) or payload.get("error") or not isinstance(payload.get("text"), str):
-            error = str(payload.get("error")) if isinstance(payload, dict) and payload.get("error") else "no-result"
-            detail = {"output_path": output_path, "error": error, "value_text": value_text[:40]}
-            if isinstance(payload, dict):
-                for field_name in ("match_count", "visible_count"):
-                    if payload.get(field_name) is not None:
-                        detail[field_name] = str(payload[field_name])
-            rejected.append(detail)
-            # The probe failed to pin one element, not to find the value: several leaves showed it,
-            # or no stable path reached the one that did. The value is still what the model read off
-            # the page, and the relation capture carries its own uniqueness proof for it.
-            if error in _DESIGNATION_ERRORS_THAT_SAW_THE_VALUE and isinstance(payload, dict):
-                validated.append(
-                    {
-                        "output_path": output_path,
-                        "selector": "",
-                        "text": str(payload.get("text") or value_text),
-                        "url": str(payload.get("url") or ""),
-                    }
-                )
+            reason = str(payload.get("error")) if isinstance(payload, dict) and payload.get("error") else "no-result"
+            unverified.append({"output_path": output_path, "reason": reason})
             continue
-        resolved_selector = payload.get("selector")
-        validated.append(
+        raw_candidates = payload.get("selector_candidates")
+        candidates: list[dict[str, Any]] = []
+        if isinstance(raw_candidates, list):
+            for candidate in raw_candidates:
+                if isinstance(candidate, str) and candidate:
+                    candidates.append({"selector": candidate, "match_count": None, "position": None})
+                elif isinstance(candidate, dict) and isinstance(candidate.get("selector"), str):
+                    candidates.append(
+                        {
+                            "selector": candidate["selector"],
+                            "match_count": candidate.get("match_count"),
+                            "position": candidate.get("position"),
+                        }
+                    )
+        if not candidates:
+            unverified.append({"output_path": output_path, "reason": "no-stable-selector"})
+            continue
+        verified.append(
             {
                 "output_path": output_path,
-                "selector": resolved_selector if isinstance(resolved_selector, str) else "",
-                "match_count": payload.get("match_count"),
-                "position": payload.get("position"),
-                "text": payload["text"],
-                "url": payload.get("url") or "",
+                "label": label,
+                "rendered_value": payload["text"],
+                "selector_candidates": candidates,
+                "page_url": str(payload.get("url") or ""),
             }
         )
-    return validated, rejected
-
-
-async def _accept_requested_output_reads(
-    copilot_ctx: AgentContext, reads: list[RequestedOutputRead], *, offered_by: str
-) -> list[dict[str, str]]:
-    """Pin the values the model read off the page, keeping what earlier offers already pinned.
-
-    The offer is reachable from every page inspection, so a path designated while one page was
-    loaded has to survive an offer made later for a different path (SKY-13485).
-    """
-    from skyvern.forge.sdk.copilot.enforcement import requested_output_extraction_plan
-
-    validated, rejected = await _validate_requested_output_reads(copilot_ctx, reads)
-    designated = {str(entry.get("output_path") or ""): entry for entry in copilot_ctx.requested_output_designations}
-    designated.update({str(entry["output_path"]): entry for entry in validated})
-    copilot_ctx.requested_output_designations = list(designated.values())
-    if validated:
-        # Bind at the observation that designated it, whoever supplied it: reach, completeness and
-        # ownership read the retained plan, so a designation that never derives one leaves the turn
-        # unable to land the read it just pinned.
-        requested_output_extraction_plan(copilot_ctx)
     LOG.info(
-        "copilot_requested_output_designations",
-        offered_by=offered_by,
-        pinned=[{"output_path": d["output_path"], "text": d["text"][:40]} for d in validated if d["selector"]],
-        value_only=[{"output_path": d["output_path"], "text": d["text"][:40]} for d in validated if not d["selector"]],
-        rejected=rejected,
+        "copilot_requested_output_designation_facts",
+        verified_paths=[fact["output_path"] for fact in verified],
+        unverified=unverified,
     )
-    return rejected
-
-
-@function_tool(name_override="synthesize_demonstrated_block")
-async def synthesize_demonstrated_block_tool(
-    ctx: RunContextWrapper,
-    requested_output_reads: list[RequestedOutputRead] | None = None,
-) -> str:
-    """Return code-block source built from the steps you already performed in the browser.
-
-    This is compiled from your recorded interactions, so it reflects what actually happened rather
-    than what you remember doing. Use it as the body of a code block instead of writing the steps
-    again from memory, and edit it if the block needs to do more.
-
-    When the request asks the workflow to return values you can see on the page, pass
-    requested_output_reads: for each requested output, `value_text` is the value exactly as it is
-    rendered ("8.9K", not 8900) and `label` is the heading it sits under. The page resolves those to
-    the element and compiles a pinned deterministic read; you do not need to know its markup.
-    """
-    copilot_ctx = ctx.context
-    arguments: dict[str, Any] = {"requested_output_reads": requested_output_reads or []}
-    loop_error = _tool_loop_error(copilot_ctx, "synthesize_demonstrated_block", arguments)
-    if loop_error:
-        return json.dumps({"ok": False, "error": loop_error})
-    rejected: list[dict[str, str]] = []
-    if requested_output_reads:
-        rejected = await _accept_requested_output_reads(
-            copilot_ctx, requested_output_reads, offered_by="synthesize_demonstrated_block"
-        )
-    source = _demonstrated_step_sources(copilot_ctx)
-    if not source:
-        result = {
-            "ok": False,
-            "error": "Nothing has been demonstrated in the browser yet, so there are no steps to compile.",
-        }
-    else:
-        data: dict[str, Any] = {"code": source}
-        if rejected:
-            data["rejected_output_reads"] = rejected
-        result = {"ok": True, "data": data}
-    record_tool_step_result_for_ctx(copilot_ctx, "synthesize_demonstrated_block", arguments, result)
-    return json.dumps(result)
+    return verified, unverified
 
 
 @function_tool(name_override="list_credentials")
@@ -627,10 +551,12 @@ async def list_credentials_tool(
     """List stored credentials (metadata only — never passwords or secrets).
     Use this to find credential IDs for login blocks.
 
-    For a saved name or credential ID stated exactly in the latest user turn, pass it as
-    `exact_reference`. Exact mode resolves organization-wide cardinality and atomically binds
-    the single match into server-owned request authority. It never falls back to fuzzy search,
-    discovery, or pagination. Zero or multiple exact matches grant no authority.
+    When the agent selects a saved name or credential ID that appears as a complete
+    credential reference in the latest literal user turn, pass it as `exact_reference`.
+    Exact mode verifies provenance and organization-wide cardinality, then atomically binds
+    the single match into server-owned request authority. It does not classify the surrounding
+    prose and never falls back to fuzzy search, discovery, or pagination. Zero or multiple exact
+    matches grant no authority.
 
     Without `exact_reference`, this is metadata-only discovery. Paginated. `page_size` caps at 50. The response includes `has_more`;
     before concluding no credential exists, keep incrementing `page` until
@@ -639,10 +565,6 @@ async def list_credentials_tool(
     """
     copilot_ctx = ctx.context
     arguments = {"page": page, "page_size": page_size, "exact_reference": exact_reference}
-    loop_error = _tool_loop_error(copilot_ctx, "list_credentials", arguments)
-    if loop_error:
-        return json.dumps({"ok": False, "error": loop_error})
-
     authority_error = _authority_tool_error(copilot_ctx, "list_credentials")
     if authority_error:
         result = {"ok": False, "error": authority_error}
@@ -658,8 +580,8 @@ async def list_credentials_tool(
 @function_tool(name_override="list_integrations")
 async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     """List the organization's connected Google and Microsoft accounts (metadata only —
-    never tokens). Each entry has `connection_id`, `provider`, `name`, `state`, and
-    `scopes_granted`.
+    never tokens). Each entry has `connection_id`, `provider`, `name`, `state`,
+    `email_address`, and `scopes_granted`.
 
     These are OAuth connections made on the Integrations page, NOT the stored
     login credentials returned by `list_credentials` — the two lists are disjoint,
@@ -675,10 +597,6 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     """
     copilot_ctx = ctx.context
     arguments: dict[str, Any] = {}
-    loop_error = _tool_loop_error(copilot_ctx, "list_integrations", arguments)
-    if loop_error:
-        return json.dumps({"ok": False, "error": loop_error})
-
     authority_error = _authority_tool_error(copilot_ctx, "list_integrations")
     if authority_error:
         result = {"ok": False, "error": authority_error}
@@ -736,25 +654,10 @@ async def run_blocks_tool(
     if authority_error:
         return _diagnosis_repair_tool_error(copilot_ctx, "run_blocks_and_collect_debug", authority_error)
 
-    loop_error = _tool_loop_error(copilot_ctx, "run_blocks_and_collect_debug", arguments)
-    if loop_error:
-        return _diagnosis_repair_tool_error(copilot_ctx, "run_blocks_and_collect_debug", loop_error)
-
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
     labels_to_execute, block_outputs_to_seed, frontier_start_label = _plan_frontier(
         copilot_ctx, block_labels, prior_definition, prior_definition
     )
-    frontier_error = _frontier_run_size_error(copilot_ctx, block_labels, labels_to_execute, prior_definition)
-    if frontier_error:
-        result = _frontier_run_size_result(frontier_error, block_labels, labels_to_execute)
-        record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, result)
-        _record_diagnosis_repair_contract(
-            copilot_ctx,
-            source_tool="run_blocks_and_collect_debug",
-            result=result,
-        )
-        return json.dumps(result)
-
     with copilot_span(
         "run_blocks",
         data=_run_blocks_span_data(
@@ -772,22 +675,16 @@ async def run_blocks_tool(
             block_outputs_to_seed=block_outputs_to_seed,
             frontier_start_label=frontier_start_label,
         )
-        consume_output_contract_advisory_grant_for_run_result(copilot_ctx, result)
-        completion_verification = await _verify_and_record_run_blocks_result(copilot_ctx, result, handler_start)
-        tool_visible_result = _tool_visible_result_after_completion_verification(
-            copilot_ctx,
-            result,
-            completion_verification,
-        )
-        record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, tool_visible_result)
+        await _verify_and_record_run_blocks_result(copilot_ctx, result, handler_start)
+        record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, result)
         _record_diagnosis_repair_contract(
             copilot_ctx,
             source_tool="run_blocks_and_collect_debug",
-            result=tool_visible_result,
+            result=result,
         )
         enqueue_screenshot_from_result(copilot_ctx, result)
 
-    sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", tool_visible_result)
+    sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
     return json.dumps(sanitized)
 
 
@@ -807,21 +704,10 @@ async def get_run_results_tool(
     params: dict[str, Any] = {}
     if workflow_run_id:
         params["workflow_run_id"] = workflow_run_id
-    loop_error = _tool_loop_error(copilot_ctx, "get_run_results", params)
-    if loop_error:
-        return json.dumps({"ok": False, "error": loop_error})
     authority_error = _authority_tool_error(copilot_ctx, "get_run_results")
     if authority_error:
         return json.dumps({"ok": False, "error": authority_error})
-    if isinstance(copilot_ctx, CopilotContext):
-        code_only_pre_run_error = _code_only_pre_run_results_error(copilot_ctx)
-        if code_only_pre_run_error is not None:
-            record_tool_step_result_for_ctx(copilot_ctx, "get_run_results", params, code_only_pre_run_error)
-            return json.dumps(code_only_pre_run_error)
-
     result = await _get_run_results(params, copilot_ctx)
-    _record_per_tool_budget_problem_blocks_from_results(copilot_ctx, result)
-    _maybe_clear_reconciliation_flag(copilot_ctx, result)
     record_tool_step_result_for_ctx(copilot_ctx, "get_run_results", params, result)
 
     sanitized = sanitize_tool_result_for_llm("get_run_results", result)
@@ -891,20 +777,6 @@ async def update_and_run_blocks_tool(
     do not compose a click against a control observed as disabled.
     """
     copilot_ctx = ctx.context
-    if _submission_only_changes_existing_blocks(copilot_ctx, workflow_yaml):
-        # Re-sending every block to change some of them is what disturbs a block that already works
-        # and grows the turn with each repair. Structural changes still come through here.
-        return json.dumps(
-            {
-                "ok": False,
-                "error": (
-                    "This submission changes existing blocks without adding or removing any, so send just "
-                    "the change: call edit_block once per block you are actually changing (or delete_block "
-                    "to remove one), then run the affected blocks with run_blocks_and_collect_debug. Send a "
-                    "whole workflow here only when the set of blocks itself changes."
-                ),
-            }
-        )
     copilot_ctx.completion_verification_result = None
     handler_start = time.monotonic()
     serialized_code_artifact_metadata: object = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
@@ -916,43 +788,16 @@ async def update_and_run_blocks_tool(
         "code_artifact_metadata": serialized_code_artifact_metadata,
         "parameters": parameters or {},
     }
-    skip_run_after_update = _request_policy_allows_update_and_skip_run(copilot_ctx, "update_and_run_blocks")
+    skip_run_after_update = _update_and_run_requires_skipped_run(copilot_ctx, "update_and_run_blocks")
     # Cleared unconditionally up front and only set True at the actual skip
     # branch below — reflects "we skipped a run", not "the policy would have
     # allowed a skip if we got that far". A stale True from an earlier call, or
     # a premature True from a policy check ahead of an unrelated update_workflow
     # failure, would misreport an authoring error as a credential ask.
     copilot_ctx.last_run_skipped_unbound_credentials = False
-    authority_error = _authority_tool_error(
-        copilot_ctx,
-        "update_and_run_blocks",
-        ignore_request_policy_error=skip_run_after_update,
-    )
+    authority_error = _authority_tool_error(copilot_ctx, "update_and_run_blocks")
     if authority_error:
         return _diagnosis_repair_tool_error(copilot_ctx, "update_and_run_blocks", authority_error)
-
-    workflow_yaml, imposed_code_artifact_metadata, envelope_imposed = _impose_output_contract_envelope_after_steering(
-        copilot_ctx,
-        workflow_yaml,
-        serialized_code_artifact_metadata,
-    )
-    if envelope_imposed:
-        serialized_code_artifact_metadata = imposed_code_artifact_metadata
-        arguments["workflow_yaml"] = workflow_yaml
-        arguments["code_artifact_metadata"] = serialized_code_artifact_metadata
-
-    scaffolded_code_artifact_metadata, scaffold_applied = _scaffold_metadata_contract_for_update(
-        copilot_ctx,
-        workflow_yaml,
-        serialized_code_artifact_metadata,
-    )
-    if scaffold_applied:
-        serialized_code_artifact_metadata = scaffolded_code_artifact_metadata
-        arguments["code_artifact_metadata"] = serialized_code_artifact_metadata
-
-    loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks", arguments)
-    if loop_error:
-        return _diagnosis_repair_tool_error(copilot_ctx, "update_and_run_blocks", loop_error)
 
     _clear_pending_browser_interaction_observation(copilot_ctx)
 
@@ -968,16 +813,12 @@ async def update_and_run_blocks_tool(
                 "block_observation_refs": normalized_block_observation_refs,
                 "raw_block_observation_refs": block_observation_refs,
                 "code_artifact_metadata": serialized_code_artifact_metadata,
-                "raw_code_artifact_metadata": serialized_code_artifact_metadata
-                if scaffold_applied or envelope_imposed
-                else code_artifact_metadata,
+                "raw_code_artifact_metadata": code_artifact_metadata,
                 "block_labels": block_labels,
                 "parameters": parameters or {},
             },
             copilot_ctx,
             allow_missing_credentials=skip_run_after_update,
-            allow_static_output_uncertainty=True,
-            formation_prepared=True,
         )
         _record_workflow_update_result(copilot_ctx, update_result, prior_definition)
 
@@ -1026,22 +867,6 @@ async def update_and_run_blocks_tool(
     labels_to_execute, block_outputs_to_seed, frontier_start_label = _plan_frontier(
         copilot_ctx, block_labels, prior_definition, new_definition
     )
-    frontier_error = _frontier_run_size_error(copilot_ctx, block_labels, labels_to_execute, new_definition)
-    if frontier_error:
-        result = _frontier_run_size_result(frontier_error, block_labels, labels_to_execute)
-        data = result.get("data")
-        if isinstance(data, dict):
-            data["workflow_updated"] = True
-        carry_author_time_findings(update_result, result)
-        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, result)
-        _record_diagnosis_repair_contract(
-            copilot_ctx,
-            source_tool="update_and_run_blocks",
-            result=result,
-            workflow_updated=True,
-        )
-        return json.dumps(result)
-
     with copilot_span(
         "run_blocks",
         data=_run_blocks_span_data(
@@ -1059,26 +884,17 @@ async def update_and_run_blocks_tool(
             block_outputs_to_seed=block_outputs_to_seed,
             frontier_start_label=frontier_start_label,
         )
-        consume_output_contract_advisory_grant_for_run_result(copilot_ctx, run_result)
-        completion_verification = await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
-        tool_visible_result = _tool_visible_result_after_completion_verification(
-            copilot_ctx,
-            run_result,
-            completion_verification,
-        )
-        carry_author_time_findings(update_result, tool_visible_result)
-        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, tool_visible_result)
+        await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
+        carry_author_time_findings(update_result, run_result)
+        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, run_result)
         _record_diagnosis_repair_contract(
             copilot_ctx,
             source_tool="update_and_run_blocks",
-            result=tool_visible_result,
+            result=run_result,
             workflow_updated=True,
         )
         enqueue_screenshot_from_result(copilot_ctx, run_result)
-        if run_result.get("ok"):
-            advance_to_testing(copilot_ctx)
-
-    sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", tool_visible_result)
+    sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)
     return json.dumps(sanitized)
 
 
@@ -1106,11 +922,12 @@ async def discover_workflow_entrypoint_tool(
     ``candidate_url`` as the ``url`` value on a ``goto_url`` block. Do NOT
     paste the evidence into workflow YAML.
 
-    Budget: one successful call per turn, three per chat, eight page hops,
-    sixty seconds. On any ``failure_reason``, ASK_QUESTION for a URL — do not
-    retry. Discovery navigates and reads pages; it will NOT type, click form
-    buttons, run JavaScript, or submit forms.
+    Discovery navigates and reads pages; it will NOT type, click form buttons,
+    run JavaScript, or submit forms.
     """
+    authority_error = _authority_tool_error(ctx.context, "discover_workflow_entrypoint")
+    if authority_error:
+        return _diagnosis_repair_tool_error(ctx.context, "discover_workflow_entrypoint", authority_error)
     result = await _discover_workflow_entrypoint_impl(ctx.context, site_or_url, intent_hint)
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
@@ -1141,27 +958,26 @@ async def inspect_page_for_composition_tool(
     evidence shows required fields or controls that the user did not supply
     enough information for, ASK_QUESTION with that observed missing input. If
     evidence is sufficient, compose and run workflow blocks from the observed fields.
-    If challenge_state.gates_submit_controls is true, treat challenge resolution
-    as a prerequisite for submit/search; do not click a submit control while the
-    latest inspected evidence says it is disabled. If a later test still leaves
-    that submit/search control disabled after a challenge-resolution attempt,
-    report the observed anti-bot blocker rather than retrying the same flow.
+    `challenge_state` reports what the page looks like, which is not what a run will do:
+    it does not establish that a submit/search path is closed, and a run settles that.
 
-    Whenever this inspection shows a value the request asked the workflow to return, pass
-    requested_output_reads: `value_text` exactly as rendered ("1.42K", not 1420), `label` the
-    heading it sits under. The page resolves each to its element and pins the read, so the value the
-    workflow returns comes from the tile you are looking at rather than from a guessed locator.
+    When the page visibly shows a requested output but its markup is unclear, pass
+    `requested_output_reads` with the `output_path` your block will return, the exact
+    rendered `value_text`, and its visible `label`. The browser verifies the designation
+    and returns every observed selector candidate with its cardinality as facts; you
+    remain responsible for choosing a selector and authoring the workflow read.
     """
+    authority_error = _authority_tool_error(ctx.context, "inspect_page_for_composition")
+    if authority_error:
+        return _diagnosis_repair_tool_error(ctx.context, "inspect_page_for_composition", authority_error)
     result = await _inspect_page_for_composition_impl(ctx.context, target_url)
-    if requested_output_reads:
-        rejected = await _accept_requested_output_reads(
-            ctx.context, requested_output_reads, offered_by="inspect_page_for_composition"
-        )
-        if rejected and isinstance(result.get("data"), dict):
-            result["data"]["rejected_output_reads"] = rejected
-    # This tool's own probe runs through call_internal_tool, which bypasses the evaluate post-hook,
-    # so the packet it just captured would otherwise never reach the resolver.
-    await resolve_requested_output_designation_from_page_evidence(ctx.context)
+    if requested_output_reads and result.get("ok"):
+        verified, unverified = await _verify_requested_output_reads(ctx.context, requested_output_reads)
+        data = result.get("data")
+        if isinstance(data, dict):
+            data["requested_output_designations"] = verified
+            if unverified:
+                data["unverified_output_designations"] = unverified
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 
@@ -1190,13 +1006,19 @@ async def fill_credential_field_tool(
     `credential_id` they choose. `field` is one of `username`, `password`, `totp`.
 
     This tool only fills; it never clicks or submits. Each successful fill is
-    recorded as a scouted interaction, so the SYNTHESIZED CODE BLOCK will bind
-    the credential as a `credential_id` workflow parameter and reference
-    username/password as `<parameter_key>.username` / `.password`.
+    recorded as a scouted interaction with the credential identity and field.
 
-    In synthesized code blocks, one-time codes must use
-    `await <parameter_key>.otp()` so authenticator, email, and SMS OTP sources
-    all resolve at runtime.
+    In model-authored code blocks, one-time codes resolve via two paths:
+    **credential-bound:** `await <parameter_key>.otp()` for a saved credential whose
+    totp_type is authenticator, email, or text — sources are specified at credential
+    creation. **identifier-based:** `await otp("<address>")` for passwordless email-code
+    sign-in, where the code lands in a connected Gmail or Outlook inbox and address is
+    a bare email (no saved credential required). For the credential-bound path, choose and
+    declare the workflow parameter key, then cite the observed `credential_id` and
+    `credential_field` in `code_artifact_metadata.input_bindings`; use that declared
+    parameter in the authored code. For the identifier-based path, pass only the email
+    address string to `otp()` and ensure an active Gmail or Outlook connection exists
+    for that mailbox.
     """
     result = await _fill_credential_field_impl(ctx.context, selector, credential_id, field)
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
@@ -1205,8 +1027,8 @@ async def fill_credential_field_tool(
 NATIVE_TOOLS = [
     update_workflow_tool,
     edit_block_tool,
+    add_block_tool,
     delete_block_tool,
-    synthesize_demonstrated_block_tool,
     list_credentials_tool,
     list_integrations_tool,
     run_blocks_tool,

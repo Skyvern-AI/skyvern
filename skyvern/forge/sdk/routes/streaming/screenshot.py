@@ -30,7 +30,7 @@ from skyvern.forge.sdk.routes.streaming.screencast import (
     wait_for_browser_state,
 )
 from skyvern.forge.sdk.routes.streaming.verify import stream_transport
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSessionStatus, is_final_status
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.org_auth_service import get_current_org
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -386,7 +386,18 @@ async def _run_local_screencast(
         )
         if browser_state is None:
             LOG.warning("Timed out waiting for browser state", **{id_key: entity_id})
-            await _send_status(websocket, id_key, entity_id, "timeout")
+            stream_status = "timeout"
+            if entity_type == "browser_session":
+                try:
+                    current_status = await get_current_status()
+                except Exception:
+                    LOG.warning("Could not refresh browser session status", **{id_key: entity_id}, exc_info=True)
+                else:
+                    if current_status is not None and (
+                        current_status == "session_expired" or is_final_status(current_status)
+                    ):
+                        stream_status = current_status
+            await _send_status(websocket, id_key, entity_id, stream_status)
             return
 
         await start_screencast_loop(
@@ -516,6 +527,11 @@ async def _local_screencast_for_task(
     )
 
 
+def _browser_session_stream_status(status: str | None) -> str | None:
+    # A finer expiry-versus-failure split must come from persisted session state, not this stream alias.
+    return "session_expired" if status == PersistentBrowserSessionStatus.timeout else status
+
+
 async def _local_screencast_for_browser_session(
     websocket: WebSocket,
     browser_session_id: str,
@@ -534,7 +550,7 @@ async def _local_screencast_for_browser_session(
             )
             return "not_found"
         if is_final_status(session.status):
-            return session.status
+            return _browser_session_stream_status(session.status)
         return None
 
     async def check_finalized() -> bool:
@@ -549,7 +565,7 @@ async def _local_screencast_for_browser_session(
             session_id=browser_session_id,
             organization_id=organization_id,
         )
-        return s.status if s else None
+        return _browser_session_stream_status(s.status) if s else None
 
     await _run_local_screencast(
         websocket=websocket,

@@ -7,6 +7,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, TypeAlias, TypeVar
 
+from skyvern.forge.sdk.browser_effect_approval import canonicalize_effect_target
+
 T = TypeVar("T")
 
 
@@ -17,6 +19,8 @@ class RedirectHopAuthorization:
     source_url: str | None
     target_url: str
     method: str
+    download_scope: str | None = None
+    initial_url: str | None = None
 
 
 RedirectHopDispatcher: TypeAlias = Callable[[tuple[str, ...]], Awaitable[T]]
@@ -24,6 +28,33 @@ RedirectHopAuthorizer: TypeAlias = Callable[
     [RedirectHopAuthorization, RedirectHopDispatcher[T]],
     Awaitable[T],
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class RunScopedRedirectHopAuthorizer:
+    download_scope: str
+
+    def __post_init__(self) -> None:
+        if not self.download_scope.strip():
+            raise ValueError("Run-scoped redirect-hop authority requires a nonempty download scope")
+
+    async def __call__(
+        self,
+        authorization: RedirectHopAuthorization,
+        dispatch: RedirectHopDispatcher[T],
+    ) -> T:
+        if authorization.method != "GET":
+            raise PermissionError("Run-scoped redirect-hop authority permits only GET requests")
+        if authorization.download_scope != self.download_scope or not authorization.initial_url:
+            raise PermissionError("Redirect hop is not bound to this run-scoped browser download")
+        # Bind the first dispatch to the exact URL Chromium reported. Later targets may legitimately
+        # move to a CDN or signed-object origin; fetch_file_bytes validates and DNS-pins each of those
+        # redirects before presenting the hop here, and strips credentials when the origin changes.
+        if authorization.source_url is None and canonicalize_effect_target(
+            authorization.target_url
+        ) != canonicalize_effect_target(authorization.initial_url):
+            raise PermissionError("Redirect hop is not bound to this run-scoped browser download")
+        return await dispatch(())
 
 
 async def authorize_request_hop_once(

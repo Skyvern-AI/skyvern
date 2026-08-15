@@ -11,6 +11,7 @@ import shutil
 import sys
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, cast
 from urllib.parse import urlparse
@@ -19,6 +20,7 @@ import json5
 import typer
 import yaml
 from rich.panel import Panel
+from rich.prompt import Prompt
 from rich.syntax import Syntax
 from rich.table import Table
 
@@ -46,6 +48,14 @@ _JSON5_COMMENT_RE = re.compile(r"(?<!:)//|/\*")
 _JSON5_TRAILING_COMMA_RE = re.compile(r",\s*[}\]]")
 _JSON5_UNQUOTED_KEY_RE = re.compile(r"(^|[{,]\s*)([A-Za-z_$][\w$-]*)\s*:", re.MULTILINE)
 _JSON5_SINGLE_QUOTED_STRING_RE = re.compile(r"(^|[:[{,]\s*)'(?:[^'\\]|\\.)*'", re.MULTILINE)
+
+
+class MCPToolScope(str, Enum):  # Keep in sync with scopes.MCPScope; ratchet test pins this.
+    all = "all"
+    operate = "operate"
+    build = "build"
+    browser = "browser"
+    lean = "lean"
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +147,7 @@ def _build_local_mcp_entry(
     command: str | None = None,
     browser_type: str | None = None,
     browser_remote_debugging_url: str | None = None,
+    scope: MCPToolScope | str = MCPToolScope.all,
 ) -> dict:
     """Build a stdio MCP entry for local self-hosted mode.
 
@@ -155,19 +166,53 @@ def _build_local_mcp_entry(
 
     _ = use_python_path
 
+    resolved_scope = scope.value if isinstance(scope, MCPToolScope) else scope
+    scope_args = [] if resolved_scope == MCPToolScope.all.value else ["--scope", resolved_scope]
     command_name = command or sys.executable
     if command_name == "skyvern":
         return {
             "command": command_name,
-            "args": ["run", "mcp"],
+            "args": ["run", "mcp", *scope_args],
             "env": env_block,
         }
 
     return {
         "command": command_name,
-        "args": ["-m", "skyvern", "run", "mcp"],
+        "args": ["-m", "skyvern", "run", "mcp", *scope_args],
         "env": env_block,
     }
+
+
+def _scope_value(scope: MCPToolScope | str) -> str:
+    return scope.value if isinstance(scope, MCPToolScope) else scope
+
+
+def _validate_scope_for_transport(*, local: bool, scope: MCPToolScope | str) -> None:
+    if not local and _scope_value(scope) != MCPToolScope.all.value:
+        console.print("[red]--scope is only supported with --local stdio setup.[/red]")
+        raise typer.Exit(code=1)
+
+
+def _prompt_mcp_scope_for_wizard(
+    *,
+    local: bool,
+    scope: MCPToolScope | str = MCPToolScope.all,
+    yes: bool = False,
+    dry_run: bool = False,
+) -> MCPToolScope:
+    _validate_scope_for_transport(local=local, scope=scope)
+    if not local or yes or dry_run or _scope_value(scope) != MCPToolScope.all.value or not sys.stdin.isatty():
+        return scope if isinstance(scope, MCPToolScope) else MCPToolScope(scope)
+
+    return MCPToolScope(
+        Prompt.ask(
+            "Tool scope for this local MCP install: all=full 112-tool surface, "
+            "operate=run/monitor/inspect existing automations, build=author/modify automations, "
+            "browser=drive a browser directly, lean=focused direct browser actions",
+            choices=[option.value for option in MCPToolScope],
+            default=MCPToolScope.all.value,
+        )
+    )
 
 
 def _build_openclaw_mcp_entry(api_key: str, url: str = _DEFAULT_REMOTE_URL) -> dict:
@@ -207,6 +252,7 @@ def _build_opencode_local_mcp_entry(
     command: str | None = None,
     browser_type: str | None = None,
     browser_remote_debugging_url: str | None = None,
+    scope: MCPToolScope | str = MCPToolScope.all,
 ) -> dict:
     """Build an OpenCode local stdio MCP entry."""
     local_entry = _build_local_mcp_entry(
@@ -216,6 +262,7 @@ def _build_opencode_local_mcp_entry(
         command=command,
         browser_type=browser_type,
         browser_remote_debugging_url=browser_remote_debugging_url,
+        scope=scope,
     )
     command_name = str(local_entry.get("command") or sys.executable)
     args = local_entry.get("args", [])
@@ -590,7 +637,9 @@ def _build_entry(
     use_mcp_remote_bridge: bool = False,
     browser_type: str | None = None,
     browser_remote_debugging_url: str | None = None,
+    scope: MCPToolScope | str = MCPToolScope.all,
 ) -> dict:
+    _validate_scope_for_transport(local=local, scope=scope)
     if local:
         return _build_local_mcp_entry(
             api_key,
@@ -598,6 +647,7 @@ def _build_entry(
             use_python_path=use_python_path,
             browser_type=browser_type,
             browser_remote_debugging_url=browser_remote_debugging_url,
+            scope=scope,
         )
     remote_url = url or _DEFAULT_REMOTE_URL
     parsed = urlparse(remote_url)
@@ -894,6 +944,14 @@ _api_key_opt = typer.Option(None, "--api-key", "-k", help="Skyvern API key (read
 _dry_run_opt = typer.Option(False, "--dry-run", help="Show changes without writing")
 _yes_opt = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt")
 _local_opt = typer.Option(False, "--local", help="Use local stdio transport instead of remote HTTPS")
+_scope_opt = typer.Option(
+    MCPToolScope.all,
+    "--scope",
+    help=(
+        "Tool scope for this MCP install: all (default), operate (run/monitor existing workflows), "
+        "build (author workflows), browser (direct browser control), or lean (focused browser surface: direct actions with selector-scoped page reading; 32 tools). Applies to --local stdio setup."
+    ),
+)
 _python_path_opt = typer.Option(
     False,
     "--use-python-path",
@@ -920,7 +978,10 @@ def _run_setup(
     use_mcp_remote_bridge: bool = False,
     browser_type: str | None = None,
     browser_remote_debugging_url: str | None = None,
+    scope: MCPToolScope | str = MCPToolScope.all,
 ) -> None:
+    _validate_scope_for_transport(local=local, scope=scope)
+
     if tool_name == "Claude Desktop" and not local and use_mcp_remote_bridge and not _has_node_runtime():
         console.print(f"[yellow]{_claude_desktop_bundle_message()}[/yellow]")
         raise typer.Exit(code=1)
@@ -935,6 +996,7 @@ def _run_setup(
         use_mcp_remote_bridge=use_mcp_remote_bridge,
         browser_type=browser_type,
         browser_remote_debugging_url=browser_remote_debugging_url,
+        scope=scope,
     )
     _upsert_mcp_config(config_path, tool_name, entry, dry_run=dry_run, yes=yes)
 
@@ -992,12 +1054,14 @@ def setup_guided(
     dry_run: bool = _dry_run_opt,
     yes: bool = _yes_opt,
     local: bool = _local_opt,
+    scope: MCPToolScope = _scope_opt,
     use_python_path: bool = _python_path_opt,
     url: str | None = _url_opt,
 ) -> None:
     """Guided quickstart: detect installed AI tools and configure MCP for all of them."""
     if ctx.invoked_subcommand is not None:
         return
+    scope = _prompt_mcp_scope_for_wizard(local=local, scope=scope, yes=yes, dry_run=dry_run)
 
     console.print(
         Panel(
@@ -1100,6 +1164,7 @@ def setup_guided(
                         use_python_path=use_python_path,
                         browser_type=env_browser_type,
                         browser_remote_debugging_url=env_browser_url,
+                        scope=scope,
                     )
                 else:
                     remote_url = url or _DEFAULT_REMOTE_URL
@@ -1124,6 +1189,7 @@ def setup_guided(
                     use_mcp_remote_bridge=use_bridge,
                     browser_type=env_browser_type,
                     browser_remote_debugging_url=env_browser_url,
+                    scope=scope,
                 )
                 _upsert_mcp_config(config_path, tool.name, entry, dry_run=dry_run, yes=True)
             if tool.name == "Claude Code":
@@ -1186,6 +1252,7 @@ def setup_claude(
     dry_run: bool = _dry_run_opt,
     yes: bool = _yes_opt,
     local: bool = _local_opt,
+    scope: MCPToolScope = _scope_opt,
     use_python_path: bool = _python_path_opt,
     url: str | None = _url_opt,
     browser_type: str | None = None,
@@ -1204,6 +1271,7 @@ def setup_claude(
         use_mcp_remote_bridge=not local,
         browser_type=browser_type,
         browser_remote_debugging_url=browser_remote_debugging_url,
+        scope=scope,
     )
 
 
@@ -1213,12 +1281,13 @@ def setup_claude_desktop_alias(
     dry_run: bool = _dry_run_opt,
     yes: bool = _yes_opt,
     local: bool = _local_opt,
+    scope: MCPToolScope = _scope_opt,
     use_python_path: bool = _python_path_opt,
     url: str | None = _url_opt,
 ) -> None:
     """Backward-compatible alias for `skyvern setup claude`."""
     setup_claude(
-        api_key, dry_run, yes, local, use_python_path, url, browser_type=None, browser_remote_debugging_url=None
+        api_key, dry_run, yes, local, scope, use_python_path, url, browser_type=None, browser_remote_debugging_url=None
     )
 
 
@@ -1228,6 +1297,7 @@ def setup_claude_code(
     dry_run: bool = _dry_run_opt,
     yes: bool = _yes_opt,
     local: bool = _local_opt,
+    scope: MCPToolScope = _scope_opt,
     use_python_path: bool = _python_path_opt,
     url: str | None = _url_opt,
     project: bool = typer.Option(
@@ -1258,6 +1328,7 @@ def setup_claude_code(
         url,
         browser_type=browser_type,
         browser_remote_debugging_url=browser_remote_debugging_url,
+        scope=scope,
     )
 
     if not skip_skills:
@@ -1276,6 +1347,7 @@ def setup_cursor(
     dry_run: bool = _dry_run_opt,
     yes: bool = _yes_opt,
     local: bool = _local_opt,
+    scope: MCPToolScope = _scope_opt,
     use_python_path: bool = _python_path_opt,
     url: str | None = _url_opt,
     browser_type: str | None = None,
@@ -1293,6 +1365,7 @@ def setup_cursor(
         url,
         browser_type=browser_type,
         browser_remote_debugging_url=browser_remote_debugging_url,
+        scope=scope,
     )
 
 
@@ -1302,6 +1375,7 @@ def setup_windsurf(
     dry_run: bool = _dry_run_opt,
     yes: bool = _yes_opt,
     local: bool = _local_opt,
+    scope: MCPToolScope = _scope_opt,
     use_python_path: bool = _python_path_opt,
     url: str | None = _url_opt,
     browser_type: str | None = None,
@@ -1319,6 +1393,7 @@ def setup_windsurf(
         url,
         browser_type=browser_type,
         browser_remote_debugging_url=browser_remote_debugging_url,
+        scope=scope,
     )
 
 
@@ -1341,12 +1416,14 @@ def setup_openclaw(
     dry_run: bool = _dry_run_opt,
     yes: bool = _yes_opt,
     local: bool = _local_opt,
+    scope: MCPToolScope = _scope_opt,
     use_python_path: bool = _python_path_opt,
     url: str | None = _url_opt,
     browser_type: str | None = None,
     browser_remote_debugging_url: str | None = None,
 ) -> None:
     """Register Skyvern MCP with OpenClaw (remote by default, --local for stdio)."""
+    _validate_scope_for_transport(local=local, scope=scope)
     resolved_key, env_url = _resolve_setup_credentials(api_key_flag=api_key, yes=yes, local=local)
     entry = _build_entry(
         resolved_key,
@@ -1356,6 +1433,7 @@ def setup_openclaw(
         url=url,
         browser_type=browser_type,
         browser_remote_debugging_url=browser_remote_debugging_url,
+        scope=scope,
     )
     if not local:
         entry = _build_openclaw_mcp_entry(resolved_key, entry["url"])
@@ -1457,12 +1535,14 @@ def setup_opencode(
     dry_run: bool = _dry_run_opt,
     yes: bool = _yes_opt,
     local: bool = _local_opt,
+    scope: MCPToolScope = _scope_opt,
     use_python_path: bool = _python_path_opt,
     url: str | None = _url_opt,
     browser_type: str | None = None,
     browser_remote_debugging_url: str | None = None,
 ) -> None:
     """Register Skyvern MCP with OpenCode using API key auth (avoids OAuth callback timeouts)."""
+    _validate_scope_for_transport(local=local, scope=scope)
     resolved_key, env_url = _resolve_setup_credentials(api_key_flag=api_key, yes=yes, local=local)
     if local:
         entry = _build_opencode_local_mcp_entry(
@@ -1471,6 +1551,7 @@ def setup_opencode(
             use_python_path=use_python_path,
             browser_type=browser_type,
             browser_remote_debugging_url=browser_remote_debugging_url,
+            scope=scope,
         )
     else:
         remote_url = url or _DEFAULT_REMOTE_URL
@@ -1493,9 +1574,11 @@ def setup_hermes(
     dry_run: bool = _dry_run_opt,
     yes: bool = _yes_opt,
     local: bool = _local_opt,
+    scope: MCPToolScope = _scope_opt,
     url: str | None = _url_opt,
 ) -> None:
     """Register Skyvern MCP with Hermes (remote by default, --local for stdio)."""
+    _validate_scope_for_transport(local=local, scope=scope)
     if local:
         # Local stdio mode: Hermes spawns `skyvern run mcp` as a child process
         local_key, local_base_url = _get_local_env_credentials()
@@ -1513,7 +1596,7 @@ def setup_hermes(
                 "[bold]SKYVERN_API_KEY[/bold] in your environment, then retry.[/red]"
             )
             raise typer.Exit(code=1)
-        local_entry = _build_local_mcp_entry(resolved_local_key, resolved_base_url)
+        local_entry = _build_local_mcp_entry(resolved_local_key, resolved_base_url, scope=scope)
         hermes_entry: dict = {
             "command": local_entry.get("command", sys.executable),
             "args": local_entry.get("args", ["-m", "skyvern", "run", "mcp"]),

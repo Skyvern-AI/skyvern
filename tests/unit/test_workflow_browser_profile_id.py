@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRequestBody
 from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -55,6 +56,43 @@ def test_workflow_create_yaml_request_accepts_browser_profile_id() -> None:
         browser_profile_id="bp_abc123",
     )
     assert request.browser_profile_id == "bp_abc123"
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_from_request_rejects_raw_load_balancer_webhook_url() -> None:
+    request = WorkflowCreateYAMLRequest(
+        title="test",
+        webhook_callback_url="https://service-123.elb.us-east-1.amazonaws.com/hook",
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+    )
+
+    with pytest.raises(SkyvernHTTPException, match="stable custom hostname"):
+        await WorkflowService().create_workflow_from_request(
+            organization=cast(Any, SimpleNamespace(organization_id="org_1")),
+            request=request,
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_from_request_allows_unchanged_legacy_webhook_url() -> None:
+    legacy_url = "https://service-123.elb.us-east-1.amazonaws.com/hook"
+    service, updated_workflow = _make_workflow_update_service(
+        existing_max_elapsed_time_minutes=None,
+        existing_webhook_callback_url=legacy_url,
+    )
+    request = WorkflowCreateYAMLRequest(
+        title="test",
+        webhook_callback_url=legacy_url,
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+    )
+
+    result = await service.create_workflow_from_request(
+        organization=cast(Any, SimpleNamespace(organization_id="org_1")),
+        request=request,
+        workflow_permanent_id="wpid_test",
+    )
+
+    assert result is updated_workflow
 
 
 def test_workflow_create_yaml_request_masks_cdp_connect_headers_on_dump() -> None:
@@ -276,6 +314,7 @@ def _make_workflow_update_service(
     existing_max_elapsed_time_minutes: int | None,
     existing_enable_self_healing: bool = True,
     existing_pin_saved_session_ip: bool = False,
+    existing_webhook_callback_url: str | None = None,
 ) -> tuple[WorkflowService, SimpleNamespace]:
     service = WorkflowService()
     existing_workflow = SimpleNamespace(
@@ -287,6 +326,7 @@ def _make_workflow_update_service(
         max_elapsed_time_minutes=existing_max_elapsed_time_minutes,
         enable_self_healing=existing_enable_self_healing,
         pin_saved_session_ip=existing_pin_saved_session_ip,
+        webhook_callback_url=existing_webhook_callback_url,
     )
     potential_workflow = SimpleNamespace(workflow_id="wf_new")
     updated_workflow = SimpleNamespace(workflow_id="wf_new", workflow_permanent_id="wpid_test")

@@ -96,7 +96,7 @@ async def test_wait_for_browser_state_returns_when_working_page_is_available(
     resolve_mock = AsyncMock(return_value=browser_state)
     sleep_mock = AsyncMock()
     monkeypatch.setattr(screencast, "_resolve_browser_state", resolve_mock)
-    monkeypatch.setattr(screencast.asyncio, "sleep", sleep_mock)
+    monkeypatch.setattr(screencast, "asyncio", SimpleNamespace(sleep=sleep_mock))
 
     result = await screencast.wait_for_browser_state("wr_123", "workflow_run", timeout=1, poll_interval=0.1)
 

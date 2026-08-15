@@ -96,6 +96,7 @@ function makeCodeBlock(
     output_parameter: makeOutputParameter(label),
     code: `# ${label}`,
     parameters: [],
+    error_code_mapping: null,
   };
 }
 

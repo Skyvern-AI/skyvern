@@ -223,9 +223,6 @@ async def test_stream_to_sse_keeps_running_after_client_disconnect() -> None:
     ctx = SimpleNamespace(
         last_artifact_health_blocker_reason=None,
         completion_verification_result=None,
-        turn_ownership=None,
-        blocker_signal_claimant=None,
-        gate_precedence_conflict_events=[],
     )
 
     await stream_to_sse(result, stream, ctx)
@@ -261,9 +258,6 @@ async def test_tool_call_sse_uses_product_safe_activity_label() -> None:
     ctx = SimpleNamespace(
         last_artifact_health_blocker_reason=None,
         completion_verification_result=None,
-        turn_ownership=None,
-        blocker_signal_claimant=None,
-        gate_precedence_conflict_events=[],
     )
 
     await stream_to_sse(result, stream, ctx)
@@ -305,9 +299,6 @@ async def test_stream_to_sse_propagates_cancelled_error() -> None:
     ctx = SimpleNamespace(
         last_artifact_health_blocker_reason=None,
         completion_verification_result=None,
-        turn_ownership=None,
-        blocker_signal_claimant=None,
-        gate_precedence_conflict_events=[],
     )
 
     with pytest.raises(asyncio.CancelledError):
@@ -406,69 +397,6 @@ async def test_stream_to_sse_suppresses_narration_on_an_iteration_with_typed_act
 
 
 @pytest.mark.asyncio
-async def test_tool_result_sse_summary_translates_loop_detected_failure() -> None:
-    """SSE TOOL_RESULT carries the user-facing translation; summarize_tool_result
-    on the same payload still yields the un-translated agent-facing text."""
-    from agents.items import RunItem
-    from agents.stream_events import RunItemStreamEvent
-
-    from skyvern.forge.sdk.copilot.output_utils import summarize_tool_result
-    from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
-
-    raw_call = {"call_id": "c1", "name": "click", "arguments": "{}"}
-    call_item = MagicMock(spec=RunItem)
-    call_item.raw_item = raw_call
-    tool_call_event = RunItemStreamEvent(name="tool_called", item=call_item)
-
-    error_payload = {
-        "ok": False,
-        "error": (
-            "LOOP DETECTED: 'click' has been called 3 times consecutively. "
-            "This tool will not run again. Use a DIFFERENT tool to continue."
-        ),
-    }
-    output_text = '{"ok": false, "error": "LOOP DETECTED: \'click\' has been called 3 times consecutively. This tool will not run again. Use a DIFFERENT tool to continue."}'
-    out_item = MagicMock(spec=RunItem)
-    out_item.raw_item = {"call_id": "c1", "name": "click"}
-    out_item.output = [{"type": "text", "text": output_text}]
-    tool_output_event = RunItemStreamEvent(name="tool_output", item=out_item)
-
-    result = MagicMock()
-    result.stream_events = lambda: _stream_events_from(tool_call_event, tool_output_event)
-    result.cancel = MagicMock()
-
-    sent: list[Any] = []
-
-    async def _send(payload: Any) -> bool:
-        sent.append(payload)
-        return True
-
-    stream = MagicMock()
-    stream.is_disconnected = AsyncMock(return_value=False)
-    stream.send = _send
-
-    ctx = SimpleNamespace(
-        last_artifact_health_blocker_reason=None,
-        completion_verification_result=None,
-        turn_ownership=None,
-        blocker_signal_claimant=None,
-        gate_precedence_conflict_events=[],
-    )
-
-    await stream_to_sse(result, stream, ctx)
-
-    tool_results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
-    assert len(tool_results) == 1
-    sse_summary = tool_results[0].summary
-    assert sse_summary == "The agent got stuck retrying the same step — moving on."
-    assert "DIFFERENT tool" not in sse_summary
-
-    agent_summary = summarize_tool_result("click", error_payload)
-    assert agent_summary.startswith("Failed:")
-    assert "LOOP DETECTED" in agent_summary
-
-
-@pytest.mark.asyncio
 async def test_tool_result_sse_uses_latest_blocker_signal_for_activity_surface() -> None:
     from agents.items import RunItem
     from agents.stream_events import RunItemStreamEvent
@@ -516,11 +444,6 @@ async def test_tool_result_sse_uses_latest_blocker_signal_for_activity_surface()
         tool_blocker_signals=[signal],
         last_artifact_health_blocker_reason=None,
         completion_verification_result=None,
-        turn_ownership=None,
-        blocker_signal_claimant=None,
-        gate_precedence_conflict_events=[],
-        output_contract_actuation_by_signature={},
-        output_contract_actuation_count_by_signature={},
     )
 
     await stream_to_sse(result, stream, ctx)
@@ -540,134 +463,6 @@ async def test_tool_result_sse_uses_latest_blocker_signal_for_activity_surface()
     assert activity[-1]["text"] == signal.user_facing_reason
     assert "Do NOT" not in activity[-1]["text"]
     assert activity[-1]["success"] is False
-
-
-@pytest.mark.asyncio
-async def test_tool_result_sse_success_true_for_phase_gated_precondition() -> None:
-    """A precondition redirect (agent tried a tool before its build phase allowed it)
-    was never a real failure — it must not render with error affect."""
-    from agents.items import RunItem
-    from agents.stream_events import RunItemStreamEvent
-
-    from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
-    from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
-
-    signal = CopilotToolBlockerSignal(
-        blocker_kind="phase_gated",
-        agent_steering_text=(
-            "Direct browser tools are not callable before composition. "
-            "Call discover_workflow_entrypoint to resolve the entrypoint URL."
-        ),
-        user_facing_reason="I need to know what site to work on before I can browse there. What URL should I use?",
-        recovery_hint="ask_user_clarifying",
-        cleared_by_tools=frozenset({"discover_workflow_entrypoint"}),
-        internal_reason_code="build_phase_browser_blocked_pre_compose",
-        blocked_tool="evaluate",
-    )
-
-    call_item = MagicMock(spec=RunItem)
-    call_item.raw_item = {"call_id": "c1", "name": "evaluate", "arguments": "{}"}
-    tool_call_event = RunItemStreamEvent(name="tool_called", item=call_item)
-
-    out_item = MagicMock(spec=RunItem)
-    out_item.raw_item = {"call_id": "c1", "name": "evaluate"}
-    out_item.output = [{"type": "text", "text": json.dumps({"ok": False, "error": signal.agent_steering_text})}]
-    tool_output_event = RunItemStreamEvent(name="tool_output", item=out_item)
-
-    result = MagicMock()
-    result.stream_events = lambda: _stream_events_from(tool_call_event, tool_output_event)
-    result.cancel = MagicMock()
-
-    sent: list[Any] = []
-
-    async def _send(payload: Any) -> bool:
-        sent.append(payload)
-        return True
-
-    stream = MagicMock()
-    stream.is_disconnected = AsyncMock(return_value=False)
-    stream.send = _send
-    ctx = SimpleNamespace(
-        latest_tool_blocker_signal=signal,
-        tool_blocker_signals=[signal],
-        last_artifact_health_blocker_reason=None,
-        completion_verification_result=None,
-    )
-
-    await stream_to_sse(result, stream, ctx)
-
-    tool_results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
-    assert len(tool_results) == 1
-    assert tool_results[0].summary == signal.user_facing_reason
-    assert tool_results[0].success is True
-
-    activity = ctx.narrator_state.design_activity
-    assert activity[-1]["kind"] == "tool_result"
-    assert activity[-1]["success"] is True
-
-
-@pytest.mark.asyncio
-async def test_stream_to_sse_cancels_and_stops_on_terminal_turn_halt() -> None:
-    from agents.items import RunItem
-    from agents.stream_events import RunItemStreamEvent
-
-    from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
-    from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt
-
-    signal = CopilotToolBlockerSignal(
-        blocker_kind="loop_detected",
-        agent_steering_text="LOOP DETECTED: 'update_workflow' has been called 3 times.",
-        user_facing_reason="I retried without making progress. Tell me what to change and I'll try again.",
-        recovery_hint="report_blocker_to_user",
-        internal_reason_code="loop_detected_consecutive_same_tool",
-        blocked_tool="update_workflow",
-    )
-
-    call_item = MagicMock(spec=RunItem)
-    call_item.raw_item = {"call_id": "c1", "name": "update_workflow", "arguments": "{}"}
-    tool_call_event = RunItemStreamEvent(name="tool_called", item=call_item)
-
-    out_item = MagicMock(spec=RunItem)
-    out_item.raw_item = {"call_id": "c1", "name": "update_workflow"}
-    out_item.output = [{"type": "text", "text": json.dumps({"ok": False, "error": signal.agent_steering_text})}]
-    tool_output_event = RunItemStreamEvent(name="tool_output", item=out_item)
-
-    late_call_item = MagicMock(spec=RunItem)
-    late_call_item.raw_item = {"call_id": "c2", "name": "update_and_run_blocks", "arguments": "{}"}
-    late_tool_call_event = RunItemStreamEvent(name="tool_called", item=late_call_item)
-    consumed_late_event = False
-
-    async def _events() -> Any:
-        nonlocal consumed_late_event
-        yield tool_call_event
-        yield tool_output_event
-        consumed_late_event = True
-        yield late_tool_call_event
-
-    result = MagicMock()
-    result.stream_events = _events
-    result.cancel = MagicMock()
-
-    stream = MagicMock()
-    stream.is_disconnected = AsyncMock(return_value=False)
-    stream.send = AsyncMock(return_value=True)
-    ctx = SimpleNamespace(
-        latest_tool_blocker_signal=signal,
-        tool_blocker_signals=[signal],
-        last_artifact_health_blocker_reason=None,
-        completion_verification_result=None,
-        turn_ownership=None,
-        blocker_signal_claimant=None,
-        gate_precedence_conflict_events=[],
-        output_contract_actuation_by_signature={},
-        output_contract_actuation_count_by_signature={},
-    )
-
-    with pytest.raises(CopilotTurnHalt):
-        await stream_to_sse(result, stream, ctx)
-
-    result.cancel.assert_called_once()
-    assert consumed_late_event is False
 
 
 @pytest.mark.asyncio
@@ -699,9 +494,6 @@ async def test_stream_to_sse_raises_and_cancels_on_repeated_unrecoverable_tool_e
     ctx = SimpleNamespace(
         last_artifact_health_blocker_reason=None,
         completion_verification_result=None,
-        turn_ownership=None,
-        blocker_signal_claimant=None,
-        gate_precedence_conflict_events=[],
     )
 
     with pytest.raises(CopilotUnrecoverableToolError):
@@ -749,9 +541,6 @@ async def test_tool_result_sse_summary_drops_click_selector_on_success() -> None
     ctx = SimpleNamespace(
         last_artifact_health_blocker_reason=None,
         completion_verification_result=None,
-        turn_ownership=None,
-        blocker_signal_claimant=None,
-        gate_precedence_conflict_events=[],
     )
 
     await stream_to_sse(result, stream, ctx)
@@ -898,16 +687,6 @@ class TestEnforcementStateUpdates:
         )
         assert ctx.update_workflow_called is True
         assert ctx.test_after_update_done is True
-
-    def test_persisted_blocks_clear_reopened_synthesized_offer_latch(self) -> None:
-        ctx = self._make_ctx()
-        ctx.synthesized_block_reopened_after_failed_run = True
-        _update_enforcement_from_tool(
-            ctx,
-            "update_and_run_blocks",
-            {"ok": False, "data": {"block_count": 2}},
-        )
-        assert ctx.synthesized_block_reopened_after_failed_run is False
 
     def test_navigate_sets_flags(self) -> None:
         from skyvern.forge.sdk.copilot.streaming_adapter import _update_enforcement_from_tool
@@ -1644,9 +1423,6 @@ def _label_probe_ctx() -> SimpleNamespace:
     return SimpleNamespace(
         last_artifact_health_blocker_reason=None,
         completion_verification_result=None,
-        turn_ownership=None,
-        blocker_signal_claimant=None,
-        gate_precedence_conflict_events=[],
     )
 
 

@@ -39,11 +39,7 @@ def strip_cross_origin_redirect_credentials(
     cookies: dict[str, str] | None,
     current_url: str,
     next_url: str,
-    *,
-    strip_cross_origin_credentials: bool = True,
 ) -> tuple[dict[str, str], dict[str, str] | None]:
-    if not strip_cross_origin_credentials:
-        return headers, cookies
     if _url_origin(current_url) == _url_origin(next_url):
         return headers, cookies
     return {key: value for key, value in headers.items() if key.lower() not in _REDIRECT_CREDENTIAL_HEADERS}, None

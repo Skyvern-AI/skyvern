@@ -5,7 +5,7 @@ import skyvern.forge.sdk.forge_log as forge_log
 from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.forge_log import add_kv_pairs_to_msg, sample_logs_processor
+from skyvern.forge.sdk.forge_log import add_log_context, sample_logs_processor
 
 SAMPLED_ORG = "o_sampled"
 
@@ -72,16 +72,17 @@ def test_empty_org_list_disables_sampling(monkeypatch: pytest.MonkeyPatch) -> No
     assert "sampling" not in result
 
 
-def test_sampling_marker_excluded_from_rendered_message() -> None:
+def test_structured_fields_are_not_duplicated_into_message() -> None:
     event = {"msg": "Handling action", "sampling": True, "action_type": "click"}
-    result = add_kv_pairs_to_msg(None, "info", event)  # type: ignore[arg-type]
-    assert "sampling" not in result["msg"]
-    assert "action_type=click" in result["msg"]
+    result = add_log_context(None, "info", event)  # type: ignore[arg-type]
+    assert result["msg"] == "Handling action"
+    assert result["sampling"] is True
+    assert result["action_type"] == "click"
 
 
-def test_add_kv_pairs_includes_copilot_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_add_log_context_includes_copilot_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(skyvern_context, "current", lambda: SkyvernContext(copilot_session_id="chat_1"))
-    result = add_kv_pairs_to_msg(None, "info", {"msg": "Handling action"})  # type: ignore[arg-type]
+    result = add_log_context(None, "info", {"msg": "Handling action"})  # type: ignore[arg-type]
     assert result["copilot_session_id"] == "chat_1"
 
 

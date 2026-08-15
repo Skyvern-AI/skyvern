@@ -26,12 +26,9 @@ def test_prompt_consolidates_ask_vs_edit_routing_rule() -> None:
     assert "Explicit edit/debug requests remain edit requests" not in rendered
 
 
-def test_workflow_credential_inputs_unbound_branch_teaches_reply_framing() -> None:
+def test_prompt_does_not_encode_request_policy_credential_verdicts() -> None:
     rendered = _render_agent_prompt()
 
-    assert "REQUEST POLICY: WORKFLOW CREDENTIAL INPUTS UNBOUND." in rendered
-    assert "`clarification_reason: workflow_credential_inputs_unbound`" in rendered
-    assert "Call `update_workflow` to land the user's edit" in rendered
-    assert "I applied your requested change. I couldn't test the modified workflow" in rendered
-    assert "add them via the Credentials UI" in rendered
-    assert 'data.skip_reason="workflow_credential_inputs_unbound"' in rendered
+    assert "REQUEST POLICY: WORKFLOW CREDENTIAL INPUTS UNBOUND." not in rendered
+    assert "`clarification_reason: workflow_credential_inputs_unbound`" not in rendered
+    assert 'data.skip_reason="workflow_credential_inputs_unbound"' not in rendered

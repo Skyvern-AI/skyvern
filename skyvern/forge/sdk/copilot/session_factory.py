@@ -19,6 +19,7 @@ from skyvern.config import settings
 from skyvern.forge.sdk.agents.context import (
     compact_agent_messages_for_llm,
     get_agent_message_field,
+    pair_tool_calls_with_outputs,
     replace_agent_message_field,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
@@ -30,7 +31,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _summarize_tool_arguments,
     _summarize_tool_output,
     aggressive_prune,
-    collapse_superseded_synthesized_offers,
     estimate_tokens,
     is_screenshot_message,
     is_synthetic_user_message,
@@ -145,8 +145,19 @@ def copilot_call_model_input_filter(data: CallModelData[Any]) -> ModelInputData:
     return _copilot_call_model_input_filter(data, token_budget=TOKEN_BUDGET)
 
 
+def _log_tool_pair_repair(moved: int, size_delta: int) -> None:
+    LOG.info("copilot_tool_pair_repaired", moved=moved, size_delta=size_delta)
+
+
 def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: int) -> ModelInputData:
-    model_data = _filter_to_budget(data, token_budget=token_budget)
+    budgeted = _filter_to_budget(data, token_budget=token_budget)
+    # Last thing before the request leaves: every budget rung above reorders nothing, but
+    # history assembly upstream can seat a result after a later assistant turn, which the
+    # provider rejects outright. Repair here so no path can emit an invalid pairing.
+    model_data = ModelInputData(
+        input=pair_tool_calls_with_outputs(list(budgeted.input), on_repair=_log_tool_pair_repair),
+        instructions=budgeted.instructions,
+    )
     _maybe_dump_model_input(data, model_data)
     return model_data
 
@@ -196,7 +207,7 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
 def _filter_to_budget(data: CallModelData[Any], *, token_budget: int) -> ModelInputData:
     """Token-budget enforcement applied just before each model call.
 
-    Graduated pruning, after dropping superseded synthesized-block offers:
+    Graduated pruning:
     1. Compact older tool outputs + function-call arguments using the
        KEEP_RECENT_TOOL_OUTPUTS rule (mirrors ``enforcement._prune_input_list``).
     2. If still over budget: drop all screenshots except the most recent.
@@ -212,11 +223,6 @@ def _filter_to_budget(data: CallModelData[Any], *, token_budget: int) -> ModelIn
 
     est = estimate_tokens(items)
     LOG.info("Token estimate before filtering", tokens=est)
-
-    # Superseded offers are pure waste, dropped before the budget rungs so the freed
-    # tokens stop triggering emergency truncation. The estimate above deliberately
-    # stays pre-collapse: it is the metric that surfaces a recurrence of the stacking.
-    items = collapse_superseded_synthesized_offers(items)
 
     # Re-run compaction here even though ``copilot_session_input_callback``
     # already compacted on session merge. The KEEP_RECENT_TOOL_OUTPUTS window

@@ -1,9 +1,7 @@
-"""Builders + deterministic `TurnIntent -> ResponseKind` mapping for `TurnOutcome`.
+"""Builders for the persisted per-turn narrative record.
 
 Schema types live in ``schemas/copilot_turn_outcome.py`` so chat-history
 schemas can embed ``TurnOutcome`` without importing copilot business logic.
-This module imports both the schema types and ``TurnIntentMode`` — the only
-direction allowed.
 """
 
 from __future__ import annotations
@@ -14,13 +12,21 @@ from typing import Any, Literal
 import structlog
 
 from skyvern.forge.sdk.copilot.signature import compute_signature
-from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentMode
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 
 LOG = structlog.get_logger()
 
 IDENTICAL_REPLY_BLOCKED_TERMINAL_REASON = "identical_reply_blocked"
+# Agent-loop exits spell a user cancel "cancel"; the route layer spells its own "user_cancelled"
+# and stamps RECOVER itself, so that value never reaches the labelers here. See
+# ROUTE_OWNED_TERMINAL_REASONS in dev_scripts/replay_turn_outcome_kind.py for the full split.
+CANCEL_TERMINAL_REASON = "cancel"
 CopilotComposerMode = Literal["ask", "build", "code"]
+
+
+def stopped_exit_response_kind(terminal_reason: str | None) -> ResponseKind:
+    """A user cancel halted the turn, so it is recorded as a stop; other turn-end exits keep the clarify label."""
+    return ResponseKind.RECOVER if terminal_reason == CANCEL_TERMINAL_REASON else ResponseKind.CLARIFY
 
 
 def apply_repeated_reply_guard(
@@ -30,7 +36,6 @@ def apply_repeated_reply_guard(
     blocked_signatures: Iterable[str],
     reason_code: str = "",
     terminal_reason: str | None = None,
-    turn_intent: TurnIntent | None = None,
     tool_calls: Iterable[str] = (),
 ) -> tuple[str, TurnOutcome]:
     """Centralized post-output record. Returns ``(final_text, outcome)``.
@@ -39,64 +44,19 @@ def apply_repeated_reply_guard(
     escalation prose both invents words the model did not say and — when it also minted a terminal
     reason — ended turns over a chat-presentation concern. Signatures are still recorded and carried
     forward so repetition stays visible downstream.
-
-    Pass ``turn_intent`` and ``tool_calls`` to preserve trace metadata on
-    the outcome; otherwise the minimal-shape builder is used.
     """
     inherited = list(blocked_signatures)
-    tool_calls_list = list(tool_calls)
     original_signature = compute_signature(final_text)
     if inherited and original_signature in inherited:
         LOG.info("copilot_repeated_reply_observed", normalized_reply_signature=original_signature)
-    if turn_intent is not None or tool_calls_list:
-        return final_text, build_turn_outcome(
-            final_text,
-            turn_intent=turn_intent,
-            response_kind=attempted_kind,
-            reason_code=reason_code,
-            tool_calls=tool_calls_list,
-            terminal_reason=terminal_reason,
-            inherited_blocked_signatures=inherited,
-        )
-    return final_text, build_minimal_turn_outcome(
+    return final_text, build_turn_outcome(
         final_text,
         response_kind=attempted_kind,
         reason_code=reason_code,
+        tool_calls=list(tool_calls),
         terminal_reason=terminal_reason,
         inherited_blocked_signatures=inherited,
     )
-
-
-_RESPONSE_KIND_BY_MODE: dict[TurnIntentMode, ResponseKind] = {
-    TurnIntentMode.BUILD: ResponseKind.BUILD,
-    TurnIntentMode.EDIT: ResponseKind.BUILD,
-    TurnIntentMode.DRAFT_ONLY: ResponseKind.BUILD,
-    TurnIntentMode.CLARIFY: ResponseKind.CLARIFY,
-    TurnIntentMode.UNKNOWN: ResponseKind.CLARIFY,
-    TurnIntentMode.DIAGNOSE: ResponseKind.DIAGNOSE,
-    TurnIntentMode.ANSWER: ResponseKind.ANSWER,
-    TurnIntentMode.REFUSE: ResponseKind.REFUSE,
-}
-
-# Catches the "added a TurnIntentMode but forgot to map it" foot-gun at import
-# time rather than letting the new mode silently fall through to CLARIFY.
-# Raises explicitly (not ``assert``) so the guard survives ``python -O``.
-_missing_modes = set(TurnIntentMode) - set(_RESPONSE_KIND_BY_MODE)
-if _missing_modes:
-    raise RuntimeError(f"_RESPONSE_KIND_BY_MODE missing entries for: {sorted(m.value for m in _missing_modes)}")
-
-
-def derive_response_kind(turn_intent: TurnIntent | None) -> ResponseKind:
-    """Closed mapping with an effect-based fallback for safe unknown explanations.
-
-    ``RECOVER`` is set only by the enforcement guard.
-    """
-    mode = getattr(turn_intent, "mode", None)
-    if isinstance(turn_intent, TurnIntent) and mode is TurnIntentMode.UNKNOWN and turn_intent.is_inline_only:
-        return ResponseKind.ANSWER
-    if isinstance(mode, TurnIntentMode):
-        return _RESPONSE_KIND_BY_MODE[mode]
-    return ResponseKind.CLARIFY
 
 
 def _dedup_signatures(signatures: Iterable[str]) -> list[str]:
@@ -160,31 +120,17 @@ def build_minimal_turn_outcome(
 def build_turn_outcome(
     final_text: str,
     *,
-    turn_intent: TurnIntent | None,
-    response_kind: ResponseKind | None = None,
+    response_kind: ResponseKind,
     reason_code: str = "",
     tool_calls: Iterable[str] = (),
     terminal_reason: str | None = None,
     inherited_blocked_signatures: Iterable[str] = (),
     extra_blocked_signatures: Iterable[str] = (),
 ) -> TurnOutcome:
-    """Used by the translation path. Resolves ``response_kind`` from the turn
-    intent when not supplied; merges inherited + extra blocked signatures so
-    the enforcement guard can record the original signature it just blocked."""
-    resolved_kind = response_kind if response_kind is not None else derive_response_kind(turn_intent)
-    intent_summary: dict[str, Any] = {}
-    if turn_intent is not None:
-        try:
-            intent_summary = dict(turn_intent.to_trace_data())
-        except Exception as exc:
-            LOG.warning(
-                "Failed to serialize TurnIntent trace data for TurnOutcome; using empty dict",
-                exc_info=exc,
-            )
-            intent_summary = {}
+    """Used by the translation path. Merges inherited + extra blocked signatures
+    so the enforcement guard can record the original signature it just blocked."""
     return TurnOutcome(
-        turn_intent_summary=intent_summary,
-        response_kind=resolved_kind,
+        response_kind=response_kind,
         reason_code=reason_code,
         normalized_reply_signature=compute_signature(final_text),
         tool_calls=[str(call) for call in tool_calls if call],

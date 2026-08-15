@@ -23,25 +23,24 @@ _SESSION_SCRUB_VALUES: dict[str, list[str]] = {}
 _MAX_SCRUB_SESSIONS = 1024
 
 # Substring-replacing a short value into stored content corrupts it: a six-digit OTP occurs by
-# chance inside ports, counts, and ids. Rewrites that persist apply this floor; log redaction does
-# not, because over-redacting a log line is cheap and leaking a secret into one is not.
+# chance inside ports, counts, and ids. Rewrites of the stored workflow apply this floor — both the
+# persisted row and the draft an edit anchors against, which have to stay the same string. Log
+# redaction does not, because over-redacting a log line is cheap and leaking a secret into one is not.
 MIN_PERSISTED_REDACTION_LENGTH = 8
 
-_ALL_VALUES_CACHE: tuple[tuple[tuple[str, int], ...], list[str]] | None = None
+_ALL_VALUES_CACHE: tuple[tuple[tuple[str, tuple[str, ...]], ...], list[str]] | None = None
 
 
-def _registry_fingerprint() -> tuple[tuple[str, int], ...]:
+def _registry_fingerprint() -> tuple[tuple[str, tuple[str, ...]], ...]:
     """Cheap key that changes on any registry mutation, including a direct one.
 
-    Keyed per session rather than on totals: aggregate counts alone collide whenever one session is
-    dropped and another registers the same number of values, which served the dropped session's
-    values as the live list and left the new session's credential unscrubbed. Values are
-    append-only within a session, so a per-session count moves on every addition.
+    Keyed by each session's values so clearing and reusing a session ID with the same value count
+    cannot serve stale credentials from the prior session lifetime.
 
     Deriving the key from the data rather than a hand-maintained counter means a caller that
     mutates the dict directly cannot be served a stale list.
     """
-    return tuple(sorted((session_id, len(values)) for session_id, values in _SESSION_SCRUB_VALUES.items()))
+    return tuple(sorted((session_id, tuple(values)) for session_id, values in _SESSION_SCRUB_VALUES.items()))
 
 
 def _session_id(ctx: AgentContext) -> str | None:

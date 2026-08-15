@@ -300,6 +300,7 @@ async def _build_webhook_payload(organization_id: str, run_id: str) -> _WebhookP
         RunType.openai_cua,
         RunType.anthropic_cua,
         RunType.ui_tars,
+        RunType.task_v3,
     }:
         return await _build_task_payload(
             organization_id=organization_id,

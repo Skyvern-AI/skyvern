@@ -27,11 +27,18 @@ function skyvernCredentialToParameterYAML(
   const hasCredentialRotation = (parameter.credentialIds?.length ?? 0) >= 2;
   const hasFallbackCredentials =
     (parameter.fallbackCredentialIds?.length ?? 0) > 0;
-  if (!hasCredentialRotation && !hasFallbackCredentials) {
+  // An at-will credential (no default selected) cannot rotate or fall back — the pool
+  // shape requires a non-empty credential_id, so it serializes as a workflow parameter
+  // with a null default_value (the backend treats a no-default credential as at-will).
+  const hasPrimaryCredential = parameter.credentialId !== "";
+  if (
+    !hasPrimaryCredential ||
+    (!hasCredentialRotation && !hasFallbackCredentials)
+  ) {
     return {
       parameter_type: WorkflowParameterTypes.Workflow,
       workflow_parameter_type: WorkflowParameterValueType.CredentialId,
-      default_value: parameter.credentialId,
+      default_value: parameter.credentialId || null,
       key: parameter.key,
       description: parameter.description || null,
     };
@@ -57,7 +64,11 @@ function skyvernCredentialToParameterYAML(
  */
 function applySkyvernCredentialEdit(
   previous: ParametersState[number] | null | undefined,
-  edit: { key: string; credentialId: string; description?: string | null },
+  edit: {
+    key: string;
+    credentialId: string;
+    description?: string | null;
+  },
 ): SkyvernCredential {
   const base: SkyvernCredential = {
     key: edit.key,
@@ -70,6 +81,11 @@ function applySkyvernCredentialEdit(
     previous.parameterType !== "credential" ||
     !parameterIsSkyvernCredential(previous)
   ) {
+    return base;
+  }
+  if (!edit.credentialId) {
+    // Clearing the credential (at-will, no default) drops rotation/fallback
+    // config — those shapes require a primary credential.
     return base;
   }
 
@@ -114,7 +130,7 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
           return {
             key: parameter.key,
             parameterType: WorkflowEditorParameterTypes.Credential,
-            credentialId: parameter.default_value as string,
+            credentialId: (parameter.default_value as string | null) ?? "",
             dataType: WorkflowParameterValueType.CredentialId,
             description: parameter.description,
           };

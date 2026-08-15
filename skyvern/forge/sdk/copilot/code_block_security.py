@@ -84,8 +84,8 @@ def _security_errors_for_tree(label: str, tree: ast.AST, attr_reasons: dict[str,
     errors: list[CodeBlockSecurityError] = []
     seen: set[str] = set()
     for node in ast.walk(tree):
-        # This AST layer catches direct attribute access. The sandbox's unresolved-name,
-        # private-attribute, and builtins restrictions remain the backstop for dynamic forms.
+        # This AST layer catches direct attribute access. The sandbox's private-attribute
+        # and builtins restrictions remain the backstop for dynamic forms.
         if isinstance(node, ast.Attribute) and node.attr in attr_reasons:
             reason = attr_reasons[node.attr]
             if reason not in seen:

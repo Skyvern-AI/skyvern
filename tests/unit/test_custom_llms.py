@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.config import settings
-from skyvern.exceptions import BlockedHost
+from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge.sdk.api.llm import custom_llm_registry
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
@@ -442,6 +442,36 @@ async def test_update_organization_accepts_valid_custom_llm_defaults(
     assert update_args is not None
     assert update_args.kwargs["default_llm_key"] == custom_llm_key(token.id)
     assert update_args.kwargs["default_secondary_llm_key"] == custom_llm_key(token.id)
+
+
+@pytest.mark.asyncio
+async def test_update_organization_allows_unchanged_legacy_webhook_url(
+    fake_organizations: FakeOrganizationsRepository,
+) -> None:
+    legacy_url = "https://service-123.us-east-1.elb.amazonaws.com/hook"
+    org = _org("o_legacy_webhook").model_copy(update={"webhook_callback_url": legacy_url})
+    fake_organizations.update_organization = AsyncMock(return_value=org)
+    update = OrganizationUpdate(webhook_callback_url=legacy_url, max_steps_per_run=10)
+
+    await agent_protocol.update_organization(update, org)
+
+    update_args = fake_organizations.update_organization.await_args
+    assert update_args is not None
+    assert update_args.kwargs["webhook_callback_url"] == legacy_url
+    assert update_args.kwargs["max_steps_per_run"] == 10
+
+
+@pytest.mark.asyncio
+async def test_update_organization_rejects_changed_raw_load_balancer_webhook_url(
+    fake_organizations: FakeOrganizationsRepository,
+) -> None:
+    org = _org("o_changed_webhook")
+    update = OrganizationUpdate(webhook_callback_url="https://service-456.us-east-1.elb.amazonaws.com/hook")
+
+    with pytest.raises(SkyvernHTTPException, match="stable custom hostname"):
+        await agent_protocol.update_organization(update, org)
+
+    fake_organizations.update_organization.assert_not_awaited()
 
 
 @pytest.mark.asyncio

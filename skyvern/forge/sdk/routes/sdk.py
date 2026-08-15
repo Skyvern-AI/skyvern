@@ -176,6 +176,7 @@ async def run_sdk_action(
                 workflow_id=workflow.workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
                 workflow_run_is_synthetic=created_workflow_run,
+                is_sdk_inline_action=True,
             )
         )
         result: Any | None = None
