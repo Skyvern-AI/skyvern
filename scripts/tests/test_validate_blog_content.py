@@ -11,6 +11,15 @@ import zlib
 from pathlib import Path
 from typing import Callable
 
+try:
+    import linkify_it  # noqa: F401
+    import markdown_it  # noqa: F401
+    import mdit_py_plugins  # noqa: F401
+except ImportError as exc:
+    raise unittest.SkipTest(
+        f"blog validator dependencies are installed only in the blog-validation CI step: {exc}"
+    ) from exc
+
 from scripts import validate_blog_content as validator
 
 TIMESTAMP = "2026-08-12T12:00:00.000Z"
