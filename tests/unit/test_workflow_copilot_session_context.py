@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -110,6 +110,8 @@ def _install_patch(monkeypatch: Any) -> Any:
     # Wire ModuleType stubs for the full logfire chain — sys.modules entries alone aren't enough.
     import sys
 
+    import agents
+
     from skyvern.forge.sdk.copilot import tracing_setup
 
     def _fake_original(span_data: Any, msg_template: str) -> dict[str, Any]:
@@ -139,15 +141,9 @@ def _install_patch(monkeypatch: Any) -> Any:
     monkeypatch.setitem(sys.modules, "logfire._internal", internal_mod)
     monkeypatch.setitem(sys.modules, "logfire._internal.integrations", integrations_mod)
     monkeypatch.setitem(sys.modules, "logfire._internal.integrations.openai_agents", oai_mod)
-    monkeypatch.setitem(
-        sys.modules,
-        "agents",
-        SimpleNamespace(
-            AgentSpanData=_FakeAgentSpanData,
-            GenerationSpanData=_FakeGenerationSpanData,
-            FunctionSpanData=_FakeFunctionSpanData,
-        ),
-    )
+    monkeypatch.setattr(agents, "AgentSpanData", _FakeAgentSpanData)
+    monkeypatch.setattr(agents, "GenerationSpanData", _FakeGenerationSpanData)
+    monkeypatch.setattr(agents, "FunctionSpanData", _FakeFunctionSpanData)
 
     tracing_setup._patch_agent_span_attributes()
     return oai_mod.attributes_from_span_data

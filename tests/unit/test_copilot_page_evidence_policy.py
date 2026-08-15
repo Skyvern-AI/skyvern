@@ -28,15 +28,6 @@ def _render_agent_prompt() -> str:
     return prompt_engine.load_prompt("workflow-copilot-agent", **_AGENT_TEMPLATE_DEFAULTS)
 
 
-def test_prompt_requires_evidence_grounded_form_and_result_composition() -> None:
-    rendered = _render_agent_prompt()
-
-    assert "grounded in observed evidence" in rendered
-    assert "not one guessed site model" in rendered
-    assert "Do not pre-author row/detail expansion from the user's words alone" in rendered
-    assert "the expansion step also needs result-page evidence" in rendered
-
-
 def test_agent_prompt_frames_inspection_as_build_time_context_not_workflow_shape_policy() -> None:
     rendered = _render_agent_prompt()
 
@@ -51,45 +42,6 @@ def test_agent_prompt_frames_inspection_as_build_time_context_not_workflow_shape
     assert "before each action" in rendered
     assert "GOTO_URL STATE SHORTCUT POLICY" not in rendered
     assert "Before extraction on stateful search/result tasks" not in rendered
-
-
-def test_agent_prompt_accounts_for_observed_challenges_without_blind_waits() -> None:
-    rendered = _render_agent_prompt()
-
-    assert "anti-bot or challenge controls" in rendered
-    assert "Use `get_browser_screenshot` whenever seeing the rendered page answers the question" in rendered
-    assert "Prefer explicit challenge handling available to Skyvern over blind waits" in rendered
-    assert "report the observed blocker instead of retrying the same flow" in rendered
-    assert "challenge_state.gates_submit_controls=true" in rendered
-    assert "submit/search control disabled" in rendered
-
-
-def test_agent_prompt_continues_from_observed_state_after_budgeted_runs() -> None:
-    rendered = _render_agent_prompt()
-
-    assert "live browser page that advanced beyond the workflow's entrypoint" in rendered
-    assert "Do not turn the observed current page into a new workflow entrypoint" in rendered
-    assert "Preserve unchanged upstream labels and text" in rendered
-    assert "run only the missing downstream labels" in rendered
-
-
-def test_agent_prompt_requires_result_page_evidence_before_expansion_blocks() -> None:
-    rendered = _render_agent_prompt()
-
-    assert "Do not pre-author row/detail expansion from the user's words alone" in rendered
-    assert "Do not author or run an expansion block before you have reached or inspected the results page" in rendered
-    assert "Do not author downstream row expansion or extraction that depends on a future page state" in rendered
-    assert "add and run the expansion block before adding extraction" in rendered
-    assert "if the requested details are already visible" in rendered
-    assert "omit the expansion block and proceed to extraction from the visible results" in rendered
-
-
-def test_agent_prompt_requires_details_evidence_label() -> None:
-    rendered = _render_agent_prompt()
-
-    assert "details or profile page" in rendered
-    assert "visible details/profile page label" in rendered
-    assert "page label only as supporting evidence" in rendered
 
 
 def test_tool_descriptions_ground_composition_without_prescribing_extra_workflow_blocks() -> None:
@@ -115,7 +67,13 @@ def test_structured_page_inspection_is_not_rationed() -> None:
 
 
 def test_default_loop_budget_allows_inspect_build_run_answer_trajectory() -> None:
-    assert DEFAULT_MAX_TURNS >= 35
+    assert DEFAULT_MAX_TURNS == 200
+
+
+def test_agent_prompt_directs_past_redundant_output_schema_confirmation() -> None:
+    rendered = _render_agent_prompt()
+
+    assert "instead of asking the user to confirm output fields or schema" in rendered
 
 
 def test_block_observation_ref_rejects_negative_steps() -> None:

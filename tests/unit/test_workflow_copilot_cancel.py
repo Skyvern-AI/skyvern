@@ -44,6 +44,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     workflow_copilot_cancel,
     workflow_copilot_chat_post,
 )
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotCancelRequest,
     WorkflowCopilotChatRequest,
@@ -300,7 +301,9 @@ async def test_route_cancel_branch_persists_user_and_cancelled_messages(
     contents = [c.kwargs.get("content") for c in insert_calls]
     assert senders.count("user") == 0
     assert senders.count("ai") == 1
-    assert workflow_params.start_copilot_turn.await_args.kwargs["user_message"] == "please update"
+    assert workflow_params.start_copilot_turn.await_args.kwargs["user_message"] == (
+        "[Message unavailable because safety screening did not complete]"
+    )
 
     assert "Cancelled by user." in contents
 
@@ -395,7 +398,9 @@ async def test_route_cancel_wip_persists_proposal_and_response_frame(
 
     insert_calls = workflow_params.create_workflow_copilot_chat_message.await_args_list
     contents = [c.kwargs.get("content") for c in insert_calls]
-    assert workflow_params.start_copilot_turn.await_args.kwargs["user_message"] == "please update"
+    assert workflow_params.start_copilot_turn.await_args.kwargs["user_message"] == (
+        "[Message unavailable because safety screening did not complete]"
+    )
     assert user_response in contents
 
     response_frames = [
@@ -1066,4 +1071,6 @@ async def test_pre_agent_cancel_row_is_visible_to_the_turn_idempotence_check() -
     assert outcome.copilot_turn_id == "turn-a"
     assert outcome.terminal_reason == USER_CANCELLED_TERMINAL_REASON
     assert outcome.terminal_reason != "interrupted"
+    assert outcome.response_kind is ResponseKind.RECOVER
+    assert outcome.response_kind is not ResponseKind.CLARIFY
     assert await _assistant_row_exists_for_turn(chat, "turn-a") is True

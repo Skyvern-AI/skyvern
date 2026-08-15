@@ -3,13 +3,17 @@ from __future__ import annotations
 import asyncio
 import errno
 import os
+import shutil
+import subprocess
+import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol, cast
 
 import structlog
 
 from skyvern.browser_extension.auth import load_or_create_pairing_token
+from skyvern.browser_extension.broker_client import BrokerClient
 from skyvern.browser_extension.errors import BrowserExtensionError
 from skyvern.browser_extension.relay import ExtensionRelayServer
 from skyvern.browser_extension.target_registry import VirtualTargetRegistry
@@ -17,6 +21,7 @@ from skyvern.browser_extension.target_registry import VirtualTargetRegistry
 LOG = structlog.get_logger(__name__)
 
 _PORT_ENV = "SKYVERN_BROWSER_EXTENSION_PORT"
+_BROKER_ENV = "SKYVERN_BROWSER_EXTENSION_BROKER"
 _DEFAULT_PORT = 19777
 
 
@@ -33,18 +38,49 @@ class _Adapter(Protocol):
     async def on_extension_disconnect(self) -> None: ...
 
 
+class _Relay(Protocol):
+    bound_port: int
+    scoped_tabs: list[dict]
+
+    @property
+    def connected(self) -> bool: ...
+
+    async def start(self) -> None: ...
+
+    async def stop(self) -> None: ...
+
+    async def wait_connected(self, timeout: float) -> bool: ...
+
+    async def request(self, op: str, args: dict, timeout: float = 30.0) -> dict: ...
+
+
 _relay_factory: Callable[
     [str, int, Callable[[str, dict], Awaitable[None]], Callable[[], Awaitable[None]] | None],
     ExtensionRelayServer,
 ] = ExtensionRelayServer
-_adapter_factory: Callable[[VirtualTargetRegistry, ExtensionRelayServer], _Adapter] | None = None
+_adapter_factory: Callable[[VirtualTargetRegistry, _Relay], _Adapter] | None = None
+
+
+def _open_browser_process(command: list[str], *, windows: bool) -> bool:
+    options: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    options["creationflags" if windows else "start_new_session"] = 0x00000208 if windows else True
+    try:
+        subprocess.Popen(command, **options)
+    except OSError:
+        return False
+    return True
 
 
 class BrowserExtensionRuntime:
     _instance: BrowserExtensionRuntime | None = None
     _lock = asyncio.Lock()
 
-    def __init__(self, relay: ExtensionRelayServer, adapter: _Adapter) -> None:
+    def __init__(self, relay: _Relay, adapter: _Adapter) -> None:
         self._relay = relay
         self._adapter = adapter
         self._stopped = False
@@ -56,6 +92,36 @@ class BrowserExtensionRuntime:
                 return cls._instance
 
             resolved_port = _resolve_port(port)
+            if _broker_requested() and not _broker_platform_supported():
+                LOG.info(
+                    "browser_extension_broker_unsupported_platform_using_legacy",
+                    code="UNSUPPORTED_PLATFORM",
+                    platform=sys.platform,
+                )
+            if broker_mode_enabled():
+                registry = VirtualTargetRegistry()
+                broker_adapter_holder: list[_Adapter] = []
+
+                async def handle_broker_event(event: str, params: dict) -> None:
+                    await broker_adapter_holder[0].handle_extension_event(event, params)
+
+                async def on_broker_disconnect() -> None:
+                    await broker_adapter_holder[0].on_extension_disconnect()
+
+                broker = BrokerClient(resolved_port, handle_broker_event, on_broker_disconnect)
+                broker_adapter = _create_adapter(registry, broker)
+                broker_adapter_holder.append(broker_adapter)
+                try:
+                    await broker_adapter.start()
+                    await broker.start()
+                except BaseException:
+                    await _cleanup_failed_start(broker, broker_adapter)
+                    raise
+
+                runtime = cls(broker, broker_adapter)
+                cls._instance = runtime
+                return runtime
+
             token = load_or_create_pairing_token()
             registry = VirtualTargetRegistry()
             adapter_holder: list[_Adapter] = []
@@ -77,8 +143,9 @@ class BrowserExtensionRuntime:
                 await _cleanup_failed_start(relay, adapter)
                 if exc.errno == errno.EADDRINUSE:
                     raise BrowserExtensionError(
-                        f"Browser extension relay port {resolved_port} is already in use; "
-                        f"set {_PORT_ENV} to a free port"
+                        f"Another Skyvern MCP session likely owns the browser-extension bridge on port {resolved_port}; "
+                        f"close that session, or set {_PORT_ENV} to a free port and update the bridge port in the Skyvern "
+                        "extension popup to match"
                     ) from exc
                 raise
             except BaseException:
@@ -104,6 +171,58 @@ class BrowserExtensionRuntime:
     async def wait_for_extension(self, timeout: float = 10.0) -> bool:
         return await self._relay.wait_connected(timeout)
 
+    @staticmethod
+    def open_extension_url(url: str) -> bool:
+        if sys.platform == "darwin":
+            executable = shutil.which("open")
+            if executable is None:
+                return False
+            for app_name in ("Google Chrome", "Google Chrome Beta", "Google Chrome Dev", "Google Chrome Canary"):
+                try:
+                    subprocess.run(
+                        [executable, "-a", app_name, url],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except (OSError, subprocess.CalledProcessError):
+                    continue
+                return True
+            return False
+
+        if sys.platform.startswith("linux"):
+            for browser_name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+                executable = shutil.which(browser_name)
+                if executable is None:
+                    continue
+                if _open_browser_process([executable, url], windows=False):
+                    return True
+            return False
+
+        if sys.platform == "win32":
+            roots = (
+                os.environ.get("LOCALAPPDATA"),
+                os.environ.get("PROGRAMFILES"),
+                os.environ.get("PROGRAMFILES(X86)"),
+            )
+            for root in roots:
+                if not root:
+                    continue
+                executable = Path(root) / "Google" / "Chrome" / "Application" / "chrome.exe"
+                if not executable.is_file():
+                    continue
+                if _open_browser_process([str(executable), url], windows=True):
+                    return True
+        return False
+
+    def open_pairing_page(self) -> bool:
+        if isinstance(self._relay, BrokerClient):
+            return False
+        embedded_relay = cast(ExtensionRelayServer, self._relay)
+        nonce = embedded_relay.get_or_create_pairing_nonce()
+        url = f"http://127.0.0.1:{embedded_relay.bound_port}/pair#{nonce}"
+        return self.open_extension_url(url)
+
     async def shutdown(self) -> None:
         cls = type(self)
         async with cls._lock:
@@ -128,7 +247,7 @@ class BrowserExtensionRuntime:
         return _resolve_port(None)
 
 
-def _create_adapter(registry: VirtualTargetRegistry, relay: ExtensionRelayServer) -> _Adapter:
+def _create_adapter(registry: VirtualTargetRegistry, relay: _Relay) -> _Adapter:
     if _adapter_factory is not None:
         return _adapter_factory(registry, relay)
     from skyvern.browser_extension.cdp_adapter import ExtensionCdpAdapter
@@ -153,7 +272,7 @@ def _resolve_port(port: int | None) -> int:
     return resolved_port
 
 
-async def _cleanup_failed_start(relay: ExtensionRelayServer, adapter: _Adapter) -> None:
+async def _cleanup_failed_start(relay: _Relay, adapter: _Adapter) -> None:
     try:
         await relay.stop()
     except Exception:
@@ -162,3 +281,15 @@ async def _cleanup_failed_start(relay: ExtensionRelayServer, adapter: _Adapter) 
         await adapter.stop()
     except Exception:
         LOG.exception("failed to stop browser extension adapter after startup error")
+
+
+def broker_mode_enabled() -> bool:
+    return _broker_requested() and _broker_platform_supported()
+
+
+def _broker_requested() -> bool:
+    return os.environ.get(_BROKER_ENV) != "0"
+
+
+def _broker_platform_supported() -> bool:
+    return os.name == "posix" and sys.platform != "win32"

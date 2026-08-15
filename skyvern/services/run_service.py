@@ -8,6 +8,10 @@ from skyvern.exceptions import OrganizationNotFound, TaskNotFound, WorkflowRunNo
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.service import (
+    truncate_oversized_response_text,
+    truncate_oversized_response_value,
+)
 from skyvern.schemas.runs import (
     BulkCancelRunsResponse,
     RunEngine,
@@ -22,7 +26,9 @@ from skyvern.services import task_v1_service, task_v2_service, webhook_service, 
 LOG = structlog.get_logger()
 
 
-async def get_run_response(run_id: str, organization_id: str | None = None) -> RunResponse | None:
+async def get_run_response(
+    run_id: str, organization_id: str | None = None, cap_output_values: bool = False
+) -> RunResponse | None:
     run = await app.DATABASE.tasks.get_run(run_id, organization_id=organization_id)
     if not run:
         # try to see if it's a workflow run id for task v2
@@ -39,6 +45,7 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
         or run.task_run_type == RunType.anthropic_cua
         or run.task_run_type == RunType.ui_tars
         or run.task_run_type == RunType.yutori_navigator
+        or run.task_run_type == RunType.task_v3
     ):
         # fetch task v1 from db and transform to task run response
         try:
@@ -56,13 +63,23 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
             run_engine = RunEngine.ui_tars
         elif run.task_run_type == RunType.yutori_navigator:
             run_engine = RunEngine.yutori_navigator
+        elif run.task_run_type == RunType.task_v3:
+            run_engine = RunEngine.skyvern_v3
 
         return TaskRunResponse(
             run_id=run.run_id,
             run_type=run.task_run_type,
             status=str(task_v1_response.status),
-            output=task_v1_response.extracted_information,
-            failure_reason=task_v1_response.failure_reason,
+            output=(
+                truncate_oversized_response_value(task_v1_response.extracted_information, run_id=run.run_id)
+                if cap_output_values
+                else task_v1_response.extracted_information
+            ),
+            failure_reason=(
+                truncate_oversized_response_text(task_v1_response.failure_reason)
+                if cap_output_values
+                else task_v1_response.failure_reason
+            ),
             queued_at=task_v1_response.queued_at,
             started_at=task_v1_response.started_at,
             finished_at=task_v1_response.finished_at,
@@ -93,9 +110,11 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
         task_v2 = await app.DATABASE.observer.get_task_v2(run.run_id, organization_id=organization_id)
         if not task_v2:
             return None
-        return await task_v2_service.build_task_v2_run_response(task_v2)
+        return await task_v2_service.build_task_v2_run_response(task_v2, cap_output_values=cap_output_values)
     elif run.task_run_type == RunType.workflow_run:
-        return await workflow_service.get_workflow_run_response(run.run_id, organization_id=organization_id)
+        return await workflow_service.get_workflow_run_response(
+            run.run_id, organization_id=organization_id, cap_output_values=cap_output_values
+        )
     raise ValueError(f"Invalid task run type: {run.task_run_type}")
 
 
@@ -158,6 +177,7 @@ async def cancel_run(run_id: str, organization_id: str | None = None, api_key: s
         RunType.anthropic_cua,
         RunType.ui_tars,
         RunType.yutori_navigator,
+        RunType.task_v3,
     ]:
         await cancel_task_v1(run_id, organization_id=organization_id, api_key=api_key)
     elif run.task_run_type == RunType.task_v2:

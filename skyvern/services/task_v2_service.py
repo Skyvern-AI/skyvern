@@ -87,6 +87,7 @@ from skyvern.schemas.workflows import (
     WorkflowDefinitionYAML,
     WorkflowStatus,
 )
+from skyvern.services import planner_levers
 from skyvern.services.webhook_delivery import deliver_webhook_with_retries, describe_delivery_error
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
@@ -685,14 +686,11 @@ def _should_run_post_block_completion_check(
     task_type: str,
     *,
     navigate_completion_check_enabled: bool,
+    skip_completion_check_after_navigate: bool,
 ) -> bool:
     if block_success is not True:
         return False
-    if (
-        settings.TASK_V2_SKIP_COMPLETION_CHECK_AFTER_NAVIGATE
-        and task_type == "navigate"
-        and navigate_completion_check_enabled
-    ):
+    if skip_completion_check_after_navigate and task_type == "navigate" and navigate_completion_check_enabled:
         return False
     return True
 
@@ -939,6 +937,10 @@ async def run_task_v2_helper(
                     except Exception:
                         LOG.exception("Failed to load Google fallback", exc_info=True, url=url, current_url=current_url)
 
+        skip_completion_check_after_navigate_enabled = await planner_levers.skip_completion_check_after_navigate(
+            organization_id
+        )
+
         if i == 0 and current_url != url:
             if should_fallback:
                 plan = f"Go to Google because the intended website ({url}) failed to load properly."
@@ -978,13 +980,16 @@ async def run_task_v2_helper(
                 continue
             current_url = current_url if current_url else str(await SkyvernFrame.get_url(frame=page) if page else url)
 
-            iterations_remaining = _converge_iterations_remaining(i, max_iterations, settings.TASK_V2_CONVERGE_PCT)
+            iterations_remaining = _converge_iterations_remaining(
+                i, max_iterations, await planner_levers.converge_pct(organization_id)
+            )
             try:
                 open_tabs_context = await build_open_tabs_context(browser_state, page)
             except Exception:
                 LOG.warning("Failed to build open-tabs context for the planner", exc_info=True)
                 open_tabs_context = None
             planner_mini_goal_improvements = await _is_planner_mini_goal_improvements_enabled(organization_id)
+            carry_subgoals_enabled = await planner_levers.carry_subgoals(organization_id)
             task_v2_prompt = load_prompt_with_elements(
                 scraped_page,
                 prompt_engine,
@@ -995,7 +1000,7 @@ async def run_task_v2_helper(
                 open_tabs_context=open_tabs_context,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
                 compute_enabled=compute_enabled,
-                prior_required_subgoals=prior_required_subgoals if settings.TASK_V2_CARRY_SUBGOALS else None,
+                prior_required_subgoals=prior_required_subgoals if carry_subgoals_enabled else None,
                 iterations_remaining=iterations_remaining,
                 step_budget=organization.max_steps_per_run or settings.MAX_STEPS_PER_RUN,
                 planner_mini_goal_improvements=planner_mini_goal_improvements,
@@ -1037,7 +1042,7 @@ async def run_task_v2_helper(
                 (task_v2_response.get("complete_criterion") or None) if planner_mini_goal_improvements else None
             )
             complete_criterion_is_untrusted = bool(complete_criterion)
-            if settings.TASK_V2_CARRY_SUBGOALS:
+            if carry_subgoals_enabled:
                 _subgoals = task_v2_response.get("required_subgoals")
                 if _subgoals:
                     prior_required_subgoals = _subgoals
@@ -1289,6 +1294,7 @@ async def run_task_v2_helper(
             block_result.success,
             task_type,
             navigate_completion_check_enabled=bool(complete_criterion),
+            skip_completion_check_after_navigate=skip_completion_check_after_navigate_enabled,
         ):
             completion_screenshots: list[bytes] = []
             completion_scraped_page: ScrapedPage | None = None
@@ -2135,7 +2141,14 @@ async def _generate_goto_url_task(
     )
 
 
-async def get_thought_timelines(*, task_v2_id: str, organization_id: str) -> list[WorkflowRunTimeline]:
+async def get_thought_timelines(
+    *, task_v2_id: str, organization_id: str, cap_output_values: bool = False
+) -> list[WorkflowRunTimeline]:
+    from skyvern.forge.sdk.workflow.service import (  # noqa: PLC0415
+        truncate_oversized_response_text,
+        truncate_oversized_response_value,
+    )
+
     thoughts = await app.DATABASE.observer.get_thoughts(
         task_v2_id=task_v2_id,
         organization_id=organization_id,
@@ -2144,6 +2157,23 @@ async def get_thought_timelines(*, task_v2_id: str, organization_id: str) -> lis
             ThoughtType.user_goal_check,
         ],
     )
+    if cap_output_values:
+        # A thought's generated text and structured output ride this response beside
+        # block outputs and are rendered directly by the run-detail UI.
+        thoughts = [
+            thought.model_copy(
+                update={
+                    "output": truncate_oversized_response_value(
+                        thought.output, thought_id=thought.observer_thought_id, field="output"
+                    ),
+                    **{
+                        field: truncate_oversized_response_text(getattr(thought, field))
+                        for field in ("user_input", "observation", "thought", "answer")
+                    },
+                }
+            )
+            for thought in thoughts
+        ]
     return [
         WorkflowRunTimeline(
             type=WorkflowRunTimelineType.thought,
@@ -2533,6 +2563,49 @@ async def _persist_completion_tab_screenshots(browser_state: BrowserState, thoug
     return captured
 
 
+def _parse_task_v2_summary_response(resp: Any) -> tuple[str | None, Any]:
+    """Extract (description, output) from a task_v2_summary reply, tolerating envelope
+    non-compliance.
+
+    The summary prompt requires a {"description", "output"} envelope, but when the user
+    goal defines its own output contract the model sometimes follows that contract
+    instead, emitting the deliverable at the top level of the reply. In that case the
+    reply itself IS the output; dropping it loses the run's extracted_information
+    (SKY-14004). The recovered payload keeps every data key — including a user-schema
+    "description" — so a goal-defined contract survives verbatim; only null envelope
+    slots are dropped.
+
+    The LLM handler runs with force_dict=True, so non-dict replies cannot reach this
+    parser in production; they are handled defensively.
+    """
+    if not isinstance(resp, dict):
+        return None, None
+    description = resp.get("description")
+    if not isinstance(description, str):
+        description = None
+    output = resp.get("output")
+    if output is None:
+        # Data beyond a compliant envelope: any key besides "output", except a
+        # "description" holding the envelope's string (or null) slot. A non-str,
+        # non-null "description" is user data, not the envelope.
+        has_payload = any(
+            key != "description" or (value is not None and not isinstance(value, str))
+            for key, value in resp.items()
+            if key != "output"
+        )
+        if has_payload:
+            output = {
+                key: value
+                for key, value in resp.items()
+                if key != "output" and not (key == "description" and value is None)
+            }
+            LOG.info(
+                "Recovered task_v2 summary output from non-envelope response",
+                recovered_keys=sorted(output.keys()),
+            )
+    return description, output
+
+
 async def _generate_task_v2_deliverable(
     task_v2: TaskV2,
     task_history: list[dict],
@@ -2567,8 +2640,7 @@ async def _generate_task_v2_deliverable(
     )
     LOG.info("Task v2 summary response", task_v2_summary_resp=task_v2_summary_resp, is_partial=is_partial)
 
-    summary_description = task_v2_summary_resp.get("description")
-    summarized_output = task_v2_summary_resp.get("output")
+    summary_description, summarized_output = _parse_task_v2_summary_response(task_v2_summary_resp)
     await app.DATABASE.observer.update_thought(
         thought_id=thought.observer_thought_id,
         organization_id=task_v2.organization_id,
@@ -2627,15 +2699,18 @@ async def _summarize_task_v2(
     )
 
 
-async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
+async def build_task_v2_run_response(task_v2: TaskV2, cap_output_values: bool = False) -> TaskRunResponse:
     """Build TaskRunResponse object for webhook backward compatibility."""
+    from skyvern.forge.sdk.workflow.service import truncate_oversized_response_value  # noqa: PLC0415
     from skyvern.services import workflow_service  # noqa: PLC0415
 
     workflow_run_resp = None
     if task_v2.workflow_run_id:
         try:
             workflow_run_resp = await workflow_service.get_workflow_run_response(
-                task_v2.workflow_run_id, organization_id=task_v2.organization_id
+                task_v2.workflow_run_id,
+                organization_id=task_v2.organization_id,
+                cap_output_values=cap_output_values,
             )
         except Exception:
             LOG.warning(
@@ -2652,7 +2727,11 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
         run_id=task_v2.observer_cruise_id,
         run_type=RunType.task_v2,
         status=task_v2.status,
-        output=task_v2.output,
+        output=(
+            truncate_oversized_response_value(task_v2.output, task_v2_id=task_v2.observer_cruise_id)
+            if cap_output_values
+            else task_v2.output
+        ),
         failure_reason=workflow_run_resp.failure_reason if workflow_run_resp else None,
         queued_at=task_v2.queued_at,
         started_at=task_v2.started_at,

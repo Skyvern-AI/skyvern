@@ -20,16 +20,17 @@ import {
   ChevronDownIcon,
   CheckIcon,
   ArrowUpIcon,
-  StopIcon,
 } from "@radix-ui/react-icons";
 import { createPortal } from "react-dom";
 import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
 import { usePasteSkillHintStore } from "@/store/usePasteSkillHintStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+import { describeRecordedAction } from "@/routes/workflows/workflowBlockUtils";
 import {
   isBlockItem,
   WorkflowRunTimelineItem,
@@ -53,6 +54,7 @@ import {
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
   WorkflowCopilotCredentialRequiredUpdate,
+  WorkflowCopilotTitleUpdate,
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
   WorkflowCopilotChatSummary,
@@ -61,6 +63,7 @@ import {
   WorkflowCopilotAudioUploadResponse,
 } from "./workflowCopilotTypes";
 import { WorkflowCopilotHistory } from "./WorkflowCopilotHistory";
+import { selectAutoBoundReceiptIndexes } from "./autoBoundReceiptIndexes";
 import { shouldWaitForLiveBrowser } from "./browserReadiness";
 import {
   QueuedPromptReason,
@@ -70,6 +73,7 @@ import {
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
 import { shouldArmDraftingGapTimer } from "./copilotPhases";
 import { InstantAckPlaceholder, NarrativeView } from "./NarrativeView";
+import { CopilotWorkingStatus } from "./CopilotWorkingStatus";
 import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
 import { DiffCard, shouldShowDiffCard } from "./cards/DiffCard";
@@ -117,12 +121,6 @@ const MAX_TURN_SNAPSHOTS = 20;
 // they land without hammering the timeline endpoint.
 const RECORDED_ACTIONS_POLL_INTERVAL_MS = 2500;
 
-function normalizeInline(value: string | null | undefined): string | null {
-  if (!value) return null;
-  const trimmed = value.replace(/\s+/g, " ").trim();
-  return trimmed.length > 0 ? trimmed : null;
-}
-
 function recordedActionDurationMs(action: ActionsApiResponse): number | null {
   const output = action.output;
   if (!output || typeof output !== "object" || Array.isArray(output)) {
@@ -138,11 +136,9 @@ function toRecordedActionSummary(
   return {
     actionId: action.action_id,
     label: getReadableActionType(action.action_type),
-    summary:
-      normalizeInline(action.reasoning) ??
-      normalizeInline(action.text) ??
-      normalizeInline(action.response) ??
-      normalizeInline(action.description),
+    // The chat has no workflow definition in scope, so rows resolve from the action
+    // itself; the run-view timeline additionally matches the definition's step text.
+    summary: describeRecordedAction(action, null),
     durationMs: recordedActionDurationMs(action),
     failed: action.status === "failed",
   };
@@ -213,6 +209,9 @@ function defaultCodeBlockRequestOverride(
 // to a tone-adaptive monochrome silhouette so both read flat on the dark UI.
 const ASK_GLYPH = "\u275D\uFE0E";
 const BUILD_GLYPH = "\uD83D\uDC09";
+
+const STOP_ORBIT_GRADIENT =
+  "conic-gradient(from 0deg, rgba(120,170,255,.08) 0deg, rgba(120,170,255,.08) 120deg, rgba(150,195,255,.55) 250deg, #dbeaff 330deg, rgba(120,170,255,.08) 360deg)";
 
 function isPictographic(glyph: string): boolean {
   try {
@@ -394,6 +393,7 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotDesignStartUpdate
   | WorkflowCopilotDesignEndUpdate
   | WorkflowCopilotWorkflowDraftUpdate
+  | WorkflowCopilotTitleUpdate
   | WorkflowCopilotCredentialRequiredUpdate;
 
 // The live pause frame is a structural superset of the card's frame; only
@@ -426,6 +426,17 @@ function credentialCardFrameFor(
     };
   }
   return null;
+}
+
+// A co-occurring credential ask/pause owns this turn's credential UI and its
+// credentialResolutions[turnId] entry; the auto-bind receipt would double up and
+// mis-adopt that ask's resolution, so it defers whenever a card frame exists.
+function autoBoundReceiptFor(
+  message: ChatMessage,
+): TurnNarrativeState["credentialAutoBound"] {
+  const turn = message.narrative;
+  if (message.sender !== "ai" || !turn || turn.turnId === null) return null;
+  return credentialCardFrameFor(turn) ? null : turn.credentialAutoBound;
 }
 
 function historicalCredentialOutcome(
@@ -501,8 +512,8 @@ const MessageItem = memo(
                 <button
                   type="button"
                   onClick={queuedStatus.onCancel}
-                  title="Cancel queued message"
-                  aria-label="Cancel queued message"
+                  title="Edit queued message"
+                  aria-label="Edit queued message"
                   className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
                 >
                   <Cross2Icon className="h-3 w-3" />
@@ -552,6 +563,10 @@ function RunLifecycleLine({ content }: { content: string }) {
 export type WorkflowUpdateOptions = {
   persisted?: boolean;
   applied?: boolean;
+  // A mid-turn draft lands while the user may be renaming the agent, so its title is
+  // applied only if nothing has named it yet. Discrete applies (accept, snap-back)
+  // are authoritative and keep the force path.
+  midTurnDraft?: boolean;
 };
 
 interface WorkflowCopilotChatProps {
@@ -763,6 +778,9 @@ export function WorkflowCopilotChat({
   const [inputValue, setInputValue] = useState("");
   const dismissPasteSkillHint = usePasteSkillHintStore((s) => s.dismiss);
   const [isLoading, setIsLoading] = useState(false);
+  // A stop is a round trip to the backend; without this the control stays
+  // live-looking and users press it repeatedly.
+  const [isStopping, setIsStopping] = useState(false);
   useTurnActivityChange(isLoading, onTurnActivityChange);
   const [queuedPrompt, setQueuedPrompt] = useState<QueuedPrompt | null>(null);
   const [narrative, setNarrative] =
@@ -1302,7 +1320,9 @@ export function WorkflowCopilotChat({
   } = useSpeechToTextField({
     value: inputValue,
     onChange: setInputValue,
-    enabled: isOpen && !queuedPrompt,
+    // Dictation follows the textarea: it stays live while a prompt is parked,
+    // because that text is now editable and replaceable rather than frozen.
+    enabled: isOpen,
   });
 
   const updateQueuedPrompt = useCallback((next: QueuedPrompt | null) => {
@@ -1788,14 +1808,55 @@ export function WorkflowCopilotChat({
     applyHistoryResponse,
   ]);
 
+  // Set by a block's "Generate" arm step so the next send scopes regeneration to that block.
+  const blockBuildTargetLabelRef = useRef<string | null>(null);
+  const fixOriginPendingRef = useRef(false);
+  // True only while a block-build turn is actually in flight (not a turn it queued behind).
+  const blockGenInFlightRef = useRef(false);
+
+  // The only disposal path for a queued prompt: its text goes back to the
+  // composer as an editable draft. Reads the synchronous ref, not state, so a
+  // stop can clear the queue before isLoading flips and the drain effect runs.
+  const restoreQueuedPromptToComposer = useCallback(() => {
+    const queued = queuedPromptRef.current;
+    if (!queued) {
+      return;
+    }
+
+    updateQueuedPrompt(null);
+    // Drop the queued block-build target so it doesn't leak into the next message.
+    // The fix-origin signal rode on the discarded prompt; clear the ref too in case
+    // a future path set it without queuing.
+    blockBuildTargetLabelRef.current = null;
+    fixOriginPendingRef.current = false;
+    setMessages((prev) => prev.filter((message) => message.id !== queued.id));
+    // Text already in the composer is the newer intent — the user was part way
+    // through replacing the queued message — so it wins over what comes back.
+    setInputValue((current) => (current.trim() ? current : queued.content));
+    window.requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+      adjustTextareaHeight();
+    });
+  }, [adjustTextareaHeight, updateQueuedPrompt]);
+
   const cancelSend = useCallback(async () => {
+    // A stop must never let a queued message auto-fire. Hand its text back to
+    // the composer synchronously, before isLoading flips and the drain effect
+    // would otherwise send it as a fresh turn.
+    restoreQueuedPromptToComposer();
+
     // Capture upfront so the 15s timer below can't latch onto a next turn's controller.
     const controllerAtCancel = streamingAbortController.current;
     if (!controllerAtCancel) return;
 
     const cancelToken = pendingCancelToken.current;
     pendingCancelToken.current = null;
+    // After the token check, not before: a turn that already finished has no
+    // token, and claiming "Stopping…" for a cancel that never goes out would
+    // rely on the isLoading reset as its only way back.
     if (!cancelToken) return;
+
+    setIsStopping(true);
 
     cancelInFlightController.current = controllerAtCancel;
 
@@ -1837,28 +1898,15 @@ export function WorkflowCopilotChat({
       controllerAtCancel.abort();
       appendCancelledBubble();
     }
-  }, [credentialGetter]);
+  }, [credentialGetter, restoreQueuedPromptToComposer]);
 
-  const cancelQueuedPrompt = useCallback(() => {
-    if (!queuedPrompt) {
-      return;
+  // The turn ending is the one signal that a stop actually landed — it covers
+  // the normal path, the 15s safety-timer abort, and the failed-POST abort.
+  useEffect(() => {
+    if (!isLoading) {
+      setIsStopping(false);
     }
-
-    updateQueuedPrompt(null);
-    // Drop the queued block-build target so it doesn't leak into the next message.
-    // The fix-origin signal rode on the discarded prompt; clear the ref too in case
-    // a future path set it without queuing.
-    blockBuildTargetLabelRef.current = null;
-    fixOriginPendingRef.current = false;
-    setMessages((prev) =>
-      prev.filter((message) => message.id !== queuedPrompt.id),
-    );
-    setInputValue(queuedPrompt.content);
-    window.requestAnimationFrame(() => {
-      textareaRef.current?.focus();
-      adjustTextareaHeight();
-    });
-  }, [adjustTextareaHeight, queuedPrompt, updateQueuedPrompt]);
+  }, [isLoading]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1866,7 +1914,7 @@ export function WorkflowCopilotChat({
         return;
       }
       if (queuedPrompt) {
-        cancelQueuedPrompt();
+        restoreQueuedPromptToComposer();
         return;
       }
       if (isLoading) {
@@ -1878,13 +1926,13 @@ export function WorkflowCopilotChat({
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [cancelQueuedPrompt, cancelSend, isLoading, isOpen, queuedPrompt]);
-
-  // Set by a block's "Generate" arm step so the next send scopes regeneration to that block.
-  const blockBuildTargetLabelRef = useRef<string | null>(null);
-  const fixOriginPendingRef = useRef(false);
-  // True only while a block-build turn is actually in flight (not a turn it queued behind).
-  const blockGenInFlightRef = useRef(false);
+  }, [
+    restoreQueuedPromptToComposer,
+    cancelSend,
+    isLoading,
+    isOpen,
+    queuedPrompt,
+  ]);
 
   const handleSend = useCallback(
     async (messageOverride?: string, options: SendOptions = {}) => {
@@ -1917,6 +1965,35 @@ export function WorkflowCopilotChat({
           messageAudioBlob = await stopSpeech();
         }
         messageAudioBlob = messageAudioBlob ?? takeSpeechAudioBlob();
+      }
+
+      if (action === "replace_queued") {
+        const queued = queuedPromptRef.current;
+        if (!queued) {
+          return;
+        }
+        // New text, so the old prompt's framing must not ride along: the
+        // fix-origin flag and the block-build scope both belonged to the
+        // message being replaced.
+        blockBuildTargetLabelRef.current = null;
+        fixOriginPendingRef.current = false;
+        updateQueuedPrompt({
+          ...queued,
+          content: candidate,
+          audioBlob: messageAudioBlob,
+          fixOrigin: false,
+        });
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === queued.id
+              ? { ...message, content: candidate }
+              : message,
+          ),
+        );
+        if (messageOverride === undefined) {
+          setInputValue("");
+        }
+        return;
       }
 
       if (action === "queue_working" || action === "queue_live_browser") {
@@ -2338,6 +2415,19 @@ export function WorkflowCopilotChat({
                   }
                 }
                 return false;
+              case "title_update":
+                // The title store is shared across workflow swaps in one Workspace, and a
+                // stream survives the swap — so a frame from the workflow we left must not
+                // name the one we are now looking at.
+                if (payload.workflow_permanent_id !== workflowPermanentId) {
+                  return false;
+                }
+                // Backend already persisted it; reload reads canonical. This only
+                // moves the live title bar, and never over a user-chosen name.
+                useWorkflowTitleStore
+                  .getState()
+                  .setTitleFromCopilotIfDefault(payload.title);
+                return false;
               case "credential_required":
                 setLivePauseFrame(payload);
                 return false;
@@ -2372,7 +2462,9 @@ export function WorkflowCopilotChat({
                 // succeeds — a swallowed update would otherwise trigger a
                 // spurious snap-back at terminal.
                 if (payload.workflow) {
-                  const applied = applyWorkflowUpdate(payload.workflow);
+                  const applied = applyWorkflowUpdate(payload.workflow, {
+                    midTurnDraft: true,
+                  });
                   if (applied) {
                     const turnId = latestTurnId.current;
                     if (turnId) {
@@ -2835,13 +2927,20 @@ export function WorkflowCopilotChat({
     }
   }, [isOpen, buttonRef, size.width, size.height]);
 
+  const autoBoundReceiptIndexes = useMemo(
+    () =>
+      selectAutoBoundReceiptIndexes(
+        messages.map(
+          (message) => autoBoundReceiptFor(message)?.credentialId ?? null,
+        ),
+      ),
+    [messages],
+  );
+
   if (!isOpen) {
     return null;
   }
 
-  // Input stays usable while Copilot works; only a parked queued prompt
-  // disables it (the message is already captured).
-  const inputDisabled = Boolean(queuedPrompt);
   const queuedPromptWaitingStatus =
     queuedPrompt?.reason === "working"
       ? "Queued — sends when this turn finishes."
@@ -2854,7 +2953,9 @@ export function WorkflowCopilotChat({
       ? null
       : queuedPromptWaitingStatus
     : isLoading
-      ? "Copilot is working. Your next send will wait for the next turn."
+      ? copilotUxV1Enabled && copilotV2Enabled
+        ? null
+        : "Copilot is working. Your next send will wait for the next turn."
       : isWaitingForLiveBrowser
         ? "Live browser is starting. Your next send will wait until it connects."
         : null;
@@ -2875,10 +2976,16 @@ export function WorkflowCopilotChat({
   const gateActionable =
     Boolean(proposedWorkflow) && !isLoading && !isLoadingHistory;
   const hasComposerText = inputValue.trim().length > 0;
-  // A live_browser-reason queued prompt parks with no active turn to stop and
-  // a disabled, emptied textarea — the morph button would otherwise render as
-  // a live "Send" that's a guaranteed no-op; only the Queued chip's ✕ acts.
-  const waitingOnQueueOnly = queuedPrompt?.reason === "live_browser";
+  // The cycling verb row plus the stop button's orbiting ring carry the
+  // working state, so the prose status line and the queued chip stand down.
+  const showWorkingRow = Boolean(
+    copilotUxV1Enabled && copilotV2Enabled && isLoading,
+  );
+  // A live_browser-reason queued prompt parks with no active turn to stop, so
+  // an empty composer's morph button would render as a guaranteed no-op "Send".
+  // With text typed it does act — it rewrites the parked prompt.
+  const waitingOnQueueOnly =
+    queuedPrompt?.reason === "live_browser" && !hasComposerText;
   // When the initial history load drops the queued bubble, the composer chip
   // takes over its live_browser status/Cancel (footer-else-chip).
   const queuedBubbleOrphaned = Boolean(
@@ -2886,13 +2993,18 @@ export function WorkflowCopilotChat({
     queuedPrompt.reason === "live_browser" &&
     !messages.some((message) => message.id === queuedPrompt.id),
   );
-  const morphButtonLabel = waitingOnQueueOnly
-    ? "Send disabled — waiting for live browser"
-    : !isLoading
-      ? "Send"
-      : hasComposerText
-        ? "Queue for next turn"
-        : "Stop";
+  const showsStopGlyph = isStopping || (isLoading && !hasComposerText);
+  const morphButtonLabel = isStopping
+    ? "Stopping…"
+    : waitingOnQueueOnly
+      ? "Send disabled — waiting for live browser"
+      : queuedPrompt && hasComposerText
+        ? "Replace queued message"
+        : !isLoading
+          ? "Send"
+          : hasComposerText
+            ? "Queue for next turn"
+            : "Stop";
   // Shared between the legacy fused split-button and the S4 mode pill so the
   // three options never drift between the two composer treatments.
   const modeMenuItems = (
@@ -3113,6 +3225,7 @@ export function WorkflowCopilotChat({
                       turn={message.narrative}
                       onBlockSelect={onBlockSelect}
                       uxV1={copilotUxV1Enabled}
+                      workingRowActive={showWorkingRow}
                     />
                     {showReviewGate ? (
                       <ReviewGateCard
@@ -3286,14 +3399,8 @@ export function WorkflowCopilotChat({
                         turnId === null
                       )
                         return null;
-                      const autoBound = message.narrative.credentialAutoBound;
-                      // A co-occurring credential ask/pause owns this turn's credential UI and its
-                      // credentialResolutions[turnId] entry; the auto-bind receipt would double up and
-                      // mis-adopt that ask's resolution, so it defers whenever a card frame exists.
-                      if (
-                        !autoBound ||
-                        credentialCardFrameFor(message.narrative)
-                      )
+                      const autoBound = autoBoundReceiptFor(message);
+                      if (!autoBound || !autoBoundReceiptIndexes.has(index))
                         return null;
                       // The receipt renders on any message (scrollback-safe). Before a Change it shows
                       // the auto-bound credential with a Change picker; after one, the local resolution
@@ -3350,7 +3457,7 @@ export function WorkflowCopilotChat({
                     queuedPrompt.id === message.id
                       ? {
                           text: queuedPromptWaitingStatus,
-                          onCancel: cancelQueuedPrompt,
+                          onCancel: restoreQueuedPromptToComposer,
                         }
                       : null
                   }
@@ -3444,6 +3551,7 @@ export function WorkflowCopilotChat({
                   turn={narrative}
                   onBlockSelect={onBlockSelect}
                   uxV1={copilotUxV1Enabled}
+                  workingRowActive={showWorkingRow}
                 />
                 {copilotUxV1Enabled &&
                 !isLoadingHistory &&
@@ -3556,7 +3664,14 @@ export function WorkflowCopilotChat({
             pending · Review
           </button>
         ) : null}
-        {copilotUxV1Enabled &&
+        {showWorkingRow ? (
+          <CopilotWorkingStatus
+            queued={Boolean(queuedPrompt)}
+            onDismissQueued={restoreQueuedPromptToComposer}
+          />
+        ) : null}
+        {!showWorkingRow &&
+        copilotUxV1Enabled &&
         copilotV2Enabled &&
         queuedPrompt &&
         (queuedPrompt.reason === "working" || queuedBubbleOrphaned) ? (
@@ -3566,16 +3681,16 @@ export function WorkflowCopilotChat({
             <span className="flex-1 truncate">{queuedPromptWaitingStatus}</span>
             <button
               type="button"
-              onClick={cancelQueuedPrompt}
-              title="Cancel queued message"
-              aria-label="Cancel queued message"
+              onClick={restoreQueuedPromptToComposer}
+              title="Edit queued message"
+              aria-label="Edit queued message"
               className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
             >
               <Cross2Icon className="h-3 w-3" />
             </button>
           </div>
         ) : null}
-        {inputStatusText ? (
+        {inputStatusText && !showWorkingRow ? (
           <div
             className="mb-2 text-xs text-muted-foreground"
             aria-live="polite"
@@ -3595,7 +3710,6 @@ export function WorkflowCopilotChat({
               isSupported={isSpeechSupported}
               isListening={isSpeechListening}
               isHearingSpeech={isSpeechHearing}
-              disabled={inputDisabled}
               onToggle={toggleSpeech}
               className="h-10 w-10 rounded-lg"
             />
@@ -3604,9 +3718,9 @@ export function WorkflowCopilotChat({
             ref={setTextareaRef}
             placeholder={
               queuedPrompt
-                ? "Prompt queued..."
+                ? "Type to replace the queued message…"
                 : isLoading
-                  ? "Type a message to send next…"
+                  ? "Type to queue a message…"
                   : isWaitingForLiveBrowser
                     ? "Type a prompt to send when ready..."
                     : copilotUxV1Enabled && copilotV2Enabled
@@ -3617,7 +3731,6 @@ export function WorkflowCopilotChat({
             onChange={(e) => setInputValue(e.target.value)}
             onPaste={() => dismissPasteSkillHint()}
             onKeyDown={handleKeyPress}
-            disabled={inputDisabled}
             rows={1}
             className={
               copilotUxV1Enabled && copilotV2Enabled
@@ -3635,7 +3748,6 @@ export function WorkflowCopilotChat({
               isSupported={isSpeechSupported}
               isListening={isSpeechListening}
               isHearingSpeech={isSpeechHearing}
-              disabled={inputDisabled}
               onToggle={toggleSpeech}
               className="h-8 w-8 rounded-full border-0 bg-transparent"
               iconClassName="h-3.5 w-3.5"
@@ -3649,20 +3761,45 @@ export function WorkflowCopilotChat({
               >
                 <button
                   type="button"
-                  disabled={waitingOnQueueOnly}
+                  disabled={waitingOnQueueOnly || isStopping}
+                  aria-busy={isStopping}
                   onClick={() =>
                     isLoading && !hasComposerText ? cancelSend() : handleSend()
                   }
                   aria-label={morphButtonLabel}
                   className={cn(
-                    "flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
-                    isLoading && !hasComposerText
-                      ? "bg-slate-elevation4 text-foreground hover:bg-slate-elevation3"
+                    "group/stop relative flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.92] disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
+                    showsStopGlyph
+                      ? "bg-slate-elevation3"
                       : "bg-cta text-cta-foreground hover:bg-cta-hover",
                   )}
                 >
-                  {isLoading && !hasComposerText ? (
-                    <StopIcon className="h-3 w-3" />
+                  {showsStopGlyph ? (
+                    <>
+                      <span
+                        aria-hidden
+                        data-testid="copilot-stop-orbit"
+                        className={cn(
+                          "absolute -inset-[50%] animate-copilot-stop-orbit motion-reduce:hidden",
+                          isStopping && "paused",
+                        )}
+                        style={{
+                          background: STOP_ORBIT_GRADIENT,
+                          filter: "blur(1.5px)",
+                          willChange: "transform",
+                        }}
+                      />
+                      <span
+                        aria-hidden
+                        className="absolute inset-0 hidden bg-[rgba(150,195,255,0.55)] motion-reduce:block"
+                      />
+                      <span
+                        aria-hidden
+                        className="absolute inset-[2px] flex items-center justify-center rounded-md bg-slate-elevation3 transition-colors group-hover/stop:bg-slate-elevation5"
+                      >
+                        <span className="h-[11.5px] w-[11.5px] rounded-[2.3px] bg-foreground" />
+                      </span>
+                    </>
                   ) : (
                     <ArrowUpIcon className="h-4 w-4" />
                   )}
@@ -3672,7 +3809,7 @@ export function WorkflowCopilotChat({
           ) : isLoading && queuedPrompt ? (
             <>
               <button
-                onClick={cancelQueuedPrompt}
+                onClick={restoreQueuedPromptToComposer}
                 title="Edit queued message"
                 className="flex h-10 items-center justify-center rounded-lg border border-border px-3 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
               >
@@ -3680,10 +3817,12 @@ export function WorkflowCopilotChat({
               </button>
               <button
                 onClick={cancelSend}
-                title="Cancel run"
-                className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
+                disabled={isStopping}
+                aria-busy={isStopping}
+                title={isStopping ? "Stopping…" : "Cancel run"}
+                className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
               >
-                Cancel run
+                {isStopping ? "Stopping…" : "Cancel run"}
               </button>
             </>
           ) : isLoading ? (
@@ -3699,19 +3838,21 @@ export function WorkflowCopilotChat({
               <button
                 type="button"
                 onClick={cancelSend}
-                title="Cancel run"
-                className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
+                disabled={isStopping}
+                aria-busy={isStopping}
+                title={isStopping ? "Stopping…" : "Cancel run"}
+                className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
               >
-                Cancel run
+                {isStopping ? "Stopping…" : "Cancel run"}
               </button>
             </>
           ) : queuedPrompt ? (
             <button
-              onClick={cancelQueuedPrompt}
+              onClick={restoreQueuedPromptToComposer}
               title="Edit queued prompt"
-              className="flex h-10 items-center justify-center rounded-lg bg-destructive px-4 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
+              className="flex h-10 items-center justify-center rounded-lg border border-border px-4 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
             >
-              Cancel
+              Edit queued
             </button>
           ) : !copilotV2Enabled ? (
             <button

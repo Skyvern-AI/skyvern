@@ -16,6 +16,7 @@ from skyvern.cli.core.browser_ops import (
     CustomSelectMatchError,
     CustomSelectOpenError,
     CustomSelectPasswordError,
+    NavigateResult,
     do_select_option,
 )
 from skyvern.cli.core.result import Artifact, BrowserContext, set_concise_responses
@@ -879,14 +880,19 @@ async def test_skyvern_click_intent_only_uses_proactive_ai(monkeypatch: pytest.M
     assert click.await_args.kwargs.get("mode") != "direct"
 
 
-def _action_page(monkeypatch: pytest.MonkeyPatch, *, skyvern_page: bool = False, **methods: AsyncMock) -> None:
-    page = make_skyvern_page(MagicMock()) if skyvern_page else SimpleNamespace(page=MagicMock())
+def _action_page(monkeypatch: pytest.MonkeyPatch, *, skyvern_page: bool = False, **methods: AsyncMock) -> object:
+    page = (
+        make_skyvern_page(MagicMock())
+        if skyvern_page
+        else SimpleNamespace(page=MagicMock(), url="https://example.test/two-factor")
+    )
     if skyvern_page:
         page.evaluate = AsyncMock(return_value=False)
     for name, method in methods.items():
         setattr(page, name, method)
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    return page
 
 
 def _native_option_page(
@@ -965,7 +971,7 @@ def _sdk_equivalent_page(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         mcp_browser,
         "do_navigate",
-        AsyncMock(return_value=SimpleNamespace(url="https://example.test", title="Example")),
+        AsyncMock(return_value=NavigateResult(url="https://example.test", title="Example")),
     )
     monkeypatch.setattr(mcp_browser, "do_extract", AsyncMock(return_value=SimpleNamespace(extracted={})))
     monkeypatch.setattr(mcp_browser, "do_act", AsyncMock(return_value=SimpleNamespace(prompt="done", completed=True)))
@@ -2779,14 +2785,22 @@ async def test_write_grid_rejects_oversize_row_before_session(monkeypatch: pytes
         ),
     ],
 )
-async def test_navigating_paired_tools_clear_the_ref_map_around_navigation(
+async def test_navigating_paired_tools_invalidate_refs_around_navigation(
     monkeypatch: pytest.MonkeyPatch, tool_name: str, extra_kwargs: dict[str, object]
 ) -> None:
-    """Parity with skyvern_navigate: a prior observe's refs must not survive a navigation.
+    """Parity with skyvern_navigate: prior refs cannot survive navigation.
 
-    Cleared before AND after, because a failed goto can still partially replace the document.
+    Invalidate before AND after, because a failed goto can partially replace the
+    document and a concurrent observe can publish while navigation is in flight.
     """
     _sdk_equivalent_page(monkeypatch)
+    events: list[str] = []
+
+    async def navigate(*_args: object, **_kwargs: object) -> NavigateResult:
+        events.append("navigate")
+        return NavigateResult(url="https://example.test", title="Example", load_state="load")
+
+    monkeypatch.setattr(mcp_browser, "do_navigate", AsyncMock(side_effect=navigate))
     monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
     monkeypatch.setattr(mcp_browser, "do_extract", AsyncMock(return_value=SimpleNamespace(extracted={"value": 1})))
     monkeypatch.setattr(
@@ -2794,28 +2808,129 @@ async def test_navigating_paired_tools_clear_the_ref_map_around_navigation(
         "save_artifact",
         Mock(return_value=Artifact(kind="screenshot", path="/tmp/shot.png", mime="image/png", bytes=3)),
     )
-    clear = Mock()
-    monkeypatch.setattr(mcp_browser, "clear_session_ref_map", clear)
+    invalidate = Mock(side_effect=lambda **_kwargs: events.append("invalidate"))
+    monkeypatch.setattr(mcp_browser, "invalidate_session_ref_map", invalidate)
 
     result = await getattr(mcp_browser, tool_name)(url="https://example.test", **extra_kwargs)
 
     assert result["ok"] is True, result
-    assert clear.call_count == 2
+    assert events == ["invalidate", "navigate", "invalidate"]
 
 
 @pytest.mark.asyncio
-async def test_navigating_paired_tools_clear_the_ref_map_even_when_navigation_fails(
+async def test_navigate_reports_ok_with_a_warning_when_the_page_settles_below_the_requested_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page that never fires `load` is navigated, not failed — say so instead of ACTION_FAILED."""
+    _sdk_equivalent_page(monkeypatch)
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_navigate",
+        AsyncMock(return_value=NavigateResult(url="https://example.test", title="Example", load_state="commit")),
+    )
+
+    result = await mcp_browser.skyvern_navigate(url="https://example.test")
+
+    assert result["ok"] is True, result
+    assert result["data"]["load_state"] == "commit"
+    assert result["data"]["url"] == "https://example.test"
+    assert any("never reached 'load'" in warning for warning in result["warnings"]), result
+
+
+@pytest.mark.asyncio
+async def test_navigate_does_not_warn_when_the_requested_state_is_reached(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _sdk_equivalent_page(monkeypatch)
-    monkeypatch.setattr(mcp_browser, "do_navigate", AsyncMock(side_effect=RuntimeError("net::ERR_ABORTED")))
-    clear = Mock()
-    monkeypatch.setattr(mcp_browser, "clear_session_ref_map", clear)
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_navigate",
+        AsyncMock(
+            return_value=NavigateResult(url="https://example.test", title="Example", load_state="domcontentloaded")
+        ),
+    )
+
+    result = await mcp_browser.skyvern_navigate(url="https://example.test", wait_until="domcontentloaded")
+
+    assert result["ok"] is True, result
+    assert result["warnings"] == []
+
+
+@pytest.mark.asyncio
+async def test_navigating_paired_tools_surface_the_degraded_load_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _sdk_equivalent_page(monkeypatch)
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_navigate",
+        AsyncMock(return_value=NavigateResult(url="https://example.test", title="Example", load_state="commit")),
+    )
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
+    monkeypatch.setattr(
+        mcp_browser,
+        "save_artifact",
+        Mock(return_value=Artifact(kind="screenshot", path="/tmp/shot.png", mime="image/png", bytes=3)),
+    )
+
+    result = await mcp_browser.skyvern_navigate_and_screenshot(url="https://example.test")
+
+    assert result["ok"] is True, result
+    assert result["data"]["load_state"] == "commit"
+    assert any("never reached 'load'" in warning for warning in result["warnings"]), result
+
+
+@pytest.mark.asyncio
+async def test_navigating_paired_tools_invalidate_refs_even_when_navigation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _sdk_equivalent_page(monkeypatch)
+    events: list[str] = []
+
+    async def fail_navigation(*_args: object, **_kwargs: object) -> NavigateResult:
+        events.append("navigate")
+        raise RuntimeError("net::ERR_ABORTED")
+
+    monkeypatch.setattr(mcp_browser, "do_navigate", AsyncMock(side_effect=fail_navigation))
+    invalidate = Mock(side_effect=lambda **_kwargs: events.append("invalidate"))
+    monkeypatch.setattr(mcp_browser, "invalidate_session_ref_map", invalidate)
 
     result = await mcp_browser.skyvern_navigate_and_screenshot(url="https://example.test")
 
     assert result["ok"] is False
-    assert clear.call_count == 2
+    assert events == ["invalidate", "navigate", "invalidate"]
+
+
+@pytest.mark.asyncio
+async def test_navigate_and_screenshot_returns_session_expired_result_for_cdp_4408(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expired_error = RuntimeError(
+        "BrowserType.connect_over_cdp: Target page, context or browser has been closed\n"
+        "Browser logs: session expired\n"
+        "Call log: <ws disconnected> code=4408 reason=session expired"
+    )
+    get_page = AsyncMock(side_effect=expired_error)
+    monkeypatch.setattr(mcp_browser, "get_page", get_page)
+
+    result = await mcp_browser.skyvern_navigate_and_screenshot(url="https://example.test")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.SESSION_EXPIRED
+    assert result["error"]["message"] == "Browser session expired."
+    assert "new browser session" in result["error"]["hint"]
+    get_page.assert_awaited_once_with(session_id=None, cdp_url=None)
+
+
+@pytest.mark.asyncio
+async def test_navigate_and_screenshot_bubbles_non_4408_cdp_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    other_close = RuntimeError("Call log: <ws disconnected> code=4401 reason=session expired")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(side_effect=other_close))
+
+    with pytest.raises(RuntimeError, match="code=4401"):
+        await mcp_browser.skyvern_navigate_and_screenshot(url="https://example.test")
 
 
 @pytest.mark.asyncio
@@ -3018,6 +3133,27 @@ async def test_wait_for_either_state_names_the_side_that_matched(
     assert result["ok"] is True
     assert result["data"]["matched_selector"] == appears
     assert result["data"]["matched"] == expected
+    assert isinstance(result["data"]["observed_wait_ms"], int)
+    assert result["data"]["source_url"] == "https://example.test/two-factor"
+    assert result["data"]["result_url"] == "https://example.test/two-factor"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_either_state_reports_the_observed_failed_wait_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _either_wait_page(monkeypatch, {"#login": None, "#home": None})
+
+    result = await mcp_browser.skyvern_wait_for_either_state(
+        selector_a="#login",
+        selector_b="#home",
+        timeout=1000,
+    )
+
+    assert result["ok"] is False
+    assert result["data"]["observed_wait_ms"] >= 1000
+    assert result["data"]["source_url"] == "https://example.test/two-factor"
+    assert result["data"]["result_url"] == "https://example.test/two-factor"
 
 
 @pytest.mark.asyncio

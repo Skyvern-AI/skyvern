@@ -1,15 +1,26 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Collection
 from typing import Any
 
 import structlog
 import yaml
 
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.credential_resolution import (
+    credential_reference_spans,
+    grounded_credential_references,
+    load_credentials,
+)
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
-from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_blocks
+from skyvern.forge.sdk.copilot.workflow_credential_utils import (
+    block_credential_ids,
+    credential_param_ids,
+    saved_credential_ids,
+    workflow_blocks,
+)
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -88,6 +99,39 @@ def _extract_credential_ids_from_workflow_definition(workflow_definition: Any) -
     return list(dict.fromkeys(found))
 
 
+def _extract_credential_ids_for_labels(workflow_definition: Any, labels: Collection[str]) -> list[str]:
+    """Credential IDs reachable from the blocks named by `labels` and their descendants, plus any
+    top-level credential parameter no block claims; falls back to the whole-document set when the
+    label set is empty or a label does not resolve. Sound only while the runtime exposes a
+    credential solely to blocks that declare it (WorkflowRunContext.credential_template_entries)."""
+    definition = _workflow_definition_as_dict(workflow_definition)
+    selected_labels = set(labels)
+    if not selected_labels:
+        return _extract_credential_ids_from_workflow_definition(definition)
+
+    parsed = {"workflow_definition": definition}
+    selected_blocks = workflow_blocks(parsed, selected_labels=selected_labels)
+    if selected_labels - {block.get("label") for block in selected_blocks}:
+        return _extract_credential_ids_from_workflow_definition(definition)
+
+    credential_params_by_key = credential_param_ids(definition.get("parameters"))
+
+    def block_ids(block: dict[str, Any]) -> list[str]:
+        return _extract_credential_ids_from_workflow_parameters(block.get("parameters")) + sorted(
+            block_credential_ids(block, credential_params_by_key)
+        )
+
+    claimed_by_any_block = {credential_id for block in workflow_blocks(parsed) for credential_id in block_ids(block)}
+    found = [
+        credential_id
+        for credential_id in _extract_credential_ids_from_workflow_parameters(definition.get("parameters"))
+        if credential_id not in claimed_by_any_block
+    ]
+    for block in selected_blocks:
+        found.extend(block_ids(block))
+    return list(dict.fromkeys(found))
+
+
 def _parsed_workflow_definition(workflow_yaml: str | None) -> dict[str, Any] | None:
     if not workflow_yaml:
         return None
@@ -161,35 +205,6 @@ def _credential_id_misbinding_findings(workflow_yaml: str | None) -> list[dict[s
     return findings
 
 
-def _credential_id_misbinding_error_message(findings: list[dict[str, str]]) -> str:
-    grouped: dict[tuple[str, str], list[str]] = {}
-    for finding in findings:
-        key = (finding["location"], finding["credential_id"])
-        grouped.setdefault(key, []).append(finding["field"])
-
-    location_lines: list[str] = []
-    for (location, credential_id), fields in grouped.items():
-        unique_fields = list(dict.fromkeys(fields))
-        joined = ", ".join(f"`{field}`" for field in unique_fields)
-        scope = "workflow parameter" if location == _MISBINDING_WORKFLOW_LOCATION else f"block `{location}`"
-        location_lines.append(f"- `{credential_id}` in {scope} field(s): {joined}")
-    body = "\n".join(location_lines)
-
-    return (
-        "A credential ID is sitting in workflow fields that do not resolve it, so at runtime the agent types "
-        "the literal ID into the page instead of the stored username/password:\n"
-        f"{body}\n"
-        "Fix BOTH halves before retrying:\n"
-        "1. Bind the credential once: add a `credential` parameter (or a `workflow` parameter with "
-        "`workflow_parameter_type: credential_id` and the ID in `default_value`) and reference its key from the "
-        "login block's `parameter_keys`.\n"
-        "2. Delete the credential ID string from every field listed above. `navigation_goal`, "
-        "`complete_criterion`, `terminate_criterion` and similar fields are plain-language instructions — they "
-        "must describe the outcome without naming the credential ID. Do NOT relocate the literal ID into another "
-        "prose or list field; only the credential parameter slot may hold it."
-    )
-
-
 def _missing_credential_reference_tool_error(missing_credential_ids: list[str]) -> str:
     formatted_ids = ", ".join(f"`{credential_id}`" for credential_id in missing_credential_ids)
     id_word = "ID" if len(missing_credential_ids) == 1 else "IDs"
@@ -212,14 +227,22 @@ def _unapproved_credential_reference_tool_error(unapproved_credential_ids: list[
     )
 
 
+def _saved_workflow_credential_ids(request_policy: RequestPolicy) -> set[str]:
+    # Read from the saved workflow row at turn start. Deliberately not the submitted YAML: that is the
+    # live canvas, which carries a copilot proposal until the user accepts or rejects it, so a binding
+    # the model staged would come back as authority on the next turn.
+    return saved_credential_ids(request_policy.persisted_workflow_credential_ids)
+
+
 def _approved_run_credential_ids(request_policy: RequestPolicy | None) -> set[str]:
     if request_policy is None:
         return set()
-    return {
+    resolved = {
         credential.credential_id
         for credential in request_policy.resolved_credentials
         if isinstance(getattr(credential, "credential_id", None), str)
     }
+    return resolved | _saved_workflow_credential_ids(request_policy)
 
 
 def _credential_run_approval_error(credential_ids: list[str], request_policy: RequestPolicy | None) -> str | None:
@@ -268,30 +291,111 @@ async def _credential_reference_validation_error(value: Any, ctx: AgentContext) 
     return await _credential_ids_validation_error(credential_ids, ctx)
 
 
+def _serialize_credential(credential: Credential) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "credential_id": credential.credential_id,
+        "name": credential.name,
+        "credential_type": str(credential.credential_type),
+        "tested_url": credential.tested_url,
+    }
+    if credential.username:
+        entry["username"] = credential.username
+        entry["totp_type"] = str(credential.totp_type) if credential.totp_type else None
+        if credential.totp_identifier:
+            entry["totp_identifier"] = credential.totp_identifier
+    elif credential.card_last4:
+        entry["card_last_four"] = credential.card_last4
+        entry["card_brand"] = credential.card_brand
+    elif credential.secret_label:
+        entry["secret_label"] = credential.secret_label
+    return entry
+
+
+def _reference_is_typed_resume(reference: str, policy: RequestPolicy) -> bool:
+    return any(
+        credential.credential_id in policy.current_turn_named_credential_ids
+        and reference in {credential.credential_id, credential.name}
+        for credential in policy.resolved_credentials
+    )
+
+
+async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[str, Any]:
+    policy = ctx.request_policy
+    if not isinstance(policy, RequestPolicy):
+        return {
+            "ok": False,
+            "data": {
+                "status": "denied",
+                "reference": reference,
+                "reason": "canonical_user_request_missing",
+            },
+        }
+
+    credentials = await load_credentials(ctx.organization_id)
+    grounded_references = grounded_credential_references(policy.canonical_user_message, credentials)
+    matches_by_id = {
+        credential.credential_id: credential
+        for credential in credentials
+        if credential.credential_id == reference or credential.name == reference
+    }
+    matches = list(matches_by_id.values())
+    literal_reference = bool(credential_reference_spans(policy.canonical_user_message, reference))
+    typed_resume = _reference_is_typed_resume(reference, policy)
+    # The agent owns natural-language interpretation. This boundary verifies only
+    # objective provenance and identity: the proposed exact reference must be a
+    # complete saved reference in the literal current turn. It deliberately does
+    # not implement a second English policy language beside the agent.
+    if not typed_resume and reference not in grounded_references and (matches or not literal_reference):
+        return {
+            "ok": False,
+            "data": {
+                "status": "denied",
+                "reference": reference,
+                "reason": "reference_not_literal_in_current_user_turn",
+            },
+        }
+    if len(matches) != 1:
+        status = "not_found" if not matches else "ambiguous"
+        return {
+            "ok": False,
+            "data": {
+                "status": status,
+                "reference": reference,
+                "candidates": [_serialize_credential(credential) for credential in matches],
+            },
+        }
+
+    credential = matches[0]
+    policy.resolved_credentials = [
+        *[item for item in policy.resolved_credentials if item.credential_id != credential.credential_id],
+        credential,
+    ]
+    policy.current_turn_named_credential_ids.add(credential.credential_id)
+    return {
+        "ok": True,
+        "data": {
+            "status": "resolved",
+            "reference": reference,
+            "credential": _serialize_credential(credential),
+        },
+    }
+
+
 async def _list_credentials(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
-    page = params.get("page", 1)
-    page_size = min(params.get("page_size", 10), 50)
+    exact_reference = params.get("exact_reference")
+    if exact_reference is not None:
+        if not isinstance(exact_reference, str) or not exact_reference:
+            return {"ok": False, "error": "exact_reference must be a non-empty exact saved name or credential ID"}
+        return await _resolve_exact_credential(exact_reference, ctx)
+
+    page = max(1, params.get("page", 1))
+    page_size = min(max(1, params.get("page_size") or 10), 50)
     credentials = await app.DATABASE.credentials.get_credentials(
         organization_id=ctx.organization_id,
         page=page,
         page_size=page_size,
     )
-    serialized = []
-    for cred in credentials:
-        entry: dict[str, Any] = {
-            "credential_id": cred.credential_id,
-            "name": cred.name,
-            "credential_type": str(cred.credential_type),
-        }
-        if cred.username:
-            entry["username"] = cred.username
-            entry["totp_type"] = str(cred.totp_type) if cred.totp_type else None
-        elif cred.card_last4:
-            entry["card_last_four"] = cred.card_last4
-            entry["card_brand"] = cred.card_brand
-        elif cred.secret_label:
-            entry["secret_label"] = cred.secret_label
-        serialized.append(entry)
+    serialized = [_serialize_credential(credential) for credential in credentials]
     _record_discovered_credentials_on_policy(ctx, credentials)
     return {
         "ok": True,

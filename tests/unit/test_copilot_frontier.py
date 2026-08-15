@@ -11,16 +11,6 @@ from jinja2.sandbox import SandboxedEnvironment
 from skyvern.forge.sdk.copilot import tools
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.enforcement import (
-    MAX_FAILED_TEST_NUDGES,
-    POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE,
-    POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE,
-    _check_enforcement,
-)
-from skyvern.forge.sdk.copilot.failure_tracking import (
-    compute_failure_signature,
-    update_repeated_failure_state,
-)
 from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
     summarize_tool_result,
@@ -28,7 +18,6 @@ from skyvern.forge.sdk.copilot.output_utils import (
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools import (
     _find_invalidated_labels,
-    _frontier_run_size_error,
     _invalidate_verified_state_on_edit,
     _plan_frontier,
     _record_workflow_update_result,
@@ -570,112 +559,6 @@ def test_runtime_frontier_anchor_does_not_clear_same_page_goto_url() -> None:
     assert anchor_url is None
     assert anchored is workflow
     assert workflow.workflow_definition.blocks[1].url == "https://example.com/search"
-
-
-def test_frontier_run_size_error_limits_long_page_changing_frontier() -> None:
-    definition = _FakeDefinition(
-        [
-            _FakeBlock("open", "goto_url"),
-            _FakeBlock("set_search", "navigation"),
-            _FakeBlock("submit_search", "navigation"),
-            _FakeBlock("expand_results", "navigation"),
-            _FakeBlock("extract", "extraction"),
-        ]
-    )
-    ctx = _make_ctx()
-
-    error = _frontier_run_size_error(
-        ctx,
-        ["open", "set_search", "submit_search", "expand_results", "extract"],
-        ["open", "set_search", "submit_search", "expand_results", "extract"],
-        definition,
-    )
-
-    assert error is not None
-    assert "Keep the same complete workflow YAML" in error
-    assert "['open', 'set_search']" in error
-    assert "Do not remove later blocks" in error
-
-
-def test_frontier_run_size_result_steers_to_smaller_saved_frontier() -> None:
-    result = tools._frontier_run_size_result(
-        "frontier too long",
-        ["open", "set_search", "submit_search", "expand_results", "extract"],
-        ["open", "set_search", "submit_search", "expand_results", "extract"],
-    )
-
-    data = result["data"]
-    assert result["ok"] is False
-    assert data["workflow_run_skipped"] is True
-    assert data["suggested_block_labels"] == ["open", "set_search"]
-    assert data["deferred_block_labels"] == ["submit_search", "expand_results", "extract"]
-    assert data["control_signal"] == {
-        "kind": "intermediate_success",
-        "user_facing_summary": data["user_facing_summary"],
-        "next_tool": "run_blocks_and_collect_debug",
-        "next_block_labels": ["open", "set_search"],
-        "preserve_workflow_yaml": True,
-    }
-
-
-def test_frontier_run_size_error_allows_tool_expanded_runtime_anchor() -> None:
-    definition = _FakeDefinition(
-        [
-            _FakeBlock("open", "goto_url"),
-            _FakeBlock("set_search", "navigation"),
-            _FakeBlock("submit_search", "navigation"),
-        ]
-    )
-    ctx = _make_ctx()
-
-    assert (
-        _frontier_run_size_error(
-            ctx,
-            ["submit_search"],
-            ["open", "set_search", "submit_search"],
-            definition,
-        )
-        is None
-    )
-
-
-def test_frontier_run_size_error_allows_small_or_single_action_frontiers() -> None:
-    single_action_definition = _FakeDefinition(
-        [
-            _FakeBlock("open", "goto_url"),
-            _FakeBlock("search", "navigation"),
-            _FakeBlock("extract", "extraction"),
-        ]
-    )
-    long_read_definition = _FakeDefinition(
-        [
-            _FakeBlock("open", "goto_url"),
-            _FakeBlock("extract_a", "extraction"),
-            _FakeBlock("extract_b", "extraction"),
-            _FakeBlock("extract_c", "extraction"),
-        ]
-    )
-    ctx = _make_ctx()
-
-    assert _frontier_run_size_error(ctx, ["open", "search"], ["open", "search"], single_action_definition) is None
-    assert (
-        _frontier_run_size_error(
-            ctx,
-            ["open", "search", "extract"],
-            ["open", "search", "extract"],
-            single_action_definition,
-        )
-        is None
-    )
-    assert (
-        _frontier_run_size_error(
-            ctx,
-            ["open", "extract_a", "extract_b", "extract_c"],
-            ["open", "extract_a", "extract_b", "extract_c"],
-            long_read_definition,
-        )
-        is None
-    )
 
 
 def test_plan_frontier_edit_walks_back_to_upstream_navigation_anchor() -> None:
@@ -1310,100 +1193,6 @@ def _set_failure_ctx(ctx: CopilotContext, definition: _FakeDefinition, reason: s
     ctx.last_test_failure_reason = reason
 
 
-def test_update_repeated_failure_state_increments_on_same_signature_and_fingerprint() -> None:
-    ctx = _make_ctx()
-    defn = _FakeDefinition([_FakeBlock("a", "extraction", {"prompt": "p"})])
-    _set_failure_ctx(ctx, defn, "Selector not found")
-
-    result = {"ok": False, "data": {"failure_categories": [{"category": "EXTRACTION_FAILURE"}]}}
-    update_repeated_failure_state(ctx, result)
-    assert ctx.repeated_failure_streak_count == 1
-    update_repeated_failure_state(ctx, result)
-    assert ctx.repeated_failure_streak_count == 2
-    update_repeated_failure_state(ctx, result)
-    assert ctx.repeated_failure_streak_count == 3
-
-
-def test_update_repeated_failure_state_resets_on_fingerprint_change() -> None:
-    ctx = _make_ctx()
-    d1 = _FakeDefinition([_FakeBlock("a", "extraction", {"prompt": "p1"})])
-    d2 = _FakeDefinition([_FakeBlock("a", "extraction", {"prompt": "p2"})])
-    result = {"ok": False, "data": {"failure_categories": []}}
-
-    _set_failure_ctx(ctx, d1, "Selector not found")
-    update_repeated_failure_state(ctx, result)
-    update_repeated_failure_state(ctx, result)
-    assert ctx.repeated_failure_streak_count == 2
-    # Pre-populate emitted so the reset-to-0 below actually observes the reset
-    # rather than a field that was never bumped.
-    ctx.repeated_failure_nudge_emitted_at_streak = 2
-
-    _set_failure_ctx(ctx, d2, "Selector not found")
-    update_repeated_failure_state(ctx, result)
-    assert ctx.repeated_failure_streak_count == 1
-    assert ctx.repeated_failure_nudge_emitted_at_streak == 0
-
-
-def test_update_repeated_failure_state_resets_on_meaningful_success() -> None:
-    ctx = _make_ctx()
-    defn = _FakeDefinition([_FakeBlock("a", "extraction")])
-    _set_failure_ctx(ctx, defn, "Selector not found")
-
-    update_repeated_failure_state(ctx, {"ok": False, "data": {}})
-    update_repeated_failure_state(ctx, {"ok": False, "data": {}})
-    assert ctx.repeated_failure_streak_count == 2
-
-    ctx.last_test_failure_reason = None
-    ctx.last_test_suspicious_success = False
-    update_repeated_failure_state(ctx, {"ok": True, "data": {}})
-    assert ctx.repeated_failure_streak_count == 0
-    assert ctx.last_failure_signature is None
-    assert ctx.repeated_failure_nudge_emitted_at_streak == 0
-
-
-def test_repeated_failure_end_to_end_flow_1_then_warn_then_stop() -> None:
-    """Streak must survive across warn/stop transitions rather than being
-    reset by enforcement — otherwise the stop nudge would never fire naturally
-    from repeated identical failures."""
-    ctx = _make_ctx()
-    ctx.update_workflow_called = True
-    ctx.test_after_update_done = True
-    ctx.last_test_ok = False
-    # Exhaust the failed-test nudge budget so it doesn't interfere with
-    # the frontier-streak assertions below.
-    ctx.failed_test_nudge_count = MAX_FAILED_TEST_NUDGES
-    defn = _FakeDefinition([_FakeBlock("a", "extraction", {"prompt": "p"})])
-    _set_failure_ctx(ctx, defn, "Selector not found")
-    result = {"ok": False, "data": {"failure_categories": []}}
-
-    update_repeated_failure_state(ctx, result)
-    assert ctx.repeated_failure_streak_count == 1
-    assert _check_enforcement(ctx) is None
-
-    update_repeated_failure_state(ctx, result)
-    assert ctx.repeated_failure_streak_count == 2
-    assert _check_enforcement(ctx) == POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE
-    assert ctx.repeated_failure_streak_count == 2
-    assert _check_enforcement(ctx) != POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE
-
-    update_repeated_failure_state(ctx, result)
-    assert ctx.repeated_failure_streak_count == 3
-    assert _check_enforcement(ctx) == POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE
-    assert _check_enforcement(ctx) != POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE
-
-
-def test_compute_failure_signature_none_on_clean_success() -> None:
-    assert (
-        compute_failure_signature(
-            frontier_start_label="a",
-            failure_reason=None,
-            failure_categories=None,
-            suspicious_success=False,
-        )
-        is None
-    )
-
-
 # --------------------------------------------------------------------------- #
 # Verified-prefix preservation on failure                                     #
 # --------------------------------------------------------------------------- #
@@ -1951,7 +1740,7 @@ def test_chokepoint_uses_passed_prior_when_last_workflow_absent() -> None:
     assert "extract" in tools._unverified_current_workflow_labels(ctx)
 
 
-def test_workflow_update_clears_terminal_run_evidence() -> None:
+def test_workflow_update_preserves_archive_but_clears_active_run_evidence() -> None:
     new = _wf_def(
         ("open", "goto_url", {"url": "https://example.com"}),
         ("extract", "extraction", {"prompt": "extract CHANGED"}),
@@ -1963,11 +1752,17 @@ def test_workflow_update_clears_terminal_run_evidence() -> None:
     ctx.last_run_blocks_block_labels = ["extract"]
     ctx.last_run_outcome = RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_old")
     ctx.last_run_outcome_block_labels = ["extract"]
-    ctx.last_outcome_gate_reason = "The prior run did not demonstrate the goal."
-    ctx.last_outcome_gate_workflow_run_id = "wr_old"
     ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
     ctx.completion_verification_result = object()  # type: ignore[assignment]
     ctx.outcome_verification_trace_snapshot = {"old": True}
+    ctx.post_run_page_observation_tool = "inspect_page"
+    ctx.post_run_page_observation_url = "https://example.com/results"
+    ctx.post_run_page_observation_workflow_run_id = "wr_old"
+    ctx.post_run_page_observation_after_failed_test = True
+    ctx.post_run_current_page_inspection_workflow_run_id = "wr_old"
+    ctx.block_state_map = {"extract": "completed"}
+    ctx.block_started_at_map = {"extract": "2026-08-10T01:00:00Z"}
+    ctx.block_ended_at_map = {"extract": "2026-08-10T01:00:01Z"}
 
     _record_workflow_update_result(ctx, {"ok": True, "_workflow": _FakeWorkflow(new)}, None)
 
@@ -1977,11 +1772,18 @@ def test_workflow_update_clears_terminal_run_evidence() -> None:
     assert ctx.last_run_blocks_block_labels == []
     assert ctx.last_run_outcome is None
     assert ctx.last_run_outcome_block_labels == []
-    assert ctx.last_outcome_gate_reason is None
-    assert ctx.last_outcome_gate_workflow_run_id is None
     assert ctx.last_test_anti_bot is None
     assert ctx.completion_verification_result is None
     assert ctx.outcome_verification_trace_snapshot == {}
+    assert ctx.post_run_page_observation_tool is None
+    assert ctx.post_run_page_observation_url is None
+    assert ctx.post_run_page_observation_workflow_run_id is None
+    assert ctx.post_run_page_observation_after_failed_test is False
+    assert ctx.post_run_current_page_inspection_workflow_run_id is None
+    assert ctx.block_state_map == {}
+    assert ctx.block_started_at_map == {}
+    assert ctx.block_ended_at_map == {}
+    assert ctx.terminal_envelope_run_outcomes == [RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_old")]
 
 
 def test_differ_exception_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -56,6 +56,10 @@ class SkyvernException(Exception):
         # so the concrete name stays in logs/monitoring but never reaches end users.
         return type(self).__name__
 
+    @property
+    def message_is_user_facing(self) -> bool:
+        return False
+
 
 class SkyvernPageAnalysisTimeout(SkyvernException):
     pass
@@ -246,6 +250,53 @@ class SecretInputMismatch(SkyvernException):
         super().__init__("Secret input read-back mismatch after atomic re-entry.")
 
 
+class FreeTextInputMismatch(SkyvernException):
+    def __init__(
+        self,
+        *,
+        element_id: str,
+        intended_length: int,
+        declared_max_length: int | None = None,
+        declared_constraint: str | None = None,
+    ):
+        self.element_id = element_id
+        self.intended_length = intended_length
+        self.declared_max_length = declared_max_length
+        self.declared_constraint = declared_constraint
+        # Safe metadata only -- an element id, one intended length, and (on the static path) one declared
+        # length or a coarse declared-constraint label. Never the raw intended/rendered value, a substring, a
+        # rejected character, a position, or category counts.
+        if declared_max_length is not None or declared_constraint is not None:
+            # Static retention-only fast path: only a browser-declared constraint that demonstrably affects
+            # value RETENTION in this seam -- a maxlength, or a number input sanitizing a non-numeric value --
+            # produces this branch. HTML pattern / email-url validity do NOT prevent retention and never reach it.
+            if declared_max_length is not None:
+                # HTML maxlength counts UTF-16 code units, so state the unit explicitly (a supplementary code
+                # point such as an emoji is two units).
+                detail = f"the field declares a maximum length of {declared_max_length} UTF-16 code units"
+                guidance = f"Propose a value within {declared_max_length} UTF-16 code units."
+            elif declared_constraint == "number":
+                detail = "the field is a number input, which does not retain a non-numeric value"
+                guidance = "Propose a valid number."
+            else:
+                detail = "the value does not satisfy the field's declared constraints"
+                guidance = "Propose a value that satisfies the field's declared constraints."
+            message = (
+                f"Free-text input for element(id={element_id}) did not retain the intended value after "
+                f"re-entry. The field's declared constraints explain the rejection: {detail}. {guidance}"
+            )
+        else:
+            # No declared retention constraint explains the rejection (including the incident, which declares
+            # nothing). No live-field diagnostic probe is run, so there are no per-candidate character
+            # observations -- fail closed with a generic, privacy-safe, still-actionable reason.
+            message = (
+                f"Free-text input for element(id={element_id}) did not retain the intended "
+                f"{intended_length}-character value after re-entry; the field likely rejects this value's "
+                "format, so re-entering the same value is unlikely to succeed."
+            )
+        super().__init__(message)
+
+
 class ConditionalBranchEvaluationError(SkyvernException):
     """A conditional block could not resolve which branch to take."""
 
@@ -356,6 +407,12 @@ class MissingBrowserStatePage(SkyvernException):
         task_str = f"task_id={task_id}" if task_id else ""
         workflow_run_str = f"workflow_run_id={workflow_run_id}" if workflow_run_id else ""
         super().__init__(f"Browser state page is missing. {task_str} {workflow_run_str}")
+
+
+class BrowserProfileNotApplied(SkyvernException):
+    def __init__(self, browser_profile_id: str) -> None:
+        self.browser_profile_id = browser_profile_id
+        super().__init__(f"Browser profile {browser_profile_id} was not applied by the created browser")
 
 
 class MissingWorkflowRunBrowserState(SkyvernException):
@@ -643,6 +700,9 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
 
     @staticmethod
     def _get_detail(exception: Exception) -> str:
+        if isinstance(exception, SkyvernException) and exception.message_is_user_facing:
+            return exception.message or "Unexpected browser creation failure."
+
         if isinstance(exception, CdpConnectionConfigurationError):
             return exception.message or str(exception)
 
@@ -1519,9 +1579,16 @@ class ScriptTerminationException(SkyvernException):
 
 
 class InProcessScriptExecutionDenied(SkyvernException):
-    def __init__(self, *, seam: str, selection_reason: str) -> None:
+    """Refusal to load a cached script into the worker process.
+
+    ``fail_closed`` separates an integrity verdict the caller must not work around from a
+    routing verdict it should absorb by running the workflow through the agent instead.
+    """
+
+    def __init__(self, *, seam: str, selection_reason: str, fail_closed: bool = True) -> None:
         self.seam = seam
         self.selection_reason = selection_reason
+        self.fail_closed = fail_closed
         super().__init__(f"In-process script execution denied at {seam}: {selection_reason}")
 
 
@@ -1577,3 +1644,14 @@ class CodeBlockRunnerSelectionError(SkyvernException):
     The block-execution call site catches this and fails the block closed instead of
     silently falling back to in-process execution.
     """
+
+
+class DownloadSaveIncompleteError(SkyvernException):
+    """save_downloaded_files finished its loop but skipped at least one file.
+
+    Files that could be saved are already saved when this raises, so a caller may treat
+    the save as retryable-incomplete rather than failed."""
+
+    def __init__(self, skipped_files: Sequence[str]) -> None:
+        self.skipped_files = list(skipped_files)
+        super().__init__(f"{len(self.skipped_files)} downloaded file(s) could not be fully saved and registered")

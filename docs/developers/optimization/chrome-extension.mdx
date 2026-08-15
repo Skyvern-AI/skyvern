@@ -39,9 +39,8 @@ and prints the remaining steps:
 skyvern browser extension-install
 ```
 
-Then enable **Developer mode**, click **Load unpacked**, and select the printed directory. If your MCP server is already
-running with the extension bridge, the command also opens the one-click pairing page. Otherwise, start the MCP server
-and run `skyvern browser extension-pair`.
+Then enable **Developer mode**, click **Load unpacked**, and select the printed directory. Start your extension-mode MCP
+server and run `skyvern browser extension-pair` to open the pairing page.
 
 For manual setup:
 
@@ -60,22 +59,24 @@ For manual setup:
 
 ## Pair the extension
 
-With your MCP server running, start the recommended one-click flow:
+With your MCP server running, start the explicit pairing flow:
 
 ```bash
 skyvern browser extension-pair
 ```
 
 Click **Approve** in the pairing page, then approve the pairing again in the **Skyvern Agent** confirmation tab that
-opens. The pairing link expires after two minutes and can be used only once; rerun the command if it expires.
+opens. The pairing link expires after two minutes and can be used only once; retry the browser-session request or rerun
+the command if it expires.
 
-As a manual fallback, copy the pairing token to your clipboard:
+The persistent broker owns its extension credential, so broker mode never displays or copies that secret. If you have
+explicitly opted into the legacy relay, its manual fallback copies the pairing token to your clipboard:
 
 ```bash
 skyvern browser extension-token
 ```
 
-Then open the **Skyvern Agent** popup, paste the token, and click **Connect**.
+Then open the **Skyvern Agent** popup, paste the token, and click **Connect**. This command is rejected in broker mode.
 
 Treat the pairing token like a password. The one-click URL contains only a short-lived nonce in its fragment; Skyvern
 does not put the pairing token in a URL or expose it through MCP tools.
@@ -107,8 +108,20 @@ Alternatively, start the local MCP server with the browser extension bridge enab
 skyvern run mcp --browser-extension
 ```
 
-The environment setting starts the bridge lazily when `skyvern_browser_session_create` needs it. The flag starts the
-bridge eagerly with the MCP server.
+On macOS and Linux, extension mode uses a persistent broker by default. The first broker start safely initializes its
+state and adopts an existing legacy extension credential when present. The flag starts the bridge in the background as
+the MCP server boots, while the environment setting starts it lazily when `skyvern_browser_session_create` needs it.
+Either way, browser session creation starts the broker if it is not already running.
+
+To opt into the legacy embedded relay on macOS or Linux, set the exact value below in the MCP environment or the normal
+Skyvern env-file chain. Unset, `1`, and every other value use the broker.
+
+```bash
+SKYVERN_BROWSER_EXTENSION_BROKER=0
+```
+
+Windows uses the legacy relay automatically because the broker's owner-authenticated transport is not implemented
+there yet; no environment override is required.
 
 Check the local setup without exposing the pairing token:
 
@@ -116,9 +129,10 @@ Check the local setup without exposing the pairing token:
 skyvern browser extension-status
 ```
 
-The command reports the extension directory, whether token configuration and file permissions are present, and whether
-the configured loopback port is accepting connections. The default port is `19777`; a custom port is configured with
-`SKYVERN_BROWSER_EXTENSION_PORT` for the MCP server and under **Advanced settings** in the popup.
+In default broker mode, the command reports sanitized broker and extension connectivity. With the legacy opt-out, it
+reports token configuration, file permissions, and whether the loopback port is accepting connections. The default port
+is `19777`; a custom port is configured with `SKYVERN_BROWSER_EXTENSION_PORT` for the MCP server and under **Advanced
+settings** in the popup.
 
 ---
 
@@ -157,8 +171,9 @@ When Skyvern attaches to a controlled tab, Chrome displays its debugger infobar;
 also never closes or restarts your Chrome browser.
 
 The extension connects outbound to a bridge bound only to `127.0.0.1`. The default endpoint is
-`ws://127.0.0.1:19777/extension/v1`. Pairing-token authentication verifies both the extension and the local MCP bridge,
-and the token is never included in the URL.
+`ws://127.0.0.1:19777/extension/v1`. On macOS and Linux, a persistent daemon owns this listener and MCP processes reach
+it through an owner-authenticated Unix domain socket. Pairing authentication verifies the extension, and credentials
+are never included in the URL or returned through MCP tools.
 
 The extension refuses to control `chrome://`, `chrome-untrusted://`, `chrome-extension://`, `devtools://`, `edge://`,
 `file://`, Chrome Web Store pages on `chromewebstore.google.com`, and `about:` pages other than `about:blank`.
@@ -170,7 +185,7 @@ The extension refuses to control `chrome://`, `chrome-untrusted://`, `chrome-ext
 - Downloads and file-chooser management are not supported yet.
 - Incognito windows are not supported.
 - Opening DevTools for a controlled tab detaches Skyvern and revokes access to that tab.
-- Only one local Skyvern MCP process can control the extension at a time.
+- The current broker generation admits one local Skyvern MCP client at a time.
 - Hosted Skyvern MCP cannot use the extension yet.
 - Chrome internal pages, extension pages, DevTools, local files, the Chrome Web Store, and the other restricted targets
   listed above cannot be controlled.
@@ -185,26 +200,53 @@ The extension refuses to control `chrome://`, `chrome-untrusted://`, `chrome-ext
 
     - Run `skyvern browser extension-install` and follow its numbered setup instructions.
     - Start the MCP server with `--browser-extension` or `BROWSER_TYPE=extension-connect`.
-    - Run `skyvern browser extension-status` and confirm it reports the bridge listening on the configured port.
+    - Run `skyvern browser extension-status` and confirm it reports the broker ready (or the opted-out legacy bridge
+      listening) on the configured port.
     - Run `skyvern browser extension-pair`, approve the browser page, then approve the Skyvern Agent confirmation tab.
-    - If one-click pairing fails, open the **Skyvern Agent** popup and use `skyvern browser extension-token` as the
-      manual paste fallback.
+    - In broker mode, retry with `skyvern browser extension-pair --cancel-pending` if an earlier pairing flow is stuck.
+      `skyvern browser extension-token` is only available with `SKYVERN_BROWSER_EXTENSION_BROKER=0`.
     - Add at least one controllable tab to **Skyvern Controlled**, then retry.
   </Accordion>
 
+  <Accordion title="The MCP server never finishes connecting">
+    The server loads a large Python dependency tree before it serves its first request. That usually takes a few
+    seconds, but the first start after an install or upgrade — and any start on a busy machine — can take
+    considerably longer than an MCP client's default startup window.
+
+    Watch for this: when a local server fails to mount, coding agents fall back to the identically named hosted
+    Skyvern tools, so a run that looks like it is driving your Chrome is really driving a cloud browser. Confirm the
+    server is connected before you trust an extension flow.
+
+    Raise your client's startup timeout:
+
+    - Claude Code: set `MCP_TIMEOUT` (milliseconds) in the environment that launches it, for example
+      `MCP_TIMEOUT=180000`.
+    - Codex: raise `startup_timeout_sec` for the server entry in `~/.codex/config.toml`.
+
+    To see where the time goes, read the client-launched server's `mcp_boot_ready` log line after it connects. The
+    event is emitted only after the server successfully handles `initialize`; it reports `spawn_to_serve_ms`
+    alongside the `env_ms` and `tool_import_ms` phases that make it up.
+  </Accordion>
+
   <Accordion title="Port already in use">
-    The bridge uses port `19777` by default. Set `SKYVERN_BROWSER_EXTENSION_PORT` in the MCP server environment,
-    configure the same port under **Advanced settings** in the popup, then restart the MCP server and reconnect the
-    extension.
+    The broker uses port `19777` by default and never steals a foreign owner or silently changes ports. Run
+    `skyvern browser extension-broker-status` to inspect it. If you intentionally stop the persistent daemon, run
+    `skyvern browser extension-broker-stop`; this releases the port. Otherwise set `SKYVERN_BROWSER_EXTENSION_PORT` in
+    the MCP server environment, configure the same port under **Advanced settings** in the popup, then restart the MCP
+    server and reconnect the extension.
   </Accordion>
 
   <Accordion title="Rotate the pairing token">
-    Stop the MCP server, delete `~/.skyvern/browser_extension_token`, and restart the server. Run
-    `skyvern browser extension-pair` and approve both browser steps. Use `skyvern browser extension-token` and paste the
-    new token into the **Skyvern Agent** popup only as a manual fallback.
+    The default broker owns its credential and does not expose it through `extension-token`. Stop it with
+    `skyvern browser extension-broker-stop`, delete
+    `~/.skyvern/run/browser-extension/<port>/extension.secret`, then restart extension-mode MCP. Startup validates the
+    journal before creating a replacement credential; an unsafe journal fails closed. Pair again with
+    `skyvern browser extension-pair`. Never edit owner-only broker artifacts while the daemon is running.
 
-    If `SKYVERN_BROWSER_EXTENSION_TOKEN` is set in the MCP environment, remove it before rotating the token file
-    because the environment value takes precedence.
+    With `SKYVERN_BROWSER_EXTENSION_BROKER=0`, stop the MCP server, delete
+    `~/.skyvern/browser_extension_token`, and restart the server. Run `skyvern browser extension-pair` and approve both
+    browser steps. If `SKYVERN_BROWSER_EXTENSION_TOKEN` is set, remove it first because the environment value takes
+    precedence in legacy mode and is rejected in broker mode.
   </Accordion>
 
   <Accordion title="DevTools or the debugger infobar disconnected a tab">

@@ -1,46 +1,11 @@
 from __future__ import annotations
 
-import pytest
-
 from skyvern.forge.sdk.copilot.signature import compute_signature
-from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 from skyvern.forge.sdk.copilot.turn_outcome import (
     build_minimal_turn_outcome,
     build_turn_outcome,
-    derive_response_kind,
 )
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
-
-
-@pytest.mark.parametrize(
-    "mode,expected",
-    [
-        (TurnIntentMode.BUILD, ResponseKind.BUILD),
-        (TurnIntentMode.EDIT, ResponseKind.BUILD),
-        (TurnIntentMode.DRAFT_ONLY, ResponseKind.BUILD),
-        (TurnIntentMode.CLARIFY, ResponseKind.CLARIFY),
-        (TurnIntentMode.UNKNOWN, ResponseKind.ANSWER),
-        (TurnIntentMode.DIAGNOSE, ResponseKind.DIAGNOSE),
-        (TurnIntentMode.ANSWER, ResponseKind.ANSWER),
-        (TurnIntentMode.REFUSE, ResponseKind.REFUSE),
-    ],
-)
-def test_derive_response_kind_covers_every_mode(mode: TurnIntentMode, expected: ResponseKind) -> None:
-    intent = TurnIntent(mode=mode)
-    assert derive_response_kind(intent) is expected
-
-
-def test_derive_response_kind_handles_none_intent() -> None:
-    assert derive_response_kind(None) is ResponseKind.CLARIFY
-
-
-def test_unknown_that_requires_user_input_remains_clarification() -> None:
-    intent = TurnIntent(
-        mode=TurnIntentMode.UNKNOWN,
-        authority=TurnIntentAuthority(requires_user_input=True),
-    )
-
-    assert derive_response_kind(intent) is ResponseKind.CLARIFY
 
 
 def test_build_minimal_turn_outcome_sets_signature_and_inherited() -> None:
@@ -58,10 +23,9 @@ def test_build_minimal_turn_outcome_sets_signature_and_inherited() -> None:
 
 
 def test_build_turn_outcome_merges_inherited_and_extra() -> None:
-    intent = TurnIntent(mode=TurnIntentMode.BUILD)
     outcome = build_turn_outcome(
         "drafted v1",
-        turn_intent=intent,
+        response_kind=ResponseKind.BUILD,
         tool_calls=["update_workflow", "run_blocks_and_collect_debug"],
         inherited_blocked_signatures=["aaaa"],
         extra_blocked_signatures=["bbbb"],
@@ -69,7 +33,6 @@ def test_build_turn_outcome_merges_inherited_and_extra() -> None:
     assert outcome.response_kind is ResponseKind.BUILD
     assert outcome.tool_calls == ["update_workflow", "run_blocks_and_collect_debug"]
     assert outcome.blocked_signatures == ["aaaa", "bbbb"]
-    assert "mode" in outcome.turn_intent_summary
 
 
 def test_turn_outcome_json_round_trip() -> None:

@@ -6,7 +6,7 @@ import ast
 import asyncio
 import inspect
 import textwrap
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
 from playwright._impl._errors import Error as PlaywrightError
@@ -62,9 +62,13 @@ async def test_calls_wait_for_page_ready_with_settle_delay() -> None:
     mock_frame = AsyncMock()
     with (
         patch("skyvern.webeye.actions.handler.SkyvernFrame.create_instance", new_callable=AsyncMock) as mock_create,
-        patch("skyvern.webeye.actions.handler.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        patch("skyvern.webeye.actions.handler._upload_settle_sleep", new_callable=AsyncMock) as mock_sleep,
     ):
         mock_create.return_value = mock_frame
+        sequence = MagicMock()
+        sequence.attach_mock(mock_sleep, "sleep")
+        sequence.attach_mock(mock_create, "create_frame")
+        sequence.attach_mock(mock_frame.wait_for_page_ready, "wait_for_page_ready")
         await _wait_for_upload_processing(page, engine_selection=engine_selection)
 
     # Settle delay before readiness polling
@@ -76,6 +80,16 @@ async def test_calls_wait_for_page_ready_with_settle_delay() -> None:
         dom_stable_ms=300,
         dom_stability_timeout_ms=2000,
     )
+    assert sequence.mock_calls == [
+        call.sleep(0.5),
+        call.create_frame(page, engine_selection=engine_selection),
+        call.wait_for_page_ready(
+            loading_indicator_timeout_ms=3000,
+            network_idle_timeout_ms=3000,
+            dom_stable_ms=300,
+            dom_stability_timeout_ms=2000,
+        ),
+    ]
 
 
 @pytest.mark.asyncio

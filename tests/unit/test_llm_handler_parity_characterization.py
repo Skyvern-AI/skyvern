@@ -84,6 +84,8 @@ class ParityResponse(FakeLLMResponse):
         completion_tokens: int = 345,
         reasoning_tokens: int = 67,
         cached_tokens: int = 89,
+        cache_creation_tokens: int | None = None,
+        provider: str | None = None,
     ) -> None:
         super().__init__(model)
         self._content = content
@@ -97,9 +99,13 @@ class ParityResponse(FakeLLMResponse):
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             completion_tokens_details=SimpleNamespace(reasoning_tokens=reasoning_tokens),
-            prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
+            prompt_tokens_details=SimpleNamespace(
+                cached_tokens=cached_tokens,
+                cache_write_tokens=cache_creation_tokens,
+            ),
             cache_read_input_tokens=0,
         )
+        self.provider = provider
 
 
 @dataclass
@@ -112,6 +118,7 @@ class HandlerOutcome:
     update_step_calls: list[dict[str, Any]] = field(default_factory=list)
     update_thought_calls: list[dict[str, Any]] = field(default_factory=list)
     block_cost_calls: list[dict[str, Any]] = field(default_factory=list)
+    usage_events: list[dict[str, Any]] = field(default_factory=list)
     span: ReadableSpan | None = None
 
     @property
@@ -179,6 +186,12 @@ def _stub_common(mp: pytest.MonkeyPatch, outcome: HandlerOutcome, context: Skyve
 
     mp.setattr(api_handler_factory, "llm_messages_builder", fake_llm_messages_builder)
     mp.setattr(api_handler_factory.litellm, "completion_cost", lambda completion_response: LLM_COST)
+
+    def capture_info(_event: str, **fields: Any) -> None:
+        if fields.get("log_code") == "copilot_model_usage":
+            outcome.usage_events.append(fields)
+
+    mp.setattr(api_handler_factory.LOG, "info", capture_info)
 
     artifact_manager = MagicMock()
     artifact_manager.prepare_llm_artifact = AsyncMock(return_value=None)
@@ -248,6 +261,7 @@ async def _run_direct(
     organization_id: str | None = None,
     screenshots: list[bytes] | None = None,
     parameters: dict[str, Any] | None = None,
+    force_parse_failure: bool = False,
 ) -> HandlerOutcome:
     outcome = HandlerOutcome()
     next_response = _response_feeder(responses)
@@ -267,6 +281,12 @@ async def _run_direct(
 
         mp.setattr(api_handler_factory.litellm, "acompletion", fake_acompletion)
         _stub_common(mp, outcome, context)
+        if force_parse_failure:
+            mp.setattr(
+                api_handler_factory,
+                "parse_api_response",
+                MagicMock(side_effect=ValueError("invalid response")),
+            )
 
         span_exporter.clear()
         handler = LLMAPIHandlerFactory.get_llm_api_handler(model_name)
@@ -299,6 +319,7 @@ async def _run_router(
     organization_id: str | None = None,
     screenshots: list[bytes] | None = None,
     parameters: dict[str, Any] | None = None,
+    force_parse_failure: bool = False,
 ) -> HandlerOutcome:
     outcome = HandlerOutcome()
     next_response = _response_feeder(responses)
@@ -345,6 +366,12 @@ async def _run_router(
 
         mp.setattr(api_handler_factory.litellm, "acompletion", fake_acompletion)
         _stub_common(mp, outcome, context)
+        if force_parse_failure:
+            mp.setattr(
+                api_handler_factory,
+                "parse_api_response",
+                MagicMock(side_effect=ValueError("invalid response")),
+            )
 
         span_exporter.clear()
         try:
@@ -420,6 +447,85 @@ async def test_happy_path_parses_and_records_identically(span_exporter: InMemory
             "prompt_name": DEFAULT_PROMPT_NAME,
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_copilot_model_usage_is_emitted_once_by_router_and_single_handler(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    def response() -> ParityResponse:
+        return ParityResponse(
+            "openai/gpt-4.1",
+            prompt_tokens=0,
+            completion_tokens=0,
+            cached_tokens=0,
+            cache_creation_tokens=0,
+            provider="openai",
+        )
+
+    direct = await _run_direct(
+        span_exporter,
+        responses=[response()],
+        model_name="gpt-4",
+        prompt_name="workflow-copilot-narration",
+        parameters={},
+    )
+    router = await _run_router(
+        span_exporter,
+        responses=[response()],
+        main_model_group="gpt-4",
+        prompt_name="workflow-copilot-narration",
+        parameters={},
+    )
+
+    expected = {
+        "log_code": "copilot_model_usage",
+        "gen_ai.operation.name": "chat",
+        "gen_ai.request.model": "gpt-4",
+        "gen_ai.response.model": "openai/gpt-4.1",
+        "gen_ai.provider.name": "openai",
+        "gen_ai.usage.input_tokens": 0,
+        "gen_ai.usage.output_tokens": 0,
+        "gen_ai.usage.cache_read.input_tokens": 0,
+        "gen_ai.usage.cache_creation.input_tokens": 0,
+        "operation.cost": LLM_COST,
+        "copilot.prompt_name": "workflow-copilot-narration",
+    }
+    assert direct.error is None and router.error is None
+    assert direct.usage_events == router.usage_events == [expected]
+
+
+@pytest.mark.asyncio
+async def test_unrelated_prompt_does_not_emit_copilot_model_usage(span_exporter: InMemorySpanExporter) -> None:
+    direct = await _run_direct(span_exporter, responses=[ParityResponse("gpt-4")], parameters={})
+    router = await _run_router(span_exporter, responses=[ParityResponse("gpt-4")], parameters={})
+
+    assert direct.usage_events == router.usage_events == []
+
+
+@pytest.mark.asyncio
+async def test_copilot_model_usage_survives_response_parse_failure(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    direct = await _run_direct(
+        span_exporter,
+        responses=[ParityResponse("openai/gpt-4.1", content="not json", provider="openai")],
+        prompt_name="workflow-copilot-narration",
+        parameters={},
+        force_parse_failure=True,
+    )
+    router = await _run_router(
+        span_exporter,
+        responses=[ParityResponse("openai/gpt-4.1", content="not json", provider="openai")],
+        prompt_name="workflow-copilot-narration",
+        parameters={},
+        force_parse_failure=True,
+    )
+
+    assert direct.error is not None and router.error is not None
+    assert len(direct.usage_events) == len(router.usage_events) == 1
+    assert direct.usage_events[0]["gen_ai.response.model"] == "openai/gpt-4.1"
+    assert router.usage_events[0]["gen_ai.response.model"] == "openai/gpt-4.1"
 
 
 @pytest.mark.asyncio
@@ -720,12 +826,24 @@ async def test_truncated_response_direct_raises_output_truncated(span_exporter: 
 
 
 @pytest.mark.asyncio
-async def test_truncated_response_router_retries_on_fallback(span_exporter: InMemorySpanExporter) -> None:
+async def test_copilot_model_usage_router_emits_for_each_truncation_attempt(
+    span_exporter: InMemorySpanExporter,
+) -> None:
     truncated = ParityResponse("gpt-4", content=None, finish_reason="length")
     router = await _run_router(
         span_exporter,
-        responses=[truncated, ParityResponse("gpt-4-fallback")],
+        responses=[
+            truncated,
+            ParityResponse(
+                "openai/gpt-4-fallback",
+                prompt_tokens=55,
+                completion_tokens=8,
+                cached_tokens=4,
+                provider="openai",
+            ),
+        ],
         fallback_groups=("gpt-4-fallback",),
+        prompt_name="workflow-copilot-future-call",
         parameters={"max_completion_tokens": 4096, "temperature": 0.0},
     )
 
@@ -739,7 +857,17 @@ async def test_truncated_response_router_retries_on_fallback(span_exporter: InMe
     assert "max_completion_tokens" not in router.router_calls[1]
     assert "max_tokens" not in router.router_calls[1]
     assert router.router_calls[1]["temperature"] == 0.0
-    assert router.span_attrs["llm_model"] == "gpt-4-fallback"
+    assert router.span_attrs["llm_model"] == "openai/gpt-4-fallback"
+    assert len(router.usage_events) == 2
+    assert [event["gen_ai.response.model"] for event in router.usage_events] == [
+        "gpt-4",
+        "openai/gpt-4-fallback",
+    ]
+    assert [event["gen_ai.request.model"] for event in router.usage_events] == [
+        "gpt-4",
+        "gpt-4-fallback",
+    ]
+    assert [event["gen_ai.usage.input_tokens"] for event in router.usage_events] == [1200, 55]
 
 
 @pytest.mark.asyncio
@@ -768,9 +896,7 @@ async def test_prompt_breakdown_consumed_once_on_both(span_exporter: InMemorySpa
     def breakdown_context() -> SkyvernContext:
         return SkyvernContext(
             last_prompt_breakdown={
-                "html_token_count": 12345,
                 "total_tokens_local": 50000,
-                "html_pct": 0.2469,
                 "template_name": DEFAULT_PROMPT_NAME,
             }
         )

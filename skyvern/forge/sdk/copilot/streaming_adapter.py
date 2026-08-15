@@ -54,9 +54,9 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotDesignStartUpdate,
     WorkflowCopilotNarrationUpdate,
     WorkflowCopilotStreamMessageType,
+    WorkflowCopilotTitleUpdate,
     WorkflowCopilotToolCallUpdate,
     WorkflowCopilotToolResultUpdate,
-    WorkflowCopilotTurnMode,
     WorkflowCopilotTurnStartUpdate,
     WorkflowCopilotWorkflowDraftUpdate,
 )
@@ -254,8 +254,7 @@ async def stream_to_sse(
 
     *ctx* is a CopilotContext object with enforcement state attributes such as
     ``update_workflow_called``, ``test_after_update_done``,
-    ``post_update_nudge_count``, ``navigate_called``, and
-    ``observation_after_navigate``.
+    ``navigate_called`` and ``observation_after_navigate``.
 
     A client disconnect does NOT cancel the agent run: we continue to iterate
     ``result.stream_events()`` so the agent completes whatever work it is
@@ -666,19 +665,12 @@ def _update_enforcement_from_tool(
     if tool_name in ("update_workflow", "update_and_run_blocks") and output.get("ok") and has_blocks:
         ctx.update_workflow_called = True
         ctx.test_after_update_done = False
-        ctx.post_update_nudge_count = 0
-    if tool_name in ("update_workflow", "update_and_run_blocks") and has_blocks:
-        ctx.synthesized_block_reopened_after_failed_run = False
-
     if tool_name in ("run_blocks_and_collect_debug", "update_and_run_blocks"):
         ctx.test_after_update_done = True
 
     if tool_name == "navigate_browser" and output.get("ok"):
         ctx.navigate_called = True
         ctx.observation_after_navigate = False
-        # Re-arm the per-cycle latch so the nudge can fire on the NEXT
-        # navigate-without-observe, not only the first one.
-        ctx.navigate_enforcement_done = False
 
     if tool_name in _OBSERVATION_TOOLS:
         ctx.observation_after_navigate = True
@@ -701,7 +693,6 @@ def _sanitize_input(raw_args: dict[str, Any]) -> dict[str, Any]:
 
 
 async def emit_turn_start(stream: EventSourceStream, ctx: CopilotContext) -> None:
-    mode_value = ctx.turn_intent.mode.value if ctx.turn_intent is not None else WorkflowCopilotTurnMode.UNKNOWN.value
     now = datetime.now(timezone.utc)
     if ctx.turn_started_at is None:
         ctx.turn_started_at = now.isoformat()
@@ -709,9 +700,19 @@ async def emit_turn_start(stream: EventSourceStream, ctx: CopilotContext) -> Non
         WorkflowCopilotTurnStartUpdate(
             turn_id=ctx.turn_id,
             turn_index=ctx.turn_index,
-            mode=WorkflowCopilotTurnMode(mode_value),
             timestamp=now,
             prior_block_count=ctx.prior_block_count,
+        )
+    )
+
+
+async def emit_title_update(stream: EventSourceStream, ctx: CopilotContext, title: str) -> None:
+    await stream.send(
+        WorkflowCopilotTitleUpdate(
+            turn_id=ctx.turn_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            title=title,
+            timestamp=datetime.now(timezone.utc),
         )
     )
 

@@ -10,7 +10,7 @@ from weakref import ReferenceType, ref
 
 import structlog
 
-from skyvern.forge.sdk.browser_action_policy import AuthorityState, RuntimeOriginAuthority
+from skyvern.forge.sdk.browser_action_policy import AuthorityState, RuntimeOriginAuthority, canonicalize_origin
 from skyvern.forge.sdk.browser_effect_approval import (
     ConsumedEffect,
     EffectApprovalRejected,
@@ -60,7 +60,11 @@ def _header(headers: dict[str, str], name: str) -> tuple[str | None, str | None]
 
 
 class BrowserNetworkEgressMonitor:
-    def __init__(self) -> None:
+    def __init__(self, *, enforcing: bool = True) -> None:
+        # Enforcement and observation are exclusive. An enforcing monitor owns context routing and
+        # denies; an observing one never routes and never denies, so binding run-scoped authority
+        # cannot turn ordinary browsing into a closed door before the deny set has been measured.
+        self._enforcing = enforcing
         self._install_started = False
         self._installed = False
         self._authority = RuntimeOriginAuthority(AuthorityState.UNWIRED)
@@ -81,11 +85,41 @@ class BrowserNetworkEgressMonitor:
         monitor._invalidate(BrowserNetworkDenialReason.UNENROLLED)
         return monitor
 
+    @classmethod
+    def observing(cls, run_url: object) -> BrowserNetworkEgressMonitor:
+        """A monitor enrolled by the run's own origin, reporting what enforcement would deny.
+
+        A run with no canonical origin has no run-scoped authority to grant, so it degrades to
+        ``unenrolled`` rather than inventing one.
+
+        The minted authority is narrower than ESTABLISHED promises elsewhere — a static origin set
+        never rotates and never goes missing — so it only gives ``_authorization`` a ceiling to
+        report reasons against. It never governs a block decision: a monitor built here is
+        permanently non-enforcing and refuses ``install``.
+        """
+        origin = canonicalize_origin(run_url)
+        if origin is None:
+            return cls.unenrolled()
+        monitor = cls(enforcing=False)
+        monitor.bind_authority(RuntimeOriginAuthority(AuthorityState.ESTABLISHED, frozenset({origin})))
+        return monitor
+
     @property
     def invalidation_reason(self) -> BrowserNetworkDenialReason | None:
         return self._invalidation_reason
 
+    @property
+    def _enrolled_for_registration(self) -> bool:
+        # An enforcing monitor registers a page so its own route defers to that page's CDP owner,
+        # which only means anything once the route exists. An observing monitor has no route, so
+        # established run-scoped authority is the whole of its enrollment.
+        if self._enforcing:
+            return self._installed
+        return self._authority.state is AuthorityState.ESTABLISHED
+
     async def install(self, context: BrowserContext) -> None:
+        if not self._enforcing:
+            raise RuntimeError("An observing browser network egress monitor never owns context routing")
         if self._install_started:
             raise RuntimeError("Browser network egress monitor is already installed")
         self._install_started = True
@@ -166,7 +200,7 @@ class BrowserNetworkEgressMonitor:
         self._initial_slots[consumption_id] = (normalized_method, normalized_url)
 
     def register_active_request_interceptor(self, *, page: object, owner: object) -> None:
-        if not self._installed or self._invalidated or page is None or owner is None:
+        if not self._enrolled_for_registration or self._invalidated or page is None or owner is None:
             self.invalidate()
             raise RuntimeError("Active-request interception cannot be registered")
         page_id = id(page)
@@ -195,9 +229,22 @@ class BrowserNetworkEgressMonitor:
 
     def authorize_request(self, *, method: str, url: str, resource_type: str, frame: object | None) -> bool:
         allowed, reason = self._authorization(method, url, resource_type, frame, allow_initial_effect=True)
-        if not allowed:
-            LOG.warning("Browser network request denied", reason=reason, decision="block")
-        return allowed
+        if allowed:
+            return True
+        if not self._enforcing:
+            # One line per request until something opens a causal epoch, so it is sampled out of
+            # the stream; the per-run S3 log artifact still keeps every line to measure against.
+            observed_origin = canonicalize_origin(url)
+            LOG.info(
+                "Browser network request observed",
+                reason=reason,
+                decision="observe",
+                origin=observed_origin.canonical if observed_origin is not None else None,
+                sampling=True,
+            )
+            return True
+        LOG.warning("Browser network request denied", reason=reason, decision="block")
+        return False
 
     def invalidate(self) -> None:
         self._invalidate(BrowserNetworkDenialReason.MONITOR_INVALIDATED)

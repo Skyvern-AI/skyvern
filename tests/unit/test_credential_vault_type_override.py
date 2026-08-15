@@ -1,12 +1,14 @@
 """Tests for per-credential vault_type override in CreateCredentialRequest and vault service routing."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 
 from skyvern.config import Settings
+from skyvern.forge.sdk.routes import credentials as credentials_routes
 from skyvern.forge.sdk.routes.credentials import (
     _delete_temporary_test_login_credential,
     _get_credential_vault_service,
@@ -21,7 +23,12 @@ from skyvern.forge.sdk.schemas.credentials import (
     SecretCredential,
     SecretCredentialResponse,
 )
+from skyvern.forge.sdk.services.credential import custom_credential_vault_service as custom_vault_module
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+from skyvern.forge.sdk.services.credential.custom_credential_vault_service import (
+    CONFIGURATION_INVALID_MESSAGE,
+    CustomCredentialVaultService,
+)
 
 
 class TestLocalCredentialVaultSettings:
@@ -310,6 +317,162 @@ class TestGetCredentialVaultServiceRouting:
             mock_app.CUSTOM_CREDENTIAL_VAULT_SERVICE = mock_custom
             result = await _get_credential_vault_service(vault_type_override=None)
             assert result is mock_custom
+
+
+def _install_stored_config(monkeypatch: pytest.MonkeyPatch, stored_config: str | None) -> None:
+    """Point the forge app's org-auth-token lookup at the given stored custom-vault configuration."""
+    auth_token = None if stored_config is None else SimpleNamespace(token=stored_config)
+    monkeypatch.setattr(
+        custom_vault_module.app,
+        "DATABASE",
+        SimpleNamespace(
+            organizations=SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=auth_token)),
+        ),
+    )
+
+
+class TestCustomVaultOrganizationPreflight:
+    """The gate preflights the custom vault's per-organization configuration before any vault call."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("stored_config", "expected_detail"),
+        [
+            pytest.param(
+                None,
+                "Custom credential service not configured for organization org_test",
+                id="no-configuration",
+            ),
+            pytest.param("not json at all", CONFIGURATION_INVALID_MESSAGE, id="unparsable-configuration"),
+            pytest.param(
+                json.dumps({"api_base_url": "https://credentials.example.test/api"}),
+                CONFIGURATION_INVALID_MESSAGE,
+                id="missing-api-token",
+            ),
+            pytest.param(
+                json.dumps({"api_base_url": "   ", "api_token": "tok_valid"}),
+                CONFIGURATION_INVALID_MESSAGE,
+                id="blank-api-base-url",
+            ),
+        ],
+    )
+    async def test_unusable_configuration_is_rejected_before_any_vault_call(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        stored_config: str | None,
+        expected_detail: str,
+    ) -> None:
+        api_client = MagicMock()
+        _install_stored_config(monkeypatch, stored_config)
+        monkeypatch.setattr(custom_vault_module, "CustomCredentialAPIClient", api_client)
+
+        with patch("skyvern.forge.sdk.routes.credentials.app") as mock_app:
+            mock_app.CUSTOM_CREDENTIAL_VAULT_SERVICE = CustomCredentialVaultService()
+            with pytest.raises(HTTPException) as exc_info:
+                await _get_credential_vault_service(
+                    vault_type_override=CredentialVaultType.CUSTOM,
+                    organization_id="org_test",
+                )
+
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail == expected_detail
+        api_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejection_detail_never_leaks_the_stored_api_token(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _install_stored_config(monkeypatch, json.dumps({"api_token": "super-secret-token"}))
+
+        with patch("skyvern.forge.sdk.routes.credentials.app") as mock_app:
+            mock_app.CUSTOM_CREDENTIAL_VAULT_SERVICE = CustomCredentialVaultService()
+            with pytest.raises(HTTPException) as exc_info:
+                await _get_credential_vault_service(
+                    vault_type_override=CredentialVaultType.CUSTOM,
+                    organization_id="org_test",
+                )
+
+        assert "super-secret-token" not in str(exc_info.value.detail)
+
+    @pytest.mark.asyncio
+    async def test_configured_organization_resolves_the_custom_vault(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _install_stored_config(
+            monkeypatch,
+            json.dumps({"api_base_url": "https://credentials.example.test/api", "api_token": "tok_valid"}),
+        )
+        service = CustomCredentialVaultService()
+
+        with patch("skyvern.forge.sdk.routes.credentials.app") as mock_app:
+            mock_app.CUSTOM_CREDENTIAL_VAULT_SERVICE = service
+            result = await _get_credential_vault_service(
+                vault_type_override=CredentialVaultType.CUSTOM,
+                organization_id="org_test",
+            )
+
+        assert result is service
+
+    @pytest.mark.asyncio
+    async def test_process_wide_vault_needs_no_organization_configuration(self) -> None:
+        mock_bw = MagicMock(spec=CredentialVaultService)
+        mock_settings = MagicMock(CREDENTIAL_VAULT_TYPE=CredentialVaultType.BITWARDEN)
+        with (
+            patch("skyvern.forge.sdk.routes.credentials.app") as mock_app,
+            patch("skyvern.forge.sdk.routes.credentials.SettingsManager.get_settings", return_value=mock_settings),
+        ):
+            mock_app.BITWARDEN_CREDENTIAL_VAULT_SERVICE = mock_bw
+            result = await _get_credential_vault_service(organization_id="org_test")
+
+        assert result is mock_bw
+        mock_bw.validate_organization_configuration.assert_awaited_once_with("org_test")
+
+    @pytest.mark.asyncio
+    async def test_callers_without_an_organization_skip_the_preflight(self) -> None:
+        # The TOTP read path relies on this: it needs CustomCredentialNotConfiguredError to reach
+        # its own handler rather than being converted at the gate.
+        mock_custom = MagicMock(spec=CredentialVaultService)
+        with patch("skyvern.forge.sdk.routes.credentials.app") as mock_app:
+            mock_app.CUSTOM_CREDENTIAL_VAULT_SERVICE = mock_custom
+            result = await _get_credential_vault_service(vault_type_override=CredentialVaultType.CUSTOM)
+
+        assert result is mock_custom
+        mock_custom.validate_organization_configuration.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_route_rejects_unconfigured_organization_without_storing_a_secret(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        api_client = MagicMock()
+        _install_stored_config(monkeypatch, None)
+        monkeypatch.setattr(custom_vault_module, "CustomCredentialAPIClient", api_client)
+        service = CustomCredentialVaultService()
+        create_credential = AsyncMock()
+        monkeypatch.setattr(service, "create_credential", create_credential)
+
+        data = CreateCredentialRequest(
+            name="Test",
+            credential_type=CredentialType.PASSWORD,
+            credential=NonEmptyPasswordCredential(username="user", password="pass"),
+            vault_type=CredentialVaultType.CUSTOM,
+        )
+
+        with patch("skyvern.forge.sdk.routes.credentials.app") as mock_app:
+            mock_app.CUSTOM_CREDENTIAL_VAULT_SERVICE = service
+            mock_app.AGENT_FUNCTION.validate_credential_write = AsyncMock()
+            with pytest.raises(HTTPException) as exc_info:
+                await credentials_routes.create_credential(
+                    background_tasks=BackgroundTasks(),
+                    data=data,
+                    current_org=SimpleNamespace(organization_id="org_test"),
+                )
+
+        assert exc_info.value.status_code == 400
+        create_credential.assert_not_awaited()
+        api_client.assert_not_called()
 
 
 class TestTemporaryTestLoginCredentialCleanup:

@@ -7,6 +7,7 @@ import {
   STUDIO_STAGE_GAP_PX,
   STUDIO_STAGE_PADDING_PX,
   STUDIO_PANE_MIN_WIDTH,
+  copilotContextForSearch,
   fitPanesToWidth,
   layoutClassForSearch,
   panesFitWidth,
@@ -19,10 +20,36 @@ import {
   searchWithRunReference,
   toReadableSearch,
   togglePane,
+  withCopilotSelection,
   withPaneClosed,
   withPaneOpen,
   withPanesOpen,
 } from "./panes";
+
+describe("Copilot pane context and selection", () => {
+  test("uses one edit context and one run context", () => {
+    expect(copilotContextForSearch("?panes=copilot")).toBe("edit");
+    expect(copilotContextForSearch("?bl=block_1")).toBe("edit");
+    expect(copilotContextForSearch("?wr=wr_1")).toBe("run");
+    expect(copilotContextForSearch("?active=act_1")).toBe("run");
+    expect(copilotContextForSearch("?wr=wr_1&bl=block_1")).toBe("run");
+  });
+
+  test("applies runtime membership and preserves a remembered position", () => {
+    expect(
+      withCopilotSelection(["copilot", "editor", "browser"], {
+        open: false,
+        index: 0,
+      }),
+    ).toEqual(["editor", "browser"]);
+    expect(
+      withCopilotSelection(["editor", "browser"], {
+        open: true,
+        index: 1,
+      }),
+    ).toEqual(["editor", "copilot", "browser"]);
+  });
+});
 
 describe("parsePanesParam", () => {
   test("returns null when the param is absent", () => {

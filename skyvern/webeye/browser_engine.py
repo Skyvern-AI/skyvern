@@ -53,6 +53,14 @@ UNSET_SELECTION = cast("BrowserEngineSelection | None", object())
 
 STOCK_ENGINE_NAME = "playwright"
 RUSTWRIGHT_ENGINE_NAME = "rustwright"
+SKYCDP_ENGINE_NAME = "skycdp"
+
+# skycdp is an in-tree, attach-only raw-CDP driver: no driver subprocess, no bundled browser, no
+# launcher. It arrives DENY-ALL for the same reason Rustwright does — a driver swap is a behavioural
+# risk, not a config change, and the measured conformance surface is still narrower than the
+# Playwright surface production uses. A source is carved in only once its behaviours are covered by
+# tests/browser_e2e/test_skycdp_conformance.py.
+SKYCDP_ALLOWED_BROWSER_SOURCES: frozenset[str] = frozenset()
 
 # Rustwright is registered so the adapter contract exists, but it is DENY-ALL (empty capability set)
 # and thus not rollout-capable: no production browser source may select it. Paths it would serve
@@ -84,6 +92,12 @@ class BrowserEngineUnavailable(SkyvernException):
     def __init__(self, name: str) -> None:
         self.name = name
         super().__init__(f"Browser engine {name!r} is registered but its driver package is not installed")
+
+
+class BrowserEngineBootstrapError(SkyvernException):
+    """A selected driver could not launch a usable browser context (a boot failure before any usable
+    context exists). Raised by a launch seam to mark a narrow experiment-engine launch failure that the
+    acquisition boundary may degrade once to the selection's classical boot fallback."""
 
 
 class BrowserSourceNotSupportedByEngine(SkyvernException):
@@ -149,6 +163,12 @@ class BrowserEngineSelection:
     target_closed_error_types: tuple[type[BaseException], ...] = ()
     cdp_connection_error_types: tuple[type[BaseException], ...] = ()
     retryable_error_types: tuple[type[BaseException], ...] = ()
+    # One-shot classical fallback used ONLY if THIS selection's driver fails to boot at the run's
+    # browser-ownership boundary, before any browser/page resource exists (see
+    # ``RealBrowserManager._create_browser_state``). ``None`` (the default, and what ``select()`` always
+    # produces) means no fallback — a boot failure fails the run as before. The fallback itself carries
+    # no further fallback, so the degrade is exactly one hop and never fires after a browser side effect.
+    boot_fallback_selection: BrowserEngineSelection | None = None
     # Derived once from the identities above (which ``select()`` loaded lazily from the driver
     # package), never passed in: the immutable error-family binding that ``classify_error`` uses. The
     # base+timeout pair is the stable public identity every driver exposes; the richer families are
@@ -385,6 +405,29 @@ def _rustwright_rich_error_types() -> BrowserEngineRichErrorTypes:
     return BrowserEngineRichErrorTypes(target_closed_types=(RustwrightTargetClosedError,))
 
 
+async def _start_skycdp_driver() -> Playwright:
+    from skyvern.webeye.skycdp import async_skycdp
+
+    # Structurally a Playwright driver for the one surface a CDP-connect run uses
+    # (``chromium.connect_over_cdp``); it is not a playwright.Playwright, and cannot be.
+    return cast(Playwright, await async_skycdp().start())
+
+
+def _skycdp_error_types() -> tuple[type[BaseException], type[BaseException]]:
+    from skyvern.webeye.skycdp.errors import CdpError, CdpTimeoutError
+
+    return CdpError, CdpTimeoutError
+
+
+def _skycdp_rich_error_types() -> BrowserEngineRichErrorTypes:
+    from skyvern.webeye.skycdp.errors import CdpConnectionError, CdpTargetClosedError
+
+    return BrowserEngineRichErrorTypes(
+        target_closed_types=(CdpTargetClosedError,),
+        cdp_connection_types=(CdpConnectionError,),
+    )
+
+
 PLAYWRIGHT_SPEC = BrowserEngineSpec(
     name=STOCK_ENGINE_NAME,
     _start_driver=_start_stock_driver,
@@ -401,9 +444,18 @@ RUSTWRIGHT_SPEC = BrowserEngineSpec(
     _load_rich_error_types=_rustwright_rich_error_types,
 )
 
+SKYCDP_SPEC = BrowserEngineSpec(
+    name=SKYCDP_ENGINE_NAME,
+    _start_driver=_start_skycdp_driver,
+    _load_error_types=_skycdp_error_types,
+    allowed_browser_sources=SKYCDP_ALLOWED_BROWSER_SOURCES,
+    _load_rich_error_types=_skycdp_rich_error_types,
+)
+
 REGISTRY = BrowserEngineRegistry()
 REGISTRY.register(PLAYWRIGHT_SPEC)
 REGISTRY.register(RUSTWRIGHT_SPEC)
+REGISTRY.register(SKYCDP_SPEC)
 
 
 @dataclass(frozen=True)

@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
-from urllib.parse import parse_qsl, urlencode, urlparse
+from urllib.parse import ParseResult, parse_qsl, urlencode, urlparse
 
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
@@ -43,9 +43,23 @@ async def load_credentials(organization_id: str) -> list[Credential]:
         page += 1
 
 
+def _parse_url(url: str) -> ParseResult | None:
+    """`urlparse` that declines a malformed authority instead of raising.
+
+    A bracket it cannot read as an IPv6 literal raises `ValueError`, and chat turns carry those
+    routinely — a pasted markdown auto-link leaves `example.com](https://example.com` in the text.
+    Every helper here runs ahead of its caller's own guard, so raising aborts the turn where
+    declining only means the value names no site.
+    """
+    try:
+        return urlparse(url)
+    except ValueError:
+        return None
+
+
 def url_parts(url: str) -> tuple[str, str, str] | None:
-    parsed = urlparse(url if "://" in url else f"https://{url}")
-    if not parsed.netloc:
+    parsed = _parse_url(url if "://" in url else f"https://{url}")
+    if parsed is None or not parsed.netloc:
         return None
     host = parsed.netloc.lower()
     path = parsed.path.rstrip("/")
@@ -65,8 +79,8 @@ def loggable_origin(url: str) -> str:
     `url_parts` keys on the whole netloc so that `https://real.example.com@evil.example/` cannot
     match `real.example.com`; that same netloc would carry basic-auth credentials into a log line.
     """
-    parsed = urlparse(url if "://" in url else f"https://{url}")
-    if not parsed.hostname:
+    parsed = _parse_url(url if "://" in url else f"https://{url}")
+    if parsed is None or not parsed.hostname:
         return ""
     try:
         port = f":{parsed.port}" if parsed.port else ""
@@ -82,11 +96,8 @@ def is_resolved_page_url(url: str) -> bool:
     any bare token — a prompt sentinel, a tool-argument echo, a placeholder — into a hostname that
     matches nothing, and the resulting "no match" reads as a fact about the org's saved credentials.
     """
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        # A malformed authority (`http://[`) raises here, and callers run this ahead of their own
-        # resolver guard, so raising would abort the observing tool rather than decline its input.
+    parsed = _parse_url(url)
+    if parsed is None:
         return False
     # Keyed on `hostname` where `url_parts` keys the whole netloc, so `https://a.example@b.example`
     # passes here and still matches no saved credential there; netloc would not harden this.
@@ -100,9 +111,8 @@ def unresolved_page_url_for_log(url: str) -> str:
     is where a secret rides, so the identity a log may name is only ever the components above them.
     A value too malformed to parse has no identity to name, and the outcome field carries that.
     """
-    try:
-        parsed = urlparse(url)
-    except ValueError:
+    parsed = _parse_url(url)
+    if parsed is None:
         return ""
     if parsed.hostname:
         return f"{parsed.scheme.lower()}://{parsed.hostname}"[:64] if parsed.scheme else f"//{parsed.hostname}"[:64]
@@ -116,6 +126,46 @@ def deduplicate_credentials(credentials: list[Credential]) -> list[Credential]:
     for credential in credentials:
         by_id.setdefault(credential.credential_id, credential)
     return list(by_id.values())
+
+
+def credential_reference_spans(message: str, reference: str) -> list[tuple[int, int]]:
+    """Return structurally delimited occurrences of one exact saved reference."""
+    spans: list[tuple[int, int]] = []
+    start = 0
+    while True:
+        index = message.find(reference, start)
+        if index < 0:
+            return spans
+        end = index + len(reference)
+        before = message[index - 1] if index else ""
+        before_is_boundary = not before or before.isspace() or before in "([{\"'`"
+        cursor = end
+        while cursor < len(message) and message[cursor] in ")]\"}'`":
+            cursor += 1
+        if cursor < len(message) and message[cursor] in ".,;:!?":
+            cursor += 1
+        after_is_boundary = cursor == len(message) or message[cursor].isspace()
+        if before_is_boundary and after_is_boundary:
+            spans.append((index, end))
+        start = index + 1
+
+
+def grounded_credential_references(message: str, credentials: list[Credential]) -> set[str]:
+    """Find complete saved names/IDs in a turn, preferring the longest overlap."""
+    candidates = {value for credential in credentials for value in (credential.name, credential.credential_id) if value}
+    occurrences = [
+        (reference, start, end)
+        for reference in candidates
+        for start, end in credential_reference_spans(message, reference)
+    ]
+    return {
+        reference
+        for reference, start, end in occurrences
+        if not any(
+            other_start <= start and end <= other_end and (other_start, other_end) != (start, end)
+            for _other, other_start, other_end in occurrences
+        )
+    }
 
 
 def _match_by_url_tiered(

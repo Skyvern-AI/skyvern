@@ -7,21 +7,15 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import json
 import keyword
-import re
 import sys
 import textwrap
 from collections import Counter
-from collections.abc import Mapping
-from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
-from structlog.testing import capture_logs
 
-from skyvern.forge.sdk.copilot import code_block_synthesis as code_block_synthesis_module
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     _SELECTION_MATCH_BASES,
     AuthoringParameterBindingCandidate,
@@ -32,8 +26,6 @@ from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     authoring_parameter_binding_directive_consumed,
     build_authoring_parameter_binding_directive,
     build_authoring_parameter_binding_snapshot,
-    derive_same_month_file_match_transform,
-    same_month_file_match_transform_fingerprint,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import preflight_code_block
 from skyvern.forge.sdk.copilot.code_block_security import author_time_code_security_errors
@@ -45,42 +37,21 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _INDENT,
     _MAX_STEPS,
     _READONLY_DEFERRED_VAR,
-    _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
     INPUT_TEMPLATED_PROVENANCE_SOURCE,
     LOCATOR_WITNESS_PARAM_SOURCE,
-    SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE,
-    SCOUTED_SPINE_TRUNCATED_REASON_CODE,
-    TRUNCATED_FINDING,
-    UNFORGIVEN_DROP_FINDING,
-    ProducedStaticReturnEnvelope,
     SynthesisDiagnostics,
     _get_by_role_expr_strict,
     _is_submit_interaction,
     _strict_period_date_pattern,
-    build_input_templated_locator,
-    build_synthesized_artifact_metadata,
     code_contains_credential_fill,
     credential_scout_gap,
     dynamic_row_evidence_fingerprint,
-    input_correspondences_for_interaction,
-    is_optional_dismissal_only_trajectory,
-    obligation_finding_reason_code,
-    produce_covered_static_return_envelope,
-    render_synthesized_offer_text,
-    spine_partition_findings,
     synthesize_code_block,
-    synthesize_code_block_with_extraction,
-    synthesize_extraction_suffix,
-    templated_selection_locator_binding,
-    uncovered_required_emitted_interactions,
-    uncovered_rung_records,
-    witness_prelude_lines,
 )
 from skyvern.forge.sdk.copilot.context import (
-    FillCarry,
     StructuredContext,
-    _fill_carry_from_scout_trajectory,
+    _carried_trajectory_from_scout_trajectory,
 )
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     LiveReadBinding,
@@ -89,12 +60,12 @@ from skyvern.forge.sdk.copilot.output_extraction_plan import (
     RevealAnchor,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
-from skyvern.forge.sdk.copilot.run_outcome import run_outcome_display_reason
-from skyvern.forge.sdk.copilot.tools import _normalize_code_artifact_metadata
-from skyvern.forge.sdk.copilot.tools.scouting import _fill_carry_to_interaction, _with_trajectory_anchor
-from skyvern.forge.sdk.copilot.tools.workflow_update import _code_block_safety_errors, _scouted_spine_omission_digest
-from skyvern.forge.sdk.workflow.exceptions import CustomizedCodeException
+from skyvern.forge.sdk.copilot.tools.scouting import _fill_carry_to_interaction
+from skyvern.forge.sdk.copilot.tools.workflow_update import (
+    _code_block_safety_errors,
+)
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockStep
+from tests.unit.copilot_test_helpers import carried_interaction
 
 
 @pytest.fixture(autouse=True)
@@ -149,6 +120,42 @@ def test_authoring_parameter_snapshot_rebinds_captured_fill_without_duplicate() 
     assert result.code.index(fill) < result.code.index('page.locator("#submit").click()')
     assert result.parameters == [{"key": "search_location"}]
     assert result.diagnostics.grounded_submit_binding_fingerprints == [snapshot.fingerprint]
+
+
+def test_authoring_parameter_snapshot_recovers_before_terminal_readiness_wait() -> None:
+    trajectory = [
+        _interaction(
+            "click",
+            selector="#submit",
+            source_url="https://example.com/form",
+            trajectory_index=9,
+            observed_disabled=True,
+        ),
+    ]
+    snapshot = build_authoring_parameter_binding_snapshot(
+        structural_key="definition-reject",
+        source_origin="https://example.com",
+        field_bindings=[
+            AuthoringParameterFieldBinding(
+                declared_key="search_location",
+                field_selector="#location",
+                match_basis="unique_ephemeral_value",
+            )
+        ],
+        terminal=AuthoringParameterTerminalBinding(
+            tool_name="click",
+            trajectory_index=9,
+            selector="#submit",
+        ),
+    )
+
+    result = synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot)
+
+    assert result is not None
+    fill = 'page.locator("#location").fill(str(search_location))'
+    enabled = 'if await page.locator("#submit").is_enabled()'
+    click = 'page.locator("#submit").click()'
+    assert result.code.index(fill) < result.code.index(enabled) < result.code.index(click)
 
 
 def test_authoring_parameter_snapshot_recovers_missing_fill_before_enter() -> None:
@@ -262,14 +269,6 @@ def test_authoring_parameter_snapshot_fails_closed_when_terminal_identity_change
     assert synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot) is None
 
 
-def _templated_selection_click(selector: str, key: str, value: str, index: int) -> dict[str, Any]:
-    interaction = _interaction(
-        "click", selector=selector, source_url="https://example.com/list", trajectory_index=index
-    )
-    interaction["input_correspondences"] = input_correspondences_for_interaction(interaction, {key: value})
-    return interaction
-
-
 def test_authored_selection_bindings_recognizes_templated_click_and_select_option() -> None:
     code = (
         'await page.locator(f"[data-account=\\"{account_number}\\"]").click()\n'
@@ -285,42 +284,6 @@ def test_authored_selection_bindings_recognizes_templated_click_and_select_optio
 def test_authored_selection_bindings_ignores_literal_only_click() -> None:
     code = 'await page.locator("#row-account-AC12345").click()\n'
     assert authored_selection_parameter_bindings(code, {"account_number"}) == {}
-
-
-def test_authoring_parameter_directive_consumed_via_templated_click() -> None:
-    click = _templated_selection_click('[data-account="AC12345"]', "account_number", "AC12345", 0)
-    key, join = templated_selection_locator_binding(click)
-    assert key == "account_number"
-    snapshot = build_authoring_parameter_binding_snapshot(
-        structural_key="definition-reject",
-        source_origin="https://example.com",
-        field_bindings=[
-            AuthoringParameterFieldBinding(
-                declared_key="account_number",
-                field_selector=join,
-                field_trajectory_index=0,
-                match_basis="scouted_selection_value",
-            )
-        ],
-        terminal=AuthoringParameterTerminalBinding(
-            tool_name="click", trajectory_index=0, selector='[data-account="AC12345"]'
-        ),
-    )
-    directive = build_authoring_parameter_binding_directive(
-        structural_key="definition-reject",
-        source_origin="https://example.com",
-        candidates=[AuthoringParameterBindingCandidate(declared_key="account_number", field_selector=join)],
-    )
-    consumed_code = 'await page.locator(f"[data-account=\\"{account_number}\\"]").click()'
-    assert authoring_parameter_binding_directive_consumed(
-        directive, snapshot, code=consumed_code, parameter_keys=["account_number"]
-    )
-    assert not authoring_parameter_binding_directive_consumed(
-        directive,
-        snapshot,
-        code='await page.locator("#row-account-AC12345").click()',
-        parameter_keys=["account_number"],
-    )
 
 
 def test_authoring_parameter_directive_consumed_via_select_option_value_argument() -> None:
@@ -354,30 +317,6 @@ def test_authoring_parameter_directive_consumed_via_select_option_value_argument
         code='await page.locator("#plan").select_option("premium")',
         parameter_keys=["plan_tier"],
     )
-
-
-def test_selection_snapshot_click_binding_references_declared_key() -> None:
-    click = _templated_selection_click('[data-account="AC12345"]', "account_number", "AC12345", 0)
-    _key, join = templated_selection_locator_binding(click)
-    snapshot = build_authoring_parameter_binding_snapshot(
-        structural_key="definition-reject",
-        source_origin="https://example.com",
-        field_bindings=[
-            AuthoringParameterFieldBinding(
-                declared_key="account_number",
-                field_selector=join,
-                field_trajectory_index=0,
-                match_basis="scouted_selection_value",
-            )
-        ],
-        terminal=AuthoringParameterTerminalBinding(
-            tool_name="click", trajectory_index=0, selector='[data-account="AC12345"]'
-        ),
-    )
-    result = synthesize_code_block([click], strict_selectors=True, parameter_binding_snapshot=snapshot)
-    assert result is not None
-    assert 'page.locator(f"[data-account=\\"{account_number}\\"]").click()' in result.code
-    assert ".fill(" not in result.code
 
 
 def test_selection_snapshot_select_option_binds_value_argument() -> None:
@@ -426,46 +365,6 @@ def test_fill_snapshot_never_emits_select_option_value_binding() -> None:
     assert result is not None
     assert ".select_option(" not in result.code
     assert snapshot.terminal.tool_name not in _SELECTION_MATCH_BASES
-
-
-def test_rekeyed_outputs_with_alike_labels_return_under_distinct_keys() -> None:
-    # Labels are not guaranteed distinct, so alike-slugging labels must not collapse onto one key.
-    plan = RequestedOutputExtractionPlan(
-        requested_output_paths=("output.request_slot_aaa_00", "output.request_slot_aaa_01"),
-        observation_step=3,
-        observation_identity="observation-identity",
-        reveal=RevealAnchor(selector="#show"),
-        live_reads=(
-            LiveReadBinding(
-                output_path="output.request_slot_aaa_00",
-                kind=LiveReadKind.KEY_VALUE,
-                selector=".kv",
-                selector_count=2,
-                selector_index=0,
-                child_index=1,
-                child_count=2,
-                relation_label="Visitors",
-            ),
-            LiveReadBinding(
-                output_path="output.request_slot_aaa_01",
-                kind=LiveReadKind.KEY_VALUE,
-                selector=".kv",
-                selector_count=2,
-                selector_index=1,
-                child_index=1,
-                child_count=2,
-                relation_label="visitors",
-            ),
-        ),
-        identity="plan-identity",
-    )
-
-    suffix = synthesize_extraction_suffix(plan)
-
-    assert suffix is not None
-    assert '"visitors": _extraction_value_0' in suffix.code
-    assert '"visitors_2": _extraction_value_1' in suffix.code
-    assert "request_slot_aaa" not in suffix.code
 
 
 def _extraction_plan() -> RequestedOutputExtractionPlan:
@@ -531,19 +430,6 @@ def _extraction_plan() -> RequestedOutputExtractionPlan:
     )
 
 
-def test_extraction_suffix_compiles_direct_guarded_live_reads() -> None:
-    suffix = synthesize_extraction_suffix(_extraction_plan())
-
-    assert suffix is not None
-    assert 'page.locator(".kv").nth(0).locator(":scope > *").nth(1).inner_text()' in suffix.code
-    assert 'page.locator("#records > tbody > tr").count() != 3' in suffix.code
-    assert "for _extraction_index" not in suffix.code
-    assert 'page.locator("#records > tbody > tr").nth(2)' in suffix.code
-    assert '"overall_state": _extraction_value_1' in suffix.code
-    assert '"detail"' in suffix.code
-    assert '"state"' in suffix.code
-
-
 class _RecipeLocator:
     def __init__(self, page: _RecipePage, selector: str, indices: tuple[int, ...] = ()) -> None:
         self.page = page
@@ -603,101 +489,6 @@ class _RecipePage:
 
     def locator(self, selector: str) -> _RecipeLocator:
         return _RecipeLocator(self, selector)
-
-
-async def _execute_recipe(page: _RecipePage) -> dict[str, object]:
-    suffix = synthesize_extraction_suffix(_extraction_plan())
-    assert suffix is not None
-    namespace: dict[str, object] = {}
-    exec("async def recipe(page):\n" + textwrap.indent(suffix.code, "    "), namespace)
-    recipe = namespace["recipe"]
-    assert callable(recipe)
-    return await recipe(page)
-
-
-@pytest.mark.asyncio
-async def test_generated_recipe_executes_and_fails_closed_on_runtime_drift() -> None:
-    page = _RecipePage()
-    result = await _execute_recipe(page)
-    assert result["output"]["record_id"] == "record-123"
-    assert len(result["output"]["records"]) == 3
-
-    page.counts[(".kv", ())] = 3
-    with pytest.raises(Exception, match="scalar selector cardinality"):
-        await _execute_recipe(page)
-
-    page.counts[(".kv", ())] = 2
-    page.visibility[("#records > tbody > tr|:scope > th, :scope > td", (1, 2))] = False
-    with pytest.raises(Exception, match="cell is no longer visible"):
-        await _execute_recipe(page)
-
-
-def _produce_table_envelope() -> ProducedStaticReturnEnvelope | None:
-    return produce_covered_static_return_envelope(
-        "x = 1",
-        plan=_extraction_plan(),
-        scalar_required_paths=set(_extraction_plan().requested_output_paths),
-        declaration_paths=set(),
-        download_required_paths=set(),
-        expects_download=False,
-    )
-
-
-async def _execute_envelope(page: _RecipePage, envelope: ProducedStaticReturnEnvelope | None) -> dict[str, object]:
-    assert envelope is not None
-    namespace: dict[str, object] = {}
-    exec("async def recipe(page):\n" + textwrap.indent(envelope.code, "    "), namespace)
-    recipe = namespace["recipe"]
-    assert callable(recipe)
-    return await recipe(page)
-
-
-@pytest.mark.asyncio
-async def test_produced_envelope_executes_table_and_scalar_reads() -> None:
-    result = await _execute_envelope(_RecipePage(), _produce_table_envelope())
-    assert result["output"]["record_id"] == "record-123"
-    assert result["output"]["overall_state"] == "Ready"
-    assert len(result["output"]["records"]) == 3
-    assert result["output"]["records"][0]["detail"] == "Detail 0"
-    assert result["output"]["records"][2]["state"] == "Ready"
-
-
-@pytest.mark.asyncio
-async def test_produced_envelope_guard_raises_on_empty_cell() -> None:
-    page = _RecipePage()
-    page.text[("#records > tbody > tr|:scope > th, :scope > td", (0, 1))] = ""
-    with pytest.raises(Exception, match="table cell value is empty"):
-        await _execute_envelope(page, _produce_table_envelope())
-
-
-def test_suffix_omits_empty_cell_guard() -> None:
-    suffix = synthesize_extraction_suffix(_extraction_plan())
-    assert suffix is not None
-    assert "table cell value is empty" not in suffix.code
-    assert "scalar value is empty" not in suffix.code
-
-
-def test_plan_compiler_requires_exact_reveal_and_is_idempotent() -> None:
-    trajectory = [
-        _interaction(
-            "click",
-            selector="#show-details",
-            role="button",
-            accessible_name="Show details",
-            source_url="https://example.com/records",
-        )
-    ]
-
-    first = synthesize_code_block_with_extraction(trajectory, _extraction_plan())
-    second = synthesize_code_block_with_extraction(trajectory, _extraction_plan())
-
-    assert first is not None
-    assert second is not None
-    assert first.code == second.code
-    assert first.code.count(".click()") == 1
-    assert first.extraction_plan_identity == "plan-identity"
-    assert first.extraction_fingerprint == second.extraction_fingerprint
-    assert synthesize_code_block_with_extraction([], _extraction_plan()) is None
 
 
 class TestLocatorSynthesis:
@@ -1098,11 +889,6 @@ class TestActionSynthesis:
         assert "example_sku_123" not in safe.code
         assert safe.parameters == [{"key": "search", "default_value": "example_sku_123"}]
 
-        offer_text = render_synthesized_offer_text(safe)
-        assert "workflow_parameter_type: string" in offer_text
-        assert "default_value" in offer_text
-        assert "example_sku_123" not in offer_text
-
         reused = synthesize_code_block(
             [typed("#search", "Search"), typed("#search", "Search", "https://example.com/results")]
         )
@@ -1138,6 +924,7 @@ class TestActionSynthesis:
                     source_url="https://example.com/find",
                     role="button",
                     accessible_name="Accept cookies",
+                    observed_hidden=True,
                 ),
                 _interaction(
                     "type_text",
@@ -1162,6 +949,7 @@ class TestActionSynthesis:
         )
         assert "        del _scout_entry_target" in lines
         assert "        del _scout_optional_dismissal" in lines
+        assert 'page.locator("#accept-consent").wait_for(state="visible"' not in result.code
         assert result.parameters == [{"key": "city_county_or_zip_code", "default_value": "Example City"}]
         ast.parse("async def _block(page):\n" + result.code)
 
@@ -1194,25 +982,6 @@ class TestActionSynthesis:
         assert "    if await _scout_optional_dismissal.count() > 0:" in lines
         assert 'await _scout_entry_target.wait_for(state="visible", timeout=120000)' in result.code
         assert 'await page.locator("button.decline").click()' not in result.code
-
-    def test_close_named_action_is_not_optional_dismissal_by_name_only(self) -> None:
-        trajectory = [
-            _interaction(
-                "click",
-                selector="#account-action",
-                source_url="https://example.com/settings",
-                role="button",
-                accessible_name="Close account",
-            )
-        ]
-
-        assert is_optional_dismissal_only_trajectory(trajectory) is False
-
-        result = synthesize_code_block(trajectory, strict_selectors=True)
-
-        assert result is not None
-        assert 'await page.locator("#account-action").click()' in result.code
-        assert "_scout_optional_dismissal" not in result.code
 
     def test_internal_scout_cleanup_ignores_names_inside_literals(self) -> None:
         result = synthesize_code_block(
@@ -1335,60 +1104,6 @@ class TestActionSynthesis:
             f'await page.locator("{fill_selector}").fill'
         )
 
-    @pytest.mark.parametrize(
-        ("click_selector", "click_role", "dismissal_line", "forbidden_snippet"),
-        [
-            pytest.param(
-                "button:not(.decline)",
-                "button",
-                "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")",
-                'page.locator("button:not(.decline)")',
-                id="not-decline",
-            ),
-            pytest.param(
-                ".btns button:nth-of-type(2)",
-                "button",
-                '    _scout_optional_dismissal = page.locator(".btns button:nth-of-type(2)")',
-                'await page.locator(".btns button:nth-of-type(2)").click()',
-                id="structural-nth-of-type",
-            ),
-            pytest.param(
-                "//button[normalize-space()='Accept']",
-                None,
-                "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")",
-                "//button[normalize-space()='Accept']",
-                id="bare-accept-xpath",
-            ),
-        ],
-    )
-    def test_one_step_optional_dismissal_is_not_entry_target(
-        self,
-        click_selector: str,
-        click_role: str | None,
-        dismissal_line: str,
-        forbidden_snippet: str,
-    ) -> None:
-        trajectory = [
-            _interaction(
-                "click",
-                selector=click_selector,
-                source_url="https://example.com/find",
-                role=click_role,
-            ),
-        ]
-        assert is_optional_dismissal_only_trajectory(trajectory) is True
-
-        result = synthesize_code_block(trajectory, strict_selectors=True)
-
-        assert result is not None
-        lines = result.code.splitlines()
-        assert lines[0] == '    await page.goto("https://example.com/find", wait_until="domcontentloaded")'
-        assert dismissal_line in lines
-        assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
-        assert 'await _scout_entry_target.wait_for(state="visible", timeout=120000)' not in result.code
-        assert forbidden_snippet not in result.code
-        ast.parse("async def _block(page):\n" + result.code)
-
     def test_terminal_anonymous_structural_click_after_required_is_emitted_as_required(self) -> None:
         terminal_selector = (
             'xpath=/*[name()="html"][1]/*[name()="body"][1]/*[name()="div"][1]/*[name()="div"][2]/*[name()="button"][2]'
@@ -1506,26 +1221,6 @@ class TestActionSynthesis:
         assert "_scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")" in result.code
         assert 'await page.locator("button:not(.decline)").click()' not in result.code
 
-    def test_optional_dismissal_with_durable_target_is_offerable(self) -> None:
-        trajectory = [
-            _interaction(
-                "click",
-                selector="button:not(.decline)",
-                source_url="https://example.com/find",
-                role="button",
-            ),
-            _interaction(
-                "type_text",
-                selector="#locInput",
-                source_url="https://example.com/find",
-                role="textbox",
-                accessible_name="City, county, or ZIP code",
-                typed_value="Example City",
-            ),
-        ]
-
-        assert is_optional_dismissal_only_trajectory(trajectory) is False
-
     def test_press_enter_uses_keyboard_when_no_selector(self) -> None:
         result = synthesize_code_block([_interaction("press_key", key="Enter")])
         assert result is not None
@@ -1545,6 +1240,31 @@ class TestActionSynthesis:
         )
         assert result is not None
         assert 'await page.get_by_role("textbox", name="Search").press("Enter")' in result.code
+
+    def test_press_key_waits_for_observed_control_readiness(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "press_key",
+                    selector="#emailAddress",
+                    key="Enter",
+                    observed_hidden=True,
+                    observed_disabled=True,
+                ),
+                _interaction("click", selector="#continue"),
+            ]
+        )
+
+        assert result is not None
+        visible_wait = 'await page.locator("#emailAddress").wait_for(state="visible", timeout=120000)'
+        enabled_poll = (
+            'if await page.locator("#emailAddress").is_enabled() '
+            'and (await page.locator("#emailAddress").get_attribute("data-disabled") or "").strip().lower() '
+            '!= "true":'
+        )
+        press = 'await page.locator("#emailAddress").press("Enter")'
+        assert result.code.index(visible_wait) < result.code.index(press)
+        assert result.code.index(enabled_poll) < result.code.index(press)
 
     def test_select_option_emits_value(self) -> None:
         result = synthesize_code_block(
@@ -1791,26 +1511,12 @@ class TestTrajectoryFidelity:
                 )
             ]
         )
-        metadata = build_synthesized_artifact_metadata(
-            [
-                _interaction(
-                    "click",
-                    selector="#go",
-                    source_url="https://user:password@example.com/search?token=secret-token&q=record#access_token=fragment-token&section=results",
-                )
-            ]
-        )
-
         assert result is not None
         assert "user:password" not in result.code
         assert "secret-token" not in result.code
         assert "fragment-token" not in result.code
         assert "q=record" in result.code
         assert "section=results" in result.code
-        page_dependency = metadata["page_dependencies"][0]
-        assert page_dependency["url_hint"] == (
-            "https://example.com/search?token=__redacted__&q=record#access_token=__redacted__&section=results"
-        )
 
     def test_synthesis_scrubs_bare_sensitive_url_fragments(self) -> None:
         result = synthesize_code_block(
@@ -1822,23 +1528,12 @@ class TestTrajectoryFidelity:
                 )
             ]
         )
-        metadata = build_synthesized_artifact_metadata(
-            [
-                _interaction(
-                    "click",
-                    selector="#go",
-                    source_url="https://example.com/search?q=record#secret-token-fragment",
-                )
-            ]
-        )
-
         assert result is not None
         assert "secret-token-fragment" not in result.code
         assert (
             'await page.goto("https://example.com/search?q=record#__redacted__", wait_until="domcontentloaded")'
             in result.code
         )
-        assert metadata["page_dependencies"][0]["url_hint"] == "https://example.com/search?q=record#__redacted__"
 
 
 class TestDeterminismAndEmpty:
@@ -2408,7 +2103,7 @@ class TestPreflightSurfacesSyntaxError:
 
         assert not any(d.code == "BROAD_DOCUMENT_BODY_TEXT_WAIT" for d in diagnostics)
 
-    def test_persist_safety_rejects_broad_body_text_wait_for_function(self) -> None:
+    def test_persist_safety_allows_broad_body_text_wait_with_nonblocking_diagnostic(self) -> None:
         workflow_yaml = (
             "title: Record lookup\n"
             "workflow_definition:\n"
@@ -2421,9 +2116,13 @@ class TestPreflightSurfacesSyntaxError:
         )
 
         errors = _code_block_safety_errors(workflow_yaml, None)
+        diagnostics = preflight_code_block(
+            "await page.wait_for_function(\"() => document.body.innerText.includes('Details')\", timeout=5000)\n",
+            parameter_keys=(),
+        )
 
-        assert any("failed the generated-code preflight check" in str(error) for error in errors)
-        assert any("localized container" in str(error) for error in errors)
+        assert errors == []
+        assert any(diagnostic.code == "BROAD_DOCUMENT_BODY_TEXT_WAIT" for diagnostic in diagnostics)
 
     def test_broad_container_record_scan_surfaces_row_extraction_diagnostic(self) -> None:
         code = """
@@ -2539,100 +2238,6 @@ class TestPreflightSurfacesSyntaxError:
         assert not any(d.code == "BROAD_TABLE_RECORD_SCAN" for d in diagnostics)
 
 
-class TestRenderSynthesizedOfferText:
-    def test_renders_label_code_and_params(self) -> None:
-        synthesized = synthesize_code_block(
-            [
-                _interaction(
-                    "type_text",
-                    selector="#searcher_s",
-                    source_url="https://example.com/",
-                    typed_length=5,
-                    role="textbox",
-                    accessible_name="Search",
-                )
-            ]
-        )
-        assert synthesized is not None
-        text = render_synthesized_offer_text(synthesized)
-        assert text.startswith("SYNTHESIZED CODE BLOCK (offered once).")
-        assert _SYNTHESIZED_BLOCK_LABEL in text
-        assert "```python" in text
-        assert 'await page.locator("#searcher_s").fill(str(search))' in text
-        assert "Workflow parameters referenced (bind these): search." in text
-
-    def test_omits_param_line_when_no_parameters(self) -> None:
-        synthesized = synthesize_code_block(
-            [
-                _interaction(
-                    "click",
-                    selector='role=button[name="Go"]',
-                    source_url="https://example.com/",
-                    role="button",
-                    accessible_name="Go",
-                )
-            ]
-        )
-        assert synthesized is not None
-        text = render_synthesized_offer_text(synthesized)
-        assert "Workflow parameters referenced" not in text
-
-    def test_includes_synthesis_notes_when_present(self) -> None:
-        synthesized = synthesize_code_block(
-            [
-                _interaction(
-                    "click",
-                    selector="li:nth-of-type(3) > a",
-                    source_url="https://example.com/",
-                )
-            ]
-        )
-        assert synthesized is not None
-        assert synthesized.notes
-        text = render_synthesized_offer_text(synthesized)
-        assert "Synthesis notes: " in text
-
-
-class TestOfferTextGoalAndSteps:
-    def test_offer_text_carries_steps_json_and_goal(self) -> None:
-        synthesized = synthesize_code_block(_SCOUT_TRAJECTORY)
-        assert synthesized is not None
-        text = render_synthesized_offer_text(
-            synthesized, _SCOUT_TRAJECTORY, goal="Search the catalog and add the item to the cart"
-        )
-        assert "`steps`" in text
-        assert "`prompt`" in text
-        assert "Search the catalog and add the item to the cart" in text
-        assert '"action_type": "goto_url"' in text
-        assert '"action_type": "input_text"' in text
-
-    def test_offer_text_omits_goal_mention_without_goal(self) -> None:
-        synthesized = synthesize_code_block(_SCOUT_TRAJECTORY)
-        assert synthesized is not None
-        text = render_synthesized_offer_text(synthesized, _SCOUT_TRAJECTORY)
-        assert "`steps`" in text
-        assert "`prompt`" not in text
-
-    def test_offer_text_goal_quotes_and_newlines_stay_in_quoted_span(self) -> None:
-        synthesized = synthesize_code_block(_SCOUT_TRAJECTORY)
-        assert synthesized is not None
-        text = render_synthesized_offer_text(synthesized, _SCOUT_TRAJECTORY, goal='find the "best" deal\nand report it')
-        assert "`prompt` field to \"find the 'best' deal and report it\"" in text
-
-    def test_offer_text_goal_code_fences_are_neutralized(self) -> None:
-        synthesized = synthesize_code_block(_SCOUT_TRAJECTORY)
-        assert synthesized is not None
-        text = render_synthesized_offer_text(synthesized, _SCOUT_TRAJECTORY, goal="do this\n```python\nx\n```")
-        assert "\n```python\nx\n```" not in text
-
-    def test_offer_text_steps_json_matches_synthesized_steps(self) -> None:
-        synthesized = synthesize_code_block(_SCOUT_TRAJECTORY)
-        assert synthesized is not None
-        text = render_synthesized_offer_text(synthesized, _SCOUT_TRAJECTORY)
-        rendered = json.dumps(synthesized.steps, indent=2, sort_keys=True)
-        assert rendered in text
-
-
 def _code_block_yaml(label: str) -> str:
     return (
         "workflow_definition:\n"
@@ -2661,66 +2266,6 @@ _SCOUT_TRAJECTORY = [
         "accessible_name": "Add to cart",
     },
 ]
-
-
-class TestSynthesizedArtifactMetadata:
-    def test_skeleton_passes_the_validator_with_placeholders(self) -> None:
-        # The skeleton passes the validator with only <fill> placeholders for the model-owned slots.
-        metadata = build_synthesized_artifact_metadata(_SCOUT_TRAJECTORY)
-        normalized, error = _normalize_code_artifact_metadata([metadata], _code_block_yaml(_SYNTHESIZED_BLOCK_LABEL))
-        assert error is None
-        assert list(normalized.keys()) == [_SYNTHESIZED_BLOCK_LABEL]
-
-    def test_skeleton_never_asserts_satisfied_status(self) -> None:
-        # The scout never ran+verified the authored block, so the only honest status is observed_not_verified.
-        metadata = build_synthesized_artifact_metadata(_SCOUT_TRAJECTORY)
-        statuses = [metadata["page_dependencies"][0]["status"], metadata["observation_refs"][0]["status"]]
-        statuses += [claim["status"] for claim in metadata["claimed_outcomes"]]
-        assert all(status == "observed_not_verified" for status in statuses)
-        assert "satisfied" not in str(metadata)
-
-    def test_skeleton_observation_ref_carries_scout_source_tool(self) -> None:
-        metadata = build_synthesized_artifact_metadata(_SCOUT_TRAJECTORY)
-        observation_ref = metadata["observation_refs"][0]
-        assert observation_ref["source_tool"] == "scout_interaction"
-        assert observation_ref["dependency_id"] == metadata["page_dependencies"][0]["id"]
-
-    def test_skeleton_leaves_terminal_goal_for_the_model(self) -> None:
-        metadata = build_synthesized_artifact_metadata(_SCOUT_TRAJECTORY)
-        assert metadata["declared_goal"].startswith("<fill:")
-        assert metadata["completion_criteria"][0]["text"].startswith("<fill:")
-        assert metadata["claimed_outcomes"][0]["text"].startswith("<fill:")
-
-    def test_skeleton_marks_placeholder_schema_self_authored(self) -> None:
-        metadata = build_synthesized_artifact_metadata(_SCOUT_TRAJECTORY)
-        assert metadata["claimed_outcomes"][0]["extraction_schema"].startswith("<fill:")
-        assert metadata["claimed_outcomes"][0]["extraction_schema_provenance"] == "self_authored"
-
-    def test_skeleton_is_byte_identical_per_trajectory(self) -> None:
-        first = build_synthesized_artifact_metadata(_SCOUT_TRAJECTORY)
-        second = build_synthesized_artifact_metadata(_SCOUT_TRAJECTORY)
-        assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
-
-    def test_skeleton_omits_url_hint_when_no_source_url(self) -> None:
-        metadata = build_synthesized_artifact_metadata([_interaction("press_key", key="Enter")])
-        assert "url_hint" not in metadata["page_dependencies"][0]
-        assert "current_url" not in metadata["observation_refs"][0]
-
-    def test_offer_text_embeds_metadata_when_trajectory_supplied(self) -> None:
-        synthesized = synthesize_code_block(_SCOUT_TRAJECTORY)
-        assert synthesized is not None
-        text = render_synthesized_offer_text(synthesized, _SCOUT_TRAJECTORY)
-        assert "code_artifact_metadata" in text
-        assert "```json" in text
-        assert "scout_interaction" in text
-        assert "returns every remaining violation at once" in text
-
-    def test_offer_text_omits_metadata_without_trajectory(self) -> None:
-        synthesized = synthesize_code_block(_SCOUT_TRAJECTORY)
-        assert synthesized is not None
-        text = render_synthesized_offer_text(synthesized)
-        assert "code_artifact_metadata" not in text
-        assert "observed_not_verified" not in text
 
 
 class TestCredentialFillSynthesis:
@@ -2766,19 +2311,6 @@ class TestCredentialFillSynthesis:
 
     def test_runtime_otp_fill_is_detected_as_credential_fill_code(self) -> None:
         assert code_contains_credential_fill('await page.locator("#otp").fill(await login_credential.otp())')
-
-    def test_demonstrated_totp_is_a_required_rung_flagged_when_a_draft_omits_it(self) -> None:
-        trajectory = [
-            self._credential_fill(),
-            self._credential_fill(selector="#totpCode", credential_field="totp", typed_length=6),
-        ]
-        result = synthesize_code_block(trajectory, strict_selectors=True)
-        assert result is not None
-        emitted = result.diagnostics.emitted_interactions
-        assert all(not str(record.get("lane") or "") for record in emitted)
-        draft_omitting_totp = [("fill", 'page.locator("#userName")')]
-        uncovered = uncovered_required_emitted_interactions(emitted, draft_omitting_totp)
-        assert [record.get("selector") for record in uncovered] == ["#totpCode"]
 
     def test_missing_credential_reference_is_dropped_with_note(self) -> None:
         result = synthesize_code_block(
@@ -2827,35 +2359,6 @@ class TestCredentialFillSynthesis:
         assert result.parameters[0] == {"key": "authtest_simple"}
         assert result.parameters[1] == {"key": "authtest_simple_2", "credential_id": "cred_123"}
         assert ".fill(authtest_simple_2.username)" in result.code
-
-    def test_offer_text_carries_credential_binding_contract(self) -> None:
-        trajectory = [self._credential_fill()]
-        synthesized = synthesize_code_block(trajectory)
-        assert synthesized is not None
-        text = render_synthesized_offer_text(synthesized, trajectory)
-        assert "`authtest_simple` -> `cred_123`" in text
-        assert "workflow_parameter_type: credential_id" in text
-        assert "default_value" in text
-        assert ".username` / `.password` attributes and `.otp()`" in text
-        assert "authtest_simple" not in [p.get("key") for p in synthesized.parameters if "credential_id" not in p]
-
-    def test_credential_parameters_excluded_from_plain_bind_line(self) -> None:
-        trajectory = [
-            _interaction(
-                "type_text",
-                selector="#q",
-                source_url="https://example.com/",
-                typed_length=4,
-                role="textbox",
-                accessible_name="Search",
-            ),
-            self._credential_fill(),
-        ]
-        synthesized = synthesize_code_block(trajectory)
-        assert synthesized is not None
-        text = render_synthesized_offer_text(synthesized, trajectory)
-        assert "Workflow parameters referenced (bind these): search." in text
-        assert "Credential parameters referenced" in text
 
     def test_plain_param_never_takes_a_bare_credential_field_name(self) -> None:
         # CodeBlock.execute injects a bound credential's fields under the bare
@@ -2949,29 +2452,6 @@ def test_code_block_preflight_restores_recursion_limit(real_mypy: None) -> None:
     assert sys.getrecursionlimit() == before
 
 
-class TestOfferDemonstratesStructuredReturn:
-    def test_offer_directs_keyed_return_not_inner_text_blob(self) -> None:
-        result = synthesize_code_block(
-            [
-                _interaction(
-                    "click",
-                    selector="#search-submit",
-                    source_url="https://example.com/search",
-                )
-            ]
-        )
-        assert result is not None
-        offer = render_synthesized_offer_text(
-            result,
-            trajectory=[
-                {"tool_name": "click", "selector": "#search-submit", "source_url": "https://example.com/search"}
-            ],
-        )
-        assert "keyed structure" in offer
-        assert "inner_text" in offer
-        assert 'return {"records":' in offer
-
-
 _DOWNLOAD_SELECTOR = '[href="/files/report.pdf"]'
 
 
@@ -3036,19 +2516,17 @@ class TestDownloadRungSynthesis:
         assert result is not None
         assert "_scout_entry_reused_current_page = False" in result.code
         assert 'await page.goto("https://example.com/bills", wait_until="domcontentloaded")' in result.code
-        assert f"async with page.expect_download() as {_DOWNLOAD_VAR_BASE}:" in result.code
-        download_obj = f"{_DOWNLOAD_VAR_BASE}_file"
-        assert f"{download_obj} = await {_DOWNLOAD_VAR_BASE}.value" in result.code
-        assert f"await {download_obj}.path()" in result.code
+        # One terminal shape both engines execute: the worker-owned claim, never raw expect_download.
+        assert "expect_download" not in result.code
         assert '"downloaded_file_name": downloaded_file_name' in result.code
         assert '"download_url"' not in result.code
         assert '"downloaded_file_path"' not in result.code
         assert '"downloaded_files"' not in result.code
         # The execution-layer dir-diff registers the single landed file, so the synthesizer never save_as.
         assert "save_as" not in result.code
-        # The click inside expect_download targets the TYPED download selector, not the navigation click.
-        download_step = result.code.split("async with page.expect_download")[1]
-        assert 'await page.locator("[href=\\"/files/report.pdf\\"]").click()' in download_step
+        # The claim targets the TYPED download selector, not the navigation click.
+        download_step = result.code.split("await click_and_claim_download(page, ")[1]
+        assert download_step.startswith('"[href=\\"/files/report.pdf\\"]")')
         assert "div.stmt-row" not in download_step
         # A download does not navigate, so no trailing load-wait inside the appended step.
         assert 'wait_for_load_state("load")' not in download_step
@@ -3104,7 +2582,7 @@ class TestDownloadRungSynthesis:
         param_keys = [p["key"] for p in result.parameters]
         assert _DOWNLOAD_VAR_BASE not in param_keys
         assert f"{_DOWNLOAD_VAR_BASE}_field" in param_keys
-        assert f"async with page.expect_download() as {_DOWNLOAD_VAR_BASE}:" in result.code
+        assert "await click_and_claim_download(page, " in result.code
 
     def test_emitted_download_snippet_is_safe_and_parses(self, monkeypatch: pytest.MonkeyPatch) -> None:
         result = synthesize_code_block([_nav_click()], reached_download_target=_download_target())
@@ -3114,14 +2592,12 @@ class TestDownloadRungSynthesis:
         assert not any(d.code == "SYNTAX_ERROR" for d in preflight_code_block(result.code, parameter_keys=()))
         ast.parse(wrapped)
 
-    def test_download_snippet_awaits_completion_without_save_as(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_download_snippet_claims_once_without_save_as(self, monkeypatch: pytest.MonkeyPatch) -> None:
         result = synthesize_code_block([_nav_click()], reached_download_target=_download_target())
         assert result is not None
-        download_obj = f"{_DOWNLOAD_VAR_BASE}_file"
-        assert result.code.count(f"{download_obj} = await {_DOWNLOAD_VAR_BASE}.value") == 1
-        # Awaiting the path() completes the download into the run-scoped dir; the SKY-10937 dir-diff
-        # registers the single file when available; the returned summary keeps the filename JSON-safe.
-        assert f"await {download_obj}.path()" in result.code
+        # The worker-owned claim clicks once and lands the file in the run-scoped dir; the SKY-10937
+        # dir-diff registers the single file; the returned summary keeps the filename JSON-safe.
+        assert result.code.count("await click_and_claim_download(page, ") == 1
         assert "return {" in result.code
         assert '"downloaded_file_name": downloaded_file_name' in result.code
         assert '"downloaded_file_path"' not in result.code
@@ -3129,13 +2605,6 @@ class TestDownloadRungSynthesis:
         assert '"downloaded_files"' not in result.code
         assert "save_as" not in result.code
         CodeBlock.is_safe_code("async def _block(page):\n" + result.code)
-
-    def test_download_offer_text_only_present_for_download_snippet(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        download = synthesize_code_block([_nav_click()], reached_download_target=_download_target())
-        plain = synthesize_code_block([_interaction("click", selector="#go", source_url="https://example.com/")])
-        assert download is not None and plain is not None
-        assert "expect_download" in render_synthesized_offer_text(download)
-        assert "expect_download" not in render_synthesized_offer_text(plain)
 
     def test_non_live_call_sites_compile_without_kwarg(self, monkeypatch: pytest.MonkeyPatch) -> None:
         result = synthesize_code_block([_nav_click()])
@@ -3149,340 +2618,6 @@ _SAME_MONTH_VALUES = {
     "download_start_date": "2026-05-01",
     "download_end_date": "2026-05-31",
 }
-
-
-def _same_month_file_match_transform(*, selector: str = _SAME_MONTH_SELECTOR, values: dict[str, str] | None = None):
-    parameter_values = values or _SAME_MONTH_VALUES
-    correspondences = input_correspondences_for_interaction(
-        {"tool_name": "click", "selector": selector}, parameter_values
-    )
-    return derive_same_month_file_match_transform(
-        selector=selector,
-        parameter_values=parameter_values,
-        identity_correspondences=correspondences,
-    )
-
-
-def test_same_month_file_match_admits_one_complete_relation() -> None:
-    transform = _same_month_file_match_transform()
-
-    assert transform is not None
-    assert transform.selector == _SAME_MONTH_SELECTOR
-    assert transform.date_format_id == "iso_date_to_year_month"
-    assert [hole.declared_keys for hole in transform.holes] == [
-        ("account_number",),
-        ("download_start_date", "download_end_date"),
-    ]
-    assert [hole.matched_literal for hole in transform.holes] == ["100245", "2026-05"]
-
-
-@pytest.mark.parametrize(
-    ("selector", "values"),
-    [
-        (
-            _SAME_MONTH_SELECTOR,
-            {**_SAME_MONTH_VALUES, "download_end_date": "2026-06-01"},
-        ),
-        (
-            _SAME_MONTH_SELECTOR,
-            {**_SAME_MONTH_VALUES, "download_start_date": "2026-02-30"},
-        ),
-        (
-            _SAME_MONTH_SELECTOR,
-            {key: value for key, value in _SAME_MONTH_VALUES.items() if key != "download_end_date"},
-        ),
-        (
-            'a[href="/files/invoice_100245.pdf"]',
-            _SAME_MONTH_VALUES,
-        ),
-        (
-            'a[href="/files/invoice_100245_2026-05_2026-05.pdf"]',
-            _SAME_MONTH_VALUES,
-        ),
-        (
-            'a[href="/files/invoice_100245_2026-05_2026-06.pdf"]',
-            {
-                "account_number": "100245",
-                "first_start": "2026-05-01",
-                "first_end": "2026-05-31",
-                "second_start": "2026-06-01",
-                "second_end": "2026-06-30",
-            },
-        ),
-    ],
-    ids=[
-        "cross-month",
-        "invalid-calendar-date",
-        "missing-date",
-        "absent-month-token",
-        "repeated-month-token",
-        "competing-date-pairs",
-    ],
-)
-def test_same_month_file_match_rejects_inadmissible_relations(selector: str, values: dict[str, str]) -> None:
-    assert _same_month_file_match_transform(selector=selector, values=values) is None
-
-
-def test_same_month_file_match_ignores_declared_keys_without_a_literal_witness() -> None:
-    transform = _same_month_file_match_transform(values={**_SAME_MONTH_VALUES, "region": "west"})
-
-    assert transform is not None
-    assert transform.expected_declared_keys == tuple(sorted(_SAME_MONTH_VALUES))
-    assert {key for hole in transform.holes for key in hole.declared_keys} == set(_SAME_MONTH_VALUES)
-
-
-def test_same_month_file_match_reuses_one_stable_download_locator() -> None:
-    transform = _same_month_file_match_transform()
-    assert transform is not None
-
-    result = synthesize_code_block(
-        [_nav_click()],
-        reached_download_target=_download_target(selector=_SAME_MONTH_SELECTOR),
-        file_match_transform=transform,
-    )
-
-    assert result is not None
-    assert result.code.count("_scout_download_target = page.locator(") == 1
-    assert "_scout_entry_target = _scout_download_target" in result.code
-    assert "await _scout_download_target.click()" in result.code
-    assert "100245" not in result.code
-    assert "2026-05" not in result.code
-    assert "account_number" in result.code
-    assert "download_start_date" in result.code
-    assert "download_end_date" in result.code
-    assert {parameter["key"] for parameter in result.parameters} == set(_SAME_MONTH_VALUES)
-    CodeBlock.is_safe_code(
-        "async def _block(page, account_number, download_start_date, download_end_date):\n" + result.code
-    )
-
-
-def test_same_month_file_match_selector_drift_preserves_literal_fallback() -> None:
-    transform = _same_month_file_match_transform()
-    assert transform is not None
-    drifted_target = _download_target(selector='a[href="/files/invoice_literal_fallback.pdf"]')
-    baseline = synthesize_code_block([_nav_click()], reached_download_target=drifted_target)
-
-    with capture_logs() as logs:
-        result = synthesize_code_block(
-            [_nav_click()],
-            reached_download_target=drifted_target,
-            file_match_transform=transform,
-        )
-
-    assert baseline is not None and result is not None
-    assert result.code == baseline.code
-    assert result.parameters == baseline.parameters
-    assert {
-        "event": "copilot_spine_same_month_file_match_transform_dropped",
-        "reason_code": "locator_build_failed",
-        "selector_matches_transform": False,
-        "log_level": "info",
-    } in logs
-
-
-def test_same_month_file_match_extraction_consumer_reuses_stable_download_locator() -> None:
-    transform = _same_month_file_match_transform()
-    assert transform is not None
-    result = synthesize_code_block_with_extraction(
-        [_interaction("click", selector="#show-details", source_url=_BILLS_URL)],
-        _extraction_plan(),
-        reached_download_target=_download_target(selector=_SAME_MONTH_SELECTOR),
-        file_match_transform=transform,
-    )
-
-    assert result is not None
-    assert result.interaction_code.count("_scout_download_target = page.locator(") == 1
-    assert "_scout_entry_target = _scout_download_target" in result.interaction_code
-    assert "await _scout_download_target.click()" in result.interaction_code
-
-
-def test_same_month_file_match_tampered_span_fails_synthesis_validation() -> None:
-    transform = _same_month_file_match_transform()
-    assert transform is not None
-    first_hole = transform.holes[0]
-    tampered = replace(
-        transform,
-        holes=(replace(first_hole, position=first_hole.position + 1), *transform.holes[1:]),
-    )
-
-    assert (
-        synthesize_code_block(
-            [_nav_click()],
-            reached_download_target=_download_target(selector=_SAME_MONTH_SELECTOR),
-            file_match_transform=tampered,
-        )
-        is None
-    )
-
-
-def test_same_month_file_match_direct_synthesis_falls_back_for_missing_identity_hole() -> None:
-    transform = _same_month_file_match_transform()
-    assert transform is not None
-    missing_identity = replace(transform, holes=tuple(hole for hole in transform.holes if hole.format_id != "identity"))
-    missing_identity = replace(
-        missing_identity,
-        provenance_fingerprint=same_month_file_match_transform_fingerprint(missing_identity),
-    )
-
-    target = _download_target(selector=_SAME_MONTH_SELECTOR)
-    baseline = synthesize_code_block([_nav_click()], reached_download_target=target)
-    result = synthesize_code_block(
-        [_nav_click()],
-        reached_download_target=target,
-        file_match_transform=missing_identity,
-    )
-
-    assert baseline is not None and result is not None
-    assert result.code == baseline.code
-
-
-def test_same_month_file_match_extraction_synthesis_falls_back_for_missing_identity_hole() -> None:
-    transform = _same_month_file_match_transform()
-    assert transform is not None
-    missing_identity = replace(transform, holes=tuple(hole for hole in transform.holes if hole.format_id != "identity"))
-    missing_identity = replace(
-        missing_identity,
-        provenance_fingerprint=same_month_file_match_transform_fingerprint(missing_identity),
-    )
-
-    trajectory = [_interaction("click", selector="#show-details", source_url=_BILLS_URL)]
-    target = _download_target(selector=_SAME_MONTH_SELECTOR)
-    baseline = synthesize_code_block_with_extraction(trajectory, _extraction_plan(), reached_download_target=target)
-    result = synthesize_code_block_with_extraction(
-        trajectory,
-        _extraction_plan(),
-        reached_download_target=target,
-        file_match_transform=missing_identity,
-    )
-
-    assert baseline is not None and result is not None
-    assert result.interaction_code == baseline.interaction_code
-
-
-def test_same_month_file_match_falls_back_for_refingerprinted_identity_provenance_tamper() -> None:
-    transform = _same_month_file_match_transform()
-    assert transform is not None
-    identity_hole = transform.holes[0]
-    tampered = replace(
-        transform,
-        holes=(replace(identity_hole, source_values=("different-account",)), *transform.holes[1:]),
-    )
-    tampered = replace(tampered, provenance_fingerprint=same_month_file_match_transform_fingerprint(tampered))
-
-    target = _download_target(selector=_SAME_MONTH_SELECTOR)
-    baseline = synthesize_code_block([_nav_click()], reached_download_target=target)
-    result = synthesize_code_block(
-        [_nav_click()],
-        reached_download_target=target,
-        file_match_transform=tampered,
-    )
-
-    assert baseline is not None and result is not None
-    assert result.code == baseline.code
-
-
-@pytest.mark.parametrize(
-    ("start", "end"),
-    [
-        ("2026-02-30", "2026-02-28"),
-        ("2026-05-01", "2026-06-01"),
-        ("2026/05/01", "2026-05-31"),
-    ],
-)
-def test_same_month_file_match_runtime_dates_fail_before_locator_construction(start: str, end: str) -> None:
-    transform = _same_month_file_match_transform()
-    assert transform is not None
-    result = synthesize_code_block(
-        [_nav_click()],
-        reached_download_target=_download_target(selector=_SAME_MONTH_SELECTOR),
-        file_match_transform=transform,
-    )
-    assert result is not None
-    prefix = result.code.split("    _scout_entry_target =", 1)[0]
-
-    class _Page:
-        def __init__(self) -> None:
-            self.locators: list[str] = []
-
-        def locator(self, selector: str) -> str:
-            self.locators.append(selector)
-            return selector
-
-    namespace: dict[str, Any] = {"Exception": Exception}
-    exec(
-        "def _build(page, account_number, download_start_date, download_end_date):\n"
-        + prefix
-        + "    return _scout_download_target\n",
-        namespace,
-    )
-    page = _Page()
-    with pytest.raises(Exception):
-        namespace["_build"](page, "100248", start, end)
-    assert page.locators == []
-
-
-def test_same_month_file_match_cross_month_error_remains_operator_visible() -> None:
-    transform = _same_month_file_match_transform()
-    assert transform is not None
-    result = synthesize_code_block(
-        [_nav_click()],
-        reached_download_target=_download_target(selector=_SAME_MONTH_SELECTOR),
-        file_match_transform=transform,
-    )
-    assert result is not None
-    prefix = result.code.split("    _scout_entry_target =", 1)[0]
-
-    class _Page:
-        def locator(self, selector: str) -> str:
-            return selector
-
-    namespace: dict[str, Any] = {"Exception": Exception}
-    exec(
-        "def _build(page, account_number, download_start_date, download_end_date):\n"
-        + prefix
-        + "    return _scout_download_target\n",
-        namespace,
-    )
-    with pytest.raises(Exception) as raised:
-        namespace["_build"](_Page(), "100248", "2024-02-01", "2024-03-01")
-
-    failure_reason = CustomizedCodeException(raised.value).message
-    assert run_outcome_display_reason(failure_reason) == (
-        "Failed to execute code block. Reason: Exception: grounded file match dates must share one calendar month"
-    )
-
-
-def test_same_month_file_match_runtime_formats_calendar_valid_leap_month() -> None:
-    transform = _same_month_file_match_transform()
-    assert transform is not None
-    result = synthesize_code_block(
-        [_nav_click()],
-        reached_download_target=_download_target(selector=_SAME_MONTH_SELECTOR),
-        file_match_transform=transform,
-    )
-    assert result is not None
-    prefix = result.code.split("    _scout_entry_target =", 1)[0]
-
-    class _Page:
-        def __init__(self) -> None:
-            self.locators: list[str] = []
-
-        def locator(self, selector: str) -> str:
-            self.locators.append(selector)
-            return selector
-
-    namespace: dict[str, Any] = {"Exception": Exception}
-    exec(
-        "def _build(page, account_number, download_start_date, download_end_date):\n"
-        + prefix
-        + "    return _scout_download_target\n",
-        namespace,
-    )
-    page = _Page()
-    assert namespace["_build"](page, "100248", "2024-02-01", "2024-02-29") == (
-        'a[href="/files/invoice_100248_2024-02.pdf"]'
-    )
-    assert page.locators == ['a[href="/files/invoice_100248_2024-02.pdf"]']
 
 
 def test_download_target_literal_fallback_is_byte_identical_without_transform() -> None:
@@ -3535,10 +2670,87 @@ class TestReadonlyControlStateSynthesis:
         ast.parse("async def _block(page):\n" + result.code)
 
     def test_disabled_holding_value_emits_verify_not_fill(self) -> None:
-        result = synthesize_code_block([_readonly_type(control_disabled=True, control_value_satisfied=True)])
+        result = synthesize_code_block(
+            [
+                _readonly_type(
+                    control_disabled=True,
+                    control_value_satisfied=True,
+                    observed_disabled=True,
+                )
+            ]
+        )
         assert result is not None
         assert ".fill(str(" not in result.code
         assert ".input_value()" in result.code
+        assert ".is_enabled()" not in result.code
+
+    def test_progressive_form_uses_demonstrated_selectors_and_waits_for_observed_readiness(self) -> None:
+        demonstrated_selectors = {
+            "#animal-kind",
+            "#breed",
+            "#emailAddress",
+            "#quote-submit",
+            "#quote-result",
+        }
+        trajectory = [
+            _interaction(
+                "select_option",
+                selector="#animal-kind",
+                source_url="https://example.com/quote",
+                value="dog",
+            ),
+            _interaction(
+                "select_option",
+                selector="#breed",
+                source_url="https://example.com/quote",
+                value="beagle",
+                observed_hidden=True,
+                observed_disabled=True,
+            ),
+            _interaction(
+                "type_text",
+                selector="#emailAddress",
+                source_url="https://example.com/quote",
+                typed_length=15,
+                typed_value="qa@example.test",
+            ),
+            _interaction(
+                "click",
+                selector="#quote-submit",
+                source_url="https://example.com/quote",
+                observed_disabled=True,
+            ),
+            _interaction(
+                "read_value",
+                source_url="https://example.com/quote",
+                read_expression="document.querySelector('#quote-result').textContent",
+                read_output_path="output.quote_reference",
+            ),
+        ]
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        for selector in demonstrated_selectors:
+            assert selector in result.code
+        assert "get_by_label" not in result.code
+        assert "get_by_role" not in result.code
+        breed_visible = 'await page.locator("#breed").wait_for(state="visible", timeout=120000)'
+        breed_enabled = (
+            'if await page.locator("#breed").is_enabled() '
+            'and (await page.locator("#breed").get_attribute("data-disabled") or "").strip().lower() != "true":'
+        )
+        breed_select = 'await page.locator("#breed").select_option("beagle")'
+        submit_enabled = (
+            'if await page.locator("#quote-submit").is_enabled() '
+            'and (await page.locator("#quote-submit").get_attribute("data-disabled") or "").strip().lower() '
+            '!= "true":'
+        )
+        submit_click = 'await page.locator("#quote-submit").click()'
+        assert result.code.index(breed_visible) < result.code.index(breed_select)
+        assert result.code.index(breed_enabled) < result.code.index(breed_select)
+        assert result.code.index(submit_enabled) < result.code.index(submit_click)
+        ast.parse("async def _block(page):\n" + result.code)
 
     def test_readonly_needing_value_defers_assertion_after_later_picker(self) -> None:
         trajectory = [
@@ -3764,12 +2976,35 @@ class TestReadonlyControlStateSynthesis:
 
 
 class TestReadonlyControlStateCarry:
+    def test_select_option_carry_roundtrip_preserves_observed_readiness(self) -> None:
+        interaction = _interaction(
+            "select_option",
+            selector="#breed",
+            source_url="https://example.com/quote",
+            value="beagle",
+            observed_hidden=True,
+            observed_disabled=True,
+        )
+        carry = _carried_trajectory_from_scout_trajectory([interaction])
+        assert len(carry) == 1
+        assert carry[0].get("observed_hidden") is True
+        assert carry[0].get("observed_disabled") is True
+        rebound = _fill_carry_to_interaction(carry[0], trajectory_index=0)
+        assert rebound["observed_hidden"] is True
+        assert rebound["observed_disabled"] is True
+
+        result = synthesize_code_block([rebound])
+
+        assert result is not None
+        assert 'page.locator("#breed").wait_for(state="visible", timeout=120000)' in result.code
+        assert 'page.locator("#breed").is_enabled()' in result.code
+
     def test_fill_carry_roundtrip_preserves_control_state_for_type_text(self) -> None:
         interaction = _readonly_type(control_readonly=True, control_value_satisfied=True)
-        carry = _fill_carry_from_scout_trajectory([interaction])
+        carry = _carried_trajectory_from_scout_trajectory([interaction])
         assert len(carry) == 1
-        assert carry[0].control_readonly is True
-        assert carry[0].control_value_satisfied is True
+        assert carry[0].get("control_readonly") is True
+        assert carry[0].get("control_value_satisfied") is True
         rebound = _fill_carry_to_interaction(carry[0], trajectory_index=0)
         assert rebound["control_readonly"] is True
         assert rebound["control_value_satisfied"] is True
@@ -3779,7 +3014,7 @@ class TestReadonlyControlStateCarry:
         assert ".input_value()" in result.code
 
     def test_credential_carry_persists_no_control_state_keys(self) -> None:
-        credential_carry = FillCarry(
+        credential_carry = carried_interaction(
             source_url="https://example.com/login",
             selector="#password",
             tool_name="fill_credential_field",
@@ -3791,9 +3026,34 @@ class TestReadonlyControlStateCarry:
         assert "control_disabled" not in persisted
         assert "control_value_satisfied" not in persisted
 
+    def test_credential_carry_roundtrip_preserves_observed_readiness(self) -> None:
+        interaction = _interaction(
+            CREDENTIAL_FILL_TOOL_NAME,
+            selector="#password",
+            source_url="https://example.com/login",
+            credential_id="cred_example",
+            credential_field="password",
+            observed_hidden=True,
+            observed_disabled=True,
+        )
+
+        carry = _carried_trajectory_from_scout_trajectory([interaction])
+
+        assert len(carry) == 1
+        assert carry[0].get("observed_hidden") is True
+        assert carry[0].get("observed_disabled") is True
+        rebound = _fill_carry_to_interaction(carry[0], trajectory_index=0)
+        result = synthesize_code_block([rebound])
+        assert result is not None
+        visible = 'page.locator("#password").wait_for(state="visible", timeout=120000)'
+        enabled = 'page.locator("#password").is_enabled()'
+        fill = 'page.locator("#password").fill(credential.password)'
+        assert result.code.index(visible) < result.code.index(fill)
+        assert result.code.index(enabled) < result.code.index(fill)
+
     def test_type_text_carry_persists_control_value_satisfied_bool(self) -> None:
         interaction = _readonly_type(control_readonly=True, control_value_satisfied=False)
-        carry = _fill_carry_from_scout_trajectory([interaction])
+        carry = _carried_trajectory_from_scout_trajectory([interaction])
         persisted = StructuredContext(fill_carry=carry).to_json_str()
         assert '"control_readonly": true' in persisted
         assert '"control_value_satisfied": false' in persisted
@@ -3891,22 +3151,6 @@ class TestEmittedInteractionPartition:
         assert emitted & forgiven == set()
         assert dropped & forgiven == set()
         assert set(self._lane_index_counts(diagnostics).values()) == {1}
-
-    def test_captured_read_and_wait_records_carry_a_lane(self) -> None:
-        trajectory = self._login_otp_trajectory()
-        trajectory.insert(5, _interaction("wait", duration_ms=2000))
-
-        result = synthesize_code_block(trajectory, strict_selectors=True)
-
-        assert result is not None
-        by_index = {record["trajectory_index"]: record for record in result.diagnostics.emitted_interactions}
-        assert by_index[4]["method"] == "evaluate"
-        assert by_index[4]["lane"] == "page_read"
-        assert by_index[5]["method"] == "wait_for_timeout"
-        assert by_index[5]["lane"] == "page_wait"
-        assert set(self._lane_index_counts(result.diagnostics).values()) == {1}
-        uncovered = uncovered_required_emitted_interactions(result.diagnostics.emitted_interactions, [])
-        assert {record["trajectory_index"] for record in uncovered}.isdisjoint({4, 5})
 
     def test_non_strict_hover_and_anchorless_interaction_stay_in_exactly_one_lane(self) -> None:
         trajectory = [
@@ -4023,45 +3267,6 @@ class TestEmittedInteractionPartition:
         by_index = {record["trajectory_index"]: record for record in result.diagnostics.emitted_interactions}
         assert by_index[1]["lane"] == "readonly_skip"
 
-    def test_branch_yielding_no_locator_without_a_record_still_lands_in_one_lane(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        trajectory = [
-            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
-            {"tool_name": "click", "selector": "#stage-b"},
-        ]
-
-        def forgetful_locator_expr(
-            interaction: Mapping[str, Any],
-            notes: list[str],
-            *,
-            diagnostics: SynthesisDiagnostics | None = None,
-            trajectory_index: int | None = None,
-            tool_name: str = "",
-            strict_selectors: bool = False,
-        ) -> str:
-            selector = str(interaction.get("selector") or "")
-            return "" if selector == "#stage-b" else f'page.locator("{selector}")'
-
-        monkeypatch.setattr(code_block_synthesis_module, "_locator_expr", forgetful_locator_expr)
-
-        result = synthesize_code_block(trajectory, strict_selectors=True)
-
-        assert result is not None
-        diagnostics = result.diagnostics
-        assert self._lane_index_counts(diagnostics) == Counter({0: 1, 1: 1})
-        assert diagnostics.dropped_interactions == [
-            {
-                "trajectory_index": 1,
-                "tool_name": "click",
-                "selector": "#stage-b",
-                "reason_code": "unaccounted_branch",
-            }
-        ]
-        findings = spine_partition_findings(diagnostics, _covering_draft_calls(diagnostics), trajectory)
-        assert [finding.kind for finding in findings] == [UNFORGIVEN_DROP_FINDING]
-        assert obligation_finding_reason_code(findings[0]) == SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE
-
 
 def _covering_draft_calls(diagnostics: SynthesisDiagnostics) -> list[tuple[str, str]]:
     return [
@@ -4089,97 +3294,6 @@ class TestSpinePartitionFindings:
             | {record["trajectory_index"] for record in diagnostics.forgiven_interactions}
         )
         assert set(diagnostics.retained_trajectory_indices) == recorded
-
-    def test_covered_draft_has_no_findings(self) -> None:
-        result = synthesize_code_block(self._spine_trajectory(), strict_selectors=True)
-        assert result is not None
-        draft_calls = _covering_draft_calls(result.diagnostics)
-        assert spine_partition_findings(result.diagnostics, draft_calls, self._spine_trajectory()) == []
-
-    def test_deferred_readonly_trajectory_has_no_findings(self) -> None:
-        trajectory = [
-            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
-            _readonly_type(control_readonly=True, control_value_satisfied=False),
-        ]
-        result = synthesize_code_block(trajectory, strict_selectors=True)
-        assert result is not None
-        draft_calls = _covering_draft_calls(result.diagnostics)
-        assert spine_partition_findings(result.diagnostics, draft_calls, trajectory) == []
-
-    def test_omitted_demonstrated_totp_fill_is_an_uncovered_rung_finding(self) -> None:
-        login_url = "https://example.com/login"
-        trajectory = [
-            _interaction(
-                CREDENTIAL_FILL_TOOL_NAME,
-                selector="#userName",
-                source_url=login_url,
-                credential_id="cred_1",
-                credential_field="username",
-                typed_length=20,
-            ),
-            _interaction(
-                CREDENTIAL_FILL_TOOL_NAME,
-                selector="#totpCode",
-                source_url=login_url,
-                credential_id="cred_1",
-                credential_field="totp",
-                typed_length=6,
-            ),
-        ]
-        result = synthesize_code_block(trajectory, strict_selectors=True)
-        assert result is not None
-        draft_calls = [("fill", 'page.locator("#userName")')]
-        findings = spine_partition_findings(result.diagnostics, draft_calls, trajectory)
-        uncovered = uncovered_rung_records(findings)
-        assert [record.get("selector") for record in uncovered] == ["#totpCode"]
-
-    def test_unforgiven_drop_is_a_typed_finding(self) -> None:
-        trajectory = [
-            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
-            {"tool_name": "press_key", "key": ""},
-        ]
-        result = synthesize_code_block(trajectory, strict_selectors=True)
-        assert result is not None
-        draft_calls = _covering_draft_calls(result.diagnostics)
-        findings = spine_partition_findings(result.diagnostics, draft_calls, trajectory)
-        kinds = {finding.kind for finding in findings}
-        assert UNFORGIVEN_DROP_FINDING in kinds
-        drop_finding = next(finding for finding in findings if finding.kind == UNFORGIVEN_DROP_FINDING)
-        assert obligation_finding_reason_code(drop_finding) == SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE
-
-    def test_entry_opener_drop_is_forgiven_not_flagged(self) -> None:
-        trajectory = [
-            {
-                "tool_name": "click",
-                "selector": "button",
-                "role": "button",
-                "accessible_name": "Open menu",
-                "source_url": "https://example.com/records",
-            },
-            {"tool_name": "click", "selector": "#stage-b"},
-        ]
-        result = synthesize_code_block(trajectory, strict_selectors=True)
-        assert result is not None
-        draft_calls = _covering_draft_calls(result.diagnostics)
-        findings = spine_partition_findings(result.diagnostics, draft_calls, trajectory)
-        assert all(finding.kind != UNFORGIVEN_DROP_FINDING for finding in findings)
-
-    def test_truncation_reports_once_and_leaves_the_tail_unlaned(self) -> None:
-        trajectory = [
-            {"tool_name": "click", "selector": f"#stage-{index}", "source_url": "https://example.com/records"}
-            for index in range(_MAX_STEPS + 3)
-        ]
-        result = synthesize_code_block(trajectory, strict_selectors=True)
-        assert result is not None
-        diagnostics = result.diagnostics
-        assert diagnostics.truncated is True
-        assert diagnostics.retained_trajectory_indices == list(range(len(trajectory)))
-        recorded = {record["trajectory_index"] for record in diagnostics.emitted_interactions}
-        assert set(diagnostics.retained_trajectory_indices) - recorded
-        assert diagnostics.dropped_interactions == []
-        findings = spine_partition_findings(diagnostics, _covering_draft_calls(diagnostics), trajectory)
-        assert [finding.kind for finding in findings] == [TRUNCATED_FINDING]
-        assert obligation_finding_reason_code(findings[0]) == SCOUTED_SPINE_TRUNCATED_REASON_CODE
 
 
 _STRUCTURAL_BUTTON_XPATH = 'xpath=/*[name()="body"][1]/*[name()="button"][3]'
@@ -4231,74 +3345,6 @@ class TestUncoveredRequiredEmittedInteractions:
             {"method": "click", "locator": 'page.locator("#c")', "selector": "#c"},
         ]
 
-    def test_verbatim_in_order_resubmission_clears(self) -> None:
-        draft_calls = [
-            ("click", 'page.locator("#a")'),
-            ("fill", 'page.locator("#b")'),
-            ("click", 'page.locator("#c")'),
-        ]
-
-        assert uncovered_required_emitted_interactions(self._emitted(), draft_calls) == []
-
-    def test_reordered_but_complete_draft_reports_under_build(self) -> None:
-        draft_calls = [
-            ("fill", 'page.locator("#b")'),
-            ("click", 'page.locator("#a")'),
-            ("click", 'page.locator("#c")'),
-        ]
-
-        uncovered = uncovered_required_emitted_interactions(self._emitted(), draft_calls)
-
-        assert [record["selector"] for record in uncovered] == ["#b", "#c"]
-
-    def test_first_miss_over_reports_later_rungs_as_missing(self) -> None:
-        draft_calls = [
-            ("click", 'page.locator("#a")'),
-            ("click", 'page.locator("#c")'),
-        ]
-
-        uncovered = uncovered_required_emitted_interactions(self._emitted(), draft_calls)
-
-        assert [record["selector"] for record in uncovered] == ["#b", "#c"]
-
-    def test_shared_name_literal_on_different_element_does_not_cover(self) -> None:
-        emitted = [
-            {"method": "click", "locator": 'page.get_by_role("button", name="Submit")', "selector": "Submit"},
-        ]
-        draft_calls = [("click", 'page.get_by_role("link", name="Submit")')]
-
-        uncovered = uncovered_required_emitted_interactions(emitted, draft_calls)
-
-        assert [record["selector"] for record in uncovered] == ["Submit"]
-
-    def test_bare_locator_call_with_exact_full_selector_covers(self) -> None:
-        emitted = [
-            {"method": "click", "locator": 'page.locator("#a").first', "selector": "#a"},
-        ]
-        draft_calls = [("click", 'page.locator("#a")')]
-
-        assert uncovered_required_emitted_interactions(emitted, draft_calls) == []
-
-    def test_receiver_quoting_selector_among_other_literals_does_not_cover(self) -> None:
-        emitted = [
-            {"method": "click", "locator": 'page.locator("#a")', "selector": "#a"},
-        ]
-        draft_calls = [("click", 'page.locator("#wrapper").locator("#a", has_text="Go")')]
-
-        uncovered = uncovered_required_emitted_interactions(emitted, draft_calls)
-
-        assert [record["selector"] for record in uncovered] == ["#a"]
-
-    def test_lane_flagged_records_are_not_required(self) -> None:
-        emitted = self._emitted()
-        emitted[1]["lane"] = "optional_dismissal"
-        draft_calls = [
-            ("click", 'page.locator("#a")'),
-            ("click", 'page.locator("#c")'),
-        ]
-
-        assert uncovered_required_emitted_interactions(emitted, draft_calls) == []
-
 
 _BILLS_URL = "https://example.com/bills"
 _STATEMENT_URL = "https://example.com/bills/statement"
@@ -4322,7 +3368,7 @@ class TestDownloadTerminalSequencing:
         assert result is not None
         assert '"#view-printable"' not in result.code
         assert '"#statement-row"' in result.code
-        assert result.code.index("async with page.expect_download()") > result.code.index('"#statement-row"')
+        assert result.code.index("await click_and_claim_download(page, ") > result.code.index('"#statement-row"')
         assert '"downloaded_file_name"' in result.code
         assert result.diagnostics.download_terminal_anchor == 1
         assert result.diagnostics.download_terminal_dropped_trailing == 1
@@ -4379,312 +3425,9 @@ class TestDownloadTerminalSequencing:
         assert '"#view-printable"' in result.code
         assert "expect_download" not in result.code
 
-    def test_extraction_suffix_composes_after_the_sequenced_terminal(self) -> None:
-        trajectory = [
-            _interaction("click", selector="#show-details", source_url=_BILLS_URL, trajectory_index=0),
-            _interaction("click", selector="#view-printable", source_url=_STATEMENT_URL, trajectory_index=1),
-        ]
-
-        result = synthesize_code_block_with_extraction(
-            trajectory,
-            _extraction_plan(),
-            reached_download_target=_download_target(trajectory_anchor=0),
-        )
-
-        assert result is not None
-        assert '"#view-printable"' not in result.interaction_code
-        assert "async with page.expect_download()" in result.interaction_code
-        assert result.extraction_code
-        assert result.code.startswith(result.interaction_code)
-
-    def test_capture_stamps_the_latest_trajectory_index(self) -> None:
-        ctx = SimpleNamespace(scout_trajectory=_anchored_trajectory()[:2])
-
-        stamped = _with_trajectory_anchor(ctx, _download_target())  # type: ignore[arg-type]
-
-        assert stamped.trajectory_anchor == 1
-        assert (
-            _with_trajectory_anchor(SimpleNamespace(scout_trajectory=[]), _download_target()).trajectory_anchor is None
-        )  # type: ignore[arg-type]
-
 
 _STATEMENT_SELECTOR = "a[href='/statements/100245_2026-05.pdf']"
 _DECLARED = {"account_number": "100245", "billing_period": "May 2026"}
-
-
-def _witnessed_click(*, selector: str = _STATEMENT_SELECTOR, accessible_name: str = "Download May") -> dict[str, Any]:
-    interaction: dict[str, Any] = {
-        "tool_name": "click",
-        "selector": selector,
-        "accessible_name": accessible_name,
-        "role": "link",
-        "source_url": "https://example.com/statements",
-    }
-    correspondences = input_correspondences_for_interaction(interaction, _DECLARED)
-    if correspondences:
-        interaction["input_correspondences"] = correspondences
-    return interaction
-
-
-def test_input_correspondence_selector_identity_and_month() -> None:
-    correspondences = input_correspondences_for_interaction(
-        {"tool_name": "click", "selector": _STATEMENT_SELECTOR}, _DECLARED
-    )
-    by_key = {c["input_key"]: c for c in correspondences}
-    assert by_key["account_number"] == {
-        "input_key": "account_number",
-        "matched_literal": "100245",
-        "parameter_value": "100245",
-        "surface": "selector",
-        "transform": "identity",
-        "position": 20,
-    }
-    assert by_key["billing_period"]["matched_literal"] == "2026-05"
-    assert by_key["billing_period"]["parameter_value"] == "May 2026"
-    assert by_key["billing_period"]["transform"] == "month_name_to_iso"
-
-
-def test_input_correspondence_iso_dates_collapse_to_canonical_period_key_independent_of_order() -> None:
-    interaction = {"tool_name": "click", "selector": "a[href='/statements/100245_2026-05.pdf']"}
-    forward = input_correspondences_for_interaction(
-        interaction,
-        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
-    )
-    reverse = input_correspondences_for_interaction(
-        interaction,
-        {"download_end_date": "2026-05-31", "download_start_date": "2026-05-01"},
-    )
-
-    assert forward == reverse
-    period = next(correspondence for correspondence in forward if correspondence["matched_literal"] == "2026-05")
-    assert period["input_key"] == "download_end_date"
-    assert period["transform"] == "iso_date_to_year_month"
-    assert period["equivalent_inputs"] == [
-        {
-            "input_key": "download_start_date",
-            "parameter_value": "2026-05-01",
-            "transform": "iso_date_to_year_month",
-        }
-    ]
-
-
-@pytest.mark.parametrize("value", ["2026-5-01", "2026-02-30", "2026-13-01", "2026-05-01T00:00:00"])
-def test_input_correspondence_iso_date_transform_is_strict(value: str) -> None:
-    assert (
-        input_correspondences_for_interaction(
-            {"tool_name": "click", "selector": "a[href='/statements/2026-05.pdf']"},
-            {"download_start_date": value},
-        )
-        == []
-    )
-
-
-def test_input_correspondence_prefers_exact_iso_date_over_its_period_projection() -> None:
-    assert input_correspondences_for_interaction(
-        {"tool_name": "click", "selector": '[data-range="2026-08-01"]'},
-        {"billing_start_date": "2026-08-01"},
-    ) == [
-        {
-            "input_key": "billing_start_date",
-            "matched_literal": "2026-08-01",
-            "parameter_value": "2026-08-01",
-            "surface": "selector",
-            "transform": "identity",
-            "position": 13,
-        }
-    ]
-
-
-def test_input_correspondence_keeps_distinct_iso_projection_outside_exact_span() -> None:
-    selector = 'a[data-date="2026-05-01"][href="/statements/2026-05.pdf"]'
-
-    correspondences = input_correspondences_for_interaction(
-        {"tool_name": "click", "selector": selector},
-        {"billing_start_date": "2026-05-01"},
-    )
-
-    assert [(hole["matched_literal"], hole["transform"], hole["position"]) for hole in correspondences] == [
-        ("2026-05-01", "identity", 13),
-        ("2026-05", "iso_date_to_year_month", 44),
-    ]
-    expression = build_input_templated_locator(
-        surface="selector", selector=selector, role="", name="", holes=correspondences
-    )
-    assert expression is not None
-    assert "{billing_start_date}" in expression
-    assert "{_scout_iso_date_to_year_month(billing_start_date)}" in expression
-    interaction = {"tool_name": "click", "selector": selector, "source_url": "https://example.com/statements"}
-    interaction["input_correspondences"] = correspondences
-    synthesized = synthesize_code_block([interaction], strict_selectors=True)
-    assert synthesized is not None
-    assert 'data-date="2026-05-01"' not in synthesized.code
-    assert "/statements/2026-05.pdf" not in synthesized.code
-
-
-def test_input_correspondence_rejects_partially_overlapping_matches() -> None:
-    assert (
-        input_correspondences_for_interaction(
-            {"tool_name": "click", "selector": "a[href='/statements/2026-05.pdf']"},
-            {"period": "2026-05", "month_suffix": "05.pdf"},
-        )
-        == []
-    )
-
-
-def test_synthesized_collision_guard_rejects_runtime_period_divergence_before_browser_mutation() -> None:
-    interaction = {
-        "tool_name": "click",
-        "selector": "a[href='/statements/100245_2026-05.pdf']",
-        "source_url": "https://example.com/statements",
-    }
-    interaction["input_correspondences"] = input_correspondences_for_interaction(
-        interaction,
-        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
-    )
-
-    synthesized = synthesize_code_block([interaction], strict_selectors=True)
-
-    assert synthesized is not None
-    code = synthesized.code
-    guard = "grounded parameters do not resolve to one period"
-    assert guard in code
-    assert code.index(guard) < code.index("await page.goto")
-    assert "_scout_iso_date_to_year_month(download_end_date)" in code
-    assert "_scout_iso_date_to_year_month(download_start_date)" in code
-
-
-def test_templated_hole_uses_validated_span_not_earlier_substring() -> None:
-    # "Widget" also occurs as a non-boundary substring inside "Widgetry"; the hole must template the
-    # boundary-validated standalone span, not the first find() hit.
-    selector = 'a[aria-label="Widgetry Widget"]'
-    holes = input_correspondences_for_interaction({"tool_name": "click", "selector": selector}, {"gadget": "Widget"})
-    assert [h["position"] for h in holes] == [23]
-    expr = build_input_templated_locator(surface="selector", selector=selector, role="", name="", holes=holes)
-    assert expr is not None
-    assert "Widgetry {gadget}" in expr
-    assert "{gadget}ry" not in expr
-
-
-@pytest.mark.parametrize(
-    "declared",
-    [
-        {"account_number": "24"},
-        {"account_number": "10 0245"},
-        {"account_number": "100245 "},
-        {"class": "100245"},
-        {"page": "100245"},
-        {"re": "100245"},
-        {"_scout_month_to_iso": "100245"},
-        {"_scout_iso_date_to_year_month": "100245"},
-        {"_scout_period_month_name": "100245"},
-        {"_scout_period_year": "100245"},
-        {"account_number": "100245'] , [href"},
-    ],
-)
-def test_input_correspondence_rejects_unsafe_or_unnamed(declared: dict[str, str]) -> None:
-    assert (
-        input_correspondences_for_interaction({"tool_name": "click", "selector": _STATEMENT_SELECTOR}, declared) == []
-    )
-
-
-def test_input_correspondence_ignores_non_click() -> None:
-    assert (
-        input_correspondences_for_interaction({"tool_name": "type_text", "selector": _STATEMENT_SELECTOR}, _DECLARED)
-        == []
-    )
-
-
-def test_input_correspondence_requires_quoted_segment() -> None:
-    # `100245` appears only in an unquoted structural position, never inside a quoted attribute value.
-    assert (
-        input_correspondences_for_interaction(
-            {"tool_name": "click", "selector": "div.row-100245 > a"}, {"account_number": "100245"}
-        )
-        == []
-    )
-
-
-def test_input_correspondence_rejects_second_occurrence() -> None:
-    selector = "a[href='/x/100245'][data-id='100245']"
-    assert (
-        input_correspondences_for_interaction(
-            {"tool_name": "click", "selector": selector}, {"account_number": "100245"}
-        )
-        == []
-    )
-
-
-def test_synthesize_templated_selector_identical_across_modes() -> None:
-    trajectory = [_witnessed_click()]
-    non_strict = synthesize_code_block(list(trajectory), strict_selectors=False)
-    strict = synthesize_code_block(list(trajectory), strict_selectors=True)
-    assert non_strict is not None and strict is not None
-    templated = "page.locator(f\"a[href='/statements/{account_number}_{_scout_month_to_iso(billing_period)}.pdf']\")"
-    assert f"await {templated}.click()" in non_strict.code
-    assert f"await {templated}.click()" in strict.code
-
-
-def test_synthesize_mints_one_witness_row_per_key() -> None:
-    trajectory = [_witnessed_click(), _witnessed_click(selector=_STATEMENT_SELECTOR, accessible_name="View May")]
-    synthesized = synthesize_code_block(trajectory)
-    assert synthesized is not None
-    witness_rows = [p for p in synthesized.parameters if p.get("source") == LOCATOR_WITNESS_PARAM_SOURCE]
-    assert sorted((row["key"], row["default_value"]) for row in witness_rows) == [
-        ("account_number", "100245"),
-        ("billing_period", "May 2026"),
-    ]
-
-
-def test_synthesize_prelude_before_entry_and_preflight_clean() -> None:
-    synthesized = synthesize_code_block([_witnessed_click()])
-    assert synthesized is not None
-    code_lines = synthesized.code.splitlines()
-    guard_line = next(i for i, line in enumerate(code_lines) if "invalid value for grounded parameter" in line)
-    entry_line = next(i for i, line in enumerate(code_lines) if "_scout_entry_target =" in line)
-    assert guard_line < entry_line
-    diagnostics = preflight_code_block(synthesized.code, parameter_keys=["account_number", "billing_period"])
-    assert not any(diagnostic.code == "SANDBOX_UNRESOLVED_NAME" for diagnostic in diagnostics)
-
-
-def test_templated_locator_reads_declared_input_at_runtime() -> None:
-    plan_holes = input_correspondences_for_interaction(
-        {"tool_name": "click", "selector": _STATEMENT_SELECTOR}, _DECLARED
-    )
-    expr = build_input_templated_locator(
-        surface="selector", selector=_STATEMENT_SELECTOR, role="", name="", holes=plan_holes
-    )
-    assert expr is not None
-
-    class _Page:
-        def locator(self, value: str) -> str:
-            return value
-
-    source_lines = ["def _block(page, account_number, billing_period):"]
-    source_lines.extend(witness_prelude_lines(["account_number", "billing_period"], include_month_helper=True))
-    source_lines.append(f"    return {expr}")
-    namespace: dict[str, Any] = {"Exception": Exception}
-    exec("\n".join(source_lines), namespace)
-    block = namespace["_block"]
-    assert block(_Page(), "100248", "June 2026") == "a[href='/statements/100248_2026-06.pdf']"
-    with pytest.raises(Exception):
-        block(_Page(), "100245'] , x[href='", "May 2026")
-    with pytest.raises(Exception):
-        block(_Page(), "100245", "Notamonth 2026")
-
-
-def test_build_input_templated_locator_recompute_and_tamper() -> None:
-    holes = input_correspondences_for_interaction({"tool_name": "click", "selector": _STATEMENT_SELECTOR}, _DECLARED)
-    expr = build_input_templated_locator(
-        surface="selector", selector=_STATEMENT_SELECTOR, role="", name="", holes=holes
-    )
-    recomputed = build_input_templated_locator(
-        surface="selector", selector=_STATEMENT_SELECTOR, role="", name="", holes=holes
-    )
-    assert expr == recomputed
-    reordered = build_input_templated_locator(
-        surface="selector", selector=_STATEMENT_SELECTOR, role="", name="", holes=list(reversed(holes))
-    )
-    assert reordered != expr
 
 
 def test_synthesize_unwitnessed_selector_byte_identical() -> None:
@@ -4746,42 +3489,6 @@ def test_valid_unused_dynamic_row_evidence_preserves_generic_positional_synthesi
     assert synthesized.diagnostics.dropped_interactions == []
 
 
-def test_dynamic_row_period_requires_unique_period_across_candidate_rows() -> None:
-    interaction = _dynamic_row_click()
-    evidence = interaction["dynamic_row_evidence"]
-    evidence["period_matches"][0]["row_match_count"] = 2
-    evidence["evidence_fingerprint"] = dynamic_row_evidence_fingerprint(
-        **{key: value for key, value in evidence.items() if key != "evidence_fingerprint"}
-    )
-
-    assert (
-        input_correspondences_for_interaction(
-            interaction,
-            {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
-        )
-        == []
-    )
-
-
-def test_stamped_dynamic_row_period_license_fails_closed_when_cross_row_count_is_stale() -> None:
-    interaction = _dynamic_row_click()
-    interaction["input_correspondences"] = input_correspondences_for_interaction(
-        interaction,
-        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
-    )
-    evidence = interaction["dynamic_row_evidence"]
-    evidence["period_matches"][0]["row_match_count"] = 2
-    evidence["evidence_fingerprint"] = dynamic_row_evidence_fingerprint(
-        **{key: value for key, value in evidence.items() if key != "evidence_fingerprint"}
-    )
-
-    synthesized = synthesize_code_block([interaction], strict_selectors=True)
-
-    assert synthesized is not None
-    assert synthesized.diagnostics.emitted_interactions == []
-    assert synthesized.diagnostics.dropped_interactions[0]["reason_code"] == "invalid_dynamic_row_evidence"
-
-
 @pytest.mark.parametrize(
     ("period", "matching", "non_matching"),
     [
@@ -4802,125 +3509,6 @@ def test_period_matcher_is_case_insensitive_and_gregorian_valid(period: str, mat
 
 def test_period_matcher_rejects_year_zero() -> None:
     assert _strict_period_date_pattern("0000-05") is None
-
-
-def test_emitted_period_matcher_uses_same_case_and_calendar_contract() -> None:
-    interaction = _dynamic_row_click()
-    interaction["input_correspondences"] = input_correspondences_for_interaction(
-        interaction,
-        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
-    )
-    synthesized = synthesize_code_block([interaction], strict_selectors=True)
-
-    assert synthesized is not None
-    function = next(
-        node
-        for node in ast.parse(textwrap.dedent(synthesized.code)).body
-        if isinstance(node, ast.FunctionDef) and node.name == "_scout_period_date_pattern"
-    )
-    namespace: dict[str, Any] = {"re": re}
-    exec(ast.unparse(function), namespace)
-    matcher = namespace["_scout_period_date_pattern"]
-
-    assert matcher("2026-05").search("Statement mAy 5, 2026") is not None
-    assert matcher("2026-05").search("Statement MAY 05, 2026.") is not None
-    assert matcher("2026-02").search("Statement February 29, 2026") is None
-    assert matcher("2024-02").search("Statement February 29, 2024") is not None
-    assert matcher("2026-04").search("Statement April 31, 2026") is None
-    with pytest.raises(Exception, match="unrecognized grounded period"):
-        matcher("0000-05")
-
-
-def test_dynamic_row_period_parity_accepts_zero_padded_day_and_trailing_punctuation() -> None:
-    interaction = _dynamic_row_click()
-    evidence = interaction["dynamic_row_evidence"]
-    evidence["row_text"] = "Statement mAy 05, 2026."
-    evidence["evidence_fingerprint"] = dynamic_row_evidence_fingerprint(
-        **{key: value for key, value in evidence.items() if key != "evidence_fingerprint"}
-    )
-
-    correspondences = input_correspondences_for_interaction(
-        interaction,
-        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
-    )
-
-    assert any(item["surface"] == "row_text" for item in correspondences)
-    interaction["input_correspondences"] = correspondences
-    synthesized = synthesize_code_block([interaction], strict_selectors=True)
-    assert synthesized is not None
-    assert ".filter(has_text=_scout_period_date_pattern(" in synthesized.code
-
-
-def test_dynamic_row_period_evidence_emits_direct_count_guarded_locator() -> None:
-    interaction = _dynamic_row_click()
-    interaction["input_correspondences"] = input_correspondences_for_interaction(
-        interaction,
-        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
-    )
-
-    synthesized = synthesize_code_block([interaction], strict_selectors=True)
-
-    assert synthesized is not None
-    assert "nth=" not in synthesized.code
-    assert 'page.locator("div.statement-row")' in synthesized.code
-    assert synthesized.code.count("def _scout_period_date_pattern(") == 1
-    assert ".filter(has_text=_scout_period_date_pattern(" in synthesized.code
-    assert "_scout_period_month_name" not in synthesized.code
-    assert "_scout_period_year" not in synthesized.code
-    assert ".count() != 1" in synthesized.code
-    assert {parameter["key"] for parameter in synthesized.parameters} == {
-        "download_end_date",
-        "download_start_date",
-    }
-
-
-def test_dynamic_row_period_matcher_does_not_join_month_and_year_from_unrelated_fields() -> None:
-    interaction = _dynamic_row_click()
-    interaction["input_correspondences"] = input_correspondences_for_interaction(
-        interaction,
-        {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
-    )
-    synthesized = synthesize_code_block([interaction], strict_selectors=True)
-
-    assert synthesized is not None
-    # The generated matcher requires one contiguous witnessed date; month/year in separate fields do not qualify.
-    pattern = _strict_period_date_pattern("2027-06")
-    assert pattern is not None
-    assert pattern.search("Month June | account opened 2027") is None
-    assert pattern.search("Statement June 5, 2027") is not None
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        lambda evidence: evidence.pop("row_text"),
-        lambda evidence: evidence.update(source_url="https://other.example.org/statements"),
-        lambda evidence: evidence.update(target_selector="div.other-row >> nth=2"),
-    ],
-)
-def test_dynamic_row_period_evidence_fails_closed_when_relation_is_missing_or_competing(mutation: Any) -> None:
-    interaction = _dynamic_row_click()
-    mutation(interaction["dynamic_row_evidence"])
-
-    assert (
-        input_correspondences_for_interaction(
-            interaction,
-            {"download_start_date": "2026-05-01", "download_end_date": "2026-05-31"},
-        )
-        == []
-    )
-    synthesized = synthesize_code_block([interaction], strict_selectors=True)
-    assert synthesized is not None
-    assert synthesized.diagnostics.emitted_interactions == []
-    assert synthesized.diagnostics.dropped_interactions[0]["reason_code"] == "invalid_dynamic_row_evidence"
-
-
-def test_synthesize_input_purity() -> None:
-    trajectory = [_witnessed_click()]
-    snapshot = json.loads(json.dumps(trajectory))
-    synthesize_code_block(list(trajectory), strict_selectors=False)
-    synthesize_code_block(list(trajectory), strict_selectors=True)
-    assert trajectory == snapshot
 
 
 def _credential_fill(**overrides: Any) -> dict[str, Any]:
@@ -5195,26 +3783,6 @@ def test_non_login_trajectory_does_not_emit_solve_captcha() -> None:
     assert "solve_captcha" not in result.code
 
 
-class TestScoutedSpineOmissionDigest:
-    @staticmethod
-    def _record(selector: str, index: int = 1) -> dict[str, Any]:
-        return {"tool_name": "click", "method": "click", "selector": selector, "trajectory_index": index}
-
-    def test_identical_omissions_share_a_digest_regardless_of_order(self) -> None:
-        forward = _scouted_spine_omission_digest([self._record("#a", 1), self._record("#b", 2)])
-        reversed_order = _scouted_spine_omission_digest([self._record("#b", 2), self._record("#a", 1)])
-        assert forward == reversed_order
-
-    def test_distinct_omissions_produce_distinct_digests(self) -> None:
-        assert _scouted_spine_omission_digest([self._record("#a")]) != _scouted_spine_omission_digest(
-            [self._record("#b")]
-        )
-
-    def test_digest_is_cross_process_stable_sha256_not_salted_hash(self) -> None:
-        digest = _scouted_spine_omission_digest([self._record("#search-submit", 0)])
-        assert digest == "8065b147a155c4e35cab8b3b35da9beab958cddc9c355b6200bac957878954ec"
-
-
 def _captcha_click(challenge_state: dict[str, Any] | None = None) -> dict[str, Any]:
     click: dict[str, Any] = {
         "tool_name": "click",
@@ -5428,118 +3996,44 @@ class TestScoutedReadBindingSafety:
         assert '"scouted_read": _read_value_0' in block.code
         assert '"scouted_read_2": _read_value_1' in block.code
 
-    def test_composite_extraction_suffix_is_reachable_after_a_captured_read(self) -> None:
-        # Base synthesis must not emit its own terminal return when an extraction suffix follows,
-        # or the suffix is unreachable and the block returns the wrong shape.
-        plan = RequestedOutputExtractionPlan(
-            requested_output_paths=("output.error_count",),
-            observation_step=1,
-            observation_identity="observation-identity",
-            reveal=RevealAnchor(selector="#go"),
-            live_reads=(
-                LiveReadBinding(
-                    output_path="output.error_count",
-                    kind=LiveReadKind.KEY_VALUE,
-                    selector="#count",
-                    selector_count=1,
-                    selector_index=0,
-                    child_index=1,
-                    child_count=2,
-                    relation_label="Errors",
-                ),
-            ),
-            identity="plan-identity",
-        )
-        block = synthesize_code_block_with_extraction(
+    def test_a_download_terminal_does_not_strand_the_reads_behind_its_return(self) -> None:
+        # A turn asked to read a value AND download a file gets one block carrying both. An early
+        # return from the download terminal would leave the read unreachable, so the block would
+        # deliver the file and silently drop the value the same request asked for.
+        block = synthesize_code_block(
             [
                 {"tool_name": "click", "selector": "#go", "source_url": "https://example.test/", "trajectory_index": 0},
                 {
                     "tool_name": "read_value",
-                    "read_expression": 'document.querySelector("#count").innerText',
-                    "read_output_path": "output.error_count",
+                    "read_expression": 'document.querySelector("#total").innerText',
+                    "read_output_path": "output.scouted_read",
                     "trajectory_index": 1,
                 },
             ],
-            plan,
+            reached_download_target=_download_target(),
         )
 
         assert block is not None
-        # The imposition seam dedents the interaction half before appending the suffix; normalize
-        # the same way, then prove the suffix's return is the only and final return.
-        normalized = (
-            textwrap.dedent(block.interaction_code).rstrip() + "\n" + textwrap.dedent(block.extraction_code).rstrip()
+        module = ast.parse(textwrap.dedent(block.code))
+        returns = [node for node in ast.walk(module) if isinstance(node, ast.Return)]
+        assert len(returns) == 1, "one return site, or everything after the first is dead"
+        assert '"scouted_read": _read_value_0' in block.code
+        assert '"downloaded_file_name": downloaded_file_name' in block.code
+        assert block.code.index("click_and_claim_download") < block.code.index("return {")
+
+    def test_a_target_the_platform_cannot_register_compiles_no_download_terminal(self) -> None:
+        # An inline render fires no download, so a claim terminal there only spends its timeout to
+        # fail. Authoring and completion already treat this kind as undeliverable; synthesis has to
+        # agree with them rather than emit a call that cannot succeed.
+        block = synthesize_code_block(
+            [
+                {"tool_name": "click", "selector": "#go", "source_url": "https://example.test/", "trajectory_index": 0},
+            ],
+            reached_download_target=_download_target(download_kind="observed_render"),
         )
-        tree = ast.parse(f"async def __wrapper__():\n{textwrap.indent(normalized, '    ')}\n")
-        returns = [n for n in ast.walk(tree) if isinstance(n, ast.Return)]
-        assert len(returns) == 1, "composite block must have exactly one terminal return"
-        normalized_lines = normalized.rstrip().splitlines()
-        trailing = [
-            line
-            for line in normalized_lines[returns[0].lineno - 2 :]
-            if line.strip() and not line.strip().startswith("#")
-        ]
-        assert len(trailing) == 1, f"unreachable code after terminal return: {trailing[1:]}"
-        assert block.extraction_code.strip() in normalized
 
-
-def test_synthesized_extraction_guards_only_name_things_the_sandbox_provides() -> None:
-    # The generated block runs with builtins emptied, so an exception class the sandbox does not
-    # bind raises NameError instead of the guard's own message.
-    from skyvern.forge.sdk.copilot.code_block_preflight import sandbox_unresolved_name_repair_diagnostic
-    from skyvern.forge.sdk.copilot.code_block_synthesis import _key_value_scalar_read_statements
-    from skyvern.forge.sdk.copilot.output_extraction_plan import LiveReadBinding
-
-    binding = LiveReadBinding(
-        output_path="output.count",
-        kind="key_value_scalar",
-        selector="#summary",
-        selector_count=1,
-        selector_index=0,
-        child_index=1,
-        child_count=2,
-        relation_label="Errors",
-    )
-
-    emitted = _key_value_scalar_read_statements(binding, "_value", guard_empty=True)
-    diagnostic = sandbox_unresolved_name_repair_diagnostic("\n".join(emitted), parameter_keys=[])
-
-    assert diagnostic is None, diagnostic.unresolved_names if diagnostic else ()
-
-
-def test_a_value_witnessed_read_proves_no_heading_at_runtime() -> None:
-    # Live failure (SKY-13226): the value witness picks the element by the value it showed, then the
-    # generated read asserted the heading beside it and raised "Observed scalar label changed" —
-    # the tile's heading slot also carries a delta chip, and a page with no heading has none to read.
-    from skyvern.forge.sdk.copilot.code_block_synthesis import _key_value_scalar_read_statements
-    from skyvern.forge.sdk.copilot.output_extraction_plan import LiveReadBinding
-
-    fields = {
-        "output_path": "output.count",
-        "kind": "key_value_scalar",
-        "selector": "#summary",
-        "selector_count": 1,
-        "selector_index": 0,
-        "child_index": 1,
-        "child_count": 3,
-        "relation_label": "Visitors",
-    }
-
-    witnessed = "\n".join(
-        _key_value_scalar_read_statements(
-            LiveReadBinding(**fields, identified_by_label=False), "_value", guard_empty=True
-        )
-    )
-    by_label = "\n".join(_key_value_scalar_read_statements(LiveReadBinding(**fields), "_value", guard_empty=True))
-
-    assert "Observed scalar label" not in witnessed
-    # The element is still pinned by everything that chose it.
-    assert "Observed scalar selector cardinality changed" in witnessed
-    assert "Observed scalar direct-child shape changed" in witnessed
-    assert '_value = (await page.locator("#summary").nth(0).locator(":scope > *").nth(1).inner_text()).strip()' in (
-        witnessed
-    )
-    # A binding the label did choose keeps proving it.
-    assert "Observed scalar label changed" in by_label
+        assert block is not None
+        assert "click_and_claim_download" not in block.code
 
 
 def test_entry_anchors_on_what_the_flow_fills_not_the_link_it_clicks_away_from() -> None:
@@ -5575,37 +4069,3 @@ def test_entry_anchors_on_what_the_flow_fills_not_the_link_it_clicks_away_from()
     # The click is still demonstrated, it just no longer decides where the flow starts.
     assert 'a[href=\\"/account/forgot_password\\"]").click()' in block.code
     assert [step["action_type"] for step in block.steps][:4] == ["goto_url", "click", "input_text", "input_text"]
-
-
-def test_a_designated_read_waits_for_a_figure_the_page_has_not_rendered_yet() -> None:
-    # Live failure (SKY-13226): the tile renders while its query is still resolving, so a read that
-    # fires once takes the empty frame — and on the log explorer it took the neighbouring control's
-    # text instead, costing a whole test run.
-    from skyvern.forge.sdk.copilot.code_block_synthesis import _key_value_scalar_read_statements
-    from skyvern.forge.sdk.copilot.output_extraction_plan import LiveReadBinding
-
-    designated = LiveReadBinding(
-        output_path="output.count",
-        kind="key_value_scalar",
-        selector="#total",
-        selector_count=1,
-        selector_index=0,
-    )
-    emitted = "\n".join(_key_value_scalar_read_statements(designated, "_value", guard_empty=True))
-
-    assert "wait_for_timeout" in emitted
-    assert emitted.count("inner_text()") == 2, "the value is re-read after each wait, not just once"
-    assert 'raise Exception("Designated value element is empty")' in emitted
-
-    # A relation-bound read proves its own shape and is left alone.
-    relation = LiveReadBinding(
-        output_path="output.count",
-        kind="key_value_scalar",
-        selector="#card",
-        selector_count=1,
-        selector_index=0,
-        child_index=1,
-        child_count=3,
-        relation_label="Visitors",
-    )
-    assert "wait_for_timeout" not in "\n".join(_key_value_scalar_read_statements(relation, "_value", guard_empty=True))

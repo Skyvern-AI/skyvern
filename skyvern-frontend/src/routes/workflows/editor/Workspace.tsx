@@ -40,6 +40,7 @@ import {
   isWorkflowYamlDirty,
 } from "@/store/WorkflowYamlEditorStore";
 import { getClient } from "@/api/AxiosClient";
+import { isPaymentRequiredError } from "@/api/paymentRequired";
 import { DebugSessionApiResponse, ProxyLocation } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
@@ -50,7 +51,7 @@ import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { resolveWorkspaceBrowserSessionBindings } from "./browserSessionBindings";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
-import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
+import { useStreamTransport } from "@/hooks/useRuntimeConfig";
 import {
   StreamModeBadge,
   StreamStatusPanel,
@@ -201,6 +202,7 @@ import { useWorkflowYamlEditorLifecycle } from "./hooks/useWorkflowYamlEditorLif
 import {
   preservedFinallyBlockLabel,
   workflowVersionFromSaveData,
+  yamlCommitInputs,
 } from "./workflowVersionFromSaveData";
 import "./workspace-styles.css";
 
@@ -529,7 +531,6 @@ function Workspace({
   const { data: workflowRun } = useWorkflowRunQuery();
   const studioRunId = useStudioRunId();
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
-  const { browserStreamingMode } = useBrowserStreamingMode();
 
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
@@ -578,11 +579,6 @@ function Workspace({
   const [isCopilotTurnActive, setIsCopilotTurnActive] = useState(false);
   const blockScriptStore = useBlockScriptStore();
   const recordingStore = useRecordingStore();
-  const isCdpStreamingMode =
-    browserStreamingMode === "cdp" && !recordingStore.isRecording;
-  // Record Browser exfiltration requires VNC even when the org default is CDP streaming.
-  const preferVncStream =
-    browserStreamingMode !== "cdp" || recordingStore.isRecording;
   const cacheKey = workflow?.cache_key ?? "";
 
   // Block delete confirmation dialog state
@@ -766,6 +762,42 @@ function Workspace({
     isRateLimited,
     keepAliveBrowserSession: true,
   });
+  const debugSessionPaymentRequired = isPaymentRequiredError(debugSessionError);
+  const debugSessionErrorPanel = (
+    <StreamStatusPanel
+      diagnostic={
+        debugSessionPaymentRequired
+          ? {
+              title: "Out of credits",
+              detail:
+                getAxiosErrorDetail(debugSessionError) ??
+                "More credits are required to start a browser session.",
+              hint: "Add credits or enable overage in Billing, then return here to start the browser session.",
+            }
+          : {
+              title: "Could not start browser session",
+              detail:
+                getAxiosErrorDetail(debugSessionError) ??
+                "The backend rejected the browser session request.",
+              hint: "Local dev only supports one browser at a time. Retry after closing other agents.",
+            }
+      }
+    >
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={() => {
+          if (debugSessionPaymentRequired) {
+            navigate("/billing");
+          } else {
+            void refetchDebugSession();
+          }
+        }}
+      >
+        {debugSessionPaymentRequired ? "Go to Billing" : "Retry"}
+      </Button>
+    </StreamStatusPanel>
+  );
   const { data: viewerState } = useActiveRunSessionQuery({
     workflowPermanentId,
     enabled:
@@ -774,6 +806,15 @@ function Workspace({
   });
 
   const activeDebugSession = debugSession ?? null;
+
+  const { streamTransport } = useStreamTransport(
+    activeDebugSession?.browser_session_id,
+  );
+  const isCdpStreamingMode =
+    streamTransport === "cdp" && !recordingStore.isRecording;
+  // Record Browser exfiltration requires VNC even when the transport is CDP streaming.
+  const preferVncStream =
+    streamTransport !== "cdp" || recordingStore.isRecording;
 
   const workflowChangesStore = useWorkflowHasChangesStore();
 
@@ -1599,7 +1640,11 @@ function Workspace({
 
   const applyWorkflowUpdate = (
     workflowData: WorkflowVersion,
-    options?: { persisted?: boolean; userDriven?: boolean },
+    options?: {
+      persisted?: boolean;
+      userDriven?: boolean;
+      midTurnDraft?: boolean;
+    },
   ) => {
     const settings: WorkflowSettings = {
       proxyLocation: workflowData.proxy_location ?? ProxyLocation.Residential,
@@ -1650,9 +1695,16 @@ function Workspace({
     useWorkflowParametersStore.getState().setParameters(initialParameters);
 
     // Sync title so snap-back on Reject reverts the editor's title bar
-    // alongside the canvas blocks.
+    // alongside the canvas blocks. A mid-turn draft is not authoritative: it must
+    // not clobber a rename made while the turn was running, and a draft still
+    // carrying the placeholder must not mark the title as generated.
     if (typeof workflowData.title === "string") {
-      useWorkflowTitleStore.getState().setTitle(workflowData.title);
+      const titleStore = useWorkflowTitleStore.getState();
+      if (options?.midTurnDraft) {
+        titleStore.setTitleFromCopilotIfDefault(workflowData.title);
+      } else {
+        titleStore.syncTitleFromWorkflow(workflowData.title);
+      }
     }
 
     if (options?.persisted) {
@@ -1765,12 +1817,16 @@ function Workspace({
       );
       return false;
     }
+    const { definition: draftDefinition, definitionYaml } = yamlCommitInputs(
+      parsed,
+      yamlStore.draft,
+    );
     try {
       const client = await getClient(credentialGetter, "sans-api-v1");
       const response = await client.post<WorkflowYAMLConversionResponse>(
         "/workflow/copilot/convert-yaml-to-blocks",
         {
-          workflow_definition_yaml: yamlStore.draft,
+          workflow_definition_yaml: definitionYaml,
           workflow_id: saveData.workflow.workflow_id,
         },
       );
@@ -1847,7 +1903,7 @@ function Workspace({
         try {
           await saveWorkflow.mutateAsync({
             blocks: upgradedBlocks,
-            parameters: parsed?.parameters ?? [],
+            parameters: draftDefinition?.parameters ?? [],
             workflowDefinitionVersion: upgradedVersion,
             settings: { ...saveData.settings, finallyBlockLabel },
           });
@@ -2533,29 +2589,13 @@ function Workspace({
                   </div>
                 )}
 
-                {/* Live browser: mode comes from BROWSER_STREAMING_MODE / runtime config */}
+                {/* Live browser: mode comes from the session's stream transport, falling back to runtime config */}
                 {showVncBrowserPanel && (
                   <div className="skyvern-vnc-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
                     <div key={reloadKey} className="w-full flex-1">
                       {!displayBrowserSessionId ? (
                         isDebugSessionError ? (
-                          <StreamStatusPanel
-                            diagnostic={{
-                              title: "Could not start browser session",
-                              detail:
-                                getAxiosErrorDetail(debugSessionError) ??
-                                "The backend rejected the browser session request.",
-                              hint: "Local dev only supports one browser at a time. Retry after closing other agents.",
-                            }}
-                          >
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => void refetchDebugSession()}
-                            >
-                              Retry
-                            </Button>
-                          </StreamStatusPanel>
+                          debugSessionErrorPanel
                         ) : (
                           <StreamStatusPanel
                             diagnostic={{
@@ -2637,23 +2677,7 @@ function Workspace({
                     >
                       {!displayBrowserSessionId ? (
                         isDebugSessionError ? (
-                          <StreamStatusPanel
-                            diagnostic={{
-                              title: "Could not start browser session",
-                              detail:
-                                getAxiosErrorDetail(debugSessionError) ??
-                                "The backend rejected the browser session request.",
-                              hint: "Local dev only supports one browser at a time. Retry after closing other agents.",
-                            }}
-                          >
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => void refetchDebugSession()}
-                            >
-                              Retry
-                            </Button>
-                          </StreamStatusPanel>
+                          debugSessionErrorPanel
                         ) : (
                           <StreamStatusPanel
                             diagnostic={{
@@ -2668,6 +2692,11 @@ function Workspace({
                           browserSessionId={displayBrowserSessionId}
                           interactive={true}
                           showControlButtons={true}
+                          // The CDP transport streams the page viewport only, so
+                          // unlike the VNC panel there is no browser address bar
+                          // to type into and a session resting on about:blank has
+                          // no way out (SKY-13705).
+                          enableUrlInput={true}
                           onReadyChange={handleLiveBrowserReadyChange}
                         />
                       ) : (

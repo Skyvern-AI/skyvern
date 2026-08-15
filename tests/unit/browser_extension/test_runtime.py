@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import subprocess
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
 
 import skyvern.browser_extension.runtime as runtime_module
-from skyvern.browser_extension.errors import BrowserExtensionError
-from skyvern.browser_extension.runtime import BrowserExtensionRuntime
+from skyvern.browser_extension.errors import BrowserExtensionBrokerError, BrowserExtensionError
+from skyvern.browser_extension.runtime import BrowserExtensionRuntime, broker_mode_enabled
 
 
 class StubRelay:
@@ -26,12 +28,16 @@ class StubRelay:
     ) -> None:
         self.token = token
         self.port = port
+        self.bound_port = port
         self.on_event = on_event
         self.on_disconnect = on_disconnect
         self.calls = calls
         self.start_error = start_error
         self.connected = True
         self.stop_count = 0
+
+    def get_or_create_pairing_nonce(self) -> str:
+        return "runtime-pairing-nonce"
 
     async def start(self) -> None:
         self.calls.append("relay.start")
@@ -71,7 +77,8 @@ class StubAdapter:
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def reset_runtime() -> AsyncGenerator[None]:
+async def reset_runtime(monkeypatch: pytest.MonkeyPatch) -> AsyncGenerator[None]:
+    monkeypatch.setenv("SKYVERN_BROWSER_EXTENSION_BROKER", "0")
     BrowserExtensionRuntime._instance = None
     BrowserExtensionRuntime._lock = asyncio.Lock()
     yield
@@ -137,6 +144,70 @@ async def test_singleton_is_idempotent_and_late_binds_adapter_callbacks(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_open_pairing_page_uses_relay_nonce_without_exposing_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    install_stubs(monkeypatch)
+    opener = MagicMock(return_value=True)
+    monkeypatch.setattr(BrowserExtensionRuntime, "open_extension_url", staticmethod(opener))
+    runtime = await BrowserExtensionRuntime.get_or_start(21003)
+
+    assert runtime.open_pairing_page()
+    assert runtime.open_pairing_page()
+    opener.assert_called_with("http://127.0.0.1:21003/pair#runtime-pairing-nonce")
+    assert opener.call_count == 2
+    assert "runtime-test-token" not in opener.call_args.args[0]
+
+
+def test_open_extension_url_targets_google_chrome_on_macos(monkeypatch: pytest.MonkeyPatch) -> None:
+    run = MagicMock()
+    monkeypatch.setattr(runtime_module.sys, "platform", "darwin")
+    monkeypatch.setattr(runtime_module.shutil, "which", lambda name: "/usr/bin/open" if name == "open" else None)
+    monkeypatch.setattr(runtime_module.subprocess, "run", run)
+
+    assert BrowserExtensionRuntime.open_extension_url("http://127.0.0.1:19777/pair#nonce")
+    run.assert_called_once_with(
+        ["/usr/bin/open", "-a", "Google Chrome", "http://127.0.0.1:19777/pair#nonce"],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_open_extension_url_launches_direct_browser_without_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    platform: str,
+) -> None:
+    popen = MagicMock()
+    monkeypatch.setattr(runtime_module.sys, "platform", platform)
+    monkeypatch.setattr(runtime_module.subprocess, "Popen", popen)
+    if platform == "linux":
+        executable = Path("/usr/bin/chromium")
+        monkeypatch.setattr(
+            runtime_module.shutil, "which", lambda name: str(executable) if name == "chromium" else None
+        )
+        platform_options = {"start_new_session": True}
+    else:
+        executable = tmp_path / "Google" / "Chrome" / "Application" / "chrome.exe"
+        executable.parent.mkdir(parents=True)
+        executable.touch()
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        monkeypatch.delenv("PROGRAMFILES", raising=False)
+        monkeypatch.delenv("PROGRAMFILES(X86)", raising=False)
+        platform_options = {"creationflags": 0x00000208}
+
+    assert BrowserExtensionRuntime.open_extension_url("http://127.0.0.1:19777/pair#nonce")
+    popen.assert_called_once_with(
+        [str(executable), "http://127.0.0.1:19777/pair#nonce"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        **platform_options,
+    )
+
+
+@pytest.mark.asyncio
 async def test_port_resolution_prefers_explicit_then_environment_then_default(monkeypatch: pytest.MonkeyPatch) -> None:
     relays, _, _ = install_stubs(monkeypatch)
     monkeypatch.setenv("SKYVERN_BROWSER_EXTENSION_PORT", "22001")
@@ -159,10 +230,13 @@ async def test_port_resolution_prefers_explicit_then_environment_then_default(mo
 async def test_port_in_use_has_actionable_browser_extension_error(monkeypatch: pytest.MonkeyPatch) -> None:
     _, adapters, _ = install_stubs(monkeypatch, relay_start_error=OSError(errno.EADDRINUSE, "address in use"))
 
-    with pytest.raises(BrowserExtensionError, match="SKYVERN_BROWSER_EXTENSION_PORT") as error_info:
+    with pytest.raises(BrowserExtensionError) as error_info:
         await BrowserExtensionRuntime.get_or_start(23001)
 
-    assert "23001" in str(error_info.value)
+    message = str(error_info.value)
+    assert "23001" in message
+    assert "SKYVERN_BROWSER_EXTENSION_PORT" in message
+    assert "extension popup" in message
     assert adapters[0].stop_count == 1
     assert BrowserExtensionRuntime.instance() is None
 
@@ -208,3 +282,123 @@ def test_extension_dir_points_to_packaged_manifest() -> None:
     if not (directory / "manifest.json").exists():
         pytest.skip("extension manifest is owned by another build stream")
     assert directory.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_broker_is_default_without_loading_embedded_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    class StubBroker:
+        def __init__(self, port: int, on_event, on_disconnect) -> None:
+            self.port = port
+            self.bound_port = port
+            self.on_event = on_event
+            self.on_disconnect = on_disconnect
+            self.connected = False
+            self.scoped_tabs: list[dict] = []
+
+        async def start(self) -> None:
+            calls.append("broker.start")
+
+        async def stop(self) -> None:
+            calls.append("broker.stop")
+
+        async def wait_connected(self, _timeout: float) -> bool:
+            return False
+
+        async def request(self, _op: str, _args: dict, timeout: float = 30.0) -> dict:
+            return {"timeout": timeout}
+
+    adapters: list[StubAdapter] = []
+
+    def adapter_factory(registry, relay) -> StubAdapter:
+        adapter = StubAdapter(registry, relay, calls=calls)
+        adapters.append(adapter)
+        return adapter
+
+    token_loader = MagicMock(side_effect=AssertionError("embedded token path must remain unused"))
+    monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_BROKER")
+    monkeypatch.setattr(runtime_module, "BrokerClient", StubBroker)
+    monkeypatch.setattr(runtime_module, "_adapter_factory", adapter_factory)
+    monkeypatch.setattr(runtime_module, "load_or_create_pairing_token", token_loader)
+
+    runtime = await BrowserExtensionRuntime.get_or_start(24003)
+
+    assert runtime.extension_connected is False
+    assert calls == ["adapter.start", "broker.start"]
+    token_loader.assert_not_called()
+    await runtime.shutdown()
+    assert calls == ["adapter.start", "broker.start", "broker.stop", "adapter.stop"]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, True), ("0", False), ("1", True), ("false", True), ("", True)],
+)
+def test_broker_gate_only_exact_zero_opts_out(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    expected: bool,
+) -> None:
+    if value is None:
+        monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_BROKER", raising=False)
+    else:
+        monkeypatch.setenv("SKYVERN_BROWSER_EXTENSION_BROKER", value)
+
+    assert broker_mode_enabled() is expected
+
+
+@pytest.mark.asyncio
+async def test_broker_startup_failure_does_not_fall_back_to_embedded_relay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relays, adapters, _calls = install_stubs(monkeypatch)
+
+    class FailingBroker:
+        def __init__(self, _port: int, _on_event, _on_disconnect) -> None:
+            self.bound_port = 24004
+            self.connected = False
+            self.scoped_tabs: list[dict] = []
+
+        async def start(self) -> None:
+            raise BrowserExtensionBrokerError("UNSAFE_STATE", "Broker lease journal is invalid")
+
+        async def stop(self) -> None:
+            return None
+
+        async def wait_connected(self, _timeout: float) -> bool:
+            return False
+
+        async def request(self, _op: str, _args: dict, timeout: float = 30.0) -> dict:
+            return {"timeout": timeout}
+
+    monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_BROKER")
+    monkeypatch.setattr(runtime_module, "BrokerClient", FailingBroker)
+
+    with pytest.raises(BrowserExtensionBrokerError, match="UNSAFE_STATE"):
+        await BrowserExtensionRuntime.get_or_start(24004)
+
+    assert relays == []
+    assert len(adapters) == 1
+    assert BrowserExtensionRuntime.instance() is None
+
+
+@pytest.mark.asyncio
+async def test_windows_default_logs_and_uses_legacy_relay(monkeypatch: pytest.MonkeyPatch) -> None:
+    relays, _adapters, calls = install_stubs(monkeypatch)
+    log = MagicMock()
+    monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_BROKER")
+    monkeypatch.setattr(runtime_module.sys, "platform", "win32")
+    monkeypatch.setattr(runtime_module.LOG, "info", log)
+
+    runtime = await BrowserExtensionRuntime.get_or_start(24005)
+
+    assert not broker_mode_enabled()
+    assert len(relays) == 1
+    assert calls == ["adapter.start", "relay.start"]
+    log.assert_called_once_with(
+        "browser_extension_broker_unsupported_platform_using_legacy",
+        code="UNSUPPORTED_PLATFORM",
+        platform="win32",
+    )
+    await runtime.shutdown()

@@ -10,7 +10,7 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.models.run_limits import MaxScreenshotScrolls
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
 from skyvern.utils.secret_headers import mask_header_values
-from skyvern.utils.url_validators import validate_url
+from skyvern.utils.url_validators import WebhookUrl, validate_url
 
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
 TASK_V2_TIMEOUT_WEBHOOK_DELIVERED_SENTINEL = "__timeout_webhook_delivered__"
@@ -218,7 +218,7 @@ class TaskV2Request(BaseModel):
     user_prompt: str
     url: str | None = None
     browser_session_id: str | None = None
-    webhook_callback_url: str | None = None
+    webhook_callback_url: WebhookUrl | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     proxy_location: ProxyLocationInput = None
@@ -235,7 +235,7 @@ class TaskV2Request(BaseModel):
     run_with: str | None = None
     ai_fallback: bool = False
 
-    @field_validator("url", "webhook_callback_url", "totp_verification_url")
+    @field_validator("url", "totp_verification_url")
     @classmethod
     def validate_urls(cls, url: str | None) -> str | None:
         if not url:

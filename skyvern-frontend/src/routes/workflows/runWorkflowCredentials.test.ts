@@ -12,9 +12,13 @@ import {
   getFallbackCredentialIds,
   getLoginCredentialInputs,
   getRotatingCredentialIds,
+  isAtWillCredentialParameter,
 } from "./runWorkflowCredentials";
 
-function workflowParameter(key: string): WorkflowParameter {
+function workflowParameter(
+  key: string,
+  overrides: Partial<WorkflowParameter> = {},
+): WorkflowParameter {
   return {
     parameter_type: WorkflowParameterTypes.Workflow,
     workflow_id: "w_1",
@@ -26,8 +30,34 @@ function workflowParameter(key: string): WorkflowParameter {
     created_at: "2026-07-08T00:00:00Z",
     modified_at: "2026-07-08T00:00:00Z",
     deleted_at: null,
+    ...overrides,
   };
 }
+
+describe("isAtWillCredentialParameter", () => {
+  test("true for a credential_id parameter with no default", () => {
+    expect(
+      isAtWillCredentialParameter(
+        workflowParameter("cred", { default_value: null }),
+      ),
+    ).toBe(true);
+  });
+
+  test("false for a credential_id parameter with a default", () => {
+    expect(isAtWillCredentialParameter(workflowParameter("cred"))).toBe(false);
+  });
+
+  test("false for a non-credential parameter with no default", () => {
+    expect(
+      isAtWillCredentialParameter(
+        workflowParameter("name", {
+          workflow_parameter_type: WorkflowParameterValueType.String,
+          default_value: null,
+        }),
+      ),
+    ).toBe(false);
+  });
+});
 
 function rotatingCredentialParameter(
   key: string,

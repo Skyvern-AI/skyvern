@@ -111,6 +111,7 @@ export type WorkflowCopilotStreamMessageType =
   | "design_start"
   | "design_end"
   | "workflow_draft"
+  | "title_update"
   | "credential_required";
 
 export interface WorkflowCopilotProcessingUpdate {
@@ -148,7 +149,6 @@ export interface WorkflowCopilotTurnStartUpdate {
   type: "turn_start";
   turn_id: string;
   turn_index: number;
-  mode: string;
   timestamp: string;
   // Block count of the canonical workflow at turn entry. Drives the FE's
   // edit-vs-build chip; the snap-back source is captured client-side at
@@ -176,6 +176,16 @@ export interface WorkflowCopilotWorkflowDraftUpdate {
   summary: string | null;
   timestamp: string;
   workflow?: WorkflowApiResponse | null;
+}
+
+// Emitted once the backend has persisted a derived agent name, before any block
+// exists. Clients must not treat it as authoritative over a user-chosen title.
+export interface WorkflowCopilotTitleUpdate {
+  type: "title_update";
+  turn_id: string;
+  workflow_permanent_id: string;
+  title: string;
+  timestamp: string;
 }
 
 // Mid-build pause frame: the turn stays open (SSE alive) while the client
@@ -247,7 +257,7 @@ export type WorkflowCopilotRunOutcomeVerdict =
   | "not_demonstrated"
   | "not_evaluated";
 
-export type RunOutcomeRole = "adjudicated" | "interim_build_test";
+export type RunOutcomeRole = "recorded" | "adjudicated" | "interim_build_test";
 
 export interface WorkflowCopilotRunOutcomeUpdate {
   type: "run_outcome";

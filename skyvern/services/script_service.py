@@ -29,11 +29,11 @@ from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     CachedDownloadError,
     CodeBlockRunnerSelectionError,
+    DownloadSaveIncompleteError,
     IllegitCompleteScriptTermination,
     InProcessScriptExecutionDenied,
     ScriptNotFound,
     ScriptTerminationException,
-    StepTerminationError,
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
@@ -915,16 +915,17 @@ async def _update_workflow_block(
                             updated_task,
                             step_for_billing,
                         )
-                except StepTerminationError as billing_error:
+                except Exception as billing_error:
                     LOG.warning(
                         "Cached step billing failed; marking workflow block as failed.",
                         organization_id=context.organization_id,
                         task_id=task_id,
                         step_id=step_id,
-                        error=str(billing_error),
+                        error_type=type(billing_error).__name__,
+                        exc_info=True,
                     )
                     status = BlockStatus.failed
-                    failure_reason = str(billing_error)
+                    failure_reason = "Cached step billing failed."
                     final_output = None
         else:
             # Non-task blocks (conditionals, etc.) — preserve the output as-is.
@@ -2465,6 +2466,16 @@ async def download(
                         run_id=run_id,
                     )
                 save_ok = True
+            except DownloadSaveIncompleteError as exc:
+                # A partial save still verifies: the files that saved are readable, and if the new
+                # download is the one that was skipped, verification fails into the AI fallback.
+                LOG.warning(
+                    "Some downloaded files were skipped during cached-download save",
+                    organization_id=org_id,
+                    workflow_run_id=run_id,
+                    skipped_file_count=len(exc.skipped_files),
+                )
+                save_ok = True
             except asyncio.TimeoutError:
                 LOG.warning(
                     "Timeout saving downloaded files after cached download, skipping verification",
@@ -3086,12 +3097,15 @@ async def ensure_in_process_script_execution_allowed(
     if decision.allowed:
         return
 
-    LOG.error(
+    # A degradable denial leaves the run to the agent, so it is not an error condition; keeping it
+    # off ERROR also keeps the fail-closed lines above distinguishable in the denial monitor.
+    log_denial = LOG.error if decision.fail_closed else LOG.warning
+    log_denial(
         "script.in_process_execution_denied",
         seam=seam,
         selection_reason=decision.selection_reason,
         flag_value=decision.flag_value,
-        env_force_on=decision.env_force_on,
+        fail_closed=decision.fail_closed,
         organization_id=organization_id,
         workflow_run_id=workflow_run_id,
         workflow_permanent_id=workflow_permanent_id,
@@ -3102,6 +3116,7 @@ async def ensure_in_process_script_execution_allowed(
     raise InProcessScriptExecutionDenied(
         seam=seam,
         selection_reason=decision.selection_reason,
+        fail_closed=decision.fail_closed,
     )
 
 

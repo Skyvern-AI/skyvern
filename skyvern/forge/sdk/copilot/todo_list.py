@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Sequence
+from collections.abc import Set as AbstractSet
 
 import structlog
 
@@ -18,28 +19,8 @@ def _page_key(url: object) -> str | None:
     return url.strip().split("#", 1)[0].rstrip("/")
 
 
-def _credential_fill_page_keys(ctx: AgentContext) -> set[str] | None:
-    """Pages where a credential fill happened, or None when no fill has happened at all."""
-    keys: set[str] = set()
-    fills = 0
-    entries: list[dict[str, Any]] = [dict(interaction) for interaction in ctx.scout_trajectory]
-    entries.extend(entry for entry in ctx.prior_fill_carry if isinstance(entry, dict))
-    for entry in entries:
-        if entry.get("tool_name") != "fill_credential_field":
-            continue
-        fills += 1
-        key = _page_key(entry.get("source_url"))
-        if key:
-            keys.add(key)
-    return keys if fills else None
-
-
 def _interaction_reached_page_keys(ctx: AgentContext) -> set[str]:
-    """Pages reached by actually interacting, not just looking — the only evidence that counts as login progress.
-
-    Heuristic ceiling: any interaction-reached page off the fill page counts, so a non-submit
-    navigation (e.g. a forgot-password link) can suppress the login line without a real login.
-    """
+    """Pages reached by actually interacting, not just looking."""
     keys: set[str] = set()
     for page in ctx.prior_observed_acted_pages:
         if isinstance(page, dict) and page.get("reached_via") == "interaction":
@@ -57,18 +38,6 @@ def _interaction_reached_page_keys(ctx: AgentContext) -> set[str]:
         if key:
             keys.add(key)
     return keys
-
-
-def _login_line(ctx: AgentContext) -> str | None:
-    policy = ctx.request_policy
-    if not isinstance(policy, RequestPolicy) or not policy.login_intent or not policy.resolved_credentials:
-        return None
-    fill_pages = _credential_fill_page_keys(ctx)
-    if fill_pages is None:
-        return "Login: credential resolved but login not yet attempted"
-    if _interaction_reached_page_keys(ctx) - fill_pages:
-        return None
-    return "Login: credential resolved but login not completed (no page reached by interaction yet)"
 
 
 def _minted_criteria(ctx: AgentContext) -> list[CompletionCriterion]:
@@ -116,15 +85,47 @@ def _outputs_line(ctx: AgentContext) -> str | None:
 
 
 def _interactions_line(ctx: AgentContext) -> str | None:
-    if ctx.scout_trajectory or ctx.prior_fill_carry or _interaction_reached_page_keys(ctx):
+    if ctx.scout_trajectory or ctx.prior_carried_trajectory or _interaction_reached_page_keys(ctx):
         return None
     return "The site has not been acted on yet (0 interactions recorded)"
 
 
+def _inapplicable_criterion_ids(ctx: AgentContext) -> set[str]:
+    """Criteria that no longer need action: satisfied, or structurally unfired because their
+    antecedent condition did not hold (a conditional download on a branch the run did not take)."""
+    result = ctx.completion_verification_result
+    if result is None:
+        return set()
+    ids = {verdict.criterion_id for verdict in result.verdicts if verdict.satisfied}
+    ids |= set(getattr(result, "structural_unfired_criterion_ids", ()) or ())
+    return ids
+
+
+def unmet_action_deliverable_criteria_from(
+    criteria: Sequence[CompletionCriterion], inapplicable_ids: AbstractSet[str]
+) -> list[CompletionCriterion]:
+    """Run-plane criteria whose deliverable needs an action on the page (today: a registered
+    browser download) and which no verification verdict has satisfied yet. Pure over its inputs
+    so offline replay runs the same decision the live gate ran."""
+    return [
+        criterion
+        for criterion in criteria
+        if "registered_download" in (criterion.deliverable_kind, criterion.declared_deliverable_kind)
+        and criterion.level == "run"
+        and criterion.id not in inapplicable_ids
+    ]
+
+
+def unmet_action_deliverable_criteria(ctx: AgentContext) -> list[CompletionCriterion]:
+    minted = _minted_criteria(ctx)
+    return unmet_action_deliverable_criteria_from(minted, _inapplicable_criterion_ids(ctx))
+
+
 def render_todo_list(ctx: AgentContext) -> str | None:
-    lines = [line for line in (_login_line(ctx), _outputs_line(ctx)) if line]
-    if not lines:
+    outputs = _outputs_line(ctx)
+    if not outputs:
         return None
+    lines = [outputs]
     interactions = _interactions_line(ctx)
     if interactions:
         lines.append(interactions)

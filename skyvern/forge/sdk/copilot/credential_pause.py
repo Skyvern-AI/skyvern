@@ -239,7 +239,11 @@ def credential_pause_reason(ctx: Any) -> str | None:
     can't trigger a pause -- see the SKY-11988 false-positive lesson.
     """
     policy = getattr(ctx, "request_policy", None)
-    skip_test = isinstance(policy, RequestPolicy) and policy.testing_intent == "skip_test"
+    raw_secret_redacted_draft = (
+        isinstance(policy, RequestPolicy)
+        and policy.raw_secret_detected
+        and policy.raw_secret_handling == "redacted_draft"
+    )
     if isinstance(policy, RequestPolicy) and (
         policy.clarification_reason == "login_credentials_unresolved"
         # Every ask the credential card can answer resumes through the same typed contract, so
@@ -248,11 +252,9 @@ def credential_pause_reason(ctx: Any) -> str | None:
     ):
         return "login_credentials_unresolved"
 
-    if getattr(ctx, "last_run_skipped_unbound_credentials", False) and not skip_test:
-        # A skip_test turn can still land here: _request_policy_allows_update_and_skip_run
-        # (guardrails.py) skips the run for a skip_test-deferred credential, same as it
-        # does for a credential_deferred_draft -- pausing here would contradict the same
-        # explicit "don't verify this yet" request the deferred-draft branch below excludes.
+    if getattr(ctx, "last_run_skipped_unbound_credentials", False) and not raw_secret_redacted_draft:
+        # This is a concrete run result, not a policy or classifier verdict. Preserve it
+        # even when legacy context labels the request as skip_test.
         return "workflow_credential_inputs_unbound"
 
     contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
@@ -268,24 +270,13 @@ def credential_pause_reason(ctx: Any) -> str | None:
     ):
         return "missing_credential_run_failure"
 
-    if (
-        isinstance(policy, RequestPolicy)
-        and policy.credential_draft_deferred_explicitly
-        # An explicit skip-test credential draft (request_policy.py's
-        # _apply_explicit_code_block_credential_draft_policy) means the user already said
-        # not to run/verify this -- pausing to ask for a credential contradicts that ask.
-        and not skip_test
-        and getattr(ctx, "update_workflow_called", False)
-    ):
-        return "credential_deferred_draft"
-
     return None
 
 
 def credential_pause_would_fire(ctx: Any, copilot_config: CopilotConfig | None) -> bool:
     """Synchronous subset of maybe_credential_pause's guards.
 
-    Called from both here and enforcement.py's _check_enforcement so the two
+    Called from both here and enforcement.py's enforcement_decision so the two
     can't drift: enforcement pre-empts hygiene nudges based on this same
     prediction, and a client/kill-switch/latch mismatch between the two would
     either suppress nudges for a pause that will never fire, or let a nudge
@@ -330,16 +321,15 @@ def _bind_connected_credential_origin(policy: RequestPolicy, credential: Credent
 
 
 def _apply_connected_credential_to_policy(ctx: Any, policy: RequestPolicy, credential: Credential) -> None:
-    """Grant the resumed loop run authority for ``credential``.
+    """Record ``credential`` as the explicit answer to the product-owned pause.
 
-    Load-bearing: without this, the resumed ``update_and_run_blocks`` call
-    re-skips via ``_request_policy_allows_update_and_skip_run`` (guardrails.py)
-    and the turn re-asks for the same credential.
+    The compatibility flags below describe the concrete credential-resume state;
+    they are not a generic tool-permission plane. Without them, the resumed
+    ``update_and_run_blocks`` call re-skips for the unresolved credential and the
+    turn re-asks for the same credential.
 
-    Also un-latches ``test_after_update_done``: the skipped run before the pause
-    already set it True, so without this reset a reply that never re-runs the
-    blocks would still clear enforcement's post_update nudge and finalize an
-    untested draft instead of being forced back through update_and_run_blocks.
+    Also un-latches ``test_after_update_done`` so the resumed run records fresh
+    verification state after the newly connected credential is applied.
     """
     ctx.test_after_update_done = False
     ctx.credential_pause_connected_credential_id = credential.credential_id
@@ -350,7 +340,12 @@ def _apply_connected_credential_to_policy(ctx: Any, policy: RequestPolicy, crede
         credential_id=credential.credential_id,
         bound_origin=loggable_origin(admitted_url) if admitted_url else None,
     )
-    policy.resolved_credentials.append(credential)
+    if credential.credential_id not in {resolved.credential_id for resolved in policy.resolved_credentials}:
+        policy.resolved_credentials.append(credential)
+    # The card answer is the user naming this credential, and it supersedes any earlier mention:
+    # the fill seam's which-credential check is set equality, so adding instead of replacing would
+    # refuse the very credential the user just picked.
+    policy.current_turn_named_credential_ids = {credential.credential_id}
     policy.allow_run_blocks = True
     policy.clarification_reason = "none"
     policy.allow_missing_credentials_in_draft = False
@@ -367,7 +362,7 @@ def _assemble_resume_messages(ctx: Any, text: str) -> list[dict[str, Any]]:
     from skyvern.forge.sdk.copilot.enforcement import _assemble_enforcement_messages, _consume_pending_screenshots
 
     screenshot_msg = _consume_pending_screenshots(ctx)
-    return _assemble_enforcement_messages(screenshot_msg, text, None)
+    return _assemble_enforcement_messages(screenshot_msg, text)
 
 
 def _connected_resume_text(credential: Credential) -> str:
@@ -630,9 +625,8 @@ async def preflight_credential_pause(
     if resolution is None or policy is None:
         return resolution
     policy.user_response_policy = "proceed"
-    # Trust-floor policy has not classified authoring intent yet. Grant the
-    # provisional policy baseline; the resumed TurnIntent pipeline decides
-    # whether the requested effect earns authoring authority.
+    # Record the explicit product-owned resume. These are compatibility facts for
+    # the credential flow, not generic update/run permissions.
     policy.allow_update_workflow = True
     policy.allow_run_blocks = True
     if resolution.action == "skip":

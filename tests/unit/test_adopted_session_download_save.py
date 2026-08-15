@@ -3,27 +3,63 @@
 On an adopted session the run connection owns the download artifact, but in prod the
 worker pod can tear the shared browser down before a deferred save_as runs. The helper
 saves eagerly and, when save_as raises (TargetClosedError) or yields a 0-byte file,
-re-fetches the replayable download url through the run page's request context.
+re-fetches the replayable download URL through the guarded file-fetch contract.
 
-For ``blob:`` URLs (client-side blobs minted by the page) the request-context fetch
-cannot be used; the helper runs an in-page ``fetch`` from a frame whose origin owns
-the blob and returns the bytes that way.
+For ``blob:`` URLs (client-side blobs minted by the page) guarded HTTP fetch cannot be
+used; the helper runs an in-page ``fetch`` from a frame whose origin owns the blob and
+returns the bytes that way.
 """
 
 import asyncio
 import base64
+from collections.abc import Awaitable, Callable
+from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
+from skyvern.forge.sdk.core.http_request_authorization import (
+    RunScopedRedirectHopAuthorizer,
+    deny_unenrolled_redirect_hop,
+)
 from skyvern.webeye.actions.handler import (
+    _adopted_session_download_binding,
     _EagerAdoptedBlobCapture,
     _read_adopted_session_blob_bytes,
-    _save_adopted_session_download,
 )
+from skyvern.webeye.actions.handler import _save_adopted_session_download as _save_adopted_session_download_impl
+from skyvern.webeye.browser_artifacts import DownloadBinding
+from skyvern.webeye.browser_factory import rebind_download_dir
+from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 
 PDF_BODY = b"%PDF-1.4\n" + b"x" * 830
+
+
+async def _authorize_request_hop(
+    _authorization: object,
+    dispatch: Callable[[tuple[str, ...]], Awaitable[object]],
+) -> object:
+    return await dispatch(())
+
+
+# Most tests below exercise save_as/blob recovery, never the guarded refetch itself, so they don't
+# care about the authorizer or headers — supply the permissive defaults here and let the handful of
+# tests that DO exercise the refetch pass their own.
+_save_adopted_session_download = partial(
+    _save_adopted_session_download_impl,
+    authorize_request_hop=_authorize_request_hop,
+    request_headers={},
+    download_scope=None,
+)
+
+
+def _guarded_fetch(*, body: bytes = PDF_BODY, side_effect: Exception | None = None):
+    fetch_file_bytes = AsyncMock(return_value=MagicMock(body=body), side_effect=side_effect)
+    return patch("skyvern.webeye.actions.handler.fetch_file_bytes", new=fetch_file_bytes)
 
 
 def _download(suggested: str = "153743777.pdf", url: str = "https://example.com/download") -> MagicMock:
@@ -38,6 +74,9 @@ def _download(suggested: str = "153743777.pdf", url: str = "https://example.com/
 
 
 def _page_with_refetch(status: int = 200, body: bytes = PDF_BODY) -> MagicMock:
+    # ``page.context.request.get`` is vestigial: the refetch path no longer calls the raw
+    # Playwright APIRequestContext, but keeping the mock harmless lets ``assert_not_awaited``
+    # assertions elsewhere in this file keep proving the raw path is never touched.
     response = MagicMock()
     response.status = status
     response.body = AsyncMock(return_value=body)
@@ -79,16 +118,63 @@ async def test_happy_path_eager_save_writes_bytes(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_dir_non_blob_suppresses_worker_replay(tmp_path) -> None:
+    # A provider-owned remote binding delivers the file through the provider destination, so the run
+    # connection has no bytes and a URL replay would run through the wrong identity. The helper must NOT
+    # save_as or replay; it returns None (signal only) so the loop keeps polling.
+    download = _download()
+    page = _page_with_refetch()
+
+    saved = await _save_adopted_session_download(
+        download, page, tmp_path, workflow_run_id="wr", download_binding=DownloadBinding.SESSION_DIR
+    )
+
+    assert saved is None
+    page.context.request.get.assert_not_awaited()
+    download.save_as.assert_not_awaited()
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_session_dir_blob_still_recovers_in_page(tmp_path) -> None:
+    # A blob download on a SESSION_DIR session is identity-safe via the in-page read (the bytes live in
+    # the page, not on any network), so it is still delivered — the suppression is non-blob only.
+    download = _download(url="blob:https://example.com/abc")
+    page = _page_with_refetch()
+
+    saved = await _save_adopted_session_download(
+        download,
+        page,
+        tmp_path,
+        workflow_run_id="wr",
+        download_binding=DownloadBinding.SESSION_DIR,
+        eager_blob_bytes=PDF_BODY,
+    )
+
+    assert saved is not None and saved.exists()
+    assert saved.read_bytes() == PDF_BODY
+    page.context.request.get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_save_as_raises_target_closed_falls_back_to_refetch(tmp_path) -> None:
     download = _download()
     download.save_as.side_effect = Exception("Target page, context or browser has been closed")
     page = _page_with_refetch()
 
-    saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+    with _guarded_fetch() as fetch_file_bytes:
+        saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
 
     assert saved is not None and saved.exists()
     assert saved.read_bytes() == PDF_BODY
-    page.context.request.get.assert_awaited_once_with(download.url, max_redirects=0)
+    fetch_file_bytes.assert_awaited_once_with(
+        download.url,
+        headers={},
+        authorize_request_hop=_authorize_request_hop,
+        download_scope=None,
+        approved_initial_url=download.url,
+    )
+    page.context.request.get.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -101,11 +187,18 @@ async def test_zero_byte_save_as_falls_back_to_refetch(tmp_path) -> None:
     download.save_as.side_effect = _save_empty
     page = _page_with_refetch()
 
-    saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+    with _guarded_fetch() as fetch_file_bytes:
+        saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
 
     assert saved is not None and saved.exists()
     assert saved.read_bytes() == PDF_BODY
-    page.context.request.get.assert_awaited_once_with(download.url, max_redirects=0)
+    fetch_file_bytes.assert_awaited_once_with(
+        download.url,
+        headers={},
+        authorize_request_hop=_authorize_request_hop,
+        download_scope=None,
+        approved_initial_url=download.url,
+    )
     # the empty placeholder must not survive alongside the recovered file
     assert sorted(p.name for p in tmp_path.iterdir()) == [saved.name]
 
@@ -114,9 +207,10 @@ async def test_zero_byte_save_as_falls_back_to_refetch(tmp_path) -> None:
 async def test_refetch_non_200_returns_none(tmp_path) -> None:
     download = _download()
     download.save_as.side_effect = Exception("closed")
-    page = _page_with_refetch(status=403, body=b"forbidden")
+    page = _page_with_refetch()
 
-    saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+    with _guarded_fetch(side_effect=Exception("403 forbidden")):
+        saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
 
     assert saved is None
     assert list(tmp_path.iterdir()) == []
@@ -126,9 +220,10 @@ async def test_refetch_non_200_returns_none(tmp_path) -> None:
 async def test_refetch_empty_body_returns_none(tmp_path) -> None:
     download = _download()
     download.save_as.side_effect = Exception("closed")
-    page = _page_with_refetch(status=200, body=b"")
+    page = _page_with_refetch()
 
-    saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+    with _guarded_fetch(body=b""):
+        saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
 
     assert saved is None
     assert list(tmp_path.iterdir()) == []
@@ -139,12 +234,28 @@ async def test_refetch_raises_returns_none(tmp_path) -> None:
     download = _download()
     download.save_as.side_effect = Exception("closed")
     page = MagicMock()
-    page.context.request.get = AsyncMock(side_effect=Exception("connection gone"))
 
-    saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+    with _guarded_fetch(side_effect=Exception("connection gone")):
+        saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
 
     assert saved is None
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_refetch_failure_does_not_log_signed_download_url(tmp_path) -> None:
+    download = _download(url="https://example.com/report.pdf?sig=url-secret")
+    download.save_as.side_effect = Exception("closed")
+    page = MagicMock()
+
+    with (
+        _guarded_fetch(side_effect=RuntimeError("https://example.com/report.pdf?sig=url-secret")),
+        capture_logs() as logs,
+    ):
+        saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+
+    assert saved is None
+    assert "url-secret" not in repr(logs)
 
 
 @pytest.mark.asyncio
@@ -159,13 +270,13 @@ async def test_partial_save_as_then_failed_refetch_leaves_no_orphan(tmp_path) ->
 
     download.save_as.side_effect = _save_partial_then_raise
     page = MagicMock()
-    page.context.request.get = AsyncMock(side_effect=Exception("connection gone"))
     page.frames = []
     page.main_frame = MagicMock()
     page.main_frame.url = "https://example.com/"
     page.main_frame.evaluate = AsyncMock()
 
-    saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
+    with _guarded_fetch(side_effect=Exception("connection gone")):
+        saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
 
     assert saved is None
     assert list(tmp_path.iterdir()) == []
@@ -803,11 +914,10 @@ def _resolvable_example_host(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_refetch_refuses_internal_destination(tmp_path, download_destinations, fake_api_request_context) -> None:
+async def test_refetch_refuses_internal_destination(tmp_path, download_destinations) -> None:
     download = _download(url=f"{download_destinations.internal_base}/internal")
     download.save_as.side_effect = Exception("Target page, context or browser has been closed")
     page = _page_with_refetch()
-    page.context.request = fake_api_request_context()
 
     saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
 
@@ -817,13 +927,10 @@ async def test_refetch_refuses_internal_destination(tmp_path, download_destinati
 
 
 @pytest.mark.asyncio
-async def test_refetch_refuses_redirect_hop_to_internal_destination(
-    tmp_path, download_destinations, fake_api_request_context
-) -> None:
+async def test_refetch_refuses_redirect_hop_to_internal_destination(tmp_path, download_destinations) -> None:
     download = _download(url=f"{download_destinations.public_base}/redirect-to-internal")
     download.save_as.side_effect = Exception("Target page, context or browser has been closed")
     page = _page_with_refetch()
-    page.context.request = fake_api_request_context()
 
     saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
 
@@ -833,14 +940,152 @@ async def test_refetch_refuses_redirect_hop_to_internal_destination(
 
 
 @pytest.mark.asyncio
-async def test_refetch_allows_permitted_destination(tmp_path, download_destinations, fake_api_request_context) -> None:
+async def test_refetch_allows_permitted_destination(tmp_path, download_destinations) -> None:
     # Non-vacuity: a permitted destination must still round-trip through the re-fetch path.
     download = _download(url=f"{download_destinations.public_base}/attachment")
     download.save_as.side_effect = Exception("Target page, context or browser has been closed")
     page = _page_with_refetch()
-    page.context.request = fake_api_request_context()
 
     saved = await _save_adopted_session_download(download, page, tmp_path, workflow_run_id="wr")
 
     assert saved is not None and saved.exists()
     assert saved.read_bytes() == download_destinations.PUBLIC_BODY
+
+
+def test_construction_without_collaborators_fails_closed(tmp_path) -> None:
+    """The production interceptor now requires an explicit network monitor and redirect-hop
+    authorizer; a bare construction must never silently substitute a default, which is how a
+    missing collaborator previously reached production undetected."""
+    with pytest.raises(TypeError):
+        CDPDownloadInterceptor(output_dir=str(tmp_path))  # type: ignore[call-arg]
+
+
+@pytest.mark.asyncio
+async def test_adopted_session_download_binding_yields_owning_interceptors_authorizer(tmp_path) -> None:
+    """The adopted-session refetch path must forward the exact authorizer bound on the page's
+    owning interceptor, not a default of its own."""
+    authorizer = RunScopedRedirectHopAuthorizer("wr_bound")
+    interceptor = CDPDownloadInterceptor(
+        output_dir=str(tmp_path),
+        network_egress_monitor=BrowserNetworkEgressMonitor.unenrolled(),
+        redirect_hop_authorizer=authorizer,
+    )
+
+    download = _download()
+    page = _page_with_refetch()
+    download.page = page
+    interceptor._page_context = page.context
+    page.context._skyvern_cdp_download_interceptor = interceptor
+    page.context._skyvern_cdp_download_interceptor_bind_lock = asyncio.Lock()
+
+    async with _adopted_session_download_binding(download, page) as (
+        bound_interceptor,
+        authorize_request_hop,
+        download_scope,
+    ):
+        assert bound_interceptor is interceptor
+        assert authorize_request_hop is authorizer
+        assert download_scope == "wr_bound"
+
+
+@pytest.mark.asyncio
+async def test_adopted_session_download_binding_blocks_scope_rotation_until_release(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "skyvern.webeye.browser_factory.get_download_dir",
+        lambda run_id: str(tmp_path / str(run_id)),
+    )
+    prior_authorizer = RunScopedRedirectHopAuthorizer("prior_run")
+    interceptor = CDPDownloadInterceptor(
+        output_dir=str(tmp_path / "prior_run"),
+        network_egress_monitor=BrowserNetworkEgressMonitor.unenrolled(),
+        redirect_hop_authorizer=prior_authorizer,
+    )
+    download = _download()
+    page = _page_with_refetch()
+    download.page = page
+    interceptor._page_context = page.context
+    page.context._skyvern_cdp_download_interceptor = interceptor
+    page.context._skyvern_cdp_download_interceptor_bind_lock = asyncio.Lock()
+    page.context._skyvern_download_run_id = "prior_run"
+    browser = MagicMock()
+    browser.contexts = [page.context]
+    browser.new_browser_cdp_session = AsyncMock()
+
+    async with _adopted_session_download_binding(download, page) as (
+        _bound_interceptor,
+        authorize_request_hop,
+        download_scope,
+    ):
+        rebinding = asyncio.create_task(rebind_download_dir(browser, run_id="next_run"))
+        await asyncio.sleep(0)
+        assert not rebinding.done()
+        assert authorize_request_hop is prior_authorizer
+        assert download_scope == "prior_run"
+
+    await asyncio.wait_for(rebinding, timeout=1)
+    assert interceptor.download_scope == "next_run"
+
+
+@pytest.mark.asyncio
+async def test_adopted_session_download_binding_skips_the_lease_for_a_provider_owned_binding() -> None:
+    """A provider-owned remote context carries neither the interceptor nor its ownership lock: the
+    creator that stamps SESSION_DIR binds no interceptor, and every download-dir rebind skips it."""
+    page = _page_with_refetch()
+    page.context = SimpleNamespace()
+    download = _download()
+    download.page = page
+
+    async with _adopted_session_download_binding(download, page, download_binding=DownloadBinding.SESSION_DIR) as (
+        bound_interceptor,
+        authorize_request_hop,
+        download_scope,
+    ):
+        assert bound_interceptor is None
+        assert authorize_request_hop is deny_unenrolled_redirect_hop
+        assert download_scope is None
+
+
+@pytest.mark.asyncio
+async def test_adopted_session_download_binding_still_demands_the_lease_for_a_run_dir_binding() -> None:
+    """The skip is scoped to the provider-owned binding; a run-dir context that lost its lock is
+    still a real defect and must not be waved through."""
+    page = _page_with_refetch()
+    page.context = SimpleNamespace()
+    download = _download()
+    download.page = page
+
+    with pytest.raises(RuntimeError, match="interceptor ownership lock"):
+        async with _adopted_session_download_binding(download, page):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_rebind_rotates_download_authority(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "skyvern.webeye.browser_factory.get_download_dir",
+        lambda run_id: str(tmp_path / str(run_id)),
+    )
+    prior_authorizer = RunScopedRedirectHopAuthorizer("prior_run")
+    interceptor = CDPDownloadInterceptor(
+        output_dir=str(tmp_path / "prior_run"),
+        network_egress_monitor=BrowserNetworkEgressMonitor.unenrolled(),
+        redirect_hop_authorizer=prior_authorizer,
+    )
+    context = MagicMock()
+    context._skyvern_cdp_download_interceptor = interceptor
+    context._skyvern_download_run_id = "prior_run"
+    cdp_session = MagicMock()
+    cdp_session.send = AsyncMock()
+    browser = MagicMock()
+    browser.contexts = [context]
+    browser.new_browser_cdp_session = AsyncMock(return_value=cdp_session)
+
+    await rebind_download_dir(browser, run_id="next_run")
+
+    assert interceptor._output_dir == tmp_path / "next_run"
+    assert isinstance(interceptor._redirect_hop_authorizer, RunScopedRedirectHopAuthorizer)
+    assert interceptor._redirect_hop_authorizer.download_scope == "next_run"
+    assert interceptor._redirect_hop_authorizer is not prior_authorizer
+    assert context._skyvern_download_run_id == "next_run"

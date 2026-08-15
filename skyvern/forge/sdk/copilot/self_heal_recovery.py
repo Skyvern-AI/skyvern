@@ -5,21 +5,44 @@ import json
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import structlog
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from skyvern.forge import app
+from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot import llm_config
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction
 from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.turn_origin import HealAdoptionFailed, TurnOrigin
+from skyvern.utils.strings import escape_code_fences
 
 if TYPE_CHECKING:
-    from skyvern.forge.sdk.copilot.turn_intent import TurnIntent
+    from skyvern.forge.sdk.experimentation.llm_prompt_config import LLMAPIHandler
 
 LOG = structlog.get_logger()
+
+_SELF_HEAL_OBSERVABLE_GOAL_PROMPT = "workflow-copilot-self-heal-observable-goal"
+_SELF_HEAL_GOAL_ENTAILMENT_PROMPT = "workflow-copilot-self-heal-goal-entailment"
+_SELF_HEAL_OBSERVABLE_GOAL_TIMEOUT_SECONDS = 10
+
+
+class _ObservableGoal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal["1"]
+    observable_end_state: str
+    source_citations: list[str]
+
+
+class _ObservableGoalEntailment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal["1"]
+    entails: bool
+
 
 _SELF_HEAL_MCP_TOOL_ALLOWLIST = frozenset(
     {
@@ -60,32 +83,6 @@ class SelfHealRecoveryResult:
     failure_note: str | None = None
 
 
-def _runtime_self_heal_intent() -> TurnIntent:
-    from skyvern.forge.sdk.copilot.turn_intent import (
-        TurnIntent,
-        TurnIntentAuthority,
-        TurnIntentExpectedOutput,
-        TurnIntentMode,
-        TurnIntentReasonCode,
-    )
-
-    authority = TurnIntentAuthority(
-        may_update_workflow=False,
-        may_run_blocks=False,
-        may_answer_without_mutation=True,
-        requires_user_input=False,
-        may_read_run_context=False,
-    )
-    return TurnIntent(
-        mode=TurnIntentMode.BUILD,
-        user_goal="runtime self-heal recovery",
-        authority=authority,
-        expected_output=TurnIntentExpectedOutput.EXPLANATION,
-        reason_codes=[TurnIntentReasonCode.REQUEST_POLICY_DERIVED],
-        confidence=1.0,
-    )
-
-
 def _self_heal_recovery_prompt(goal: str) -> str:
     return (
         "You are performing runtime self-heal recovery for a failed code block.\n"
@@ -95,7 +92,9 @@ def _self_heal_recovery_prompt(goal: str) -> str:
         "- Browser/scout tools only.\n"
         "- Never ask the user for input.\n"
         "- Never propose or mutate workflow YAML.\n"
-        '- Final answer must be strict JSON: {"type":"REPLY","user_response":"<short completion claim>"}.\n'
+        "- The completion claim must describe only the observable page state now visible after recovery, "
+        "not the action you performed.\n"
+        '- Final answer must be strict JSON: {"type":"REPLY","user_response":"<observable end state>"}.\n'
     )
 
 
@@ -132,6 +131,54 @@ def _classify_terminal_reply(final_text: str) -> str:
     if response_type == "REPLY":
         return "reply"
     return "unparseable_terminal"
+
+
+async def _derive_observable_goal(goal: str, handler: LLMAPIHandler | None) -> str:
+    """Derive the judge's criterion independently, before the acting loop can influence it."""
+    if handler is None:
+        return ""
+    try:
+        prompt = prompt_engine.load_prompt(
+            template=_SELF_HEAL_OBSERVABLE_GOAL_PROMPT,
+            recovery_goal=escape_code_fences(goal[:8000]),
+        )
+        raw = await asyncio.wait_for(
+            handler(prompt=prompt, prompt_name=_SELF_HEAL_OBSERVABLE_GOAL_PROMPT),
+            timeout=_SELF_HEAL_OBSERVABLE_GOAL_TIMEOUT_SECONDS,
+        )
+        if isinstance(raw, str):
+            from skyvern.forge.sdk.copilot.output_utils import parse_final_response
+
+            raw = parse_final_response(raw)
+        parsed = _ObservableGoal.model_validate(raw)
+        observable_end_state = parsed.observable_end_state.strip()
+        citations = parsed.source_citations
+        citations_are_grounded = bool(citations) and all(citation and citation in goal for citation in citations)
+        if not observable_end_state or not citations_are_grounded:
+            return ""
+        entailment_prompt = prompt_engine.load_prompt(
+            template=_SELF_HEAL_GOAL_ENTAILMENT_PROMPT,
+            recovery_goal=escape_code_fences(goal[:8000]),
+            observable_end_state=escape_code_fences(observable_end_state[:4000]),
+        )
+        entailment_raw = await asyncio.wait_for(
+            handler(prompt=entailment_prompt, prompt_name=_SELF_HEAL_GOAL_ENTAILMENT_PROMPT),
+            timeout=_SELF_HEAL_OBSERVABLE_GOAL_TIMEOUT_SECONDS,
+        )
+        if isinstance(entailment_raw, str):
+            from skyvern.forge.sdk.copilot.output_utils import parse_final_response
+
+            entailment_raw = parse_final_response(entailment_raw)
+        entailment = _ObservableGoalEntailment.model_validate(entailment_raw)
+        if entailment.entails is not True:
+            return ""
+        return observable_end_state
+    except (ValidationError, asyncio.TimeoutError):
+        LOG.warning("Runtime self-heal observable-goal derivation returned invalid output", exc_info=True)
+        return ""
+    except Exception:
+        LOG.warning("Runtime self-heal observable-goal derivation failed", exc_info=True)
+        return ""
 
 
 def _count_successful_self_heal_browser_calls(ctx: AgentContext) -> int:
@@ -176,7 +223,7 @@ def _performed_mutation_during_self_heal(ctx: AgentContext) -> bool:
 async def _seed_completion_criteria(
     ctx: AgentContext,
     *,
-    composed_goal: str,
+    observable_goal: str,
     organization_id: str,
     llm_handler: Any,
     copilot_config: Any,
@@ -184,38 +231,25 @@ async def _seed_completion_criteria(
     workflow_run_block_id: str,
 ) -> bool:
     try:
-        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+        from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 
-        # A runtime heal is verified from the post-recovery page, so criteria must be phrased as
-        # the observable end state (what is or is not present), not the actions taken to reach it.
-        # An action-phrased criterion ("the Accept button is clicked") is unverifiable from a page
-        # snapshot and forces every heal to regress to the floor.
-        verification_request = (
-            f"{composed_goal}\n\n"
-            "Define completion criteria strictly as the observable end state of the page once this "
-            "is achieved (what becomes visible, or is no longer visible), never as the actions taken."
-        )
-        policy = await build_request_policy(
-            user_message=verification_request,
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id=organization_id,
-            handler=llm_handler,
-            config=copilot_config,
+        del organization_id, llm_handler, copilot_config
+        observable_goal = observable_goal.strip()
+        if not observable_goal:
+            return False
+        policy = RequestPolicy(
+            completion_contract=observable_goal,
+            completion_contract_status="present",
+            completion_criteria=[
+                CompletionCriterion(
+                    id="runtime_self_heal_observable_goal",
+                    outcome=observable_goal,
+                    kind="outcome",
+                    level="run",
+                )
+            ],
         )
         ctx.request_policy = policy
-        # verification_seeded must mean "there is something to grade", not merely "the call
-        # returned". Current main's criteria generator is conservative, and a machine-written heal
-        # goal can yield zero gradeable criteria, which makes verified=True unreachable and would
-        # silently regress every such heal to the floor. Surface it as a distinct signal instead.
-        if not policy.graded_completion_criteria():
-            LOG.warning(
-                "Runtime self-heal produced no gradeable completion criteria; verification cannot pass",
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-            )
-            return False
         return True
     except Exception:
         LOG.warning(
@@ -307,7 +341,6 @@ async def run_self_heal_recovery(
         injected_browser_state=browser_state,
         heal_workflow_run_id=workflow_run_id,
     )
-    ctx.turn_intent = _runtime_self_heal_intent()
 
     copilot_config = app.AGENT_FUNCTION.get_copilot_config() or CopilotConfig()
     copilot_config.max_turns = min(copilot_config.max_turns, max_actions + 1)
@@ -335,6 +368,16 @@ async def run_self_heal_recovery(
     started = time.monotonic()
     try:
         async with asyncio.timeout(wall_clock_budget_seconds):
+            observable_goal = await _derive_observable_goal(composed_goal, llm_handler)
+            if not observable_goal:
+                return SelfHealRecoveryResult(
+                    success=False,
+                    verified=False,
+                    action_count=0,
+                    wall_clock_ms=int((time.monotonic() - started) * 1000),
+                    scout_trajectory=[],
+                    failure_note="no_gradeable_criteria",
+                )
             from agents import GuardrailFunctionOutput, OutputGuardrail
 
             from skyvern.forge.sdk.copilot.agent import (
@@ -373,13 +416,14 @@ async def run_self_heal_recovery(
                     workflow_run_block_id=workflow_run_block_id,
                 )
                 result = None
-            # Seed completion criteria AFTER the loop: build_request_policy classifies the heal
-            # goal as an authoring request, so pre-loop seeding drives the browser-only agent to
-            # call workflow-authoring tools (update_workflow) absent from its surface. Post-loop,
-            # only the judge reads the criteria.
+            from skyvern.forge.sdk.copilot.output_utils import extract_final_text
+
+            final_text = extract_final_text(result) if result is not None else ""
+            # Seed the independently derived criterion only after the loop so it cannot alter
+            # acting-tool behavior, while the actor can never redefine its own success condition.
             verification_seeded = await _seed_completion_criteria(
                 ctx,
-                composed_goal=composed_goal,
+                observable_goal=observable_goal,
                 organization_id=organization_id,
                 llm_handler=llm_handler,
                 copilot_config=copilot_config,
@@ -421,9 +465,6 @@ async def run_self_heal_recovery(
         )
 
     wall_clock_ms = int((time.monotonic() - started) * 1000)
-    from skyvern.forge.sdk.copilot.output_utils import extract_final_text
-
-    final_text = extract_final_text(result) if result is not None else ""
     action_count = _effective_action_count(ctx)
     verified = verification_seeded and outcome_fully_verified(ctx)
     if action_count > max_actions:

@@ -406,11 +406,9 @@ or what the data looks like), not the schema.
 
 ## Caching Considerations
 
-Workflows created via MCP default to AI agent execution (run_with="agent"). For JSON definitions \
-code_version=2 is also injected by default; YAML definitions use the backend schema (currently \
-leaves code_version unset, so pass `code_version: 2` explicitly in YAML if you want to opt into \
-the v2 caching framework). Set run_with="code" on the workflow (or at run time) to opt into cached \
-script execution.
+When omitted, run_with defaults to "agent" and code_version defaults to 2 for workflows created \
+via MCP, for both JSON and YAML definitions. Set run_with="code" on the workflow (or at run time) \
+to opt into cached script execution.
 {CODE_ONLY_SCHEMA_GUIDANCE}
 
 ### What this means for workflow design
@@ -504,10 +502,10 @@ def extract_data(
 # qa_test
 # ---------------------------------------------------------------------------
 
-# NOTE: The local/stdio QA workflow is maintained in three places — keep all in sync:
-# 1. skyvern/cli/skills/qa/SKILL.md         (bundled with pip package — canonical)
-# 2. .claude/skills/qa/SKILL.md              (project-local copy for this repo)
-# 3. skyvern/cli/mcp_tools/prompts.py        (QA_TEST_CONTENT — this file)
+# NOTE: .agents/skills/qa/SKILL.md is the repository canonical source.
+# Keep both synchronized copies in sync with it:
+# 1. skyvern/cli/skills/qa/SKILL.md  (bundled with the pip package)
+# 2. skyvern/cli/mcp_tools/prompts.py (QA_TEST_CONTENT — this file)
 # The MCP prompt renderer adds a stateless-HTTP variant at runtime for remote
 # connectors, because those clients cannot assume local shell/filesystem/gh access.
 QA_TEST_CONTENT = """\

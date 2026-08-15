@@ -746,6 +746,7 @@ class WorkflowRunModel(Base):
     totp_identifier = Column(String)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     max_elapsed_time_minutes = Column(Integer, nullable=True)
+    browser_runtime = Column(String, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
     cdp_connect_headers = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True, index=True)
@@ -774,6 +775,12 @@ class WorkflowRunModel(Base):
     ignore_inherited_workflow_system_prompt = Column(
         Boolean, nullable=False, default=False, server_default=sqlalchemy.false()
     )
+    # The secure-CodeBlock verdict resolved when this run was routed. The routing decision it
+    # feeds (which cluster the run lands on) is made once, at publication, but the gates that
+    # consume it run later in a different process; re-resolving the rollout flag there lets a
+    # mid-run flag edit strand the run on a cluster with no runner. NULL means the run predates
+    # the pin, and the gates resolve the flag as before.
+    secure_runner_pinned = Column(Boolean, nullable=True)
     copilot_session_id = Column(String, nullable=True)
 
     credits_used = Column(Integer, nullable=True, default=0, server_default="0")
@@ -1556,6 +1563,7 @@ class CredentialModel(Base):
     card_brand = Column(String, nullable=True)
     secret_label = Column(String, nullable=True)
     browser_profile_id = Column(String, nullable=True)
+    auto_profile_disabled = Column(Boolean, nullable=True, default=False)
     tested_url = Column(String, nullable=True)
     user_context = Column(String(1000), nullable=True)
     save_browser_session_intent = Column(Boolean, nullable=True, default=False)

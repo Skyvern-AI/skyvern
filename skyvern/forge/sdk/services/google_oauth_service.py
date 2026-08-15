@@ -58,11 +58,9 @@ GOOGLE_REVOKE_ENDPOINT = "https://oauth2.googleapis.com/revoke"
 
 # Spreadsheets + Drive scopes for the picker UX:
 # - spreadsheets: read/write sheet cells and create new spreadsheets
-# - drive.file: list/read spreadsheets this integration created or the user picked
 # - drive.metadata.readonly: list file metadata (required for the picker search)
 GOOGLE_SHEETS_SCOPES: tuple[str, ...] = (
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/drive.metadata.readonly",
 )
 GOOGLE_GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
@@ -497,7 +495,6 @@ def build_authorize_url(
     url, _returned_state = flow.authorization_url(
         access_type="offline",
         prompt="consent",
-        include_granted_scopes="true",
     )
     # Flow.code_verifier is None when autogenerate is False AND we didn't set
     # it; that path is unreachable here, but raise (not assert) so a future

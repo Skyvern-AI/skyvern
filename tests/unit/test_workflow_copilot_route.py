@@ -74,6 +74,33 @@ def _default_terminal_envelope_render_flag(monkeypatch: pytest.MonkeyPatch) -> N
     )
 
 
+@pytest.fixture
+def organization() -> SimpleNamespace:
+    return SimpleNamespace(organization_id="org-1")
+
+
+@pytest.fixture
+def anon_request() -> MagicMock:
+    request = MagicMock()
+    request.headers = {}
+    return request
+
+
+@pytest.fixture
+def api_key_request() -> MagicMock:
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test-key"}
+    return request
+
+
+@pytest.fixture
+def copilot_stream() -> MagicMock:
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+    stream.is_disconnected = AsyncMock(return_value=False)
+    return stream
+
+
 def _make_chat_request(
     mode: str | None = None, code_block: bool | None = None, keep_pending_proposal: bool = False
 ) -> WorkflowCopilotChatRequest:
@@ -95,7 +122,7 @@ def _terminal_payload(
     verified: bool,
     workflow_applied: bool,
     workflow_mutated: bool = True,
-    turn_outcome_response_kind: str = "build",
+    workflow_attempted: bool = True,
 ) -> dict[str, Any]:
     envelope = assemble_terminal_envelope(
         response_type="REPLY",
@@ -107,7 +134,7 @@ def _terminal_payload(
         halt_kind=None,
         attempted="Attempted full run.",
         workflow_mutated=workflow_mutated,
-        turn_outcome_response_kind=turn_outcome_response_kind,
+        workflow_attempted=workflow_attempted,
     )
     assert envelope is not None
     return envelope.model_dump(mode="json")
@@ -370,6 +397,35 @@ def test_chat_history_preserves_terminal_envelope() -> None:
     assert served["terminalEnvelope"]["rendered_from_envelope"] is True
 
 
+def test_finalized_terminal_envelope_omits_recorded_output_from_telemetry() -> None:
+    output_report = 'Recorded output from the latest completed run: {"customer_record":"synthetic"}'
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=None,
+        global_llm_context=None,
+        response_type="REPLY",
+        terminal_envelope={
+            **_terminal_payload(verified=False, workflow_applied=False),
+            "run_output_report": output_report,
+        },
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        finalized = workflow_copilot_route._finalized_terminal_envelope(
+            agent_result,
+            workflow_applied=False,
+            final_message="done",
+            response_type="REPLY",
+        )
+
+    assert finalized is not None
+    _, payload = finalized
+    assert payload["run_output_report"] == output_report
+    terminal_log = next(log for log in logs if log["event"] == "copilot_terminal_envelope")
+    assert "run_output_report" not in terminal_log
+    assert output_report not in str(terminal_log)
+
+
 @pytest.mark.asyncio
 async def test_cancel_turn_finalizes_terminal_envelope_to_non_completed_state(
     monkeypatch: pytest.MonkeyPatch,
@@ -558,7 +614,7 @@ async def test_finalise_normal_turn_preserves_and_persists_answer_outcome(
             verified=False,
             workflow_applied=False,
             workflow_mutated=False,
-            turn_outcome_response_kind="answer",
+            workflow_attempted=False,
         ),
     )
     setup_workflow = SimpleNamespace(workflow_id="wf-canonical")
@@ -1073,7 +1129,9 @@ def _install_mock_provider(
 
 
 @pytest.mark.asyncio
-async def test_request_mode_ask_forces_v1_over_flag_on(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_request_mode_ask_forces_v1_over_flag_on(
+    monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace
+) -> None:
     """mode='ask' must take the v1 path even when the settings flag is on."""
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
 
@@ -1085,18 +1143,16 @@ async def test_request_mode_ask_forces_v1_over_flag_on(monkeypatch: pytest.Monke
 
     captured = install_fake_create(monkeypatch)
 
-    request = MagicMock()
-    request.headers = {}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(mode="ask"), organization)
+    response = await workflow_copilot_chat_post(anon_request, _make_chat_request(mode="ask"), organization)
 
     assert response is captured["sentinel"]
     new_copilot_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_request_mode_build_forces_v2_over_flag_off(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_request_mode_build_forces_v2_over_flag_off(
+    monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace
+) -> None:
     """mode='build' must take the v2 path even when the settings flag is off."""
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
     _install_mock_provider(monkeypatch, return_value=False)
@@ -1108,18 +1164,16 @@ async def test_request_mode_build_forces_v2_over_flag_off(monkeypatch: pytest.Mo
         new_copilot_mock,
     )
 
-    request = MagicMock()
-    request.headers = {}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(mode="build"), organization)
+    response = await workflow_copilot_chat_post(anon_request, _make_chat_request(mode="build"), organization)
 
     assert response is sentinel
     new_copilot_mock.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_request_mode_absent_follows_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_request_mode_absent_follows_flag(
+    monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace
+) -> None:
     """mode absent (None) keeps following the settings flag in both directions."""
     new_copilot_mock = AsyncMock(return_value=object())
     monkeypatch.setattr(
@@ -1128,18 +1182,14 @@ async def test_request_mode_absent_follows_flag(monkeypatch: pytest.MonkeyPatch)
     )
     captured = install_fake_create(monkeypatch)
 
-    request = MagicMock()
-    request.headers = {}
-    organization = SimpleNamespace(organization_id="org-1")
-
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
     _install_mock_provider(monkeypatch, return_value=False)
-    response = await workflow_copilot_chat_post(request, _make_chat_request(mode=None), organization)
+    response = await workflow_copilot_chat_post(anon_request, _make_chat_request(mode=None), organization)
     assert response is captured["sentinel"]
     new_copilot_mock.assert_not_awaited()
 
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
-    response = await workflow_copilot_chat_post(request, _make_chat_request(mode=None), organization)
+    response = await workflow_copilot_chat_post(anon_request, _make_chat_request(mode=None), organization)
     assert response is new_copilot_mock.return_value
     new_copilot_mock.assert_awaited_once()
 
@@ -1167,6 +1217,8 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
     workflow_was_persisted: bool,
     has_valid_proposal: bool,
     expect_restore: bool,
+    api_key_request: MagicMock,
+    organization: SimpleNamespace,
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
 
@@ -1201,11 +1253,7 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
 
     restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
 
-    request = MagicMock()
-    request.headers = {"x-api-key": "sk-test-key"}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    response = await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
     assert response is captured["sentinel"]
 
     stream = MagicMock()
@@ -1225,7 +1273,9 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
 
 
 @pytest.mark.asyncio
-async def test_flag_on_pre_agent_failure_persists_recoverable_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_flag_on_pre_agent_failure_persists_recoverable_reply(
+    monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, copilot_stream: MagicMock, organization: SimpleNamespace
+) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
     captured = install_fake_create(monkeypatch)
 
@@ -1282,20 +1332,12 @@ async def test_flag_on_pre_agent_failure_persists_recoverable_reply(monkeypatch:
     app.AGENT_FUNCTION.get_copilot_config_for_request = AsyncMock(return_value=None)
     app.AGENT_FUNCTION.resolve_org_api_key = AsyncMock(return_value="sk-test-key")
 
-    request = MagicMock()
-    request.headers = {}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    response = await workflow_copilot_chat_post(anon_request, _make_chat_request(), organization)
     assert response is captured["sentinel"]
-
-    stream = MagicMock()
-    stream.send = AsyncMock(return_value=True)
-    stream.is_disconnected = AsyncMock(return_value=False)
 
     handler = captured["handler"]
     assert callable(handler)
-    await handler(stream)
+    await handler(copilot_stream)
 
     contents = [
         call.kwargs.get("content") for call in workflow_params.create_workflow_copilot_chat_message.await_args_list
@@ -1308,7 +1350,7 @@ async def test_flag_on_pre_agent_failure_persists_recoverable_reply(monkeypatch:
     assert "The workflow was not modified" in assistant_contents[0]
     assert "reference cpe_" in assistant_contents[0]
 
-    frames = [call.args[0] for call in stream.send.await_args_list if call.args]
+    frames = [call.args[0] for call in copilot_stream.send.await_args_list if call.args]
     response_frames = [frame for frame in frames if isinstance(frame, WorkflowCopilotStreamResponseUpdate)]
     assert response_frames
     assert response_frames[-1].narrative_payload is not None
@@ -1328,6 +1370,9 @@ async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
     monkeypatch: pytest.MonkeyPatch,
     error: BaseException,
     expected_summary: str,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
     captured = install_fake_create(monkeypatch)
@@ -1361,26 +1406,20 @@ async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
         AsyncMock(side_effect=error),
     )
 
-    request = MagicMock()
-    request.headers = {"x-api-key": "sk-test-key"}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    response = await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
     assert response is captured["sentinel"]
-
-    stream = MagicMock()
-    stream.send = AsyncMock(return_value=True)
-    stream.is_disconnected = AsyncMock(return_value=False)
 
     handler = captured["handler"]
     assert callable(handler)
-    await handler(stream)
+    await handler(copilot_stream)
 
     contents = [
         call.kwargs.get("content")
         for call in app.DATABASE.workflow_params.create_workflow_copilot_chat_message.await_args_list
     ]
-    assert app.DATABASE.workflow_params.start_copilot_turn.await_args.kwargs["user_message"] == "Please update it"
+    assert app.DATABASE.workflow_params.start_copilot_turn.await_args.kwargs["user_message"] == (
+        "[Message unavailable because safety screening did not complete]"
+    )
     assistant_contents = [content for content in contents if isinstance(content, str)]
     assert len(assistant_contents) == 1
     assert expected_summary in assistant_contents[0]
@@ -1400,7 +1439,7 @@ async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
     assert turn_outcome.copilot_effective_mode == "build"
     assert turn_outcome.copilot_turn_id is not None
 
-    frames = [call.args[0] for call in stream.send.await_args_list if call.args]
+    frames = [call.args[0] for call in copilot_stream.send.await_args_list if call.args]
     response_frames = [frame for frame in frames if isinstance(frame, WorkflowCopilotStreamResponseUpdate)]
     assert response_frames
     assert response_frames[-1].narrative_payload is not None
@@ -1409,8 +1448,66 @@ async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
 
 
 @pytest.mark.asyncio
+async def test_v2_route_never_persists_unscreened_user_message(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = SimpleNamespace(
+        user_response="I created a redacted draft.",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        unvalidated=False,
+        turn_outcome=None,
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    literal = "The password is semantic-secret-value"
+    canonical = "The password is [REDACTED_SECRET]"
+
+    async def _run_with_safety_redaction(**kwargs: Any) -> Any:
+        kwargs["chat_request"].message = canonical
+        await kwargs["persist_canonical_user_message"](canonical)
+        return agent_result
+
+    monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", _run_with_safety_redaction)
+    request = _make_chat_request()
+    request.message = literal
+
+    response = await workflow_copilot_chat_post(api_key_request, request, organization)
+    assert response is captured["sentinel"]
+    await captured["handler"](copilot_stream)
+
+    assert workflow_params.start_copilot_turn.await_args.kwargs["user_message"] != literal
+    replace_call = workflow_params.replace_workflow_copilot_chat_message.await_args
+    assert replace_call.kwargs["workflow_copilot_chat_message_id"] == "wccm-user-1"
+    assert replace_call.kwargs["content"] == canonical
+
+
+@pytest.mark.asyncio
 async def test_route_error_after_restore_reports_workflow_not_modified(
     monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
     captured = install_fake_create(monkeypatch)
@@ -1450,20 +1547,12 @@ async def test_route_error_after_restore_reports_workflow_not_modified(
 
     monkeypatch.setattr(workflow_copilot_route, "_finalise_normal_turn", flaky_finalise)
 
-    request = MagicMock()
-    request.headers = {"x-api-key": "sk-test-key"}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    response = await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
     assert response is captured["sentinel"]
-
-    stream = MagicMock()
-    stream.send = AsyncMock(return_value=True)
-    stream.is_disconnected = AsyncMock(return_value=False)
 
     handler = captured["handler"]
     assert callable(handler)
-    await handler(stream)
+    await handler(copilot_stream)
 
     restore_mock.assert_awaited_once()
     assert len(finalise_results) == 2
@@ -1485,6 +1574,57 @@ async def test_route_error_after_restore_reports_workflow_not_modified(
 
 
 @pytest.mark.asyncio
+async def test_pre_agent_config_error_uses_default_turn_index_during_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = SimpleNamespace(
+        user_response="unused",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        unvalidated=False,
+        turn_outcome=None,
+    )
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    app.AGENT_FUNCTION.get_copilot_config_for_request = AsyncMock(side_effect=RuntimeError("config boom"))
+
+    response = await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
+    assert response is captured["sentinel"]
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(copilot_stream)
+
+    assistant_rows = [
+        call
+        for call in app.DATABASE.workflow_params.create_workflow_copilot_chat_message.await_args_list
+        if call.kwargs.get("sender") == WorkflowCopilotChatSender.AI
+    ]
+    assert len(assistant_rows) == 1
+    assert assistant_rows[0].kwargs["narrative_payload"]["turnIndex"] == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "raised_error",
     [RuntimeError("post-agent route boom"), LLMProviderError("OPENAI_GPT5_5")],
@@ -1493,6 +1633,9 @@ async def test_route_error_after_restore_reports_workflow_not_modified(
 async def test_route_error_after_restore_keeps_bypassed_proposal_when_keep_pending(
     monkeypatch: pytest.MonkeyPatch,
     raised_error: BaseException,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
 ) -> None:
     # Route-level (not direct-function-call) pin: keep_pending_proposal must
     # reach both exception-recovery call sites, not just _persist_proposed_workflow_state.
@@ -1534,20 +1677,14 @@ async def test_route_error_after_restore_keeps_bypassed_proposal_when_keep_pendi
 
     monkeypatch.setattr(workflow_copilot_route, "_finalise_normal_turn", flaky_finalise)
 
-    request = MagicMock()
-    request.headers = {"x-api-key": "sk-test-key"}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(keep_pending_proposal=True), organization)
+    response = await workflow_copilot_chat_post(
+        api_key_request, _make_chat_request(keep_pending_proposal=True), organization
+    )
     assert response is captured["sentinel"]
-
-    stream = MagicMock()
-    stream.send = AsyncMock(return_value=True)
-    stream.is_disconnected = AsyncMock(return_value=False)
 
     handler = captured["handler"]
     assert callable(handler)
-    await handler(stream)
+    await handler(copilot_stream)
 
     restore_mock.assert_awaited_once()
     assert len(finalise_results) == 2
@@ -1567,6 +1704,9 @@ async def test_route_error_after_restore_keeps_bypassed_proposal_when_keep_pendi
 async def test_route_error_honors_real_agent_explicit_clear_despite_keep_pending(
     monkeypatch: pytest.MonkeyPatch,
     raised_error: BaseException,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
 ) -> None:
     # The real (pre-exception) agent_result can itself carry clear_proposed_workflow=True;
     # the recovery path must not silently drop that signal just because it's rebuilding
@@ -1609,20 +1749,14 @@ async def test_route_error_honors_real_agent_explicit_clear_despite_keep_pending
 
     monkeypatch.setattr(workflow_copilot_route, "_finalise_normal_turn", flaky_finalise)
 
-    request = MagicMock()
-    request.headers = {"x-api-key": "sk-test-key"}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(keep_pending_proposal=True), organization)
+    response = await workflow_copilot_chat_post(
+        api_key_request, _make_chat_request(keep_pending_proposal=True), organization
+    )
     assert response is captured["sentinel"]
-
-    stream = MagicMock()
-    stream.send = AsyncMock(return_value=True)
-    stream.is_disconnected = AsyncMock(return_value=False)
 
     handler = captured["handler"]
     assert callable(handler)
-    await handler(stream)
+    await handler(copilot_stream)
 
     restore_mock.assert_awaited_once()
     assert len(finalise_results) == 2
@@ -1644,6 +1778,9 @@ async def test_route_error_honors_real_agent_explicit_clear_despite_keep_pending
 async def test_route_error_after_staged_commit_clears_stale_proposal_despite_keep_pending(
     monkeypatch: pytest.MonkeyPatch,
     raised_error: BaseException,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
 ) -> None:
     # An auto-accept turn eligible for a staged commit (has_staged_proposal=True) that
     # then hits an exception elsewhere in finalisation still invalidates a stale kept
@@ -1689,20 +1826,14 @@ async def test_route_error_after_staged_commit_clears_stale_proposal_despite_kee
 
     monkeypatch.setattr(workflow_copilot_route, "_finalise_normal_turn", flaky_finalise)
 
-    request = MagicMock()
-    request.headers = {"x-api-key": "sk-test-key"}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(keep_pending_proposal=True), organization)
+    response = await workflow_copilot_chat_post(
+        api_key_request, _make_chat_request(keep_pending_proposal=True), organization
+    )
     assert response is captured["sentinel"]
-
-    stream = MagicMock()
-    stream.send = AsyncMock(return_value=True)
-    stream.is_disconnected = AsyncMock(return_value=False)
 
     handler = captured["handler"]
     assert callable(handler)
-    await handler(stream)
+    await handler(copilot_stream)
 
     restore_mock.assert_not_awaited()
     assert len(finalise_results) == 2
@@ -1774,6 +1905,9 @@ async def test_finalise_normal_turn_clears_stale_proposal_when_rollback_itself_f
 async def test_route_error_recovery_clears_stale_proposal_when_its_own_rollback_fails(
     monkeypatch: pytest.MonkeyPatch,
     raised_error: BaseException,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
 ) -> None:
     # The recovery block's OWN restore attempt (not the main flow's — flaky_finalise
     # bypasses that entirely) can itself fail; that must still force-clear a kept
@@ -1817,20 +1951,14 @@ async def test_route_error_recovery_clears_stale_proposal_when_its_own_rollback_
 
     monkeypatch.setattr(workflow_copilot_route, "_finalise_normal_turn", flaky_finalise)
 
-    request = MagicMock()
-    request.headers = {"x-api-key": "sk-test-key"}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(keep_pending_proposal=True), organization)
+    response = await workflow_copilot_chat_post(
+        api_key_request, _make_chat_request(keep_pending_proposal=True), organization
+    )
     assert response is captured["sentinel"]
-
-    stream = MagicMock()
-    stream.send = AsyncMock(return_value=True)
-    stream.is_disconnected = AsyncMock(return_value=False)
 
     handler = captured["handler"]
     assert callable(handler)
-    await handler(stream)
+    await handler(copilot_stream)
 
     assert len(finalise_results) == 2
     recovered_result = finalise_results[1]
@@ -1849,6 +1977,9 @@ async def test_route_error_recovery_clears_stale_proposal_when_its_own_rollback_
 async def test_route_error_before_write_keeps_older_proposal_despite_attempted_fresh_draft(
     monkeypatch: pytest.MonkeyPatch,
     raised_error: BaseException,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
 ) -> None:
     # Negative companion to test_route_error_after_real_fresh_write_clears_it_even_with_
     # no_prior_proposal: agent_result.updated_workflow being SET only means a write was
@@ -1874,7 +2005,7 @@ async def test_route_error_before_write_keeps_older_proposal_despite_attempted_f
     )
     agent_result = SimpleNamespace(
         user_response="unused",
-        updated_workflow=SimpleNamespace(model_dump=lambda mode: {"title": "fresh draft"}),
+        updated_workflow=SimpleNamespace(title="fresh draft", model_dump=lambda mode: {"title": "fresh draft"}),
         global_llm_context=None,
         workflow_yaml="title: fresh draft\n",
         workflow_was_persisted=False,
@@ -1896,20 +2027,14 @@ async def test_route_error_before_write_keeps_older_proposal_despite_attempted_f
 
     monkeypatch.setattr(workflow_copilot_route, "_finalise_normal_turn", flaky_finalise)
 
-    request = MagicMock()
-    request.headers = {"x-api-key": "sk-test-key"}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(keep_pending_proposal=True), organization)
+    response = await workflow_copilot_chat_post(
+        api_key_request, _make_chat_request(keep_pending_proposal=True), organization
+    )
     assert response is captured["sentinel"]
-
-    stream = MagicMock()
-    stream.send = AsyncMock(return_value=True)
-    stream.is_disconnected = AsyncMock(return_value=False)
 
     handler = captured["handler"]
     assert callable(handler)
-    await handler(stream)
+    await handler(copilot_stream)
 
     restore_mock.assert_not_awaited()
     assert len(finalise_results) == 2
@@ -1921,6 +2046,9 @@ async def test_route_error_before_write_keeps_older_proposal_despite_attempted_f
 @pytest.mark.asyncio
 async def test_route_error_after_real_fresh_write_clears_it_even_with_no_prior_proposal(
     monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
 ) -> None:
     # Unlike the flaky_finalise-based tests above (which bypass _finalise_normal_turn's
     # real body entirely), this lets the REAL first attempt genuinely write the fresh
@@ -1947,7 +2075,7 @@ async def test_route_error_after_real_fresh_write_clears_it_even_with_no_prior_p
     )
     agent_result = SimpleNamespace(
         user_response="Here is your draft.",
-        updated_workflow=SimpleNamespace(model_dump=lambda mode: {"title": "fresh draft"}),
+        updated_workflow=SimpleNamespace(title="fresh draft", model_dump=lambda mode: {"title": "fresh draft"}),
         global_llm_context=None,
         workflow_yaml="title: fresh draft\n",
         workflow_was_persisted=False,
@@ -1969,20 +2097,14 @@ async def test_route_error_after_real_fresh_write_clears_it_even_with_no_prior_p
 
     workflow_params.create_workflow_copilot_chat_message = AsyncMock(side_effect=flaky_create_message)
 
-    request = MagicMock()
-    request.headers = {"x-api-key": "sk-test-key"}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(keep_pending_proposal=True), organization)
+    response = await workflow_copilot_chat_post(
+        api_key_request, _make_chat_request(keep_pending_proposal=True), organization
+    )
     assert response is captured["sentinel"]
-
-    stream = MagicMock()
-    stream.send = AsyncMock(return_value=True)
-    stream.is_disconnected = AsyncMock(return_value=False)
 
     handler = captured["handler"]
     assert callable(handler)
-    await handler(stream)
+    await handler(copilot_stream)
 
     update_calls = workflow_params.update_workflow_copilot_chat.await_args_list
     write_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is not None]
@@ -2042,6 +2164,9 @@ async def test_proposed_workflow_cleared_on_restore(
     prior_proposal: dict | None,
     clear_proposed_flag: bool,
     expect_clear_call: bool,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
 
@@ -2076,20 +2201,12 @@ async def test_proposed_workflow_cleared_on_restore(
 
     setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
 
-    request = MagicMock()
-    request.headers = {"x-api-key": "sk-test-key"}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    response = await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
     assert response is captured["sentinel"]
-
-    stream = MagicMock()
-    stream.send = AsyncMock(return_value=True)
-    stream.is_disconnected = AsyncMock(return_value=False)
 
     handler = captured["handler"]
     assert callable(handler)
-    await handler(stream)
+    await handler(copilot_stream)
 
     update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
     clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
@@ -2103,7 +2220,7 @@ async def test_proposed_workflow_cleared_on_restore(
     # chat.proposed_workflow, so the payload must mirror agent_result.
     response_frames = [
         call.args[0]
-        for call in stream.send.await_args_list
+        for call in copilot_stream.send.await_args_list
         if isinstance(call.args[0], WorkflowCopilotStreamResponseUpdate)
     ]
     assert len(response_frames) == 1, f"expected exactly one RESPONSE frame, got {response_frames!r}"
@@ -2116,6 +2233,9 @@ async def test_proposed_workflow_cleared_on_restore(
 @pytest.mark.asyncio
 async def test_verified_code_only_fix_stays_pending_without_auto_accept(
     monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
 ) -> None:
     # With auto_accept off, a verified CODE_ONLY_BROWSER fix (auto_applicable + staged)
     # must stay a pending proposal: no canonical commit, proposal persisted, terminal
@@ -2183,20 +2303,12 @@ async def test_verified_code_only_fix_stays_pending_without_auto_accept(
         AsyncMock(return_value="copilot"),
     )
 
-    request = MagicMock()
-    request.headers = {"x-api-key": "sk-test-key"}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    response = await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
     assert response is captured["sentinel"]
-
-    stream = MagicMock()
-    stream.send = AsyncMock(return_value=True)
-    stream.is_disconnected = AsyncMock(return_value=False)
 
     handler = captured["handler"]
     assert callable(handler)
-    await handler(stream)
+    await handler(copilot_stream)
 
     restore_mock.assert_not_awaited()
     workflow_service.update_workflow_definition.assert_not_awaited()
@@ -2207,7 +2319,7 @@ async def test_verified_code_only_fix_stays_pending_without_auto_accept(
 
     response_frames = [
         call.args[0]
-        for call in stream.send.await_args_list
+        for call in copilot_stream.send.await_args_list
         if isinstance(call.args[0], WorkflowCopilotStreamResponseUpdate)
     ]
     assert len(response_frames) == 1
@@ -2218,6 +2330,9 @@ async def test_verified_code_only_fix_stays_pending_without_auto_accept(
 @pytest.mark.asyncio
 async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_auto_accept(
     monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
 
@@ -2255,20 +2370,12 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
 
     setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
 
-    request = MagicMock()
-    request.headers = {"x-api-key": "sk-test-key"}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    response = await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
     assert response is captured["sentinel"]
-
-    stream = MagicMock()
-    stream.send = AsyncMock(return_value=True)
-    stream.is_disconnected = AsyncMock(return_value=False)
 
     handler = captured["handler"]
     assert callable(handler)
-    await handler(stream)
+    await handler(copilot_stream)
 
     update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
     clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
@@ -2283,7 +2390,7 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
 
     response_frames = [
         call.args[0]
-        for call in stream.send.await_args_list
+        for call in copilot_stream.send.await_args_list
         if isinstance(call.args[0], WorkflowCopilotStreamResponseUpdate)
     ]
     assert len(response_frames) == 1
@@ -2293,7 +2400,9 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
 
 
 @pytest.mark.asyncio
-async def test_unvalidated_timeout_wip_overrides_auto_accept(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_unvalidated_timeout_wip_overrides_auto_accept(
+    monkeypatch: pytest.MonkeyPatch, api_key_request: MagicMock, organization: SimpleNamespace
+) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
 
     captured = install_fake_create(monkeypatch)
@@ -2311,7 +2420,8 @@ async def test_unvalidated_timeout_wip_overrides_auto_accept(monkeypatch: pytest
         description="Original description",
         workflow_definition=None,
     )
-    proposal = MagicMock(spec=["model_dump"])
+    proposal = MagicMock(spec=["model_dump", "title"])
+    proposal.title = "WIP"
     proposal.model_dump.return_value = {"workflow_id": "wf-canonical"}
     agent_result = SimpleNamespace(
         user_response="I ran out of time before I could finish testing.",
@@ -2337,11 +2447,7 @@ async def test_unvalidated_timeout_wip_overrides_auto_accept(monkeypatch: pytest
 
     restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
 
-    request = MagicMock()
-    request.headers = {"x-api-key": "sk-test-key"}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    response = await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
     assert response is captured["sentinel"]
 
     sent_frames: list[object] = []
@@ -2378,7 +2484,9 @@ async def test_unvalidated_timeout_wip_overrides_auto_accept(monkeypatch: pytest
 
 
 @pytest.mark.asyncio
-async def test_env_on_short_circuits_posthog(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_env_on_short_circuits_posthog(
+    monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace
+) -> None:
     """Env var True must skip the PostHog check entirely and route to v2."""
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
     mock_provider = _install_mock_provider(
@@ -2393,11 +2501,7 @@ async def test_env_on_short_circuits_posthog(monkeypatch: pytest.MonkeyPatch) ->
         new_copilot_mock,
     )
 
-    request = MagicMock()
-    request.headers = {}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    response = await workflow_copilot_chat_post(anon_request, _make_chat_request(), organization)
 
     assert response is sentinel
     new_copilot_mock.assert_awaited_once()
@@ -2405,7 +2509,7 @@ async def test_env_on_short_circuits_posthog(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.asyncio
-async def test_env_off_posthog_on_uses_v2(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_env_off_posthog_on_uses_v2(monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock) -> None:
     """Env var False + PostHog True -> v2 path, with org_id as distinct_id."""
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
     mock_provider = _install_mock_provider(monkeypatch, return_value=True)
@@ -2417,11 +2521,9 @@ async def test_env_off_posthog_on_uses_v2(monkeypatch: pytest.MonkeyPatch) -> No
         new_copilot_mock,
     )
 
-    request = MagicMock()
-    request.headers = {}
     organization = SimpleNamespace(organization_id="org-abc")
 
-    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    response = await workflow_copilot_chat_post(anon_request, _make_chat_request(), organization)
 
     assert response is sentinel
     new_copilot_mock.assert_awaited_once()
@@ -2433,7 +2535,9 @@ async def test_env_off_posthog_on_uses_v2(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_provider_failure_falls_back_to_legacy(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_provider_failure_falls_back_to_legacy(
+    monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace
+) -> None:
     """Provider errors (PostHog down, DB hiccup) must not break the endpoint."""
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
     _install_mock_provider(monkeypatch, side_effect=RuntimeError("posthog unreachable"))
@@ -2446,18 +2550,16 @@ async def test_provider_failure_falls_back_to_legacy(monkeypatch: pytest.MonkeyP
 
     captured = install_fake_create(monkeypatch)
 
-    request = MagicMock()
-    request.headers = {}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    response = await workflow_copilot_chat_post(anon_request, _make_chat_request(), organization)
 
     assert response is captured["sentinel"]
     new_copilot_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_env_off_posthog_off_uses_legacy(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_env_off_posthog_off_uses_legacy(
+    monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace
+) -> None:
     """Env var False + PostHog False -> legacy stream handler, v2 not reached."""
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
     mock_provider = _install_mock_provider(monkeypatch, return_value=False)
@@ -2470,11 +2572,7 @@ async def test_env_off_posthog_off_uses_legacy(monkeypatch: pytest.MonkeyPatch) 
 
     captured = install_fake_create(monkeypatch)
 
-    request = MagicMock()
-    request.headers = {}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    response = await workflow_copilot_chat_post(anon_request, _make_chat_request(), organization)
 
     assert response is captured["sentinel"]
     new_copilot_mock.assert_not_awaited()
@@ -2482,7 +2580,9 @@ async def test_env_off_posthog_off_uses_legacy(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.asyncio
-async def test_legacy_path_persists_copilot_yaml_on_proposal(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_legacy_path_persists_copilot_yaml_on_proposal(
+    monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, copilot_stream: MagicMock, organization: SimpleNamespace
+) -> None:
     """Legacy V1 path stashes _copilot_yaml so /apply-proposed-workflow can re-create the version.
 
     Regression for #10568 + SKY-9206: Accept on the frontend now hits
@@ -2502,7 +2602,8 @@ async def test_legacy_path_persists_copilot_yaml_on_proposal(monkeypatch: pytest
         auto_accept=False,
     )
 
-    proposal = MagicMock(spec=["model_dump"])
+    proposal = MagicMock(spec=["model_dump", "title"])
+    proposal.title = "Updated"
     proposal.model_dump.return_value = {"workflow_id": "wf-canonical", "title": "Updated"}
 
     workflow_yaml = "title: Updated\nworkflow_definition:\n  blocks: []\n"
@@ -2526,20 +2627,12 @@ async def test_legacy_path_persists_copilot_yaml_on_proposal(monkeypatch: pytest
         ),
     )
 
-    request = MagicMock()
-    request.headers = {}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    response = await workflow_copilot_chat_post(anon_request, _make_chat_request(), organization)
     assert response is captured["sentinel"]
-
-    stream = MagicMock()
-    stream.send = AsyncMock(return_value=True)
-    stream.is_disconnected = AsyncMock(return_value=False)
 
     handler = captured["handler"]
     assert callable(handler)
-    await handler(stream)
+    await handler(copilot_stream)
 
     update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
     persist_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is not None]
@@ -2567,7 +2660,7 @@ async def test_persist_state_keeps_verified_review_tested_proposal(monkeypatch: 
         SimpleNamespace(update_workflow_copilot_chat=AsyncMock()),
     )
     agent_result = SimpleNamespace(
-        updated_workflow=SimpleNamespace(model_dump=lambda mode: {"title": "built"}),
+        updated_workflow=SimpleNamespace(title="built", model_dump=lambda mode: {"title": "built"}),
         workflow_yaml="title: built\n",
         clear_proposed_workflow=False,
         proposal_disposition="review_tested",
@@ -2691,7 +2784,7 @@ async def test_persist_state_keep_pending_proposal_does_not_block_new_proposal_o
         SimpleNamespace(update_workflow_copilot_chat=AsyncMock()),
     )
     agent_result = _make_bypassed_proposal_agent_result(
-        updated_workflow=SimpleNamespace(model_dump=lambda mode: {"title": "new draft"}),
+        updated_workflow=SimpleNamespace(title="new draft", model_dump=lambda mode: {"title": "new draft"}),
         workflow_yaml="title: new draft\n",
     )
 
@@ -3439,7 +3532,7 @@ def test_reconcile_threshold_outlasts_the_turn_enforcement_ceiling() -> None:
 
 @pytest.mark.asyncio
 async def test_marker_survives_a_finalizer_that_raises_with_no_assistant_row(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, api_key_request: MagicMock, copilot_stream: MagicMock
 ) -> None:
     """No assistant row was written, so the turn stays recoverable instead of being orphaned."""
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
@@ -3475,17 +3568,11 @@ async def test_marker_survives_a_finalizer_that_raises_with_no_assistant_row(
         AsyncMock(side_effect=RuntimeError("database down")),
     )
 
-    request = MagicMock()
-    request.headers = {"x-api-key": "sk-test-key"}
-
-    await workflow_copilot_chat_post(request, _make_chat_request(), SimpleNamespace(organization_id="org-1"))
-    stream = MagicMock()
-    stream.send = AsyncMock(return_value=True)
-    stream.is_disconnected = AsyncMock(return_value=False)
+    await workflow_copilot_chat_post(api_key_request, _make_chat_request(), SimpleNamespace(organization_id="org-1"))
     handler = captured["handler"]
     assert callable(handler)
     with contextlib.suppress(RuntimeError):
-        await handler(stream)
+        await handler(copilot_stream)
 
     assert app.DATABASE.workflow_params.start_copilot_turn.await_count == 1
     app.DATABASE.workflow_params.clear_pending_copilot_turn.assert_not_awaited()
@@ -3583,7 +3670,7 @@ async def test_finalise_normal_turn_persists_deadline_cause_and_keeps_timeout_co
         halt_kind=None,
         attempted=None,
         workflow_mutated=False,
-        turn_outcome_response_kind=None,
+        workflow_attempted=False,
         terminal_cause="deadline_expired",
     )
     assert envelope is not None

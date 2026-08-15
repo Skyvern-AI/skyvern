@@ -32,6 +32,12 @@ export class TabScope {
     this.expectedGroupTransitions = new Map();
     this.tabOperations = new Map();
     this.debuggerRouter = null;
+    this.activeOperationCount = 0;
+    this.operationsIdle = Promise.resolve();
+    this.resolveOperationsIdle = null;
+    this.resetting = false;
+    this.resetFinished = Promise.resolve();
+    this.resolveResetFinished = null;
     this.ready = new Promise((resolve) => {
       this.resolveReady = resolve;
     });
@@ -87,6 +93,53 @@ export class TabScope {
     }
     this.resolveReady();
     await this.reconcileStoredTabs();
+  }
+
+  async prepareForReset() {
+    await this.ready;
+    if (this.resetting) {
+      await this.resetFinished;
+      return this.prepareForReset();
+    }
+    this.resetting = true;
+    this.resetFinished = new Promise((resolve) => {
+      this.resolveResetFinished = resolve;
+    });
+    await this.operationsIdle;
+  }
+
+  finishReset() {
+    this.resetting = false;
+    this.resolveResetFinished?.();
+    this.resolveResetFinished = null;
+  }
+
+  async reset() {
+    const scopedGroups = [...this.scopedGroupIds];
+    this.scopedTabIds.clear();
+    this.scopedGroupIds.clear();
+    this.expectedGroupTransitions.clear();
+    this.tabOperations.clear();
+    await chrome.storage.session.remove([
+      SCOPED_TAB_IDS_KEY,
+      SCOPED_GROUP_IDS_KEY,
+    ]);
+    await Promise.all(
+      scopedGroups.map(async ([tabId, groupId]) => {
+        if (!Number.isInteger(groupId)) {
+          return;
+        }
+        try {
+          const tab = await chrome.tabs.get(tabId);
+          if (tab.groupId === groupId) {
+            await chrome.tabs.ungroup([tabId]);
+          }
+        } catch {
+          return;
+        }
+      }),
+    );
+    this.expectedGroupTransitions.clear();
   }
 
   isScoped(tabId) {
@@ -591,6 +644,15 @@ export class TabScope {
   }
 
   async runTabOperation(tabId, operation) {
+    while (this.resetting) {
+      await this.resetFinished;
+    }
+    if (this.activeOperationCount === 0) {
+      this.operationsIdle = new Promise((resolve) => {
+        this.resolveOperationsIdle = resolve;
+      });
+    }
+    this.activeOperationCount += 1;
     const previous = this.tabOperations.get(tabId) ?? Promise.resolve();
     const current = previous.catch(() => undefined).then(operation);
     this.tabOperations.set(tabId, current);
@@ -599,6 +661,11 @@ export class TabScope {
     } finally {
       if (this.tabOperations.get(tabId) === current) {
         this.tabOperations.delete(tabId);
+      }
+      this.activeOperationCount -= 1;
+      if (this.activeOperationCount === 0) {
+        this.resolveOperationsIdle?.();
+        this.resolveOperationsIdle = null;
       }
     }
   }

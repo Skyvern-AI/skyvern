@@ -9,19 +9,34 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from skyvern.cli.core.browser_ops import NavigateResult
 from skyvern.cli.core.result import Artifact, BrowserContext
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.response import (
+    MCP_MAX_RESPONSE_BYTES,
     MCP_MAX_RESPONSE_CHARS,
     size_capped,
     truncate_response,
+    truncate_response_bytes,
 )
 
 
 def test_truncate_response_passes_small_payload_unchanged() -> None:
     small = {"ok": True, "data": {"items": list(range(10))}}
     assert truncate_response(small) is small
+
+
+def test_truncate_response_bytes_caps_multibyte_payload() -> None:
+    payload = {"ok": True, "data": {"body": "é" * (MCP_MAX_RESPONSE_BYTES // 2)}}
+
+    result = truncate_response_bytes(payload)
+
+    assert result["_truncated"] is True
+    assert result["_max_bytes"] == MCP_MAX_RESPONSE_BYTES
+    assert result["_original_bytes"] > MCP_MAX_RESPONSE_BYTES
+    assert len(json.dumps(result, ensure_ascii=False).encode()) <= MCP_MAX_RESPONSE_BYTES
+    assert "data" not in result
 
 
 def test_truncate_response_wraps_large_payload_with_envelope() -> None:
@@ -244,7 +259,7 @@ async def test_every_registered_extract_tool_caps_an_oversize_extraction(
     monkeypatch.setattr(
         mcp_browser,
         "do_navigate",
-        AsyncMock(return_value=SimpleNamespace(url="https://example.test", title="Example")),
+        AsyncMock(return_value=NavigateResult(url="https://example.test", title="Example")),
     )
     monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
     monkeypatch.setattr(
@@ -275,7 +290,7 @@ def _stub_browser(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         mcp_browser,
         "do_navigate",
-        AsyncMock(return_value=SimpleNamespace(url="https://example.test", title="Example")),
+        AsyncMock(return_value=NavigateResult(url="https://example.test", title="Example")),
     )
     monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
     monkeypatch.setattr(

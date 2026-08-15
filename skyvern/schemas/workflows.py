@@ -1,5 +1,9 @@
 import abc
+import ast
 import functools
+import re
+import textwrap
+import unicodedata
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Protocol, TypeVar
@@ -887,6 +891,113 @@ class CodeBlockStepYAML(BaseModel):
     line_end: int | None = None
 
 
+ERROR_CODE_MAX_LENGTH = 128
+ERROR_CODE_REASONING_MAX_LENGTH = 2000
+ERROR_CODE_MAPPING_MAX_ENTRIES = 64
+ERROR_CODE_MAPPING_MAX_UTF8_BYTES = 32768
+
+
+def _contains_unicode_category_c(value: str) -> bool:
+    return any(unicodedata.category(character).startswith("C") for character in value)
+
+
+def _validate_code_block_error_code_mapping(mapping: Any) -> None:
+    if mapping is None:
+        return
+    if type(mapping) is not dict:
+        raise ValueError("error_code_mapping must be a dictionary")
+    if len(mapping) > ERROR_CODE_MAPPING_MAX_ENTRIES:
+        raise ValueError("error_code_mapping must contain at most 64 entries")
+    aggregate_size = 0
+    for code, description in mapping.items():
+        if type(code) is not str or not code or code != code.strip() or len(code) > ERROR_CODE_MAX_LENGTH:
+            raise ValueError("error code keys must be trimmed, non-empty strings of at most 128 characters")
+        if _contains_unicode_category_c(code):
+            raise ValueError("error code keys must not contain Unicode category-C characters")
+        if (
+            type(description) is not str
+            or not description
+            or description != description.strip()
+            or len(description) > ERROR_CODE_REASONING_MAX_LENGTH
+        ):
+            raise ValueError("error code descriptions must be trimmed, non-empty strings of at most 2000 characters")
+        if _contains_unicode_category_c(description):
+            raise ValueError("error code descriptions must not contain Unicode category-C characters")
+        aggregate_size += len(code.encode("utf-8")) + len(description.encode("utf-8"))
+    if aggregate_size > ERROR_CODE_MAPPING_MAX_UTF8_BYTES:
+        raise ValueError("error_code_mapping keys and values must total at most 32768 UTF-8 bytes")
+
+
+def _direct_code_block_error_code_raises(code: str) -> set[tuple[int, str]]:
+    sanitized = re.sub(
+        r"\{%.*?%\}",
+        lambda match: "\n".join("# __JINJA_BLOCK__" for _ in range(match.group().count("\n") + 1)),
+        textwrap.dedent(code),
+        flags=re.DOTALL,
+    )
+    try:
+        tree = ast.parse(sanitized)
+    except SyntaxError as exc:
+        raise ValueError(f"CodeBlock code is invalid Python: {exc.msg} at line {exc.lineno}") from exc
+    direct: set[tuple[int, str]] = set()
+    accepted: set[int] = set()
+    raises = [node for node in ast.walk(tree) if isinstance(node, ast.Raise)]
+    raise_count_by_line: dict[int, int] = {}
+    for raise_node in raises:
+        for line in range(raise_node.lineno, (raise_node.end_lineno or raise_node.lineno) + 1):
+            raise_count_by_line[line] = raise_count_by_line.get(line, 0) + 1
+    ambiguous_lines = {
+        line
+        for node in raises
+        if isinstance(node.exc, ast.Call) and isinstance(node.exc.func, ast.Name) and node.exc.func.id == "ErrorCode"
+        for line in range(node.lineno, (node.end_lineno or node.lineno) + 1)
+        if raise_count_by_line[line] > 1
+    }
+    if ambiguous_lines:
+        raise ValueError("ErrorCode must be constructed directly in an unambiguous raise statement")
+    for node in ast.walk(tree):
+        if (
+            (isinstance(node, ast.Name) and node.id == "ErrorCode" and isinstance(node.ctx, ast.Store))
+            or (isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "ErrorCode")
+            or (isinstance(node, ast.arg) and node.arg == "ErrorCode")
+            or (isinstance(node, ast.ExceptHandler) and node.name == "ErrorCode")
+            or (isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == "ErrorCode")
+            or (isinstance(node, ast.MatchMapping) and node.rest == "ErrorCode")
+        ):
+            raise ValueError("ErrorCode cannot be shadowed")
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+            alias.asname == "ErrorCode" or (alias.asname is None and alias.name == "ErrorCode") for alias in node.names
+        ):
+            raise ValueError("ErrorCode cannot be imported or aliased")
+        if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Name) and node.exc.id == "ErrorCode":
+            raise ValueError("ErrorCode must be raised as ErrorCode('literal', reasoning)")
+        if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
+            continue
+        call = node.exc
+        if isinstance(call.func, ast.Attribute) and call.func.attr == "ErrorCode":
+            raise ValueError("ErrorCode must be constructed directly in a raise statement")
+        if isinstance(call.func, ast.Name) and call.func.id == "ErrorCode":
+            if call.keywords or len(call.args) != 2:
+                raise ValueError("ErrorCode requires exactly two positional arguments")
+            code_node = call.args[0]
+            if not isinstance(code_node, ast.Constant) or type(code_node.value) is not str:
+                raise ValueError("ErrorCode code must be a direct string literal")
+            direct.add((node.lineno, code_node.value))
+            accepted.add(id(call))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "ErrorCode":
+            if id(node) not in accepted:
+                raise ValueError("ErrorCode must be constructed directly in a raise statement")
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) and node.value.id == "ErrorCode":
+            raise ValueError("ErrorCode aliases are not allowed")
+    return direct
+
+
+def _validate_code_block_error_code_calls(code: str) -> set[tuple[int, str]]:
+    """Validate ErrorCode call shape at execution time, immediately before exec()."""
+    return _direct_code_block_error_code_raises(code)
+
+
 class CodeBlockYAML(BlockYAML):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -895,6 +1006,7 @@ class CodeBlockYAML(BlockYAML):
     block_type: Literal[BlockType.CODE] = BlockType.CODE  # type: ignore
 
     code: str
+    error_code_mapping: dict[str, str] | None = None
     parameter_keys: list[str] | None = None
     prompt: str | None = Field(
         default=None,
@@ -908,11 +1020,15 @@ class CodeBlockYAML(BlockYAML):
     @model_validator(mode="before")
     @classmethod
     def reject_parameters_field(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "error_code" in data:
+            raise ValueError("Code blocks do not accept 'error_code'; use 'error_code_mapping'")
         if isinstance(data, dict) and "parameters" in data:
             raise ValueError(
                 "Code blocks do not accept a 'parameters' field; use 'parameter_keys' "
                 "(a list of workflow parameter names) to inject parameters into the code block."
             )
+        if isinstance(data, dict):
+            _validate_code_block_error_code_mapping(data.get("error_code_mapping"))
         return data
 
 

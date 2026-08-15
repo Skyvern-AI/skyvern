@@ -91,22 +91,6 @@ class WorkflowCopilotChatSender(StrEnum):
     AI = "ai"
 
 
-# Wire-format mirror of ``copilot.turn_intent.TurnIntentMode`` — lives here
-# rather than importing the source enum because ``turn_intent`` already
-# imports this module (a back-edge would be circular). Values MUST stay in
-# lockstep; a cross-enum equality test in the unit tests catches drift.
-class WorkflowCopilotTurnMode(StrEnum):
-    BUILD = "build"
-    EDIT = "edit"
-    DIAGNOSE = "diagnose"
-    # Wire-compatible mirror of the generic answer-only TurnIntent mode.
-    ANSWER = "docs_answer"
-    DRAFT_ONLY = "draft_only"
-    CLARIFY = "clarify"
-    REFUSE = "refuse"
-    UNKNOWN = "unknown"
-
-
 class WorkflowCopilotChatMessage(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -163,10 +147,9 @@ class WorkflowCopilotChatRequest(BaseModel):
     fix_origin: bool = Field(
         False,
         description=(
-            "True when the turn originates from the 'Fix with Copilot' action on a failed run. Routes the "
-            "run-grounded turn to diagnose-first (DIAGNOSE, no write authority) instead of a direct rewrite. "
-            "Only takes effect when a run signal (workflow_run_id or prior run context) is present; "
-            "otherwise it is a no-op."
+            "True when the turn originates from the 'Fix with Copilot' action on a failed run. Carried as "
+            "provenance only: it does not change the turn's routing or tool authority, which come from the "
+            "request policy and the run the turn is grounded in."
         ),
     )
     supports_credential_pause: bool = Field(
@@ -262,6 +245,7 @@ class WorkflowCopilotStreamMessageType(StrEnum):
     WORKFLOW_DRAFT = "workflow_draft"
     CREDENTIAL_REQUIRED = "credential_required"
     CODEGEN_PROGRESS = "codegen_progress"
+    TITLE_UPDATE = "title_update"
 
 
 class WorkflowCopilotProcessingUpdate(BaseModel):
@@ -418,20 +402,20 @@ class WorkflowCopilotBlockProgressUpdate(BaseModel):
 
 
 class WorkflowCopilotRunOutcomeUpdate(BaseModel):
-    # Emitted once as an "evaluating" hold when an ok run enters adjudication and
-    # once with the final recorded verdict; rows render success from this, not raw status.
+    # Current authoring emits one factual terminal record. Legacy persisted
+    # frames may still carry the older evaluating/adjudicated shape.
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.RUN_OUTCOME, description="Message type"
     )
-    workflow_run_id: str = Field(..., description="Workflow run the verdict applies to")
+    workflow_run_id: str = Field(..., description="Workflow run the record applies to")
     workflow_run_block_ids: list[str] = Field(
-        default_factory=list, description="Run-block ids of the adjudicated run; match the FE per-row keys"
+        default_factory=list, description="Run-block ids of the recorded run; match the FE per-row keys"
     )
     block_labels: list[str] = Field(
-        default_factory=list, description="Block labels of the adjudicated run; key the persisted narrative payload"
+        default_factory=list, description="Block labels of the recorded run; key the persisted narrative payload"
     )
-    verdict: RunOutcomeVerdict = Field(..., description="Recorded outcome verdict for the run")
-    role: RunOutcomeRole = Field("adjudicated", description="Display scope of the recorded run verdict")
+    verdict: RunOutcomeVerdict = Field(..., description="Legacy-compatible recorded run state")
+    role: RunOutcomeRole = Field("recorded", description="Display scope of the run record")
     reason_code: RunOutcomeReasonCode | None = Field(
         None, description="Machine-readable cause for a not_demonstrated verdict"
     )
@@ -446,7 +430,6 @@ class WorkflowCopilotTurnStartUpdate(BaseModel):
     )
     turn_id: str = Field(..., description="UUID for this turn; correlates with the matching terminal frame")
     turn_index: int = Field(..., description="Zero-based ordinal of this turn within the chat")
-    mode: WorkflowCopilotTurnMode = Field(..., description="TurnIntent mode for this turn")
     timestamp: datetime = Field(..., description="Server timestamp")
     prior_block_count: int | None = Field(
         None,
@@ -480,6 +463,16 @@ class WorkflowCopilotWorkflowDraftUpdate(BaseModel):
         None,
         description="Staged workflow API response (same shape as terminal RESPONSE.updated_workflow). Drives mid-turn canvas updates.",
     )
+
+
+class WorkflowCopilotTitleUpdate(BaseModel):
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.TITLE_UPDATE, description="Message type"
+    )
+    turn_id: str = Field(..., description="UUID for the turn that named the agent")
+    workflow_permanent_id: str = Field(..., description="The agent that was named")
+    title: str = Field(..., description="The persisted title; only ever emitted after the write succeeded")
+    timestamp: datetime = Field(..., description="Server timestamp")
 
 
 class WorkflowCopilotCredentialRequiredUpdate(BaseModel):

@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import asyncio
 import textwrap
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
 
+from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids
 from skyvern.forge.sdk.routes.workflow_copilot import (
     _blockless_submission_fallback,
     _effective_auto_accept,
@@ -25,10 +27,31 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     _normalize_copilot_yaml,
     _prior_copilot_workflow_yaml,
     _proposal_disposition,
+    _run_grant_workflow_yaml,
+    _should_commit_staged_workflow,
     _should_restore_persisted_workflow,
+    _workflow_copilot_ingress_log_fields,
 )
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamResponseUpdate
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatMessage,
+    WorkflowCopilotChatSender,
+    WorkflowCopilotStreamResponseUpdate,
+)
+from skyvern.forge.sdk.workflow.models.parameter import (
+    OutputParameter,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import ProxyLocation
+
+
+def test_workflow_copilot_ingress_log_fields_are_content_free() -> None:
+    literal = "Hunter2Portal!"
+    fields = _workflow_copilot_ingress_log_fields(f"The password is {literal}")
+
+    assert fields == {"message_length": len(f"The password is {literal}")}
+    assert literal not in repr(fields)
 
 
 def _agent_result(
@@ -83,6 +106,31 @@ class TestShouldRestorePersistedWorkflow:
 
         assert _should_restore_persisted_workflow(True, agent_result) is True
         assert _should_restore_persisted_workflow(False, agent_result) is True
+
+
+class TestShouldCommitStagedWorkflow:
+    def test_tested_proposal_from_a_question_turn_stays_pending_under_auto_accept(self) -> None:
+        ask_result = _agent_result(
+            persisted=False,
+            proposal_disposition="review_tested",
+            updated_workflow=MagicMock(),
+            has_staged_proposal=True,
+        )
+
+        assert _effective_auto_accept(True, ask_result) is False
+        assert _should_commit_staged_workflow(True, ask_result) is False
+
+    def test_auto_applicable_proposal_still_commits_under_auto_accept(self) -> None:
+        reply_result = _agent_result(
+            persisted=False,
+            proposal_disposition="auto_applicable",
+            updated_workflow=MagicMock(),
+            has_staged_proposal=True,
+        )
+
+        assert _effective_auto_accept(True, reply_result) is True
+        assert _should_commit_staged_workflow(True, reply_result) is True
+        assert _should_commit_staged_workflow(False, reply_result) is False
 
 
 class TestEffectiveAutoAccept:
@@ -437,3 +485,130 @@ async def test_ensure_terminal_frame_swallows_send_exception() -> None:
 async def test_ensure_terminal_frame_swallows_send_cancellation() -> None:
     stream = _FakeStream(raise_on_send=asyncio.CancelledError())
     await _ensure_terminal_frame(stream, already_emitted=False)  # type: ignore[arg-type]
+
+
+def _persisted_message(narrative_payload: dict[str, Any]) -> WorkflowCopilotChatMessage:
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    return WorkflowCopilotChatMessage(
+        workflow_copilot_chat_message_id="wccm_1",
+        workflow_copilot_chat_id="wcc_1",
+        sender=WorkflowCopilotChatSender.AI,
+        content="reply",
+        narrative_payload=narrative_payload,  # type: ignore[arg-type]
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def _non_error_narrative_payload() -> dict[str, Any]:
+    """The shape the acting path builds — every key it actually supplies, and nothing else."""
+    return {
+        "turnId": "turn_1",
+        "turnIndex": 0,
+        "designStarted": True,
+        "designEnded": True,
+        "draft": None,
+        "blocks": [],
+        "terminal": "done",
+        "terminalMessage": None,
+        "narrativeSummary": "answered",
+        "priorBlockCount": None,
+        "designActivity": [],
+        "startedAt": None,
+        "endedAt": None,
+    }
+
+
+def test_non_error_narrative_payload_survives_persistence_validation() -> None:
+    """Every required TurnNarrativePayload key must have a live supplier.
+
+    A required key whose only supplier was deleted passes type checking and every test that
+    stubs persistence, then raises on both write and read at the Pydantic boundary, halting
+    every turn. Grade the real boundary, not a stub.
+    """
+    message = _persisted_message(_non_error_narrative_payload())
+
+    assert message.narrative_payload is not None
+    assert message.narrative_payload["turnId"] == "turn_1"
+
+
+def test_narrative_payload_tolerates_keys_persisted_before_the_field_was_removed() -> None:
+    legacy = _non_error_narrative_payload() | {"mode": "build"}
+
+    message = _persisted_message(legacy)
+
+    assert message.narrative_payload is not None
+    assert "mode" not in message.narrative_payload
+
+
+def _credential_bound_workflow(credential_id: str) -> Any:
+    """A saved workflow row whose login block binds ``credential_id``."""
+    parameter = WorkflowParameter(
+        parameter_type="workflow",
+        workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+        key="login_credential",
+        workflow_parameter_id="wp_1",
+        workflow_id="w_1",
+        default_value=credential_id,
+        created_at=datetime.now(timezone.utc),
+        modified_at=datetime.now(timezone.utc),
+    )
+    return Workflow(
+        workflow_id="w_1",
+        organization_id="o_1",
+        title="saved",
+        workflow_permanent_id="wpid_1",
+        version=1,
+        proxy_location=ProxyLocation.NONE,
+        is_saved_task=False,
+        workflow_definition=WorkflowDefinition(
+            parameters=[parameter],
+            blocks=[
+                {
+                    "label": "login",
+                    "block_type": "login",
+                    "url": "https://example.com/login",
+                    "parameter_keys": ["login_credential"],
+                    "output_parameter": OutputParameter(
+                        output_parameter_id="op_1",
+                        key="login_output",
+                        workflow_id="w_1",
+                        created_at=datetime.now(timezone.utc),
+                        modified_at=datetime.now(timezone.utc),
+                    ),
+                }
+            ],
+        ),
+        created_at=datetime.now(timezone.utc),
+        modified_at=datetime.now(timezone.utc),
+    )
+
+
+def test_run_grant_yaml_carries_the_saved_rows_credential() -> None:
+    grant_yaml = _run_grant_workflow_yaml(_credential_bound_workflow("cred_saved"))
+
+    assert grant_yaml is not None
+    assert workflow_credential_ids(grant_yaml) == {"cred_saved"}
+
+
+def test_run_grant_yaml_ignores_a_binding_that_exists_only_on_the_submitted_canvas() -> None:
+    """The authority boundary: the grant reads the workflow row, never the submission.
+
+    A copilot proposal sits on the canvas until the user accepts it, so the next turn resubmits
+    it as a non-empty ``workflow_yaml``. If that ever reached the grant, a binding the model
+    staged would authorize its own run.
+    """
+    saved_row = _credential_bound_workflow("cred_saved")
+    # What the frontend would submit next turn: the canvas, still showing a staged proposal.
+    submitted_canvas_yaml = _run_grant_workflow_yaml(_credential_bound_workflow("cred_staged_by_model"))
+    assert submitted_canvas_yaml is not None
+    assert workflow_credential_ids(submitted_canvas_yaml) == {"cred_staged_by_model"}
+
+    grant_yaml = _run_grant_workflow_yaml(saved_row)
+
+    assert grant_yaml is not None
+    assert workflow_credential_ids(grant_yaml) == {"cred_saved"}
+
+
+def test_run_grant_yaml_is_none_when_the_row_has_no_blocks() -> None:
+    assert _run_grant_workflow_yaml(None) is None

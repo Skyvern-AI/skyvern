@@ -1,5 +1,5 @@
 import { BrowserStream } from "@/components/BrowserStream";
-import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
+import { useStreamTransport } from "@/hooks/useRuntimeConfig";
 import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
 
 type StreamPresenterProps = {
@@ -8,6 +8,9 @@ type StreamPresenterProps = {
   showControlButtons?: boolean;
   isRecording?: boolean;
   hideRecordingIndicator?: boolean;
+  // CDP only: turns the read-only URL bar into a navigation input while the user
+  // holds control. VNC needs nothing here — it streams the browser's own chrome.
+  enableUrlInput?: boolean;
   // Only the CDP transport carries the page URL; VNC is pixels-only and never
   // calls this.
   onUrlChange?: (url: string) => void;
@@ -24,11 +27,17 @@ export function StreamPresenter({
   showControlButtons = false,
   isRecording = false,
   hideRecordingIndicator = false,
+  enableUrlInput = false,
   onUrlChange,
   onActivity,
 }: StreamPresenterProps) {
-  const { browserStreamingMode } = useBrowserStreamingMode();
-  const useCdp = browserStreamingMode === "cdp" && !isRecording;
+  const { streamTransport } = useStreamTransport(browserSessionId);
+  const useCdp = streamTransport === "cdp" && !isRecording;
+
+  if (!streamTransport) {
+    // Mounting either transport now would open a connection this session may not serve.
+    return null;
+  }
 
   if (useCdp) {
     // CDP frames must be explicitly centered; VNC handles this in its own CSS.
@@ -37,6 +46,7 @@ export function StreamPresenter({
         browserSessionId={browserSessionId}
         interactive={interactive}
         showControlButtons={showControlButtons}
+        enableUrlInput={enableUrlInput}
         onUrlChange={onUrlChange}
         onActivity={onActivity}
         centered

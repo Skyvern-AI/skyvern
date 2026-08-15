@@ -20,7 +20,7 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
-from skyvern.exceptions import PDFParsingError
+from skyvern.exceptions import DownloadSaveIncompleteError, PDFParsingError
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
@@ -187,6 +187,10 @@ class PdfFillBlock(Block):
             file_url_parameter_value = workflow_run_context.get_value(self.file_url)
             if file_url_parameter_value:
                 self.file_url = extract_file_url_from_block_output(file_url_parameter_value) or file_url_parameter_value
+            else:
+                # Absent optional parameter: fail on the empty URL rather than
+                # treating the literal parameter key as a URL.
+                self.file_url = ""
 
         self.file_url = _render_string(self.file_url)
         self.prompt = _render_string(self.prompt)
@@ -1022,6 +1026,14 @@ class PdfFillBlock(Block):
         try:
             async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                 await app.STORAGE.save_downloaded_files(organization_id=organization_id, run_id=workflow_run_id)
+        except DownloadSaveIncompleteError as exc:
+            # The filled PDF may be among the files that did save; read back what registered.
+            LOG.warning(
+                "Storage skipped saving some downloaded files; reading back what registered",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                skipped_file_count=len(exc.skipped_files),
+            )
         except Exception:
             LOG.warning(
                 "PdfFillBlock failed to register filled PDF as downloaded file",

@@ -28,10 +28,10 @@ from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.trace import traced
 from skyvern.schemas.runs import ProxyLocationInput
-from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory, resolve_artifact_path
-from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.cdp_download_interceptor import disable_download_interceptor_for_context
 from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
 from skyvern.webeye.scraper import scraper
@@ -117,9 +117,38 @@ class RealBrowserState(BrowserState):
         page = await self.get_working_page()
         if page is not None:
             return page
+        recovered_page = await self._reopen_lost_working_page()
+        if recovered_page is not None:
+            return recovered_page
         pages = (self.browser_context.pages or []) if self.browser_context else []
         LOG.error("BrowserState has no page", urls=[p.url for p in pages])
         raise MissingBrowserStatePage()
+
+    async def _reopen_lost_working_page(self) -> Page | None:
+        # A tab can die on its own (a download-turned-navigation, a renderer crash) while the
+        # context survives. Recover here rather than in each consumer: every caller that needs a
+        # page treats "no page" as fatal, so one of them recovering only relocates the failure.
+        if self.browser_context is None or not self.is_connected():
+            return None
+        lost_page = self.__page
+        restore_url = lost_page.url if lost_page is not None else ""
+        try:
+            page = await self.browser_context.new_page()
+        except Exception:
+            LOG.warning("Failed to re-open a working page after the previous one was lost", exc_info=True)
+            return None
+        await self.set_working_page(page)
+        if restore_url and restore_url not in BLANK_PAGE_URLS:
+            try:
+                await self.navigate_to_url(page=page, url=restore_url)
+            except Exception:
+                LOG.warning(
+                    "Re-opened the working page but could not restore the URL it was on",
+                    url=restore_url,
+                    exc_info=True,
+                )
+        LOG.info("Re-opened the working page after it was lost", url=restore_url)
+        return page
 
     async def _close_all_other_pages(self, discard_orphaned_videos: bool = False) -> None:
         cur_page = await self.get_working_page()
@@ -199,10 +228,18 @@ class RealBrowserState(BrowserState):
         cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
+        download_binding: DownloadBinding | None = None,
     ) -> None:
         if self.browser_context is None:
             LOG.info("creating browser context")
             context = skyvern_context.current()
+            # When recreation omits a binding, preserve the prior artifacts' binding instead of
+            # downgrading to RUN_DIR.
+            effective_download_binding = download_binding
+            if effective_download_binding is None:
+                effective_download_binding = (
+                    self.browser_artifacts.download_binding if self.browser_artifacts else DownloadBinding.RUN_DIR
+                )
             (
                 browser_context,
                 browser_artifacts,
@@ -222,6 +259,7 @@ class RealBrowserState(BrowserState):
                 browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
                 browser_profile_id=browser_profile_id,
                 engine_selection=self.engine_selection,
+                download_binding=effective_download_binding,
             )
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts
@@ -374,10 +412,7 @@ class RealBrowserState(BrowserState):
         return True
 
     async def must_get_working_page(self) -> Page:
-        page = await self.get_working_page()
-        if page is None:
-            raise MissingBrowserStatePage()
-        return page
+        return await self.__assert_page()
 
     async def set_working_page(self, page: Page | None, index: int = 0) -> None:
         self.__page = page
@@ -502,6 +537,12 @@ class RealBrowserState(BrowserState):
         # The old driver pipe is gone, so check_and_fix_state must not reuse self.pw; start a
         # fresh Playwright driver and reconnect to the same (still-alive) remote browser.
         stale_pw = self.pw
+        # check_and_fix_state rebuilds through the factory; forward this session's download binding so the
+        # creator seam preserves the provider-selected destination on reconnect. The binding is carried
+        # forward, never overridden after the fact, so a genuine provider change is not mislabeled.
+        prior_download_binding = (
+            self.browser_artifacts.download_binding if self.browser_artifacts else DownloadBinding.RUN_DIR
+        )
         self.browser_context = None
         await self.set_working_page(None)
         # Reconnect on the SAME engine this state was pinned to at creation; never silently switch
@@ -520,6 +561,7 @@ class RealBrowserState(BrowserState):
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
+                download_binding=prior_download_binding,
             )
         except Exception:
             # The caller abandons this state on failure, so stop the just-started driver too or it leaks.

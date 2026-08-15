@@ -44,6 +44,7 @@ from skyvern.errors.errors import (
 from skyvern.exceptions import (
     BrowserSessionNotFound,
     DownloadFileMaxWaitingTime,
+    DownloadSaveIncompleteError,
     EmptyScrapePage,
     FailedToGetTOTPVerificationCode,
     FailedToNavigateToUrl,
@@ -92,6 +93,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     get_org_aware_secondary_llm_api_handler,
 )
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
 from skyvern.forge.sdk.api.llm.exceptions import (
     LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE,
     LLM_PROVIDER_ERROR_TYPE,
@@ -523,6 +525,43 @@ class StepPromptResult:
     without_page_information: bool
 
 
+async def _read_task_v3_llm_name_override(task_id: str, organization_id: str) -> str | None:
+    """Return the registered llm_key named by the TASK_V3_LLM_NAME PostHog flag, or None.
+
+    Same shape as the CONTENT_FILTER_RESCUE_LLM_NAME resolver: a multivariate flag whose value is an
+    llm_key, validated against the registry per task. An unset/invalid/unregistered value returns
+    None so the caller falls back to the configured model — a bad flag value can never break a run.
+    """
+    try:
+        variant = await app.EXPERIMENTATION_PROVIDER.get_value_cached(
+            "TASK_V3_LLM_NAME", task_id, properties={"organization_id": organization_id}
+        )
+    except Exception:
+        LOG.warning("Failed to read TASK_V3_LLM_NAME; using configured v3 model", exc_info=True)
+        return None
+    if not isinstance(variant, str) or not variant:
+        return None
+    # get_config synthesizes a config for unknown keys, so require an explicitly registered,
+    # non-custom (not org-owned BYO) llm_key.
+    if is_custom_llm_key(variant) or not LLMConfigRegistry.is_registered(variant):
+        LOG.warning("TASK_V3_LLM_NAME is not a usable registered llm_key; ignoring", variant=variant)
+        return None
+    return variant
+
+
+async def _resolve_task_v3_llm_key(task: Task) -> str:
+    """Choose the LLM the native Task V3 engine runs on.
+
+    Order: explicit task.llm_key -> TASK_V3_LLM_NAME PostHog flag (per-task runtime override, so the
+    model can change without a redeploy, like LLM_NAME) -> TASK_V3_LLM_KEY setting -> LLM_KEY setting.
+    LLMCaller now dispatches router/flex keys too, so any of these may be a router group.
+    """
+    if task.llm_key:
+        return task.llm_key
+    override = await _read_task_v3_llm_name_override(task.task_id, task.organization_id)
+    return override or settings.TASK_V3_LLM_KEY or settings.LLM_KEY
+
+
 class ForgeAgent:
     def __init__(self) -> None:
         self.async_operation_pool = AsyncOperationPool()
@@ -841,6 +880,165 @@ class ForgeAgent:
         operations = await app.AGENT_FUNCTION.generate_async_operations(organization, task, page)
         self.async_operation_pool.add_operations(task.task_id, operations)
 
+    async def _execute_task_v3(
+        self,
+        *,
+        task: Task,
+        step: Step,
+        browser_state: BrowserState,
+        organization: Organization,
+        api_key: str | None,
+        close_browser_on_completion: bool,
+        browser_session_id: str | None,
+    ) -> tuple[Step, Task]:
+        """Run a whole task via the native Task V3 tool-loop (one persistent conversation).
+
+        The loop owns the page for the entire task and returns a single outcome, which we
+        map onto the task's terminal state here. Runs exactly once: the caller returns
+        next_step=None for this engine, so neither retry nor execute-all-steps recursion fires.
+        """
+        from skyvern.forge.sdk.api.files import get_download_dir, resolve_run_download_id
+        from skyvern.forge.taskv3.engine import DEFAULT_MAX_TURNS, run_task_v3_agent_loop
+
+        page = await browser_state.must_get_working_page()
+        llm_caller = LLMCaller(llm_key=await _resolve_task_v3_llm_key(task))
+        parameters = task.navigation_payload if isinstance(task.navigation_payload, dict) else None
+        goal = task.navigation_goal or ""
+        if task.data_extraction_goal:
+            goal = (
+                f"{goal}\n\nWhen the page goal is met, extract the requested data and return it as the "
+                f"`extracted_output` argument to finish. Data to extract: {task.data_extraction_goal}"
+            ).strip()
+        if task.extracted_information_schema:
+            goal = (
+                f"{goal}\n\nThe extracted_output MUST be valid JSON conforming to this schema:\n"
+                f"{json.dumps(task.extracted_information_schema, default=str)}"
+            ).strip()
+
+        async def _should_cancel() -> bool:
+            refreshed = await app.DATABASE.tasks.get_task(
+                task_id=task.task_id, organization_id=organization.organization_id
+            )
+            return bool(refreshed and refreshed.status == TaskStatus.canceled)
+
+        download_id = resolve_run_download_id(skyvern_context.current(), fallback_run_id=task.task_id)
+        # Honor an explicit step cap (per-request override, task, or org) as the turn budget so a
+        # caller's cost cap isn't silently dropped; otherwise use the engine's own default. A turn is
+        # an LLM iteration (it may batch several actions), so the step-engine default is not the floor.
+        context = skyvern_context.current()
+        explicit_cap = (
+            (context.max_steps_override if context else None)
+            or task.max_steps_per_run
+            or organization.max_steps_per_run
+        )
+        outcome = await run_task_v3_agent_loop(
+            page=page,
+            llm_caller=llm_caller,
+            goal=goal,
+            parameters=parameters,
+            starting_url=task.url,
+            downloads_dir=get_download_dir(download_id),
+            organization_id=organization.organization_id,
+            max_turns=explicit_cap or DEFAULT_MAX_TURNS,
+            step=step,
+            should_cancel=_should_cancel,
+        )
+        LOG.info(
+            "Task V3 loop finished",
+            task_id=task.task_id,
+            status=outcome.status,
+            turns=outcome.turns,
+            tool_calls=outcome.tool_calls,
+        )
+        status_map = {
+            "completed": TaskStatus.completed,
+            "terminated": TaskStatus.terminated,
+            "canceled": TaskStatus.canceled,
+        }
+        task_status = status_map.get(outcome.status, TaskStatus.failed)
+        # A completed run with a data-extraction goal must actually carry data. The model declaring
+        # completion with no extracted_output is a failed extraction, not an empty success — report it
+        # as failed rather than fabricate an empty object that reads as a successful-but-empty result.
+        # An explicit empty structure ({}/[]) is a real answer and is left as completed.
+        extraction_requested = bool(task.data_extraction_goal or task.extracted_information_schema)
+        missing_extraction = (
+            task_status == TaskStatus.completed and extraction_requested and outcome.extracted_output is None
+        )
+        if missing_extraction:
+            task_status = TaskStatus.failed
+        completed = task_status == TaskStatus.completed
+        if task_status == TaskStatus.canceled:
+            step_status = StepStatus.canceled
+        elif task_status in (TaskStatus.completed, TaskStatus.terminated):
+            # A terminate decision is itself a successful step; only a real error fails the step.
+            step_status = StepStatus.completed
+        else:
+            step_status = StepStatus.failed
+        extracted_information = outcome.extracted_output if completed else None
+        # Emit one action-result per billable browser action so the per-step billing hook meters a
+        # task_v3 run per action, exactly like the step engine — no billing-model change.
+        _tool_action_types = {
+            "click": ActionType.CLICK,
+            "type": ActionType.INPUT_TEXT,
+            "select_option": ActionType.SELECT_OPTION,
+            "press_key": ActionType.KEYPRESS,
+            "file_upload": ActionType.UPLOAD_FILE,
+        }
+        billable_action_results: list[tuple[Action, list[ActionResult]]] = [
+            (
+                Action(
+                    action_type=_tool_action_types.get(name, ActionType.CLICK),
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    description=f"task_v3 {name}",
+                ),
+                [ActionSuccess()],
+            )
+            for name in outcome.billable_actions
+        ]
+        step = await self.update_step(
+            step,
+            status=step_status,
+            is_last=True,
+            output=AgentStepOutput(action_results=[], actions_and_results=billable_action_results),
+        )
+        # Meter the run through the same hook the step engine uses (the v3 branch returns before
+        # execute_step's own post_step_execution call). Contain any billing error: if it propagated,
+        # the caller's `step, task = ...` assignment would never complete and execute_step's generic
+        # handler would fail_task a run that actually finished — dropping its extracted_information
+        # after credits were already consumed. send_meter_event re-raises on Stripe errors, so this
+        # is reachable, not theoretical.
+        try:
+            await app.AGENT_FUNCTION.post_step_execution(task, step)
+        except Exception:
+            LOG.warning(
+                "task_v3 post-step billing hook failed; run already finalized, not failing it",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                exc_info=True,
+            )
+        if task_status in (TaskStatus.completed, TaskStatus.canceled):
+            failure_reason = None
+        elif missing_extraction:
+            failure_reason = "task_v3 reported completion but returned no extracted_output for the data-extraction goal"
+        else:
+            failure_reason = outcome.reason or outcome.status
+        task = await self.update_task(
+            task,
+            status=task_status,
+            extracted_information=extracted_information,
+            failure_reason=failure_reason,
+        )
+        await self.clean_up_task(
+            task=task,
+            last_step=step,
+            api_key=api_key,
+            need_call_webhook=True,
+            close_browser_on_completion=close_browser_on_completion,
+            browser_session_id=browser_session_id,
+        )
+        return step, task
+
     # Span name intentionally differs from the method: this is the outer wrapper
     # that handles cancellation checks, status updates, retries, and cleanup around
     # the inner step body. "step_orchestration" reads better on the trace dashboard
@@ -1014,6 +1212,34 @@ class ForgeAgent:
                     last_step=step,
                     api_key=api_key,
                     need_call_webhook=True,
+                    close_browser_on_completion=close_browser_on_completion,
+                    browser_session_id=browser_session_id,
+                )
+                return step, detailed_output, None
+
+            # Task V3 native engine: run the whole task as one persistent tool-loop and
+            # complete here. Returns next_step=None, so neither retry nor execute-all-steps
+            # recursion re-invokes the loop. DISABLE_TASK_V3 falls through to the step engine.
+            if (
+                engine == RunEngine.skyvern_v3
+                # v3 does not yet preserve workflow download_suffix/complete_on_download, so a
+                # workflow task block falls through to the step engine until that is supported.
+                and task_block is None
+                # v3 has no 2FA/TOTP handling yet; fall back to the step engine when a TOTP
+                # verification URL is set. A bare totp_identifier proceeds on v3 (rarely exercises 2FA).
+                and not task.totp_verification_url
+                and not await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                    "DISABLE_TASK_V3",
+                    task.workflow_run_id or task.task_id,
+                    properties={"organization_id": task.organization_id},
+                )
+            ):
+                step, task = await self._execute_task_v3(
+                    task=task,
+                    step=step,
+                    browser_state=browser_state,
+                    organization=organization,
+                    api_key=api_key,
                     close_browser_on_completion=close_browser_on_completion,
                     browser_session_id=browser_session_id,
                 )
@@ -1473,7 +1699,7 @@ class ForgeAgent:
         exception: Exception | None = None,
     ) -> bool:
         try:
-            if step is not None:
+            if step is not None and step.status != StepStatus.completed:
                 await self.update_step(
                     step=step,
                     status=StepStatus.failed,
@@ -4364,6 +4590,16 @@ class ForgeAgent:
         )
         extra_action_guidance = await app.AGENT_FUNCTION.get_extra_extract_action_guidance(task)
 
+        # SKY-9983: render per-step-changing sections (action history, dialogs, tabs) after the
+        # element tree so provider prefix caches can hit the tree across steps on the same page.
+        stable_prefix_ordering = False
+        if template == EXTRACT_ACTION_TEMPLATE:
+            stable_prefix_ordering = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "EXTRACT_ACTION_STABLE_PREFIX",
+                task.workflow_run_id if task.workflow_run_id else task.task_id,
+                properties={"task_url": task.url, "organization_id": task.organization_id},
+            )
+
         # Offer PASTE_TEXT (fill a spreadsheet grid with one tab/newline block) only under the umbrella,
         # so grid-fill guidance is scoped to the eval org until proven out.
         planner_mini_goal_improvements = settings.PLANNER_MINI_GOAL_IMPROVEMENTS
@@ -4419,6 +4655,7 @@ class ForgeAgent:
                     "llm_screenshots_enabled": llm_screenshots_enabled,
                     "enriched_tree_enabled": enriched_tree_enabled,
                     "slim_output": slim_output,
+                    "stable_prefix_ordering": stable_prefix_ordering,
                 }
                 cache_variant = self._build_extract_action_cache_variant(
                     verification_code_check=verification_code_check,
@@ -4466,15 +4703,11 @@ class ForgeAgent:
 
                 combined_token_count = count_tokens(combined_prompt)
 
-                # SKY-9718: stash html-token breakdown on the cached split-template path
-                # too — load_prompt_with_elements_tracked never sees this prompt, so the
+                # SKY-9718: stash the breakdown on the cached split-template path too —
+                # load_prompt_with_elements_tracked never sees this prompt, so the
                 # downstream LLM API handler would otherwise log nothing for it.
-                html_tokens = count_tokens(elements_for_prompt) if elements_for_prompt else 0
-                html_pct = (html_tokens / combined_token_count) if combined_token_count else None
                 context.last_prompt_breakdown = {
-                    "html_token_count": html_tokens,
                     "total_tokens_local": combined_token_count,
-                    "html_pct": round(html_pct, 4) if html_pct is not None else None,
                     "template_name": f"{template}-cached",
                 }
 
@@ -4494,6 +4727,7 @@ class ForgeAgent:
                     task_id=task.task_id,
                     prompt_name=EXTRACT_ACTION_PROMPT_NAME,
                     cache_variant=cache_variant,
+                    stable_prefix_ordering=stable_prefix_ordering,
                 )
                 # Map template to prompt_name for logging/caching guards
                 prompt_name = EXTRACT_ACTION_PROMPT_NAME if template == EXTRACT_ACTION_TEMPLATE else template
@@ -4552,6 +4786,7 @@ class ForgeAgent:
                 llm_screenshots_enabled=llm_screenshots_enabled,
                 enriched_tree_enabled=enriched_tree_enabled,
                 slim_output=slim_output,
+                stable_prefix_ordering=stable_prefix_ordering,
                 lean_compress_long_href=False,
                 lean_compress_image_src=context.enable_lean_element_tree,
                 lean_strip_url_query_strings=context.enable_lean_element_tree,
@@ -4567,6 +4802,7 @@ class ForgeAgent:
         _prompt_build_span.set_attribute("prompt_name", prompt_name)
         _prompt_build_span.set_attribute("prompt_tokens", count_tokens(full_prompt))
         _prompt_build_span.set_attribute("use_caching", bool(use_caching))
+        _prompt_build_span.set_attribute("stable_prefix_ordering", stable_prefix_ordering)
 
         if recent_dialog_messages_str is not None:
             context.clear_recent_dialog_messages()
@@ -5011,10 +5247,19 @@ class ForgeAgent:
                         finalization_run_id = (
                             resolve_run_download_id(context, fallback_run_id=task.workflow_run_id) or task.task_id
                         )
-                        await app.STORAGE.save_downloaded_files(
-                            organization_id=task.organization_id,
-                            run_id=finalization_run_id,
-                        )
+                        try:
+                            await app.STORAGE.save_downloaded_files(
+                                organization_id=task.organization_id,
+                                run_id=finalization_run_id,
+                            )
+                        except DownloadSaveIncompleteError as exc:
+                            # Session-artifact claiming below must still run for the files that saved.
+                            LOG.warning(
+                                "Some downloaded files were skipped during cleanup save",
+                                task_id=task.task_id,
+                                workflow_run_id=task.workflow_run_id,
+                                skipped_file_count=len(exc.skipped_files),
+                            )
                         # Tag any session-scoped DOWNLOAD artifacts created during
                         # this run with run_id, so GET /v1/runs/{id} surfaces them
                         # (the watcher in browser_controller can't know the active
@@ -5560,11 +5805,11 @@ class ForgeAgent:
             if getattr(task, key) != value
         }
 
+        start_time = task.started_at.replace(tzinfo=UTC) if task.started_at else task.created_at.replace(tzinfo=UTC)
+        duration_seconds = (datetime.now(UTC) - start_time).total_seconds()
         # Track task duration when task is completed, failed, or terminated
         if status in [TaskStatus.completed, TaskStatus.failed, TaskStatus.terminated]:
-            start_time = task.started_at.replace(tzinfo=UTC) if task.started_at else task.created_at.replace(tzinfo=UTC)
             queued_seconds = (start_time - task.created_at.replace(tzinfo=UTC)).total_seconds()
-            duration_seconds = (datetime.now(UTC) - start_time).total_seconds()
             LOG.info(
                 "Task duration metrics",
                 task_id=task.task_id,
@@ -5575,14 +5820,22 @@ class ForgeAgent:
                 organization_id=task.organization_id,
                 failure_reason=failure_reason,
             )
-
         await save_task_logs(task.task_id)
         LOG.info("Updating task in db", task_id=task.task_id, diff=update_comparison, sampling=True)
-        return await app.DATABASE.tasks.update_task(
+        updated_task = await app.DATABASE.tasks.update_task(
             task.task_id,
             organization_id=task.organization_id,
             **updates,
         )
+        # Minutes emit after the terminal write lands and only on the non-final ->
+        # final transition (task holds the pre-write status), so neither a retried
+        # failed write nor a repeated terminal update double-counts the run;
+        # is_final() includes canceled and timed_out, matching the workflow-run gate.
+        if task.workflow_run_id is None and status.is_final() and not task.status.is_final():
+            await app.AGENT_FUNCTION.record_run_duration(
+                run_type="task_v1", status=str(status), duration_seconds=duration_seconds
+            )
+        return updated_task
 
     async def _handle_completed_step_with_parallel_verification(
         self,

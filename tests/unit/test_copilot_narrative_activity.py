@@ -16,7 +16,7 @@ from skyvern.forge.sdk.copilot.narration import (
 )
 from skyvern.forge.sdk.copilot.output_utils import format_tool_result_for_user
 
-_SURGICAL_EDIT_TOOLS = ("edit_block", "delete_block", "synthesize_demonstrated_block")
+_SURGICAL_EDIT_TOOLS = ("edit_block", "delete_block")
 
 _CREDENTIAL_PAYLOAD: dict[str, object] = {
     "count": 4,
@@ -234,9 +234,6 @@ def test_build_narrative_payload_empty_when_no_narrator_state() -> None:
 def test_surgical_edit_tools_label_the_operation_and_target_block() -> None:
     assert tool_activity_display_label("edit_block", {"label": "Log in"}) == 'Editing block "Log In"'
     assert tool_activity_display_label("delete_block", {"label": "Log in"}) == 'Deleting block "Log In"'
-    assert (
-        tool_activity_display_label("synthesize_demonstrated_block", {}) == "Building a block from the recorded steps"
-    )
     assert tool_activity_display_label("edit_block") == "Editing block"
 
 
@@ -277,7 +274,6 @@ def test_surgical_edit_tools_never_render_the_working_fallback() -> None:
     labels = {
         "edit_block": tool_activity_display_label("edit_block", {"label": "Log in"}),
         "delete_block": tool_activity_display_label("delete_block", {"label": "Old step"}),
-        "synthesize_demonstrated_block": tool_activity_display_label("synthesize_demonstrated_block", {}),
     }
     for index, tool_name in enumerate(_SURGICAL_EDIT_TOOLS):
         display_label = labels[tool_name]
@@ -287,12 +283,11 @@ def test_surgical_edit_tools_never_render_the_working_fallback() -> None:
         )
 
     rows = state.design_activity
-    assert len(rows) == 6
+    assert len(rows) == 4
     assert all("Working" not in row["text"] for row in rows)
     assert all("Working" not in (row.get("displayLabel") or "") for row in rows)
     assert 'Editing block "Log In"…' in [row["text"] for row in rows]
     assert 'Deleting block "Old Step"' in [row["text"] for row in rows]
-    assert "Building a block from the recorded steps" in [row["text"] for row in rows]
 
 
 def _credential_rows(state: NarratorState, parsed: dict[str, object], index: int) -> None:

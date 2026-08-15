@@ -5,42 +5,26 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
-import os
 import re
 import time
-import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import structlog
-from agents import ModelSettings, RunConfig
 from agents.run import Runner
 
 from skyvern.config import settings
-from skyvern.forge.sdk.copilot import config as copilot_config_defaults
 from skyvern.forge.sdk.copilot import streaming_adapter
 from skyvern.forge.sdk.copilot.blocker_signal import (
-    SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
     CopilotToolBlockerSignal,
-    clear_tool_blocker_signals_for_reason_codes,
     stash_blocker_signal,
-)
-from skyvern.forge.sdk.copilot.build_phase import (
-    DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD,
-    DISCOVERY_PERMITTED_PHASES,
-    BuildPhase,
-)
-from skyvern.forge.sdk.copilot.build_test_outcome import (
-    latest_recorded_build_test_outcome_repeated,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_carrier
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     CREDENTIAL_FILL_TOOL_NAME,
-    LIVE_SCOUT_CREDENTIAL_FIELDS,
     ONE_TIME_CODE_CREDENTIAL_FIELD,
-    ObligationFinding,
     credential_scout_gap,
     credential_submit_boundary_index,
     first_matched_post_fill_submit_index,
@@ -49,23 +33,14 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     first_stable_login_submit_index as _first_stable_login_submit_index,
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
-    freeze_requested_output_extraction_candidate,
     is_durable_fallback_entry_target,
     is_generic_entry_opener_click,
-    is_optional_dismissal_only_trajectory,
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     last_scout_credential_fill_index as _last_scout_credential_fill_index,
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
-    missing_rung_text,
-    render_obligation_findings,
-    render_synthesized_offer_text,
-    spine_partition_findings,
-    synthesize_code_block,
-    synthesize_code_block_with_extraction,
     trajectory_has_browser_fill_interaction,
-    uncovered_rung_records,
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import requested_output_paths
 from skyvern.forge.sdk.copilot.completion_verification import only_structural_requested_output_abstentions
@@ -73,72 +48,30 @@ from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_sche
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
     DEFAULT_TOKEN_BUDGET,
-    POST_ANTI_BOT_FAILED_TEST_NUDGE,
-    POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE,
-    POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE,
-    POST_FAILED_TEST_INSPECT_FIRST_NUDGE,
-    POST_FAILED_TEST_NUDGE,
-    POST_NAVIGATE_NUDGE,
-    POST_NO_WORKFLOW_DELIVERY_NUDGE,
-    POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE,
-    POST_PARAMETER_BINDING_STOP_NUDGE,
-    POST_PARAMETER_BINDING_WARN_NUDGE,
-    POST_PER_TOOL_BUDGET_NUDGE,
-    POST_PER_TOOL_BUDGET_STOP_NUDGE,
-    POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE,
-    POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE,
-    POST_SUSPICIOUS_SUCCESS_NUDGE,
-    POST_UPDATE_NUDGE,
-    PRE_DISCOVERY_URL_QUESTION_NUDGE,
-    SCREENSHOT_DROPPED_NUDGE,
-    SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD,
-    BlockAuthoringPolicy,
     CopilotConfig,
-    normalize_block_authoring_policy,
 )
-from skyvern.forge.sdk.copilot.context import (
-    AskSubject,
-    coerce_ask_subject,
-    parsed_ask_refs,
-)
-from skyvern.forge.sdk.copilot.credential_pause import credential_pause_would_fire, maybe_credential_pause
+from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTIAL_FIELDS
+from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause
 from skyvern.forge.sdk.copilot.credential_resolution import url_parts
-from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
-    RepairLoopState,
-    RepairNextAction,
-)
-from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY, normalize_failure_reason
+from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
 from skyvern.forge.sdk.copilot.narration import TransitionKind
-from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
-    RequestedOutputExtractionPlan,
-    bindable_candidate_headings,
-    derivation_bail_reason,
-    derive_requested_output_extraction_plan,
-    plan_from_designations,
     resolve_shape_expectations_by_path,
-    unbound_candidate_relations,
-    value_shown_in_selectable_evidence,
 )
 from skyvern.forge.sdk.copilot.output_policy import (
-    completion_criterion_requires_browser_fill_delivery,
     normalize_response_scaffolding,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
     extract_final_text,
-    looks_like_workflow_delivery_claim,
     parse_final_response,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
-    REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS,
     CompletionCriterion,
     RequestPolicy,
     floor_rekeyed_requested_output_paths,
-    request_policy_has_present_completion_contract,
     requested_output_path_for_field,
     schema_output_path_aliases_from_criteria,
 )
-from skyvern.forge.sdk.copilot.request_slots import is_canonical_request_slot_path
 from skyvern.forge.sdk.copilot.result_evidence import (
     COVERAGE_TOKEN_RE,
     ScoutObservationContract,
@@ -155,7 +88,6 @@ from skyvern.forge.sdk.copilot.run_outcome import (
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
-    diagnosis_repair_obligation_open,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.terminal_predicates import (
@@ -165,14 +97,8 @@ from skyvern.forge.sdk.copilot.terminal_predicates import (
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
-    blocker_signal_is_genuinely_terminal,
     raise_if_turn_halt,
     stash_turn_halt_from_blocker_signal,
-)
-from skyvern.forge.sdk.copilot.turn_intent import RequiredContextKey, TurnIntent, TurnIntentMode
-from skyvern.forge.sdk.copilot.turn_ownership import (
-    TurnClaimant,
-    claim_turn,
 )
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
     CopilotUnrecoverableToolError as CopilotUnrecoverableToolError,
@@ -192,36 +118,6 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
-POST_FORMAT_NUDGE = copilot_config_defaults.POST_FORMAT_NUDGE
-POST_INTERMEDIATE_SUCCESS_NUDGE = copilot_config_defaults.POST_INTERMEDIATE_SUCCESS_NUDGE
-
-MAX_POST_UPDATE_NUDGES = 2
-MAX_INTERMEDIATE_NUDGES = 8
-MAX_FAILED_TEST_NUDGES = 2
-# Repair rounds the typed obligation may force past the ordinary nudge budget before a turn is
-# allowed to report an unrepairable failure.
-MAX_REPAIR_OBLIGATION_NUDGES = 6
-MAX_FORMAT_NUDGES = 2
-MAX_NO_WORKFLOW_NUDGES = 2
-MAX_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGES = 2
-MAX_PRE_DISCOVERY_URL_QUESTION_NUDGES = 2
-MAX_EXPLORE_WITHOUT_WORKFLOW_NUDGES = 2
-# Stops the suspicious-success nudge from re-firing forever when the agent has
-# correctly diagnosed an unrecoverable block (anti-bot, paywall) and is no
-# longer willing to re-run extraction.
-MAX_SUSPICIOUS_SUCCESS_NUDGES = 2
-# Streak levels for repeated-failure (same frontier + same failure signature).
-REPEATED_FRONTIER_STREAK_ESCALATE_AT = 2
-REPEATED_FRONTIER_STREAK_STOP_AT = 3
-# Stop after this many consecutive runs where navigation succeeded but the
-# scraper could not read the page. Aligned with MAX_FAILED_TEST_NUDGES so the
-# copilot gets one generic retry nudge, then stops on the second occurrence.
-# Caps how many times the per-tool-budget split nudge can fire. After two
-# trips the agent should already be at single-block granularity; further
-# trips fall through to the repeated-frontier escalation path.
-MAX_PER_TOOL_BUDGET_NUDGES = 2
-_NO_PROGRESS_INTERACTION_REASON_CODES = frozenset({"loop_detected_no_forward_progress_interaction"})
-MIN_BLOCKS_FOR_AUTO_COMPLETE = 10
 TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
 # Floor for the per-iteration ``wait_for`` deadline so an already-spent budget
 # never yields ``wait_for(timeout=0)`` (which raises immediately). Kept as a
@@ -232,13 +128,6 @@ NUDGE_SENTINEL = "[copilot:nudge] "
 SCREENSHOT_PLACEHOLDER = SCREENSHOT_SENTINEL + "[prior screenshot removed to save context]"
 TOKEN_BUDGET = DEFAULT_TOKEN_BUDGET
 SYNTHESIZED_BLOCK_PERSISTENCE_TOOL = "update_and_run_blocks"
-_SYNTHESIZED_BLOCK_PERSISTENCE_ALLOWED_TOOLS = frozenset(
-    {SYNTHESIZED_BLOCK_PERSISTENCE_TOOL, "fill_credential_field", "update_workflow"}
-)
-_ACTUATION_OBLIGATION_REQUIRED_FILL_TOOL = "type_text"
-_SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS = frozenset(
-    {"click", "press_key", "type_text", "select_option", "navigate_browser"}
-)
 # Both tools re-author the workflow draft and clear the coverage-reopen flag; the steer must fire
 # for either or an update_workflow re-author silently spends the one-shot rescout.
 _SYNTHESIZED_BLOCK_REAUTHORING_TOOLS = frozenset({SYNTHESIZED_BLOCK_PERSISTENCE_TOOL, "update_workflow"})
@@ -257,36 +146,19 @@ TOKENS_PER_RESIZED_IMAGE = 765
 # Keep the last N function_call_output items at full (head-truncated) size.
 # Older outputs collapse to a compact synopsis so context doesn't grow linearly.
 KEEP_RECENT_TOOL_OUTPUTS = 3
-_RECENT_TOOL_OUTPUT_CHAR_CAP = 2000
+# A tripwire against pathological payloads, not a routine ration: code-bearing tool
+# results (synthesized blocks, edit re-anchor echoes) run 3-30KB plus JSON escaping
+# and must reach the model whole, so the cap sits above that class with headroom.
+_RECENT_TOOL_OUTPUT_CHAR_CAP = 50_000
+# Older tool-call arguments that fail to summarize keep only this much; that channel
+# exists to shrink replayed context and must not follow the recent-window cap.
+_SUMMARIZED_TOOL_ARGUMENT_CHAR_CAP = 2000
 _TOOL_OUTPUT_SUMMARIZE_THRESHOLD = 300
 _TOOL_OUTPUT_TRUNCATION_SUFFIX = "\n... [older tool output truncated]"
 # Head-truncation marker for the recent tool-output window. Kept on a
 # module-level constant so session_factory can import the same string and
 # the two paths stay in sync if the wording ever changes.
 _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX = "\n... [truncated]"
-
-# A REPLY matching any of these is almost certainly the agent leaking internal
-# iteration state instead of finalizing or asking a specific question.
-_PROGRESS_NARRATION_PATTERNS = [
-    re.compile(r"\b(next|then)\s+i\s+will\b", re.IGNORECASE),
-    re.compile(r"\bi\s+did\s+not\s+attempt\b", re.IGNORECASE),
-    re.compile(r"\bunless\s+you\s+want\b", re.IGNORECASE),
-    re.compile(r"\bi\s+will\s+(?:now\s+)?proceed\b", re.IGNORECASE),
-    re.compile(r"\bi\s+have\s+not\s+yet\b", re.IGNORECASE),
-]
-
-PRESENT_COMPLETION_CONTRACT_ASK_RETRY = (
-    "The final ASK_QUESTION is not an allowed terminal response for this turn: the request already has a typed "
-    "completion contract / completion criteria and no separate required clarification is active. Continue authoring "
-    "the workflow from the existing contract, then run/test it before responding. Only ask the user if a separate "
-    "required input is missing under RequestPolicy or TurnIntent."
-)
-
-
-def _is_progress_narration(user_response: Any) -> bool:
-    if not isinstance(user_response, str) or not user_response:
-        return False
-    return any(pattern.search(user_response) for pattern in _PROGRESS_NARRATION_PATTERNS)
 
 
 def _normalized_proxy_label(proxy_location: Any) -> str | None:
@@ -313,124 +185,6 @@ def _effective_proxy_label(ctx: Any) -> str | None:
     if workflow is None:
         return None
     return _normalized_proxy_label(getattr(workflow, "proxy_location", None))
-
-
-def _repair_loop_state(ctx: Any) -> RepairLoopState | None:
-    contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
-    state = getattr(contract, "repair_loop_state", None)
-    return state if isinstance(state, RepairLoopState) else None
-
-
-_CHURN_REASON_CODES = frozenset({"code_authoring_guardrail_churn", "credential_priority_authoring_churn"})
-
-
-def _scouted_spine_open_obligation(ctx: AgentContext) -> list[ObligationFinding]:
-    """Partition-exhaustiveness findings the latest persisted draft leaves open — uncovered required
-    rungs, dropped interactions the allowlist does not forgive, retained indices in no lane, and
-    truncation; empty when no in-turn persist exists or the full manifest is accounted for."""
-    persisted_calls = ctx.persisted_draft_browser_calls
-    if persisted_calls is None:
-        return []
-    if not ctx.impose_synthesized_code_block:
-        return []
-    if normalize_block_authoring_policy(ctx.block_authoring_policy) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return []
-    trajectory = ctx.scout_trajectory
-    if not trajectory:
-        return []
-    if not str(trajectory[0].get("source_url") or "").strip():
-        return []
-    synthesized = synthesize_code_block(
-        trajectory,
-        strict_selectors=True,
-        reached_download_target=ctx.reached_download_target,
-    )
-    if synthesized is None:
-        return []
-    return spine_partition_findings(synthesized.diagnostics, persisted_calls, trajectory)
-
-
-def _scouted_spine_missing_text(findings: list[ObligationFinding]) -> str:
-    uncovered = uncovered_rung_records(findings)
-    return missing_rung_text(uncovered) if uncovered else render_obligation_findings(findings)
-
-
-def _log_scouted_spine_unresolved(findings: list[ObligationFinding], *, site: str) -> None:
-    LOG.info(
-        "copilot_scouted_spine_under_build_unresolved",
-        site=site,
-        missing_rung_count=len(uncovered_rung_records(findings)),
-        missing_rungs=_scouted_spine_missing_text(findings),
-    )
-
-
-def _get_scouted_spine_missing_steps_for_halt(ctx: AgentContext) -> str | None:
-    """Missing-steps text for any give-up offer, covering every open obligation family
-    (uncovered rungs, unforgiven drops, unrecorded indices, truncation), not uncovered rungs alone."""
-    try:
-        findings = _scouted_spine_open_obligation(ctx)
-    except Exception:
-        LOG.warning("copilot_scouted_spine_halt_missing_steps_failed", exc_info=True)
-        return None
-    if not findings:
-        return None
-    return _scouted_spine_missing_text(findings)
-
-
-def log_scouted_spine_unresolved_at_turn_halt(ctx: AgentContext) -> bool:
-    """Log-only and never raises: a failed obligation read must not block rendering the halt reply."""
-    try:
-        findings = _scouted_spine_open_obligation(ctx)
-    except Exception:
-        LOG.warning("copilot_scouted_spine_turn_halt_check_failed", exc_info=True)
-        return False
-    if not findings:
-        return False
-    _log_scouted_spine_unresolved(findings, site="turn_halt")
-    return True
-
-
-def _code_authoring_reject_count_resets(repeated_outcome: bool | None, frontier_unchanged: bool) -> bool:
-    # A frontier-unchanged reject is churn even when sibling edits move the whole-signature key each
-    # turn (which reads as a non-repeat); it must accumulate toward the churn stop, not reset.
-    return repeated_outcome is False and not frontier_unchanged
-
-
-def _record_code_authoring_guardrail_reject(
-    ctx: AgentContext,
-    *,
-    defer_churn_stop: bool = False,
-    frontier_unchanged: bool = False,
-    output_policy_reason_codes: frozenset[str] | None = None,
-) -> None:
-    # Callers record the current build-test outcome first so repeat detection compares that key to history.
-    repeated_outcome = latest_recorded_build_test_outcome_repeated(ctx)
-    if _code_authoring_reject_count_resets(repeated_outcome, frontier_unchanged):
-        ctx.code_authoring_guardrail_reject_count = 0
-    ctx.code_authoring_guardrail_reject_count += 1
-    ctx.last_code_authoring_reject_was_credential_priority = defer_churn_stop
-    # Any non-output-policy reject clears the cause, so the credential-priority terminal never
-    # attributes a scout-gate stop to a stale raw-secret-leak streak.
-    ctx.last_output_policy_reject_reason_codes = output_policy_reason_codes
-    LOG.info(
-        "copilot code-authoring guardrail reject recorded",
-        reject_count=ctx.code_authoring_guardrail_reject_count,
-        credential_priority=defer_churn_stop,
-    )
-
-
-def reset_no_progress_interaction_count(ctx: Any) -> None:
-    if _get_int(ctx, "consecutive_no_progress_interaction_count") == 0:
-        return
-    ctx.consecutive_no_progress_interaction_count = 0
-    clear_tool_blocker_signals_for_reason_codes(ctx, _NO_PROGRESS_INTERACTION_REASON_CODES)
-    LOG.info("copilot_no_progress_interaction_reset")
-
-
-def register_no_progress_interaction_click(ctx: Any, *, outcome: str) -> None:
-    count = _get_int(ctx, "consecutive_no_progress_interaction_count") + 1
-    ctx.consecutive_no_progress_interaction_count = count
-    LOG.info("copilot_no_progress_interaction_click", outcome=outcome, count=count)
 
 
 def _typed_terminal_challenge_outcome(ctx: Any) -> RecordedRunOutcome | None:
@@ -579,10 +333,16 @@ def _one_time_code_fill_targets(ctx: Any) -> set[tuple[str, str]]:
 
     Keyed by page as well as selector because an observation packet records only the selector, and
     the same selector text recurs across sites.
+
+    Carried entries are a prior turn's history, not this turn's acts: the trajectory is seeded with
+    the retained record, and a code entered on an earlier turn cannot supersede a challenge this
+    turn is looking at.
     """
     targets: set[tuple[str, str]] = set()
     for item in getattr(ctx, "scout_trajectory", None) or []:
         if not isinstance(item, Mapping):
+            continue
+        if item.get("carried") is True:
             continue
         if str(item.get("tool_name") or "").strip() != CREDENTIAL_FILL_TOOL_NAME:
             continue
@@ -647,73 +407,6 @@ def one_time_code_fill_supersedes_challenge(ctx: Any, evidence: Mapping[str, Any
         if (page, selector) in targets and _observed_page_key(packet.get("interaction_source_url")) == page:
             return True
     return False
-
-
-def terminal_challenge_blocker_signal_from_current_page_evidence(
-    ctx: Any,
-    *,
-    blocked_tool: str,
-    evidence_source: str = "page_evidence",
-) -> CopilotToolBlockerSignal | None:
-    if getattr(ctx, "last_failure_category_top", None) == PER_TOOL_BUDGET_FAILURE_CATEGORY:
-        return None
-    for evidence in _current_page_evidence_candidates(ctx):
-        if evidence.get("observed_after_workflow_run") is not True:
-            continue
-        if not _current_page_challenge_requires_stop(evidence):
-            continue
-        signal = terminal_challenge_blocker_signal_from_page_evidence(
-            ctx,
-            blocked_tool=blocked_tool,
-            evidence_source=evidence_source,
-            evidence=evidence,
-        )
-        if signal is not None:
-            return signal
-    return None
-
-
-CURRENT_PAGE_CHALLENGE_ADVISORY_REASON_CODE = "tool_error_current_page_challenge_advisory"
-
-
-def current_page_challenge_advisory_signal(
-    ctx: Any, *, blocked_tool: str, evidence_source: str = "page_evidence"
-) -> CopilotToolBlockerSignal | None:
-    """A fire-once advisory in place of the current-page pre-veto: the model sees the challenge
-    verdict and decides, holding facts this plane cannot see — what it filled and what it holds.
-
-    Terminal stopping stays with the producers that key on outcomes: a run that failed with
-    anti-bot evidence, the loop plane, budget. A page that merely looks like a wall has not
-    stopped anything yet.
-    """
-    signal = terminal_challenge_blocker_signal_from_current_page_evidence(
-        ctx, blocked_tool=blocked_tool, evidence_source=evidence_source
-    )
-    if signal is None:
-        return None
-    reason = str(signal.extra.get("evidence_reason") or "a verification challenge")
-    fired = getattr(ctx, "challenge_advisory_fired_reasons", None)
-    if not isinstance(fired, set) or reason in fired:
-        return None
-    fired.add(reason)
-    return CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text=(
-            f"Structured page evidence flags the current page as a verification challenge: {reason}. "
-            "This is advisory, not a wall. If the page is asking for something this turn already holds — "
-            "for example a one-time code from the resolved credential — fill it, submit it, and continue. "
-            "If it is a genuine anti-bot wall you cannot satisfy, do NOT retry the same path; reply to the "
-            "user naming the blocker."
-        ),
-        user_facing_reason="The page may be showing a verification step; I'm checking whether I can complete it.",
-        recovery_hint="retry_with_different_tool",
-        cleared_by_tools=frozenset({blocked_tool}),
-        preserves_workflow_draft=True,
-        renders_final_reply=False,
-        internal_reason_code=CURRENT_PAGE_CHALLENGE_ADVISORY_REASON_CODE,
-        blocked_tool=blocked_tool,
-        extra={key: value for key, value in signal.extra.items() if key != "run_outcome_reason_code"},
-    )
 
 
 def _maybe_stash_terminal_challenge_halt(ctx: Any) -> None:
@@ -793,7 +486,7 @@ def built_complete_without_evaluated_outcome(ctx: CopilotContext) -> bool:
         and latest_diagnosis_contract_satisfies_goal(ctx)
     ):
         return False
-    return not _verified_goal_likely_needs_more_work(ctx)
+    return True
 
 
 def built_unverified_repair_inert_context(ctx: CopilotContext) -> bool:
@@ -803,16 +496,7 @@ def built_unverified_repair_inert_context(ctx: CopilotContext) -> bool:
         and _outcome_criteria_evaluated(ctx)
         and _latest_diagnosis_contract_selects_no_repair(ctx)
         and _completion_verification_only_structural_abstentions(ctx)
-        and not _verified_goal_likely_needs_more_work(ctx)
     )
-
-
-def verified_goal_claim_authorized(ctx: CopilotContext) -> bool:
-    """Whether the terminal may CLAIM a tested success. Turn completion keeps
-    flowing through ``verified_goal_satisfied_context``; the claim tier additionally
-    requires judge-confirmed outcome evidence — criteria-less or judge-less terminals
-    end the turn but render built-but-unverified."""
-    return outcome_fully_verified(ctx)
 
 
 def gate_decision_trace_fields(ctx: CopilotContext) -> dict[str, bool]:
@@ -821,30 +505,19 @@ def gate_decision_trace_fields(ctx: CopilotContext) -> dict[str, bool]:
     Captured wherever the gate is evaluated (including when it returns False, the
     signal that explains why the turn continued) so a single trace shows whether
     the gate failed on the test, the full-workflow run, the diagnosis contract,
-    the absence of outcome verification, or the block-count heuristic.
+    or the absence of outcome verification.
     """
     return {
         "gate_satisfied": verified_goal_satisfied_context(ctx),
         "gate_built_unverified_repair_inert": built_unverified_repair_inert_context(ctx),
         "gate_built_complete_without_evaluated_outcome": built_complete_without_evaluated_outcome(ctx),
-        "gate_claim_authorized": verified_goal_claim_authorized(ctx),
         "gate_last_test_ok": ctx.last_test_ok is True,
         "gate_last_full_workflow_test_ok": ctx.last_full_workflow_test_ok is True,
         "gate_diagnosis_contract_satisfies_goal": latest_diagnosis_contract_satisfies_goal(ctx),
         "gate_outcome_criteria_evaluated": _outcome_criteria_evaluated(ctx),
         "gate_artifact_health_blocked": artifact_health_blocked(ctx),
-        "gate_likely_needs_more_work": _verified_goal_likely_needs_more_work(ctx),
         "gate_evaluated_this_turn": True,
     }
-
-
-def _verified_goal_likely_needs_more_work(ctx: CopilotContext) -> bool:
-    block_count = ctx.last_update_block_count
-    if not isinstance(block_count, int):
-        return False
-    user_message = ctx.user_message
-    completion_contract = _request_completion_contract(ctx)
-    return _goal_likely_needs_more_blocks(user_message, block_count, completion_contract)
 
 
 def _mark_copilot_total_timeout(ctx: Any, *, elapsed_seconds: float, iteration: int) -> None:
@@ -852,14 +525,10 @@ def _mark_copilot_total_timeout(ctx: Any, *, elapsed_seconds: float, iteration: 
     ctx.copilot_total_timeout_exceeded = True
     if already_marked:
         return
-    # Only CopilotContext carries build_phase; the self-heal path passes a bare AgentContext,
-    # and an AttributeError here would replace the timeout with a crash.
-    build_phase = getattr(ctx, "build_phase", None)
     LOG.warning(
         "copilot_turn_deadline_expired",
         elapsed_seconds=round(elapsed_seconds, 3),
         iteration=iteration,
-        build_phase=build_phase.value if isinstance(build_phase, BuildPhase) else None,
     )
 
 
@@ -920,9 +589,6 @@ def _maybe_raise_non_retriable_nav(ctx: Any) -> None:
     raise CopilotNonRetriableNavError(url=_extract_url_from_nav_error(err), error_message=err)
 
 
-_POST_RUN_PAGE_OBSERVATION_TOOLS = frozenset({"evaluate", "get_browser_screenshot", "inspect_page_for_composition"})
-
-
 def _raise_if_unrecoverable_contract_stop(ctx: Any) -> None:
     contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
     diagnosis = getattr(contract, "diagnosis_result", None)
@@ -948,184 +614,27 @@ def _raise_if_unrecoverable_contract_stop(ctx: Any) -> None:
     raise CopilotUnrecoverableToolError(tool_name, reason)
 
 
-_ACTION_CATEGORIES: list[list[str]] = [
-    ["navigate", "go to", "open", "visit"],
-    ["download", "save", "export"],
-    ["extract", "scrape", "collect", "gather", "get all", "grab", "capture", "retrieve", "pull"],
-    ["login", "log in", "sign in", "authenticate"],
-    ["search", "find", "look for", "look up", "check", "verify"],
-    ["fill", "enter", "type", "submit", "complete the form", "input"],
-    ["click", "select", "choose", "pick"],
-    ["upload", "attach"],
-]
-
-_SEQUENTIAL_CONNECTORS = [" and then ", " then ", " after that ", " next ", " followed by ", " afterward "]
-
-
-def _request_completion_contract(ctx: Any) -> str | None:
-    request_policy = getattr(ctx, "request_policy", None)
-    completion_contract = getattr(request_policy, "completion_contract", None)
-    if isinstance(completion_contract, str) and completion_contract.strip():
-        return completion_contract.strip()
-    return None
-
-
-def _request_completion_contract_status(ctx: Any) -> str:
-    request_policy = getattr(ctx, "request_policy", None)
-    status = getattr(request_policy, "completion_contract_status", None)
-    if status in ("present", "absent", "unknown"):
-        return status
-    return "present" if _request_completion_contract(ctx) else "absent"
-
-
-def _completion_contract_unknown_due_to_policy_fallback(ctx: Any) -> bool:
-    return _request_completion_contract_status(ctx) == "unknown"
-
-
-_AUTHORING_TURN_INTENT_MODES = frozenset({TurnIntentMode.BUILD, TurnIntentMode.EDIT, TurnIntentMode.DRAFT_ONLY})
-
-
-def _turn_intent_can_author_without_user_input(turn_intent: Any) -> bool:
-    if not isinstance(turn_intent, TurnIntent):
-        return False
-    if turn_intent.mode not in _AUTHORING_TURN_INTENT_MODES:
-        return False
-    if turn_intent.authority.requires_user_input:
-        return False
-    return turn_intent.authority.may_update_workflow
-
-
-def _turn_intent_can_update_and_run_without_user_input(turn_intent: Any) -> bool:
-    if not _turn_intent_can_author_without_user_input(turn_intent):
-        return False
-    return bool(turn_intent.authority.may_run_blocks)
-
-
-def _present_completion_contract_ask_admission_base(ctx: CopilotContext) -> bool:
-    request_policy = ctx.request_policy
-    if not isinstance(request_policy, RequestPolicy):
-        return False
-    if not request_policy_has_present_completion_contract(request_policy):
-        return False
-    if request_policy.user_response_policy == "ask_clarification":
-        return False
-    if request_policy.clarification_reason not in (None, "none"):
-        return False
-    return _turn_intent_can_author_without_user_input(ctx.turn_intent)
-
-
-def recycle_admits_present_completion_contract_ask(ctx: CopilotContext) -> bool:
-    if not _present_completion_contract_ask_admission_base(ctx):
-        return False
-    return not ctx.has_genuine_workflow_attempt()
-
-
-def _present_completion_contract_ask_retry(ctx: CopilotContext, parsed: dict[str, Any]) -> str | None:
-    if parsed.get("type") != "ASK_QUESTION":
-        return None
-    ask_subject = coerce_ask_subject(parsed.get("ask_subject"))
-    if ask_subject is not None:
-        # A schema ask the contract already answers is redundant whether or not the turn has
-        # built anything yet, so it resolves on the base admission without the attempt check.
-        if _present_completion_contract_ask_admission_base(ctx):
-            auto_answer = _typed_ask_subject_auto_answer(ctx, ask_subject, parsed)
-            if auto_answer is not None:
-                return auto_answer
-    retry_admitted = recycle_admits_present_completion_contract_ask(ctx)
-    if ask_subject is not None:
-        LOG.info(
-            "copilot_ask_subject_passed_through",
-            subject=ask_subject,
-            outcome="build_first_retry" if retry_admitted else "reached_user",
-            **ctx.genuine_attempt_parity_fields(),
-        )
-    if not retry_admitted:
-        return None
-    LOG.info(
-        "copilot.present_completion_contract_ask_retry",
-        reason_code="present_completion_contract_ask_internal_retry",
-        turn_intent_mode=ctx.turn_intent.mode if ctx.turn_intent else None,
-        **ctx.genuine_attempt_parity_fields(),
-    )
-    return PRESENT_COMPLETION_CONTRACT_ASK_RETRY
-
-
-def _typed_ask_subject_auto_answer(ctx: CopilotContext, ask_subject: AskSubject, parsed: dict[str, Any]) -> str | None:
-    if ask_subject != "output_schema":
-        return None
-    # Reads the raw policy criteria rather than the turn-active set the other requested-output
-    # consumers use: floor-rekey annotations are baked in at request-policy build time, and what
-    # the model may cite as refs is rendered from this same set in `prompt_summary`.
-    policy = ctx.request_policy
-    if not isinstance(policy, RequestPolicy):
-        return None
-    criteria = policy.graded_completion_criteria()
-    requested = requested_output_paths(criteria) | floor_rekeyed_requested_output_paths(criteria)
-    if not requested:
-        return None
-    refs = parsed_ask_refs(parsed.get("refs"))
-    if refs and set(refs) <= requested:
-        resolved = sorted(set(refs))
-        LOG.info(
-            "copilot_ask_subject_auto_answered",
-            subject=ask_subject,
-            resolved_refs=resolved,
-        )
-        # An output_schema ask is usually "which page value is it?", and the asker has already named a
-        # candidate; telling it to choose a representation licensed freelance parsing while the
-        # designation route sat unused (SKY-13485). Point the ask at the read that binds instead.
-        return (
-            f"The output path is settled: {', '.join(resolved)}. Which page value it is, is yours to "
-            "decide from what you can see — do not ask the user. If the requested value is visible "
-            "now, read it off the live page: call evaluate with an expression whose result is just "
-            "that value exactly as rendered, and set output_path to the requested path on that call; "
-            "the extraction will bind to the value you observed. If it is not visible yet, author and "
-            "test the workflow to produce it."
-        )
-    # A request that named no output key is pinned to anonymous slots, so no name the model could
-    # propose is citable and the coverage check above can never be satisfied. The contract still
-    # settles that an output is owed; only what to call it is open, and that belongs to the author.
-    if any(not is_canonical_request_slot_path(path) for path in requested):
-        return None
-    LOG.info(
-        "copilot_ask_subject_auto_answered",
-        subject=ask_subject,
-        resolved_refs=[],
-        proposed_refs=sorted(set(refs)),
-        anonymous_slot_count=len(requested),
-    )
-    owed = len(requested)
-    subject_phrase = "one output is owed" if owed == 1 else f"{owed} outputs are owed"
-    naming_phrase = "what to call it" if owed == 1 else "what to call them"
-    return (
-        f"This request's completion contract already settles that {subject_phrase}; the only open "
-        f"question is {naming_phrase}, and that is yours to choose. Author and test the workflow to "
-        "produce every value the user asked for, under reasonable names and representations, instead "
-        "of asking the user to confirm field names."
-    )
-
-
 def _nudge(config: CopilotConfig | None, key: str) -> str:
     if config is None:
         return DEFAULT_ENFORCEMENT_NUDGES[key]
     return config.nudge(key)
 
 
-def _goal_likely_needs_more_blocks(user_message: Any, block_count: int, completion_contract: str | None = None) -> bool:
-    """Return True when the goal likely requires more blocks than currently exist."""
-    if block_count >= MIN_BLOCKS_FOR_AUTO_COMPLETE:
-        return False
-    if not isinstance(user_message, str):
-        return False
-    text = user_message.lower()
-    has_sequential = any(conn in text for conn in _SEQUENTIAL_CONNECTORS)
-    if block_count >= 1 and completion_contract:
-        return has_sequential and block_count < 2
+@dataclass(frozen=True)
+class EnforcementDecision:
+    """Which enforcement rule fired, and the text it renders to.
 
-    matched_categories = sum(1 for category in _ACTION_CATEGORIES if any(keyword in text for keyword in category))
+    ``rule`` is the stable identity because nudge prose is operator-configurable;
+    most rules name a key in ``DEFAULT_ENFORCEMENT_NUDGES``, but the ask-retry
+    rules carry a hardcoded message and are not resolvable through ``_nudge``.
+    """
 
-    estimated_min_blocks = max(matched_categories, 2) if has_sequential else matched_categories
-    return block_count < estimated_min_blocks
+    rule: str
+    message: str
+
+
+def _decision(config: CopilotConfig | None, key: str) -> EnforcementDecision:
+    return EnforcementDecision(rule=key, message=_nudge(config, key))
 
 
 def _same_page(left: str | None, right: str | None) -> bool:
@@ -1143,155 +652,6 @@ def _same_page(left: str | None, right: str | None) -> bool:
     left_path = (left_parsed.path or "/").rstrip("/") or "/"
     right_path = (right_parsed.path or "/").rstrip("/") or "/"
     return left_path == right_path
-
-
-def _has_candidate_bound_page_evidence(ctx: Any, candidate_url: str) -> bool:
-    inspection_count = int(getattr(ctx, "page_inspection_calls_this_turn", 0) or 0)
-    inspection_baseline = int(getattr(ctx, "resolved_discovery_entrypoint_inspection_baseline", 0) or 0)
-    if inspection_count <= inspection_baseline:
-        return False
-    evidence = getattr(ctx, "composition_page_evidence", None)
-    if not isinstance(evidence, dict):
-        return False
-    if evidence.get("source_tool") != "inspect_page_for_composition":
-        return False
-    for key in ("inspected_url", "current_url"):
-        value = evidence.get(key)
-        if isinstance(value, str) and _same_page(candidate_url, value):
-            return True
-    return False
-
-
-def _pre_discovery_url_question_nudge(
-    ctx: Any,
-    parsed: dict[str, Any],
-    config: CopilotConfig | None = None,
-) -> str | None:
-    """Steer the model to discovery when it asks before discovery has run.
-
-    INITIAL/DISCOVERING phase with zero discovery calls means the model went
-    straight to asking instead of resolving the entrypoint itself. Credential,
-    loop, and conditional clarifications carry a non-default
-    request_policy.clarification_reason and are let through; the structural
-    triple (phase + zero discovery calls + default clarification_reason) already
-    excludes them. The post-discovery could-not-resolve ask happens after
-    discovery ran (discovery_calls_this_turn > 0) and so never reaches this gate.
-    Steering any remaining pre-discovery ASK to discovery is correct: discovery
-    is cheap, and if the site cannot resolve the model re-asks afterward.
-    """
-    if parsed.get("type") != "ASK_QUESTION":
-        return None
-    if getattr(ctx, "build_phase", None) not in DISCOVERY_PERMITTED_PHASES:
-        return None
-    if _get_int(ctx, "discovery_calls_this_turn") != 0:
-        return None
-    if (
-        getattr(ctx, "turn_halt", None) is not None
-        or _get_int(ctx, "discovery_failure_streak_this_turn") >= DISCOVERY_FAILURE_STREAK_ESCAPE_THRESHOLD
-    ):
-        return None
-    request_policy = getattr(ctx, "request_policy", None)
-    clarification_reason = getattr(request_policy, "clarification_reason", "none")
-    if clarification_reason not in (None, "none"):
-        return None
-    nudge_count = _get_int(ctx, "pre_discovery_url_question_nudge_count")
-    if nudge_count >= MAX_PRE_DISCOVERY_URL_QUESTION_NUDGES:
-        return None
-    ctx.pre_discovery_url_question_nudge_count = nudge_count + 1
-    LOG.info(
-        "copilot.pre_discovery_url_question_nudge",
-        reason_code="pre_discovery_url_question_steer_to_discovery",
-        build_phase=getattr(getattr(ctx, "build_phase", None), "value", None),
-        nudge_count=ctx.pre_discovery_url_question_nudge_count,
-    )
-    return _nudge(config, "pre_discovery_url_question")
-
-
-def _post_discovery_entrypoint_url_question_nudge(
-    ctx: Any,
-    parsed: dict[str, Any],
-    config: CopilotConfig | None = None,
-) -> str | None:
-    if parsed.get("type") != "ASK_QUESTION":
-        return None
-    candidate_url = getattr(ctx, "resolved_discovery_entrypoint_url", None)
-    failure_reason = getattr(ctx, "resolved_discovery_failure_reason", None)
-    if not isinstance(candidate_url, str) or not candidate_url or failure_reason:
-        return None
-    inspected_after_discovery = _has_candidate_bound_page_evidence(ctx, candidate_url)
-    mutated_after_discovery = bool(getattr(ctx, "update_workflow_called", False))
-    if inspected_after_discovery or mutated_after_discovery:
-        return None
-    nudge_count = getattr(ctx, "discovery_entrypoint_url_question_nudge_count", 0)
-    if nudge_count >= MAX_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGES:
-        return None
-    ctx.discovery_entrypoint_url_question_nudge_count = nudge_count + 1
-    return f"{_nudge(config, 'post_discovery_entrypoint_url_question')} Resolved candidate_url: {candidate_url}"
-
-
-def _response_coverage_nudge(ctx: Any, parsed: dict[str, Any], config: CopilotConfig | None = None) -> str | None:
-    """Peek at the model's final output and return a nudge for coverage gaps
-    or progress-narration format. ASK_QUESTION is let through so the agent
-    can request missing credentials or disambiguation, except when discovery
-    resolved a candidate and the agent has not yet inspected or composed from
-    that candidate.
-
-    Returns the nudge string to inject, or None to let the response through.
-    """
-    response_type = parsed.get("type")
-    pre_discovery_nudge = _pre_discovery_url_question_nudge(ctx, parsed, config)
-    if pre_discovery_nudge is not None:
-        return pre_discovery_nudge
-
-    discovery_entrypoint_nudge = _post_discovery_entrypoint_url_question_nudge(ctx, parsed, config)
-    if discovery_entrypoint_nudge is not None:
-        return discovery_entrypoint_nudge
-
-    present_contract_retry = _present_completion_contract_ask_retry(ctx, parsed)
-    if present_contract_retry is not None:
-        return present_contract_retry
-
-    if response_type not in ("REPLY", "REPLACE_WORKFLOW"):
-        return None
-
-    if (
-        response_type == "REPLY"
-        and not getattr(ctx, "update_workflow_called", False)
-        and looks_like_workflow_delivery_claim(parsed.get("user_response"))
-    ):
-        nudge_count = getattr(ctx, "no_workflow_nudge_count", 0)
-        if nudge_count < MAX_NO_WORKFLOW_NUDGES:
-            ctx.no_workflow_nudge_count = nudge_count + 1
-            return _nudge(config, "post_no_workflow_delivery")
-
-    workflow_tested_ok = (
-        getattr(ctx, "last_test_ok", None) is True
-        and getattr(ctx, "update_workflow_called", False)
-        and getattr(ctx, "test_after_update_done", False)
-    )
-    if workflow_tested_ok:
-        block_count = getattr(ctx, "last_update_block_count", None)
-        # ctx.user_message is set by the agent orchestrator in a later stack PR
-        # (06c). The getattr default keeps this gate working on partial stacks.
-        user_message = getattr(ctx, "user_message", "")
-        completion_contract = _request_completion_contract(ctx)
-        if (
-            isinstance(block_count, int)
-            and not _completion_contract_unknown_due_to_policy_fallback(ctx)
-            and _goal_likely_needs_more_blocks(user_message, block_count, completion_contract)
-        ):
-            nudge_count = getattr(ctx, "coverage_nudge_count", 0)
-            if nudge_count < MAX_INTERMEDIATE_NUDGES:
-                ctx.coverage_nudge_count = nudge_count + 1
-                return _nudge(config, "post_intermediate_success")
-
-    if _is_progress_narration(parsed.get("user_response")):
-        nudge_count = getattr(ctx, "format_nudge_count", 0)
-        if nudge_count < MAX_FORMAT_NUDGES:
-            ctx.format_nudge_count = nudge_count + 1
-            return _nudge(config, "post_format")
-
-    return None
 
 
 def _consume_pending_screenshots(ctx: Any) -> dict[str, Any] | None:
@@ -1325,86 +685,6 @@ def _consume_pending_screenshots(ctx: Any) -> dict[str, Any] | None:
     return {"role": "user", "content": content}
 
 
-def _needs_explore_without_workflow_nudge(ctx: Any) -> bool:
-    """Return True when the agent navigated and observed but never engaged the workflow path."""
-    if not getattr(ctx, "navigate_called", False):
-        return False
-    if not getattr(ctx, "observation_after_navigate", False):
-        return False
-    if getattr(ctx, "update_workflow_called", False):
-        return False
-    if getattr(ctx, "test_after_update_done", False):
-        return False
-    nudge_count = getattr(ctx, "explore_without_workflow_nudge_count", 0)
-    return nudge_count < MAX_EXPLORE_WITHOUT_WORKFLOW_NUDGES
-
-
-def _repair_obligation_live(ctx: AgentContext) -> bool:
-    """The typed obligation, bounded. It is discharged by evidence, but must not outlive the
-    evidence that produced it: a failure that looks repairable and is not would otherwise be
-    re-nudged until the turn budget dies, burying the blocker the model is trying to report."""
-    if not diagnosis_repair_obligation_open(ctx):
-        return False
-    return _get_int(ctx, "repair_obligation_nudge_count") < MAX_REPAIR_OBLIGATION_NUDGES
-
-
-def _repair_obligation_blocks_finalize(ctx: AgentContext, result: RunResultStreaming | None) -> bool:
-    """True when the turn is about to end while the typed contract still says the failure is repairable.
-
-    The nudge counters bound *repetition of a nudge*; they were never evidence that the failure had been
-    addressed, so once they ran out a turn could finalize a draft its own build test disproved. Ending is
-    still bounded — by the total-turn timeout and max-turns, both of which exit as WIP rather than as an
-    accept-ready proposal."""
-    if not _repair_obligation_live(ctx):
-        return False
-    parsed = _parse_normalized_final_response(result)
-    # ASK_QUESTION is a legitimate exit: it needs the user, not another repair round.
-    return parsed is not None and parsed.get("type") == "REPLY"
-
-
-def _needs_failed_test_nudge(ctx: Any) -> bool:
-    """Return True when the last test failed and the agent hasn't iterated yet."""
-    # A permanent nav error cannot be 'fix the workflow and retry' material —
-    # the dedicated non-retriable branch in _check_enforcement owns this case.
-    if getattr(ctx, "last_test_non_retriable_nav_error", None):
-        return False
-    if getattr(ctx, "pending_reconciliation_requires_user_input", False) is True:
-        return False
-    if getattr(ctx, "last_test_ok", None) is not False:
-        return False
-    if not getattr(ctx, "test_after_update_done", False):
-        return False
-    nudge_count = getattr(ctx, "failed_test_nudge_count", 0)
-    return nudge_count < MAX_FAILED_TEST_NUDGES
-
-
-def _needs_inspect_before_repair_nudge(ctx: Any) -> bool:
-    """True when a failed run is repairable and the reached page is not yet observed.
-
-    Routes the first post-failure move to observing the reached page before
-    re-authoring, instead of guessing a new block goal and re-running blind.
-    """
-    contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
-    if contract is None:
-        return False
-    if contract.repair_decision.next_action is not RepairNextAction.REPAIR:
-        return False
-    if not contract.diagnosis_input.browser_page_state.get("has_current_url"):
-        return False
-    return not _has_post_failed_run_page_observation(ctx)
-
-
-def _has_post_failed_run_page_observation(ctx: AgentContext) -> bool:
-    if getattr(ctx, "post_run_page_observation_after_failed_test", False) is not True:
-        return False
-    tool = getattr(ctx, "post_run_page_observation_tool", None)
-    if tool not in _POST_RUN_PAGE_OBSERVATION_TOOLS:
-        return False
-    observed_run_id = getattr(ctx, "post_run_page_observation_workflow_run_id", None)
-    current_run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
-    return bool(isinstance(observed_run_id, str) and observed_run_id and observed_run_id == current_run_id)
-
-
 def _parse_normalized_final_response(result: RunResultStreaming | None) -> dict[str, Any] | None:
     if result is None:
         return None
@@ -1422,205 +702,22 @@ def _parse_normalized_final_response(result: RunResultStreaming | None) -> dict[
     return parsed
 
 
-def _post_run_observed_reply_can_finalize(ctx: AgentContext, result: RunResultStreaming | None) -> bool:
-    if not _has_post_failed_run_page_observation(ctx):
-        return False
-    parsed = _parse_normalized_final_response(result)
-    if parsed is None or parsed.get("type") != "REPLY":
-        return False
-    user_response = parsed.get("user_response")
-    return isinstance(user_response, str) and bool(user_response.strip()) and not _is_progress_narration(user_response)
-
-
-def _needs_suspicious_success_nudge(ctx: Any) -> bool:
-    """Return True when the last test 'completed' but data blocks had no output."""
-    if _typed_terminal_challenge_outcome(ctx) is not None:
-        return False
-    # A non-retriable nav failure cannot be "suspiciously successful" — defer
-    # to the dedicated stop path rather than competing for the nudge slot.
-    if getattr(ctx, "last_test_non_retriable_nav_error", None):
-        return False
-    if not getattr(ctx, "last_test_suspicious_success", False):
-        return False
-    nudge_count = getattr(ctx, "suspicious_success_nudge_count", 0)
-    return nudge_count < MAX_SUSPICIOUS_SUCCESS_NUDGES
-
-
-def _needs_per_tool_budget_nudge(ctx: Any) -> bool:
-    if getattr(ctx, "last_failure_category_top", None) != PER_TOOL_BUDGET_FAILURE_CATEGORY:
-        return False
-    return _get_int(ctx, "per_tool_budget_nudge_count") < MAX_PER_TOOL_BUDGET_NUDGES
-
-
-def _get_int(ctx: Any, name: str, default: int = 0) -> int:
-    value = getattr(ctx, name, default)
-    return value if isinstance(value, int) else default
-
-
-def _repeated_frontier_failure_nudge(ctx: Any, config: CopilotConfig | None = None) -> str | None:
-    """Emit each escalation level at most once per streak. The streak itself
-    keeps climbing on further identical failures (incremented elsewhere by
-    update_repeated_failure_state), so the stop nudge fires naturally on the
-    next repeat after a warn."""
-    # Non-retriable nav errors get their own dedicated stop path; don't let a
-    # repeated-frontier nudge smuggle different retry advice past the gate.
-    if getattr(ctx, "last_test_non_retriable_nav_error", None):
-        return None
-    streak = _get_int(ctx, "repeated_failure_streak_count")
-    emitted = _get_int(ctx, "repeated_failure_nudge_emitted_at_streak")
-    top_category = getattr(ctx, "last_failure_category_top", None)
-    is_param_binding = top_category == "PARAMETER_BINDING_ERROR"
-
-    if streak >= REPEATED_FRONTIER_STREAK_STOP_AT and emitted < REPEATED_FRONTIER_STREAK_STOP_AT:
-        return _nudge(
-            config,
-            "post_parameter_binding_stop" if is_param_binding else "post_repeated_frontier_failure_stop",
-        )
-    if streak >= REPEATED_FRONTIER_STREAK_ESCALATE_AT and emitted < REPEATED_FRONTIER_STREAK_ESCALATE_AT:
-        return _nudge(
-            config,
-            "post_parameter_binding_warn" if is_param_binding else "post_repeated_frontier_failure_warn",
-        )
-    return None
-
-
-def _is_stop_level_frontier_nudge(nudge: str, config: CopilotConfig | None = None) -> bool:
-    return nudge in {
-        _nudge(config, "post_repeated_frontier_failure_stop"),
-        _nudge(config, "post_parameter_binding_stop"),
-    }
-
-
-def _non_retriable_nav_error_nudge(ctx: Any, config: CopilotConfig | None = None) -> tuple[str, str] | None:
-    """Emit POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE at most once per distinct
-    non-retriable nav-error signature. Returns ``(nudge, signature)`` when it
-    should fire, ``None`` otherwise. Signature normalization is shared with
-    `failure_tracking.compute_failure_signature`, so a cert error after a DNS
-    error (or vice versa) counts as a distinct signature and re-fires."""
-    raw = getattr(ctx, "last_test_non_retriable_nav_error", None)
-    if not isinstance(raw, str) or not raw:
-        return None
-    signature = normalize_failure_reason(raw)
-    last_emitted = getattr(ctx, "non_retriable_nav_error_last_emitted_signature", None)
-    if signature == last_emitted:
-        return None
-    return _nudge(config, "post_non_retriable_nav_error_stop"), signature
-
-
-def _check_enforcement(
+def enforcement_decision(
     ctx: Any,
     result: RunResultStreaming | None = None,
     config: CopilotConfig | None = None,
-) -> str | None:
+) -> EnforcementDecision | None:
+    """Propagate terminal runtime evidence without prescribing another authoring action."""
+    del result, config
     verified = outcome_fully_verified(ctx)
-    # Terminal failure-mode signals must pre-empt tool-call hygiene nudges.
     terminal_signal = getattr(ctx, "latest_tool_blocker_signal", None) or getattr(ctx, "blocker_signal", None)
     if terminal_signal is not None:
         stash_turn_halt_from_blocker_signal(ctx, terminal_signal, source="enforcement_backstop")
     raise_if_turn_halt(ctx, verified=verified)
     _raise_if_unrecoverable_contract_stop(ctx)
 
-    # A pending credential pause pre-empts every hygiene nudge below, not just
-    # the failed-test one: a credential-blocked update_and_run_blocks call
-    # satisfies post_update (test not run) and, when the diagnosis contract
-    # is the source, the generic failed-test nudge too. None of those nudges
-    # can be acted on without the credential the pause is about to ask for.
-    if credential_pause_would_fire(ctx, config):
-        return None
-
-    # A permanent navigation error (DNS / cert / SSL / invalid URL) cannot be
-    # resolved by observing a prior navigate or by testing an updated
-    # workflow against the same bad URL, so let it speak first.
-    non_retriable = _non_retriable_nav_error_nudge(ctx, config)
-    if non_retriable is not None:
-        nudge_msg, signature = non_retriable
-        ctx.non_retriable_nav_error_last_emitted_signature = signature
-        return nudge_msg
-
-    if ctx.navigate_called and not ctx.observation_after_navigate and not ctx.navigate_enforcement_done:
-        ctx.navigate_enforcement_done = True
-        return _nudge(config, "post_navigate")
-
-    if _needs_explore_without_workflow_nudge(ctx):
-        ctx.explore_without_workflow_nudge_count += 1
-        return _nudge(config, "post_explore_without_workflow")
-
-    if (
-        ctx.update_workflow_called
-        and not ctx.test_after_update_done
-        and getattr(ctx, "allow_untested_workflow_draft", False) is not True
-    ):
-        return _nudge(config, "post_update")
-
-    # Observing the reached page is the first repair move, not the last: while the typed contract
-    # still says REPAIR, a reply that reports the failure instead of acting on it re-enters the loop.
-    if not _repair_obligation_live(ctx) and _post_run_observed_reply_can_finalize(ctx, result):
-        return None
-
     _maybe_stash_terminal_challenge_halt(ctx)
     raise_if_turn_halt(ctx, verified=verified)
-
-    # If the last run had confirmed challenge evidence, do not misdiagnose a
-    # challenge-solving loop as a long-chain budgeting problem.
-    if _needs_failed_test_nudge(ctx) and getattr(ctx, "last_test_anti_bot", None):
-        ctx.failed_test_nudge_count += 1
-        return _nudge(config, "post_anti_bot_failed_test")
-
-    # A budget-trip without challenge evidence is a structural problem (chain
-    # too long), not a workflow-shape problem — emit the targeted "split the
-    # chain" advice before the generic repeated-frontier and failed-test paths
-    # can fire.
-    if _needs_per_tool_budget_nudge(ctx):
-        prior = _get_int(ctx, "per_tool_budget_nudge_count")
-        ctx.per_tool_budget_nudge_count = prior + 1
-        # First budget trip earns one smaller-frontier retry. A second consecutive trip
-        # (the shrunk frontier ALSO blew the budget) is a doomed shrinking-budget spiral on a
-        # too-heavy page — finalize the verified prefix instead of re-running into less time.
-        if prior >= 1:
-            return _nudge(config, "post_per_tool_budget_stop")
-        return _nudge(config, "post_per_tool_budget")
-
-    repeated_frontier_nudge = _repeated_frontier_failure_nudge(ctx, config)
-    if repeated_frontier_nudge is not None:
-        # Latch the emitted level so each escalation fires at most once per streak.
-        ctx.repeated_failure_nudge_emitted_at_streak = (
-            REPEATED_FRONTIER_STREAK_STOP_AT
-            if _is_stop_level_frontier_nudge(repeated_frontier_nudge, config)
-            else REPEATED_FRONTIER_STREAK_ESCALATE_AT
-        )
-        return repeated_frontier_nudge
-
-    # Do NOT clear last_test_suspicious_success here. tools._record_run_blocks_result
-    # resets it on every new run; if the agent ignores the nudge and answers
-    # without rerunning, we want _check_enforcement to re-emit the nudge.
-    if _needs_suspicious_success_nudge(ctx):
-        ctx.suspicious_success_nudge_count = getattr(ctx, "suspicious_success_nudge_count", 0) + 1
-        return _nudge(config, "post_suspicious_success")
-
-    # Checked before the generic failed-test nudge so a scrape-wall streak
-    # emits the specific STOP text and does not also consume a
-    # failed_test_nudge_count slot.
-    if _needs_failed_test_nudge(ctx):
-        ctx.failed_test_nudge_count += 1
-        if _needs_inspect_before_repair_nudge(ctx):
-            return _nudge(config, "post_failed_test_inspect_first")
-        return _nudge(config, "post_failed_test")
-
-    # Counters exhausted but the contract still says REPAIR: keep steering rather than finalize a
-    # draft the build test disproved.
-    if _repair_obligation_blocks_finalize(ctx, result):
-        ctx.repair_obligation_nudge_count = _get_int(ctx, "repair_obligation_nudge_count") + 1
-        return _nudge(config, "post_failed_test")
-
-    # Response-time gate: peek at the model's final output to tell ASK_QUESTION
-    # (always allowed) from a REPLY with a coverage gap or progress-narration.
-    # Only runs when no state-based nudge fired.
-    if result is not None:
-        parsed = _parse_normalized_final_response(result)
-        if parsed is None:
-            return None
-        return _response_coverage_nudge(ctx, parsed, config)
-
     return None
 
 
@@ -1656,7 +753,7 @@ def _is_nudge_message(item: Any) -> bool:
 
 
 def is_synthetic_user_message(item: Any) -> bool:
-    """Return True if item is a screenshot or nudge (not a real user turn)."""
+    """Return True if item is a screenshot or enforcement nudge, not a real user turn."""
     return is_screenshot_message(item) or _is_nudge_message(item)
 
 
@@ -1687,6 +784,9 @@ def _summarize_tool_output(output: str) -> str:
 
     data = parsed.get("data")
     if isinstance(data, dict):
+        code = data.get("code")
+        if isinstance(code, str) and code:
+            synopsis["code_chars_elided"] = len(code)
         for key in ("overall_status", "workflow_run_id", "failure_reason", "url", "message"):
             val = data.get(key)
             if val is None or val == "":
@@ -1757,9 +857,9 @@ def _summarize_tool_arguments(args_json: str) -> str:
     try:
         parsed = json.loads(args_json)
     except (TypeError, ValueError):
-        return args_json[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
+        return args_json[:_SUMMARIZED_TOOL_ARGUMENT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
     if not isinstance(parsed, dict):
-        return args_json[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
+        return args_json[:_SUMMARIZED_TOOL_ARGUMENT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
     compact: dict[str, Any] = {}
     for key, val in parsed.items():
         if isinstance(val, str) and len(val) > 500:
@@ -1773,7 +873,16 @@ def _summarize_tool_arguments(args_json: str) -> str:
     try:
         return json.dumps(compact, separators=(",", ":"))
     except (TypeError, ValueError):
-        return args_json[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
+        return args_json[:_SUMMARIZED_TOOL_ARGUMENT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
+
+
+def log_recent_tool_output_truncation(truncated_count: int, largest_original_chars: int) -> None:
+    LOG.warning(
+        "copilot_recent_tool_output_truncated",
+        truncated_count=truncated_count,
+        cap=_RECENT_TOOL_OUTPUT_CHAR_CAP,
+        largest_original_chars=largest_original_chars,
+    )
 
 
 def _prune_input_list(items: list[Any]) -> list[Any]:
@@ -1795,6 +904,8 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
     recent_fc_set = set(fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:])
 
     result: list[Any] = []
+    recent_truncated_count = 0
+    recent_truncated_largest = 0
     for i, item in enumerate(items):
         if i in drop_indices:
             result.append({"role": "user", "content": SCREENSHOT_PLACEHOLDER})
@@ -1805,11 +916,13 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
             output = _item_field(item, "output")
             if isinstance(output, str):
                 if i in recent_fco_set:
-                    new_output = (
-                        output[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX
-                        if len(output) > _RECENT_TOOL_OUTPUT_CHAR_CAP
-                        else output
-                    )
+                    if len(output) > _RECENT_TOOL_OUTPUT_CHAR_CAP:
+                        new_output = output[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX
+                        if new_output != output:
+                            recent_truncated_count += 1
+                            recent_truncated_largest = max(recent_truncated_largest, len(output))
+                    else:
+                        new_output = output
                 else:
                     new_output = _summarize_tool_output(output)
                 if new_output != output:
@@ -1822,6 +935,8 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
                     item = _replace_item_field(item, "arguments", new_args)
 
         result.append(item)
+    if recent_truncated_count:
+        log_recent_tool_output_truncation(recent_truncated_count, recent_truncated_largest)
     return result
 
 
@@ -1919,58 +1034,9 @@ def _is_context_window_error(exc: BaseException) -> bool:
     )
 
 
-_NUDGE_TYPE_BY_MESSAGE: dict[str, str] = {
-    POST_UPDATE_NUDGE: "post_update",
-    POST_NAVIGATE_NUDGE: "post_navigate",
-    POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE: "explore_without_workflow",
-    POST_SUSPICIOUS_SUCCESS_NUDGE: "suspicious_success",
-    POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE: "repeated_frontier_failure_warn",
-    POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE: "repeated_frontier_failure_stop",
-    POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE: "non_retriable_nav_error_stop",
-    POST_PARAMETER_BINDING_WARN_NUDGE: "parameter_binding_warn",
-    POST_PARAMETER_BINDING_STOP_NUDGE: "parameter_binding_stop",
-    POST_ANTI_BOT_FAILED_TEST_NUDGE: "anti_bot_block",
-    POST_PER_TOOL_BUDGET_NUDGE: "per_tool_budget_split",
-    POST_PER_TOOL_BUDGET_STOP_NUDGE: "per_tool_budget_stop",
-    POST_NO_WORKFLOW_DELIVERY_NUDGE: "no_workflow_delivery",
-    POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE: "discovery_entrypoint_url_question",
-    PRE_DISCOVERY_URL_QUESTION_NUDGE: "pre_discovery_url_question",
-    POST_FAILED_TEST_NUDGE: "post_failed_test",
-    POST_FAILED_TEST_INSPECT_FIRST_NUDGE: "post_failed_test_inspect_first",
-    SCREENSHOT_DROPPED_NUDGE: "screenshot_dropped_on_recovery",
-}
-
-
 _NUDGE_TYPE_BY_KEY: dict[str, str] = {
-    "post_update": "post_update",
-    "post_navigate": "post_navigate",
-    "post_explore_without_workflow": "explore_without_workflow",
-    "post_suspicious_success": "suspicious_success",
-    "post_repeated_frontier_failure_warn": "repeated_frontier_failure_warn",
-    "post_repeated_frontier_failure_stop": "repeated_frontier_failure_stop",
-    "post_non_retriable_nav_error_stop": "non_retriable_nav_error_stop",
-    "post_parameter_binding_warn": "parameter_binding_warn",
-    "post_parameter_binding_stop": "parameter_binding_stop",
-    "post_anti_bot_failed_test": "anti_bot_block",
-    "post_per_tool_budget": "per_tool_budget_split",
-    "post_per_tool_budget_stop": "per_tool_budget_stop",
-    "post_no_workflow_delivery": "no_workflow_delivery",
-    "post_discovery_entrypoint_url_question": "discovery_entrypoint_url_question",
-    "pre_discovery_url_question": "pre_discovery_url_question",
-    "post_failed_test": "post_failed_test",
-    "post_failed_test_inspect_first": "post_failed_test_inspect_first",
     "screenshot_dropped": "screenshot_dropped_on_recovery",
-    "post_intermediate_success": "intermediate_success",
-    "post_format": "format",
 }
-
-
-def _nudge_type_for_log(nudge: str, config: CopilotConfig | None = None) -> str:
-    nudge_by_key = config.enforcement_nudges if config is not None else DEFAULT_ENFORCEMENT_NUDGES
-    for key, value in nudge_by_key.items():
-        if value == nudge:
-            return _NUDGE_TYPE_BY_KEY.get(key, key)
-    return _NUDGE_TYPE_BY_MESSAGE.get(nudge, "intermediate_success")
 
 
 def _strip_input_images(current_input: str | list) -> tuple[str | list, bool]:
@@ -2118,171 +1184,10 @@ async def _run_streamed_with_deadline(
             await asyncio.wait_for(streaming_adapter.stream_to_sse(result, tracked_stream, ctx), timeout=remaining)
         finally:
             _accumulate_usage(result, ctx)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         _mark_copilot_total_timeout(ctx, elapsed_seconds=_elapsed_run_seconds(ctx, start_time), iteration=iteration)
         raise CopilotTotalTimeoutError() from None
     return result
-
-
-def _maybe_synthesized_block_offer_msg(ctx: Any) -> dict[str, Any] | None:
-    """Post-turn fallback offer of a deterministically synthesized code block, in code-only mode.
-
-    Returns a single user message wrapping the synthesized Playwright block, or
-    None when the policy/latch/empty-trajectory guards do not hold. Shares the
-    latch with the pre-authoring prompt-side offer. The initial offer suppresses
-    near-duplicate repeats, but a materially longer scout trajectory can refresh
-    the deterministic code before the model authors the workflow.
-    """
-    extraction_plan = requested_output_extraction_plan(ctx)
-    requested_extraction = bool(_requested_output_paths_for_ctx(ctx))
-    if requested_extraction and extraction_plan is None:
-        return None
-    plan_changed = requested_output_extraction_plan_changed(ctx, extraction_plan)
-    reopened_after_failed_run = synthesized_persistence_reopened_after_failed_run(ctx)
-    reopened = synthesized_persistence_reopened(ctx) or plan_changed
-    if getattr(ctx, "update_workflow_called", False) and not reopened:
-        return None
-    if normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)) != (
-        BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    ):
-        return None
-    trajectory = getattr(ctx, "scout_trajectory", None) or []
-    if not trajectory:
-        return None
-    if is_optional_dismissal_only_trajectory(trajectory):
-        return None
-    trajectory_len = len(trajectory)
-    previous_offer_len = getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0
-    trajectory_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
-    known_terminal_actions = _known_non_method_mandated_terminal_actions(ctx)
-    business_goal_complete = (
-        _trajectory_reaches_post_credential_commit(ctx) if known_terminal_actions else trajectory_goal_complete
-    )
-    if (
-        (known_terminal_actions or _active_floor_rekeyed_runtime_outputs(ctx))
-        and _last_scout_credential_fill_index(trajectory) is not None
-        and not business_goal_complete
-    ):
-        return None
-    if (
-        getattr(ctx, "synthesized_block_offered", False)
-        and trajectory_len < previous_offer_len + SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD
-        and (not trajectory_goal_complete or getattr(ctx, "synthesized_block_offered_goal_complete", False))
-        and not reopened
-    ):
-        return None
-    synthesized = (
-        synthesize_code_block_with_extraction(
-            trajectory,
-            extraction_plan,
-            strict_selectors=True,
-            reached_download_target=getattr(ctx, "reached_download_target", None),
-        )
-        if extraction_plan is not None
-        else synthesize_code_block(
-            trajectory,
-            reached_download_target=getattr(ctx, "reached_download_target", None),
-        )
-    )
-    if synthesized is None:
-        return None
-    if extraction_plan is not None:
-        candidate = freeze_requested_output_extraction_candidate(synthesized, extraction_plan, source="generated")
-        if candidate is None:
-            return None
-        existing_candidate = getattr(ctx, "requested_output_extraction_candidate", None)
-        if existing_candidate is not None and existing_candidate != candidate and not reopened:
-            return None
-        ctx.requested_output_extraction_candidate = candidate
-
-    ctx.synthesized_block_offered = True
-    ctx.synthesized_block_offered_trajectory_len = trajectory_len
-    ctx.synthesized_block_offered_goal_complete = trajectory_goal_complete
-    if reopened_after_failed_run:
-        ctx.synthesized_block_reopened_after_failed_run = True
-    goal = getattr(ctx, "block_goal_main_goal", "") or getattr(ctx, "user_message", "") or ""
-    offer_text = render_synthesized_offer_text(synthesized, trajectory, goal=goal)
-    missing_steps = _get_scouted_spine_missing_steps_for_halt(ctx)
-    if missing_steps:
-        offer_text += f"\n\n**Note:** This draft is missing these demonstrated steps: {missing_steps}"
-    return {"role": "user", "content": offer_text}
-
-
-def _completion_verification_unsatisfied(ctx: Any) -> bool:
-    result = getattr(ctx, "completion_verification_result", None)
-    if result is None or getattr(result, "status", None) != "evaluated":
-        return False
-    is_fully_satisfied = getattr(result, "is_fully_satisfied", None)
-    if callable(is_fully_satisfied) and is_fully_satisfied():
-        return False
-    return True
-
-
-def _last_scout_interaction_commits(trajectory: list[Any]) -> bool:
-    if not trajectory:
-        return False
-    last = trajectory[-1]
-    if not isinstance(last, dict):
-        return False
-    return str(last.get("tool_name") or "") in _SYNTHESIZED_BLOCK_COMMIT_TOOLS and not is_generic_entry_opener_click(
-        last
-    )
-
-
-def synthesized_persistence_reopened_after_failed_run(ctx: Any) -> bool:
-    if getattr(ctx, "synthesized_block_reopened_after_failed_run", False):
-        return True
-    if not getattr(ctx, "update_workflow_called", False):
-        return False
-    if not getattr(ctx, "test_after_update_done", False):
-        return False
-    if getattr(ctx, "last_test_ok", None) is not False:
-        return False
-    if getattr(ctx, "last_test_non_retriable_nav_error", None):
-        return False
-    if not _completion_verification_unsatisfied(ctx):
-        return False
-    trajectory = getattr(ctx, "scout_trajectory", None)
-    if not isinstance(trajectory, list):
-        return False
-    previous_offer_len = getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0
-    if len(trajectory) <= previous_offer_len:
-        return False
-    return _last_scout_interaction_commits(trajectory)
-
-
-def synthesized_offer_reopened_for_extraction_plan(
-    ctx: AgentContext, plan: RequestedOutputExtractionPlan | None
-) -> bool:
-    """Whether a newly provable read is worth reopening a closed offer for.
-
-    The offer is made once per authoring, but the value a turn was asked for often only becomes
-    provable after the draft exists — the page carrying it is reached later. Without this the proven
-    read is derived and never offered, and the draft's own guess is what the first run executes.
-    Reopening stops as soon as the authored block already carries this plan, so it cannot loop.
-
-    A page whose wording never matches the request binds no plan at all, and the relations it does
-    offer are named only by the offer this gate guards; requiring a bound plan to reopen therefore
-    asked the read that makes the plan bind to already exist. Unbound candidates reopen it too, and
-    stop doing so once one has been read into a requested path.
-    """
-    if plan is None:
-        requested = _requested_output_paths_for_ctx(ctx)
-        if not requested or not unbound_candidate_relations(ctx.flow_evidence):
-            return False
-        # The offer names relations no read has claimed, so it stops once one of them has been read
-        # into a requested path. Without this the prompt re-carries the whole offer on every build.
-        return not (requested & set(_witness_values_for_derivation(ctx)))
-    carried = (ctx.requested_output_extraction_candidate, ctx.pending_requested_output_extraction_candidate)
-    return all(candidate is None or candidate.plan_identity != plan.identity for candidate in carried)
-
-
-def synthesized_persistence_reopened(ctx: AgentContext) -> bool:
-    if ctx.synthesized_block_reopened_for_credential_scout:
-        return True
-    if synthesized_goal_completion_landing_pending(ctx):
-        return True
-    return synthesized_persistence_reopened_after_failed_run(ctx)
 
 
 # Intentionally distinct from request_policy._OUTPUT_GENERIC_WORDS: this list filters output-path leaf
@@ -2367,15 +1272,28 @@ def pre_run_gated_outputs_without_path(ctx: AgentContext) -> tuple[CompletionCri
 def _requested_output_paths_for_ctx(ctx: AgentContext) -> set[str]:
     pre_run_gated_paths = set(requested_output_paths(_pre_run_gated_completion_criteria(ctx)))
     unregisterable = pre_run_gated_outputs_without_path(ctx)
-    if unregisterable:
-        LOG.warning(
-            "copilot_pre_run_gated_output_criterion_without_path",
-            count=len(unregisterable),
-            criterion_ids=[criterion.id for criterion in unregisterable],
-            outcomes=[criterion.outcome[:80] for criterion in unregisterable],
-            floor_rekeyed=[criterion.requested_output_floor_rekeyed for criterion in unregisterable],
-            floor_rekeyed_from_path=[criterion.floor_rekeyed_from_path for criterion in unregisterable],
+    warning_fingerprint = tuple(
+        sorted(
+            (
+                criterion.id,
+                criterion.outcome,
+                criterion.requested_output_floor_rekeyed,
+                criterion.floor_rekeyed_from_path or "",
+            )
+            for criterion in unregisterable
         )
+    )
+    if warning_fingerprint != ctx.pre_run_gated_output_warning_fingerprint:
+        ctx.pre_run_gated_output_warning_fingerprint = warning_fingerprint
+        if unregisterable:
+            LOG.warning(
+                "copilot_pre_run_gated_output_criterion_without_path",
+                count=len(unregisterable),
+                criterion_ids=[criterion.id for criterion in unregisterable],
+                outcomes=[criterion.outcome[:80] for criterion in unregisterable],
+                floor_rekeyed=[criterion.requested_output_floor_rekeyed for criterion in unregisterable],
+                floor_rekeyed_from_path=[criterion.floor_rekeyed_from_path for criterion in unregisterable],
+            )
     paths = set(pre_run_gated_paths) | _floor_rekeyed_requested_output_paths(ctx)
     repair_context = ctx.last_code_authoring_repair_context
     if repair_context is not None:
@@ -2427,30 +1345,6 @@ def _requested_output_coverage_tokens(ctx: AgentContext) -> dict[str, frozenset[
     }
 
 
-def _registered_download_deliverable_paths(ctx: AgentContext) -> set[str]:
-    return {
-        criterion.output_path
-        for criterion in _pre_run_gated_completion_criteria(ctx)
-        if criterion.declared_deliverable_kind == "registered_download" and criterion.output_path
-    }
-
-
-def download_satisfied_requested_output_paths(ctx: AgentContext) -> set[str]:
-    """Requested-output paths a reached download registration satisfies at runtime rather than a
-    page-scalar read: the registered-download alias paths plus the paths the classifier declared as
-    ``registered_download`` deliverables. Empty unless a download target with a captured selector
-    was reached. Author-time seam classification only — it never credits scout coverage."""
-    download = ctx.reached_download_target
-    if download is None or not download.selector:
-        return set()
-    requested = _requested_output_paths_for_ctx(ctx)
-    # The scout reads page scalars; it can never read a file that exists only once a download fires.
-    # So a declared download kind on a path the scout DID cover is a classifier false positive, and the
-    # path stays a live-read scalar. The canonical alias paths are download-registered by definition.
-    declared = _registered_download_deliverable_paths(ctx) - set(ctx.scouted_output_covered_paths)
-    return requested & (REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS | declared)
-
-
 def uncovered_requested_output_paths(ctx: AgentContext) -> set[str]:
     """Requested-output paths not yet credited by scouted evidence. A path whose identifying
     tokens are all generic (e.g. ``output.data``) is uncoverable by token match and is exempted,
@@ -2459,7 +1353,7 @@ def uncovered_requested_output_paths(ctx: AgentContext) -> set[str]:
     if not requested:
         return set()
     tokens_by_path = _requested_output_coverage_tokens(ctx)
-    covered: set[str] = set(ctx.scouted_output_covered_paths) | download_satisfied_requested_output_paths(ctx)
+    covered: set[str] = set(ctx.scouted_output_covered_paths)
     return {path for path in requested if path not in covered and tokens_by_path.get(path)}
 
 
@@ -2492,240 +1386,6 @@ def _requested_output_labels_by_path(ctx: AgentContext) -> dict[str, tuple[str, 
             labels_by_path.setdefault(path, ())
             labels_by_path[path] += (label,)
     return labels_by_path
-
-
-def _witnessed_values_by_path(ctx: AgentContext) -> dict[str, str]:
-    """The scalar each requested output was read as, keyed by the path the read claimed.
-
-    Capture retains every read of a path and defers the choice to synthesis, so this is where that
-    choice lives: differing reads resolve to the one value a selectable observation still shows,
-    because the page corroborates what was read from it and cannot corroborate a probe's echo. A
-    conflict the page corroborates for none, or for more than one, still carries no witness.
-    """
-    reads: dict[str, list[str]] = {}
-    for interaction in ctx.scout_trajectory:
-        if interaction.get("tool_name") != "read_value":
-            continue
-        # A read that inherited its path by elimination says nothing about that path: an early probe
-        # of a login form was promoted that way and its JSON became the witness for a metric the page
-        # had not shown yet. Only a read that named the path witnesses it (SKY-13226).
-        if interaction.get("read_output_path_source") != "declared":
-            continue
-        path = str(interaction.get("read_output_path") or "")
-        value = str(interaction.get("read_result_value") or "")
-        if path and value:
-            reads.setdefault(path, []).append(value)
-    resolved: dict[str, str] = {}
-    for path, values in reads.items():
-        distinct = list(dict.fromkeys(values))
-        if len(distinct) == 1:
-            resolved[path] = distinct[0]
-            continue
-        shown = [
-            value
-            for value in distinct
-            if value_shown_in_selectable_evidence(getattr(ctx, "flow_evidence", None) or [], value)
-        ]
-        if len(shown) == 1:
-            resolved[path] = shown[0]
-    return resolved
-
-
-def dump_derivation_inputs(ctx: AgentContext, *, outcome: str) -> None:
-    """Write the inputs a derivation was given, when a local run asks for them.
-
-    Derivation and the synthesis it feeds are both pure, so a live outcome is reproducible offline
-    from these values alone; without them every attempt at either costs a full turn. Successes are
-    written as well as failures because the code a bound plan generates is only reachable from a
-    packet that bound. The evidence carries whatever text the page held, so writing takes both an
-    explicit path and a local environment rather than the path alone: a deployed run cannot be
-    talked into dumping page contents by its environment.
-    """
-    directory = os.environ.get("COPILOT_DUMP_DERIVATION_INPUTS")
-    if not directory or settings.ENV != "local":
-        return
-    try:
-        os.makedirs(directory, exist_ok=True)
-        payload = {
-            "outcome": outcome,
-            "labels_by_path": {path: list(labels) for path, labels in _requested_output_labels_by_path(ctx).items()},
-            "witnessed_by_path": _witnessed_values_by_path(ctx),
-            # Scope is authoritative, so a replay that rebuilds it from the labels is not the same
-            # derivation the run performed.
-            "requested_paths": sorted(_requested_output_paths_for_ctx(ctx)),
-            "designations": list(ctx.requested_output_designations),
-            "flow_evidence": ctx.flow_evidence,
-            "scout_trajectory": list(ctx.scout_trajectory),
-        }
-        target = os.path.join(directory, f"derivation-{outcome}-{len(ctx.flow_evidence)}-{uuid.uuid4().hex[:8]}.json")
-        with open(target, "w") as handle:
-            json.dump(payload, handle, default=str)
-    except Exception:
-        LOG.info("copilot_derivation_input_dump_failed", exc_info=True)
-
-
-def _current_page_designations(ctx: AgentContext) -> list[dict[str, Any]]:
-    """Designations pin coordinates on one page; once the browser moves they describe a page the
-    block will not be looking at, so they are dropped rather than compiled into a stale read."""
-    designations = ctx.requested_output_designations
-    if not designations:
-        return []
-    page_evidence = ctx.composition_page_evidence or {}
-    current_url = str(page_evidence.get("current_url") or "")
-    # An unknown current URL is the ordinary state right after designating — the probe stamps the
-    # page, but only a composition inspection records one — so it cannot stand in for staleness.
-    if not current_url:
-        return list(designations)
-    return [
-        designation
-        for designation in designations
-        if not str(designation.get("url") or "") or str(designation.get("url")) == current_url
-    ]
-
-
-def _designated_values_by_path(ctx: AgentContext) -> dict[str, str]:
-    """The value the model designated and the page confirmed, keyed by the path it fills.
-
-    A designation is a witness the page validated against the live DOM, so it arms the value binder
-    without the model having to author an expression that returns exactly one scalar (SKY-13226).
-    """
-    values: dict[str, str] = {}
-    for designation in _current_page_designations(ctx):
-        path = designation.get("output_path")
-        text = designation.get("text")
-        if isinstance(path, str) and isinstance(text, str) and text:
-            values[path] = text
-    return values
-
-
-def _witness_values_for_derivation(ctx: AgentContext) -> dict[str, str]:
-    """Read-witnessed values, overridden for any path the page confirmed a designation for."""
-    return {**_witnessed_values_by_path(ctx), **_designated_values_by_path(ctx)}
-
-
-def _labels_outranked_by_designation(
-    ctx: AgentContext, labels_by_path: dict[str, tuple[str, ...]]
-) -> dict[str, tuple[str, ...]]:
-    """Drop the lexical channel for a path the model designated on the live page.
-
-    Both channels can bind the same path to different relations, and the designation is the one an
-    element was actually resolved from.
-    """
-    designated = _designated_values_by_path(ctx)
-    return {path: labels for path, labels in labels_by_path.items() if path not in designated}
-
-
-def requested_output_extraction_plan_diagnostic(ctx: AgentContext) -> dict[str, Any]:
-    """Why a derivation returned nothing: gate mismatch, or no bindable packet.
-
-    Without both sides plus the trajectory's stamps, an unavailable-plan log cannot separate the two
-    and each guess costs a live run.
-    """
-    requested_paths = _requested_output_paths_for_ctx(ctx)
-    labels_by_path = _requested_output_labels_by_path(ctx)
-    return {
-        "requested_paths": sorted(requested_paths),
-        "label_paths": sorted(labels_by_path),
-        # The values, not just the keys: a fallen-back outcome sentence and a minted page noun have
-        # identical paths, and only the value says which one the binder was actually given.
-        "labels_by_path": {path: list(labels) for path, labels in sorted(labels_by_path.items())},
-        "paths_match": set(labels_by_path) == requested_paths,
-        "designations": len(_current_page_designations(ctx)),
-        "bail_reason": derivation_bail_reason(
-            flow_evidence=ctx.flow_evidence,
-            labels_by_path=labels_by_path,
-            witnessed_by_path=_witness_values_for_derivation(ctx),
-            requested_paths=requested_paths,
-        ),
-        "candidate_headings": bindable_candidate_headings(ctx.flow_evidence),
-        "flow_evidence_reached_via": [
-            str(entry.get("reached_via") or "") for entry in ctx.flow_evidence if isinstance(entry, dict)
-        ],
-    }
-
-
-def requested_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtractionPlan | None:
-    requested_paths = _requested_output_paths_for_ctx(ctx)
-    if not requested_paths:
-        return None
-    # Labels are one channel for meeting the request, not the definition of it: withholding the plan
-    # unless every requested path carried a label meant a page whose wording the request never uses
-    # was refused before the value witness that exists for it could be tried (SKY-13226).
-    labels_by_path = _labels_outranked_by_designation(ctx, _requested_output_labels_by_path(ctx))
-    plan = derive_requested_output_extraction_plan(
-        flow_evidence=ctx.flow_evidence,
-        labels_by_path=labels_by_path,
-        witnessed_by_path=_witness_values_for_derivation(ctx),
-        requested_paths=requested_paths,
-    )
-    if plan is not None:
-        ctx.last_bound_requested_output_extraction_plan = plan
-        return plan
-    # The structured packet could not carry the designated element — it is truncated, or the value
-    # is not a relation the capture models. The probe already pinned it, so read it where it sits.
-    designated = plan_from_designations(_current_page_designations(ctx), requested_paths)
-    if designated is not None:
-        ctx.last_bound_requested_output_extraction_plan = designated
-        return designated
-    # Derivation reads the freshest packet, and most are truncated or unbindable, so a plan that did
-    # bind every requested path is answered with rather than re-derived away before the imposition
-    # that needs it. A changed request abandons it: it bound paths the turn no longer asks for.
-    retained = ctx.last_bound_requested_output_extraction_plan
-    if retained is not None and set(retained.requested_output_paths) == requested_paths:
-        return retained
-    return None
-
-
-def unbound_requested_output_paths_for_designation(ctx: AgentContext) -> set[str]:
-    """Requested paths no plan has bound yet, so the resolver only decides what is still open.
-
-    Keyed on the bound plan rather than on a witness existing: a declared read can leave a stale or
-    unbindable scalar behind, and treating that as settled retires the path while it is still unread
-    — the page that finally shows the value would never be offered (SKY-13485).
-    """
-    requested = _requested_output_paths_for_ctx(ctx)
-    if not requested:
-        return set()
-    plan = ctx.last_bound_requested_output_extraction_plan
-    bound = set(plan.requested_output_paths) if plan is not None else set()
-    return requested - bound
-
-
-def requested_scalar_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtractionPlan | None:
-    """Extraction plan over the page-scalar subset of requested outputs (requested minus the
-    download-registered paths), for the mixed download+scalar shape whose download half is
-    satisfied by execution registration rather than a static keyed read."""
-    requested_paths = _requested_output_paths_for_ctx(ctx) - download_satisfied_requested_output_paths(ctx)
-    if not requested_paths:
-        return None
-    labels_by_path: dict[str, tuple[str, ...]] = {}
-    for criterion in _pre_run_gated_completion_criteria(ctx):
-        outcome = criterion.outcome.strip()
-        path = _effective_requested_output_path(criterion)
-        if path in requested_paths and outcome:
-            labels_by_path.setdefault(path, ())
-            labels_by_path[path] += (outcome,)
-    plan = derive_requested_output_extraction_plan(
-        flow_evidence=ctx.flow_evidence,
-        labels_by_path=_labels_outranked_by_designation(ctx, labels_by_path),
-        witnessed_by_path=_witness_values_for_derivation(ctx),
-        requested_paths=requested_paths,
-    )
-    if plan is not None:
-        return plan
-    return plan_from_designations(_current_page_designations(ctx), requested_paths)
-
-
-def requested_output_extraction_plan_changed(ctx: AgentContext, current: RequestedOutputExtractionPlan | None) -> bool:
-    if current is None or len(ctx.flow_evidence) < 2:
-        return False
-    previous = derive_requested_output_extraction_plan(
-        flow_evidence=ctx.flow_evidence[:-1],
-        labels_by_path=_labels_outranked_by_designation(ctx, _requested_output_labels_by_path(ctx)),
-        witnessed_by_path=_witness_values_for_derivation(ctx),
-        requested_paths=_requested_output_paths_for_ctx(ctx),
-    )
-    return previous is not None and previous.identity != current.identity
 
 
 def mint_scout_observation_contract_for_ctx(
@@ -2838,9 +1498,8 @@ def _credential_password_demand_holds(ctx: Any, interactions: list[dict[str, Any
 
 
 def _credential_flow_scout_gap_incomplete(ctx: Any, trajectory: list[Any]) -> bool:
-    """Trajectory- and inventory-scoped mirror of the persist seam's credential scout gate: engaged
-    credentials (username/password fills) must have every required field filled plus a post-fill
-    submit before the synthesized trajectory may grade goal-complete."""
+    """Engaged credentials (username/password fills) must have every required field filled plus a
+    post-fill submit before the synthesized trajectory may grade goal-complete."""
     interactions = [item for item in trajectory if isinstance(item, dict)]
     filled_by_credential = _credential_flow_filled_fields_by_credential(interactions)
     if not filled_by_credential:
@@ -2911,52 +1570,12 @@ def _trajectory_has_noncredential_business_fill(trajectory: Sequence[Mapping[str
     )
 
 
-def synthesized_trajectory_reaches_goal(ctx: AgentContext) -> bool:
-    """The scout trajectory covers an opening click followed by a commit, a durable entry followed by a commit,
-    or a reached download target with a selector. Monotone in what the scout captured."""
-    trajectory = ctx.scout_trajectory
-    if not trajectory:
-        return False
-    if _active_floor_rekeyed_runtime_outputs(ctx) and not _trajectory_has_noncredential_business_fill(trajectory):
-        return False
-    if _active_non_method_mandated_terminal_actions(ctx) or (
-        _active_floor_rekeyed_runtime_outputs(ctx) and _last_scout_credential_fill_index(trajectory) is not None
-    ):
-        return _trajectory_reaches_post_credential_commit(ctx)
-    if _read_deliverable_reached(ctx):
-        return True
-    return _trajectory_reaches_generic_goal(ctx, trajectory, include_download=True)
-
-
-def _read_deliverable_reached(ctx: AgentContext) -> bool:
-    """A read deliverable has no commit to reach; the bound requested-output extraction plan is its
-    reach evidence. Keys on the retained plan rather than a fresh derivation so reach stays monotone
-    per attempt, which is what the ownership latch requires (SKY-13485)."""
-    if _request_expects_unreached_download(ctx):
-        return False
-    # A mandated action is part of what was asked for, so a read that binds while it is still
-    # outstanding has not reached the goal. Non-method-mandated ones never arrive here — the caller
-    # routes them to the post-credential commit shape first.
-    if any(criterion.kind == "terminal_action" for criterion in _active_completion_criteria(ctx)):
-        return False
-    plan = ctx.last_bound_requested_output_extraction_plan
-    if plan is None:
-        return False
-    requested = _requested_output_paths_for_ctx(ctx)
-    return bool(requested) and requested.issubset(set(plan.requested_output_paths))
-
-
 def _trajectory_reaches_generic_goal(
-    ctx: AgentContext,
     trajectory: list[Any],
     *,
-    include_download: bool,
     allow_intermediate_interactions: bool = False,
 ) -> bool:
-    """Apply the established download, open-to-commit, and durable-entry reach shapes to one trajectory slice."""
-    download = getattr(ctx, "reached_download_target", None)
-    if include_download and download is not None and download.selector:
-        return True
+    """Apply the established open-to-commit and durable-entry reach shapes to one trajectory slice."""
     opening_trajectory_index: int | None = None
     ordered_pair_candidates = trajectory if allow_intermediate_interactions or len(trajectory) == 2 else []
     for interaction in ordered_pair_candidates:
@@ -3009,16 +1628,6 @@ def _is_result_surface_navigation_click(interaction: Mapping[str, Any]) -> bool:
     return any(token in target for token in ("table", "results", "history", "listing"))
 
 
-def _request_expects_unreached_download(ctx: AgentContext) -> bool:
-    # A registered-download deliverable is confirmable only post-run, so it is absent from the pre-run
-    # requested-output gate — a goal-reaching prefix (e.g. sign-in) would otherwise read goal-complete
-    # before the scout reaches the download and land the latch on a partial spine.
-    download = ctx.reached_download_target
-    if download is not None and download.selector:
-        return False
-    return any(criterion.deliverable_kind == "registered_download" for criterion in _active_completion_criteria(ctx))
-
-
 def _trajectory_reaches_post_credential_commit(ctx: AgentContext) -> bool:
     """Apply the ordinary reach shapes only to the business spine after the credential submit."""
     trajectory = ctx.scout_trajectory
@@ -3028,18 +1637,14 @@ def _trajectory_reaches_post_credential_commit(ctx: AgentContext) -> bool:
     credential_index = _last_scout_credential_fill_index(interactions)
     if credential_index is None:
         return _trajectory_reaches_generic_goal(
-            ctx,
             interactions,
-            include_download=False,
             allow_intermediate_interactions=True,
         )
     credential_submit_index = credential_submit_boundary_index(interactions, credential_index)
     if credential_submit_index is None:
         return False
     return _trajectory_reaches_generic_goal(
-        ctx,
         interactions[credential_submit_index + 1 :],
-        include_download=False,
         allow_intermediate_interactions=True,
     )
 
@@ -3074,283 +1679,9 @@ def _request_expects_unreached_terminal_action(ctx: AgentContext) -> bool:
     return False
 
 
-def synthesized_trajectory_is_goal_complete(ctx: AgentContext) -> bool:
-    """A goal-reaching trajectory with no requested-output path left uncovered; an empty requested-output set falls
-    through to the reach shape byte-identically, so an entry ``synthesize_code_block`` would drop never counts."""
-    if uncovered_requested_output_paths(ctx):
-        return False
-    if _request_expects_unreached_download(ctx):
-        return False
-    if _request_expects_unreached_terminal_action(ctx):
-        return False
-    scalar_paths = _requested_output_paths_for_ctx(ctx) - download_satisfied_requested_output_paths(ctx)
-    if scalar_paths:
-        plan = requested_scalar_output_extraction_plan(ctx)
-        if plan is None or not scalar_paths.issubset(set(plan.requested_output_paths)):
-            return False
-    if _credential_flow_scout_gap_incomplete(ctx, ctx.scout_trajectory):
-        return False
-    return synthesized_trajectory_reaches_goal(ctx)
-
-
-def synthesized_goal_completion_landing_pending(ctx: AgentContext) -> bool:
-    """A goal-complete scout trajectory whose spine has not yet landed in a persisted draft. Only the imposition
-    seam lands a spine and only an authoring call can leave one unlanded, so both are preconditions."""
-    if not ctx.impose_synthesized_code_block:
-        return False
-    if not ctx.update_workflow_called:
-        return False
-    if ctx.synthesized_goal_complete_landed:
-        return False
-    return synthesized_trajectory_is_goal_complete(ctx)
-
-
-def _has_unconsumed_output_contract_advisory_grant(ctx: Any) -> bool:
-    states = getattr(ctx, "output_contract_actuation_by_signature", None)
-    if not isinstance(states, dict):
-        return False
-    return any(state == OutputContractAdvisoryState.GRANTED for state in states.values())
-
-
-def _should_force_advisory_run_dispatch(ctx: Any) -> bool:
-    """Actuate a granted output-contract advisory run through the same tool_choice forcing lane as the
-    synthesized-persistence force, rather than leaving dispatch to the model. Fires only while a grant is
-    unconsumed, authority permits running blocks, and no genuinely-terminal blocker holds."""
-    if not _has_unconsumed_output_contract_advisory_grant(ctx):
-        return False
-    if not _turn_intent_can_update_and_run_without_user_input(getattr(ctx, "turn_intent", None)):
-        return False
-    if normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)) != (
-        BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    ):
-        return False
-    if getattr(ctx, "turn_halt", None) is not None:
-        return False
-    return not blocker_signal_is_genuinely_terminal(getattr(ctx, "blocker_signal", None))
-
-
-def _should_force_synthesized_block_persistence(ctx: Any) -> bool:
-    if getattr(ctx, "update_workflow_called", False) and not synthesized_persistence_reopened(ctx):
-        return False
-    if not _turn_intent_can_update_and_run_without_user_input(getattr(ctx, "turn_intent", None)):
-        return False
-    if normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)) != (
-        BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    ):
-        return False
-    if not getattr(ctx, "synthesized_block_offered", False):
-        return False
-    trajectory = getattr(ctx, "scout_trajectory", None) or []
-    if (getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0) != len(trajectory):
-        return False
-    if not getattr(ctx, "synthesized_block_offered_goal_complete", False):
-        return False
-    return synthesized_trajectory_is_goal_complete(ctx)
-
-
-def _should_block_mutating_tool_after_synthesized_offer(ctx: Any, tool_name: str) -> bool:
-    if tool_name not in _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS:
-        return False
-    if _active_non_method_mandated_terminal_actions(ctx) or _active_floor_rekeyed_runtime_outputs(ctx):
-        if not synthesized_trajectory_is_goal_complete(ctx):
-            return False
-    else:
-        if uncovered_requested_output_paths(ctx):
-            return False
-        if _credential_flow_scout_gap_incomplete(ctx, getattr(ctx, "scout_trajectory", None) or []):
-            return False
-    if getattr(ctx, "update_workflow_called", False) and not synthesized_persistence_reopened(ctx):
-        return False
-    if not _turn_intent_can_update_and_run_without_user_input(getattr(ctx, "turn_intent", None)):
-        return False
-    if normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)) != (
-        BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    ):
-        return False
-    if not getattr(ctx, "synthesized_block_offered", False):
-        return False
-    trajectory = getattr(ctx, "scout_trajectory", None) or []
-    return (getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0) == len(trajectory)
-
-
-def _ambiguous_bare_selector_repair_context(ctx: Any) -> Any | None:
-    repair_context = getattr(ctx, "last_code_authoring_repair_context", None)
-    if getattr(repair_context, "reason_code", None) != "ambiguous_bare_selector":
-        return None
-    if getattr(repair_context, "workflow_run_id", None):
-        return None
-    if getattr(ctx, "last_run_blocks_workflow_run_id", None):
-        return None
-    return repair_context
-
-
-def _ambiguous_bare_selector_rescout_key(ctx: Any) -> str | None:
-    repair_context = _ambiguous_bare_selector_repair_context(ctx)
-    if repair_context is None:
-        return None
-    if getattr(repair_context, "refiner_selector", None):
-        return None
-    selector_alternatives = getattr(repair_context, "selector_alternatives", None)
-    if isinstance(selector_alternatives, list) and selector_alternatives:
-        return None
-    payload = {
-        "block_label": str(getattr(repair_context, "block_label", "") or ""),
-        "selector": str(getattr(repair_context, "selector", "") or ""),
-        "source_url": str(getattr(repair_context, "source_url", "") or ""),
-    }
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
-
-
-def _ambiguous_bare_selector_rescout_signal_state(ctx: Any, tool_name: str) -> str | None:
-    if tool_name != "evaluate":
-        return None
-    repair_context = _ambiguous_bare_selector_repair_context(ctx)
-    if repair_context is None:
-        return None
-    if getattr(repair_context, "refiner_selector", None):
-        return "block"
-    selector_alternatives = getattr(repair_context, "selector_alternatives", None)
-    if isinstance(selector_alternatives, list) and selector_alternatives:
-        return "block"
-    key = _ambiguous_bare_selector_rescout_key(ctx)
-    if key is None:
-        return None
-    if getattr(ctx, "ambiguous_bare_selector_rescout_context_key", None) == key:
-        return "block"
-    # Track the one allowed same-page rescout for this author-time repair context.
-    ctx.ambiguous_bare_selector_rescout_context_key = key
-    return "allow"
-
-
-def _actuation_obligation_live_fill_delivery_required(ctx: CopilotContext) -> bool:
-    turn_intent = getattr(ctx, "turn_intent", None)
-    if (
-        not isinstance(turn_intent, TurnIntent)
-        or turn_intent.mode != TurnIntentMode.BUILD
-        or RequiredContextKey.BROWSER_STATE not in turn_intent.required_context
-    ):
-        return False
-    if normalize_block_authoring_policy(ctx.block_authoring_policy) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return False
-    request_policy = getattr(ctx, "request_policy", None)
-    criteria: list[CompletionCriterion] = []
-    if isinstance(request_policy, RequestPolicy):
-        criteria.extend(request_policy.completion_criteria)
-    turn_state = getattr(ctx, "completion_criteria_turn_state", None)
-    if turn_state is not None and turn_state.decision is not None:
-        criteria.extend(turn_state.decision.criteria)
-    if any(completion_criterion_requires_browser_fill_delivery(criterion) for criterion in criteria):
-        return True
-    trajectory = getattr(ctx, "scout_trajectory", None)
-    return trajectory_has_browser_fill_interaction(trajectory) if isinstance(trajectory, list) else False
-
-
-def _actuation_obligation_required_fill_tool(ctx: CopilotContext) -> str | None:
-    if _actuation_obligation_live_fill_delivery_required(ctx):
-        return _ACTUATION_OBLIGATION_REQUIRED_FILL_TOOL
-    return None
-
-
-def _actuation_obligation_admits_required_fill_tool(ctx: CopilotContext, tool_name: str) -> bool:
-    return tool_name == _actuation_obligation_required_fill_tool(ctx)
-
-
-def _actuation_obligation_admits_login_completion_tool(
-    ctx: CopilotContext, tool_name: str, arguments: Mapping[str, Any] | None
-) -> bool:
-    if tool_name not in _SYNTHESIZED_BLOCK_COMMIT_TOOLS:
-        return False
-    # Only Enter commits a login form, matching what _first_stable_login_submit_index credits as a
-    # submit; every other keystroke stays gated. Absent arguments fail closed — the signature
-    # defaults them to None, so a caller that omits them must not admit arbitrary keystrokes.
-    if tool_name == "press_key" and (
-        not isinstance(arguments, Mapping) or str(arguments.get("key") or "").strip() != "Enter"
-    ):
-        return False
-    if not _actuation_obligation_live_fill_delivery_required(ctx):
-        return False
-    if _last_scout_credential_fill_index(ctx.scout_trajectory) is None:
-        return False
-    return not _trajectory_reaches_post_credential_commit(ctx)
-
-
-def arm_credential_scout_reopen(ctx: AgentContext, identity_digest: str) -> bool:
-    """Arm a one-shot scout-window reopen for the first author-time credential-scout reject per
-    (structural identity + credential binding) digest. A repeat identical reject returns False and
-    falls through so it counts normally toward the repair ceiling."""
-    if ctx.credential_scout_rescout_context_key == identity_digest:
-        return False
-    ctx.credential_scout_rescout_context_key = identity_digest
-    ctx.synthesized_block_reopened_for_credential_scout = True
-    return True
-
-
-def _credential_scout_reopen_admits_evaluate(ctx: CopilotContext, tool_name: str) -> bool:
-    return tool_name == "evaluate" and bool(ctx.synthesized_block_reopened_for_credential_scout)
-
-
-def synthesized_block_persistence_signal(
-    ctx: Any, tool_name: str, arguments: Mapping[str, Any] | None = None
-) -> CopilotToolBlockerSignal | None:
-    if tool_name in _SYNTHESIZED_BLOCK_PERSISTENCE_ALLOWED_TOOLS:
-        return None
-    ambiguous_selector_rescout_state = _ambiguous_bare_selector_rescout_signal_state(ctx, tool_name)
-    if ambiguous_selector_rescout_state == "allow":
-        return None
-    if _credential_scout_reopen_admits_evaluate(ctx, tool_name):
-        claim_turn(ctx, TurnClaimant.CREDENTIAL_SCOUT_REOPEN)
-        return None
-    if _actuation_obligation_admits_required_fill_tool(ctx, tool_name):
-        claim_turn(ctx, TurnClaimant.ACTUATION_OBLIGATION_FILL)
-        return None
-    if _actuation_obligation_admits_login_completion_tool(ctx, tool_name, arguments):
-        claim_turn(ctx, TurnClaimant.ACTUATION_OBLIGATION_LOGIN_COMPLETION)
-        return None
-    if (
-        ambiguous_selector_rescout_state != "block"
-        and not _should_force_synthesized_block_persistence(ctx)
-        and not _should_block_mutating_tool_after_synthesized_offer(ctx, tool_name)
-    ):
-        return None
-    return CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text=(
-            "A synthesized code block offer is already available for this authoring turn. "
-            f"Call {SYNTHESIZED_BLOCK_PERSISTENCE_TOOL} with that block now before any more scouting, "
-            "reading, page evaluation, or browser interaction. This blocker clears only after "
-            f"{SYNTHESIZED_BLOCK_PERSISTENCE_TOOL} succeeds."
-        ),
-        user_facing_reason="I need to save and test the drafted workflow before scouting more.",
-        recovery_hint="retry_with_different_tool",
-        cleared_by_tools=frozenset({SYNTHESIZED_BLOCK_PERSISTENCE_TOOL}),
-        preserves_workflow_draft=True,
-        renders_final_reply=False,
-        internal_reason_code=SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
-        blocked_tool=tool_name,
-        extra={
-            "synthesized_block_offered_trajectory_len": (
-                getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0
-            ),
-        },
-    )
-
-
-def _runner_kwargs_with_forced_tool_choice(runner_kwargs: dict[str, Any], tool_name: str) -> dict[str, Any]:
-    run_config = runner_kwargs.get("run_config")
-    if isinstance(run_config, RunConfig):
-        model_settings = run_config.model_settings
-        if isinstance(model_settings, ModelSettings):
-            forced_settings = replace(model_settings, tool_choice=tool_name)
-        else:
-            forced_settings = ModelSettings(tool_choice=tool_name)
-        return {**runner_kwargs, "run_config": replace(run_config, model_settings=forced_settings)}
-    return {**runner_kwargs, "run_config": RunConfig(model_settings=ModelSettings(tool_choice=tool_name))}
-
-
 def _assemble_enforcement_messages(
     screenshot_msg: dict[str, Any] | None,
     nudge_content: str | None,
-    synthesized_msg: dict[str, Any] | None,
 ) -> list[Any]:
     """Build the extra messages for an enforcement retry, ordered so a nudge, when present, stays last.
 
@@ -3361,8 +1692,6 @@ def _assemble_enforcement_messages(
         extra_msgs.append(screenshot_msg)
     if nudge_content is not None:
         extra_msgs.append({"role": "user", "content": NUDGE_SENTINEL + nudge_content})
-    if synthesized_msg is not None:
-        extra_msgs.insert(0, synthesized_msg)
     return extra_msgs
 
 
@@ -3411,46 +1740,7 @@ async def run_with_enforcement(
             "enforcement_iteration",
             data={"iteration": iteration, "elapsed_seconds": round(elapsed, 3)},
         ):
-            force_synthesized_block_persistence = _should_force_synthesized_block_persistence(ctx)
-            force_advisory_run_dispatch = _should_force_advisory_run_dispatch(ctx)
-            # The advisory-dispatch force claims the actuation ladder itself (same-claimant), so the
-            # grant-consumption path can never self-deadlock.
-            if force_advisory_run_dispatch:
-                claim_turn(ctx, TurnClaimant.OUTPUT_CONTRACT_ACTUATION)
-            force_run_dispatch = force_synthesized_block_persistence or force_advisory_run_dispatch
-            current_runner_kwargs = (
-                _runner_kwargs_with_forced_tool_choice(runner_kwargs, SYNTHESIZED_BLOCK_PERSISTENCE_TOOL)
-                if force_run_dispatch
-                else runner_kwargs
-            )
-            effective_run_config = current_runner_kwargs.get("run_config")
-            effective_model_settings = (
-                effective_run_config.model_settings if isinstance(effective_run_config, RunConfig) else None
-            )
-            turn_intent = getattr(ctx, "turn_intent", None)
-            turn_intent_authority = getattr(turn_intent, "authority", None)
-            LOG.info(
-                "copilot synthesized persistence force decision",
-                force_synthesized_block_persistence=force_synthesized_block_persistence,
-                force_advisory_run_dispatch=force_advisory_run_dispatch,
-                forced_tool_name=(SYNTHESIZED_BLOCK_PERSISTENCE_TOOL if force_run_dispatch else None),
-                chosen_tool_name=(SYNTHESIZED_BLOCK_PERSISTENCE_TOOL if force_run_dispatch else None),
-                turn_intent_mode=getattr(getattr(turn_intent, "mode", None), "value", None),
-                turn_intent_may_update_workflow=getattr(turn_intent_authority, "may_update_workflow", None),
-                turn_intent_may_run_blocks=getattr(turn_intent_authority, "may_run_blocks", None),
-                turn_intent_requires_user_input=getattr(turn_intent_authority, "requires_user_input", None),
-                block_authoring_policy=getattr(
-                    normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)),
-                    "value",
-                    None,
-                ),
-                synthesized_block_offered=getattr(ctx, "synthesized_block_offered", False),
-                synthesized_block_offered_trajectory_len=(
-                    getattr(ctx, "synthesized_block_offered_trajectory_len", 0) or 0
-                ),
-                update_workflow_called=getattr(ctx, "update_workflow_called", False),
-                effective_tool_choice=getattr(effective_model_settings, "tool_choice", None),
-            )
+            current_runner_kwargs = runner_kwargs
             try:
                 result = await _run_streamed_with_deadline(
                     agent,
@@ -3525,18 +1815,14 @@ async def run_with_enforcement(
         # the agent's already-final REPLY with one synthesized from a single
         # browser frame.
         if pending_recovery_nudge is not None:
-            nudge: str | None = pending_recovery_nudge
+            decision: EnforcementDecision | None = EnforcementDecision(
+                rule="screenshot_dropped", message=pending_recovery_nudge
+            )
             pending_recovery_nudge = None
         else:
-            nudge = _check_enforcement(ctx, result, copilot_config)
+            decision = enforcement_decision(ctx, result, copilot_config)
 
-        # The offer is independent of the nudge: a clean scout-then-author turn
-        # finalizes with nudge=None, so injecting it only inside the nudge branch
-        # would never reach the model. Compute it once here so it rides both the
-        # nudge path and the finalize path.
-        synthesized_msg = _maybe_synthesized_block_offer_msg(ctx)
-
-        if nudge is None:
+        if decision is None:
             # Checked whenever there's no regular nudge, even if a synthesized
             # offer is also pending: a credential-blocked run's diagnosis can
             # coincide with a reopened synthesized-block offer, and the pause
@@ -3554,35 +1840,15 @@ async def run_with_enforcement(
                 and getattr(ctx, "credential_pause_used", False)
                 and getattr(ctx, "credential_pause_outcome", None) == "declined"
             ):
-                # The latch just flipped on THIS call with no frame ever sent
-                # (disconnect, cache gone, or the reason vanished under the
-                # async-only checks credential_pause_would_fire's docstring notes
-                # it excludes) -- fall back to whatever nudge this iteration would
-                # have gotten without the pre-empt, instead of silently finalizing
-                # an uncorrected reply. Gated on the latch's own transition (not
-                # just the outcome value) so a later iteration's unrelated
-                # nudge=None doesn't re-trigger this off a stale "declined".
-                nudge = _check_enforcement(ctx, result, copilot_config)
-            if nudge is None and synthesized_msg is None:
+                # The pause resolved without a frame; terminal runtime evidence is
+                # still propagated before the turn returns.
+                decision = enforcement_decision(ctx, result, copilot_config)
+            if decision is None:
                 _consume_pending_screenshots(ctx)
                 _maybe_raise_non_retriable_nav(ctx)
                 return result
 
-        if nudge is not None and nudge == _nudge(copilot_config, "post_update"):
-            if ctx.post_update_nudge_count >= MAX_POST_UPDATE_NUDGES:
-                LOG.warning(
-                    "Enforcement exhausted post-update nudges, allowing response",
-                    nudge_count=ctx.post_update_nudge_count,
-                )
-                _consume_pending_screenshots(ctx)
-                _maybe_raise_non_retriable_nav(ctx)
-                return result
-            ctx.post_update_nudge_count += 1
-
-        if nudge is not None:
-            nudge_type = _nudge_type_for_log(nudge, copilot_config)
-        else:
-            nudge_type = "synthesized_block_offer"
+        nudge_type = _NUDGE_TYPE_BY_KEY.get(decision.rule, decision.rule)
         LOG.info("Enforcement nudge", nudge_type=nudge_type, iteration=iteration)
 
         # OpenAI rejects images in tool messages, so a queued post-run
@@ -3592,7 +1858,7 @@ async def run_with_enforcement(
             LOG.info("Injecting screenshot user message", count=len(screenshot_msg["content"]) - 1)
 
         with copilot_span("enforcement_nudge", data={"nudge_type": nudge_type, "iteration": iteration}):
-            extra_msgs = _assemble_enforcement_messages(screenshot_msg, nudge, synthesized_msg)
+            extra_msgs = _assemble_enforcement_messages(screenshot_msg, decision.message)
             current_input = (
                 extra_msgs if session is not None else _prune_input_list(result.to_input_list()) + extra_msgs
             )

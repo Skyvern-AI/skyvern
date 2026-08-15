@@ -263,7 +263,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       ),
     ).toBeTruthy();
     expect(
-      screen.getByPlaceholderText("Type a message to send next…"),
+      screen.getByPlaceholderText("Type to queue a message…"),
     ).toBeTruthy();
     expect(screen.getByRole("button", { name: "Send next" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Queue" })).toBeNull();
@@ -349,7 +349,6 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     await submit("first message");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     await submit("second message");
-    expect(textarea().disabled).toBe(true);
 
     await act(async () => {
       fireEvent.keyDown(window, { key: "Escape" });
@@ -954,5 +953,106 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     expect(screen.getAllByText("queued message")).toHaveLength(1);
     expect(postStreaming).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("WorkflowCopilotChat — a stop never replays a queued message", () => {
+  it("hands the queued text back to the composer instead of auto-sending it", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await submit("also add a login step");
+    expect(screen.getAllByText("also add a login step")).toHaveLength(1);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Cancel run/ }));
+    });
+    // The turn ends only after the stop lands — this is the edge that used to
+    // drain the queue and start a whole new build turn.
+    await completeOldestStream("stopped");
+
+    expect(textarea().value).toBe("also add a login step");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Queued")).toBeNull();
+  });
+
+  it("shows a stopping state on the first press so the control is not pressed repeatedly", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    const stop = screen.getByRole("button", { name: /Cancel run/ });
+    expect(stop.hasAttribute("disabled")).toBe(false);
+
+    await act(async () => {
+      fireEvent.click(stop);
+    });
+
+    const stopping = screen.getByRole("button", { name: /Stopping/ });
+    expect(stopping.hasAttribute("disabled")).toBe(true);
+    expect(cancelPost).toHaveBeenCalledTimes(1);
+
+    // A second press cannot reach the handler, so no second cancel is posted.
+    await act(async () => {
+      fireEvent.click(stopping);
+    });
+    expect(cancelPost).toHaveBeenCalledTimes(1);
+
+    await completeOldestStream("stopped");
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /Stopping/ })).toBeNull(),
+    );
+  });
+});
+
+describe("WorkflowCopilotChat — the composer stays usable while a prompt is parked", () => {
+  // A turn parked on a credential/2FA ask holds the stream open, so isLoading
+  // never flips and the queued prompt never drains. Disabling the composer on
+  // a queued prompt therefore locked the user out exactly when they had the
+  // code the copilot was waiting for.
+  it("keeps the textarea typable while a prompt is queued", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await submit("first answer");
+
+    expect(textarea().disabled).toBe(false);
+    expect(
+      screen.getByPlaceholderText("Type to replace the queued message…"),
+    ).toBeTruthy();
+  });
+
+  it("does not clobber half-typed composer text when a stop returns the queued one", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await submit("queued answer");
+    // Half-typed replacement, never submitted.
+    fireEvent.change(textarea(), {
+      target: { value: "half typed replacement" },
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Cancel run/ }));
+    });
+
+    expect(textarea().value).toBe("half typed replacement");
+  });
+
+  it("replaces the parked prompt rather than swallowing the second send", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await submit("wrong code 000000");
+    await submit("correct code 123456");
+
+    expect(screen.queryByText("wrong code 000000")).toBeNull();
+    expect(screen.getAllByText("correct code 123456")).toHaveLength(1);
+    // Still exactly one parked prompt, and still no second stream.
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    await completeOldestStream("done");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]!.body.message).toBe("correct code 123456");
   });
 });

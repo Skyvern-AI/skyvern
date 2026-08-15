@@ -13,6 +13,7 @@ from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPag
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.schemas.workflows import BlockStatus
 from skyvern.services.script_service import _update_workflow_block
 from tests.unit.forge.sdk.artifact.storage.test_helpers import TEST_ORGANIZATION_ID, TEST_TASK_ID, create_fake_step
 
@@ -426,6 +427,42 @@ class TestUpdateWorkflowBlockFlush:
 
             # Flush was attempted
             mock_manager.flush_step_archive.assert_awaited_once_with(TEST_STEP_ID)
+
+
+@pytest.mark.asyncio
+async def test_cached_billing_failure_marks_workflow_block_failed() -> None:
+    context = _make_context(use_bundling=False)
+
+    with (
+        patch("skyvern.services.script_service.skyvern_context") as mock_ctx,
+        patch("skyvern.services.script_service.app") as mock_app,
+        patch("skyvern.services.script_service.script_run_context_manager") as mock_run_ctx,
+        patch("skyvern.services.script_service.TaskOutput.from_task") as mock_task_output,
+    ):
+        mock_ctx.current.return_value = context
+        mock_app.DATABASE.tasks.update_step = AsyncMock()
+        mock_app.DATABASE.tasks.update_task = AsyncMock(return_value=MagicMock(extracted_information=None))
+        mock_app.DATABASE.tasks.get_step = AsyncMock(return_value=MagicMock())
+        mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+        mock_app.STORAGE.get_downloaded_files = AsyncMock(return_value=[])
+        mock_app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts = AsyncMock(return_value=[])
+        mock_app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts = AsyncMock(return_value=[])
+        mock_app.AGENT_FUNCTION.post_cache_step_execution = AsyncMock(side_effect=RuntimeError("meter failed"))
+        mock_run_ctx.get_run_context.return_value = None
+        mock_task_output.return_value.model_dump.return_value = {}
+
+        await _update_workflow_block(
+            workflow_run_block_id=TEST_WORKFLOW_RUN_BLOCK_ID,
+            status=BlockStatus.completed,
+            task_id=TEST_TASK_ID,
+            step_id=TEST_STEP_ID,
+        )
+
+        update = mock_app.DATABASE.observer.update_workflow_run_block
+        update.assert_awaited_once()
+        assert update.await_args.kwargs["status"] == BlockStatus.failed
+        assert update.await_args.kwargs["failure_reason"] == "Cached step billing failed."
+        assert update.await_args.kwargs["output"] is None
 
 
 # ---------------------------------------------------------------------------

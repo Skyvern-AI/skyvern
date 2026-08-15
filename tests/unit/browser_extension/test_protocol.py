@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import shutil
+import subprocess
+import zipfile
+from pathlib import Path
 
 import pytest
 
 from skyvern.browser_extension.errors import BrowserExtensionError
+from skyvern.browser_extension.package_extension import package_extension
 from skyvern.browser_extension.protocol import (
     ALLOWED_CDP_METHOD_PREFIXES,
     ALLOWED_EVENTS,
@@ -22,7 +29,7 @@ from skyvern.browser_extension.protocol import (
 
 def test_parse_valid_response() -> None:
     parsed = parse_extension_message(
-        json.dumps({"v": 1, "type": "response", "id": "r-1", "ok": True, "result": {"tabId": 12}})
+        json.dumps({"v": 2, "type": "response", "id": "r-1", "ok": True, "result": {"tabId": 12}})
     )
 
     assert parsed.kind == "response"
@@ -36,7 +43,7 @@ def test_parse_valid_event() -> None:
     parsed = parse_extension_message(
         json.dumps(
             {
-                "v": 1,
+                "v": 2,
                 "type": "event",
                 "event": "scope.tabAdded",
                 "params": {"tabId": 12, "url": "https://example.com", "title": "Example"},
@@ -61,8 +68,8 @@ def test_unknown_message_type_raises() -> None:
 
 
 def test_protocol_allowlists_match_contract() -> None:
-    assert PROTOCOL_VERSION == 1
-    assert EXTENSION_ID == "fmamdhmfeihjjaiheideemihnbpnokin"
+    assert PROTOCOL_VERSION == 2
+    assert EXTENSION_ID == "dhommdmblflboaledbbfkdaapkadphlp"
     assert ALLOWED_OPS == frozenset(
         {
             "debugger.attach",
@@ -99,9 +106,34 @@ def test_protocol_allowlists_match_contract() -> None:
     )
 
 
+def test_manifest_key_derives_extension_id() -> None:
+    extension_dir = Path(__file__).parents[3] / "skyvern" / "browser_extension" / "extension"
+    manifest = json.loads((extension_dir / "manifest.json").read_text())
+    public_key = base64.b64decode(manifest["key"], validate=True)
+    digest_prefix = hashlib.sha256(public_key).hexdigest()[:32]
+    derived_extension_id = "".join(chr(ord("a") + int(nibble, 16)) for nibble in digest_prefix)
+
+    assert derived_extension_id == EXTENSION_ID
+
+
+def test_package_extension_builds_store_upload_zip(tmp_path: Path) -> None:
+    output_path = package_extension(tmp_path / "skyvern-agent.zip")
+
+    with zipfile.ZipFile(output_path) as archive:
+        names = set(archive.namelist())
+        packaged_manifest = json.loads(archive.read("manifest.json"))
+
+    assert "key" not in packaged_manifest
+    assert "service_worker.js" in names
+    assert "README.md" not in names
+
+    second_path = package_extension(tmp_path / "skyvern-agent-second.zip")
+    assert output_path.read_bytes() == second_path.read_bytes()
+
+
 def test_build_request_checks_operation_allowlist() -> None:
     assert build_request("r-3", "tabs.list", {}) == {
-        "v": 1,
+        "v": 2,
         "type": "request",
         "id": "r-3",
         "op": "tabs.list",
@@ -112,6 +144,130 @@ def test_build_request_checks_operation_allowlist() -> None:
         build_request("r-4", "cookies.read", {})
     with pytest.raises(BrowserExtensionError):
         build_request(4, "tabs.list", {})  # type: ignore[arg-type]
+
+
+def test_reset_ack_and_versioned_hello_contract() -> None:
+    reset_ack = parse_extension_message(
+        '{"v":2,"type":"extension.reset_ack","epoch":"daemon-epoch","generation":7,"ok":true}'
+    )
+    failed_reset_ack = parse_extension_message(
+        '{"v":2,"type":"extension.reset_ack","epoch":"daemon-epoch","generation":8,"ok":false,"failedTabCount":2}'
+    )
+    hello = parse_extension_message(
+        '{"v":2,"type":"event","event":"extension.hello",'
+        '"params":{"protocolVersion":2,"extensionVersion":"1.0.0","scopedTabs":[]}}'
+    )
+    legacy_hello = parse_extension_message(
+        '{"v":1,"type":"event","event":"extension.hello","params":{"extensionVersion":"0.9.0","scopedTabs":[]}}'
+    )
+
+    assert reset_ack.kind == "extension.reset_ack"
+    assert reset_ack.reset_epoch == "daemon-epoch"
+    assert reset_ack.generation == 7
+    assert reset_ack.ok is True
+    assert reset_ack.failed_tab_count == 0
+    assert failed_reset_ack.reset_epoch == "daemon-epoch"
+    assert failed_reset_ack.generation == 8
+    assert failed_reset_ack.ok is False
+    assert failed_reset_ack.failed_tab_count == 2
+    assert hello.protocol_version == 2
+    assert hello.params is not None and hello.params["protocolVersion"] == 2
+    assert legacy_hello.protocol_version == 1
+    assert legacy_hello.params is not None and "protocolVersion" not in legacy_hello.params
+
+    with pytest.raises(BrowserExtensionError, match="protocolVersion"):
+        parse_extension_message(
+            '{"v":2,"type":"event","event":"extension.hello","params":{"extensionVersion":"1.0.0","scopedTabs":[]}}'
+        )
+    with pytest.raises(BrowserExtensionError, match="generation"):
+        parse_extension_message('{"v":2,"type":"extension.reset_ack","epoch":"daemon-epoch","generation":-1,"ok":true}')
+    with pytest.raises(BrowserExtensionError, match="epoch"):
+        parse_extension_message('{"v":2,"type":"extension.reset_ack","epoch":"","generation":1,"ok":true}')
+    with pytest.raises(BrowserExtensionError, match="failedTabCount"):
+        parse_extension_message(
+            '{"v":2,"type":"extension.reset_ack","epoch":"daemon-epoch","generation":1,"ok":false,"failedTabCount":0}'
+        )
+
+
+def test_extension_reset_ack_supports_idempotent_replay_and_verified_detach() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the extension reset contract test")
+    extension_dir = Path(__file__).parents[3] / "skyvern" / "browser_extension" / "extension"
+    bridge_uri = (extension_dir / "bridge_connection.js").as_uri()
+    debugger_uri = (extension_dir / "debugger_router.js").as_uri()
+    script = f"""
+globalThis.chrome = {{
+  alarms: {{ onAlarm: {{ addListener() {{}} }} }},
+  debugger: {{
+    onEvent: {{ addListener() {{}} }},
+    onDetach: {{ addListener() {{}} }},
+  }},
+}};
+globalThis.WebSocket = {{ OPEN: 1 }};
+const {{ BridgeConnection }} = await import({json.dumps(bridge_uri)});
+const {{ DebuggerRouter }} = await import({json.dumps(debugger_uri)});
+const frames = [];
+const resetResults = [
+  {{ executed: false, ok: true, failedTabCount: 0 }},
+  null,
+  {{ executed: true, ok: false, failedTabCount: 1 }},
+  {{ executed: true, ok: true, failedTabCount: 0 }},
+];
+const bridge = new BridgeConnection({{
+  onRequest: async () => ({{}}),
+  onAuthenticated: async () => undefined,
+  onReset: async () => resetResults.shift(),
+  onStateChange: () => undefined,
+}});
+bridge.authenticated = true;
+bridge.socket = {{ readyState: 1, send: (raw) => frames.push(JSON.parse(raw)) }};
+const resetFrame = (generation) => JSON.stringify({{
+  v: 2,
+  type: "extension.reset",
+  epoch: "daemon-epoch",
+  generation,
+}});
+await bridge.handleMessage(resetFrame(1));
+if (frames[0]?.ok !== true || frames[0]?.generation !== 1) {{
+  throw new Error("successfully executed reset identity was not re-acknowledged");
+}}
+await bridge.handleMessage(resetFrame(0));
+if (frames.length !== 1) throw new Error("stale reset without a recorded outcome was acknowledged");
+await bridge.handleMessage(resetFrame(2));
+if (frames[1]?.ok !== false || frames[1]?.failedTabCount !== 1) {{
+  throw new Error("failed reset acknowledgement was not fail-closed");
+}}
+await bridge.handleMessage(resetFrame(2));
+if (frames[2]?.ok !== true || frames[2]?.epoch !== "daemon-epoch") {{
+  throw new Error("failed reset identity did not re-execute successfully");
+}}
+
+let targets = [{{ tabId: 7, attached: true }}];
+chrome.debugger.detach = async () => {{ throw new Error("detach failed"); }};
+chrome.debugger.getTargets = async () => targets;
+const router = new DebuggerRouter({{
+  tabScope: {{}},
+  sendEvent: () => undefined,
+  onAttachedChange: () => undefined,
+}});
+router.attachedTabs.add(7);
+const failed = await router.reset();
+if (failed.failedTabCount !== 1 || !router.attachedTabs.has(7)) {{
+  throw new Error("live debugger attachment was certified as detached");
+}}
+targets = [];
+const benign = await router.reset();
+if (benign.failedTabCount !== 0 || router.attachedTabs.has(7)) {{
+  throw new Error("already-detached or missing target was not accepted");
+}}
+"""
+
+    result = subprocess.run(
+        [node, "--input-type=module", "--eval", script], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_cdp_method_allowlist() -> None:

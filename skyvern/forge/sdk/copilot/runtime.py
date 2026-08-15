@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, NotRequired, TypeAlias, TypedDict, cast
+from typing import TYPE_CHECKING, Any, NotRequired, TypeAlias, TypedDict, cast
 
 import structlog
 
@@ -27,7 +28,6 @@ from skyvern.cli.core.session_manager import (
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_origin import (
@@ -45,30 +45,18 @@ from skyvern.webeye.browser_state import BrowserState
 if TYPE_CHECKING:
     from playwright.async_api import Page
 
-    from skyvern.forge.sdk.copilot.authoring_parameter_binding import AuthoringParameterBindingSnapshot
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.build_test_outcome import (
-        MetadataRejectLadderState,
         RecordedBuildTestOutcome,
-        RecordedOutcomeBindingConstraint,
-        RecordedOutcomeGroundingRequirement,
     )
-    from skyvern.forge.sdk.copilot.code_block_synthesis import SynthesizedCodeBlock
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
     from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
-    from skyvern.forge.sdk.copilot.output_extraction_plan import (
-        FrozenRequestedOutputExtractionCandidate,
-        RequestedOutputExtractionPlan,
-    )
-    from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-    from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence, ScoutObservationContract
+    from skyvern.forge.sdk.copilot.result_evidence import ScoutObservationContract
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
-    from skyvern.forge.sdk.copilot.turn_intent import TurnIntent
-    from skyvern.forge.sdk.copilot.turn_ownership import GatePrecedenceConflictEvent, TurnClaimant, TurnOwnership
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 
@@ -197,31 +185,49 @@ class ScoutedDynamicRowEvidence(TypedDict):
     evidence_fingerprint: str
 
 
+class ScoutedSelectorCandidate(TypedDict):
+    selector: str
+    source: str
+
+
 class ScoutedInteraction(TypedDict):
+    # Every field here crosses the turn boundary into persisted, model-visible context except
+    # those named in context._TURN_EPHEMERAL_INTERACTION_FIELDS. A field added here that holds a
+    # raw value — a literal, page text — has to be listed there too; nothing enforces the pair.
     tool_name: str
     selector: NotRequired[str]
+    selector_candidates: NotRequired[list[ScoutedSelectorCandidate]]
+    selector_match_count: NotRequired[int]
     source_url: NotRequired[str]
+    result_url: NotRequired[str]
+    observed_effects: NotRequired[dict[str, bool]]
+    observed_wait_ms: NotRequired[int]
+    input_id: NotRequired[str]
+    input_value: NotRequired[str]
     value: NotRequired[str]
     # Grounded value-containment witnesses computed at the update_workflow confluence; drive
     # generator-owned templated locators. Empty/absent => literal replay.
     input_correspondences: NotRequired[list[ScoutedInputCorrespondence]]
     dynamic_row_evidence: NotRequired[ScoutedDynamicRowEvidence]
-    typed_value: NotRequired[str]
     key: NotRequired[str]
     typed_length: NotRequired[int]
-    # Raw scout-typed value for run-scoped test binding, gated at capture by should_reject_type_text_value.
-    # Turn-ephemeral; excluded from every persistence path (default_value promotion, typed identity, YAML).
-    raw_typed_value: NotRequired[str]
     role: NotRequired[str]
     accessible_name: NotRequired[str]
+    role_name_match_count: NotRequired[int]
     # Captured for the type_text lane only; absent on credential fills (secret-leak boundary).
     control_readonly: NotRequired[bool]
     control_disabled: NotRequired[bool]
     control_value_satisfied: NotRequired[bool]
+    # Exact-selector facts from an earlier bounded observation of the same page.
+    # Synthesis compiles these into runtime readiness waits before replaying the
+    # demonstrated action; they are evidence, not inferred failure categories.
+    observed_hidden: NotRequired[bool]
+    observed_disabled: NotRequired[bool]
     trajectory_index: NotRequired[int]
+    observation_step: NotRequired[int]
     carried: NotRequired[bool]
     # A read the scout proved on the live page: the expression it ran and the output path the
-    # value answers. Recorded so authoring quotes a proven read instead of guessing a selector.
+    # value answers. Recorded so the model receives the observed read without guessing a selector.
     read_expression: NotRequired[str]
     read_output_path: NotRequired[str]
     # Whether the reader named this path or it was the only one left. A witness binds a value to a
@@ -230,7 +236,7 @@ class ScoutedInteraction(TypedDict):
     read_result_shape: NotRequired[str]
     # The scalar the read actually returned, so a later binding can locate the element that still
     # carries it rather than re-deriving one from labels. Bounded and scalar-only; turn-ephemeral,
-    # like raw_typed_value, and excluded from every persistence path.
+    # turn-ephemeral and excluded from every persistence path.
     read_result_value: NotRequired[str]
     # Set when a live scout-time count()==1 probe found the captured selector matching >1 element on its
     # source page; synthesis re-anchors or drops it rather than emitting a selector that strict-mode-fails.
@@ -267,7 +273,6 @@ class AgentContext:
     turn_origin: TurnOrigin = TurnOrigin.interactive
     injected_browser_state: BrowserState | None = None
     heal_workflow_run_id: str | None = None
-    turn_intent: TurnIntent | None = None
     # The streaming adapter narrates any context it is handed, so the design-phase latches live here
     # rather than on the copilot subclass it is annotated for.
     design_start_emitted: bool = False
@@ -279,7 +284,6 @@ class AgentContext:
     supports_vision: bool = True
     pending_screenshots: list[ScreenshotEntry] = field(default_factory=list)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
-    failed_tool_step_tracker: dict[str, int] = field(default_factory=dict)
     unrecoverable_tool_error_streak_count: int = 0
     unrecoverable_tool_error_signature: str | None = None
     unrecoverable_tool_error_reason: str | None = None
@@ -293,7 +297,6 @@ class AgentContext:
     last_requested_block_labels: list[str] = field(default_factory=list)
     last_executed_block_labels: list[str] = field(default_factory=list)
     last_frontier_start_label: str | None = None
-    pending_action_sequence_fingerprint: str | None = None
     verified_block_outputs: dict[str, Any] = field(default_factory=dict)
     verified_prefix_labels: list[str] = field(default_factory=list)
     last_full_workflow_test_ok: bool = False
@@ -301,52 +304,37 @@ class AgentContext:
     workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
 
     # Enforcement state. Set lazily by streaming_adapter, tools, and
-    # failure_tracking; declared here so _check_enforcement can read them on a
+    # failure_tracking; declared here so enforcement_decision can read them on a
     # fresh context without AttributeError.
     navigate_called: bool = False
     observation_after_navigate: bool = False
-    navigate_enforcement_done: bool = False
     update_workflow_called: bool = False
     test_after_update_done: bool = False
-    post_update_nudge_count: int = 0
-    coverage_nudge_count: int = 0
-    format_nudge_count: int = 0
     copilot_total_timeout_exceeded: bool = False
-    failed_test_nudge_count: int = 0
-    explore_without_workflow_nudge_count: int = 0
+    copilot_max_turns_exceeded: bool = False
+    model_calls_this_turn: int = 0
+    enforcement_pass_count: int = 0
+    pre_run_gated_output_warning_fingerprint: tuple[tuple[str, str, bool, str], ...] = ()
     last_test_ok: bool | None = None
     last_test_suspicious_success: bool = False
     last_test_anti_bot: str | None = None
     last_test_failure_reason: str | None = None
-    # Latest evaluated outcome-gate verdict this turn. Deliberately not reset
-    # per-run: a later run that fails before verification keeps the verdict.
-    last_outcome_gate_reason: str | None = None
-    last_outcome_gate_workflow_run_id: str | None = None
     last_failure_category_top: str | None = None
     last_update_block_count: int | None = None
     last_failed_workflow_yaml: str | None = None
     code_only_code_schema_seen: bool = False
     code_only_target_page_evidence_seen: bool = False
     code_native_pending_capability: str | None = None
-    repeated_failure_streak_count: int = 0
-    repeated_failure_nudge_emitted_at_streak: int = 0
-    code_authoring_guardrail_reject_count: int = 0
-    last_code_authoring_reject_was_credential_priority: bool = False
-    last_output_policy_reject_reason_codes: frozenset[str] | None = None
     # Climbs on each click that made no verified forward progress (failed/timed-out
     # click or a hollow post-click observe); resets on verified progress.
-    consecutive_no_progress_interaction_count: int = 0
     last_scout_act_observe_outcome: str | None = None
     last_scout_act_observe_packet: dict[str, Any] | None = None
     last_scout_act_observe_recapture_attempted: bool = False
     last_scout_act_observe_recapture_result: str = ""
-    ambiguous_bare_selector_rescout_context_key: str | None = None
     pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
-    challenge_gated_proxy_retry_count: int = 0
     last_test_non_retriable_nav_error: str | None = None
     last_infrastructure_tool_error: str | None = None
-    non_retriable_nav_error_last_emitted_signature: str | None = None
     workflow_persisted: bool = False
     last_workflow: Any | None = None
     last_workflow_yaml: str | None = None
@@ -359,7 +347,6 @@ class AgentContext:
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
-    impose_synthesized_code_block: bool = False
     effective_workflow_proxy_location: Any | None = None
 
     copilot_run_start_monotonic: float | None = None
@@ -375,13 +362,8 @@ class AgentContext:
     last_run_outcome: RecordedRunOutcome | None = None
     last_run_outcome_block_labels: list[str] = field(default_factory=list)
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
-    metadata_reject_ladder_state: MetadataRejectLadderState | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
     recorded_persisted_block_run_workflow_run_id: str | None = None
-    recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None = None
-    recorded_outcome_binding_constraint: RecordedOutcomeBindingConstraint | None = None
-    authoring_parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None
-    consecutive_non_converging_repair_count: int = 0
     completion_verification_result: CompletionVerificationResult | None = None
     completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
     verified_terminal_proposal_ready: bool = False
@@ -397,7 +379,6 @@ class AgentContext:
     # Feeds the per-acted-page composition gate; never persisted into workflow YAML.
     flow_evidence: list[dict[str, Any]] = field(default_factory=list)
     # Challenge-advisory reasons already surfaced to the model this turn, so the advisory fires once.
-    challenge_advisory_fired_reasons: set[str] = field(default_factory=set)
     pending_browser_interaction_observation: PendingBrowserInteractionObservation | None = None
     # In-turn side channel from workflow mutation calls: block label -> flow_evidence
     # observation step used to ground the newly authored page-acting block.
@@ -415,125 +396,33 @@ class AgentContext:
     # flow_evidence does not cover it (closes the spent-inspection-budget
     # deadlock). Each item: {url, had_bounded_schema, reached_via}.
     prior_observed_acted_pages: list[dict[str, Any]] = field(default_factory=list)
-    prior_fill_carry: list[dict[str, str | int | bool | list[str] | None]] = field(default_factory=list)
-    fill_carry_rebound_done: bool = False
-    post_budget_page_inspection_required: bool = False
-    post_budget_page_inspection_url: str | None = None
-    post_budget_page_inspection_run_id: str | None = None
+    prior_carried_trajectory: list[dict[str, str | int | bool | list[str] | None]] = field(default_factory=list)
+    carried_trajectory_rebound_done: bool = False
     post_run_page_observation_tool: str | None = None
     post_run_page_observation_url: str | None = None
     post_run_page_observation_workflow_run_id: str | None = None
     post_run_page_observation_after_failed_test: bool = False
     post_run_page_observation_generation: int = 0
     post_run_current_page_inspection_workflow_run_id: str | None = None
-    last_evaluate_actionable_signature: str | None = None
-    last_evaluate_actionable_url: str | None = None
-    latest_evaluate_result_composition_steer: LoadedResultCompositionEvidence | None = None
-    latest_evaluate_result_composition_signature: str | None = None
-    last_auto_acted_signature: str | None = None
     observed_browser_urls: list[str] = field(default_factory=list)
     # Ephemeral within-turn scout captures; not persisted across turns.
     scouted_interactions: list[ScoutedInteraction] = field(default_factory=list)
     # Append-only, non-deduped record of the scout's interaction sequence in
     # acted order. Unlike scouted_interactions (deduped for auto-credit), this
-    # preserves repeats and ordering so code_block_synthesis can emit a faithful
-    # linear Playwright trajectory.
+    # preserves repeats and ordering as factual model input.
     scout_trajectory: list[ScoutedInteraction] = field(default_factory=list)
     # Solve attempts already spent per challenge. A challenge that never passes is precisely the
     # one re-observed on every later capture, so cost otherwise grows with how stuck the turn is.
     challenge_solve_attempts: dict[str, int] = field(default_factory=dict)
-    # Latest typed reached-download target from the scout steer; the synthesizer compiles the terminal
-    # expect_download step from it. Selector is the observed download link, not necessarily a trajectory click.
-    reached_download_target: ReachedDownloadTarget | None = None
-    # Ordered (method, receiver) browser mutations of the last successfully persisted draft's code
-    # blocks; None until a persist succeeds this turn. Gates the scouted-spine under-build reject and turn-end nudge.
-    persisted_draft_browser_calls: list[tuple[str, str]] | None = None
-    scouted_spine_previous_omission_digest: str | None = None
-    scouted_spine_repeated_identical_missing_steps: bool = False
-    # Author-time output-contract cross-turn state, keyed by the contract signature; set lazily by workflow_update.
-    output_contract_pinned_block_label_by_signature: dict[str, str] = field(default_factory=dict)
-    runtime_output_repair_attempt_by_signature: dict[str, bool] = field(default_factory=dict)
-    # Whether an imposition landed for this contract since the last attempt.
-    output_contract_imposed_since_last_reject_by_signature: dict[str, bool] = field(default_factory=dict)
-    # Structural fingerprint captured when a structure directive was armed; a re-entry whose
-    # fingerprint still matches means the directive went unconsumed (cosmetic churn), which
-    # escalates the actuation lattice instead of re-arming the same directive forever.
-    output_contract_armed_directive_fingerprint_by_signature: dict[str, str] = field(default_factory=dict)
-    # Armed when a collapsed-spine violation cannot be split; carries split blockers and stage count to the
-    # next authoring prompt, keyed by a composite {signature, label, authored-YAML hash} so a new draft re-arms.
-    output_contract_spine_directive_blockers_by_attempt_key: dict[str, list[str]] = field(default_factory=dict)
-    output_contract_spine_directive_stage_count_by_attempt_key: dict[str, int] = field(default_factory=dict)
-    output_contract_output_owner_directive_candidates_by_signature: dict[str, list[str]] = field(default_factory=dict)
-    # Two-phase advisory grant per output-contract signature (any family, gated on observable source):
-    # the resolver GRANTs one adjudicating run, the run-dispatch seam CONSUMEs it, and a terminal requires
-    # CONSUMED so a double preflight pass cannot burn it.
-    output_contract_actuation_by_signature: dict[str, OutputContractAdvisoryState] = field(default_factory=dict)
-    # Liveness gate distinct from the reject counter: actuations (directive arms) landed since the last
-    # executed run, reset only by a run dispatch, so a never-converging draft still reaches arm-D in bounded steps.
-    output_contract_actuation_count_by_signature: dict[str, int] = field(default_factory=dict)
-    # Set when a de-click-only actuation (imposition/directive carrying the requested output paths) left the
-    # spine click-only; the no-observable-source terminal fires only after such an attempt, never on a lone
-    # flaky scout pass. Cleared when the spine gains a source, on imposition, or on run dispatch.
-    output_contract_declick_attempted_by_signature: dict[str, bool] = field(default_factory=dict)
-    # One-shot per signature: a consumed advisory run whose observed output bound no required path may
-    # re-enter the ladder once before any terminal.
-    output_contract_dispatch_reopened_by_signature: dict[str, bool] = field(default_factory=dict)
-    # The exhaustion terminal requires this, and no rung sets it while code blocks stay on raw
-    # Playwright, so that terminal is unreachable until output grounding returns.
-    output_contract_page_extraction_imposed_by_signature: dict[str, bool] = field(default_factory=dict)
-    # Run-output evidence recorded at the run-result seam: a dispatched run's output-contract signatures
-    # mapped to their required paths (armed at seam-admit and page-source imposition), then the observed
-    # result — whether the run's registered output was seen at all, and whether it covered any required path.
-    output_contract_pending_run_evidence: dict[str, list[str]] = field(default_factory=dict)
-    output_contract_run_output_observed_by_signature: dict[str, bool] = field(default_factory=dict)
-    output_contract_run_bound_required_path_by_signature: dict[str, bool] = field(default_factory=dict)
-    # Lifecycle-progress token the loop-defer choke-point snapshots on each swallowed loop signal; a second
-    # swallow with no advance expires the grant into a typed terminal instead of holding to the timeout wall.
-    output_contract_defer_progress_token: tuple[int, int, int, int] | None = None
-    # Per tool-call latch: the imposition seam already ran the actuation ladder this call, so the shared
-    # reject-counting seam does not adjudicate the same signature twice. Reset at each imposition entry.
-    output_contract_bail_actuated_this_call: bool = False
-    synthesized_block_offered: bool = False
-    synthesized_block_offered_trajectory_len: int = 0
-    synthesized_block_offered_goal_complete: bool = False
-    # Probe-validated value elements the model designated, each pinned to the page it was resolved on.
-    requested_output_designations: list[dict[str, Any]] = field(default_factory=list)
-    resolved_designation_fingerprints: set[str] = field(default_factory=set)
-    requested_output_extraction_candidate: FrozenRequestedOutputExtractionCandidate | None = None
-    # Candidate frozen by an imposition that has not been persisted yet; promoted to the committed
-    # candidate only once the update it rode in on succeeds.
-    pending_requested_output_extraction_candidate: FrozenRequestedOutputExtractionCandidate | None = None
-    # The last plan that bound every requested path. Derivation reads the freshest packet, which is
-    # usually truncated or unbindable, so a plan that did bind is kept rather than re-derived away
-    # before the imposition that needs it.
-    last_bound_requested_output_extraction_plan: RequestedOutputExtractionPlan | None = None
-    # Set by the imposition seam when a goal-complete spine is on its way into a draft; the successful update
-    # promotes it to the landed latch only when the persisted draft covers the freshly scouted spine.
-    pending_goal_complete_landing: bool = False
-    synthesized_goal_complete_landed: bool = False
-    # Imposition answered this persist attempt on a goal-complete trajectory; owned-carrier metadata
-    # scaffolding keys off it (workflow_update._scaffold_metadata_from_owned_carrier_produced_output).
-    spine_imposition_owned_attempt: bool = False
-    # Synthesized block computed by this persist attempt's imposition pass; the pre-persist spine gate
-    # reuses it so both seams grade one synthesis. Reset at each imposition entry.
-    imposition_synthesized_block: SynthesizedCodeBlock | None = None
-    # Label of the code block the imposition attempt owns this call (carrier), including on no-op early
-    # returns. The freehand persist-seam surface leg exempts exactly this label and gates its siblings.
-    spine_imposition_carrier_label: str | None = None
-    synthesized_block_reopened_after_failed_run: bool = False
-    synthesized_block_reopened_for_credential_scout: bool = False
-    # Business inputs proven required by an earlier synthesized-draft rejection stay required for the
-    # rest of the turn. A later retry cannot evade the floor by deleting those parameters from its YAML.
-    synthesized_business_required_parameter_keys: set[str] = field(default_factory=set)
     scouted_output_covered_paths: set[str] = field(default_factory=set)
     # Ids of active terminal_action completion criteria the scout has structurally reached past the
-    # login prefix; releases the is_goal_complete terminal-action gate mirroring reached_download_target.
+    # login prefix; releases the corresponding is_goal_complete terminal-action gate.
     scout_observed_terminal_criterion_ids: set[str] = field(default_factory=set)
     scout_observation_contract: ScoutObservationContract | None = None
-    credential_scout_rescout_context_key: str | None = None
     # Which requires-live-scout fields (username/password, non-empty) each scouted credential
     # carries; recorded at credential resolve time and rehydrated from FillCarry across turns.
     scouted_credential_field_inventory_by_credential_id: dict[str, frozenset[str]] = field(default_factory=dict)
+    credential_fill_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Read once per turn: repeated fill attempts must not re-scan the org's credentials.
     org_credentials_for_turn: list[Credential] | None = None
     vault_login_uris_by_credential_id: dict[str, list[str]] = field(default_factory=dict)
@@ -546,27 +435,38 @@ class AgentContext:
     unbound_required_parameter_keys: list[str] = field(default_factory=list)
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
-    pending_scout_typed_value: str | None = None
+    pending_scout_selector_candidates: list[ScoutedSelectorCandidate] | None = None
+    pending_scout_input_value: str | None = None
     # (selector, role, accessible_name) read before an in-flight click that may navigate: a post-action
     # read would describe the landing element, so a navigating click's anchor is captured pre-navigation.
     pending_scout_role_name: tuple[str, str, str] | None = None
+    pending_scout_role_name_match_count: tuple[str, str, str, int] | None = None
     # Selector of an in-flight click, captured pre-dispatch so a failed/timed-out click can gate a
     # settle re-perception on whether that selector still resolves to a live element.
     pending_scout_click_selector: str | None = None
     # Browser-session download filenames snapshotted before a scout click, so the post-hook can tell
     # a download this click produced from one an earlier click left behind.
     pending_scout_download_snapshot: frozenset[str] | None = None
-    repair_obligation_nudge_count: int = 0
+    # Whether the in-flight click fired a browser download, recorded by the listener armed at click
+    # dispatch. Event-driven, so it holds before the session store registers the file (the store lags
+    # the event by seconds, or never sees it on vendor sessions).
+    pending_scout_download: bool = False
+    # Removers for the download listeners armed for the in-flight click, on the clicked page and on
+    # any popup it opened. Run when the click's result is consumed and again before the next click
+    # arms: a listener left attached would write a later download into another click's window.
+    pending_scout_download_detachers: list[Callable[[], None]] = field(default_factory=list)
+    pending_scout_popup: Page | None = None
+    pending_scout_popup_content_type: str | None = None
     # (selector, ambiguous) verdict from a pre-dispatch live count probe, applied to the recorded
     # interaction only when the post-action resolved selector matches the probed one.
     pending_scout_ambiguous: tuple[str, bool] | None = None
+    pending_scout_selector_match_count: tuple[str, int] | None = None
     # (selector, role, accessible_name) captured pre-dispatch for an ambiguous selector only when the
     # get_by_role(role, name, exact=True) re-anchor resolves to exactly one live element on the source
     # page; a non-unique or nameless ambiguous selector leaves this None so synthesis drops the interaction.
     pending_scout_reanchor: tuple[str, str, str] | None = None
     # Source-bound row identity captured before a positional click dispatches. The post-hook consumes it
     # only for the exact selector/source pair, so navigation cannot transfer the witness to another click.
-    pending_scout_dynamic_row: ScoutedDynamicRowEvidence | None = None
     # Expression of an in-flight evaluate, stashed pre-dispatch: the MCP response carries only the
     # result, so a post-hook that wants the expression must receive it from the invocation side.
     pending_scout_read_expression: str | None = None
@@ -592,46 +492,6 @@ class AgentContext:
     # render the current tool result from structured product text.
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
     tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
-    # Single-owner turn-precedence contract. One mechanism owns a turn's steering
-    # at a time; a contradicting weaker claim is recorded here and yields.
-    turn_ownership: TurnOwnership | None = None
-    gate_precedence_conflict_events: list[GatePrecedenceConflictEvent] = field(default_factory=list)
-    # Claimant whose owned claim stashed the current blocker_signal; the stash choke-point clears
-    # it whenever the held signal changes identity, so a plain stash can never alias a stale owner.
-    blocker_signal_claimant: TurnClaimant | None = None
-
-
-def diagnosis_repair_obligation_open(ctx: AgentContext) -> bool:
-    """True while the latest diagnosis contract says the failed run is repairable and no later run has
-    discharged it. The build-test oracle already reported the failure; this keeps the loop on the hook for
-    consuming it, so a turn cannot observe the reached page once and then finalize a draft the run disproved.
-
-    Keyed on the typed decision, never on a nudge count: the contract's own ASK/STOP/NO_CHANGE transitions
-    discharge it, and the operational total-turn timeout bounds it."""
-    # Deferred: diagnosis_repair_contract reaches this module through context, so a module-level
-    # import cycles.
-    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
-
-    contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
-    if contract is None:
-        return False
-    return contract.repair_decision.next_action is RepairNextAction.REPAIR
-
-
-def output_contract_ladder_unresolved(ctx: AgentContext) -> bool:
-    """True while an output-contract signature has a live actuation ladder — a landed actuation or a GRANTED
-    advisory — that has not yet reached a typed terminal or a dispatched (CONSUMED) run. Loop and churn detectors
-    defer to this state so the bounded actuation ladder, not a generic max-turn backstop, owns the turn's outcome.
-    Keyed on actuation state, not the reject counter, so a bail with no live actuation path cannot defer forever;
-    a CONSUMED or EXPIRED signature is resolved and re-enables the detectors."""
-    resolved_states = {OutputContractAdvisoryState.CONSUMED, OutputContractAdvisoryState.EXPIRED}
-    actuation_states = ctx.output_contract_actuation_by_signature
-    if any(state == OutputContractAdvisoryState.GRANTED for state in actuation_states.values()):
-        return True
-    return any(
-        int(count or 0) >= 1 and actuation_states.get(sig) not in resolved_states
-        for sig, count in ctx.output_contract_actuation_count_by_signature.items()
-    )
 
 
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:

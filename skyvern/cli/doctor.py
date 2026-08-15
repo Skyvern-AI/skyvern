@@ -26,6 +26,11 @@ from rich.panel import Panel
 from rich.table import Table
 
 from skyvern.cli.console import console
+from skyvern.cli.credential_placeholders import (
+    CREDENTIAL_PLACEHOLDERS,
+    is_frontend_api_key_placeholder,
+    is_placeholder_credential_value,
+)
 
 doctor_app = typer.Typer(help="Check Skyvern installation health.")
 
@@ -51,13 +56,6 @@ LOCAL_STREAMING_MODE = "cdp"
 FRONTEND_STREAMING_MODE_VAR = "VITE_BROWSER_STREAMING_MODE"
 BACKEND_STREAMING_MODE_VAR = "BROWSER_STREAMING_MODE"
 ALLOWED_STREAMING_MODES = {"cdp", "vnc"}
-
-FRONTEND_BUNDLE_PLACEHOLDERS = {
-    "__VITE_API_BASE_URL_PLACEHOLDER__",
-    "__VITE_WSS_BASE_URL_PLACEHOLDER__",
-    "__VITE_ARTIFACT_API_BASE_URL_PLACEHOLDER__",
-    "__SKYVERN_API_KEY_PLACEHOLDER__",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -557,8 +555,8 @@ def _check_api_key_consistency() -> CheckResult:
     frontend_env = Path("skyvern-frontend/.env")
 
     backend_key = dotenv_values(backend_env).get("SKYVERN_API_KEY", "") if backend_env.exists() else ""
-    frontend_raw = dotenv_values(frontend_env).get("VITE_SKYVERN_API_KEY", "") if frontend_env.exists() else ""
-    frontend_key = "" if frontend_raw in ("", "YOUR_API_KEY") else frontend_raw
+    frontend_raw = str(dotenv_values(frontend_env).get("VITE_SKYVERN_API_KEY", "")) if frontend_env.exists() else ""
+    frontend_key = "" if is_frontend_api_key_placeholder(frontend_raw) else frontend_raw
     generated_key = _read_generated_credential()
     legacy_key = _read_legacy_streamlit_credential()
 
@@ -674,12 +672,7 @@ def _docker_compose_available() -> bool:
 
 
 def _is_placeholder_env_value(value: str) -> bool:
-    normalized = value.strip()
-    return (
-        normalized in ("", "PLACEHOLDER", "YOUR_API_KEY")
-        or normalized in FRONTEND_BUNDLE_PLACEHOLDERS
-        or (normalized.startswith("__") and normalized.endswith("__") and "PLACEHOLDER" in normalized)
-    )
+    return is_placeholder_credential_value(value)
 
 
 def _validate_frontend_runtime_url_values(values: dict[str, str], source: str) -> list[str]:
@@ -997,14 +990,18 @@ def _check_docker_local_auth() -> CheckResult:
     if not _docker_compose_available():
         return CheckResult(name="Docker Local Auth", status="ok", detail="not checked (no docker-compose.yml)")
 
-    script = r"""
+    docker_placeholder_values = json.dumps(CREDENTIAL_PLACEHOLDERS)
+    script = (
+        r"""
 import json
 import os
 import urllib.error
 import urllib.request
 
 token = os.environ.get("SKYVERN_API_KEY", "").strip()
-if not token or token == "PLACEHOLDER":
+if not token or token in """
+        + docker_placeholder_values
+        + r""":
     print(json.dumps({"status": "missing_container_api_key"}))
     raise SystemExit(0)
 
@@ -1032,6 +1029,7 @@ except urllib.error.HTTPError as exc:
             "detail": payload.get("detail") if isinstance(payload, dict) else body or str(exc),
         }))
 """
+    )
 
     try:
         result = _run_docker_compose_exec("skyvern", script, timeout=60)
@@ -1678,7 +1676,7 @@ async def _wait_for_stream_frame(ws_url: str, timeout_seconds: int) -> str:
             if payload.get("screenshot"):
                 return str(payload.get("format") or "unknown")
             last_status = str(payload.get("status") or payload)
-            if last_status in {"not_found", "timeout", "completed", "failed"}:
+            if last_status in {"not_found", "timeout", "session_expired", "completed", "failed"}:
                 raise RuntimeError(f"stream ended before a frame arrived: {last_status}")
 
 

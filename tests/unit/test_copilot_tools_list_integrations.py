@@ -6,7 +6,6 @@ import pytest
 from skyvern.forge.sdk.copilot.tools.integrations import _list_integrations, _serialize
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
-from tests.unit.conftest import render_agent_prompt
 
 ORGANIZATION_ID = "o_test_org"
 
@@ -114,21 +113,32 @@ def test_serializer_is_an_allowlist_so_a_new_token_field_cannot_leak() -> None:
         id="goac_1",
         credential_name="Sheets account",
         state="active",
+        email_address="mailbox@example.com",
         scopes_granted=["https://www.googleapis.com/auth/spreadsheets"],
         **{name: f"SECRET_{name}" for name in TOKEN_FIELD_NAMES},
     )
 
     entry = _serialize(leaky_google, "google")
 
-    assert set(entry) == {"connection_id", "provider", "name", "state", "scopes_granted"}
+    assert set(entry) == {"connection_id", "provider", "name", "state", "scopes_granted", "email_address"}
     for name in TOKEN_FIELD_NAMES:
         assert name not in entry
     assert not any("SECRET_" in str(value) for value in entry.values())
 
 
-def test_prompt_routes_oauth_accounts_to_the_right_lookup() -> None:
-    rendered = render_agent_prompt()
-    assert "appear ONLY in `list_integrations`" in rendered
+@pytest.mark.asyncio
+async def test_surfaces_the_mailbox_address_so_the_agent_can_bind_an_identifier(patched_services) -> None:
+    patched_services(
+        [_google(email_address="inbox@example.com")],
+        [_microsoft(email_address="outlook@example.com")],
+    )
+    ctx = SimpleNamespace(organization_id=ORGANIZATION_ID)
+
+    result = await _list_integrations({}, ctx)
+
+    google_entry, microsoft_entry = result["data"]["integrations"]
+    assert google_entry["email_address"] == "inbox@example.com"
+    assert microsoft_entry["email_address"] == "outlook@example.com"
 
 
 @pytest.mark.asyncio

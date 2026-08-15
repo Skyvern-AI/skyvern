@@ -418,10 +418,13 @@ def _validate_tree(
     allow_self_super_private_attrs: bool = False,
     check_constant_format_fields: bool = False,
     check_unsafe_loaders: bool = False,
+    block_class_keywords: bool = False,
 ) -> None:
     assignment_values, import_paths, binding_counts = _script_bindings(tree)
     directly_called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
     for node in ast.walk(tree):
+        if block_class_keywords and isinstance(node, ast.ClassDef) and node.keywords:
+            raise error_factory("Not allowed to use metaclasses or keywords in class definitions")
         if isinstance(node, ast.Attribute) and node.attr in blocked_private_attrs:
             raise error_factory(f"Not allowed to access '{node.attr}'")
         if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
@@ -538,7 +541,13 @@ def is_safe_code(
 ) -> None:
     """Reject imports, private members, and known escape hatches."""
     tree = ast.parse(textwrap.dedent(code))
-    _validate_tree(tree, blocked_imports=None, blocked_names=frozenset(), error_factory=error_factory)
+    _validate_tree(
+        tree,
+        blocked_imports=None,
+        blocked_names=frozenset(),
+        error_factory=error_factory,
+        block_class_keywords=True,
+    )
 
 
 def is_safe_script_code(

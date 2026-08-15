@@ -454,7 +454,14 @@ def test_model_call_cost_uses_runtime_litellm_pricing(monkeypatch: pytest.Monkey
     }
 
 
-def test_model_call_cost_prices_dated_gpt56_response_with_base_rates() -> None:
+def test_model_call_cost_normalizes_dated_gpt56_response_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    priced_models: list[str] = []
+
+    def fake_cost_per_token(**kwargs: Any) -> tuple[float, float]:
+        priced_models.append(kwargs["model"])
+        return 0.25, 0.125
+
+    monkeypatch.setattr(model_telemetry_module.litellm, "cost_per_token", fake_cost_per_token)
     telemetry = model_telemetry_module.CopilotModelCallTelemetry(
         model_call_index=1,
         input_tokens=40_000,
@@ -471,6 +478,7 @@ def test_model_call_cost_prices_dated_gpt56_response_with_base_rates() -> None:
 
     assert dated_cost is not None
     assert dated_cost == pytest.approx(base_cost)
+    assert priced_models == ["gpt-5.6-sol", "gpt-5.6-sol"]
 
 
 def test_completed_model_call_emits_datadog_usage_with_explicit_zeroes(
@@ -586,6 +594,21 @@ def test_model_call_without_provider_usage_does_not_emit_datadog_event(
         pass
 
     assert events == []
+
+
+def test_datadog_logging_failure_does_not_escape_or_leak_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_to_log(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("logger unavailable")
+
+    monkeypatch.setattr(model_telemetry_module.LOG, "info", fail_to_log)
+
+    with model_call_telemetry_scope(6, model="gpt-5.6-sol") as telemetry:
+        telemetry.input_tokens = 100
+        telemetry.output_tokens = 5
+
+    assert current_model_call_telemetry() is None
 
 
 @pytest.mark.asyncio

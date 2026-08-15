@@ -16,7 +16,6 @@ except ImportError:  # pragma: no cover - bs4 is a transitive dep but inspection
     BeautifulSoup = None  # type: ignore[assignment, misc]
 
 from skyvern.config import settings
-from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     CHALLENGE_EVIDENCE_SOURCE_KEY,
     CONSENT_OBSTRUCTION_KIND,
@@ -25,16 +24,11 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
     vision_challenge_carrier,
 )
 from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
-from skyvern.forge.sdk.copilot.reached_download_target import (
-    NAV_TARGET_DOWNLOAD_KIND_KEY,
-    classify_download_affordance,
-)
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()
 
-_BUILD_MODE_VALUES: frozenset[str] = frozenset({"build", "draft_only", "edit", "unknown"})
 # Block types whose acted page, when no url is on the block, is the current
 # frontier (observation of the page suffices). navigation without a url is the
 # interaction-on-current-page case and is also frontier-anchored.
@@ -105,7 +99,6 @@ _ANTI_BOT_SCAN_BYTES = 250_000
 
 class _PostRunCompositionContext(Protocol):
     composition_page_evidence: dict[str, Any] | None
-    per_tool_budget_problem_block_labels: list[str]
     workflow_verification_evidence: WorkflowVerificationEvidence
     post_run_page_observation_after_failed_test: bool
     last_failure_category_top: str | None
@@ -414,20 +407,6 @@ def _block_acts_on_page(block: dict[str, Any]) -> str | None:
     return None
 
 
-def _mode_requires_evidence(ctx: Any) -> bool:
-    mode_value = getattr(getattr(getattr(ctx, "turn_intent", None), "mode", None), "value", None)
-    phase = getattr(ctx, "build_phase", None)
-    return (
-        isinstance(mode_value, str)
-        and mode_value in _BUILD_MODE_VALUES
-        and phase
-        in (
-            BuildPhase.COMPOSING,
-            BuildPhase.TESTING,
-        )
-    )
-
-
 def _gated_page_acting_blocks(workflow_yaml: str | None, previous_workflow_yaml: str | None) -> list[dict[str, Any]]:
     """New-or-url-changed blocks that act on a page and so need observed evidence.
 
@@ -556,8 +535,6 @@ def _same_url_ignoring_fragment(left: str | None, right: str | None) -> bool:
 
 
 def _post_run_recovery_state(ctx: _PostRunCompositionContext) -> bool:
-    if any(ctx.per_tool_budget_problem_block_labels):
-        return True
     if any(ctx.workflow_verification_evidence.per_tool_budget_on_block):
         return True
     if ctx.post_run_page_observation_after_failed_test is True:
@@ -1058,8 +1035,6 @@ def composition_page_evidence_error(
     by evals, not enforced by a classifier in the mutation path.
     """
 
-    if not _mode_requires_evidence(ctx):
-        return None
     previous_workflow_yaml = getattr(ctx, "workflow_yaml", None)
     post_run_url_error = _post_run_observed_url_goto_error(ctx, workflow_yaml, previous_workflow_yaml)
     if post_run_url_error:
@@ -1432,7 +1407,7 @@ def _selector_for(node: Any) -> str:
 
 
 def _clickable_controls_channel(controls: list[dict[str, Any]] | None) -> dict[str, Any]:
-    if not settings.COPILOT_CLICK_REPERCEPTION_ATTACH_ENABLED:
+    if not settings.COPILOT_CLICKABLE_CONTROLS_EVIDENCE_ENABLED:
         return {}
     return {"clickable_controls": controls or []}
 
@@ -2458,12 +2433,6 @@ def parse_composition_html(
             "href": resolved_href[:300],
             "selector": _bounded_selector(_selector_for(link)),
         }
-        download_kind = classify_download_affordance(
-            href=resolved_href,
-            has_download_attr=link.has_attr("download"),
-        )
-        if download_kind is not None:
-            nav_entry[NAV_TARGET_DOWNLOAD_KIND_KEY] = download_kind
         navigation_targets.append(nav_entry)
 
     result_containers: list[dict[str, Any]] = []
@@ -2578,39 +2547,41 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
         if not isinstance(node, dict) or len(fields) >= _MAX_FIELDS_PER_FORM:
             continue
         field_type = (_structured_str(node.get("type")) or "text").lower()
-        fields.append(
-            {
-                "name": _structured_str(node.get("name"))[:120],
-                "id": _structured_str(node.get("id"))[:120],
-                "label": _schema_text(_structured_str(node.get("label")), 240),
-                "type": field_type[:40],
-                "value": _structured_str(node.get("value")).strip()[:160],
-                "filled": node.get("filled") is True,
-                "class": _structured_classes(node.get("class")),
-                "placeholder": _schema_text(_structured_str(node.get("placeholder")), 240),
-                "required": node.get("required") is True,
-                "disabled": node.get("disabled") is True,
-                "checked": node.get("checked") is True,
-                "options": _structured_select_options(node.get("options")),
-                "selector": _bounded_selector(_structured_str(node.get("selector"))),
-            }
-        )
+        field = {
+            "name": _structured_str(node.get("name"))[:120],
+            "id": _structured_str(node.get("id"))[:120],
+            "label": _schema_text(_structured_str(node.get("label")), 240),
+            "type": field_type[:40],
+            "value": _structured_str(node.get("value")).strip()[:160],
+            "filled": node.get("filled") is True,
+            "class": _structured_classes(node.get("class")),
+            "placeholder": _schema_text(_structured_str(node.get("placeholder")), 240),
+            "required": node.get("required") is True,
+            "disabled": node.get("disabled") is True,
+            "checked": node.get("checked") is True,
+            "options": _structured_select_options(node.get("options")),
+            "selector": _bounded_selector(_structured_str(node.get("selector"))),
+        }
+        if isinstance(node.get("visible"), bool):
+            field["visible"] = node["visible"]
+        fields.append(field)
     submit_controls: list[dict[str, Any]] = []
     for control in form.get("submit_controls") or []:
         if not isinstance(control, dict):
             continue
-        submit_controls.append(
-            {
-                "text": _schema_text(_structured_str(control.get("text")), 120),
-                "name": _structured_str(control.get("name"))[:120],
-                "id": _structured_str(control.get("id"))[:120],
-                "value": _structured_str(control.get("value")).strip()[:160],
-                "class": _structured_classes(control.get("class")),
-                "type": (_structured_str(control.get("type")) or "").lower()[:40],
-                "disabled": control.get("disabled") is True,
-                "selector": _bounded_selector(_structured_str(control.get("selector"))),
-            }
-        )
+        submit_control = {
+            "text": _schema_text(_structured_str(control.get("text")), 120),
+            "name": _structured_str(control.get("name"))[:120],
+            "id": _structured_str(control.get("id"))[:120],
+            "value": _structured_str(control.get("value")).strip()[:160],
+            "class": _structured_classes(control.get("class")),
+            "type": (_structured_str(control.get("type")) or "").lower()[:40],
+            "disabled": control.get("disabled") is True,
+            "selector": _bounded_selector(_structured_str(control.get("selector"))),
+        }
+        if isinstance(control.get("visible"), bool):
+            submit_control["visible"] = control["visible"]
+        submit_controls.append(submit_control)
     return {
         "id": _structured_str(form.get("id"))[:120],
         "name": _structured_str(form.get("name"))[:120],
@@ -2640,12 +2611,6 @@ def _structured_navigation_targets(value: Any, *, base_url: str) -> list[dict[st
             "href": href[:300],
             "selector": _bounded_selector(_structured_str(link.get("selector"))),
         }
-        download_kind = classify_download_affordance(
-            href=href,
-            has_download_attr=link.get("has_download_attr") is True,
-        )
-        if download_kind is not None:
-            entry[NAV_TARGET_DOWNLOAD_KIND_KEY] = download_kind
         targets.append(entry)
     return targets
 

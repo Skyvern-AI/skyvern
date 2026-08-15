@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any
 from urllib.parse import urlparse
 
 import structlog
@@ -28,24 +28,10 @@ from playwright.async_api import Browser, BrowserContext
 from skyvern.cli.core.session_manager import request_session_scope
 from skyvern.forge import app
 from skyvern.forge.agent_functions import CopilotCandidateNetworkHop
-from skyvern.forge.sdk.copilot.blocker_signal import (
-    build_loop_blocker_signal,
-    loop_blocker_evidence_from_ctx,
-    refresh_held_loop_blocker_evidence,
-    stash_blocker_signal,
-)
-from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
-from skyvern.forge.sdk.copilot.enforcement import (
-    current_page_challenge_advisory_signal,
-    register_no_progress_interaction_click,
-    requested_output_paths_for_derivation,
-    synthesized_block_persistence_signal,
-)
-from skyvern.forge.sdk.copilot.loop_detection import (
-    detect_failed_tool_step_loop_for_ctx,
-    record_tool_step_result_for_ctx,
-)
+from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
+from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     ensure_browser_session,
@@ -55,8 +41,6 @@ from skyvern.forge.sdk.copilot.runtime import (
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
-from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
-from skyvern.forge.sdk.copilot.turn_ownership import emit_blocker_signal_payload
 from skyvern.webeye.browser_state import BrowserState
 
 PreHook = Callable[[dict[str, Any], AgentContext], Awaitable[dict[str, Any] | None]]
@@ -69,17 +53,14 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "pending_browser_interaction_observation",
     "scouted_interactions",
     "scout_trajectory",
-    "requested_output_designations",
-    "resolved_designation_fingerprints",
-    "last_bound_requested_output_extraction_plan",
     "pending_scout_source_url",
-    "pending_scout_typed_value",
+    "pending_scout_selector_candidates",
+    "pending_scout_input_value",
     "pending_scout_role_name",
+    "pending_scout_role_name_match_count",
     "pending_scout_ambiguous",
+    "pending_scout_selector_match_count",
     "pending_scout_reanchor",
-    "post_budget_page_inspection_required",
-    "post_budget_page_inspection_url",
-    "post_budget_page_inspection_run_id",
     "post_run_page_observation_tool",
     "post_run_page_observation_url",
     "post_run_page_observation_workflow_run_id",
@@ -87,23 +68,11 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "post_run_page_observation_generation",
     "latest_recorded_build_test_outcome",
     "code_only_target_page_evidence_seen",
-    "last_evaluate_actionable_signature",
-    "last_evaluate_actionable_url",
     "last_scout_observation_trajectory_index",
     "last_scout_observation_has_password_control",
-    "latest_evaluate_result_composition_steer",
-    "latest_evaluate_result_composition_signature",
-    "last_auto_acted_signature",
-    "reached_download_target",
-    "synthesized_block_offered",
-    "synthesized_block_offered_trajectory_len",
-    "synthesized_block_offered_goal_complete",
-    "synthesized_business_required_parameter_keys",
     "scouted_output_covered_paths",
     "scout_observed_terminal_criterion_ids",
     "scout_observation_contract",
-    "requested_output_extraction_candidate",
-    "consecutive_no_progress_interaction_count",
 )
 
 
@@ -144,32 +113,6 @@ class SchemaOverlay:
 
 LOG = structlog.get_logger()
 _INTERNAL_TOOL_ARG_KEYS = frozenset({"_summarized"})
-_CURRENT_PAGE_CHALLENGE_ADVISORY_MCP_TOOLS = frozenset(
-    {
-        "click",
-        "evaluate",
-        "get_browser_screenshot",
-        "navigate_browser",
-        "press_key",
-        "scroll",
-        "select_option",
-        "type_text",
-    }
-)
-
-
-def _stash_and_emit_loop_blocker(ctx: Any, loop_message: str, tool_name: str) -> str:
-    signal = build_loop_blocker_signal(loop_message, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx))
-    payload = emit_blocker_signal_payload(ctx, signal)
-    stash_turn_halt_from_blocker_signal(ctx, signal, source="mcp_loop_blocker")
-    return payload
-
-
-def _emit_current_page_challenge_advisory(ctx: Any, tool_name: str) -> str | None:
-    signal = current_page_challenge_advisory_signal(ctx, blocked_tool=tool_name, evidence_source="mcp_page_evidence")
-    if signal is None:
-        return None
-    return emit_blocker_signal_payload(ctx, signal)
 
 
 def _requested_output_path_choices(schema: dict[str, Any], paths: list[str]) -> dict[str, Any]:
@@ -482,52 +425,15 @@ class SkyvernOverlayMCPServer(MCPServer):
         copilot_ctx = self._context_provider()
         overlay = self._overlays.get(tool_name, SchemaOverlay())
 
-        # MCP-side phase gate; mirror of `_authority_tool_error` in tools.py for MCP-only tools.
-        phase_signal = _phase_blocker_signal(copilot_ctx, tool_name)
-        if phase_signal is not None:
-            LOG.warning(
-                "Phase-gated MCP tool call rejected",
-                tool_name=tool_name,
-                build_phase=getattr(getattr(copilot_ctx, "build_phase", None), "value", None),
-            )
-            payload = stash_blocker_signal(copilot_ctx, phase_signal)
-            record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, {"ok": False, "error": payload})
-            return _copilot_to_call_tool_result({"ok": False, "error": payload})
-
-        refresh_held_loop_blocker_evidence(copilot_ctx)
-        if tool_name in _CURRENT_PAGE_CHALLENGE_ADVISORY_MCP_TOOLS:
-            challenge_advisory_payload = _emit_current_page_challenge_advisory(copilot_ctx, tool_name)
-            if challenge_advisory_payload is not None:
-                LOG.info(
-                    "Current page challenge advisory issued for MCP browser tool",
-                    tool_name=tool_name,
-                )
-                return _copilot_to_call_tool_result({"ok": False, "error": challenge_advisory_payload})
-
-        persistence_signal = synthesized_block_persistence_signal(copilot_ctx, tool_name, arguments)
-        if persistence_signal is not None:
-            LOG.warning(
-                "Synthesized block persistence required before MCP tool",
-                tool_name=tool_name,
-                synthesized_block_offered_trajectory_len=getattr(
-                    copilot_ctx,
-                    "synthesized_block_offered_trajectory_len",
-                    None,
-                ),
-            )
-            payload = emit_blocker_signal_payload(copilot_ctx, persistence_signal)
-            result = {"ok": False, "error": payload}
+        policy = copilot_ctx.request_policy
+        if overlay.requires_browser and isinstance(policy, RequestPolicy) and policy.raw_secret_detected:
+            result = {
+                "ok": False,
+                "error": "A raw-secret draft cannot use browser tools. Save only the redacted draft.",
+            }
+            LOG.info("Raw-secret safety blocked MCP browser tool", tool_name=tool_name)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
             return _copilot_to_call_tool_result(result)
-
-        loop_error = detect_failed_tool_step_loop_for_ctx(copilot_ctx, tool_name, arguments)
-        if loop_error:
-            LOG.warning(
-                "Failed tool step loop detected, skipping execution",
-                tool_name=tool_name,
-            )
-            payload = _stash_and_emit_loop_blocker(copilot_ctx, loop_error, tool_name)
-            return _copilot_to_call_tool_result({"ok": False, "error": payload})
 
         if overlay.pre_hook:
             hook_result = await overlay.pre_hook(arguments, copilot_ctx)
@@ -581,8 +487,6 @@ class SkyvernOverlayMCPServer(MCPServer):
                 exc_info=True,
             )
             err = scrub_secrets_from_structure(copilot_ctx, {"ok": False, "error": f"{tool_name} failed: {e}"})
-            if tool_name == "click":
-                register_no_progress_interaction_click(copilot_ctx, outcome="click_failed")
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err)
 

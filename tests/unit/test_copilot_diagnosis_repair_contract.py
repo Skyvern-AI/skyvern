@@ -9,21 +9,16 @@ import pytest
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
-from skyvern.forge.sdk.copilot.build_test_outcome import (
-    RecordedBuildTestOutcome,
-)
-from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
-    RepairLoopState,
     RepairNextAction,
     build_diagnosis_repair_contract,
 )
 from skyvern.forge.sdk.copilot.enforcement import latest_diagnosis_contract_satisfies_goal
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
     TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
@@ -37,7 +32,6 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
 )
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
-from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 
 
 def _ctx() -> CopilotContext:
@@ -49,11 +43,7 @@ def _ctx() -> CopilotContext:
         browser_session_id=None,
         stream=SimpleNamespace(),  # type: ignore[arg-type]
         user_message="Fix the workflow with password=hunter2",
-        turn_intent=TurnIntent(
-            mode=TurnIntentMode.EDIT,
-            user_goal="Fix the workflow with password=hunter2",
-            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
-        ),
+        request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
     )
 
 
@@ -222,7 +212,7 @@ def test_contract_shapes_for_failed_suspicious_and_missing_credential_cases() ->
         missing.diagnosis_result.suspected_failure_type,
         missing.repair_decision.next_action,
         missing.repair_decision.required_authority,
-    ) == (DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT, RepairNextAction.ASK, ["may_answer_without_mutation"])
+    ) == (DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT, RepairNextAction.ASK, [])
 
 
 def test_authoring_repair_contexts_have_distinct_structural_root_cause_signatures() -> None:
@@ -232,14 +222,14 @@ def test_authoring_repair_contexts_have_distinct_structural_root_cause_signature
         selector="button",
         refiner_selector="xpath=//button[normalize-space()='View / Download']",
     )
-    sandbox = CodeAuthoringRepairContext(
+    runtime = CodeAuthoringRepairContext(
         block_label="retrieve_document_link",
-        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        reason_code="runtime_block_failure",
         unresolved_names=["row_text", "confirmation_number"],
     )
-    sandbox_reordered = CodeAuthoringRepairContext(
+    runtime_reordered = CodeAuthoringRepairContext(
         block_label="retrieve_document_link",
-        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        reason_code="runtime_block_failure",
         unresolved_names=["confirmation_number", "row_text"],
     )
     synthesized_binding = CodeAuthoringRepairContext(
@@ -256,14 +246,14 @@ def test_authoring_repair_contexts_have_distinct_structural_root_cause_signature
         result=_authoring_repair_result(ambiguous),
         ctx=_ctx(),
     )
-    sandbox_contract = build_diagnosis_repair_contract(
+    runtime_contract = build_diagnosis_repair_contract(
         source_tool="update_and_run_blocks",
-        result=_authoring_repair_result(sandbox),
+        result=_authoring_repair_result(runtime),
         ctx=_ctx(),
     )
-    sandbox_reordered_contract = build_diagnosis_repair_contract(
+    runtime_reordered_contract = build_diagnosis_repair_contract(
         source_tool="update_and_run_blocks",
-        result=_authoring_repair_result(sandbox_reordered),
+        result=_authoring_repair_result(runtime_reordered),
         ctx=_ctx(),
     )
     synthesized_binding_contract = build_diagnosis_repair_contract(
@@ -273,22 +263,22 @@ def test_authoring_repair_contexts_have_distinct_structural_root_cause_signature
     )
 
     ambiguous_signature = ambiguous_contract.to_trace_data()["root_cause_signature"]
-    sandbox_signature = sandbox_contract.to_trace_data()["root_cause_signature"]
+    runtime_signature = runtime_contract.to_trace_data()["root_cause_signature"]
     synthesized_binding_signature = synthesized_binding_contract.to_trace_data()["root_cause_signature"]
     assert ambiguous_contract.repair_decision.next_action == RepairNextAction.REPAIR
-    assert sandbox_contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert runtime_contract.repair_decision.next_action == RepairNextAction.REPAIR
     assert synthesized_binding_contract.repair_decision.next_action == RepairNextAction.REPAIR
     assert synthesized_binding_contract.repair_decision.target_blocks == ["retrieve_document_link"]
     assert ambiguous_signature is not None
-    assert sandbox_signature is not None
+    assert runtime_signature is not None
     assert synthesized_binding_signature is not None
-    assert ambiguous_signature != sandbox_signature
-    assert synthesized_binding_signature not in {ambiguous_signature, sandbox_signature}
+    assert ambiguous_signature != runtime_signature
+    assert synthesized_binding_signature not in {ambiguous_signature, runtime_signature}
     assert (
         synthesized_binding_contract.diagnosis_result.root_cause_identity.error_class
         == "code_authoring_synthesized_parameter_binding_ambiguous"
     )
-    assert sandbox_reordered_contract.to_trace_data()["root_cause_signature"] == sandbox_signature
+    assert runtime_reordered_contract.to_trace_data()["root_cause_signature"] == runtime_signature
 
 
 def test_missing_required_output_key_repair_identity_uses_structural_context_only() -> None:
@@ -396,63 +386,6 @@ def test_runtime_authoring_repair_context_identity_includes_bounded_page_state()
     )
 
 
-def test_repair_loop_state_climbs_on_the_same_failure_repeating() -> None:
-    ctx = _ctx()
-    ambiguous = CodeAuthoringRepairContext(
-        block_label="retrieve_document_link",
-        reason_code="ambiguous_bare_selector",
-        selector="button",
-        refiner_selector="xpath=//button[normalize-space()='View / Download']",
-    )
-
-    for expected_count in (1, 2, 3):
-        contract = build_diagnosis_repair_contract(
-            source_tool="update_and_run_blocks",
-            result=_authoring_repair_result(ambiguous),
-            ctx=ctx,
-        )
-        run_execution_module._update_repair_loop_state(ctx, contract)
-        assert contract.repair_loop_state.consecutive_identical_repair_count == expected_count
-
-
-def _uncovered_output_turn_state(output_path: str) -> SimpleNamespace:
-    criterion = CompletionCriterion(id=output_path, outcome="the value is captured", output_path=output_path)
-    return SimpleNamespace(decision=SimpleNamespace(criteria=(criterion,)))
-
-
-def _run_repair_loop_state(ctx: CopilotContext) -> RepairLoopState:
-    repair_context = CodeAuthoringRepairContext(
-        block_label="extract_order",
-        reason_code="runtime_block_failure",
-        runtime_failure_reason="output missing",
-    )
-    contract = build_diagnosis_repair_contract(
-        source_tool="update_and_run_blocks",
-        result=_authoring_repair_result(repair_context),
-        ctx=ctx,
-    )
-    run_execution_module._update_repair_loop_state(ctx, contract)
-    return contract.repair_loop_state
-
-
-def test_persisted_run_outcome_is_not_excluded_from_repair_streak() -> None:
-    ctx = _ctx()
-    ctx.completion_criteria_turn_state = _uncovered_output_turn_state("output.document_name")
-    ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
-        phase="persisted_block_run",
-        attempted_tool="update_and_run_blocks",
-        verdict="repairable_failure",
-        reason_code="outcome_not_demonstrated",
-        structural_failure_identity="completion:unsatisfied-output",
-        missing_requested_output_facts=[{"output_path": "output.document_name", "output_root": "output"}],
-    )
-    state = _run_repair_loop_state(ctx)
-    assert state.consecutive_identical_repair_count == 1
-
-    repeat = _run_repair_loop_state(ctx)
-    assert repeat.consecutive_identical_repair_count == 2
-
-
 def test_failed_run_finalizes_runtime_authoring_repair_context_after_matching_page_observation() -> None:
     ctx = _ctx()
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
@@ -506,7 +439,7 @@ def test_failed_run_finalizes_runtime_authoring_repair_context_after_matching_pa
     assert isinstance(repair_context, CodeAuthoringRepairContext)
     assert result["data"]["authoring_repair_context"] == repair_context.model_dump(mode="json")
     assert repair_context.block_label == "search_registry"
-    assert repair_context.runtime_failure_class == "timeout_waiting_for_selector"
+    assert repair_context.runtime_failure_class is None
     assert repair_context.current_origin == "https://example.test"
     assert repair_context.current_url_present is True
     assert repair_context.current_title_present is True
@@ -545,7 +478,7 @@ def test_failed_run_injects_pending_runtime_authoring_context_before_page_observ
     assert repair_context.reason_code == "runtime_block_failure"
     assert repair_context.block_label == "search_registry"
     assert repair_context.workflow_run_id == "wr_failed"
-    assert repair_context.runtime_failure_class
+    assert repair_context.runtime_failure_class is None
     assert repair_context.observed_after_workflow_run is False
 
     contract = build_diagnosis_repair_contract(
@@ -883,10 +816,14 @@ def test_runtime_authoring_repair_context_suppressed_for_terminal_page_evidence(
     assert ctx.last_code_authoring_repair_context is None
 
 
-def test_runtime_authoring_repair_context_suppressed_for_authority_ask_and_state_stop() -> None:
+def test_runtime_authoring_repair_context_ignores_policy_verdict_but_respects_state_stop() -> None:
     ask_ctx = _ctx()
     ask_ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    ask_ctx.turn_intent.authority.may_update_workflow = False
+    ask_ctx.request_policy = RequestPolicy(
+        user_response_policy="ask_clarification",
+        allow_update_workflow=False,
+        allow_run_blocks=False,
+    )
     run_execution_module._record_run_blocks_result(
         ask_ctx,
         {
@@ -909,8 +846,8 @@ def test_runtime_authoring_repair_context_suppressed_for_authority_ask_and_state
 
     inject_runtime_authoring_repair_context(ask_ctx, ask_result)
 
-    assert "authoring_repair_context" not in ask_result["data"]
-    assert ask_ctx.last_code_authoring_repair_context is None
+    assert "authoring_repair_context" in ask_result["data"]
+    assert ask_ctx.last_code_authoring_repair_context is not None
 
     stop_ctx = _ctx()
     stop_ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
@@ -1076,64 +1013,6 @@ def test_runtime_authoring_repair_context_sanitizes_failure_and_page_summaries()
     assert repair_context.current_origin == "https://example.test"
 
 
-def test_judge_confirmed_suspicious_success_forces_no_change() -> None:
-    ctx = _ctx()
-    ctx.last_test_suspicious_success = True
-    ctx.completion_verification_result = _satisfied_completion_verification()
-    contract = build_diagnosis_repair_contract(
-        source_tool="update_and_run_blocks",
-        result={
-            "ok": True,
-            "data": {
-                "workflow_run_id": "wr_verified",
-                "overall_status": "completed",
-                "frontier_start_label": "extract",
-                "blocks": [{"label": "extract", "block_type": "EXTRACTION", "status": "completed"}],
-            },
-        },
-        ctx=ctx,
-        workflow_updated=True,
-    )
-
-    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
-    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
-    assert contract.verification_result.user_goal_satisfied is True
-    assert contract.verification_result.completion_contract_satisfied is True
-    assert contract.diagnosis_result.missing_context == []
-    assert contract.verification_result.remaining_blocker is None
-    trace = contract.to_trace_data()
-    assert trace["failure_type"] == "no_failure"
-    assert trace["missing_context"] == []
-
-
-def test_verified_success_ignores_incidental_login_prose_without_structured_blocker() -> None:
-    ctx = _ctx()
-    ctx.last_test_suspicious_success = True
-    ctx.completion_verification_result = _satisfied_completion_verification()
-
-    contract = build_diagnosis_repair_contract(
-        source_tool="update_and_run_blocks",
-        result={
-            "ok": True,
-            "error": "The extracted public instructions mention login credentials, but no login was attempted.",
-            "data": {
-                "workflow_run_id": "wr_verified_login_text",
-                "overall_status": "completed",
-                "frontier_start_label": "extract",
-                "blocks": [{"label": "extract", "block_type": "EXTRACTION", "status": "completed"}],
-            },
-        },
-        ctx=ctx,
-        workflow_updated=True,
-    )
-
-    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
-    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
-    assert contract.verification_result.user_goal_satisfied is True
-    assert contract.verification_result.completion_contract_satisfied is True
-    assert contract.verification_result.remaining_blocker is None
-
-
 @pytest.mark.parametrize(
     "completion_verification",
     [
@@ -1146,7 +1025,7 @@ def test_verified_success_ignores_incidental_login_prose_without_structured_bloc
         ),
     ],
 )
-def test_clean_run_with_present_unsatisfied_completion_verification_fails_safe(
+def test_clean_run_ignores_interactive_completion_verification(
     completion_verification: CompletionVerificationResult,
 ) -> None:
     ctx = _ctx()
@@ -1159,11 +1038,11 @@ def test_clean_run_with_present_unsatisfied_completion_verification_fails_safe(
         workflow_updated=True,
     )
 
-    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.SUSPICIOUS_SUCCESS
-    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
-    assert contract.verification_result.user_goal_satisfied is False
-    assert contract.verification_result.completion_contract_satisfied is False
-    assert contract.verification_result.remaining_blocker is not None
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+    assert contract.verification_result.user_goal_satisfied is True
+    assert contract.verification_result.completion_contract_satisfied is True
+    assert contract.verification_result.remaining_blocker is None
 
 
 def test_clean_run_with_structural_abstention_completion_verification_does_not_repair() -> None:
@@ -1181,10 +1060,10 @@ def test_clean_run_with_structural_abstention_completion_verification_does_not_r
     assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
     assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
     assert contract.repair_decision.next_action != RepairNextAction.REPAIR
-    assert contract.repair_decision.completion_check == "No repair selected; completion remains unverified."
-    assert contract.verification_result.user_goal_satisfied is False
-    assert contract.verification_result.completion_contract_satisfied is False
-    assert latest_diagnosis_contract_satisfies_goal(ctx) is False
+    assert contract.repair_decision.completion_check == "Current run already satisfies the goal."
+    assert contract.verification_result.user_goal_satisfied is True
+    assert contract.verification_result.completion_contract_satisfied is True
+    assert latest_diagnosis_contract_satisfies_goal(ctx) is True
 
 
 def test_clean_run_with_satisfied_completion_verification_has_no_repair_or_blocker() -> None:
@@ -1226,7 +1105,7 @@ def test_committed_same_run_outcome_satisfies_diagnosis_after_later_contradictio
     assert latest_diagnosis_contract_satisfies_goal(ctx) is True
 
 
-def test_first_pass_contradiction_does_not_satisfy_latest_diagnosis_contract() -> None:
+def test_first_pass_completion_contradiction_cannot_overturn_clean_run() -> None:
     ctx = _ctx()
     ctx.completion_verification_result = _contradictory_completion_verification()
 
@@ -1238,14 +1117,14 @@ def test_first_pass_contradiction_does_not_satisfy_latest_diagnosis_contract() -
     )
     ctx.latest_diagnosis_repair_contract = contract
 
-    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.SUSPICIOUS_SUCCESS
-    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
-    assert contract.verification_result.user_goal_satisfied is False
-    assert contract.verification_result.completion_contract_satisfied is False
-    assert latest_diagnosis_contract_satisfies_goal(ctx) is False
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+    assert contract.verification_result.user_goal_satisfied is True
+    assert contract.verification_result.completion_contract_satisfied is True
+    assert latest_diagnosis_contract_satisfies_goal(ctx) is True
 
 
-def test_failed_run_with_satisfied_completion_verification_has_no_repair_or_blocker() -> None:
+def test_failed_run_is_not_rescued_by_completion_verification() -> None:
     ctx = _ctx()
     ctx.completion_verification_result = _satisfied_completion_verification()
 
@@ -1258,7 +1137,7 @@ def test_failed_run_with_satisfied_completion_verification_has_no_repair_or_bloc
                 "workflow_run_id": "wr_partial_verified",
                 "overall_status": "failed",
                 "frontier_start_label": "extract",
-                "failure_categories": [{"category": "OUTCOME_UNVERIFIED"}],
+                "failure_categories": [{"category": "DATA_EXTRACTION_FAILURE"}],
                 "blocks": [
                     {
                         "label": "extract",
@@ -1273,11 +1152,11 @@ def test_failed_run_with_satisfied_completion_verification_has_no_repair_or_bloc
         workflow_updated=True,
     )
 
-    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
-    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
-    assert contract.verification_result.user_goal_satisfied is True
-    assert contract.verification_result.completion_contract_satisfied is True
-    assert contract.verification_result.remaining_blocker is None
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert contract.verification_result.user_goal_satisfied is False
+    assert contract.verification_result.completion_contract_satisfied is False
+    assert contract.verification_result.remaining_blocker is not None
     assert contract.diagnosis_result.missing_context == []
 
 
@@ -1479,12 +1358,9 @@ def test_credentialed_runtime_auth_failure_repairs_failed_code_block() -> None:
 
     assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
     assert contract.repair_decision.next_action == RepairNextAction.REPAIR
-    assert contract.repair_decision.target_blocks == ["login"]
-    assert contract.diagnosis_result.suspected_failure_type != DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
-    assert contract.repair_decision.next_action != RepairNextAction.ASK
 
 
-def test_contradictory_completion_auth_evidence_repairs_frontier_block() -> None:
+def test_failed_auth_run_repairs_frontier_block_without_authoring_judge_authority() -> None:
     ctx = _ctx()
     ctx.completion_verification_result = CompletionVerificationResult(
         status="evaluated",
@@ -1515,7 +1391,7 @@ def test_contradictory_completion_auth_evidence_repairs_frontier_block() -> None
                 "page_title": "Login Failure",
                 "failure_categories": [
                     {
-                        "category": "OUTCOME_UNVERIFIED",
+                        "category": "AUTH_FAILURE",
                         "reasoning": "success flag contradicted by current page evidence",
                     }
                 ],
@@ -1529,11 +1405,8 @@ def test_contradictory_completion_auth_evidence_repairs_frontier_block() -> None
 
     assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
     assert contract.repair_decision.next_action == RepairNextAction.REPAIR
-    assert contract.repair_decision.target_blocks == ["login"]
     assert contract.verification_result.user_goal_satisfied is False
     assert contract.verification_result.completion_contract_satisfied is False
-    assert contract.diagnosis_result.suspected_failure_type != DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
-    assert contract.repair_decision.next_action != RepairNextAction.ASK
 
 
 def test_unbound_credential_skip_and_parameter_binding_errors_still_ask() -> None:
@@ -1584,11 +1457,11 @@ def test_unbound_credential_skip_and_parameter_binding_errors_still_ask() -> Non
     )
 
 
-def test_result_unresolved_symbol_context_prefers_repair_over_credential_ask() -> None:
+def test_result_runtime_repair_context_prefers_repair_over_credential_ask() -> None:
     ctx = _ctx()
     repair_context = CodeAuthoringRepairContext(
         block_label="create_request",
-        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        reason_code="runtime_block_failure",
         unresolved_names=["business_name"],
         parameter_keys=[],
     )
@@ -1610,16 +1483,16 @@ def test_result_unresolved_symbol_context_prefers_repair_over_credential_ask() -
 
     assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
     assert contract.repair_decision.next_action == RepairNextAction.REPAIR
-    assert "may_update_workflow" in contract.repair_decision.required_authority
+    assert contract.repair_decision.required_authority == []
     assert contract.repair_decision.target_blocks == ["create_request"]
     assert contract.to_trace_data()["next_action"] == "repair"
 
 
-def test_stale_stored_unresolved_symbol_context_does_not_override_credential_ask() -> None:
+def test_stale_stored_runtime_context_does_not_override_credential_ask() -> None:
     ctx = _ctx()
     ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
         block_label="create_request",
-        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        reason_code="runtime_block_failure",
         unresolved_names=["business_name"],
         parameter_keys=[],
     )
@@ -1639,14 +1512,14 @@ def test_stale_stored_unresolved_symbol_context_does_not_override_credential_ask
 
     assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
     assert contract.repair_decision.next_action == RepairNextAction.ASK
-    assert contract.repair_decision.required_authority == ["may_answer_without_mutation"]
+    assert contract.repair_decision.required_authority == []
 
 
-def test_non_credential_unresolved_name_result_repairs_instead_of_credential_ask() -> None:
+def test_non_credential_runtime_failure_result_repairs_instead_of_credential_ask() -> None:
     ctx = _ctx()
     repair_context = CodeAuthoringRepairContext(
         block_label="create_request",
-        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        reason_code="runtime_block_failure",
         unresolved_names=["business_name"],
         parameter_keys=[],
     )
@@ -1666,7 +1539,7 @@ def test_non_credential_unresolved_name_result_repairs_instead_of_credential_ask
     assert contract.repair_decision.target_blocks == ["create_request"]
 
 
-def test_missing_credential_without_unresolved_symbol_context_still_asks() -> None:
+def test_missing_credential_without_runtime_repair_context_still_asks() -> None:
     ctx = _ctx()
     ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
         block_label="create_request",
@@ -1686,14 +1559,14 @@ def test_missing_credential_without_unresolved_symbol_context_still_asks() -> No
 
     assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
     assert contract.repair_decision.next_action == RepairNextAction.ASK
-    assert contract.repair_decision.required_authority == ["may_answer_without_mutation"]
+    assert contract.repair_decision.required_authority == []
 
 
-def test_unresolved_symbol_context_does_not_preempt_terminal_challenge_stop() -> None:
+def test_runtime_repair_context_does_not_preempt_terminal_challenge_stop() -> None:
     ctx = _ctx()
     ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
         block_label="create_request",
-        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        reason_code="runtime_block_failure",
         unresolved_names=["business_name"],
         parameter_keys=[],
     )
@@ -1920,7 +1793,7 @@ def test_post_run_gated_challenge_observation_forces_stop_on_repairable_failure(
     ctx = _ctx()
     ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
         block_label="create_request",
-        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        reason_code="runtime_block_failure",
         unresolved_names=["business_name"],
         parameter_keys=[],
     )
@@ -1960,7 +1833,7 @@ def test_post_run_gated_challenge_observation_forces_stop_on_repairable_failure(
 
 def test_user_goal_urls_are_reduced_to_origins() -> None:
     ctx = _ctx()
-    ctx.turn_intent.user_goal = "Fix https://example.test/account?id=secret now"
+    ctx.user_message = "Fix https://example.test/account?id=secret now"
 
     contract = build_diagnosis_repair_contract(
         source_tool="run_blocks_and_collect_debug",
@@ -1996,7 +1869,7 @@ def test_stop_and_no_change_decisions_preserve_current_behavior_shadow_only() ->
     stop_ctx = _ctx()
     stop_ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
         block_label="create_request",
-        reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        reason_code="runtime_block_failure",
         unresolved_names=["business_name"],
         parameter_keys=[],
     )
@@ -2441,3 +2314,40 @@ def test_user_code_error_still_repairs_through_the_contract() -> None:
 
     assert contract.diagnosis_result.suspected_failure_type != DiagnosisFailureType.UNRECOVERABLE_TOOL_ERROR
     assert contract.repair_decision.next_action != RepairNextAction.STOP
+
+
+def test_sheets_missing_binding_failure_arms_repair_on_the_failed_block() -> None:
+    # SKY-13624 B2: the strict-render failure is run evidence that arms repair targeting the failed
+    # block, never an evidence-free fresh-build route.
+    run_result = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_failed",
+            "overall_status": "failed",
+            "blocks": [
+                {"label": "collect_visitors", "status": "completed"},
+                {
+                    "label": "append_visitors_to_sheet",
+                    "status": "failed",
+                    "failure_reason": (
+                        "Failed to format jinja template: block `append_visitors_to_sheet` field `values` "
+                        "references a value no upstream block produced: 'dict object' has no attribute "
+                        "'visitor_count'. Return that key from the producing block, or write an explicit "
+                        "default (e.g. {{ block_label.field | default('') }}) if an empty cell is intended."
+                    ),
+                },
+            ],
+        },
+    }
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=run_result,
+        ctx=_ctx(),
+        workflow_updated=True,
+    )
+
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert contract.repair_decision.target_blocks == ["append_visitors_to_sheet"]
+    assert contract.diagnosis_input.failed_block_labels == ["append_visitors_to_sheet"]

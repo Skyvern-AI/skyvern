@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import structlog
 import tldextract
 
 from skyvern.cli.core.session_manager import get_page
 from skyvern.forge import app
-from skyvern.forge.sdk.browser_action_policy import BrowserOrigin, canonicalize_origin
+from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELDS
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, url_parts
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -17,7 +20,12 @@ from skyvern.forge.sdk.copilot.request_policy import (
     admit_credential_for_live_page,
     loggable_origin,
 )
-from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session, mcp_browser_context
+from skyvern.forge.sdk.copilot.runtime import (
+    AgentContext,
+    ScoutedSelectorCandidate,
+    ensure_browser_session,
+    mcp_browser_context,
+)
 from skyvern.forge.sdk.copilot.secret_scrub import (
     REDACTED_SECRET_PLACEHOLDER,
     register_secret_scrub_value,
@@ -33,14 +41,15 @@ from skyvern.forge.sdk.schemas.credentials import (
 from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize_totp_config
 
 from .banned_blocks import _copilot_block_authoring_policy
-from .blockers import _tool_loop_error
 from .credentials import _missing_credential_reference_tool_error
 from .guardrails import _authority_tool_error
 from .mcp_hooks import _verify_scout_type_landed
 from .scouting import (
+    _attach_scout_observation_step,
     _capture_element_fingerprint,
     _capture_enclosing_form_submits,
     _capture_post_interaction_screenshot,
+    _capture_scout_selector_candidates,
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
     _consume_scout_source_url,
@@ -49,11 +58,13 @@ from .scouting import (
     _record_scouted_interaction,
     _register_scout_interaction_observation,
     _resolve_scout_role_name,
+    _role_name_match_count,
+    _selector_live_match_count,
 )
 
 LOG = structlog.get_logger()
 
-_CREDENTIAL_FILL_FIELDS = frozenset({"username", "password", "totp"})
+_CREDENTIAL_FILL_FIELDS = CREDENTIAL_FILL_FIELDS
 _CREDENTIAL_FILL_TIMEOUT_MS = 15000
 
 
@@ -97,11 +108,8 @@ def _credential_fill_prerequisite_error(copilot_ctx: AgentContext, credential_id
             "Author a `login` block bound to the credential parameter instead."
         )
     policy = getattr(copilot_ctx, "request_policy", None)
-    if not isinstance(policy, RequestPolicy) or not policy.allow_run_blocks:
-        return (
-            "Saved-credential scouting is not authorized for this request. "
-            "Ask the user for the required credential or clarification before filling credential fields."
-        )
+    if not isinstance(policy, RequestPolicy) or policy.raw_secret_detected:
+        return "Saved-credential scouting is unavailable because this turn has no safe credential provenance."
     return None
 
 
@@ -234,26 +242,49 @@ async def _vault_named_sites(copilot_ctx: AgentContext, credential_id: str) -> l
     return uris
 
 
-def _missing_credential_origin_error(credential_id: str) -> str:
+def _missing_credential_origin_error(credential_id: str, page_url: str | None) -> str:
+    if page_url:
+        origin = loggable_origin(page_url)
+        return (
+            f"Credential `{credential_id}` cannot be filled on {origin}: the user has not named this site "
+            f"in this chat. Ask the user to confirm the sign-in site by pasting its URL — {origin} — "
+            "then retry."
+        )
     return (
-        f"Credential `{credential_id}` has no intended login origin, so it cannot be filled into the live browser. "
-        "Test the saved credential against its login page to bind it to that site, then inspect the page and retry."
+        f"Credential `{credential_id}` cannot be filled: no live page is open. "
+        "Navigate to the sign-in page first, then retry."
     )
 
 
-def _sole_grounded_login_target(policy: RequestPolicy) -> str | None:
-    """The one sign-in page this request grounds in the user's own words, if there is exactly one; a
-    request naming several grounds none, since nothing here can tell which of them a password belongs to.
+def _log_fill_grant(route: str, url: str, credential_id: str, source_message: int | None = None) -> None:
+    LOG.info(
+        "copilot credential fill grant",
+        route=route,
+        page_origin=loggable_origin(url),
+        credential_id=credential_id,
+        source_user_message=source_message,
+    )
+
+
+def _user_provided_site_url_match(policy: RequestPolicy, page_url: str) -> tuple[str | None, bool]:
+    """Match the live page against a site the user pasted, reporting whether the match was
+    site-level. Hosts outside the public suffix list (internal domains, localhost) have no
+    registrable site to compare, so they fall back to an exact-origin match.
     """
-    by_origin: dict[BrowserOrigin, str] = {}
-    for url in policy.grounded_login_target_urls:
-        parts = url_parts(url)
-        origin = canonicalize_origin(parts[2]) if parts else None
-        if origin is not None:
-            by_origin[origin] = url
-    if len(by_origin) != 1:
-        return None
-    return next(iter(by_origin.values()))
+    for url in policy.user_provided_site_urls:
+        if _same_site(page_url, url):
+            return url, True
+        if _still_on_admitted_site(page_url, url):
+            return url, False
+    return None, False
+
+
+def _request_settled_credential(policy: RequestPolicy, credential_id: str) -> bool:
+    """A non-model signal already answered which credential: the user named it this turn, or it is
+    the only credential resolved for this request (e.g. the one card answer, carried)."""
+    if policy.current_turn_named_credential_ids == {credential_id}:
+        return True
+    return {credential.credential_id for credential in policy.resolved_credentials} == {credential_id}
 
 
 async def _sole_org_password_credential_id(
@@ -300,26 +331,29 @@ async def _credential_fill_origin_grant(
 
     if not authority_error:
         if not isinstance(policy, RequestPolicy):
-            return None, _missing_credential_origin_error(credential_id)
+            return None, _missing_credential_origin_error(credential_id, None)
         intended_url = _resolved_credential_intended_url(policy, credential_id)
         if intended_url:
+            _log_fill_grant("admitted_or_tested", intended_url, credential_id)
             return _CredentialFillOriginGrant(intended_url), None
-        # A credential saved without a login URL has no record of where it belongs, but that is an
-        # absent answer rather than a contrary one. The sign-in page the user themselves named can
-        # supply the origin, provided something other than the model settled which credential to use.
         page_url = await _live_working_page_url(copilot_ctx) or ""
         # The vault entry names the site the user filed this credential under, so it answers where
         # the secret belongs without anyone having to run the test flow first.
         if page_url and any(_same_site(page_url, uri) for uri in await _vault_named_sites(copilot_ctx, credential_id)):
+            _log_fill_grant("vault_site", page_url, credential_id)
             return _CredentialFillOriginGrant(page_url, whole_site=True), None
-        grounded_target = _sole_grounded_login_target(policy)
-        if not page_url or grounded_target is None or not _still_on_admitted_site(page_url, grounded_target):
-            return None, _missing_credential_origin_error(credential_id)
-        if policy.current_turn_named_credential_ids == {credential_id}:
-            return _CredentialFillOriginGrant(page_url), None
-        if credential_id == await _sole_org_password_credential_id(load_once):
-            return _CredentialFillOriginGrant(page_url), None
-        return None, _ambiguous_unbound_credential_steer(credential_id, page_url)
+        if page_url:
+            matched_url, site_level = _user_provided_site_url_match(policy, page_url)
+            if matched_url is not None:
+                if _request_settled_credential(
+                    policy, credential_id
+                ) or credential_id == await _sole_org_password_credential_id(load_once):
+                    # An origin-only match (no registrable site) keeps the origin-scoped grant so the
+                    # release guard can still compare it; site matches travel the whole site.
+                    _log_fill_grant("user_url", page_url, credential_id, policy.user_site_url_sources.get(matched_url))
+                    return _CredentialFillOriginGrant(page_url, whole_site=site_level), None
+                return None, _ambiguous_unbound_credential_steer(credential_id, page_url)
+        return None, _missing_credential_origin_error(credential_id, page_url or None)
 
     if not isinstance(policy, RequestPolicy):
         return None, authority_error
@@ -332,9 +366,10 @@ async def _credential_fill_origin_grant(
         load_org_credentials=load_once,
     )
     if admission.admitted and admission.page_url:
+        _log_fill_grant("live_page_admission", admission.page_url, credential_id)
         return _CredentialFillOriginGrant(admission.page_url), None
     if admission.admitted:
-        return None, _missing_credential_origin_error(credential_id)
+        return None, _missing_credential_origin_error(credential_id, None)
     return None, admission.steer or authority_error
 
 
@@ -387,7 +422,7 @@ async def _resolve_credential_fill_value(
             # A saved OTP identifier means the code is delivered out-of-band;
             # only runtime polling has the run/task context needed to resolve it.
             if credential.totp_identifier or credential.totp_type in {TotpType.EMAIL, TotpType.TEXT}:
-                return None, "", _runtime_otp_steering_error(credential_id)
+                return None, credential_item.name, _runtime_otp_steering_error(credential_id)
             return None, "", f"Credential `{credential_id}` has no TOTP secret configured."
         try:
             value = generate_totp_code(
@@ -424,15 +459,26 @@ async def _fill_credential_field_impl(
     credential_id: str,
     field: str,
 ) -> dict[str, Any]:
+    lock = getattr(copilot_ctx, "credential_fill_lock", None)
+    if not isinstance(lock, asyncio.Lock):
+        lock = asyncio.Lock()
+        copilot_ctx.credential_fill_lock = lock
+    async with lock:
+        return await _fill_credential_field_impl_serial(copilot_ctx, selector, credential_id, field)
+
+
+async def _fill_credential_field_impl_serial(
+    copilot_ctx: AgentContext,
+    selector: str,
+    credential_id: str,
+    field: str,
+) -> dict[str, Any]:
     arguments = {"selector": selector, "credential_id": credential_id, "field": field}
 
     def finish(result: dict[str, Any]) -> dict[str, Any]:
         record_tool_step_result_for_ctx(copilot_ctx, "fill_credential_field", arguments, result)
         return result
 
-    loop_error = _tool_loop_error(copilot_ctx, "fill_credential_field", arguments)
-    if loop_error:
-        return {"ok": False, "error": loop_error}
     authority_error = _authority_tool_error(copilot_ctx, "fill_credential_field")
     if authority_error:
         return finish({"ok": False, "error": authority_error})
@@ -452,16 +498,42 @@ async def _fill_credential_field_impl(
             field=field,
             organization_id=copilot_ctx.organization_id,
         )
-        return finish({"ok": False, "error": policy_error or _missing_credential_origin_error(credential_id)})
+        return finish({"ok": False, "error": policy_error or _missing_credential_origin_error(credential_id, None)})
 
     value, credential_name, resolve_error = await _resolve_credential_fill_value(copilot_ctx, credential_id, field)
     if resolve_error or value is None:
-        return finish({"ok": False, "error": resolve_error or "Could not resolve the credential value."})
+        error_result: dict[str, Any] = {
+            "ok": False,
+            "error": resolve_error or "Could not resolve the credential value.",
+        }
+        if credential_name:
+            error_result["data"] = {
+                "credential_id": credential_id,
+                "credential_name": credential_name,
+                "credential_field": field,
+            }
+        return finish(error_result)
 
     session_error = await ensure_browser_session(copilot_ctx)
     if session_error:
         return finish(session_error)
     await _capture_scout_source_url(copilot_ctx)
+    # Capture the target's factual identity before the secret-bearing action. A fill can change
+    # attributes, trigger framework replacement, or navigate; post-fill inspection would then
+    # describe a different element. These facts never include the credential value.
+    await _capture_scout_selector_candidates(copilot_ctx, selector)
+    captured_selector_candidates = getattr(copilot_ctx, "pending_scout_selector_candidates", None)
+    copilot_ctx.pending_scout_selector_candidates = None
+    selector_candidates: list[ScoutedSelectorCandidate] = [{"selector": selector, "source": "requested"}]
+    for candidate in captured_selector_candidates or []:
+        if candidate not in selector_candidates:
+            selector_candidates.append(candidate)
+    role, accessible_name = await _resolve_scout_role_name(copilot_ctx, selector)
+    selector_match_count = await _selector_live_match_count(copilot_ctx, selector)
+    role_name_match_count = (
+        await _role_name_match_count(copilot_ctx, role, accessible_name) if role and accessible_name else None
+    )
+    fingerprint = await _capture_element_fingerprint(copilot_ctx, selector)
     try:
         async with mcp_browser_context(copilot_ctx):
             page, _ = await get_page(session_id=copilot_ctx.browser_session_id)
@@ -507,16 +579,19 @@ async def _fill_credential_field_impl(
         return finish(landing_failure)
     url = await _live_working_page_url(copilot_ctx) or ""
     _mark_pending_browser_interaction_observation(copilot_ctx, tool_name="fill_credential_field", url=url)
-    role, accessible_name = await _resolve_scout_role_name(copilot_ctx, selector)
-    fingerprint = await _capture_element_fingerprint(copilot_ctx, selector)
     _record_scouted_interaction(
         copilot_ctx,
         tool_name="fill_credential_field",
         selector=selector,
+        selector_candidates=selector_candidates,
+        selector_match_count=selector_match_count,
         source_url=source_url,
+        result_url=url,
+        observed_effects={"value_landed": True},
         typed_length=len(value),
         role=role,
         accessible_name=accessible_name,
+        role_name_match_count=role_name_match_count,
         credential_id=credential_id,
         credential_field=field,
         credential_name=credential_name,
@@ -538,13 +613,22 @@ async def _fill_credential_field_impl(
     observation_step, _ = await _register_scout_interaction_observation(
         copilot_ctx, tool_name="fill_credential_field", selector=selector, source_url=source_url, url=url
     )
+    _attach_scout_observation_step(
+        copilot_ctx,
+        tool_name="fill_credential_field",
+        selector=selector,
+        observation_step=observation_step,
+    )
     data: dict[str, Any] = {
         "selector": selector,
         "credential_id": credential_id,
         "field": field,
         "typed_length": len(value),
         "url": url,
+        "credential_name": credential_name,
     }
+    if observation_step is not None:
+        data["observation_step"] = observation_step
     form_submits = await _capture_enclosing_form_submits(copilot_ctx, selector)
     if form_submits:
         data["form_submit_controls"] = form_submits

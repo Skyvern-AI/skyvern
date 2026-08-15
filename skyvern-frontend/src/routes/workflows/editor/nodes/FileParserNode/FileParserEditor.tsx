@@ -1,4 +1,4 @@
-import { useReactFlow } from "@xyflow/react";
+import { useNodes, useReactFlow } from "@xyflow/react";
 
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { ModelSelector } from "@/components/ModelSelector";
@@ -21,6 +21,7 @@ import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/
 
 import { helpTooltips } from "../../helpContent";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
+import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { type AppNode, isWorkflowBlockNode } from "..";
 import {
   isFileParserNode,
@@ -29,6 +30,10 @@ import {
 } from "./types";
 import { dataSchemaExampleForFileExtraction } from "../types";
 import { useUpdate } from "../../useUpdate";
+import {
+  getParentLoopSkipsOnFail,
+  isNodeInsideForLoop,
+} from "../../workflowEditorUtils";
 
 const FILE_TYPE_OPTIONS: Array<{ value: FileParserFileType; label: string }> = [
   { value: "auto_detect", label: "Auto detect" },
@@ -92,6 +97,9 @@ function FileParserEditorBody({
   const data = node.data;
   const editable = data.editable;
   const update = useUpdate<FileParserNode["data"]>({ id: blockId, editable });
+  const nodes = useNodes<AppNode>();
+  const isInsideForLoop = isNodeInsideForLoop(nodes, blockId);
+  const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
 
   const handleFileUrlChange = (value: string) => {
     const detected = detectFileTypeFromUrl(value);
@@ -177,6 +185,21 @@ function FileParserEditorBody({
             Advanced Settings
           </AccordionTrigger>
           <AccordionContent className="pl-6 pr-1 pt-1">
+            <BlockExecutionOptions
+              continueOnFailure={data.continueOnFailure}
+              nextLoopOnFailure={data.nextLoopOnFailure}
+              editable={editable}
+              isInsideForLoop={isInsideForLoop}
+              parentLoopSkipsOnFail={parentLoopSkipsOnFail}
+              blockType="fileParser"
+              hideTopSeparator
+              onContinueOnFailureChange={(continueOnFailure) =>
+                update({ continueOnFailure })
+              }
+              onNextLoopOnFailureChange={(nextLoopOnFailure) =>
+                update({ nextLoopOnFailure })
+              }
+            />
             <IgnoreWorkflowSystemPrompt
               ignoreWorkflowSystemPrompt={
                 data.ignoreWorkflowSystemPrompt ?? false

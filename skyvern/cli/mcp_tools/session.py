@@ -5,7 +5,7 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
-from skyvern.browser_extension.runtime import BrowserExtensionRuntime
+from skyvern.browser_extension.runtime import BrowserExtensionRuntime, broker_mode_enabled
 from skyvern.cli.core.action_log import drain_action_log_events
 from skyvern.cli.core.api_key_hash import hash_api_key_for_cache
 from skyvern.cli.core.client import get_active_api_key
@@ -33,11 +33,25 @@ from ._session import (
     set_current_session,
 )
 
-_EXTENSION_NOT_CONNECTED_GUIDANCE = (
-    "Skyvern browser extension is not connected. Install it: run `skyvern browser extension-path`, open "
-    "chrome://extensions, enable Developer mode, Load unpacked, and select that directory. Then run "
-    "`skyvern browser extension-token`, paste the token into the extension popup, and click Connect. Then retry."
-)
+
+def _extension_not_connected_guidance(*, pairing_opened: bool) -> str:
+    if pairing_opened:
+        return (
+            "Skyvern browser extension is not connected. A secure pairing tab was opened. Approve the connection, "
+            "approve pairing in the Skyvern Agent confirmation tab, and retry."
+        )
+    return (
+        "Skyvern browser extension is not connected and the pairing tab could not be opened automatically. Run "
+        "`skyvern browser extension-pair`, approve the connection, approve pairing in the Skyvern Agent confirmation "
+        "tab, and retry."
+    )
+
+
+def _broker_extension_not_connected_guidance() -> str:
+    return (
+        "Skyvern browser extension did not reconnect within 35 seconds. Keep Chrome and the Skyvern extension open, "
+        "then retry. To start a new explicit pairing flow, run `skyvern browser extension-pair`."
+    )
 
 
 def _session_api_key_hash() -> str | None:
@@ -143,8 +157,22 @@ async def skyvern_browser_session_create(
                     ),
                 )
             try:
+                broker_mode = broker_mode_enabled()
                 runtime = await BrowserExtensionRuntime.get_or_start()
-                if not await runtime.wait_for_extension(10.0):
+                if not await runtime.wait_for_extension(35.0 if broker_mode else 10.0):
+                    if broker_mode:
+                        timer.mark("sdk")
+                        return make_result(
+                            "skyvern_browser_session_create",
+                            ok=False,
+                            timing_ms=timer.timing_ms,
+                            error=make_error(
+                                ErrorCode.BROWSER_NOT_FOUND,
+                                _broker_extension_not_connected_guidance(),
+                                "",
+                            ),
+                        )
+                    pairing_opened = runtime.open_pairing_page()
                     timer.mark("sdk")
                     return make_result(
                         "skyvern_browser_session_create",
@@ -152,7 +180,7 @@ async def skyvern_browser_session_create(
                         timing_ms=timer.timing_ms,
                         error=make_error(
                             ErrorCode.BROWSER_NOT_FOUND,
-                            _EXTENSION_NOT_CONNECTED_GUIDANCE,
+                            _extension_not_connected_guidance(pairing_opened=pairing_opened),
                             "",
                         ),
                     )
@@ -172,13 +200,18 @@ async def skyvern_browser_session_create(
                 _browser, ctx = await resolve_browser(extension_runtime=runtime)
                 timer.mark("sdk")
             except Exception:
+                guidance = (
+                    _broker_extension_not_connected_guidance()
+                    if broker_mode
+                    else _extension_not_connected_guidance(pairing_opened=False)
+                )
                 return make_result(
                     "skyvern_browser_session_create",
                     ok=False,
                     timing_ms=timer.timing_ms,
                     error=make_error(
                         ErrorCode.BROWSER_NOT_FOUND,
-                        _EXTENSION_NOT_CONNECTED_GUIDANCE,
+                        guidance,
                         "",
                     ),
                 )

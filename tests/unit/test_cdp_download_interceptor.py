@@ -17,12 +17,158 @@ import pytest
 from structlog.testing import capture_logs
 
 import skyvern.webeye.cdp_download_interceptor as mod
+from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
+from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
 from skyvern.webeye.cdp_download_interceptor import (
     CDPDownloadInterceptor,
     _is_stale_interception_error,
     extract_filename,
     is_download_response,
 )
+
+
+def _make_interceptor(
+    *args: Any,
+    network_egress_monitor: Any | None = None,
+    redirect_hop_authorizer: Any | None = None,
+    **kwargs: Any,
+) -> CDPDownloadInterceptor:
+    if network_egress_monitor is None:
+        network_egress_monitor = MagicMock()
+        network_egress_monitor.authorize_request.return_value = True
+    if redirect_hop_authorizer is None:
+        redirect_hop_authorizer = AsyncMock(side_effect=AssertionError("unexpected direct HTTP request"))
+    return mod.CDPDownloadInterceptor(
+        *args,
+        network_egress_monitor=network_egress_monitor,
+        redirect_hop_authorizer=redirect_hop_authorizer,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    ("network_egress_monitor", "redirect_hop_authorizer"),
+    [
+        pytest.param(None, AsyncMock(), id="missing-monitor"),
+        pytest.param(MagicMock(), None, id="missing-authorizer"),
+    ],
+)
+def test_constructor_rejects_missing_required_collaborator(
+    network_egress_monitor: Any, redirect_hop_authorizer: Any
+) -> None:
+    with pytest.raises(TypeError, match="required collaborators"):
+        CDPDownloadInterceptor(
+            network_egress_monitor=network_egress_monitor,
+            redirect_hop_authorizer=redirect_hop_authorizer,
+        )
+
+
+@pytest.mark.asyncio
+async def test_ownership_only_context_binding_does_not_install_page_listener() -> None:
+    interceptor = _make_interceptor()
+    context = MagicMock()
+    context._skyvern_cdp_download_interceptor = None
+
+    await interceptor.bind_to_context(context, enable_page_interception=False)
+
+    assert context._skyvern_cdp_download_interceptor is interceptor
+    assert interceptor._page_context is context
+    assert interceptor._page_listener is None
+    assert interceptor._accepting_pages is False
+    context.on.assert_not_called()
+
+
+def test_successful_scope_rebind_restores_installed_browser_monitor(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(
+        output_dir=str(tmp_path / "prior"),
+        redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("prior"),
+    )
+    interceptor._browser_session = MagicMock()
+    interceptor._browser_download_listener = MagicMock()
+    assert interceptor.download_scope == "prior"
+
+    interceptor.invalidate_download_scope()
+    assert interceptor._accepting_browser_downloads is False
+    assert interceptor.download_scope is None
+
+    interceptor.rebind_download_scope(
+        download_dir=str(tmp_path / "next"),
+        redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("next"),
+    )
+
+    assert interceptor._accepting_browser_downloads is True
+    assert interceptor.download_scope == "next"
+
+
+def test_invalidated_scope_cannot_publish_in_flight_artifact(tmp_path: Path) -> None:
+    output_dir = tmp_path / "prior"
+    interceptor = _make_interceptor(
+        output_dir=str(output_dir),
+        redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("prior"),
+    )
+    interceptor.set_download_dir(str(output_dir))
+    prior_generation = interceptor._artifact_scope_generation
+    save_path = output_dir / "late.pdf"
+
+    interceptor.invalidate_download_scope()
+
+    with pytest.raises(mod._DownloadScopeInvalidated):
+        interceptor._atomically_write_bytes(save_path, b"late prior-run bytes", prior_generation)
+    assert not save_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_rotated_scope_does_not_capture_event_admitted_under_prior_scope(tmp_path: Path) -> None:
+    prior_dir = tmp_path / "prior"
+    next_dir = tmp_path / "next"
+    interceptor = _make_interceptor(
+        output_dir=str(prior_dir),
+        redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("prior"),
+    )
+    prior_generation = interceptor._artifact_scope_generation
+    interceptor.rebind_download_scope(
+        download_dir=str(next_dir),
+        redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("next"),
+    )
+    cdp_session = MagicMock()
+    cdp_session.send = AsyncMock()
+    raw_headers = [
+        {"name": "Content-Disposition", "value": 'attachment; filename="late.pdf"'},
+        {"name": "Content-Type", "value": "application/pdf"},
+    ]
+
+    await interceptor._handle_download(
+        cdp_session,
+        "request-1",
+        "https://example.test/late.pdf",
+        mod._parse_headers(raw_headers),
+        200,
+        raw_headers,
+        prior_generation,
+    )
+
+    cdp_session.send.assert_awaited_once_with(
+        "Fetch.continueResponse",
+        {"requestId": "request-1"},
+    )
+    assert not list(prior_dir.glob("*.pdf"))
+    assert not list(next_dir.glob("*.pdf"))
+
+
+@pytest.mark.asyncio
+async def test_browser_download_event_metadata_is_redacted_from_logs() -> None:
+    interceptor = _make_interceptor()
+    interceptor._browser_context = MagicMock()
+    secret_url = "blob:https://example.test/customer-secret-token"
+    secret_filename = "customer-account-1234.pdf"
+
+    with capture_logs() as logs:
+        await interceptor._handle_browser_download({"url": secret_url, "suggestedFilename": secret_filename})
+
+    rendered_logs = repr(logs)
+    assert secret_url not in rendered_logs
+    assert secret_filename not in rendered_logs
+    assert "suggested_filename_fp" in rendered_logs
 
 
 class TestIsDownloadResponse:
@@ -378,7 +524,7 @@ class TestResolveSavePath:
     """Tests for CDPDownloadInterceptor._resolve_save_path()."""
 
     def _make_interceptor(self, tmp_path: Path) -> CDPDownloadInterceptor:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         return interceptor
 
     @pytest.mark.parametrize(
@@ -425,19 +571,31 @@ class TestResolveSavePath:
         assert filename.endswith(".pdf")
         assert save_path == tmp_path / filename
 
-    def test_path_traversal_sanitized(self, tmp_path: Path) -> None:
-        """Path traversal components should be stripped — only the final name is kept."""
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            pytest.param("../../etc/cron.d/evil", id="traversal"),
+            pytest.param("../evil", id="parent"),
+            pytest.param("nested/report.pdf", id="posix-separator"),
+            pytest.param(r"nested\report.pdf", id="windows-separator"),
+            pytest.param("/tmp/report.pdf", id="absolute-posix"),
+            pytest.param(r"C:\temp\report.pdf", id="absolute-windows"),
+            pytest.param("%2Ftmp%2Freport.pdf", id="encoded-posix-separator"),
+            pytest.param(r"%5Cserver%5Cshare%5Creport.pdf", id="encoded-windows-separator"),
+            pytest.param("%252Ftmp%252Freport.pdf", id="double-encoded-posix-separator"),
+            pytest.param(r"%255Cserver%255Cshare%255Creport.pdf", id="double-encoded-windows-separator"),
+            pytest.param("%252e%252e%252freport.pdf", id="double-encoded-traversal"),
+            pytest.param(".", id="current-directory"),
+            pytest.param("..", id="parent-directory"),
+            pytest.param("report\x00.pdf", id="nul"),
+            pytest.param("report\n.pdf", id="control-character"),
+        ],
+    )
+    def test_non_basename_filename_fails_closed(self, tmp_path: Path, filename: str) -> None:
         interceptor = self._make_interceptor(tmp_path)
-        save_path, filename = interceptor._resolve_save_path("../../etc/cron.d/evil")
-        assert filename == "evil"
-        assert save_path == tmp_path / "evil"
 
-    def test_header_date_separators_are_filename_chars(self, tmp_path: Path) -> None:
-        """Invoice-style slashes in Content-Disposition should not collapse to the last date segment."""
-        interceptor = self._make_interceptor(tmp_path)
-        save_path, filename = interceptor._resolve_save_path("invoice_5/19/2026", "application/pdf")
-        assert filename == "invoice_5_19_2026.pdf"
-        assert save_path == tmp_path / "invoice_5_19_2026.pdf"
+        with pytest.raises(ValueError, match="basename"):
+            interceptor._resolve_save_path(filename)
 
     def test_missing_extension_uses_pdf_content_type(self, tmp_path: Path) -> None:
         interceptor = self._make_interceptor(tmp_path)
@@ -447,9 +605,138 @@ class TestResolveSavePath:
 
     def test_existing_pdf_extension_not_duplicated(self, tmp_path: Path) -> None:
         interceptor = self._make_interceptor(tmp_path)
-        save_path, filename = interceptor._resolve_save_path("invoice_5/19/2026.pdf", "application/pdf")
-        assert filename == "invoice_5_19_2026.pdf"
-        assert save_path == tmp_path / "invoice_5_19_2026.pdf"
+        save_path, filename = interceptor._resolve_save_path("invoice_2026.pdf", "application/pdf")
+        assert filename == "invoice_2026.pdf"
+        assert save_path == tmp_path / "invoice_2026.pdf"
+
+
+class TestConfinedDownloadWrites:
+    def test_symlinked_output_directory_fails_closed(self, tmp_path: Path) -> None:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        output_dir = tmp_path / "downloads"
+        output_dir.symlink_to(outside, target_is_directory=True)
+        interceptor = _make_interceptor(output_dir=str(output_dir))
+
+        with pytest.raises(OSError):
+            save_path, _ = interceptor._resolve_save_path("report.pdf")
+            interceptor._atomically_write_bytes(save_path, b"private report")
+
+        assert not (outside / "report.pdf").exists()
+
+    def test_symlink_destination_fails_closed(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        save_path, _ = interceptor._resolve_save_path("report.pdf")
+        outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
+        outside.write_bytes(b"outside")
+        save_path.symlink_to(outside)
+
+        with pytest.raises(OSError):
+            interceptor._atomically_write_bytes(save_path, b"private report")
+
+        assert outside.read_bytes() == b"outside"
+
+    def test_hard_link_destination_fails_closed(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        save_path, _ = interceptor._resolve_save_path("report.pdf")
+        outside = tmp_path.parent / f"{tmp_path.name}-hard-link-outside.txt"
+        outside.write_bytes(b"outside")
+        save_path.hardlink_to(outside)
+
+        with pytest.raises(FileExistsError):
+            interceptor._atomically_write_bytes(save_path, b"private report")
+
+        assert outside.read_bytes() == b"outside"
+
+    def test_fdopen_failure_leaks_neither_fd_nor_temp_file(self, tmp_path: Path) -> None:
+        """A failure between os.open and os.fdopen (e.g. MemoryError) must still close the raw fd,
+        unlink the just-created temp file, and close the directory fd — not just the directory fd."""
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        save_path, _ = interceptor._resolve_save_path("report.pdf")
+
+        with patch("os.fdopen", side_effect=OSError("no file descriptors available")):
+            with pytest.raises(OSError, match="no file descriptors available"):
+                interceptor._atomically_write_bytes(save_path, b"private report")
+
+        assert list(tmp_path.iterdir()) == []
+
+    def test_collision_hard_link_race_fails_before_existing_inode_is_modified(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        save_path, _ = interceptor._resolve_save_path("report.pdf")
+        save_path.write_bytes(b"existing report")
+        outside = tmp_path.parent / f"{tmp_path.name}-racing-hard-link.txt"
+        real_ftruncate = mod.os.ftruncate
+
+        def add_outside_link_before_truncate(file_descriptor: int, length: int) -> None:
+            outside.hardlink_to(save_path)
+            real_ftruncate(file_descriptor, length)
+
+        with (
+            patch.object(mod.os, "ftruncate", side_effect=add_outside_link_before_truncate),
+            pytest.raises(FileExistsError),
+        ):
+            interceptor._atomically_write_bytes(save_path, b"private report")
+
+        assert save_path.read_bytes() == b"existing report"
+        assert not outside.exists()
+
+    def test_post_check_destination_swap_fails_at_publication(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        save_path, _ = interceptor._resolve_save_path("report.pdf")
+        outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
+        outside.write_bytes(b"outside")
+        real_link = mod.os.link
+        swapped = False
+
+        def swap_destination_then_link(src: str, dst: str, **kwargs: Any) -> None:
+            nonlocal swapped
+            if dst == save_path.name:
+                save_path.symlink_to(outside)
+                swapped = True
+            real_link(src, dst, **kwargs)
+
+        with (
+            patch.object(mod.os, "link", side_effect=swap_destination_then_link),
+            pytest.raises(OSError),
+        ):
+            interceptor._atomically_write_bytes(save_path, b"private report")
+
+        assert swapped
+        assert save_path.is_symlink()
+        assert outside.read_bytes() == b"outside"
+
+    def test_alias_on_temporary_inode_during_link_fails_at_publication(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        save_path, _ = interceptor._resolve_save_path("report.pdf")
+        alias = tmp_path.parent / f"{tmp_path.name}-temporary-alias.txt"
+        real_link = mod.os.link
+
+        def alias_temporary_inode_then_link(src: str, dst: str, **kwargs: Any) -> None:
+            real_link(tmp_path / src, alias)
+            real_link(src, dst, **kwargs)
+
+        with (
+            patch.object(mod.os, "link", side_effect=alias_temporary_inode_then_link),
+            pytest.raises(OSError, match="unexpected link"),
+        ):
+            interceptor._atomically_write_bytes(save_path, b"private report")
+
+        assert not save_path.exists()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_post_check_output_directory_swap_fails_closed(self, tmp_path: Path) -> None:
+        output_dir = tmp_path / "downloads"
+        interceptor = _make_interceptor(output_dir=str(output_dir))
+        save_path, _ = interceptor._resolve_save_path("report.pdf")
+        original_dir = tmp_path / "original-downloads"
+        output_dir.rename(original_dir)
+        output_dir.mkdir()
+
+        with pytest.raises(OSError, match="changed"):
+            interceptor._atomically_write_bytes(save_path, b"private report")
+
+        assert list(output_dir.iterdir()) == []
+        assert list(original_dir.iterdir()) == []
 
 
 class TestCDPDownloadInterceptorProxyAuth:
@@ -460,10 +747,13 @@ class TestCDPDownloadInterceptorProxyAuth:
         proxy_username: str | None = None,
         proxy_password: str | None = None,
     ) -> CDPDownloadInterceptor:
-        return CDPDownloadInterceptor(
+        network_egress_monitor = MagicMock()
+        network_egress_monitor.authorize_request.return_value = True
+        return _make_interceptor(
             output_dir="/tmp/test_downloads",
             proxy_username=proxy_username,
             proxy_password=proxy_password,
+            network_egress_monitor=network_egress_monitor,
         )
 
     def _make_cdp_session(self) -> MagicMock:
@@ -622,7 +912,7 @@ class TestCDPDownloadInterceptorProxyAuth:
 
     @pytest.mark.asyncio
     async def test_enable_for_page_without_proxy_auth(self) -> None:
-        """enable_for_page without credentials should only intercept Response stage."""
+        """Network mediation requires Request-stage interception even without proxy auth."""
         interceptor = self._make_interceptor()
 
         mock_cdp_session = self._make_cdp_session()
@@ -632,11 +922,14 @@ class TestCDPDownloadInterceptorProxyAuth:
 
         await interceptor.enable_for_page(mock_page)
 
-        # Verify Fetch.enable with Response-only pattern, no auth
+        # Request-stage mediation is always enabled; auth handling remains proxy-only.
         mock_cdp_session.send.assert_called_once_with(
             "Fetch.enable",
             {
-                "patterns": [{"requestStage": "Response"}],
+                "patterns": [
+                    {"requestStage": "Response"},
+                    {"urlPattern": "*", "requestStage": "Request"},
+                ],
                 "handleAuthRequests": False,
             },
         )
@@ -645,6 +938,279 @@ class TestCDPDownloadInterceptorProxyAuth:
         event_names = [call.args[0] for call in mock_cdp_session.on.call_args_list]
         assert "Fetch.requestPaused" in event_names
         assert "Fetch.authRequired" not in event_names
+
+    @pytest.mark.asyncio
+    async def test_enable_registers_page_only_after_fetch_interception_is_live(self) -> None:
+        interceptor = self._make_interceptor()
+        monitor = interceptor._network_egress_monitor
+        cdp_session = self._make_cdp_session()
+        page = MagicMock(url="about:blank")
+        page.context.new_cdp_session = AsyncMock(return_value=cdp_session)
+        ordering: list[str] = []
+        cdp_session.send.side_effect = lambda method, *_: ordering.append(method)
+        monitor.register_active_request_interceptor.side_effect = lambda **_: ordering.append("register")
+
+        await interceptor.enable_for_page(page)
+
+        assert ordering == ["Fetch.enable", "register"]
+        monitor.register_active_request_interceptor.assert_called_once_with(page=page, owner=interceptor)
+
+    @pytest.mark.asyncio
+    async def test_fetch_enable_failure_never_registers_page(self) -> None:
+        interceptor = self._make_interceptor()
+        monitor = interceptor._network_egress_monitor
+        cdp_session = self._make_cdp_session()
+        page = MagicMock(url="about:blank")
+        page.context.new_cdp_session = AsyncMock(return_value=cdp_session)
+        ordering: list[str] = []
+
+        async def ambiguous_send(method: str, *_: object) -> None:
+            ordering.append(method)
+            if method == "Fetch.enable":
+                raise RuntimeError("Fetch unavailable")
+
+        cdp_session.send.side_effect = ambiguous_send
+        monitor.invalidate.side_effect = lambda: ordering.append("invalidate")
+
+        with pytest.raises(RuntimeError, match="Fetch unavailable"):
+            await interceptor.enable_for_page(page)
+
+        monitor.register_active_request_interceptor.assert_not_called()
+        assert ordering == ["Fetch.enable", "invalidate", "Fetch.disable"]
+        assert not interceptor._accepting_cdp_handlers
+        assert interceptor._cdp_sessions == []
+
+    @pytest.mark.asyncio
+    async def test_registration_failure_invalidates_and_disables_fetch(self) -> None:
+        interceptor = self._make_interceptor()
+        monitor = interceptor._network_egress_monitor
+        monitor.register_active_request_interceptor.side_effect = RuntimeError("registration failed")
+        cdp_session = self._make_cdp_session()
+        page = MagicMock(url="about:blank")
+        page.context.new_cdp_session = AsyncMock(return_value=cdp_session)
+
+        with pytest.raises(RuntimeError, match="registration failed"):
+            await interceptor.enable_for_page(page)
+
+        monitor.invalidate.assert_called_once_with()
+        cdp_session.send.assert_awaited_with("Fetch.disable")
+        assert interceptor._cdp_sessions == []
+
+    @pytest.mark.asyncio
+    async def test_page_closed_during_registration_unregisters_and_disables_fetch(self) -> None:
+        interceptor = self._make_interceptor()
+        monitor = interceptor._network_egress_monitor
+        cdp_session = self._make_cdp_session()
+        page = MagicMock(url="about:blank")
+        page.is_closed.return_value = True
+        page.context.new_cdp_session = AsyncMock(return_value=cdp_session)
+
+        with pytest.raises(RuntimeError, match="closed during interceptor registration"):
+            await interceptor.enable_for_page(page)
+
+        monitor.unregister_active_request_interceptor.assert_called_once_with(page=page, owner=interceptor)
+        cdp_session.send.assert_awaited_with("Fetch.disable")
+        assert interceptor._cdp_sessions == []
+
+    @pytest.mark.asyncio
+    async def test_page_close_unregisters_exact_owner_once(self) -> None:
+        interceptor = self._make_interceptor()
+        monitor = interceptor._network_egress_monitor
+        cdp_session = self._make_cdp_session()
+        page = MagicMock(url="about:blank")
+        page.context.new_cdp_session = AsyncMock(return_value=cdp_session)
+        await interceptor.enable_for_page(page)
+        close_listener = next(call.args[1] for call in page.on.call_args_list if call.args[0] == "close")
+
+        close_listener(page)
+        await interceptor.disable()
+
+        monitor.unregister_active_request_interceptor.assert_called_once_with(page=page, owner=interceptor)
+
+    @pytest.mark.asyncio
+    async def test_page_close_identity_mismatch_invalidates_and_unregisters_bound_page(self) -> None:
+        interceptor = self._make_interceptor()
+        monitor = interceptor._network_egress_monitor
+        cdp_session = self._make_cdp_session()
+        page = MagicMock(url="about:blank")
+        page.context.new_cdp_session = AsyncMock(return_value=cdp_session)
+        await interceptor.enable_for_page(page)
+        close_listener = next(call.args[1] for call in page.on.call_args_list if call.args[0] == "close")
+
+        close_listener(MagicMock(url="about:blank"))
+
+        monitor.invalidate.assert_called_once_with()
+        monitor.unregister_active_request_interceptor.assert_called_once_with(page=page, owner=interceptor)
+
+    @pytest.mark.asyncio
+    async def test_sequential_duplicate_page_enable_fails_before_second_cdp_session(self) -> None:
+        interceptor = self._make_interceptor()
+        cdp_session = self._make_cdp_session()
+        page = MagicMock(url="about:blank")
+        page.context.new_cdp_session = AsyncMock(return_value=cdp_session)
+        await interceptor.enable_for_page(page)
+
+        with pytest.raises(RuntimeError, match="already active or enrolling"):
+            await interceptor.enable_for_page(page)
+
+        page.context.new_cdp_session.assert_awaited_once_with(page)
+        assert len(interceptor._cdp_sessions) == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_duplicate_page_enable_fails_while_first_is_in_flight(self) -> None:
+        interceptor = self._make_interceptor()
+        cdp_session = self._make_cdp_session()
+        page = MagicMock(url="about:blank")
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        session_calls = 0
+
+        async def paused_new_session(_: object) -> MagicMock:
+            nonlocal session_calls
+            session_calls += 1
+            if session_calls == 1:
+                first_started.set()
+                await release_first.wait()
+            return cdp_session
+
+        page.context.new_cdp_session = AsyncMock(side_effect=paused_new_session)
+        first_enable = asyncio.create_task(interceptor.enable_for_page(page))
+        await first_started.wait()
+        try:
+            with pytest.raises(RuntimeError, match="already active or enrolling"):
+                await interceptor.enable_for_page(page)
+        finally:
+            release_first.set()
+            await first_enable
+
+        page.context.new_cdp_session.assert_awaited_once_with(page)
+        assert len(interceptor._cdp_sessions) == 1
+
+    @pytest.mark.asyncio
+    async def test_disable_unregisters_every_page_before_disabling_fetch(self) -> None:
+        interceptor = self._make_interceptor()
+        monitor = interceptor._network_egress_monitor
+        first_session = self._make_cdp_session()
+        second_session = self._make_cdp_session()
+        first_page = MagicMock(url="about:blank")
+        second_page = MagicMock(url="about:blank")
+        first_page.context.new_cdp_session = AsyncMock(return_value=first_session)
+        second_page.context.new_cdp_session = AsyncMock(return_value=second_session)
+        await interceptor.enable_for_page(first_page)
+        await interceptor.enable_for_page(second_page)
+        ordering: list[str] = []
+        monitor.unregister_active_request_interceptor.side_effect = lambda **_: ordering.append("unregister")
+        first_session.send.side_effect = lambda method, *_: ordering.append(method)
+        second_session.send.side_effect = lambda method, *_: ordering.append(method)
+
+        await interceptor.disable()
+
+        assert ordering == ["unregister", "unregister", "Fetch.disable", "Fetch.disable"]
+
+    @pytest.mark.asyncio
+    async def test_unregister_failure_invalidates_before_fetch_disable(self) -> None:
+        interceptor = self._make_interceptor()
+        monitor = interceptor._network_egress_monitor
+        cdp_session = self._make_cdp_session()
+        page = MagicMock(url="about:blank")
+        page.context.new_cdp_session = AsyncMock(return_value=cdp_session)
+        await interceptor.enable_for_page(page)
+        ordering: list[str] = []
+        monitor.unregister_active_request_interceptor.side_effect = lambda **_: (
+            ordering.append("unregister") or (_ for _ in ()).throw(RuntimeError("unregister failed"))
+        )
+        monitor.invalidate.side_effect = lambda: ordering.append("invalidate")
+        cdp_session.send.side_effect = lambda method, *_: ordering.append(method)
+
+        await interceptor.disable()
+
+        assert ordering == ["unregister", "invalidate", "Fetch.disable"]
+
+    @pytest.mark.asyncio
+    async def test_fetch_disable_failure_invalidates_egress_monitor(self) -> None:
+        interceptor = self._make_interceptor()
+        monitor = interceptor._network_egress_monitor
+        cdp_session = self._make_cdp_session()
+        page = MagicMock(url="about:blank")
+        page.context.new_cdp_session = AsyncMock(return_value=cdp_session)
+        await interceptor.enable_for_page(page)
+        monitor.invalidate.reset_mock()
+        cdp_session.send.side_effect = RuntimeError("session detached")
+
+        await interceptor.disable()
+
+        monitor.invalidate.assert_called_once_with()
+        assert interceptor._cdp_sessions == []
+
+    @pytest.mark.asyncio
+    async def test_fetch_disable_stale_interception_error_does_not_invalidate(self) -> None:
+        """Normal teardown usually finds the target already closed, so Fetch.disable raising a
+        stale-close error is a benign race, not a live-interception leak — it must not invalidate."""
+        interceptor = self._make_interceptor()
+        monitor = interceptor._network_egress_monitor
+        cdp_session = self._make_cdp_session()
+        page = MagicMock(url="about:blank")
+        page.context.new_cdp_session = AsyncMock(return_value=cdp_session)
+        await interceptor.enable_for_page(page)
+        monitor.invalidate.reset_mock()
+        cdp_session.send.side_effect = RuntimeError("Target closed")
+
+        await interceptor.disable()
+
+        monitor.invalidate.assert_not_called()
+        assert interceptor._cdp_sessions == []
+
+    @pytest.mark.asyncio
+    async def test_cancelled_disable_still_unregisters_before_propagating(self) -> None:
+        interceptor = self._make_interceptor()
+        monitor = interceptor._network_egress_monitor
+        cdp_session = self._make_cdp_session()
+        page = MagicMock(url="about:blank")
+        page.context.new_cdp_session = AsyncMock(return_value=cdp_session)
+        await interceptor.enable_for_page(page)
+
+        with (
+            patch.object(interceptor, "_drain_tasks", new=AsyncMock(side_effect=asyncio.CancelledError)),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await interceptor.disable()
+
+        monitor.unregister_active_request_interceptor.assert_called_once_with(page=page, owner=interceptor)
+        cdp_session.send.assert_awaited_with("Fetch.disable")
+
+    @pytest.mark.asyncio
+    async def test_cancelled_disable_waits_for_inflight_fetch_enable_cleanup(self) -> None:
+        interceptor = self._make_interceptor()
+        context = MagicMock()
+        context._skyvern_cdp_download_interceptor = None
+        page = MagicMock(url="about:blank", context=context)
+        cdp_session = self._make_cdp_session()
+        fetch_enable_started = asyncio.Event()
+        methods: list[str] = []
+
+        async def paused_send(method: str, *_: object) -> None:
+            methods.append(method)
+            if method == "Fetch.enable":
+                fetch_enable_started.set()
+                await asyncio.Event().wait()
+
+        cdp_session.send.side_effect = paused_send
+        context.new_cdp_session = AsyncMock(return_value=cdp_session)
+        await interceptor.bind_to_context(context)
+        page_listener = context.on.call_args.args[1]
+        page_listener(page)
+        await fetch_enable_started.wait()
+        disabling = asyncio.create_task(interceptor.disable())
+        await asyncio.sleep(0)
+        disabling.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await disabling
+
+        assert methods == ["Fetch.enable", "Fetch.disable"]
+        assert not interceptor._page_enable_tasks
+        assert not interceptor._accepting_cdp_handlers
+        assert interceptor._cdp_sessions == []
 
     @pytest.mark.asyncio
     async def test_page_events_do_not_use_browser_download_admission(self) -> None:
@@ -663,27 +1229,147 @@ class TestCDPDownloadInterceptorProxyAuth:
             listeners["Fetch.authRequired"]({"requestId": "auth"})
             await asyncio.sleep(0)
 
-        request_handler.assert_awaited_once_with({"requestId": "request"}, cdp_session)
+        request_handler.assert_awaited_once_with(
+            {"requestId": "request"}, cdp_session, interceptor._artifact_scope_generation
+        )
         auth_handler.assert_awaited_once_with({"requestId": "auth"}, cdp_session)
         assert not interceptor._accepting_browser_downloads
         assert interceptor._browser_download_listener is None
 
     @pytest.mark.asyncio
-    async def test_request_stage_continues_request(self) -> None:
-        """Request-stage events (no responseStatusCode) should be continued with Fetch.continueRequest."""
+    async def test_request_stage_authorizes_before_continuing(self) -> None:
+        """The monitor must authorize before a request carrying browser credentials is dispatched."""
         interceptor = self._make_interceptor(proxy_username="user", proxy_password="pass")
         cdp_session = self._make_cdp_session()
+        ordering: list[str] = []
+        interceptor._network_egress_monitor.authorize_request.side_effect = lambda **_: (
+            ordering.append("authorize") or True
+        )
+        cdp_session.send.side_effect = lambda *_: ordering.append("dispatch")
 
         event = {
             "requestId": "req-1",
-            "request": {"url": "https://example.com/page"},
+            "request": {"method": "GET", "url": "https://example.com/page"},
             "resourceType": "Document",
+            "frameId": "frame-1",
             # No responseStatusCode — this is a Request-stage event
         }
 
         await interceptor._handle_request_paused(event, cdp_session)
 
+        assert ordering == ["authorize", "dispatch"]
+        interceptor._network_egress_monitor.authorize_request.assert_called_once_with(
+            method="GET",
+            url="https://example.com/page",
+            resource_type="document",
+            frame="frame-1",
+        )
         cdp_session.send.assert_called_once_with("Fetch.continueRequest", {"requestId": "req-1"})
+
+    @pytest.mark.asyncio
+    async def test_request_stage_dispatch_failure_does_not_log_url_or_exception_secret(self) -> None:
+        interceptor = self._make_interceptor()
+        cdp_session = self._make_cdp_session()
+        cdp_session.send.side_effect = RuntimeError("transport-exception-secret")
+        event = {
+            "requestId": "req-secret",
+            "request": {"method": "GET", "url": "https://example.com/private?sig=url-secret"},
+            "resourceType": "Document",
+            "frameId": "frame-1",
+        }
+
+        with capture_logs() as logs:
+            await interceptor._handle_request_paused(event, cdp_session)
+
+        serialized_logs = repr(logs)
+        assert "url-secret" not in serialized_logs
+        assert "private" not in serialized_logs
+        assert "transport-exception-secret" not in serialized_logs
+
+    @pytest.mark.asyncio
+    async def test_unsafe_download_name_failure_does_not_log_url_secret(self) -> None:
+        interceptor = self._make_interceptor()
+        cdp_session = self._make_cdp_session()
+        event = {
+            "requestId": "download-secret",
+            "request": {"method": "GET", "url": "https://example.com/private?sig=url-secret"},
+            "resourceType": "Document",
+            "frameId": "frame-1",
+            "responseStatusCode": 200,
+            "responseHeaders": [
+                {"name": "content-type", "value": "application/pdf"},
+                {"name": "content-disposition", "value": 'attachment; filename="../report.pdf"'},
+            ],
+        }
+
+        with capture_logs() as logs:
+            await interceptor._handle_request_paused(event, cdp_session)
+
+        serialized_logs = repr(logs)
+        assert "url-secret" not in serialized_logs
+        assert "private" not in serialized_logs
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("monitor_verdict", [False, RuntimeError("monitor unavailable")])
+    async def test_request_stage_denial_aborts_without_continuing(self, monitor_verdict: object) -> None:
+        interceptor = self._make_interceptor()
+        cdp_session = self._make_cdp_session()
+        if isinstance(monitor_verdict, Exception):
+            interceptor._network_egress_monitor.authorize_request.side_effect = monitor_verdict
+        else:
+            interceptor._network_egress_monitor.authorize_request.return_value = monitor_verdict
+        event = {
+            "requestId": "req-denied",
+            "request": {"method": "GET", "url": "https://example.com/report.pdf"},
+            "resourceType": "Document",
+            "frameId": "frame-1",
+        }
+
+        await interceptor._handle_request_paused(event, cdp_session)
+
+        cdp_session.send.assert_awaited_once_with(
+            "Fetch.failRequest",
+            {"requestId": "req-denied", "errorReason": "BlockedByClient"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_request_stage_missing_monitor_aborts_without_continuing(self) -> None:
+        interceptor = self._make_interceptor()
+        interceptor._network_egress_monitor = None
+        cdp_session = self._make_cdp_session()
+        event = {
+            "requestId": "req-unenrolled",
+            "request": {"method": "GET", "url": "https://example.com/report.pdf"},
+            "resourceType": "Document",
+            "frameId": "frame-1",
+        }
+
+        await interceptor._handle_request_paused(event, cdp_session)
+
+        cdp_session.send.assert_awaited_once_with(
+            "Fetch.failRequest",
+            {"requestId": "req-unenrolled", "errorReason": "BlockedByClient"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_same_origin_redirect_without_fresh_slot_is_denied(self) -> None:
+        interceptor = self._make_interceptor()
+        interceptor._network_egress_monitor.authorize_request.return_value = False
+        cdp_session = self._make_cdp_session()
+        event = {
+            "requestId": "redirect-hop",
+            "redirectedRequestId": "initial-hop",
+            "request": {"method": "GET", "url": "https://example.com/final.pdf"},
+            "resourceType": "Document",
+            "frameId": "frame-1",
+        }
+
+        await interceptor._handle_request_paused(event, cdp_session)
+
+        cdp_session.send.assert_awaited_once_with(
+            "Fetch.failRequest",
+            {"requestId": "redirect-hop", "errorReason": "BlockedByClient"},
+        )
 
     @pytest.mark.asyncio
     async def test_request_stage_error_does_not_retry(self) -> None:
@@ -746,6 +1432,85 @@ class TestCDPDownloadInterceptorProxyAuth:
         assert second_call.args[1]["authChallengeResponse"]["response"] == "CancelAuth"
 
 
+class TestDownloadsOnlyInterception:
+    """An explicitly unenrolled egress monitor marks a flow that does no request mediation (the
+    vendor-attach browsers). Download interception must still come up for those pages instead of
+    aborting setup, while every ambiguous monitor state keeps failing closed (SKY-14066)."""
+
+    def _page_with_session(self) -> tuple[MagicMock, MagicMock]:
+        cdp_session = MagicMock()
+        cdp_session.send = AsyncMock()
+        page = MagicMock(url="about:blank")
+        page.is_closed.return_value = False
+        page.context.new_cdp_session = AsyncMock(return_value=cdp_session)
+        return page, cdp_session
+
+    @pytest.mark.asyncio
+    async def test_unenrolled_monitor_enables_downloads_only(self) -> None:
+        monitor = BrowserNetworkEgressMonitor.unenrolled()
+        interceptor = _make_interceptor(output_dir="/tmp/test_downloads", network_egress_monitor=monitor)
+        page, cdp_session = self._page_with_session()
+
+        await interceptor.enable_for_page(page)
+
+        cdp_session.send.assert_called_once_with(
+            "Fetch.enable",
+            {"patterns": [{"requestStage": "Response"}], "handleAuthRequests": False},
+        )
+        assert interceptor._cdp_sessions == [cdp_session]
+
+    @pytest.mark.asyncio
+    async def test_unenrolled_monitor_with_proxy_auth_keeps_request_stage(self) -> None:
+        monitor = BrowserNetworkEgressMonitor.unenrolled()
+        interceptor = _make_interceptor(
+            output_dir="/tmp/test_downloads",
+            proxy_username="user",
+            proxy_password="pass",
+            network_egress_monitor=monitor,
+        )
+        page, cdp_session = self._page_with_session()
+
+        await interceptor.enable_for_page(page)
+
+        cdp_session.send.assert_called_once_with(
+            "Fetch.enable",
+            {
+                "patterns": [{"requestStage": "Response"}, {"urlPattern": "*", "requestStage": "Request"}],
+                "handleAuthRequests": True,
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_request_stage_passes_through_without_mediation(self) -> None:
+        monitor = BrowserNetworkEgressMonitor.unenrolled()
+        interceptor = _make_interceptor(
+            output_dir="/tmp/test_downloads",
+            proxy_username="user",
+            proxy_password="pass",
+            network_egress_monitor=monitor,
+        )
+        page, cdp_session = self._page_with_session()
+        await interceptor.enable_for_page(page)
+        cdp_session.send.reset_mock()
+
+        event = {"requestId": "req-1", "request": {"method": "GET", "url": "https://example.com/"}}
+        await interceptor._handle_request_paused(event, cdp_session, interceptor._artifact_scope_generation)
+
+        cdp_session.send.assert_awaited_once_with("Fetch.continueRequest", {"requestId": "req-1"})
+
+    @pytest.mark.asyncio
+    async def test_enforcing_uninstalled_monitor_still_fails_closed(self) -> None:
+        # Not invalidated, not installed: an enforcing monitor mid-setup is ambiguous, and
+        # silently downgrading it to downloads-only would drop mediation. It must stay loud.
+        monitor = BrowserNetworkEgressMonitor()
+        interceptor = _make_interceptor(output_dir="/tmp/test_downloads", network_egress_monitor=monitor)
+        page, cdp_session = self._page_with_session()
+
+        with pytest.raises(RuntimeError):
+            await interceptor.enable_for_page(page)
+        cdp_session.send.assert_awaited_with("Fetch.disable")
+
+
 class TestStaleInterceptionRace:
     """Fetch.continueRequest/continueResponse can fail with 'Invalid InterceptionId' when the
     interception is resolved/cancelled or its target detaches before our async handler responds.
@@ -754,7 +1519,7 @@ class TestStaleInterceptionRace:
     _MOD = "skyvern.webeye.cdp_download_interceptor"
 
     def _make_interceptor(self) -> CDPDownloadInterceptor:
-        return CDPDownloadInterceptor(output_dir="/tmp/test_downloads")
+        return _make_interceptor(output_dir="/tmp/test_downloads")
 
     def _make_cdp_session(self) -> MagicMock:
         session = MagicMock()
@@ -844,7 +1609,7 @@ class TestBlobDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_blob_download_read_and_saved(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._browser_context = self._context()
         pdf_bytes = b"%PDF-1.4 fake blob invoice bytes"
 
@@ -859,8 +1624,25 @@ class TestBlobDownloadCapture:
         assert saved[0].read_bytes() == pdf_bytes
 
     @pytest.mark.asyncio
+    async def test_blob_download_rejects_destination_symlink(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        save_path, _ = interceptor._resolve_save_path("invoice.pdf")
+        outside = tmp_path.parent / f"{tmp_path.name}-blob-outside.pdf"
+        outside.write_bytes(b"outside")
+        save_path.symlink_to(outside)
+
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=b"private blob")):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/confined", "suggestedFilename": "invoice.pdf"}
+            )
+
+        assert save_path.is_symlink()
+        assert outside.read_bytes() == b"outside"
+
+    @pytest.mark.asyncio
     async def test_blob_download_falls_through_pages_until_readable(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._browser_context = self._context(num_pages=2)
         pdf_bytes = b"%PDF blob"
         read = AsyncMock(side_effect=[None, pdf_bytes])
@@ -877,7 +1659,7 @@ class TestBlobDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_blob_download_threads_max_size_and_guards_oversize(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._browser_context = self._context()
         read = AsyncMock(return_value=b"x" * 2048)  # exceeds the patched limit (defense-in-depth)
 
@@ -894,7 +1676,7 @@ class TestBlobDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_blob_download_unreadable_is_noop(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._browser_context = self._context()
 
         with patch(self._READ_BLOB, new=AsyncMock(return_value=None)):
@@ -908,7 +1690,7 @@ class TestBlobDownloadCapture:
     async def test_blob_download_saves_distinct_file_with_identical_bytes(self, tmp_path: Path) -> None:
         # Two independent downloads can share bytes but differ by name — the second must not be
         # dropped just because matching bytes already exist on disk.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._browser_context = self._context()
         pdf_bytes = b"%PDF identical bytes, different download"
         (tmp_path / "prior.pdf").write_bytes(pdf_bytes)
@@ -923,7 +1705,7 @@ class TestBlobDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_blob_download_no_context_is_noop(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         with patch(self._READ_BLOB, new=AsyncMock()) as read:
             await interceptor._handle_browser_download(
                 {"url": "blob:https://example.com/none", "suggestedFilename": "x.pdf"}
@@ -933,7 +1715,7 @@ class TestBlobDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_blob_download_already_captured_via_fetch_is_skipped(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         url = "blob:https://example.com/dup"
         interceptor._downloaded_urls.add(url)
         interceptor._browser_context = self._context()
@@ -949,7 +1731,7 @@ class TestBlobDownloadCapture:
         # A large-response empty-body fulfill can make page JS re-emit a 0-byte blob with the same
         # suggestedFilename as a just-captured real download. Since _resolve_save_path overwrites on
         # collision, an empty blob must never be persisted — else it truncates the real artifact.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._browser_context = self._context()
         real_bytes = b"%PDF-1.4 real captured document bytes"
         (tmp_path / "report.pdf").write_bytes(real_bytes)
@@ -965,7 +1747,7 @@ class TestBlobDownloadCapture:
     @pytest.mark.asyncio
     async def test_empty_blob_writes_no_artifact(self, tmp_path: Path) -> None:
         # A genuinely empty blob is not a useful download and is skipped (no 0-byte file created).
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._browser_context = self._context()
 
         with patch(self._READ_BLOB, new=AsyncMock(return_value=b"")):
@@ -996,7 +1778,7 @@ class TestDataUrlDownloadCapture:
     async def test_data_url_download_saved(
         self, tmp_path: Path, url: str, expected_filename: str, expected_bytes: bytes
     ) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
 
         await interceptor._handle_browser_download({"url": url, "suggestedFilename": "report"})
 
@@ -1011,15 +1793,30 @@ class TestDataUrlDownloadCapture:
         assert len(dedupe_key) == len("data:sha256:") + 64
 
     @pytest.mark.asyncio
-    async def test_data_url_uses_safe_generated_filename(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+    async def test_data_url_rejects_non_basename_filename(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
 
         await interceptor._handle_browser_download(
             {"url": "data:application/pdf;base64,JVBERg==", "suggestedFilename": "../../report.pdf"}
         )
 
-        assert [path.name for path in tmp_path.iterdir()] == ["report.pdf"]
+        assert list(tmp_path.iterdir()) == []
         assert not (tmp_path.parent / "report.pdf").exists()
+
+    @pytest.mark.asyncio
+    async def test_data_url_rejects_destination_symlink(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        save_path, _ = interceptor._resolve_save_path("report.pdf")
+        outside = tmp_path.parent / f"{tmp_path.name}-data-outside.pdf"
+        outside.write_bytes(b"outside")
+        save_path.symlink_to(outside)
+
+        await interceptor._handle_browser_download(
+            {"url": "data:application/pdf;base64,JVBERg==", "suggestedFilename": "report.pdf"}
+        )
+
+        assert save_path.is_symlink()
+        assert outside.read_bytes() == b"outside"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1035,7 +1832,7 @@ class TestDataUrlDownloadCapture:
         ],
     )
     async def test_malformed_data_url_does_not_create_artifact(self, tmp_path: Path, url: str) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
 
         await interceptor._handle_browser_download({"url": url, "suggestedFilename": "report.pdf"})
 
@@ -1044,7 +1841,7 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_duplicate_data_url_event_is_saved_once(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         event = {"url": "data:text/plain,hello", "suggestedFilename": "note.txt"}
 
         await interceptor._handle_browser_download(event)
@@ -1055,7 +1852,7 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_duplicate_data_url_logs_never_include_payload(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         payload = "private-inline-payload"
         event = {"url": f"data:text/plain,{payload}", "suggestedFilename": "note.txt"}
 
@@ -1067,7 +1864,7 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_non_base64_oversize_rejected_before_percent_decode(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         with (
             patch.object(mod, "MAX_FILE_SIZE_BYTES", 4),
             patch.object(mod, "_percent_decode_payload", wraps=mod._percent_decode_payload) as decode,
@@ -1081,7 +1878,7 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_concurrent_duplicate_is_reserved_and_failure_can_retry(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         event = {"url": "data:text/plain,hello", "suggestedFilename": "note.txt"}
         started = asyncio.Event()
         release = asyncio.Event()
@@ -1103,7 +1900,7 @@ class TestDataUrlDownloadCapture:
 
         assert [path.name for path in tmp_path.iterdir()] == ["note.txt"]
 
-        retry_interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path / "retry"))
+        retry_interceptor = _make_interceptor(output_dir=str(tmp_path / "retry"))
         with patch.object(retry_interceptor, "_decode_data_url", side_effect=OSError("transient")):
             await retry_interceptor._handle_browser_download(event)
         await retry_interceptor._handle_browser_download(event)
@@ -1113,7 +1910,7 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_data_url_over_size_limit_does_not_create_artifact(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         url = "data:application/octet-stream;base64,eHh4eHg="
 
         with patch.object(mod, "MAX_FILE_SIZE_BYTES", 4):
@@ -1123,46 +1920,46 @@ class TestDataUrlDownloadCapture:
         assert url not in interceptor._downloaded_urls
 
     @staticmethod
-    def _paused_replace() -> tuple[threading.Event, threading.Event, Any]:
+    def _paused_publication() -> tuple[threading.Event, threading.Event, Any]:
         entered, release = threading.Event(), threading.Event()
-        real_replace = mod.os.replace
+        real_link = mod.os.link
 
-        def replace(source: Path, destination: Path) -> None:
+        def link(source: str, destination: str, **kwargs: Any) -> None:
             entered.set()
             assert release.wait(timeout=2)
-            real_replace(source, destination)
+            real_link(source, destination, **kwargs)
 
-        return entered, release, patch.object(mod.os, "replace", side_effect=replace)
+        return entered, release, patch.object(mod.os, "link", side_effect=link)
 
     @pytest.mark.asyncio
     async def test_data_url_is_atomically_published_from_incomplete_path(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        entered_replace, release_replace, replace_patch = self._paused_replace()
-        with replace_patch:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        entered_publication, release_publication, publication_patch = self._paused_publication()
+        with publication_patch:
             task = asyncio.create_task(
                 interceptor._handle_browser_download(
                     {"url": "data:text/plain,complete", "suggestedFilename": "note.txt"}
                 )
             )
-            assert await asyncio.to_thread(entered_replace.wait, 2)
+            assert await asyncio.to_thread(entered_publication.wait, 2)
             visible = list(tmp_path.iterdir())
             assert len(visible) == 1
             assert visible[0].name.startswith("note.txt.")
             assert visible[0].name.endswith(".crdownload")
             assert not (tmp_path / "note.txt").exists()
-            release_replace.set()
+            release_publication.set()
             await asyncio.wait_for(task, timeout=2)
 
         assert [path.name for path in tmp_path.iterdir()] == ["note.txt"]
 
     @pytest.mark.asyncio
     async def test_cancellation_drains_publication_before_retry(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         event = {"url": "data:text/plain,complete", "suggestedFilename": "note.txt"}
-        entered_replace, release_replace, replace_patch = self._paused_replace()
-        with replace_patch:
+        entered_publication, release_publication, publication_patch = self._paused_publication()
+        with publication_patch:
             first = asyncio.create_task(interceptor._handle_browser_download(event))
-            assert await asyncio.to_thread(entered_replace.wait, 2)
+            assert await asyncio.to_thread(entered_publication.wait, 2)
             first.cancel()
             retry = asyncio.create_task(interceptor._handle_browser_download(event))
             await asyncio.sleep(0)
@@ -1170,7 +1967,7 @@ class TestDataUrlDownloadCapture:
             visible = list(tmp_path.iterdir())
             assert len(visible) == 1
             assert visible[0].name.endswith(".crdownload")
-            release_replace.set()
+            release_publication.set()
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(first, timeout=2)
             await asyncio.wait_for(retry, timeout=2)
@@ -1180,8 +1977,10 @@ class TestDataUrlDownloadCapture:
         assert len(interceptor._downloaded_urls) == 1
 
     @pytest.mark.asyncio
-    async def test_concurrent_distinct_data_urls_with_same_filename_are_serialized(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+    async def test_concurrent_distinct_data_urls_with_same_filename_fail_closed_on_collision(
+        self, tmp_path: Path
+    ) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         first = {"url": "data:text/plain,first", "suggestedFilename": "note.txt"}
         second = {"url": "data:text/plain,second", "suggestedFilename": "note.txt"}
 
@@ -1194,12 +1993,12 @@ class TestDataUrlDownloadCapture:
         )
 
         assert (tmp_path / "note.txt").read_bytes() in {b"first", b"second"}
-        assert len(interceptor._downloaded_urls) == 2
+        assert len(interceptor._downloaded_urls) == 1
         assert not list(tmp_path.glob("*.crdownload"))
 
     @pytest.mark.asyncio
     async def test_digest_is_off_loop_and_invalid_shape_rejected_before_digest(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         event_loop_thread = threading.get_ident()
 
         real_identity = mod._download_identity
@@ -1223,7 +2022,7 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_disable_drains_active_browser_download_task(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         browser_session = MagicMock()
         browser_session.send = AsyncMock()
         browser_session.detach = AsyncMock()
@@ -1254,7 +2053,7 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_settle_browser_downloads_includes_event_admitted_while_draining(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._accepting_browser_downloads = True
         first_started = asyncio.Event()
         release_first = asyncio.Event()
@@ -1287,8 +2086,122 @@ class TestDataUrlDownloadCapture:
         assert not interceptor._browser_download_tasks
 
     @pytest.mark.asyncio
+    async def test_browser_download_handlers_are_serialized(self) -> None:
+        interceptor = _make_interceptor()
+        interceptor._accepting_browser_downloads = True
+        first_started = asyncio.Event()
+        release = asyncio.Event()
+        active = 0
+        max_active = 0
+
+        async def paused_download(_url: str, _filename: str, _artifact_scope_generation: int) -> None:
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            first_started.set()
+            await release.wait()
+            active -= 1
+
+        with patch.object(interceptor, "_download_url_directly", side_effect=paused_download):
+            interceptor._schedule_browser_download_handler(
+                {"url": "https://example.com/one", "suggestedFilename": "one"}
+            )
+            await first_started.wait()
+            interceptor._schedule_browser_download_handler(
+                {"url": "https://example.com/two", "suggestedFilename": "two"}
+            )
+            await asyncio.sleep(0)
+            assert max_active == 1
+            release.set()
+            async with interceptor.settle_browser_downloads():
+                pass
+
+        assert not interceptor._browser_download_tasks
+
+    @pytest.mark.asyncio
+    async def test_queued_browser_event_keeps_its_pre_rotation_scope_generation(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(
+            output_dir=str(tmp_path / "prior"),
+            redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("prior"),
+        )
+        interceptor._accepting_browser_downloads = True
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        admitted_generations: list[int] = []
+
+        async def serialized_handler(_event: dict[str, Any], artifact_scope_generation: int) -> None:
+            admitted_generations.append(artifact_scope_generation)
+            if len(admitted_generations) == 1:
+                first_started.set()
+                await release_first.wait()
+
+        prior_generation = interceptor._artifact_scope_generation
+        with patch.object(interceptor, "_handle_browser_download_serialized", side_effect=serialized_handler):
+            interceptor._schedule_browser_download_handler({"url": "https://example.test/first"})
+            await first_started.wait()
+            interceptor._schedule_browser_download_handler({"url": "https://example.test/queued"})
+            interceptor.rebind_download_scope(
+                download_dir=str(tmp_path / "next"),
+                redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("next"),
+            )
+            release_first.set()
+            async with interceptor.settle_browser_downloads():
+                pass
+
+        assert admitted_generations == [prior_generation, prior_generation]
+        assert interceptor._artifact_scope_generation != prior_generation
+
+    @pytest.mark.asyncio
+    async def test_browser_download_handler_queue_is_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        interceptor = _make_interceptor()
+        interceptor._accepting_browser_downloads = True
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def paused_handler(_event: dict[str, Any]) -> None:
+            started.set()
+            await release.wait()
+
+        monkeypatch.setattr(mod, "MAX_PENDING_BROWSER_DOWNLOAD_TASKS", 1)
+        with patch.object(interceptor, "_handle_browser_download", side_effect=paused_handler):
+            interceptor._schedule_browser_download_handler({"url": "https://example.com/one"})
+            await started.wait()
+            interceptor._schedule_browser_download_handler({"url": "https://example.com/two"})
+            assert len(interceptor._browser_download_tasks) == 1
+            release.set()
+            async with interceptor.settle_browser_downloads():
+                pass
+
+        assert not interceptor._browser_download_tasks
+
+    @pytest.mark.asyncio
+    async def test_browser_download_handler_queue_has_a_byte_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        interceptor = _make_interceptor()
+        interceptor._accepting_browser_downloads = True
+        started = asyncio.Event()
+        release = asyncio.Event()
+        first_event = {"url": "https://example.com/one"}
+
+        async def paused_handler(_event: dict[str, Any]) -> None:
+            started.set()
+            await release.wait()
+
+        monkeypatch.setattr(mod, "MAX_PENDING_BROWSER_DOWNLOAD_EVENT_BYTES", len(first_event["url"]) + 1)
+        with patch.object(interceptor, "_handle_browser_download", side_effect=paused_handler):
+            interceptor._schedule_browser_download_handler(first_event)
+            await started.wait()
+            interceptor._schedule_browser_download_handler({"url": "https://example.com/two"})
+            assert len(interceptor._browser_download_tasks) == 1
+            assert interceptor._pending_browser_download_event_bytes == len(first_event["url"])
+            release.set()
+            async with interceptor.settle_browser_downloads():
+                pass
+
+        assert interceptor._pending_browser_download_event_bytes == 0
+
+    @pytest.mark.asyncio
     async def test_settle_browser_downloads_drains_event_admitted_inside_context(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._accepting_browser_downloads = True
         handler_started = asyncio.Event()
         release_handler = asyncio.Event()
@@ -1315,8 +2228,35 @@ class TestDataUrlDownloadCapture:
         assert not interceptor._browser_download_tasks
 
     @pytest.mark.asyncio
+    async def test_settle_browser_downloads_waits_for_browser_event_after_action_returns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        interceptor = _make_interceptor()
+        interceptor._browser_session = MagicMock()
+        interceptor._accepting_browser_downloads = True
+        handled = asyncio.Event()
+        delayed_admission: asyncio.Task[None] | None = None
+
+        async def handler(_event: dict[str, Any]) -> None:
+            handled.set()
+
+        async def admit_after_action() -> None:
+            await asyncio.sleep(0.01)
+            interceptor._schedule_browser_download_handler({"url": "https://example.com/late"})
+
+        monkeypatch.setattr(mod, "BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS", 0.05)
+        with patch.object(interceptor, "_handle_browser_download", side_effect=handler):
+            async with interceptor.settle_browser_downloads():
+                delayed_admission = asyncio.create_task(admit_after_action())
+
+        assert delayed_admission is not None
+        await delayed_admission
+        assert handled.is_set()
+        assert not interceptor._browser_download_tasks
+
+    @pytest.mark.asyncio
     async def test_cancelled_settle_does_not_poison_reused_interceptor(self) -> None:
-        interceptor = CDPDownloadInterceptor()
+        interceptor = _make_interceptor()
         interceptor._accepting_browser_downloads = True
         first_started = asyncio.Event()
         never_release = asyncio.Event()
@@ -1350,7 +2290,7 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_cancelled_settle_body_cancels_admitted_handler_and_remains_reusable(self) -> None:
-        interceptor = CDPDownloadInterceptor()
+        interceptor = _make_interceptor()
         interceptor._accepting_browser_downloads = True
         first_started = asyncio.Event()
         second_handled = asyncio.Event()
@@ -1383,7 +2323,7 @@ class TestDataUrlDownloadCapture:
         assert interceptor._accepting_browser_downloads
 
     def test_maximum_size_percent_encoded_payload_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        interceptor = CDPDownloadInterceptor()
+        interceptor = _make_interceptor()
         monkeypatch.setattr(mod, "MAX_FILE_SIZE_BYTES", 12)
         url = "data:text/plain," + "%41" * 12
 
@@ -1393,7 +2333,7 @@ class TestDataUrlDownloadCapture:
         assert data == b"A" * 12
 
     def test_percent_escaped_base64_payload_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        interceptor = CDPDownloadInterceptor()
+        interceptor = _make_interceptor()
         monkeypatch.setattr(mod, "MAX_FILE_SIZE_BYTES", 1)
         url = "data:text/plain;base64,%51%51%3D%3D"
 
@@ -1403,7 +2343,7 @@ class TestDataUrlDownloadCapture:
         assert data == b"A"
 
     def test_maximum_size_percent_escaped_base64_payload_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        interceptor = CDPDownloadInterceptor()
+        interceptor = _make_interceptor()
         monkeypatch.setattr(mod, "MAX_FILE_SIZE_BYTES", 4)
         url = "data:text/plain;base64," + "".join(f"%{byte:02X}" for byte in b"QUJDRA==")
 
@@ -1413,7 +2353,7 @@ class TestDataUrlDownloadCapture:
         assert data == b"ABCD"
 
     def test_percent_escaped_base64_decoded_overflow_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        interceptor = CDPDownloadInterceptor()
+        interceptor = _make_interceptor()
         monkeypatch.setattr(mod, "MAX_FILE_SIZE_BYTES", 4)
         url = "data:text/plain;base64," + "".join(f"%{byte:02X}" for byte in b"QUJDREU=")
 
@@ -1429,7 +2369,7 @@ class TestDataUrlDownloadCapture:
         ],
     )
     def test_malformed_percent_escaped_base64_is_rejected(self, monkeypatch: pytest.MonkeyPatch, payload: str) -> None:
-        interceptor = CDPDownloadInterceptor()
+        interceptor = _make_interceptor()
         monkeypatch.setattr(mod, "MAX_FILE_SIZE_BYTES", 4)
         url = f"data:text/plain;base64,{payload}"
 
@@ -1450,7 +2390,7 @@ class TestDataUrlDownloadCapture:
         decoded_length.assert_not_called()
 
     def test_oversized_percent_payload_rejected_before_decode_allocation(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        interceptor = CDPDownloadInterceptor()
+        interceptor = _make_interceptor()
         monkeypatch.setattr(mod, "MAX_FILE_SIZE_BYTES", 12)
         url = "data:text/plain," + "A" * 12 + "%41"
 
@@ -1463,7 +2403,7 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_disable_waits_for_racing_browser_monitor_enable(self) -> None:
-        interceptor = CDPDownloadInterceptor()
+        interceptor = _make_interceptor()
         send_started = asyncio.Event()
         release_send = asyncio.Event()
         browser_session = MagicMock()
@@ -1494,7 +2434,7 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_browser_monitor_can_reenable_after_disable(self) -> None:
-        interceptor = CDPDownloadInterceptor()
+        interceptor = _make_interceptor()
         first_session = MagicMock(send=AsyncMock(), detach=AsyncMock())
         second_session = MagicMock(send=AsyncMock(), detach=AsyncMock())
         browser = MagicMock()
@@ -1516,7 +2456,7 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_context_binding_owns_new_page_listener_and_tasks(self) -> None:
-        interceptor = CDPDownloadInterceptor()
+        interceptor = _make_interceptor()
         context = MagicMock()
         context._skyvern_cdp_download_interceptor = None
         page = MagicMock()
@@ -1548,8 +2488,8 @@ class TestDataUrlDownloadCapture:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(mod, "BROWSER_INTERCEPTOR_DISABLE_TIMEOUT", 0.01)
-        old_interceptor = CDPDownloadInterceptor()
-        new_interceptor = CDPDownloadInterceptor()
+        old_interceptor = _make_interceptor()
+        new_interceptor = _make_interceptor()
         context = MagicMock()
         context._skyvern_cdp_download_interceptor = old_interceptor
         entered_cancel = asyncio.Event()
@@ -1604,8 +2544,8 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_context_rebind_awaits_fast_disable_before_binding(self) -> None:
-        old_interceptor = CDPDownloadInterceptor()
-        new_interceptor = CDPDownloadInterceptor()
+        old_interceptor = _make_interceptor()
+        new_interceptor = _make_interceptor()
         context = MagicMock()
         context._skyvern_cdp_download_interceptor = old_interceptor
         disabled = False
@@ -1624,8 +2564,8 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_context_rebind_propagates_fast_disable_failure(self) -> None:
-        old_interceptor = CDPDownloadInterceptor()
-        new_interceptor = CDPDownloadInterceptor()
+        old_interceptor = _make_interceptor()
+        new_interceptor = _make_interceptor()
         context = MagicMock()
         context._skyvern_cdp_download_interceptor = old_interceptor
         old_interceptor.disable = AsyncMock(side_effect=RuntimeError("disable failed"))  # type: ignore[method-assign]
@@ -1639,8 +2579,8 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_context_rebind_cancellation_owns_old_disable_task(self) -> None:
-        old_interceptor = CDPDownloadInterceptor()
-        new_interceptor = CDPDownloadInterceptor()
+        old_interceptor = _make_interceptor()
+        new_interceptor = _make_interceptor()
         context = MagicMock()
         context._skyvern_cdp_download_interceptor = old_interceptor
         started = asyncio.Event()
@@ -1676,7 +2616,7 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_cancelled_rebind_detached_disable_has_external_gc_root(self) -> None:
-        old_interceptor = CDPDownloadInterceptor()
+        old_interceptor = _make_interceptor()
         context = MagicMock()
         context._skyvern_cdp_download_interceptor = old_interceptor
         started = asyncio.Event()
@@ -1692,7 +2632,7 @@ class TestDataUrlDownloadCapture:
                 await asyncio.wait_for(release.wait(), timeout=2)
 
         old_interceptor.disable = stuck_disable  # type: ignore[method-assign]
-        new_interceptor = CDPDownloadInterceptor()
+        new_interceptor = _make_interceptor()
         new_ref = weakref.ref(new_interceptor)
         binding = asyncio.create_task(new_interceptor.bind_to_context(context))
         binding_ref = weakref.ref(binding)
@@ -1726,7 +2666,7 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_context_binding_same_interceptor_is_idempotent(self) -> None:
-        interceptor = CDPDownloadInterceptor()
+        interceptor = _make_interceptor()
         context = MagicMock()
         context._skyvern_cdp_download_interceptor = None
 
@@ -1741,9 +2681,9 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_concurrent_context_rebinds_leave_only_last_listener(self) -> None:
-        old_interceptor = CDPDownloadInterceptor()
-        first_interceptor = CDPDownloadInterceptor()
-        second_interceptor = CDPDownloadInterceptor()
+        old_interceptor = _make_interceptor()
+        first_interceptor = _make_interceptor()
+        second_interceptor = _make_interceptor()
         context = MagicMock()
         context._skyvern_cdp_download_interceptor = old_interceptor
         old_disable_started = asyncio.Event()
@@ -1789,7 +2729,7 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_context_page_enable_failure_is_retrieved_and_logged(self) -> None:
-        interceptor = CDPDownloadInterceptor()
+        interceptor = _make_interceptor()
         context = MagicMock()
         context._skyvern_cdp_download_interceptor = None
 
@@ -1815,12 +2755,12 @@ class TestDataUrlDownloadCapture:
 
     @pytest.mark.asyncio
     async def test_disable_drains_admitted_fetch_handler(self) -> None:
-        interceptor = CDPDownloadInterceptor()
+        interceptor = _make_interceptor()
         started = asyncio.Event()
         release = asyncio.Event()
         session = MagicMock(send=AsyncMock())
 
-        async def paused_handler(event: dict[str, Any], cdp_session: Any) -> None:
+        async def paused_handler(event: dict[str, Any], cdp_session: Any, _artifact_scope_generation: int) -> None:
             assert cdp_session is session
             started.set()
             await release.wait()
@@ -1838,46 +2778,21 @@ class TestDataUrlDownloadCapture:
 
 
 class TestDirectHttpDownloadAuthAndHtmlGuard:
-    """_download_url_directly falls back from the cookie-sharing Playwright APIRequestContext to a
-    raw urllib fetch. That fallback must (1) still carry the browser session's cookies, and (2) not
-    silently save an HTML login/session-gate page under a binary filename.
+    """Direct HTTP downloads fail closed without an enrolled backend and reject HTML login masquerades."""
 
-    Regression: a session-gated download endpoint fetched without cookies returns its HTML login
-    page (HTTP 200); the old fallback issued a cookieless request and saved that HTML as e.g. a
-    .zip while reporting the download as successful.
-    """
-
-    _URLOPEN = "skyvern.webeye.cdp_download_interceptor._urlopen_single_hop"
+    _URLOPEN = "urllib.request.urlopen"
+    _BUILD_OPENER = "urllib.request.build_opener"
 
     @staticmethod
-    def _fake_urlopen(body: bytes, content_type: str) -> MagicMock:
-        return MagicMock(return_value=(200, {"content-type": content_type}, body))
+    def _context() -> MagicMock:
+        context = MagicMock()
+        context.cookies = AsyncMock(return_value=[])
+        context.request.get = AsyncMock(side_effect=AssertionError("raw BrowserContext request bypass"))
+        return context
 
     @staticmethod
-    def _context_forcing_urllib(cookies: list[dict]) -> MagicMock:
-        """Browser context whose APIRequestContext returns proxy-407 (non-OK), forcing the urllib
-        fallback, and whose cookies() returns the given session cookies."""
-        ctx = MagicMock()
-        non_ok = MagicMock()
-        non_ok.ok = False
-        non_ok.status = 407
-        ctx.request.get = AsyncMock(return_value=non_ok)
-        ctx.cookies = AsyncMock(return_value=cookies)
-        return ctx
-
-    @pytest.fixture(autouse=True)
-    def _resolvable_site_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Keep this class's ``site.example`` fixtures off real DNS now destinations are checked."""
-        import socket
-
-        real_getaddrinfo = socket.getaddrinfo
-
-        def fake_getaddrinfo(host: str, port: object = None, *args: object, **kwargs: object) -> list:
-            if host == "site.example":
-                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 0))]
-            return real_getaddrinfo(host, port, *args, **kwargs)
-
-        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    def _guarded_fetch(body: bytes, content_type: str, filename: str) -> AsyncMock:
+        return AsyncMock(return_value=MagicMock(body=body, content_type=content_type, filename=filename))
 
     _LOGIN_HTML = (
         b'\n<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN">\n'
@@ -1886,152 +2801,249 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
     )
 
     @pytest.mark.asyncio
-    async def test_urllib_fallback_forwards_browser_cookies(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context_forcing_urllib(
-            [{"name": "ASP.NET_SessionId", "value": "sess123"}, {"name": "auth", "value": "tok"}]
-        )
-        zip_bytes = b"PK\x03\x04 real zip payload"
-        urlopen = self._fake_urlopen(zip_bytes, "application/zip")
+    async def test_failed_guarded_helper_does_not_fall_back_to_unenrolled_clients(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        context = self._context()
+        interceptor._browser_context = context
+        guarded_fetch = AsyncMock(side_effect=RuntimeError("guarded backend unavailable"))
+        urlopen = MagicMock(side_effect=AssertionError("raw urllib bypass"))
+        build_opener = MagicMock(side_effect=AssertionError("raw urllib opener bypass"))
 
-        with patch(self._URLOPEN, urlopen):
-            await interceptor._download_url_directly("https://site.example/download?f=statement.zip", "statement.zip")
+        with (
+            patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True),
+            patch(self._URLOPEN, urlopen),
+            patch(self._BUILD_OPENER, build_opener),
+        ):
+            await interceptor._download_url_directly("https://site.example/report.pdf", "report.pdf")
 
-        sent_request = urlopen.call_args.args[0]
-        assert sent_request.get_header("Cookie") == "ASP.NET_SessionId=sess123; auth=tok"
-        saved = list(tmp_path.iterdir())
-        assert [p.name for p in saved] == ["statement.zip"]
-        assert saved[0].read_bytes() == zip_bytes
-
-    @pytest.mark.asyncio
-    async def test_cookie_header_skips_control_char_values(self, tmp_path: Path) -> None:
-        # A stored cookie value with CR/LF must not inject extra directives into the Cookie line.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context_forcing_urllib(
-            [{"name": "good", "value": "ok"}, {"name": "bad", "value": "x\r\nSet-Cookie: evil=1"}]
-        )
-        urlopen = self._fake_urlopen(b"PK\x03\x04 zip payload", "application/zip")
-
-        with patch(self._URLOPEN, urlopen):
-            await interceptor._download_url_directly("https://site.example/download?f=statement.zip", "statement.zip")
-
-        assert urlopen.call_args.args[0].get_header("Cookie") == "good=ok"
-
-    @pytest.mark.asyncio
-    async def test_html_login_page_for_binary_filename_not_saved(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context_forcing_urllib([])
-        urlopen = self._fake_urlopen(self._LOGIN_HTML, "text/html; charset=utf-8")
-
-        with patch(self._URLOPEN, urlopen):
-            await interceptor._download_url_directly("https://site.example/download?f=statement.zip", "statement.zip")
-
+        context.request.get.assert_not_called()
+        urlopen.assert_not_called()
+        build_opener.assert_not_called()
         assert list(tmp_path.iterdir()) == []
 
     @pytest.mark.asyncio
-    async def test_html_login_page_for_encoded_binary_filename_not_saved(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context_forcing_urllib([])
-        urlopen = self._fake_urlopen(self._LOGIN_HTML, "text/html; charset=utf-8")
+    async def test_direct_download_uses_only_guarded_helper(self, tmp_path: Path) -> None:
+        authorizer = AsyncMock()
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._redirect_hop_authorizer = authorizer
+        context = MagicMock()
+        context.cookies = AsyncMock(return_value=[{"name": "session", "value": "cookie-secret"}])
+        context.request.get = AsyncMock(side_effect=AssertionError("raw BrowserContext request bypass"))
+        interceptor._browser_context = context
+        guarded_response = MagicMock(
+            body=b"private report",
+            content_type="application/pdf",
+            filename="report.pdf",
+        )
+        guarded_fetch = AsyncMock(return_value=guarded_response)
+        urlopen = MagicMock(side_effect=AssertionError("raw urllib bypass"))
+        build_opener = MagicMock(side_effect=AssertionError("raw urllib opener bypass"))
 
-        with patch(self._URLOPEN, urlopen):
-            await interceptor._download_url_directly("https://site.example/download?f=statement.zip", "statement%2Ezip")
+        with (
+            patch("skyvern.forge.sdk.api.files.fetch_file_bytes", guarded_fetch, create=True),
+            patch(self._URLOPEN, urlopen),
+            patch(self._BUILD_OPENER, build_opener),
+        ):
+            await interceptor._download_url_directly("https://site.example/report.pdf?sig=secret", "report.pdf")
 
-        assert list(tmp_path.iterdir()) == []
+        context.request.get.assert_not_called()
+        urlopen.assert_not_called()
+        build_opener.assert_not_called()
+        guarded_fetch.assert_awaited_once_with(
+            "https://site.example/report.pdf?sig=secret",
+            max_size_mb=100,
+            headers={"Cookie": "session=cookie-secret"},
+            filename="report.pdf",
+            authorize_request_hop=authorizer,
+            download_scope=None,
+            approved_initial_url="https://site.example/report.pdf?sig=secret",
+        )
+        assert (tmp_path / "report.pdf").read_bytes() == b"private report"
 
     @pytest.mark.asyncio
-    async def test_html_payload_for_encoded_html_filename_is_saved(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context_forcing_urllib([])
-        urlopen = self._fake_urlopen(b"<!DOCTYPE html><html><body>report</body></html>", "text/html")
+    async def test_guarded_download_failure_does_not_log_url_or_exception_secret(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        guarded_fetch = AsyncMock(side_effect=RuntimeError("exception-secret"))
 
-        with patch(self._URLOPEN, urlopen):
-            await interceptor._download_url_directly("https://site.example/report", "report%2Ehtml")
-
-        assert [path.name for path in tmp_path.iterdir()] == ["report.html"]
-
-    @pytest.mark.asyncio
-    async def test_html_payload_for_double_encoded_binary_filename_is_not_saved(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context_forcing_urllib([])
-        urlopen = self._fake_urlopen(self._LOGIN_HTML, "text/html")
-
-        with patch(self._URLOPEN, urlopen):
-            await interceptor._download_url_directly(
-                "https://site.example/download?f=statement%252Ezip", "statement%252Ezip"
+        with (
+            patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True),
+            capture_logs() as logs,
+        ):
+            await interceptor._handle_browser_download(
+                {
+                    "url": "https://site.example/protected-path?sig=url-secret",
+                    "suggestedFilename": "report.pdf",
+                }
             )
 
-        assert list(tmp_path.iterdir()) == []
+        serialized_logs = repr(logs)
+        assert "url-secret" not in serialized_logs
+        assert "protected-path" not in serialized_logs
+        assert "exception-secret" not in serialized_logs
+        assert any(
+            log.get("event") == "Guarded direct download failed" and log.get("error_type") == "RuntimeError"
+            for log in logs
+        )
 
     @pytest.mark.asyncio
-    async def test_html_body_without_html_content_type_still_rejected(self, tmp_path: Path) -> None:
-        # Some servers mislabel the login page's content-type; sniff the body markup too.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context_forcing_urllib([])
-        urlopen = self._fake_urlopen(self._LOGIN_HTML, "application/octet-stream")
+    async def test_guarded_download_failure_logs_the_raising_module(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
 
-        with patch(self._URLOPEN, urlopen):
-            await interceptor._download_url_directly("https://site.example/download?f=statement.zip", "statement.zip")
+        async def guarded_fetch(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("exception-secret")
 
-        assert list(tmp_path.iterdir()) == []
+        with (
+            patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True),
+            capture_logs() as logs,
+        ):
+            await interceptor._download_url_directly("https://site.example/report.pdf?sig=url-secret", "report.pdf")
+
+        failures = [log for log in logs if log.get("event") == "Guarded direct download failed"]
+        assert len(failures) == 1
+        assert failures[0]["error_type"] == "RuntimeError"
+        assert failures[0]["error_origin"].startswith(f"{__name__}:guarded_fetch:")
+        serialized_logs = repr(logs)
+        assert "url-secret" not in serialized_logs
+        assert "exception-secret" not in serialized_logs
+
+    @pytest.mark.asyncio
+    async def test_run_scoped_hop_authorizer_fetches_without_unenrolled_drop(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(
+            output_dir=str(tmp_path),
+            redirect_hop_authorizer=RunScopedRedirectHopAuthorizer("wr_download"),
+        )
+        interceptor._browser_context = self._context()
+        guarded_fetch = self._guarded_fetch(b"%PDF-1.7 report", "application/pdf", "report.pdf")
+
+        with (
+            patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True),
+            capture_logs() as logs,
+        ):
+            await interceptor._download_url_directly("https://site.example/report.pdf?sig=url-secret", "report.pdf")
+
+        guarded_fetch.assert_awaited_once()
+        assert guarded_fetch.await_args.kwargs["download_scope"] == "wr_download"
+        assert guarded_fetch.await_args.kwargs["approved_initial_url"] == (
+            "https://site.example/report.pdf?sig=url-secret"
+        )
+        assert (tmp_path / "report.pdf").read_bytes() == b"%PDF-1.7 report"
+        assert not any(
+            log.get("event")
+            == "Redirect hop authorization is unenrolled for this browser session, dropping direct download"
+            for log in logs
+        )
+        assert "url-secret" not in repr(logs)
+
+    @pytest.mark.asyncio
+    async def test_cookie_header_omits_control_characters(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        context = self._context()
+        context.cookies.return_value = [
+            {"name": "session", "value": "safe"},
+            {"name": "injected\r\nHeader", "value": "bad"},
+            {"name": "unsafe", "value": "bad\x00value"},
+        ]
+        interceptor._browser_context = context
+
+        assert await interceptor._cookie_header_for_url("https://site.example/report.pdf") == "session=safe"
 
     @pytest.mark.parametrize(
-        "body",
+        ("body", "content_type", "filename", "expected_filename"),
         [
-            pytest.param(b"<!-- generated --><!DOCTYPE html><html><body>login</body></html>", id="comment"),
-            pytest.param(b'<?xml version="1.0"?><html><body>login</body></html>', id="xml-declaration"),
-            pytest.param(b"<head><title>Login</title></head><body>login</body>", id="omitted-html-root"),
-            pytest.param(b"<head\n><title>Login</title></head><body>login</body>", id="tag-newline"),
+            pytest.param(_LOGIN_HTML, "text/html", "statement.zip", None, id="binary-name"),
+            pytest.param(_LOGIN_HTML, "text/html", "statement%2Ezip", None, id="encoded-binary-name"),
+            pytest.param(_LOGIN_HTML, "text/html", "statement%252Ezip", None, id="double-encoded-binary-name"),
+            pytest.param(_LOGIN_HTML, "application/octet-stream", "statement.zip", None, id="mislabelled-html"),
+            pytest.param(_LOGIN_HTML, "application/octet-stream", "", None, id="nameless-binary-claim"),
+            pytest.param(_LOGIN_HTML, "text/html", "statement", None, id="extensionless-name"),
+            pytest.param(_LOGIN_HTML, "text/html", "report%2Ehtml", "report.html", id="encoded-html-name"),
+            pytest.param(_LOGIN_HTML, "text/html", "report.html", "report.html", id="html-name"),
+            pytest.param(_LOGIN_HTML, "text/html", "", "<generated>", id="nameless-html"),
+            pytest.param(_LOGIN_HTML, "", "", "<generated>", id="nameless-no-content-type"),
+            pytest.param(b"%PDF-1.7 report", "application/pdf", "invoice.pdf", "invoice.pdf", id="binary"),
+            pytest.param(b"PK\x03\x04 archive", "text/html", "archive.zip", "archive.zip", id="mislabeled-binary"),
+            pytest.param(
+                b"<!-- generated --><!DOCTYPE html><html><body>login</body></html>",
+                "application/octet-stream",
+                "statement.zip",
+                None,
+                id="leading-comment",
+            ),
+            pytest.param(
+                b'<?xml version="1.0"?><html><body>login</body></html>',
+                "application/octet-stream",
+                "statement.zip",
+                None,
+                id="xml-declaration",
+            ),
+            pytest.param(
+                b"<head><title>Login</title></head><body>login</body>",
+                "application/octet-stream",
+                "statement.zip",
+                None,
+                id="omitted-html-root",
+            ),
+            pytest.param(
+                b"<head\n><title>Login</title></head><body>login</body>",
+                "application/octet-stream",
+                "statement.zip",
+                None,
+                id="tag-newline",
+            ),
         ],
     )
     @pytest.mark.asyncio
-    async def test_html_body_with_legal_leading_markup_is_rejected(self, tmp_path: Path, body: bytes) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context_forcing_urllib([])
-        urlopen = self._fake_urlopen(body, "application/octet-stream")
+    async def test_html_masquerade_guard(
+        self,
+        tmp_path: Path,
+        body: bytes,
+        content_type: str,
+        filename: str,
+        expected_filename: str | None,
+    ) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        guarded_fetch = self._guarded_fetch(body, content_type, filename)
 
-        with patch(self._URLOPEN, urlopen):
-            await interceptor._download_url_directly("https://site.example/download", "statement.zip")
-
-        assert list(tmp_path.iterdir()) == []
-
-    @pytest.mark.asyncio
-    async def test_real_binary_payload_is_saved(self, tmp_path: Path) -> None:
-        # Guard must not over-reject genuine binary downloads.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context_forcing_urllib([])
-        pdf = b"%PDF-1.7 real invoice bytes"
-        urlopen = self._fake_urlopen(pdf, "application/pdf")
-
-        with patch(self._URLOPEN, urlopen):
-            await interceptor._download_url_directly("https://site.example/download?i=1", "invoice.pdf")
+        with patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True):
+            await interceptor._download_url_directly("https://site.example/download", filename)
 
         saved = list(tmp_path.iterdir())
-        assert [p.name for p in saved] == ["invoice.pdf"]
-        assert saved[0].read_bytes() == pdf
+        if expected_filename is None:
+            assert saved == []
+        else:
+            assert len(saved) == 1
+            if expected_filename != "<generated>":
+                assert saved[0].name == expected_filename
+            assert saved[0].read_bytes() == body
 
     @pytest.mark.asyncio
-    async def test_html_payload_for_html_filename_is_saved(self, tmp_path: Path) -> None:
-        # An HTML document downloaded under an .html name is honest, not a masquerade — keep it.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context_forcing_urllib([])
-        urlopen = self._fake_urlopen(b"<!DOCTYPE html><html><body>report</body></html>", "text/html")
+    async def test_direct_download_rejects_destination_symlink(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        guarded_fetch = self._guarded_fetch(b"private report", "application/pdf", "report.pdf")
+        save_path, _ = interceptor._resolve_save_path("report.pdf")
+        outside = tmp_path.parent / f"{tmp_path.name}-direct-outside.pdf"
+        outside.write_bytes(b"outside")
+        save_path.symlink_to(outside)
 
-        with patch(self._URLOPEN, urlopen):
-            await interceptor._download_url_directly("https://site.example/report", "report.html")
+        with patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True):
+            await interceptor._handle_browser_download(
+                {"url": "https://example.com/report.pdf", "suggestedFilename": "report.pdf"}
+            )
 
-        saved = list(tmp_path.iterdir())
-        assert [p.name for p in saved] == ["report.html"]
+        assert save_path.is_symlink()
+        assert outside.read_bytes() == b"outside"
 
     @pytest.mark.asyncio
     async def test_http_browser_download_routes_through_direct_download(self, tmp_path: Path) -> None:
-        # Real wiring: an http(s) browser download goes through _download_url_directly, which
-        # forwards cookies and rejects the HTML login masquerade.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context_forcing_urllib([{"name": "sid", "value": "x"}])
-        urlopen = self._fake_urlopen(self._LOGIN_HTML, "text/html")
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        guarded_fetch = self._guarded_fetch(self._LOGIN_HTML, "text/html", "report.zip")
 
-        with patch(self._URLOPEN, urlopen):
+        with patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True):
             await interceptor._handle_browser_download(
                 {
                     "url": "https://site.example/download?f=report.zip",
@@ -2040,71 +3052,6 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
             )
 
         assert list(tmp_path.iterdir()) == []
-        assert urlopen.call_args.args[0].get_header("Cookie") == "sid=x"
-
-    @pytest.mark.asyncio
-    async def test_nameless_binary_content_type_html_body_not_saved(self, tmp_path: Path) -> None:
-        # No filename extension but a binary content-type + HTML body is still a masquerade.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context_forcing_urllib([])
-        urlopen = self._fake_urlopen(self._LOGIN_HTML, "application/octet-stream")
-
-        with patch(self._URLOPEN, urlopen):
-            await interceptor._download_url_directly("https://site.example/download", "")
-
-        assert list(tmp_path.iterdir()) == []
-
-    @pytest.mark.asyncio
-    async def test_nameless_html_content_type_is_saved(self, tmp_path: Path) -> None:
-        # A nameless download that is honestly HTML (html content-type, no binary claim) is kept.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context_forcing_urllib([])
-        urlopen = self._fake_urlopen(self._LOGIN_HTML, "text/html; charset=utf-8")
-
-        with patch(self._URLOPEN, urlopen):
-            await interceptor._download_url_directly("https://site.example/page", "")
-
-        assert len(list(tmp_path.iterdir())) == 1
-
-    @pytest.mark.asyncio
-    async def test_extensionless_named_html_login_page_is_not_saved(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context_forcing_urllib([])
-        urlopen = self._fake_urlopen(self._LOGIN_HTML, "text/html; charset=utf-8")
-
-        with patch(self._URLOPEN, urlopen):
-            await interceptor._download_url_directly("https://site.example/download", "statement")
-
-        assert list(tmp_path.iterdir()) == []
-
-    @pytest.mark.asyncio
-    async def test_binary_payload_mislabeled_as_html_is_saved(self, tmp_path: Path) -> None:
-        # A real binary payload a server mislabels as text/html must be saved, not discarded:
-        # the body is the ground truth, so a non-HTML body is never treated as a masquerade.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context_forcing_urllib([])
-        zip_bytes = b"PK\x03\x04 genuine archive, not html"
-        urlopen = self._fake_urlopen(zip_bytes, "text/html")
-
-        with patch(self._URLOPEN, urlopen):
-            await interceptor._download_url_directly("https://site.example/download?f=statement.zip", "statement.zip")
-
-        saved = list(tmp_path.iterdir())
-        assert [p.name for p in saved] == ["statement.zip"]
-        assert saved[0].read_bytes() == zip_bytes
-
-    @pytest.mark.asyncio
-    async def test_nameless_no_content_type_html_is_saved(self, tmp_path: Path) -> None:
-        # Nameless download with no content-type and an HTML body makes no binary claim, so it is
-        # saved as-is (intentional "no claim, no mismatch"), not rejected.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context_forcing_urllib([])
-        urlopen = self._fake_urlopen(self._LOGIN_HTML, "")
-
-        with patch(self._URLOPEN, urlopen):
-            await interceptor._download_url_directly("https://site.example/page", "")
-
-        assert len(list(tmp_path.iterdir())) == 1
 
 
 class TestDownloadDirRebindDedup:
@@ -2120,7 +3067,7 @@ class TestDownloadDirRebindDedup:
     async def test_data_url_reprocessed_after_dir_change(self, tmp_path: Path) -> None:
         dir_a = tmp_path / "run_a"
         dir_b = tmp_path / "run_b"
-        interceptor = CDPDownloadInterceptor(output_dir=str(dir_a))
+        interceptor = _make_interceptor(output_dir=str(dir_a))
         event = {"url": "data:text/plain,hello", "suggestedFilename": "note.txt"}
 
         await interceptor._handle_browser_download(event)
@@ -2135,7 +3082,7 @@ class TestDownloadDirRebindDedup:
 
     @pytest.mark.asyncio
     async def test_same_dir_set_preserves_data_url_dedupe(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         event = {"url": "data:text/plain,hello", "suggestedFilename": "note.txt"}
 
         await interceptor._handle_browser_download(event)
@@ -2148,7 +3095,7 @@ class TestDownloadDirRebindDedup:
         assert [path.name for path in tmp_path.iterdir()] == ["note.txt"]
 
     def test_real_dir_change_clears_cross_path_dedupe(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path / "run_a"))
+        interceptor = _make_interceptor(output_dir=str(tmp_path / "run_a"))
         interceptor._downloaded_urls.update(
             {"https://site.example/report.pdf", "blob:https://site.example/abc", "data:sha256:deadbeef"}
         )
@@ -2158,7 +3105,7 @@ class TestDownloadDirRebindDedup:
         assert interceptor._downloaded_urls == set()
 
     def test_same_dir_set_preserves_cross_path_dedupe(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         seeded = {"https://site.example/report.pdf", "blob:https://site.example/abc"}
         interceptor._downloaded_urls.update(seeded)
 
@@ -2167,7 +3114,7 @@ class TestDownloadDirRebindDedup:
         assert interceptor._downloaded_urls == seeded
 
     def test_first_dir_set_from_none_does_not_touch_dedupe(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor()
+        interceptor = _make_interceptor()
         assert interceptor._output_dir is None
 
         interceptor.set_download_dir(str(tmp_path))
@@ -2182,16 +3129,16 @@ class TestDownloadDirRebindDedup:
         in dir A, so dir B could otherwise skip an identical download and miss its artifact."""
         dir_a = tmp_path / "run_a"
         dir_b = tmp_path / "run_b"
-        interceptor = CDPDownloadInterceptor(output_dir=str(dir_a))
+        interceptor = _make_interceptor(output_dir=str(dir_a))
         event = {"url": "data:text/plain,hello", "suggestedFilename": "note.txt"}
 
-        entered_replace, release_replace, replace_patch = TestDataUrlDownloadCapture._paused_replace()
-        with replace_patch:
+        entered_publication, release_publication, publication_patch = TestDataUrlDownloadCapture._paused_publication()
+        with publication_patch:
             writing = asyncio.create_task(interceptor._handle_browser_download(event))
-            assert await asyncio.to_thread(entered_replace.wait, 2)
+            assert await asyncio.to_thread(entered_publication.wait, 2)
             interceptor.set_download_dir(str(dir_b))
             assert interceptor._downloaded_urls == set()
-            release_replace.set()
+            release_publication.set()
             await asyncio.wait_for(writing, timeout=2)
 
         assert (dir_a / "note.txt").read_bytes() == b"hello"
@@ -2209,7 +3156,7 @@ class TestDownloadDirRebindDedup:
         """A failed mkdir during a real dir change must not leave the new scope carrying the prior
         run's dedupe: the clear happens on scope assignment, before mkdir, so a same-dir retry
         (dir_changed=False) still starts from an empty set and can write."""
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path / "run_a"))
+        interceptor = _make_interceptor(output_dir=str(tmp_path / "run_a"))
         interceptor._downloaded_urls.update({"https://site.example/report.pdf", "data:sha256:deadbeef"})
         target = tmp_path / "run_b"
         event = {"url": "data:text/plain,hello", "suggestedFilename": "note.txt"}
@@ -2401,7 +3348,7 @@ class TestTwoPathDownloadStreaming:
 
     @pytest.mark.asyncio
     async def test_small_body_buffered_full_replay(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         payload = b"A" * 500
         cdp = _StreamCDP(chunks=[payload])
         with _stream_limits():
@@ -2413,8 +3360,25 @@ class TestTwoPathDownloadStreaming:
         assert cdp.count("Fetch.failRequest") == 0
 
     @pytest.mark.asyncio
+    async def test_buffered_download_rejects_destination_symlink(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        save_path, _ = interceptor._resolve_save_path("doc.pdf")
+        outside = tmp_path.parent / f"{tmp_path.name}-buffered-outside.pdf"
+        outside.write_bytes(b"outside")
+        save_path.symlink_to(outside)
+        cdp = _StreamCDP(chunks=[b"private report"])
+
+        with _stream_limits(threshold=1024):
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=14))
+
+        assert save_path.is_symlink()
+        assert outside.read_bytes() == b"outside"
+        assert cdp.count("Fetch.failRequest") == 1
+        assert cdp.count("Fetch.fulfillRequest") == 0
+
+    @pytest.mark.asyncio
     async def test_at_threshold_streams_to_disk_empty_fulfill(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         payload = b"B" * 1024  # exactly the threshold → large path
         cdp = _StreamCDP(chunks=[payload])
         with _stream_limits(threshold=1024):
@@ -2426,8 +3390,52 @@ class TestTwoPathDownloadStreaming:
         assert cdp.count("Fetch.failRequest") == 0
 
     @pytest.mark.asyncio
+    async def test_streamed_download_rejects_symlinked_output_directory(self, tmp_path: Path) -> None:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        output_dir = tmp_path / "downloads"
+        output_dir.symlink_to(outside, target_is_directory=True)
+        interceptor = _make_interceptor(output_dir=str(output_dir))
+        cdp = _StreamCDP(chunks=[b"B" * 1024])
+
+        with _stream_limits(threshold=1024):
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=1024))
+
+        assert list(outside.iterdir()) == []
+        assert cdp.count("Fetch.failRequest") == 1
+        assert cdp.count("Fetch.fulfillRequest") == 0
+
+    @pytest.mark.asyncio
+    async def test_streamed_download_destination_swap_fails_at_publication(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        outside = tmp_path.parent / f"{tmp_path.name}-stream-outside.txt"
+        outside.write_bytes(b"outside")
+        cdp = _StreamCDP(chunks=[b"B" * 1024])
+        real_link = mod.os.link
+        swapped = False
+
+        def swap_destination_then_link(src: str, dst: str, **kwargs: Any) -> None:
+            nonlocal swapped
+            if dst == "doc.pdf":
+                (tmp_path / dst).symlink_to(outside)
+                swapped = True
+            real_link(src, dst, **kwargs)
+
+        with (
+            _stream_limits(threshold=1024),
+            patch.object(mod.os, "link", side_effect=swap_destination_then_link),
+        ):
+            await _drive_download(interceptor, cdp, _raw_headers(content_length=1024))
+
+        assert swapped
+        assert (tmp_path / "doc.pdf").is_symlink()
+        assert outside.read_bytes() == b"outside"
+        assert cdp.count("Fetch.failRequest") == 1
+        assert cdp.count("Fetch.fulfillRequest") == 0
+
+    @pytest.mark.asyncio
     async def test_above_threshold_known_large_streams(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         payload = b"C" * 2000
         cdp = _StreamCDP(chunks=[b"C" * 800, b"C" * 800, b"C" * 400])
         with _stream_limits(threshold=1024, cap=4096):
@@ -2438,7 +3446,7 @@ class TestTwoPathDownloadStreaming:
 
     @pytest.mark.asyncio
     async def test_unknown_content_length_spills_to_disk(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         # No Content-Length: must not assume small. Buffers, then spills once bytes cross the threshold.
         chunks = [b"D" * 400, b"D" * 400, b"D" * 400, b"D" * 400, b"D" * 400]  # 2000 total
         cdp = _StreamCDP(chunks=list(chunks))
@@ -2450,7 +3458,7 @@ class TestTwoPathDownloadStreaming:
 
     @pytest.mark.asyncio
     async def test_lying_small_content_length_spills(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         # Header claims 100 bytes but the body is 2000 → must spill to the large path, not trust the header.
         cdp = _StreamCDP(chunks=[b"E" * 700, b"E" * 700, b"E" * 600])
         with _stream_limits(threshold=1024, cap=4096):
@@ -2461,7 +3469,7 @@ class TestTwoPathDownloadStreaming:
 
     @pytest.mark.asyncio
     async def test_lying_large_content_length_tiny_body_finalizes(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         # Header claims large (>= threshold) → disk path from chunk 1, but the actual body is tiny.
         cdp = _StreamCDP(chunks=[b"F" * 300])
         with _stream_limits(threshold=1024, cap=4096):
@@ -2473,7 +3481,7 @@ class TestTwoPathDownloadStreaming:
 
     @pytest.mark.asyncio
     async def test_cap_breach_unknown_cl_aborts_no_artifact(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         cdp = _StreamCDP(chunks=[b"G" * 1500, b"G" * 1500, b"G" * 1500, b"G" * 1500])  # 6000 > cap 4096
         with _stream_limits(threshold=1024, cap=4096):
             await _drive_download(interceptor, cdp, _raw_headers(content_length=None))
@@ -2484,7 +3492,7 @@ class TestTwoPathDownloadStreaming:
 
     @pytest.mark.asyncio
     async def test_header_content_length_over_cap_fast_fails(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         cdp = _StreamCDP(chunks=[b"H" * 10])
         with _stream_limits(threshold=1024, cap=4096):
             await _drive_download(interceptor, cdp, _raw_headers(content_length=5000))  # > cap
@@ -2499,7 +3507,7 @@ class TestTwoPathDownloadStreaming:
         # Browser.downloadWillBegin lets _handle_browser_download re-fetch it via _download_url_directly
         # (which reads the whole body before its 100 MiB check) and materializes the very payload the cap
         # exists to block (SKY-12642).
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         cdp = _StreamCDP(chunks=[b"H" * 10])
         url = "https://example.com/huge.pdf"
         with _stream_limits(threshold=1024, cap=4096):
@@ -2510,7 +3518,7 @@ class TestTwoPathDownloadStreaming:
 
     @pytest.mark.asyncio
     async def test_midstream_read_error_cleans_temp_and_fails(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         # Known-large → disk path; the second IO.read raises after one chunk is on disk.
         cdp = _StreamCDP(
             chunks=[b"I" * 800, b"I" * 800, b"I" * 800],
@@ -2526,7 +3534,7 @@ class TestTwoPathDownloadStreaming:
 
     @pytest.mark.asyncio
     async def test_cancelled_error_cleans_temp_and_propagates(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         cdp = _StreamCDP(
             chunks=[b"J" * 800, b"J" * 800, b"J" * 800],
             read_error=asyncio.CancelledError(),
@@ -2541,7 +3549,7 @@ class TestTwoPathDownloadStreaming:
 
     @pytest.mark.asyncio
     async def test_streamed_empty_fulfill_normalizes_headers(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         cdp = _StreamCDP(chunks=[b"K" * 2000])
         raw = _raw_headers(
             content_length=2000,
@@ -2566,7 +3574,7 @@ class TestTwoPathDownloadStreaming:
     async def test_stream_start_fail_fails_request_never_falls_back_to_whole_body(self, tmp_path: Path) -> None:
         # takeResponseBodyAsStream failing must fail the request — we never fall back to getResponseBody,
         # whose whole-body materialization could OOM on a lying/understated Content-Length (SKY-12642).
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         cdp = _StreamCDP(take_error=RuntimeError("takeResponseBodyAsStream unavailable"), getbody=b"L" * 300)
         with _stream_limits(threshold=1024, cap=4096):
             await _drive_download(interceptor, cdp, _raw_headers(content_length=300))
@@ -2578,7 +3586,7 @@ class TestTwoPathDownloadStreaming:
 
     @pytest.mark.asyncio
     async def test_stream_start_fail_with_content_encoding_no_direct_fallback(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         # Encoded small CL can decode to an unbounded body → getResponseBody would materialize it. Refuse.
         cdp = _StreamCDP(take_error=RuntimeError("take failed"), getbody=b"L" * 300)
         with _stream_limits(threshold=1024, cap=4096):
@@ -2592,7 +3600,7 @@ class TestTwoPathDownloadStreaming:
     async def test_extraction_serialized_second_download_waits_for_lock(self, tmp_path: Path) -> None:
         # Single-active guard: while one extraction holds the lock, a second _handle_download must block
         # (not stream concurrently), so N parallel downloads cannot each write up to the cap to disk.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         cdp = _StreamCDP(chunks=[b"A" * 200])
         await interceptor._download_extraction_lock.acquire()
         task = asyncio.create_task(_drive_download(interceptor, cdp, _raw_headers(content_length=200)))
@@ -2610,7 +3618,7 @@ class TestTwoPathDownloadStreaming:
     async def test_extraction_lock_released_on_success_error_and_start_failure(self, tmp_path: Path) -> None:
         # The single-active lock must be released on every exit path, or one failed download deadlocks all
         # later downloads on this interceptor.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         await _drive_download(interceptor, _StreamCDP(chunks=[b"S" * 100]), _raw_headers(content_length=100))
         assert not interceptor._download_extraction_lock.locked()  # success
         with _stream_limits(threshold=1024, cap=4096):
@@ -2625,7 +3633,7 @@ class TestTwoPathDownloadStreaming:
         # not yet classified as a download). settle drains those to quiescence, so a capture queued behind
         # the lock — which owns no .crdownload yet — is still waited on before artifact collection instead
         # of being silently omitted.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         cdp = _StreamCDP(chunks=[b"Q" * 150])
         await interceptor._download_extraction_lock.acquire()  # hold the lock so the capture queues
         interceptor._schedule_cdp_handler(_drive_download(interceptor, cdp, _raw_headers(content_length=150)))
@@ -2643,7 +3651,7 @@ class TestTwoPathDownloadStreaming:
     async def test_stalled_close_times_out_and_releases_lock(self, tmp_path: Path) -> None:
         # The IO.close cleanup is bounded too: a hung close on a dead session must not hold the extraction
         # lock or hang teardown. The streamed file is already published, so the download still finalizes.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         cdp = _StreamCDP(chunks=[b"C" * 2000], close_hang=True)  # IO.close never returns
         with _stream_limits(threshold=1024, cap=4096), patch.object(mod, "STREAM_IO_READ_TIMEOUT_SECONDS", 0.05):
             await asyncio.wait_for(_drive_download(interceptor, cdp, _raw_headers(content_length=2000)), timeout=5)
@@ -2654,7 +3662,7 @@ class TestTwoPathDownloadStreaming:
     async def test_settle_cancellation_does_not_cancel_capture(self, tmp_path: Path) -> None:
         # A settle-timeout cancellation must NOT cancel the in-flight/queued capture handlers (gather would,
         # destroying the temp mid-stream); the capture keeps running and its artifact still lands.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         cdp = _StreamCDP(chunks=[b"K" * 150])
         await interceptor._download_extraction_lock.acquire()  # hold the lock so the capture queues
         interceptor._schedule_cdp_handler(_drive_download(interceptor, cdp, _raw_headers(content_length=150)))
@@ -2674,7 +3682,7 @@ class TestTwoPathDownloadStreaming:
     async def test_stalled_take_stream_times_out_and_releases_lock(self, tmp_path: Path) -> None:
         # takeResponseBodyAsStream on a dead session is bounded too: on timeout it becomes _StreamStartError
         # → failRequest, so it can't hold the lock or hang settle's drain.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         cdp = _StreamCDP(take_hang=True)  # takeResponseBodyAsStream never returns
         with _stream_limits(threshold=1024, cap=4096), patch.object(mod, "STREAM_IO_READ_TIMEOUT_SECONDS", 0.05):
             await asyncio.wait_for(_drive_download(interceptor, cdp, _raw_headers(content_length=300)), timeout=5)
@@ -2686,7 +3694,7 @@ class TestTwoPathDownloadStreaming:
     async def test_stalled_fulfill_times_out_and_releases_lock(self, tmp_path: Path) -> None:
         # A hung fulfillRequest (after the streamed file is already published) is bounded: the artifact is
         # saved, the download still finalizes, and the lock is released.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         cdp = _StreamCDP(chunks=[b"F" * 2000], fulfill_hang=True)  # fulfillRequest never returns
         with _stream_limits(threshold=1024, cap=4096), patch.object(mod, "STREAM_IO_READ_TIMEOUT_SECONDS", 0.05):
             await asyncio.wait_for(_drive_download(interceptor, cdp, _raw_headers(content_length=2000)), timeout=5)
@@ -2697,7 +3705,7 @@ class TestTwoPathDownloadStreaming:
     async def test_stalled_read_times_out_and_releases_lock(self, tmp_path: Path) -> None:
         # A stalled IO.read must not hold the extraction lock forever (which would deadlock later captures
         # and hang teardown's drain). The per-read timeout aborts it, cleans the temp, and releases the lock.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         cdp = _StreamCDP(read_hang=True)  # IO.read never returns
         with _stream_limits(threshold=1024, cap=4096), patch.object(mod, "STREAM_IO_READ_TIMEOUT_SECONDS", 0.05):
             # Outer bound so a regression (no per-read timeout) fails fast instead of hanging the suite.
@@ -2708,7 +3716,7 @@ class TestTwoPathDownloadStreaming:
 
     @pytest.mark.asyncio
     async def test_stream_start_fail_unknown_cl_no_direct_fallback(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         cdp = _StreamCDP(take_error=RuntimeError("take failed"), getbody=b"M" * 300)
         with _stream_limits(threshold=1024, cap=4096):
             await _drive_download(interceptor, cdp, _raw_headers(content_length=None))
@@ -2719,11 +3727,11 @@ class TestTwoPathDownloadStreaming:
         assert cdp.count("Fetch.failRequest") == 1
 
     @pytest.mark.asyncio
-    async def test_os_replace_failure_cleans_temp_and_fails(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+    async def test_publication_failure_cleans_temp_and_fails(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         cdp = _StreamCDP(chunks=[b"N" * 2000])
         with _stream_limits(threshold=1024, cap=4096):
-            with patch.object(mod.os, "replace", side_effect=OSError("rename failed")):
+            with patch.object(mod.os, "link", side_effect=OSError("publication failed")):
                 await _drive_download(interceptor, cdp, _raw_headers(content_length=2000))
 
         assert list(tmp_path.iterdir()) == []  # temp cleaned even when finalize fails
@@ -2732,7 +3740,7 @@ class TestTwoPathDownloadStreaming:
 
     @pytest.mark.asyncio
     async def test_read_data_and_eof_in_same_message_not_dropped(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         # Single IO.read returns the whole body AND eof in one message; the last chunk must not be lost.
         cdp = _StreamCDP(chunks=[b"O" * 900])
         with _stream_limits(threshold=1024, cap=4096):
@@ -2743,7 +3751,7 @@ class TestTwoPathDownloadStreaming:
 
     @pytest.mark.asyncio
     async def test_zero_byte_download_saved_and_replayed(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         cdp = _StreamCDP(chunks=[])  # immediate eof, no data
         with _stream_limits(threshold=1024, cap=4096):
             await _drive_download(interceptor, cdp, _raw_headers(content_length=0))
@@ -2754,7 +3762,7 @@ class TestTwoPathDownloadStreaming:
 
     @pytest.mark.asyncio
     async def test_stale_interception_on_fulfill_is_benign_after_save(self, tmp_path: Path) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
         stale = Exception("Protocol error (Fetch.fulfillRequest): Invalid InterceptionId")
         cdp = _StreamCDP(chunks=[b"P" * 2000], fulfill_error=stale)
         with _stream_limits(threshold=1024, cap=4096):
@@ -2763,136 +3771,3 @@ class TestTwoPathDownloadStreaming:
 
         assert _only_file(tmp_path).read_bytes() == b"P" * 2000  # file saved despite the benign fulfill race
         assert not [log for log in logs if log.get("log_level") == "error"]
-
-
-class TestDownloadDestinationValidation:
-    """A download URL is chosen by the page, so it must be checked against the destination rules
-    before the worker fetches it — on the initial URL and on every redirect hop, and on both the
-    Playwright and urllib transports."""
-
-    @staticmethod
-    def _context(request_context: object | None = None, cookies: list[dict] | None = None) -> MagicMock:
-        ctx = MagicMock()
-        if request_context is None:
-            # Non-OK forces _download_url_directly onto its urllib transport.
-            non_ok = MagicMock()
-            non_ok.ok = False
-            non_ok.status = 407
-            ctx.request.get = AsyncMock(return_value=non_ok)
-        else:
-            ctx.request = request_context
-        ctx.cookies = AsyncMock(return_value=cookies or [])
-        return ctx
-
-    @pytest.mark.asyncio
-    async def test_playwright_transport_refuses_internal_destination(
-        self, tmp_path: Path, download_destinations: Any, fake_api_request_context: Any
-    ) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context(fake_api_request_context())
-
-        await interceptor._download_url_directly(f"{download_destinations.internal_base}/internal", "statement.pdf")
-
-        assert download_destinations.reached_internal() is False
-        assert list(tmp_path.iterdir()) == []
-
-    @pytest.mark.asyncio
-    async def test_playwright_transport_refuses_redirect_hop_to_internal_destination(
-        self, tmp_path: Path, download_destinations: Any, fake_api_request_context: Any
-    ) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context(fake_api_request_context())
-
-        await interceptor._download_url_directly(
-            f"{download_destinations.public_base}/redirect-to-internal", "statement.pdf"
-        )
-
-        assert download_destinations.reached_internal() is False
-        saved = list(tmp_path.iterdir())
-        assert [path.read_bytes() for path in saved] == []
-
-    @pytest.mark.asyncio
-    async def test_urllib_transport_refuses_internal_destination(
-        self, tmp_path: Path, download_destinations: Any
-    ) -> None:
-        # No browser context, so the urllib transport is entered directly and owns the initial
-        # destination check itself rather than inheriting one from the Playwright transport.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = None
-
-        await interceptor._download_url_directly(f"{download_destinations.internal_base}/internal", "statement.pdf")
-
-        assert download_destinations.reached_internal() is False
-        assert list(tmp_path.iterdir()) == []
-
-    @pytest.mark.asyncio
-    async def test_urllib_transport_refuses_redirect_hop_to_internal_destination(
-        self, tmp_path: Path, download_destinations: Any
-    ) -> None:
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context(cookies=[{"name": "sess", "value": "tok"}])
-
-        await interceptor._download_url_directly(
-            f"{download_destinations.public_base}/redirect-to-internal", "statement.pdf"
-        )
-
-        assert download_destinations.reached_internal() is False
-        saved = list(tmp_path.iterdir())
-        assert [path.read_bytes() for path in saved] == []
-
-    @pytest.mark.asyncio
-    async def test_allowed_destination_still_downloads(
-        self, tmp_path: Path, download_destinations: Any, fake_api_request_context: Any
-    ) -> None:
-        # Non-vacuity: the harness must be able to complete a download that is not refused,
-        # otherwise the refusal assertions above would pass for the wrong reason.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context(fake_api_request_context())
-
-        await interceptor._download_url_directly(f"{download_destinations.public_base}/attachment", "statement.pdf")
-
-        saved = list(tmp_path.iterdir())
-        assert [path.name for path in saved] == ["statement.pdf"]
-        assert saved[0].read_bytes() == download_destinations.PUBLIC_BODY
-
-    @pytest.mark.asyncio
-    async def test_urllib_transport_drops_session_cookie_on_cross_origin_hop(
-        self, tmp_path: Path, download_destinations: Any
-    ) -> None:
-        # The session cookie belongs to the host the download started on. A hop to a different
-        # origin — permitted or not — must not replay it.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = self._context(cookies=[{"name": "sess", "value": "tok"}])
-
-        await interceptor._download_url_directly(
-            f"{download_destinations.public_base}/redirect-to-other", "statement.pdf"
-        )
-
-        assert download_destinations.cookies_by_path["public-host.test"] == "sess=tok"
-        assert download_destinations.cookies_by_path["other-host.test"] == ""
-        saved = list(tmp_path.iterdir())
-        assert [path.name for path in saved] == ["statement.pdf"]
-
-    @pytest.mark.asyncio
-    async def test_urllib_transport_reads_content_type_case_insensitively(
-        self, tmp_path: Path, download_destinations: Any
-    ) -> None:
-        # Servers send "Content-Type"; the extension for a suffix-less download comes from it.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = None
-
-        await interceptor._download_url_directly(f"{download_destinations.public_base}/attachment", "statement")
-
-        assert [path.name for path in tmp_path.iterdir()] == ["statement.pdf"]
-
-    @pytest.mark.asyncio
-    async def test_urllib_transport_does_not_save_an_error_response_body(
-        self, tmp_path: Path, download_destinations: Any
-    ) -> None:
-        # An error page is not the file. Saving its body would report a corrupt download as success.
-        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
-        interceptor._browser_context = None
-
-        await interceptor._download_url_directly(f"{download_destinations.public_base}/notfound", "statement.pdf")
-
-        assert list(tmp_path.iterdir()) == []

@@ -1,6 +1,7 @@
 import { ActionsApiResponse, Status as WorkflowRunStatus } from "@/api/types";
 import { BrowserStream } from "@/components/BrowserStream";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
+import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
 import { ActionScreenshot } from "@/routes/tasks/detail/ActionScreenshot";
 import { statusIsFinalized } from "@/routes/tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
@@ -25,7 +26,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";
-import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
+import { useStreamTransport } from "@/hooks/useRuntimeConfig";
 import { RunHealChip } from "./RunHealChip";
 import { RunReliabilityUplink } from "./RunReliabilityUplink";
 
@@ -48,7 +49,6 @@ function WorkflowRunOverview() {
   const activeIteration = parseActiveIterationParam(iterationParam);
   const queryClient = useQueryClient();
   const [vncFailed, setVncFailed] = useState(false);
-  const { browserStreamingMode } = useBrowserStreamingMode();
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
     useWorkflowRunWithWorkflowQuery();
 
@@ -60,6 +60,7 @@ function WorkflowRunOverview() {
   const workflowPermanentId = workflow?.workflow_permanent_id;
 
   const browserSessionId = workflowRun?.browser_session_id;
+  const { streamTransport } = useStreamTransport(browserSessionId);
 
   const invalidateQueries = useCallback(() => {
     if (workflowRunId) {
@@ -120,7 +121,7 @@ function WorkflowRunOverview() {
         selection.block_type === "human_interaction"))
   );
 
-  const shouldUseCdpStream = browserStreamingMode === "cdp";
+  const shouldUseCdpStream = streamTransport === "cdp";
   const shouldShowBrowserStream =
     wantsVncStream && !shouldUseCdpStream && !vncFailed;
   const shouldShowScreencastFallback =
@@ -148,10 +149,21 @@ function WorkflowRunOverview() {
             onClose={handleVncClose}
           />
         )}
+        {/* The per-run stream is fed only by display capture on the worker, which stops as soon
+            as a run has a browser_session_id — so a session-backed run streams the session. */}
+        {shouldShowScreencastFallback && (
+          <BrowserSessionStream
+            key={browserSessionId}
+            browserSessionId={browserSessionId!}
+            interactive={isPaused}
+            showControlButtons={isPaused}
+            centered
+          />
+        )}
         {!shouldShowBrowserStream &&
-          (shouldShowScreencastFallback || selection === "stream") && (
+          !shouldShowScreencastFallback &&
+          selection === "stream" && (
             <WorkflowRunStream
-              alwaysShowStream={shouldShowScreencastFallback}
               interactive={isPaused}
               showControlButtons={isPaused}
             />

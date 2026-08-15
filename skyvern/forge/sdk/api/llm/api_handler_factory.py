@@ -27,6 +27,10 @@ from skyvern.forge import app
 from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler, dummy_llm_api_handler
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+from skyvern.forge.sdk.api.llm.copilot_model_usage import (
+    CopilotModelUsageEvent,
+    emit_direct_copilot_model_usage,
+)
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     CUSTOM_LLM_KEY_PREFIX,
     custom_llm_passthrough_parameters,
@@ -204,6 +208,7 @@ VISION_FALLBACK_PROMPT_NAMES = {
     "css-shape-convert",
     "extract-text-from-image",
     "solve-arithmetic-captcha",
+    "solve-dice-captcha",
     "ui-tars-system-prompt",
 }
 
@@ -539,8 +544,6 @@ def _consume_prompt_breakdown(context: SkyvernContext | None) -> dict[str, Any]:
     breakdown = context.last_prompt_breakdown
     context.last_prompt_breakdown = None
     return {
-        "html_token_count": breakdown.get("html_token_count"),
-        "html_pct": breakdown.get("html_pct"),
         "total_tokens_local": breakdown.get("total_tokens_local"),
         "prompt_template_name": breakdown.get("template_name"),
     }
@@ -638,6 +641,91 @@ def _response_routing_metadata(response: object) -> tuple[str | None, str | None
     )
 
 
+def _usage_int_field(value: Any, *field_names: str) -> int | None:
+    for field_name in field_names:
+        field = value.get(field_name) if isinstance(value, dict) else getattr(value, field_name, None)
+        if isinstance(field, int) and not isinstance(field, bool):
+            return field
+    return None
+
+
+def _copilot_model_usage_event(
+    response: object,
+    *,
+    request_model: str,
+    provider_name: str | None,
+    cost: float | None,
+    prompt_name: str | None,
+) -> CopilotModelUsageEvent:
+    try:
+        response_model = getattr(response, "model", None)
+    except Exception:
+        response_model = None
+    try:
+        usage = getattr(response, "usage", None)
+        input_tokens = _usage_int_field(usage, "prompt_tokens", "input_tokens") if usage is not None else None
+        output_tokens = _usage_int_field(usage, "completion_tokens", "output_tokens") if usage is not None else None
+        details = None
+        if usage is not None:
+            details = getattr(usage, "prompt_tokens_details", None) or getattr(usage, "input_tokens_details", None)
+        cache_read_tokens = _usage_int_field(details, "cached_tokens") if details is not None else None
+        if cache_read_tokens is None and usage is not None:
+            cache_read_tokens = _usage_int_field(usage, "cache_read_input_tokens")
+        cache_creation_tokens = (
+            _usage_int_field(details, "cache_write_tokens", "cache_creation_input_tokens")
+            if details is not None
+            else None
+        )
+        if cache_creation_tokens is None and details is not None:
+            model_extra = getattr(details, "model_extra", None)
+            if isinstance(model_extra, dict):
+                cache_creation_tokens = _usage_int_field(model_extra, "cache_write_tokens")
+        if cache_creation_tokens is None and usage is not None:
+            cache_creation_tokens = _usage_int_field(usage, "cache_creation_input_tokens", "cache_write_input_tokens")
+    except Exception:
+        input_tokens = None
+        output_tokens = None
+        cache_read_tokens = None
+        cache_creation_tokens = None
+    return CopilotModelUsageEvent(
+        request_model=request_model,
+        response_model=response_model if isinstance(response_model, str) else None,
+        provider_name=provider_name,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_creation_tokens=cache_creation_tokens,
+        cost=cost,
+        prompt_name=prompt_name,
+    )
+
+
+def _emit_copilot_model_usage_for_response(
+    response: object,
+    *,
+    request_model: str,
+    prompt_name: str | None,
+    cost: float | None,
+) -> None:
+    try:
+        provider_name, _ = _response_routing_metadata(response)
+        emit_direct_copilot_model_usage(
+            _copilot_model_usage_event(
+                response,
+                request_model=request_model,
+                provider_name=provider_name,
+                cost=cost,
+                prompt_name=prompt_name,
+            ),
+            logger=LOG,
+        )
+    except Exception:
+        try:
+            LOG.warning("Failed to emit Copilot model usage", exc_info=True)
+        except Exception:
+            pass
+
+
 @runtime_checkable
 class RouterWithModelList(Protocol):
     model_list: list[dict[str, Any]]
@@ -683,6 +771,7 @@ class LLMCallStats(BaseModel):
     reasoning_tokens: int | None = None
     cached_tokens: int | None = None
     llm_cost: float | None = None
+    llm_cost_available: bool = False
 
 
 def _get_artifact_targets_and_persist_flag(
@@ -812,6 +901,72 @@ def _convert_allowed_fails_policy(policy: LLMAllowedFailsPolicy | None) -> Allow
 # Public so callers (e.g. scripts/skyvern_run_script_helper.get_gemini_3_reasoning_effort_override)
 # can validate against the same set instead of duplicating the values.
 VALID_GEMINI_3_REASONING_EFFORTS: tuple[str, ...] = ("minimal", "low", "medium", "high")
+
+
+def _build_litellm_router(llm_config: LLMRouterConfig) -> litellm.Router:
+    """Build a litellm.Router from a router config.
+
+    Shared by get_llm_api_handler_with_router (step engine) and LLMCaller (v3 / direct-call
+    engines) so both dispatch router/fallback groups identically. Behavior-identical to the
+    original inline construction.
+    """
+    cache_kwargs: dict[str, int] = {}
+    if llm_config.redis_max_connections is not None:
+        cache_kwargs["max_connections"] = llm_config.redis_max_connections
+
+    fallback_groups: list[str]
+    if not llm_config.fallback_model_group:
+        fallback_groups = []
+    elif isinstance(llm_config.fallback_model_group, str):
+        fallback_groups = [llm_config.fallback_model_group]
+    else:
+        fallback_groups = list(llm_config.fallback_model_group)
+
+    # Emit one fallbacks entry per non-terminal hop so secondary entry points
+    # (e.g. truncation retry that calls router.acompletion(model=fallback_groups[0]))
+    # also benefit from the remaining chain. Equivalent to the legacy single-dict
+    # shape for the primary entry point. SKY-10200.
+    chain = [llm_config.main_model_group, *fallback_groups]
+    fallbacks_payload: list[dict[str, list[str]]] = [{chain[i]: chain[i + 1 :]} for i in range(len(chain) - 1)]
+
+    return litellm.Router(
+        model_list=_inject_gemini_safety_settings([dataclasses.asdict(model) for model in llm_config.model_list]),
+        redis_host=llm_config.redis_host,
+        redis_port=llm_config.redis_port,
+        redis_password=llm_config.redis_password,
+        cache_kwargs=cache_kwargs,
+        routing_strategy=llm_config.routing_strategy,
+        fallbacks=fallbacks_payload,
+        # Router-level default timeout. Per litellm router precedence
+        # (litellm/router.py:_get_non_stream_timeout) this is the fallback used when neither the
+        # caller kwarg nor the per-deployment litellm_params['timeout'] is set. Callers that omit a
+        # per-call timeout let per-deployment timeouts apply.
+        timeout=settings.LLM_CONFIG_TIMEOUT,
+        num_retries=llm_config.num_retries,
+        retry_after=llm_config.retry_delay_seconds,
+        disable_cooldowns=llm_config.disable_cooldowns,
+        allowed_fails=llm_config.allowed_fails,
+        allowed_fails_policy=_convert_allowed_fails_policy(llm_config.allowed_fails_policy),
+        cooldown_time=llm_config.cooldown_time,
+        set_verbose=(False if settings.is_cloud_environment() else llm_config.set_verbose),
+        enable_pre_call_checks=True,
+    )
+
+
+# Cache routers by llm_key so concurrent LLMCaller instances (v3 builds one per run) share a single
+# litellm.Router + redis pool instead of rebuilding per task. NOTE: this is a SEPARATE cache from
+# LLMAPIHandlerFactory._router_handler_cache (which caches step-engine *handlers*), so a router group
+# used by both the step engine and LLMCaller currently has two Router instances (two redis pools,
+# independent cooldown state). Accepted at current v3 volume; unifying the two is a follow-up.
+_LLMCALLER_ROUTER_CACHE: dict[str, litellm.Router] = {}
+
+
+def _get_or_build_cached_router(llm_key: str, llm_config: LLMRouterConfig) -> litellm.Router:
+    cached = _LLMCALLER_ROUTER_CACHE.get(llm_key)
+    if cached is None:
+        cached = _build_litellm_router(llm_config)
+        _LLMCALLER_ROUTER_CACHE[llm_key] = cached
+    return cached
 
 
 class LLMAPIHandlerFactory:
@@ -963,7 +1118,7 @@ class LLMAPIHandlerFactory:
         return None
 
     @staticmethod
-    def _completion_cost(response: ModelResponse | CustomStreamWrapper) -> float:
+    def _completion_cost_or_none(response: ModelResponse | CustomStreamWrapper) -> float | None:
         """litellm completion cost, with two known litellm gaps corrected here: the Vertex
         Gemini flex tier, and long-context OpenAI-direct GPT-5.6 flex calls. Both bill at
         the standard rate in litellm and are halved post hoc. Internal cost tracking only
@@ -973,7 +1128,7 @@ class LLMAPIHandlerFactory:
             cost = litellm.completion_cost(completion_response=response)
         except Exception as e:
             LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
-            return 0.0
+            return None
         hidden_params = getattr(response, "_hidden_params", None)
         provider_specific = hidden_params.get("provider_specific_fields") if isinstance(hidden_params, dict) else None
         if isinstance(provider_specific, dict) and provider_specific.get("traffic_type") == _VERTEX_FLEX_TRAFFIC_TYPE:
@@ -1052,6 +1207,18 @@ class LLMAPIHandlerFactory:
                 LLMAPIHandlerFactory._apply_anthropic_thinking_optimization(
                     parameters, new_budget, llm_config, prompt_name
                 )
+            elif llm_config.pin_reasoning_effort:
+                # setdefault, not a bare return: a caller that supplies its own parameters
+                # skips get_api_parameters, so the pinned effort would otherwise be absent.
+                parameters.setdefault("reasoning_effort", llm_config.reasoning_effort)
+                LOG.debug(
+                    "Thinking budget optimization left reasoning_effort pinned by config",
+                    prompt_name=prompt_name,
+                    budget=new_budget,
+                    model=model_label,
+                    reasoning_effort=parameters.get("reasoning_effort"),
+                )
+                return
             else:
                 is_xai_model = (check_model or "").lower().startswith("xai/")
                 reasoning_effort = (parameters.get("reasoning_effort") or "low") if is_xai_model else "low"
@@ -1408,10 +1575,10 @@ class LLMAPIHandlerFactory:
         if not isinstance(llm_config, LLMRouterConfig):
             raise InvalidLLMConfigError(llm_key)
 
-        cache_kwargs: dict[str, int] = {}
-        if llm_config.redis_max_connections is not None:
-            cache_kwargs["max_connections"] = llm_config.redis_max_connections
-
+        router = _build_litellm_router(llm_config)
+        main_model_group = llm_config.main_model_group
+        # Re-derived here (also computed inside _build_litellm_router) because the truncation-retry
+        # and non-gemini-fallback paths in the handler below reference fallback_groups directly.
         fallback_groups: list[str]
         if not llm_config.fallback_model_group:
             fallback_groups = []
@@ -1419,40 +1586,6 @@ class LLMAPIHandlerFactory:
             fallback_groups = [llm_config.fallback_model_group]
         else:
             fallback_groups = list(llm_config.fallback_model_group)
-
-        # Emit one fallbacks entry per non-terminal hop so secondary entry points
-        # (e.g. truncation retry that calls router.acompletion(model=fallback_groups[0]))
-        # also benefit from the remaining chain. For the primary entry point
-        # this is equivalent to the legacy single-dict shape because litellm's
-        # run_async_fallback outer loop iterates either form end-to-end. SKY-10200.
-        chain = [llm_config.main_model_group, *fallback_groups]
-        fallbacks_payload: list[dict[str, list[str]]] = [{chain[i]: chain[i + 1 :]} for i in range(len(chain) - 1)]
-
-        router = litellm.Router(
-            model_list=_inject_gemini_safety_settings([dataclasses.asdict(model) for model in llm_config.model_list]),
-            redis_host=llm_config.redis_host,
-            redis_port=llm_config.redis_port,
-            redis_password=llm_config.redis_password,
-            cache_kwargs=cache_kwargs,
-            routing_strategy=llm_config.routing_strategy,
-            fallbacks=fallbacks_payload,
-            # Router-level default timeout. Per litellm router precedence
-            # (litellm/router.py:_get_non_stream_timeout) this is the fallback
-            # used when neither the caller kwarg nor the per-deployment
-            # litellm_params['timeout'] is set. Setting it here (and dropping
-            # the per-call timeout kwarg below) lets per-deployment timeouts
-            # actually apply — previously the call-site value clobbered them.
-            timeout=settings.LLM_CONFIG_TIMEOUT,
-            num_retries=llm_config.num_retries,
-            retry_after=llm_config.retry_delay_seconds,
-            disable_cooldowns=llm_config.disable_cooldowns,
-            allowed_fails=llm_config.allowed_fails,
-            allowed_fails_policy=_convert_allowed_fails_policy(llm_config.allowed_fails_policy),
-            cooldown_time=llm_config.cooldown_time,
-            set_verbose=(False if settings.is_cloud_environment() else llm_config.set_verbose),
-            enable_pre_call_checks=True,
-        )
-        main_model_group = llm_config.main_model_group
 
         @traced(name=LLM_REQUEST_SPAN_NAME, tags=[llm_key])
         async def llm_api_handler_with_router_and_fallback(
@@ -1753,6 +1886,12 @@ class LLMAPIHandlerFactory:
                                 cache_resource_name,
                                 cache_variant,
                             )
+                            _emit_copilot_model_usage_for_response(
+                                response,
+                                request_model=direct_model_used,
+                                prompt_name=prompt_name,
+                                cost=LLMAPIHandlerFactory._completion_cost_or_none(response),
+                            )
                             model_used = response.model or direct_model_used
                             # This path invokes the primary deployment directly, so a
                             # successful response is primary-served by construction.
@@ -1771,6 +1910,12 @@ class LLMAPIHandlerFactory:
 
                     if response is None:
                         response, llm_request_json = await _call_router_without_cache()
+                        _emit_copilot_model_usage_for_response(
+                            response,
+                            request_model=main_model_group,
+                            prompt_name=prompt_name,
+                            cost=LLMAPIHandlerFactory._completion_cost_or_none(response),
+                        )
                         response_model = response.model or main_model_group
                         model_used = response_model
                         served_group = LLMAPIHandlerFactory._served_model_group(router, response)
@@ -1822,6 +1967,12 @@ class LLMAPIHandlerFactory:
                                 messages=messages,
                                 drop_params=True,
                                 **fallback_params,
+                            )
+                            _emit_copilot_model_usage_for_response(
+                                response,
+                                request_model=fallback_model,
+                                prompt_name=prompt_name,
+                                cost=LLMAPIHandlerFactory._completion_cost_or_none(response),
                             )
                         finally:
                             llm_duration_seconds += time.perf_counter() - _llm_call_start
@@ -1931,6 +2082,12 @@ class LLMAPIHandlerFactory:
                                     messages=messages,
                                     drop_params=True,
                                     **parameters,
+                                )
+                                _emit_copilot_model_usage_for_response(
+                                    response,
+                                    request_model=fallback_model,
+                                    prompt_name=prompt_name,
+                                    cost=LLMAPIHandlerFactory._completion_cost_or_none(response),
                                 )
                             finally:
                                 llm_duration_seconds += time.perf_counter() - _llm_call_start
@@ -2043,7 +2200,7 @@ class LLMAPIHandlerFactory:
                 completion_token_detail = None
                 cached_token_detail = None
                 # FIXME: volcengine doesn't support litellm cost calculation.
-                llm_cost = LLMAPIHandlerFactory._completion_cost(response)
+                llm_cost = LLMAPIHandlerFactory._completion_cost_or_none(response) or 0.0
                 prompt_tokens = 0
                 completion_tokens = 0
                 reasoning_tokens = 0
@@ -2559,6 +2716,12 @@ class LLMAPIHandlerFactory:
                         **active_parameters,
                     )
                     llm_duration_seconds = time.perf_counter() - t_llm_request
+                    _emit_copilot_model_usage_for_response(
+                        response,
+                        request_model=model_name,
+                        prompt_name=prompt_name,
+                        cost=LLMAPIHandlerFactory._completion_cost_or_none(response),
+                    )
                 # Error paths only set status=error, not token/cost attrs via
                 # _enrich_llm_span — no response object exists so there's nothing to report.
                 except (litellm.exceptions.APIError, *_TRANSIENT_LLM_DEPENDENCY_ERRORS) as e:
@@ -2655,7 +2818,7 @@ class LLMAPIHandlerFactory:
                 completion_token_detail = None
                 cached_token_detail = None
                 # FIXME: volcengine doesn't support litellm cost calculation.
-                llm_cost = LLMAPIHandlerFactory._completion_cost(response)
+                llm_cost = LLMAPIHandlerFactory._completion_cost_or_none(response) or 0.0
                 prompt_tokens = 0
                 completion_tokens = 0
                 reasoning_tokens = 0
@@ -3045,6 +3208,15 @@ class LLMCaller:
                 http_client=ForgeAsyncHttpxClientWrapper(),
             )
 
+        # Router configs (fallback/flex groups) can't be dispatched as a single litellm model;
+        # build the shared litellm.Router once so call() can route through it. Direct configs
+        # leave this None and take the single-model acompletion path unchanged.
+        self._router: litellm.Router | None = None
+        self._router_model_group: str | None = None
+        if isinstance(self.llm_config, LLMRouterConfig):
+            self._router = _get_or_build_cached_router(self.original_llm_key, self.llm_config)
+            self._router_model_group = self.llm_config.main_model_group
+
     def add_tool_result(self, tool_result: dict[str, Any]) -> None:
         self.current_tool_results.append(tool_result)
 
@@ -3089,8 +3261,9 @@ class LLMCaller:
         active_parameters.update(parameters)
         if extra_parameters:
             active_parameters.update(extra_parameters)
-        if self.llm_config.litellm_params:  # type: ignore
-            active_parameters.update(self.llm_config.litellm_params)  # type: ignore
+        # Router configs carry per-deployment litellm_params inside the Router, not on the config.
+        if not isinstance(self.llm_config, LLMRouterConfig) and self.llm_config.litellm_params:
+            active_parameters.update(self.llm_config.litellm_params)
 
         context = skyvern_context.current()
         secret_values = _current_secret_values_for_redaction()
@@ -3310,6 +3483,17 @@ class LLMCaller:
                 LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
                 raise LLMProviderError(self.llm_key, cause=e) from e
 
+            call_stats = LLMCallStats()
+            try:
+                call_stats = await self.get_call_stats(response)
+            finally:
+                _emit_copilot_model_usage_for_response(
+                    response,
+                    request_model=self.llm_config.model_name,
+                    prompt_name=prompt_name,
+                    cost=call_stats.llm_cost if call_stats.llm_cost_available else None,
+                )
+
             llm_response_json = _safe_model_dump_json(response)
             if should_persist_llm_artifacts:
                 if _should_bundle:
@@ -3323,7 +3507,6 @@ class LLMCaller:
                         )
                     )
 
-            call_stats = await self.get_call_stats(response)
             actual_model = _normalize_llm_model(getattr(response, "model", None) or self.llm_config.model_name)
             if step and not is_speculative_step:
                 await app.DATABASE.tasks.update_step(
@@ -3395,8 +3578,6 @@ class LLMCaller:
                 **_consume_prompt_breakdown(context),
             )
 
-            # See comment on the non-router _enrich_llm_span call — same reasoning
-            # for the fallback to self.llm_config.model_name.
             _enrich_llm_span(
                 _llm_span,
                 model=actual_model or self.llm_config.model_name,
@@ -3623,6 +3804,18 @@ class LLMCaller:
                     except Exception:
                         LOG.warning("Failed to close custom OpenRouter client", exc_info=True)
 
+        if self._router is not None:
+            # Router/fallback groups dispatch through the litellm.Router built in __init__. No
+            # timeout kwarg: the router's own precedence lets per-deployment timeouts apply
+            # (see _build_litellm_router). Direct configs fall through to acompletion below.
+            return await self._router.acompletion(
+                model=self._router_model_group,
+                messages=messages,
+                tools=tools,
+                drop_params=True,
+                **active_parameters,
+            )
+
         if self.llm_key and "ANTHROPIC" in self.llm_key:
             return await self._call_anthropic(messages, tools, timeout, **active_parameters)
 
@@ -3816,15 +4009,17 @@ class LLMCaller:
 
         if isinstance(response, AnthropicMessage):
             usage = response.usage
+            cached_tokens = usage.cache_read_input_tokens or 0
             input_token_cost = (3.0 / 1000000) * usage.input_tokens
             output_token_cost = (15.0 / 1000000) * usage.output_tokens
-            cached_token_cost = (0.3 / 1000000) * usage.cache_read_input_tokens
+            cached_token_cost = (0.3 / 1000000) * cached_tokens
             llm_cost = input_token_cost + output_token_cost + cached_token_cost
             return LLMCallStats(
                 llm_cost=llm_cost,
+                llm_cost_available=True,
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
-                cached_tokens=usage.cache_read_input_tokens,
+                cached_tokens=cached_tokens,
                 reasoning_tokens=0,
             )
         elif isinstance(response, (ModelResponse, CustomStreamWrapper)):
@@ -3832,10 +4027,12 @@ class LLMCaller:
                 response
             )
             llm_cost = 0.0
+            llm_cost_available = False
             if LLMAPIHandlerFactory._openrouter_model_name(self.original_llm_key, self.llm_config):
                 reported_cost = LLMAPIHandlerFactory._extract_reported_usage_cost(response)
                 if reported_cost is not None:
                     llm_cost = reported_cost
+                    llm_cost_available = True
                 else:
                     LOG.warning(
                         "OpenRouter response missing usage.cost; cost will be reported as 0",
@@ -3843,9 +4040,13 @@ class LLMCaller:
                         response_id=getattr(response, "id", None),
                     )
             else:
-                llm_cost = LLMAPIHandlerFactory._completion_cost(response)
+                computed_cost = LLMAPIHandlerFactory._completion_cost_or_none(response)
+                if computed_cost is not None:
+                    llm_cost = computed_cost
+                    llm_cost_available = True
             return LLMCallStats(
                 llm_cost=llm_cost,
+                llm_cost_available=llm_cost_available,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cached_tokens=cached_tokens,

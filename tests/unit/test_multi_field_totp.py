@@ -223,6 +223,12 @@ async def test_dom_input_generates_totp_immediately_before_write(monkeypatch: py
     )
     element.apply_secret_visual_mask = AsyncMock()
     element.input = AsyncMock(side_effect=lambda _text: events.append("input"))
+    # An untyped input defaults to type=text, so the single-field TOTP write runs through the read-back path
+    # (SKY-13821): the generated code is filled atomically, read back, and confirmed.
+    element.input_sequentially = AsyncMock()
+    element.input_clear = AsyncMock()
+    element.input_fill = AsyncMock(side_effect=lambda **_kwargs: events.append("input"))
+    element.refresh_locator_if_stale = AsyncMock()
 
     dom = MagicMock()
     dom.get_skyvern_element_by_id = AsyncMock(return_value=element)
@@ -231,7 +237,8 @@ async def test_dom_input_generates_totp_immediately_before_write(monkeypatch: py
     frame.safe_wait_for_animation_end = AsyncMock(side_effect=lambda **_kwargs: events.append("animation-wait"))
     monkeypatch.setattr(handler.SkyvernFrame, "create_instance", AsyncMock(return_value=frame))
     monkeypatch.setattr(handler, "IncrementalScrapePage", MagicMock())
-    monkeypatch.setattr(handler, "get_input_value", AsyncMock(return_value=""))
+    # First read (current_text) stays empty; the second read is the TOTP read-back, which confirms the code.
+    monkeypatch.setattr(handler, "get_input_value", AsyncMock(side_effect=["", "654321"]))
     monkeypatch.setattr(handler, "_get_input_or_select_context", AsyncMock(return_value=None))
     scraped_page = SimpleNamespace(id_to_element_dict={"otp": {"tagName": "input"}})
 
@@ -246,7 +253,9 @@ async def test_dom_input_generates_totp_immediately_before_write(monkeypatch: py
     assert len(results) == 1
     assert isinstance(results[0], ActionSuccess)
     assert events == ["animation-wait", "blocking-check", "generate", "input"]
-    element.input.assert_awaited_once_with("654321")
+    element.input_fill.assert_awaited_once_with(text="654321")
+    element.input_sequentially.assert_not_awaited()
+    element.input.assert_not_awaited()
     assert workflow_context.runtime_otp_values == {"654321"}
 
 
@@ -428,7 +437,7 @@ class TestHandleMultiFieldTotpSequence:
             patch("skyvern.webeye.actions.handler.skyvern_context.ensure_context", return_value=context),
             patch("skyvern.webeye.actions.handler.parse_totp_config", return_value=fake_totp),
             patch("skyvern.webeye.actions.handler.time.time", return_value=44),
-            patch("skyvern.webeye.actions.handler.asyncio.sleep", new_callable=AsyncMock) as sleep_mock,
+            patch("skyvern.webeye.actions.handler._totp_window_sleep", new_callable=AsyncMock) as sleep_mock,
         ):
             result = await _handle_multi_field_totp_sequence(
                 {"action_index": 5, "totp_secret": "otpauth://totp/example?secret=abc"},

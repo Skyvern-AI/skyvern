@@ -365,7 +365,7 @@ def test_recorded_branch_degraded_only_is_not_repairable() -> None:
     }
     outcome = recorded_outcome_from_run_blocks_result(
         result,
-        recorded_run_outcome=RecordedRunOutcome(verdict="not_demonstrated", reason_code="outcome_not_demonstrated"),
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_demonstrated", reason_code="no_meaningful_output"),
         completion_verification=_degraded_verification(),
     )
     assert outcome is not None
@@ -514,7 +514,7 @@ def test_recorded_branch_ambiguous_code_with_failed_block_stays_repairable() -> 
     }
     outcome = recorded_outcome_from_run_blocks_result(
         result,
-        recorded_run_outcome=RecordedRunOutcome(verdict="not_demonstrated", reason_code="outcome_not_demonstrated"),
+        recorded_run_outcome=RecordedRunOutcome(verdict="not_demonstrated", reason_code="no_meaningful_output"),
         completion_verification=_degraded_verification(),
     )
     assert outcome is not None

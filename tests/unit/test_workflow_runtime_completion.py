@@ -16,11 +16,13 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.runtime_completion import (
     CompletionCriterion,
     carried_contract,
+    contract_from_code_artifact_metadata,
     contract_from_request_criteria,
     grade_completion_contract,
     parse_completion_contract,
     with_contract,
 )
+from skyvern.forge.sdk.workflow.service import run_selection_is_partial
 
 _DOWNLOAD_CONTRACT = {
     "completion_contract": {
@@ -250,6 +252,43 @@ def test_requested_contract_round_trips_through_the_parser() -> None:
     assert grade_completion_contract(criteria, registered_download_count=1).satisfied is True
 
 
+def test_download_contract_comes_from_model_declared_artifact_metadata() -> None:
+    metadata = {
+        "download_statement": {
+            "completion_criteria": [
+                {
+                    "id": "deliver_statement",
+                    "text": "The requested statement is delivered as a registered file.",
+                    "deliverable_kind": "registered_download",
+                }
+            ]
+        }
+    }
+
+    contract = contract_from_code_artifact_metadata(metadata)
+
+    assert contract == {
+        "schema_version": 1,
+        "criteria": [{"id": "deliver_statement", "kind": "registered_download", "min_count": 1}],
+    }
+
+
+def test_ordinary_artifact_criterion_does_not_create_a_download_contract() -> None:
+    metadata = {
+        "extract_status": {
+            "completion_criteria": [
+                {
+                    "id": "return_status",
+                    "text": "The current status is returned.",
+                    "output_path": "output.status",
+                }
+            ]
+        }
+    }
+
+    assert contract_from_code_artifact_metadata(metadata) is None
+
+
 @pytest.mark.asyncio
 async def test_finalize_skips_grading_a_partial_run(monkeypatch: pytest.MonkeyPatch) -> None:
     """A frontier run of a block subset was never asked to produce the whole deliverable."""
@@ -264,6 +303,83 @@ async def test_finalize_skips_grading_a_partial_run(monkeypatch: pytest.MonkeyPa
     )
 
     assert statuses == [WorkflowRunStatus.completed]
+
+
+@pytest.mark.asyncio
+async def test_finalize_grades_a_test_run_against_the_requested_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A copilot test run executes a version the obligation has not been written onto yet, so a run
+    that registered nothing must still not finalize as completed."""
+    service, run, statuses = _wire_finalize(monkeypatch, contract=None, downloaded=[])
+
+    await service._finalize_workflow_run_status(
+        workflow_run_id=run.workflow_run_id,
+        workflow_run=run,
+        pre_finally_status=WorkflowRunStatus.running,
+        pre_finally_failure_reason=None,
+        requested_completion_contract=_DERIVED_CONTRACT,
+    )
+
+    assert statuses == [WorkflowRunStatus.terminated]
+
+
+@pytest.mark.asyncio
+async def test_finalize_completes_a_test_run_that_produced_the_requested_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, run, statuses = _wire_finalize(monkeypatch, contract=None, downloaded=["invoice.pdf"])
+
+    await service._finalize_workflow_run_status(
+        workflow_run_id=run.workflow_run_id,
+        workflow_run=run,
+        pre_finally_status=WorkflowRunStatus.running,
+        pre_finally_failure_reason=None,
+        requested_completion_contract=_DERIVED_CONTRACT,
+    )
+
+    assert statuses == [WorkflowRunStatus.completed]
+
+
+@pytest.mark.asyncio
+async def test_a_subset_run_stays_ungraded_even_with_a_requested_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    service, run, statuses = _wire_finalize(monkeypatch, contract=None, downloaded=[])
+
+    await service._finalize_workflow_run_status(
+        workflow_run_id=run.workflow_run_id,
+        workflow_run=run,
+        pre_finally_status=WorkflowRunStatus.running,
+        pre_finally_failure_reason=None,
+        is_partial_run=True,
+        requested_completion_contract=_DERIVED_CONTRACT,
+    )
+
+    assert statuses == [WorkflowRunStatus.completed]
+
+
+def _workflow_with_blocks(*labels: str, finally_block_label: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        workflow_definition=SimpleNamespace(
+            blocks=[SimpleNamespace(label=label) for label in labels],
+            finally_block_label=finally_block_label,
+        )
+    )
+
+
+def test_a_selection_naming_every_block_is_not_a_partial_run() -> None:
+    workflow = _workflow_with_blocks("download_statement", "summarize")
+
+    assert run_selection_is_partial(workflow, None) is False
+    assert run_selection_is_partial(workflow, ["download_statement", "summarize"]) is False
+    assert run_selection_is_partial(workflow, ["download_statement"]) is True
+
+
+def test_the_finally_block_is_not_owed_by_a_full_selection() -> None:
+    """execute_workflow runs the finally block on its own path, so a full selection never names it.
+
+    Counting it as unrun would silently skip contract grading for every workflow that has one."""
+    workflow = _workflow_with_blocks("download_statement", "summarize", "cleanup", finally_block_label="cleanup")
+
+    assert run_selection_is_partial(workflow, ["download_statement", "summarize"]) is False
+    assert run_selection_is_partial(workflow, ["download_statement"]) is True
 
 
 def test_a_stored_contract_survives_a_write_that_does_not_carry_one() -> None:
@@ -301,36 +417,13 @@ async def test_finalize_counts_session_scoped_downloads_not_yet_claimed(
     assert statuses == [WorkflowRunStatus.completed]
 
 
-@pytest.mark.asyncio
-async def test_both_acceptance_paths_attach_the_same_contract(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The obligation must not depend on whether the user clicked Accept or had auto-accept on."""
-    from skyvern.forge.sdk.copilot.completion_verification import registered_download_completion_criterion
+def test_interactive_copilot_routes_do_not_own_completion_contract_lifecycle() -> None:
     from skyvern.forge.sdk.routes import workflow_copilot as route
 
-    snapshot = SimpleNamespace(active=SimpleNamespace(criteria=[registered_download_completion_criterion()]))
-    monkeypatch.setattr(route, "_load_completion_criteria_snapshot", AsyncMock(return_value=snapshot))
-    chat = SimpleNamespace(workflow_copilot_chat_id="wcc_1", workflow_permanent_id="wpid_1")
-
-    for target in (
-        SimpleNamespace(workflow_definition=SimpleNamespace(completion_contract=None)),  # manual accept
-        SimpleNamespace(workflow_definition=SimpleNamespace(completion_contract=None)),  # auto accept
-    ):
-        await route._attach_requested_completion_contract(chat, target)
-        assert target.workflow_definition.completion_contract["criteria"][0]["kind"] == "registered_download"
-
-
-@pytest.mark.asyncio
-async def test_no_active_criteria_attaches_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
-    from skyvern.forge.sdk.routes import workflow_copilot as route
-
-    monkeypatch.setattr(
-        route, "_load_completion_criteria_snapshot", AsyncMock(return_value=SimpleNamespace(active=None))
-    )
-    target = SimpleNamespace(workflow_definition=SimpleNamespace(completion_contract=None))
-    await route._attach_requested_completion_contract(
-        SimpleNamespace(workflow_copilot_chat_id="c", workflow_permanent_id="w"), target
-    )
-    assert target.workflow_definition.completion_contract is None
+    assert not hasattr(route, "_load_completion_criteria_snapshot")
+    assert not hasattr(route, "_persist_completion_criteria_state")
+    assert not hasattr(route, "_turn_completion_criteria")
+    assert not hasattr(route, "_attach_requested_completion_contract")
 
 
 def test_apply_proposed_workflow_route_is_bound_to_the_route_handler() -> None:
@@ -362,47 +455,3 @@ def test_a_request_criterion_is_recognized_by_its_typed_deliverable_fields() -> 
 def test_output_path_alone_identifies_a_requested_download() -> None:
     by_path = SimpleNamespace(id="c0", deliverable_kind=None, output_path="output.downloaded_files")
     assert contract_from_request_criteria([by_path]) is not None
-
-
-@pytest.mark.asyncio
-async def test_auto_accept_uses_this_turns_criteria_not_the_stored_snapshot(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Auto-accept commits before the turn's criteria are persisted, so a turn that first mints a
-    download criterion must still carry the contract."""
-    from skyvern.forge.sdk.copilot.completion_verification import registered_download_completion_criterion
-    from skyvern.forge.sdk.routes import workflow_copilot as route
-
-    # The stored snapshot is pre-turn and has nothing; this turn's state holds the new criterion.
-    monkeypatch.setattr(
-        route, "_load_completion_criteria_snapshot", AsyncMock(return_value=SimpleNamespace(active=None))
-    )
-    agent_result = SimpleNamespace(
-        completion_criteria_turn_state=SimpleNamespace(
-            decision=SimpleNamespace(criteria=(registered_download_completion_criterion(),))
-        )
-    )
-    target = SimpleNamespace(workflow_definition=SimpleNamespace(completion_contract=None))
-
-    await route._attach_requested_completion_contract(
-        SimpleNamespace(workflow_copilot_chat_id="c", workflow_permanent_id="w"), target, agent_result
-    )
-
-    assert target.workflow_definition.completion_contract is not None
-
-
-@pytest.mark.asyncio
-async def test_manual_accept_still_falls_back_to_the_stored_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Manual accept runs in a later request with no turn state, so the persisted set is the source."""
-    from skyvern.forge.sdk.copilot.completion_verification import registered_download_completion_criterion
-    from skyvern.forge.sdk.routes import workflow_copilot as route
-
-    snapshot = SimpleNamespace(active=SimpleNamespace(criteria=[registered_download_completion_criterion()]))
-    monkeypatch.setattr(route, "_load_completion_criteria_snapshot", AsyncMock(return_value=snapshot))
-    target = SimpleNamespace(workflow_definition=SimpleNamespace(completion_contract=None))
-
-    await route._attach_requested_completion_contract(
-        SimpleNamespace(workflow_copilot_chat_id="c", workflow_permanent_id="w"), target
-    )
-
-    assert target.workflow_definition.completion_contract is not None

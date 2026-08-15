@@ -9,9 +9,9 @@ ignoring Linux paths).
 Flow:
 1. Enable Fetch interception for each page:
    - Response stage: detect and intercept downloads
-   - Request stage (when proxy auth configured): enable Fetch.authRequired for proxy 407 challenges
+   - Request stage: mediate every active request before dispatch and enable proxy auth challenges
 2. On each paused request:
-   - Request stage → Fetch.continueRequest (pass through to server)
+   - Request stage → authorize, then continue or fail closed before dispatch
    - Response non-download → Fetch.continueResponse (pass through)
    - Response download → extract body via stream → save to disk → Fetch.fulfillRequest
 """
@@ -21,37 +21,44 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import errno
 import hashlib
 import inspect
 import os
 import re
-import ssl
+import stat
+import threading
 import time
-import urllib.error
-import urllib.request
 import uuid
-from collections.abc import AsyncIterator, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Any, Literal
+from typing import IO, TYPE_CHECKING, Any, Literal
 from urllib.parse import unquote, urlparse
 
 import structlog
 from playwright.async_api import Browser, BrowserContext, CDPSession, Page
 
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, BROWSER_INTERCEPTOR_DISABLE_TIMEOUT
-from skyvern.exceptions import HttpException, SkyvernHTTPException
-from skyvern.forge.sdk.core.aiohttp_helper import strip_cross_origin_redirect_credentials
-from skyvern.utils.url_validators import (
-    MAX_SAFE_REDIRECTS,
-    SAFE_REDIRECT_STATUS_CODES,
-    validate_fetch_url,
-    validate_redirect_url,
+from skyvern.forge.sdk.api import files as file_api
+from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkDenialReason
+from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
+from skyvern.forge.sdk.core.http_request_authorization import (
+    RunScopedRedirectHopAuthorizer,
+    deny_unenrolled_redirect_hop,
+    is_unenrolled_redirect_hop_authorizer,
 )
 from skyvern.webeye.utils.page import SkyvernFrame
 
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.api.files import GuardedFileFetchHopResult
+    from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
+    from skyvern.forge.sdk.core.http_request_authorization import RedirectHopAuthorizer
+
 LOG = structlog.get_logger()
+
+CDP_DOWNLOAD_HTTP_SINK_KIND = "browser.download.http"
 
 _DETACHED_DISABLE_TASKS: set[asyncio.Task[None]] = set()
 
@@ -76,6 +83,19 @@ def _own_detached_disable(task: asyncio.Task[None]) -> None:
 
 # Maximum file size we'll attempt to download (data-url / direct-url / blob capture paths)
 MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024  # 100 MB
+# Browser.downloadWillBegin is fire-and-forget. Bound its admitted queue and serialize processing so
+# a page cannot make the worker buffer many direct-download responses concurrently.
+MAX_PENDING_BROWSER_DOWNLOAD_TASKS = 64
+# ``Browser.downloadWillBegin`` carries the complete URL. A data URL can therefore retain hundreds
+# of MiB before its task reaches the serialized worker. Bound the aggregate queued event text as
+# well as task count; 4x the accepted payload cap admits one worst-case encoded payload while
+# preventing a burst from retaining one such URL per task.
+MAX_PENDING_BROWSER_DOWNLOAD_EVENT_BYTES = 4 * MAX_FILE_SIZE_BYTES + 64 * 1024
+# Browser.downloadWillBegin can arrive just after the triggering Playwright action resolves. Hold a
+# short post-action admission window before declaring quiescence; the outer CodeBlock timeout still
+# bounds this and all subsequent handler work.
+BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS = 0.25
+_ARTIFACT_SCOPE_GENERATION_EVENT_KEY = "_skyvernArtifactScopeGeneration"
 
 # At/above this size a captured download is streamed straight to a temp file and the browser is
 # fulfilled with an empty body, instead of buffering the whole body in RAM and base64-replaying it —
@@ -109,6 +129,13 @@ class _StreamOutcome:
     total_bytes: int
 
 
+@dataclass
+class _ConfinedTemporaryFile:
+    directory_fd: int
+    name: str
+    handle: IO[bytes]
+
+
 class _StreamStartError(Exception):
     """Fetch.takeResponseBodyAsStream failed before any body bytes were consumed (body not taken)."""
 
@@ -119,6 +146,10 @@ class _StreamAborted(Exception):
     def __init__(self, total_bytes: int) -> None:
         super().__init__(f"streamed download exceeded {MAX_STREAMED_FILE_SIZE_BYTES} bytes ({total_bytes} read)")
         self.total_bytes = total_bytes
+
+
+class _DownloadScopeInvalidated(Exception):
+    """An in-flight capture reached publication after its run binding was revoked or rotated."""
 
 
 # Resource types that should NEVER be treated as downloads.
@@ -229,6 +260,22 @@ _STALE_INTERCEPTION_ERROR_SUBSTRINGS = (
 def _is_stale_interception_error(error: BaseException) -> bool:
     message = str(error).lower()
     return any(substr in message for substr in _STALE_INTERCEPTION_ERROR_SUBSTRINGS)
+
+
+def redacted_exception_origin(error: BaseException) -> str:
+    """Name the frame that raised ``error`` as ``module:function:line``.
+
+    Exception messages and tracebacks on the download path can carry the credential-bearing
+    download URL, so this reports only where a failure came from and never what it said.
+    """
+    traceback = error.__traceback__
+    if traceback is None:
+        return "unknown"
+    while traceback.tb_next is not None:
+        traceback = traceback.tb_next
+    code = traceback.tb_frame.f_code
+    module = traceback.tb_frame.f_globals.get("__name__")
+    return f"{module if isinstance(module, str) else code.co_filename}:{code.co_name}:{traceback.tb_lineno}"
 
 
 def _parse_headers(raw_headers: list[dict[str, str]]) -> dict[str, str]:
@@ -362,61 +409,6 @@ def _body_starts_with_html(data: bytes) -> bool:
     return head.startswith(b"<!doctype html") or bool(_HTML_START_TAG_RE.match(head))
 
 
-def _has_control_chars(text: str) -> bool:
-    return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text)
-
-
-# A refused destination and an exhausted hop budget both mean "do not fetch this"; callers must
-# treat them as a decision, not as a transport failure worth retrying on another client.
-DOWNLOAD_DESTINATION_ERRORS = (SkyvernHTTPException, HttpException)
-
-
-def _header_value(headers: dict[str, str], name: str) -> str | None:
-    lowered = name.lower()
-    return next((value for key, value in headers.items() if key.lower() == lowered), None)
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
-        return None
-
-
-def _urlopen_single_hop(
-    request: urllib.request.Request, ssl_context: ssl.SSLContext
-) -> tuple[int, dict[str, str], bytes]:
-    """Perform one HTTP hop without following redirects, so the next hop can be checked first."""
-    opener = urllib.request.build_opener(_NoRedirectHandler, urllib.request.HTTPSHandler(context=ssl_context))
-    try:
-        with opener.open(request) as response:
-            return response.status, dict(response.headers), response.read()
-    except urllib.error.HTTPError as error:
-        # Suppressing redirects turns them into errors here, so a redirect is returned for the
-        # caller to check. Every other error status stays an error: its body is not the file.
-        if error.code not in SAFE_REDIRECT_STATUS_CODES:
-            raise
-        with error:
-            return error.code, dict(error.headers), error.read()
-
-
-async def fetch_download_through_request_context(request_context: Any, url: str) -> Any:
-    """Return the final response for a page-supplied download URL.
-
-    The destination is checked before the initial request and again before every redirect hop, so
-    no hop carries cookies or headers to a host that has not been cleared. Raises on a refused
-    destination, a redirect without a target, or an exhausted hop budget.
-    """
-    current_url = await asyncio.to_thread(validate_fetch_url, url)
-    for _ in range(MAX_SAFE_REDIRECTS + 1):
-        response = await request_context.get(current_url, max_redirects=0)
-        if response.status not in SAFE_REDIRECT_STATUS_CODES:
-            return response
-        location = _header_value(dict(response.headers), "location")
-        if not location:
-            raise HttpException(response.status, current_url, "Redirected download provided no target")
-        current_url = await asyncio.to_thread(validate_redirect_url, current_url, location)
-    raise HttpException(400, current_url, "Too many redirects while fetching a download")
-
-
 def _payload_is_html_login_masquerade(data: bytes, content_type: str, filename: str) -> bool:
     """True when a download's bytes are an HTML document but the download does not claim to be HTML.
 
@@ -469,6 +461,27 @@ def normalize_download_filename(filename: str, content_type: str = "") -> str:
     if extension:
         return f"{filename}{extension}"
     return filename
+
+
+def _validated_download_basename(filename: str, content_type: str = "") -> str:
+    decoded_filename = filename.strip()
+    while True:
+        next_filename = unquote(decoded_filename)
+        if next_filename == decoded_filename:
+            break
+        decoded_filename = next_filename
+    if not decoded_filename:
+        return ""
+    if (
+        decoded_filename in {".", ".."}
+        or bool(_FILENAME_CONTROL_CHAR_RE.search(decoded_filename))
+        or "/" in decoded_filename
+        or "\\" in decoded_filename
+        or bool(_WINDOWS_DRIVE_RE.match(decoded_filename))
+        or Path(decoded_filename).is_absolute()
+    ):
+        raise ValueError("download filename must be a basename")
+    return normalize_download_filename(decoded_filename, content_type)
 
 
 def download_filename_from_suffix(download_suffix: str, source_extension: str, existing_names: set[str]) -> str:
@@ -596,11 +609,27 @@ class CDPDownloadInterceptor:
         output_dir: str | None = None,
         proxy_username: str | None = None,
         proxy_password: str | None = None,
+        *,
+        network_egress_monitor: BrowserNetworkEgressMonitor,
+        redirect_hop_authorizer: RedirectHopAuthorizer[GuardedFileFetchHopResult],
     ) -> None:
+        if network_egress_monitor is None or redirect_hop_authorizer is None:
+            raise TypeError("browser download required collaborators must be enrolled")
         self._output_dir: Path | None = Path(output_dir) if output_dir else None
+        self._download_directory_identities: dict[Path, tuple[int, int]] = {}
         self._proxy_username: str | None = proxy_username
         self._proxy_password: str | None = proxy_password
+        self._network_egress_monitor = network_egress_monitor
+        self._redirect_hop_authorizer = redirect_hop_authorizer
+        self._download_scope = (
+            redirect_hop_authorizer.download_scope
+            if isinstance(redirect_hop_authorizer, RunScopedRedirectHopAuthorizer)
+            else None
+        )
         self._cdp_sessions: list[CDPSession] = []
+        self._active_request_interceptors: dict[CDPSession, tuple[Page, Callable[[Page], None]]] = {}
+        self._enrolling_pages: list[Page] = []
+        self._mediates_requests = True
         self._enabled = False
         self._download_index = 0
         # Track auth attempts per requestId to prevent infinite retry loops
@@ -608,13 +637,18 @@ class CDPDownloadInterceptor:
         self._auth_attempts: dict[str, int] = {}
         # Track URLs already downloaded (dedup between Fetch interception and browser download monitor)
         self._downloaded_urls: set[str] = set()
-        self._data_download_lock = asyncio.Lock()
+        self._artifact_scope_lock = threading.Lock()
+        self._artifact_scope_generation = 0
+        self._artifact_scope_valid = True
+        self._browser_download_processing_lock = asyncio.Lock()
         # Serialize CDP download body extraction: at most one capture streams/buffers at a time per
         # interceptor, so concurrent large downloads cannot each write up to the cap and exhaust the
         # worker's ephemeral disk. Bounds in-flight disk use to a single capture (<= the stream cap).
         self._download_extraction_lock = asyncio.Lock()
         self._browser_download_monitor_lock = asyncio.Lock()
         self._browser_download_tasks: set[asyncio.Task[None]] = set()
+        self._browser_download_task_event_bytes: dict[asyncio.Task[None], int] = {}
+        self._pending_browser_download_event_bytes = 0
         self._browser_download_generation = 0
         self._accepting_browser_downloads = False
         self._browser_download_listener: Any | None = None
@@ -648,7 +682,55 @@ class CDPDownloadInterceptor:
         if dir_changed:
             self._downloaded_urls.clear()
         self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._remember_download_directory(self._output_dir)
         LOG.info("CDP download interceptor download dir set", download_dir=download_dir, dir_changed=dir_changed)
+
+    def rebind_download_scope(
+        self,
+        *,
+        download_dir: str,
+        redirect_hop_authorizer: RedirectHopAuthorizer[GuardedFileFetchHopResult],
+    ) -> None:
+        """Rotate a persistent interceptor's directory and redirect-hop authority as one scope."""
+        new_output_dir = Path(download_dir)
+        new_output_dir.mkdir(parents=True, exist_ok=True)
+        self._remember_download_directory(new_output_dir)
+        dir_changed = self._output_dir is not None and self._output_dir != new_output_dir
+        with self._artifact_scope_lock:
+            self._output_dir, self._redirect_hop_authorizer = new_output_dir, redirect_hop_authorizer
+            self._download_scope = (
+                redirect_hop_authorizer.download_scope
+                if isinstance(redirect_hop_authorizer, RunScopedRedirectHopAuthorizer)
+                else None
+            )
+            self._artifact_scope_generation += 1
+            self._artifact_scope_valid = True
+            if dir_changed:
+                self._downloaded_urls.clear()
+            if self._browser_session is not None and self._browser_download_listener is not None:
+                self._accepting_browser_downloads = True
+        LOG.info("CDP download interceptor scope rebound", download_dir=download_dir, dir_changed=dir_changed)
+
+    def invalidate_download_scope(self) -> None:
+        """Revoke run authority after an interrupted/failed persistent-session rebind."""
+        with self._artifact_scope_lock:
+            self._redirect_hop_authorizer = deny_unenrolled_redirect_hop
+            self._download_scope = None
+            self._artifact_scope_generation += 1
+            self._artifact_scope_valid = False
+            self._accepting_browser_downloads = False
+        for task in tuple(self._browser_download_tasks):
+            task.cancel()
+        LOG.error("CDP download interceptor run scope invalidated")
+
+    def _artifact_scope_is_active(self, generation: int) -> bool:
+        return self._artifact_scope_valid and generation == self._artifact_scope_generation
+
+    @property
+    def download_scope(self) -> str | None:
+        """Return the currently enrolled run scope for ownership-bound consumers."""
+        with self._artifact_scope_lock:
+            return self._download_scope
 
     def is_monitoring_browser_downloads(self) -> bool:
         """True while the monitor owns the context's setDownloadBehavior binding ({deny, eventsEnabled:True},
@@ -658,17 +740,18 @@ class CDPDownloadInterceptor:
     def _resolve_save_path(self, filename: str = "", content_type: str = "") -> tuple[Path, str]:
         """Generate a unique save path under _output_dir.
 
-        Sanitizes the filename (path traversal prevention), falls back to a UUID-based
+        Rejects non-basename filenames, falls back to a UUID-based
         name when empty, increments _download_index, and logs a warning if a file with
-        the same name already exists. Returns (save_path, sanitized_filename).
+        the same name already exists. Returns (save_path, validated_filename).
 
         Callers can pass a raw or empty filename — this method handles all normalization.
         """
         assert self._output_dir is not None
         self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._remember_download_directory(self._output_dir)
 
         self._download_index += 1
-        filename = normalize_download_filename(filename, content_type)
+        filename = _validated_download_basename(filename, content_type)
         if not filename:
             filename = f"download_{uuid.uuid4().hex[:8]}{_download_extension_for_content_type(content_type)}"
 
@@ -678,7 +761,11 @@ class CDPDownloadInterceptor:
         save_path = self._output_dir / filename
         # TODO: implement proper filename dedup (e.g., content hash or UUID suffix)
         if save_path.exists():
-            LOG.warning("Download filename collision, overwriting", filename=filename, save_path=str(save_path))
+            LOG.warning(
+                "Download filename collision; write will fail closed",
+                filename_fp=diagnostic_fingerprint(filename),
+                save_path_fp=diagnostic_fingerprint(str(save_path)),
+            )
 
         return save_path, filename
 
@@ -690,6 +777,17 @@ class CDPDownloadInterceptor:
         Playwright uses Request-stage interception with handleAuthRequests to receive
         proxy 407 challenges via Fetch.authRequired.
         """
+        if any(candidate is page for candidate in self._enrolling_pages) or any(
+            registered_page is page for registered_page, _ in self._active_request_interceptors.values()
+        ):
+            raise RuntimeError("CDP interception is already active or enrolling for this page")
+        self._enrolling_pages.append(page)
+        try:
+            await self._enable_for_page(page)
+        finally:
+            self._enrolling_pages = [candidate for candidate in self._enrolling_pages if candidate is not page]
+
+    async def _enable_for_page(self, page: Page) -> None:
         self._accepting_cdp_handlers = True
         cdp_session = await page.context.new_cdp_session(page)
         cdp_session.on("Fetch.requestPaused", lambda event: self._on_request_paused(event, cdp_session))
@@ -699,24 +797,56 @@ class CDPDownloadInterceptor:
         if has_proxy_auth:
             cdp_session.on("Fetch.authRequired", lambda event: self._on_auth_required(event, cdp_session))
 
-        # Always intercept Response stage for download detection.
-        # When proxy auth is needed, also intercept Request stage (like Playwright's
-        # CRNetworkManager) — Chrome requires Request-stage patterns for
-        # Fetch.authRequired to fire on proxy 407 challenges.
+        # A monitor explicitly constructed unenrolled marks a flow with no request mediation at
+        # all (vendor-attach browsers); download interception still has to come up there, so it
+        # runs Response-stage only. Only that exact state downgrades: an enforcing monitor in any
+        # other state (including mid-setup) must keep the loud registration failure below, because
+        # silently skipping registration would drop mediation the flow was promised.
+        self._mediates_requests = (
+            self._network_egress_monitor.invalidation_reason is not BrowserNetworkDenialReason.UNENROLLED
+        )
+
+        # Request-stage interception is the last boundary before browser credentials go on the
+        # wire. When mediating, it is mandatory even without proxy auth; the active request must
+        # consume the monitor's exact one-shot slot before Fetch.continueRequest can dispatch it.
+        # Without mediation it is only needed to receive proxy auth challenges.
         patterns: list[dict[str, str]] = [{"requestStage": "Response"}]
-        if has_proxy_auth:
-            # urlPattern "*" intercepts all requests at Request stage, which adds overhead.
-            # This is required: Chrome only fires Fetch.authRequired for proxy 407 challenges
-            # when a Request-stage pattern is registered.
+        if self._mediates_requests or has_proxy_auth:
             patterns.append({"urlPattern": "*", "requestStage": "Request"})
 
-        await cdp_session.send(
-            "Fetch.enable",
-            {
-                "patterns": patterns,
-                "handleAuthRequests": has_proxy_auth,
-            },
-        )
+        try:
+            await cdp_session.send(
+                "Fetch.enable",
+                {
+                    "patterns": patterns,
+                    "handleAuthRequests": has_proxy_auth,
+                },
+            )
+            if self._mediates_requests:
+                self._network_egress_monitor.register_active_request_interceptor(page=page, owner=self)
+
+            def close_listener(closed_page: Page) -> None:
+                # This listener is bound to `page`, so a close event carrying any other page means
+                # the registration is misrouted and the monitor can no longer be trusted to describe
+                # this page's egress. Normal self-close takes the plain unregister path.
+                if closed_page is not page:
+                    self._network_egress_monitor.invalidate()
+                self._unregister_active_request_interceptor(cdp_session)
+
+            self._active_request_interceptors[cdp_session] = (page, close_listener)
+            if page.is_closed() is True:
+                raise RuntimeError("page closed during interceptor registration")
+            page.on("close", close_listener)
+        except BaseException:
+            self._accepting_cdp_handlers = False
+            if cdp_session in self._active_request_interceptors:
+                self._unregister_active_request_interceptor(cdp_session)
+            self._network_egress_monitor.invalidate()
+            try:
+                await cdp_session.send("Fetch.disable")
+            except Exception:
+                pass
+            raise
         self._cdp_sessions.append(cdp_session)
         self._enabled = True
         LOG.info(
@@ -726,6 +856,21 @@ class CDPDownloadInterceptor:
             output_dir=str(self._output_dir),
             proxy_auth_enabled=has_proxy_auth,
         )
+
+    def _unregister_active_request_interceptor(self, cdp_session: CDPSession) -> None:
+        registration = self._active_request_interceptors.pop(cdp_session, None)
+        if registration is None:
+            return
+        page, close_listener = registration
+        try:
+            page.remove_listener("close", close_listener)
+        except Exception:
+            pass
+        try:
+            self._network_egress_monitor.unregister_active_request_interceptor(page=page, owner=self)
+        except Exception as error:
+            self._network_egress_monitor.invalidate()
+            LOG.error("Failed to unregister active request interceptor", error_type=type(error).__name__)
 
     async def enable_browser_download_monitor(self, browser: Browser, browser_context: BrowserContext) -> None:
         """Monitor browser-initiated downloads and save them directly via HTTP.
@@ -772,7 +917,17 @@ class CDPDownloadInterceptor:
             self._accepting_browser_downloads = True
             LOG.info("Browser download monitor enabled")
 
-    async def bind_to_context(self, browser_context: BrowserContext) -> None:
+    async def bind_to_context(
+        self,
+        browser_context: BrowserContext,
+        *,
+        enable_page_interception: bool = True,
+    ) -> None:
+        """Bind ownership to a context, optionally enrolling page-level Fetch.
+
+        Adopted persistent sessions use ownership-only mode: this keeps browser-download recovery
+        and run-scope rebind available without displacing the browser's provider-owned proxy auth.
+        """
         bind_lock = getattr(browser_context, "_skyvern_cdp_download_interceptor_bind_lock", None)
         if not isinstance(bind_lock, asyncio.Lock):
             bind_lock = asyncio.Lock()
@@ -782,22 +937,30 @@ class CDPDownloadInterceptor:
             existing: CDPDownloadInterceptor | None = getattr(
                 browser_context, "_skyvern_cdp_download_interceptor", None
             )
-            if existing is self and self._page_context is browser_context and self._page_listener is not None:
-                return
+            if existing is self and self._page_context is browser_context:
+                current_page_interception = self._page_listener is not None
+                if current_page_interception == enable_page_interception:
+                    return
+                raise RuntimeError("CDP download interceptor binding mode cannot change in place")
             if existing is not None and existing is not self:
                 await self._disable_for_rebind(existing)
 
-            def page_listener(page: Page) -> None:
-                if not self._accepting_pages:
-                    return
-                task = asyncio.create_task(self.enable_for_page(page))
-                self._page_enable_tasks.add(task)
-                task.add_done_callback(self._page_enable_done)
-
             self._page_context = browser_context
-            self._page_listener = page_listener
-            self._accepting_pages = True
-            browser_context.on("page", page_listener)
+            if enable_page_interception:
+
+                def page_listener(page: Page) -> None:
+                    if not self._accepting_pages:
+                        return
+                    task = asyncio.create_task(self.enable_for_page(page))
+                    self._page_enable_tasks.add(task)
+                    task.add_done_callback(self._page_enable_done)
+
+                self._page_listener = page_listener
+                self._accepting_pages = True
+                browser_context.on("page", page_listener)
+            else:
+                self._page_listener = None
+                self._accepting_pages = False
             browser_context._skyvern_cdp_download_interceptor = self  # type: ignore[attr-defined]
 
     async def _disable_for_rebind(self, existing: CDPDownloadInterceptor) -> None:
@@ -835,6 +998,11 @@ class CDPDownloadInterceptor:
             LOG.warning("CDP interception handler failed", error_type=type(error).__name__)
 
     def _browser_download_done(self, task: asyncio.Task[None]) -> None:
+        event_bytes = self._browser_download_task_event_bytes.pop(task, 0)
+        self._pending_browser_download_event_bytes = max(
+            0,
+            self._pending_browser_download_event_bytes - event_bytes,
+        )
         self._browser_download_tasks.discard(task)
         if task.cancelled():
             return
@@ -852,21 +1020,30 @@ class CDPDownloadInterceptor:
         except BaseException:
             for task in snapshot:
                 task.cancel()
+            await asyncio.gather(*snapshot, return_exceptions=True)
             raise
 
     async def _handle_browser_download(self, event: dict[str, Any]) -> None:
+        artifact_scope_generation = event.get(_ARTIFACT_SCOPE_GENERATION_EVENT_KEY)
+        if not isinstance(artifact_scope_generation, int):
+            artifact_scope_generation = self._artifact_scope_generation
+        async with self._browser_download_processing_lock:
+            await self._handle_browser_download_serialized(event, artifact_scope_generation)
+
+    async def _handle_browser_download_serialized(
+        self,
+        event: dict[str, Any],
+        artifact_scope_generation: int,
+    ) -> None:
         """Handle Browser.downloadWillBegin — save the file from its URL."""
         is_data_url = False
         try:
             url = event.get("url", "")
             suggested_filename = event.get("suggestedFilename", "")
-            logged_url = url
-            if url.lower().startswith("data:"):
-                logged_url = "data:<payload omitted>"
             LOG.info(
                 "Browser download detected",
-                url=logged_url,
-                suggested_filename=suggested_filename,
+                url_scheme=urlparse(url).scheme.lower(),
+                suggested_filename_fp=diagnostic_fingerprint(suggested_filename),
             )
             if not url:
                 LOG.warning("Empty download URL, skipping")
@@ -874,12 +1051,11 @@ class CDPDownloadInterceptor:
 
             is_data_url = url.lower().startswith("data:")
             if is_data_url:
-                async with self._data_download_lock:
-                    await self._download_data_url(url, suggested_filename)
+                await self._download_data_url(url, suggested_filename, artifact_scope_generation)
                 return
 
             if url in self._downloaded_urls:
-                LOG.debug("URL already captured via Fetch, skipping direct download", url=url)
+                LOG.debug("URL already captured via Fetch, skipping direct download")
                 return
 
             if url.startswith("blob:"):
@@ -887,16 +1063,16 @@ class CDPDownloadInterceptor:
                 # page builds the file client-side (e.g. Blob + createObjectURL), the CDP Fetch
                 # path never sees a network response, so read the bytes back from a same-origin
                 # page instead of dropping the download.
-                await self._download_blob_url(url, suggested_filename)
+                await self._download_blob_url(url, suggested_filename, artifact_scope_generation)
             elif url.startswith("http"):
-                await self._download_url_directly(url, suggested_filename)
+                await self._download_url_directly(url, suggested_filename, artifact_scope_generation)
             else:
                 LOG.warning("Download URL scheme not supported, skipping", scheme=urlparse(url).scheme)
         except Exception as exc:
             if is_data_url:
                 LOG.warning("Error handling data URL download event", error_type=type(exc).__name__)
             else:
-                LOG.warning("Error handling browser download event", exc_info=True)
+                LOG.warning("Error handling browser download event", error_type=type(exc).__name__)
 
     async def _run_data_worker(self, function: Any, *args: Any) -> tuple[Any, bool]:
         worker = asyncio.create_task(asyncio.to_thread(function, *args))
@@ -908,7 +1084,12 @@ class CDPDownloadInterceptor:
             except BaseException as worker_error:
                 raise asyncio.CancelledError from worker_error
 
-    async def _download_data_url(self, url: str, suggested_filename: str) -> bool:
+    async def _download_data_url(
+        self,
+        url: str,
+        suggested_filename: str,
+        artifact_scope_generation: int | None = None,
+    ) -> bool:
         if not self._output_dir:
             LOG.warning("No output_dir set, skipping data URL download")
             return False
@@ -923,7 +1104,14 @@ class CDPDownloadInterceptor:
                 LOG.debug("Data URL already captured, skipping", identity=download_identity)
                 return False
             save_path, filename = self._resolve_save_path(suggested_filename, content_type)
-            _, cancelled = await self._run_data_worker(self._atomically_write_bytes, save_path, data)
+            if artifact_scope_generation is None:
+                artifact_scope_generation = self._artifact_scope_generation
+            _, cancelled = await self._run_data_worker(
+                self._atomically_write_bytes,
+                save_path,
+                data,
+                artifact_scope_generation,
+            )
             # A rebind may have cleared the dedupe set and repointed _output_dir while this write
             # was off-loop. The file published into save_path's dir; only record its identity if
             # that dir is still the current scope, else it would skip an identical download in the
@@ -936,10 +1124,10 @@ class CDPDownloadInterceptor:
 
         LOG.info(
             "CDP download saved (data URL)",
-            filename=filename,
+            filename_fp=diagnostic_fingerprint(filename),
             content_type=content_type,
             size=len(data),
-            save_path=str(save_path),
+            save_path_fp=diagnostic_fingerprint(str(save_path)),
             download_index=self._download_index,
         )
         if cancelled:
@@ -966,158 +1154,238 @@ class CDPDownloadInterceptor:
         return _download_identity(url), content_type, data
 
     @staticmethod
-    def _atomically_write_bytes(save_path: Path, data: bytes | bytearray) -> None:
-        temporary_path = save_path.with_name(f"{save_path.name}.{uuid.uuid4().hex}{BROWSER_DOWNLOADING_SUFFIX}")
+    def _open_download_directory(directory: Path) -> int:
+        required_flags = ("O_DIRECTORY", "O_NOFOLLOW")
+        if any(not hasattr(os, flag) for flag in required_flags):
+            raise OSError(errno.ENOTSUP, "confined download writes are unsupported")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        return os.open(directory, flags)
+
+    def _remember_download_directory(self, directory: Path) -> None:
+        directory_fd = self._open_download_directory(directory)
         try:
-            with open(temporary_path, "wb") as file:
-                file.write(data)
-            os.replace(temporary_path, save_path)
+            directory_stat = os.fstat(directory_fd)
+            identity = (directory_stat.st_dev, directory_stat.st_ino)
+            expected_identity = self._download_directory_identities.setdefault(directory, identity)
+            if identity != expected_identity:
+                raise OSError(errno.ESTALE, "download directory changed after binding")
         finally:
-            temporary_path.unlink(missing_ok=True)
+            os.close(directory_fd)
 
-    async def _cookie_header_for_url(self, url: str) -> str:
-        """Build a Cookie header from the browser context's cookies applicable to ``url``.
+    def _open_confined_temporary_file(self, save_path: Path) -> _ConfinedTemporaryFile:
+        expected_identity = self._download_directory_identities.get(save_path.parent)
+        if expected_identity is None:
+            raise OSError(errno.ESTALE, "download directory is not bound")
 
-        The urllib fallback in ``_download_url_directly`` does not share the BrowserContext, so
-        without this it fetches unauthenticated and a session-gated endpoint answers with its
-        login page. Best-effort: returns "" if there is no context or cookies can't be read.
-        """
-        if self._browser_context is None:
-            return ""
+        directory_fd = self._open_download_directory(save_path.parent)
         try:
-            cookies = await self._browser_context.cookies(url)
-        except Exception as e:
-            LOG.debug("Could not read browser cookies for download fallback", url=url, error=str(e))
-            return ""
-        parts: list[str] = []
-        for cookie in cookies:
-            name, value = cookie.get("name") or "", cookie.get("value") or ""
-            # Skip control chars (CR/LF/NUL/DEL) so a stored value can't inject into the header line.
-            if name and not _has_control_chars(name) and not _has_control_chars(value):
-                parts.append(f"{name}={value}")
-        return "; ".join(parts)
+            directory_stat = os.fstat(directory_fd)
+            if (directory_stat.st_dev, directory_stat.st_ino) != expected_identity:
+                raise OSError(errno.ESTALE, "download directory changed after binding")
 
-    async def _download_url_via_urllib(self, url: str) -> tuple[bytes, str]:
-        """Fetch a download over urllib, checking the destination before every hop.
+            temporary_name = f"{save_path.name}.{uuid.uuid4().hex}{BROWSER_DOWNLOADING_SUFFIX}"
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            file_descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+            try:
+                handle = os.fdopen(file_descriptor, "w+b")
+            except BaseException:
+                os.close(file_descriptor)
+                os.unlink(temporary_name, dir_fd=directory_fd)
+                raise
+        except BaseException:
+            os.close(directory_fd)
+            raise
+        return _ConfinedTemporaryFile(
+            directory_fd=directory_fd,
+            name=temporary_name,
+            handle=handle,
+        )
 
-        The session cookie rides a normal header and is dropped when a hop crosses origin, so it
-        reaches the original host across a same-host redirect but is never replayed to another one.
-        """
-        current_url = await asyncio.to_thread(validate_fetch_url, url)
-        headers = {"User-Agent": "Mozilla/5.0"}
-        cookie_header = await self._cookie_header_for_url(current_url)
-        if cookie_header:
-            headers["Cookie"] = cookie_header
-        ssl_ctx = ssl.create_default_context()
+    @staticmethod
+    def _publish_confined_temporary_file(temporary_file: _ConfinedTemporaryFile, filename: str) -> None:
+        temporary_file.handle.flush()
+        source_stat = os.fstat(temporary_file.handle.fileno())
+        if not stat.S_ISREG(source_stat.st_mode) or source_stat.st_nlink != 1:
+            raise OSError(errno.EPERM, "download temporary file must be a regular single-link file")
+        os.link(
+            temporary_file.name,
+            filename,
+            src_dir_fd=temporary_file.directory_fd,
+            dst_dir_fd=temporary_file.directory_fd,
+            follow_symlinks=False,
+        )
 
-        for _ in range(MAX_SAFE_REDIRECTS + 1):
-            request = urllib.request.Request(current_url, headers=dict(headers))
-            status, response_headers, body = await asyncio.to_thread(_urlopen_single_hop, request, ssl_ctx)
-            if status not in SAFE_REDIRECT_STATUS_CODES:
-                return body, _header_value(response_headers, "content-type") or ""
-            location = _header_value(response_headers, "location")
-            if not location:
-                raise HttpException(status, current_url, "Redirected download provided no target")
-            next_url = await asyncio.to_thread(validate_redirect_url, current_url, location)
-            headers, _ = strip_cross_origin_redirect_credentials(headers, None, current_url, next_url)
-            current_url = next_url
-        raise HttpException(400, current_url, "Too many redirects while fetching a download")
+        try:
+            # The pre-link nlink check is not atomic with os.link, so re-read the source inode:
+            # the temp name plus the name we just published are the only two links that may exist.
+            # A third means someone aliased the inode inside that window.
+            published_stat = os.fstat(temporary_file.handle.fileno())
+            if published_stat.st_nlink != 2:
+                raise OSError(errno.EPERM, "download temporary file gained an unexpected link during publication")
 
-    async def _download_url_directly(self, url: str, suggested_filename: str) -> None:
-        """Download a URL directly via HTTP and save to the output directory.
+            destination_flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+            destination_flags |= getattr(os, "O_CLOEXEC", 0)
+            destination_fd = os.open(filename, destination_flags, dir_fd=temporary_file.directory_fd)
+            with os.fdopen(destination_fd, "rb") as destination:
+                destination_stat = os.fstat(destination.fileno())
+                if not stat.S_ISREG(destination_stat.st_mode) or (
+                    destination_stat.st_dev,
+                    destination_stat.st_ino,
+                ) != (source_stat.st_dev, source_stat.st_ino):
+                    raise OSError(errno.ESTALE, "download destination changed during publication")
+        except BaseException:
+            # Rolls back the link created above. os.link refuses collisions, so this name did not
+            # exist before this call; unlinking it assumes the confined directory grants no other
+            # writer the right to claim `filename` mid-publication.
+            os.unlink(filename, dir_fd=temporary_file.directory_fd)
+            raise
 
-        Tries Playwright's APIRequestContext first (shares browser context cookies),
-        falls back to urllib for pre-signed URLs or when APIRequestContext fails.
+    @staticmethod
+    def _cleanup_confined_temporary_file(temporary_file: _ConfinedTemporaryFile) -> None:
+        try:
+            temporary_file.handle.close()
+        finally:
+            try:
+                os.unlink(temporary_file.name, dir_fd=temporary_file.directory_fd)
+            finally:
+                os.close(temporary_file.directory_fd)
+
+    def _atomically_write_bytes(
+        self,
+        save_path: Path,
+        data: bytes | bytearray,
+        artifact_scope_generation: int | None = None,
+    ) -> None:
+        temporary_file = self._open_confined_temporary_file(save_path)
+        try:
+            temporary_file.handle.write(data)
+            if artifact_scope_generation is None:
+                self._publish_confined_temporary_file(temporary_file, save_path.name)
+            else:
+                with self._artifact_scope_lock:
+                    if not self._artifact_scope_is_active(artifact_scope_generation):
+                        raise _DownloadScopeInvalidated
+                    self._publish_confined_temporary_file(temporary_file, save_path.name)
+        finally:
+            self._cleanup_confined_temporary_file(temporary_file)
+
+    async def _download_url_directly(
+        self,
+        url: str,
+        suggested_filename: str,
+        artifact_scope_generation: int | None = None,
+    ) -> None:
+        """Download through the validated, pinned, per-hop-authorized shared fetch seam.
+
+        This seam is the only transport; there is deliberately no raw fallback, so a fetch that the
+        guard rejects (or that fails for any other reason) drops the download rather than retrying
+        it unmediated.
         """
         if not self._output_dir:
-            LOG.warning("No output_dir set, skipping direct download", url=url)
+            LOG.warning("No output_dir set, skipping direct download")
+            return
+        if self._browser_context is None:
+            LOG.error("Browser download context is unenrolled")
+            return
+        if is_unenrolled_redirect_hop_authorizer(self._redirect_hop_authorizer):
+            LOG.error("Redirect hop authorization is unenrolled for this browser session, dropping direct download")
             return
 
         t0 = time.monotonic()
-        data: bytes | None = None
-        method = ""
-        content_type = ""
-
-        # Try Playwright's APIRequestContext which shares the BrowserContext's cookies.
-        # We use the BrowserContext (not a Page) so this survives individual page closes.
-        if self._browser_context:
-            try:
-                response = await fetch_download_through_request_context(self._browser_context.request, url)
-                if response.ok:
-                    data = await response.body()
-                    content_type = response.headers.get("content-type", "")
-                    method = "playwright_api"
-                else:
-                    LOG.debug(
-                        "Playwright APIRequestContext returned non-OK status, trying urllib",
-                        url=url,
-                        status=response.status,
-                    )
-            except DOWNLOAD_DESTINATION_ERRORS as e:
-                # A refused destination is a decision about this URL, so the urllib transport must
-                # not be tried as a second chance at the same host.
-                LOG.error("Download destination refused", url=url, reason=str(e))
-                return
-            except Exception as e:
-                LOG.debug("Playwright APIRequestContext download failed, trying urllib", url=url, error=str(e))
-
-        # Fallback: direct HTTP via urllib (works for pre-signed URLs). This does not share the
-        # BrowserContext, so it must carry the session cookies itself — otherwise a session-gated
-        # endpoint answers an unauthenticated request with its login page (saved as a corrupt file).
-        if data is None:
-            try:
-                data, content_type = await self._download_url_via_urllib(url)
-                method = "urllib"
-            except DOWNLOAD_DESTINATION_ERRORS as e:
-                LOG.error("Download destination refused", url=url, reason=str(e))
-                return
-            except Exception as e:
-                LOG.error("Direct HTTP download failed", url=url, error=str(e), exc_info=True)
-                return
-
-        if data is None:
-            LOG.error("Download produced no data", url=url)
+        try:
+            validated_filename = _validated_download_basename(suggested_filename)
+            cookie_header = await self._cookie_header_for_url(url)
+            headers = {"Cookie": cookie_header} if cookie_header else None
+            response = await file_api.fetch_file_bytes(  # type: ignore[attr-defined]
+                url,
+                max_size_mb=MAX_FILE_SIZE_BYTES // (1024 * 1024),
+                headers=headers,
+                filename=validated_filename or None,
+                authorize_request_hop=self._redirect_hop_authorizer,
+                download_scope=self._download_scope,
+                approved_initial_url=url,
+            )
+        except Exception as exc:
+            # The download URL is credential-bearing and can reappear inside an exception message
+            # (aiohttp embeds it), so the raise site stands in for the message and traceback.
+            LOG.error(
+                "Guarded direct download failed",
+                error_type=type(exc).__name__,
+                error_origin=redacted_exception_origin(exc),
+            )
             return
 
+        data = response.body
+        content_type = response.content_type
+        response_filename = response.filename
+        if not isinstance(data, bytes) or not isinstance(content_type, str) or not isinstance(response_filename, str):
+            LOG.error("Guarded direct download returned an invalid response")
+            return
         if len(data) > MAX_FILE_SIZE_BYTES:
             LOG.warning(
                 "Direct download exceeds size limit, discarding",
-                url=url,
                 size=len(data),
                 max_size=MAX_FILE_SIZE_BYTES,
             )
             return
 
-        normalized_filename = normalize_download_filename(suggested_filename, content_type)
+        normalized_filename = normalize_download_filename(response_filename, content_type)
         if _payload_is_html_login_masquerade(data, content_type, normalized_filename):
             LOG.error(
                 "Direct download returned an HTML page for a non-HTML file; not saving "
                 "(likely an unauthenticated fetch landing on a login/session-gate page)",
-                url=url,
-                suggested_filename=normalized_filename,
+                suggested_filename_fp=diagnostic_fingerprint(normalized_filename),
                 content_type=content_type,
                 size=len(data),
-                method=method,
             )
             return
 
-        save_path, filename = self._resolve_save_path(suggested_filename, content_type)
+        save_path, filename = self._resolve_save_path(response_filename, content_type)
 
-        with open(save_path, "wb") as f:
-            f.write(data)
+        if artifact_scope_generation is None:
+            artifact_scope_generation = self._artifact_scope_generation
+        self._atomically_write_bytes(save_path, data, artifact_scope_generation)
 
         elapsed_ms = (time.monotonic() - t0) * 1000
         LOG.info(
             "CDP download saved (direct HTTP)",
-            filename=filename,
+            filename_fp=diagnostic_fingerprint(filename),
             size=len(data),
             duration_ms=round(elapsed_ms, 1),
-            save_path=str(save_path),
+            save_path_fp=diagnostic_fingerprint(str(save_path)),
             download_index=self._download_index,
-            method=method,
+            method="guarded_http",
         )
 
-    async def _download_blob_url(self, url: str, suggested_filename: str) -> None:
+    async def _cookie_header_for_url(self, url: str) -> str:
+        if self._browser_context is None:
+            return ""
+        try:
+            cookies = await self._browser_context.cookies(url)
+        except Exception:
+            return ""
+        parts: list[str] = []
+        for cookie in cookies:
+            name = cookie.get("name")
+            value = cookie.get("value")
+            if (
+                isinstance(name, str)
+                and name
+                and isinstance(value, str)
+                and not _FILENAME_CONTROL_CHAR_RE.search(name)
+                and not _FILENAME_CONTROL_CHAR_RE.search(value)
+            ):
+                parts.append(f"{name}={value}")
+        return "; ".join(parts)
+
+    async def _download_blob_url(
+        self,
+        url: str,
+        suggested_filename: str,
+        artifact_scope_generation: int | None = None,
+    ) -> None:
         """Save a blob: URL download by reading its bytes back from a same-origin page.
 
         blob: URLs are in-memory references owned by the document that created them, so they
@@ -1126,7 +1394,11 @@ class CDPDownloadInterceptor:
         URL before we read it.
         """
         if not self._output_dir or self._browser_context is None:
-            LOG.warning("Cannot read blob download: no output dir or browser context", url=url)
+            LOG.warning(
+                "Cannot read blob download: no output dir or browser context",
+                url_scheme=urlparse(url).scheme.lower(),
+                suggested_filename_fp=diagnostic_fingerprint(suggested_filename),
+            )
             return
 
         # probe=True: this fans out over every open page as a best-effort fallback, so the
@@ -1142,8 +1414,8 @@ class CDPDownloadInterceptor:
         if data is None:
             LOG.warning(
                 "Could not read blob download from any page",
-                url=url,
-                suggested_filename=suggested_filename,
+                url_scheme=urlparse(url).scheme.lower(),
+                suggested_filename_fp=diagnostic_fingerprint(suggested_filename),
             )
             return
         # An empty blob must never be persisted: _resolve_save_path overwrites on filename collision, so
@@ -1152,8 +1424,8 @@ class CDPDownloadInterceptor:
         if not data:
             LOG.warning(
                 "Blob download is empty, skipping to avoid clobbering a captured artifact",
-                url=url,
-                suggested_filename=suggested_filename,
+                url_scheme=urlparse(url).scheme.lower(),
+                suggested_filename_fp=diagnostic_fingerprint(suggested_filename),
             )
             return
         # Defense-in-depth: read_blob_url_bytes already rejects oversized blobs in-page before
@@ -1161,20 +1433,22 @@ class CDPDownloadInterceptor:
         if len(data) > MAX_FILE_SIZE_BYTES:
             LOG.warning(
                 "Blob download exceeds size limit, discarding",
-                url=url,
+                url_scheme=urlparse(url).scheme.lower(),
+                suggested_filename_fp=diagnostic_fingerprint(suggested_filename),
                 size=len(data),
                 max_size=MAX_FILE_SIZE_BYTES,
             )
             return
         save_path, filename = self._resolve_save_path(suggested_filename)
-        with open(save_path, "wb") as f:
-            f.write(data)
+        if artifact_scope_generation is None:
+            artifact_scope_generation = self._artifact_scope_generation
+        self._atomically_write_bytes(save_path, data, artifact_scope_generation)
         self._downloaded_urls.add(url)
         LOG.info(
             "CDP download saved (blob)",
-            filename=filename,
+            filename_fp=diagnostic_fingerprint(filename),
             size=len(data),
-            save_path=str(save_path),
+            save_path_fp=diagnostic_fingerprint(str(save_path)),
             download_index=self._download_index,
         )
 
@@ -1189,18 +1463,33 @@ class CDPDownloadInterceptor:
             except Exception:
                 pass
         self._page_listener = None
-        await self._drain_tasks(self._page_enable_tasks)
-
         self._accepting_cdp_handlers = False
-        await self._drain_tasks(self._cdp_handler_tasks)
-
-        session_count = len(self._cdp_sessions)
-        for cdp_session in self._cdp_sessions:
-            try:
-                await cdp_session.send("Fetch.disable")
-            except Exception:
-                pass
-        self._cdp_sessions.clear()
+        try:
+            await self._drain_tasks(self._page_enable_tasks)
+            await self._drain_tasks(self._cdp_handler_tasks)
+        finally:
+            sessions = tuple(self._cdp_sessions)
+            for cdp_session in sessions:
+                self._unregister_active_request_interceptor(cdp_session)
+            for cdp_session in sessions:
+                try:
+                    await cdp_session.send("Fetch.disable")
+                except Exception as error:
+                    if _is_stale_interception_error(error):
+                        # Normal teardown usually finds the target already closed/detached
+                        # (SKY-11964); that benign race carries no live interception to leave
+                        # untracked, so it doesn't warrant invalidating the monitor.
+                        LOG.debug(
+                            "CDP Fetch interception was already stale at disable (benign race)",
+                            error_type=type(error).__name__,
+                        )
+                        continue
+                    # Interception may still be live on a session we have already unregistered,
+                    # which would leave requests egressing untracked. Mirror the enable path.
+                    self._network_egress_monitor.invalidate()
+                    LOG.warning("Failed to disable CDP Fetch interception", error_type=type(error).__name__)
+            self._cdp_sessions.clear()
+        session_count = len(sessions)
 
         async with self._browser_download_monitor_lock:
             self._accepting_browser_downloads = False
@@ -1251,9 +1540,11 @@ class CDPDownloadInterceptor:
                     await asyncio.gather(*tasks, return_exceptions=True)
                 raise
             else:
-                await self._drain_browser_downloads_to_quiescence()
+                await self._drain_browser_downloads_to_quiescence(admit_browser_events=True)
 
-    async def _drain_browser_downloads_to_quiescence(self) -> None:
+    async def _drain_browser_downloads_to_quiescence(self, *, admit_browser_events: bool = False) -> None:
+        if admit_browser_events and self._browser_session is not None and self._accepting_browser_downloads:
+            await asyncio.sleep(BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS)
         while True:
             generation = self._browser_download_generation
             cdp_generation = self._cdp_handler_generation
@@ -1282,14 +1573,38 @@ class CDPDownloadInterceptor:
     def _schedule_browser_download_handler(self, event: dict[str, Any]) -> None:
         if not self._accepting_browser_downloads:
             return
+        event_url = event.get("url", "")
+        event_bytes = len(event_url) if isinstance(event_url, str) else 0
+        if (
+            event_bytes > MAX_PENDING_BROWSER_DOWNLOAD_EVENT_BYTES
+            or self._pending_browser_download_event_bytes + event_bytes > MAX_PENDING_BROWSER_DOWNLOAD_EVENT_BYTES
+        ):
+            LOG.warning(
+                "Browser download handler queue byte budget exceeded; dropping event",
+                pending_event_bytes=self._pending_browser_download_event_bytes,
+                event_bytes=event_bytes,
+                event_byte_limit=MAX_PENDING_BROWSER_DOWNLOAD_EVENT_BYTES,
+            )
+            return
+        if len(self._browser_download_tasks) >= MAX_PENDING_BROWSER_DOWNLOAD_TASKS:
+            LOG.warning(
+                "Browser download handler queue is full; dropping event",
+                pending_count=len(self._browser_download_tasks),
+                pending_limit=MAX_PENDING_BROWSER_DOWNLOAD_TASKS,
+            )
+            return
         self._browser_download_generation += 1
-        task = asyncio.create_task(self._handle_browser_download(event))
+        admitted_event = dict(event)
+        admitted_event[_ARTIFACT_SCOPE_GENERATION_EVENT_KEY] = self._artifact_scope_generation
+        task = asyncio.create_task(self._handle_browser_download(admitted_event))
         self._browser_download_tasks.add(task)
+        self._browser_download_task_event_bytes[task] = event_bytes
+        self._pending_browser_download_event_bytes += event_bytes
         task.add_done_callback(self._browser_download_done)
 
     def _on_request_paused(self, event: dict[str, Any], cdp_session: CDPSession) -> None:
         """Handle Fetch.requestPaused — schedule async handler with the originating session."""
-        self._schedule_cdp_handler(self._handle_request_paused(event, cdp_session))
+        self._schedule_cdp_handler(self._handle_request_paused(event, cdp_session, self._artifact_scope_generation))
 
     def _on_auth_required(self, event: dict[str, Any], cdp_session: CDPSession) -> None:
         """Handle Fetch.authRequired — schedule async handler with the originating session."""
@@ -1368,12 +1683,16 @@ class CDPDownloadInterceptor:
                 exc_info=True,
             )
 
-    async def _handle_request_paused(self, event: dict[str, Any], cdp_session: CDPSession) -> None:
+    async def _handle_request_paused(
+        self,
+        event: dict[str, Any],
+        cdp_session: CDPSession,
+        artifact_scope_generation: int | None = None,
+    ) -> None:
         """Async handler for paused requests.
 
         Handles both Request-stage and Response-stage events:
-        - Request stage (no responseStatusCode): continue the request immediately.
-          We intercept at Request stage only to make Fetch.authRequired fire for proxy auth.
+        - Request stage (no responseStatusCode): authorize before continuing, otherwise abort.
         - Response stage: check for downloads and intercept if needed.
         """
         request_id = event["requestId"]
@@ -1381,10 +1700,30 @@ class CDPDownloadInterceptor:
         url = event.get("request", {}).get("url", "<unknown>")
 
         try:
-            # Request stage: no response yet (responseStatusCode absent). Continue the request
-            # so it proceeds to the server. We only intercept Request stage to enable
-            # Fetch.authRequired for proxy 407 challenges.
+            # Request stage: authorize before continueRequest can put browser credentials on the
+            # wire. A missing, failed, or negative collaborator is unenrolled and fails closed.
             if response_status is None:
+                if not self._mediates_requests:
+                    await cdp_session.send("Fetch.continueRequest", {"requestId": request_id})
+                    return
+                request = event.get("request", {})
+                try:
+                    monitor = self._network_egress_monitor
+                    authorized = monitor is not None and monitor.authorize_request(
+                        method=request.get("method", ""),
+                        url=request.get("url", ""),
+                        resource_type=event.get("resourceType", "").lower(),
+                        frame=event.get("frameId"),
+                    )
+                except Exception:
+                    authorized = False
+                if not authorized:
+                    await self._fail_request(
+                        cdp_session,
+                        request_id,
+                        error_reason="BlockedByClient",
+                    )
+                    return
                 await cdp_session.send("Fetch.continueRequest", {"requestId": request_id})
                 return
 
@@ -1395,7 +1734,6 @@ class CDPDownloadInterceptor:
 
             LOG.debug(
                 "CDP Fetch response paused",
-                url=url,
                 resource_type=resource_type,
                 status_code=response_status,
                 content_type=response_headers.get("content-type", ""),
@@ -1405,14 +1743,19 @@ class CDPDownloadInterceptor:
             if is_download_response(response_headers, response_status, resource_type):
                 LOG.info(
                     "CDP download response detected",
-                    url=url,
                     resource_type=resource_type,
                     status_code=response_status,
                     content_type=response_headers.get("content-type", ""),
                     content_disposition=response_headers.get("content-disposition", ""),
                 )
                 await self._handle_download(
-                    cdp_session, request_id, url, response_headers, response_status, raw_response_headers
+                    cdp_session,
+                    request_id,
+                    url,
+                    response_headers,
+                    response_status,
+                    raw_response_headers,
+                    artifact_scope_generation,
                 )
             else:
                 await self._continue_response(cdp_session, request_id)
@@ -1425,16 +1768,13 @@ class CDPDownloadInterceptor:
                 LOG.debug(
                     "CDP interception went stale before response (benign race)",
                     request_id=request_id,
-                    url=url,
-                    error=str(e),
+                    error_type=type(e).__name__,
                 )
                 return
             LOG.error(
                 "Error handling CDP request",
                 request_id=request_id,
-                url=url,
-                exc_info=True,
-                error=str(e),
+                error_type=type(e).__name__,
             )
             # For Response-stage errors (e.g. download handling failed), try to let the
             # response through so the request doesn't hang indefinitely.
@@ -1459,26 +1799,38 @@ class CDPDownloadInterceptor:
         headers: dict[str, str],
         response_status: int,
         raw_response_headers: list[dict[str, str]],
+        artifact_scope_generation: int | None = None,
     ) -> None:
         """Capture a download to disk and complete the browser side.
 
         Small responses (< STREAM_TO_DISK_THRESHOLD_BYTES) are buffered and replayed to the browser
         unchanged. Large responses stream straight to a temp file and are fulfilled with an empty body,
         so the browser never materializes a large base64 payload (the OOM in SKY-12642)."""
+        if artifact_scope_generation is None:
+            artifact_scope_generation = self._artifact_scope_generation
+        if not self._artifact_scope_is_active(artifact_scope_generation):
+            LOG.warning("CDP download scope changed before capture; passing response through")
+            await self._continue_response(cdp_session, request_id)
+            return
         if not self._output_dir:
-            LOG.warning("CDP download intercepted but no output_dir set, passing through", url=url)
+            LOG.warning("CDP download intercepted but no output_dir set, passing through")
             await self._continue_response(cdp_session, request_id)
             return
 
         content_length = _parse_content_length(headers)
         content_type = _normalized_content_type(headers.get("content-type", ""))
         raw_filename = extract_filename(headers, url)
-        save_path, filename = self._resolve_save_path(raw_filename, content_type)
+        try:
+            save_path, filename = self._resolve_save_path(raw_filename, content_type)
+        except (OSError, ValueError) as error:
+            LOG.error("Unsafe CDP download output path", error_type=type(error).__name__)
+            self._downloaded_urls.add(url)
+            await self._fail_request(cdp_session, request_id, url=url)
+            return
 
         LOG.info(
             "CDP download detected",
             filename=filename,
-            url=url,
             content_type=content_type,
             content_length=content_length,
         )
@@ -1518,13 +1870,16 @@ class CDPDownloadInterceptor:
             try:
                 try:
                     outcome = await self._stream_response_body(
-                        cdp_session, request_id, save_path, start_on_disk=start_on_disk
+                        cdp_session,
+                        request_id,
+                        save_path,
+                        start_on_disk=start_on_disk,
+                        artifact_scope_generation=artifact_scope_generation,
                     )
                 except _StreamAborted as e:
                     LOG.error(
                         "CDP download exceeds stream cap, aborting",
                         filename=filename,
-                        url=url,
                         total_bytes=e.total_bytes,
                         cap=MAX_STREAMED_FILE_SIZE_BYTES,
                     )
@@ -1538,8 +1893,7 @@ class CDPDownloadInterceptor:
                     LOG.error(
                         "takeResponseBodyAsStream failed, failing request (no whole-body fallback)",
                         filename=filename,
-                        url=url,
-                        error=str(e.__cause__ or e),
+                        error_type=type(e.__cause__ or e).__name__,
                     )
                     await self._fail_request(cdp_session, request_id, filename=filename, url=url)
                     return
@@ -1552,17 +1906,24 @@ class CDPDownloadInterceptor:
                 LOG.error(
                     "Failed to extract CDP download",
                     filename=filename,
-                    url=url,
                     content_type=content_type,
                     content_length=content_length,
-                    error=str(e),
-                    exc_info=True,
+                    error_type=type(e).__name__,
                 )
                 await self._fail_request(cdp_session, request_id, filename=filename, url=url)
                 return
 
             await self._finalize_download(
-                cdp_session, request_id, response_status, raw_response_headers, outcome, save_path, filename, url, t0
+                cdp_session,
+                request_id,
+                response_status,
+                raw_response_headers,
+                outcome,
+                save_path,
+                filename,
+                url,
+                t0,
+                artifact_scope_generation,
             )
 
     async def _fulfill_with_body(
@@ -1643,9 +2004,13 @@ class CDPDownloadInterceptor:
             )
         except Exception as e:
             if _is_stale_interception_error(e):
-                LOG.debug("failRequest hit stale interception (benign race)", filename=filename, url=url, error=str(e))
+                LOG.debug(
+                    "failRequest hit stale interception (benign race)",
+                    filename=filename,
+                    error_type=type(e).__name__,
+                )
             else:
-                LOG.warning("failRequest failed", filename=filename, url=url, error=str(e))
+                LOG.warning("failRequest failed", filename=filename, error_type=type(e).__name__)
 
     async def _finalize_download(
         self,
@@ -1658,6 +2023,7 @@ class CDPDownloadInterceptor:
         filename: str,
         url: str,
         t0: float,
+        artifact_scope_generation: int,
     ) -> None:
         """Persist a buffered body (if any) and complete the browser side: empty fulfill for large
         downloads, full replay for small ones."""
@@ -1666,9 +2032,18 @@ class CDPDownloadInterceptor:
             try:
                 # Off-loop the write so a large buffered body never blocks the event loop,
                 # matching the data-URL path (_download_data_url).
-                _, cancelled = await self._run_data_worker(self._atomically_write_bytes, save_path, data)
+                _, cancelled = await self._run_data_worker(
+                    self._atomically_write_bytes,
+                    save_path,
+                    data,
+                    artifact_scope_generation,
+                )
+            except _DownloadScopeInvalidated:
+                LOG.warning("CDP download scope changed before buffered publication; failing request")
+                await self._fail_request(cdp_session, request_id)
+                return
             except Exception as e:
-                LOG.error("Failed to save CDP download", filename=filename, url=url, error=str(e), exc_info=True)
+                LOG.error("Failed to save CDP download", filename=filename, error_type=type(e).__name__)
                 await self._fail_request(cdp_session, request_id, filename=filename, url=url)
                 return
             elapsed_ms = (time.monotonic() - t0) * 1000
@@ -1709,17 +2084,15 @@ class CDPDownloadInterceptor:
                 LOG.debug(
                     "fulfillRequest hit stale interception after download (benign race)",
                     filename=filename,
-                    url=url,
-                    error=str(e),
+                    error_type=type(e).__name__,
                 )
             else:
-                LOG.warning("fulfillRequest failed after download", filename=filename, url=url, error=str(e))
+                LOG.warning("fulfillRequest failed after download", filename=filename, error_type=type(e).__name__)
 
-    def _open_stream_temp_file(self, save_path: Path) -> tuple[Path, IO[bytes]]:
-        """Open a same-directory ``.crdownload`` temp file for streaming (atomic os.replace on finalize;
+    def _open_stream_temp_file(self, save_path: Path) -> _ConfinedTemporaryFile:
+        """Open a descriptor-bound ``.crdownload`` temp file for streaming (hard-link publication;
         the suffix also makes the download waiter block until the stream completes)."""
-        temp_path = save_path.with_name(f"{save_path.name}.{uuid.uuid4().hex}{BROWSER_DOWNLOADING_SUFFIX}")
-        return temp_path, open(temp_path, "wb")
+        return self._open_confined_temporary_file(save_path)
 
     @staticmethod
     def _write_chunks(handle: IO[bytes], chunks: list[bytes]) -> None:
@@ -1733,6 +2106,7 @@ class CDPDownloadInterceptor:
         save_path: Path,
         *,
         start_on_disk: bool,
+        artifact_scope_generation: int,
     ) -> _StreamOutcome:
         """Read the response body via Fetch.takeResponseBodyAsStream + IO.read into either memory
         (small) or a temp file (large), enforcing the threshold and hard cap.
@@ -1750,13 +2124,12 @@ class CDPDownloadInterceptor:
             raise _StreamStartError() from e
 
         buffer: list[bytes] | None = None if start_on_disk else []
-        temp_path: Path | None = None
-        temp_file: IO[bytes] | None = None
+        temp_file: _ConfinedTemporaryFile | None = None
         total = 0
 
         try:
             if start_on_disk:
-                temp_path, temp_file = self._open_stream_temp_file(save_path)
+                temp_file = self._open_stream_temp_file(save_path)
 
             while True:
                 # Bound each read so a stalled IO.read can't hold the extraction lock (and hang teardown's
@@ -1786,39 +2159,36 @@ class CDPDownloadInterceptor:
                             # single loop iteration (no interleaved IO.read await), so off-load it via
                             # _run_data_worker to keep it off the event loop. The worker is shielded, so
                             # on cancellation the write finishes before the sync finally removes the temp.
-                            temp_path, temp_file = self._open_stream_temp_file(save_path)
+                            temp_file = self._open_stream_temp_file(save_path)
                             spilled, buffer = buffer, None
-                            _, cancelled = await self._run_data_worker(self._write_chunks, temp_file, spilled)
+                            _, cancelled = await self._run_data_worker(self._write_chunks, temp_file.handle, spilled)
                             # Release the spilled chunks (up to the threshold) now they are on disk, so a
                             # slow subsequent stream never retains a whole buffered copy in memory.
                             del spilled
                             if cancelled:
                                 raise asyncio.CancelledError
                     else:
-                        temp_file.write(chunk)
+                        temp_file.handle.write(chunk)
 
                 if eof:
                     break
 
             if temp_file is not None:
-                assert temp_path is not None  # temp_file and temp_path are always opened together
-                temp_file.flush()
-                temp_file.close()
-                temp_file = None
-                os.replace(temp_path, save_path)
+                with self._artifact_scope_lock:
+                    if not self._artifact_scope_is_active(artifact_scope_generation):
+                        raise _DownloadScopeInvalidated
+                    self._publish_confined_temporary_file(temp_file, save_path.name)
                 return _StreamOutcome(mode="streamed", data=None, save_path=save_path, total_bytes=total)
             return _StreamOutcome(mode="buffered", data=b"".join(buffer or []), save_path=None, total_bytes=total)
         finally:
             # Sync cleanup first (uninterruptible): close the temp handle and remove any unfinalized temp
-            # file, so no partial artifact survives an error, abort, or cancellation. The unlink is
-            # unconditional — after os.replace the temp name no longer exists, so it is a missing_ok no-op.
+            # file, so no partial artifact survives an error, abort, or cancellation. Publication creates
+            # the final hard link; the temporary name is always removed here.
             if temp_file is not None:
                 try:
-                    temp_file.close()
+                    self._cleanup_confined_temporary_file(temp_file)
                 except Exception:
                     pass
-            if temp_path is not None:
-                temp_path.unlink(missing_ok=True)
             try:
                 # Bound the close too: if the session/target is dead (the same condition that stalls a
                 # read), an unbounded IO.close would hold the extraction lock and hang teardown's drain.
@@ -1853,8 +2223,14 @@ async def disable_download_interceptor_for_context(browser_context: BrowserConte
 
 
 async def bind_download_interceptor_to_context(
-    interceptor: CDPDownloadInterceptor, browser_context: BrowserContext
+    interceptor: CDPDownloadInterceptor,
+    browser_context: BrowserContext,
+    *,
+    enable_page_interception: bool = True,
 ) -> None:
-    binding = interceptor.bind_to_context(browser_context)
+    binding = interceptor.bind_to_context(
+        browser_context,
+        enable_page_interception=enable_page_interception,
+    )
     if inspect.isawaitable(binding):
         await binding

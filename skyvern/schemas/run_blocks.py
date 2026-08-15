@@ -4,13 +4,14 @@ from typing_extensions import Self
 from skyvern.forge.sdk.workflow.models.run_limits import MaxScreenshotScrolls
 from skyvern.schemas.credential_type import CredentialType
 from skyvern.schemas.proxy_location import ProxyLocation
+from skyvern.utils.url_validators import WebhookUrl
 
 
 class BaseRunBlockRequest(BaseModel):
     """Base class for run block requests with common browser automation parameters"""
 
     url: str | None = Field(default=None, description="Website URL")
-    webhook_url: str | None = Field(default=None, description="Webhook URL to send status updates")
+    webhook_url: WebhookUrl | None = Field(default=None, description="Webhook URL to send status updates")
     proxy_location: ProxyLocation | None = Field(default=None, description="Proxy location to use")
     totp_identifier: str | None = Field(
         default=None, description="Identifier for TOTP (Time-based One-Time Password) if required"

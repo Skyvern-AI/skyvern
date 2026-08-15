@@ -104,6 +104,8 @@ class BackgroundTaskExecutor(AsyncExecutor):
             engine = RunEngine.ui_tars
         elif run_obj and run_obj.task_run_type == RunType.yutori_navigator:
             engine = RunEngine.yutori_navigator
+        elif run_obj and run_obj.task_run_type == RunType.task_v3:
+            engine = RunEngine.skyvern_v3
 
         context: SkyvernContext = skyvern_context.ensure_context()
         context.task_id = task.task_id

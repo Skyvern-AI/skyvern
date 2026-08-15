@@ -1177,6 +1177,68 @@ function isDatepickerNavigationElement(element) {
   return ["«", "»", "‹", "›"].includes(text);
 }
 
+function isDataTablesSelectCheckboxCell(element) {
+  // jQuery DataTables' Select extension renders each row's selection control as a
+  // <td class="select-checkbox"> whose click is delegated on the ancestor table, so
+  // the cell carries no directly-bound handler for the other checks to detect.
+  if (element.tagName.toLowerCase() !== "td") {
+    return false;
+  }
+  const classNames = (element.className?.toString().toLowerCase() ?? "")
+    .split(/\s+/)
+    .filter(Boolean);
+  return classNames.includes("select-checkbox");
+}
+
+function isKendoDropdownValueTrigger(element) {
+  // Kendo UI renders a DropDownList's selected value as
+  // <span class="k-input-value-text"> and delegates open/close on the widget
+  // wrapper. When the wrapper exposes no combobox role, button toggle, or pointer
+  // cursor, none of the other checks surface any node of the widget, so the value
+  // span is the only aim-able trigger for opening the menu. A well-formed picker's
+  // value span is already interactable via its role/cursor, so this only recovers
+  // the wrongly-hidden case.
+  if (element.tagName.toLowerCase() !== "span") {
+    return false;
+  }
+  const classNames = (element.className?.toString().toLowerCase() ?? "")
+    .split(/\s+/)
+    .filter(Boolean);
+  if (!classNames.includes("k-input-value-text")) {
+    // An unset picker emits no value-text child and renders its placeholder straight
+    // into <span class="k-input-inner">, leaving that span the only aim-able trigger.
+    // The .k-picker scope keeps this off a ComboBox, whose wrapper carries k-input and
+    // whose inner is an <input>; a surviving value-text child is the trigger instead, so
+    // the inner stands down rather than nesting a second one.
+    if (!classNames.includes("k-input-inner")) {
+      return false;
+    }
+    if (!element.closest?.(".k-picker")) {
+      return false;
+    }
+    if (element.querySelector?.(".k-input-value-text")) {
+      return false;
+    }
+  }
+  // Fail closed on a disabled or readonly widget: a readonly picker never binds its open
+  // handler either, so surfacing one would hand the planner an unclickable target.
+  if (element.closest?.('[aria-disabled="true"], .k-disabled')) {
+    return false;
+  }
+  const picker = element.closest?.(".k-picker");
+  const pickerClassNames = (picker?.className?.toString().toLowerCase() ?? "")
+    .split(/\s+/)
+    .filter(Boolean);
+  // Kendo stamps aria-readonly="false" on editable pickers, so check the exact value.
+  if (
+    picker?.getAttribute?.("aria-readonly") === "true" ||
+    pickerClassNames.includes("k-readonly")
+  ) {
+    return false;
+  }
+  return true;
+}
+
 function isValidCSSSelector(selector) {
   try {
     document.querySelector(selector);
@@ -1222,6 +1284,14 @@ function isInteractable(element, hoverStylesMap) {
 
   const tagName = element.tagName.toLowerCase();
   if (isDatepickerNavigationElement(element)) {
+    return true;
+  }
+
+  if (isDataTablesSelectCheckboxCell(element)) {
+    return true;
+  }
+
+  if (isKendoDropdownValueTrigger(element)) {
     return true;
   }
 

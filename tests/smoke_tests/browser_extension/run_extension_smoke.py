@@ -4,7 +4,6 @@ import argparse
 import asyncio
 import base64
 import hashlib
-import inspect
 import json
 import os
 import re
@@ -17,15 +16,19 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from aiohttp import web
+from fastmcp import Client
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
+from skyvern.browser_extension.broker_client import BrokerClient
+from skyvern.browser_extension.broker_state import broker_paths, read_extension_secret
 from skyvern.browser_extension.protocol import EXTENSION_ID
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime
+from tests.evals.mcp.task import build_mcp_stdio_transport, unwrap_tool_result
 
 EXPECTED_EXTENSION_ID = EXTENSION_ID
 TOKEN_ENV = "SKYVERN_BROWSER_EXTENSION_TOKEN"
-BROWSER_TYPE_ENV = "BROWSER_TYPE"
-MCP_BROWSER_TYPE = "extension-connect"
+PORT_ENV = "SKYVERN_BROWSER_EXTENSION_PORT"
+BROKER_ENV = "SKYVERN_BROWSER_EXTENSION_BROKER"
 SMOKE_TEXT = "Skyvern extension bridge smoke"
 CHECKS = (
     "setup",
@@ -33,19 +36,15 @@ CHECKS = (
     "navigate",
     "screenshot",
     "trusted selector click",
-    "coordinate click",
-    "type",
     "iframe evaluate",
     "new tab",
     "close tab",
     "chrome survives disconnect",
     "mcp session/navigate/observe",
+    "mcp coordinate click",
+    "mcp coordinate type",
 )
 CDP_URL_PATTERN = re.compile(r"ws://127\.0\.0\.1:\d+/cdp/[A-Za-z0-9_-]+")
-
-
-class McpUnavailableError(RuntimeError):
-    pass
 
 
 class SmokeReport:
@@ -131,7 +130,8 @@ def _safe_text(value: object, redactions: Sequence[str]) -> str:
     for secret_value in redactions:
         if secret_value:
             text = text.replace(secret_value, "<redacted>")
-    return " ".join(text.split())[:600]
+    text = " ".join(text.split())
+    return text if len(text) <= 600 else f"{text[:300]} ... {text[-295:]}"
 
 
 async def _discover_extension_id(context: BrowserContext, timeout_seconds: float = 15.0) -> str:
@@ -193,13 +193,21 @@ async def _start_fixture_servers() -> FixtureServers:
 
     async def outer_handler(_request: web.Request) -> web.Response:
         html = f"""<!doctype html><html><head><meta charset="utf-8">
-<title>Extension Bridge Fixture</title></head><body>
+<title>Extension Bridge Fixture</title><style>
+#smoke-button {{ position: fixed; left: 40px; top: 40px; width: 160px; height: 40px; }}
+#text-input {{ position: fixed; left: 40px; top: 120px; width: 240px; height: 32px; }}
+#click-result {{ position: fixed; left: 40px; top: 180px; }}
+#password-input {{ position: fixed; left: 40px; top: 220px; }}
+#smoke-frame {{ position: fixed; left: 320px; top: 40px; width: 320px; height: 180px; }}
+</style></head><body>
 <button id="smoke-button" type="button">Smoke button</button>
 <input id="text-input" type="text"><input id="password-input" type="password">
+<div id="click-result">not-clicked</div>
 <iframe id="smoke-frame" src="{iframe_url}"></iframe><script>
 window.smokeState = {{clickCount: 0, lastTrusted: false}};
 document.querySelector("#smoke-button").addEventListener("click", (event) => {{
   window.smokeState.clickCount += 1; window.smokeState.lastTrusted = event.isTrusted;
+  document.querySelector("#click-result").textContent = `clicked:${{window.smokeState.clickCount}}`;
 }});</script></body></html>"""
         return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-store"})
 
@@ -211,7 +219,7 @@ document.querySelector("#smoke-button").addEventListener("click", (event) => {{
     return FixtureServers(
         outer_runner=outer_runner,
         iframe_runner=iframe_runner,
-        outer_url=f"http://localhost:{outer_port}/",
+        outer_url=f"http://127.0.0.1:{outer_port}/",
     )
 
 
@@ -224,44 +232,109 @@ def _tool_error(result: dict[str, object]) -> str:
     return f"{code}: {message}"
 
 
-async def _run_mcp_phase(fixture_url: str) -> str:
-    from skyvern.cli.mcp_tools import browser as browser_tools
-    from skyvern.cli.mcp_tools import session as session_tools
+async def _wait_for_popup_connection(popup_page: Page, timeout_seconds: float = 15.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while loop.time() < deadline:
+        status = (await popup_page.locator("#status-label").text_content() or "").strip()
+        if status in {"Connected", "Client attached"}:
+            return
+        await asyncio.sleep(0.1)
+    error = await popup_page.locator("#connection-error").text_content()
+    raise TimeoutError(f"extension did not reconnect to MCP relay; popup error: {error or 'none'}")
 
-    if MCP_BROWSER_TYPE not in inspect.getsource(session_tools):
-        raise McpUnavailableError("the current MCP session layer has no extension-connect branch")
 
-    previous_browser_type = os.environ.get(BROWSER_TYPE_ENV)
-    os.environ[BROWSER_TYPE_ENV] = MCP_BROWSER_TYPE
+async def _wait_for_fixture_page(context: BrowserContext, fixture_url: str, timeout_seconds: float = 15.0) -> Page:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while loop.time() < deadline:
+        matches = [page for page in context.pages if not page.is_closed() and page.url == fixture_url]
+        if matches:
+            return matches[-1]
+        await asyncio.sleep(0.1)
+    raise TimeoutError(f"MCP navigation did not expose fixture page {fixture_url}")
+
+
+async def _run_mcp_phase(
+    context: BrowserContext,
+    popup_page: Page,
+    fixture_url: str,
+    relay_port: int,
+    pairing_token: str,
+    legacy_mode: bool,
+    report: SmokeReport,
+) -> None:
+    env_overrides = {
+        PORT_ENV: str(relay_port),
+        # Keep the production SSRF default intact; only this disposable child may reach its loopback fixture.
+        "ALLOWED_HOSTS": json.dumps(["127.0.0.1"]),
+    }
+    if legacy_mode:
+        env_overrides[TOKEN_ENV] = pairing_token
+    transport = build_mcp_stdio_transport(
+        browser_extension=True,
+        env_overrides=env_overrides,
+    )
     session_created = False
-    try:
-        session_result = await session_tools.skyvern_browser_session_create()
-        if session_result.get("ok") is not True:
-            raise McpUnavailableError(f"session=FAIL; unavailable in-process ({_tool_error(session_result)})")
-        session_created = True
+    async with Client(transport, timeout=60) as client:
+        await _wait_for_popup_connection(popup_page)
 
-        navigate_result = await browser_tools.skyvern_navigate(url=fixture_url)
-        observe_result = await browser_tools.skyvern_observe(selector="body", interactive_only=True)
-        statuses = (
-            f"session={'PASS' if session_result.get('ok') is True else 'FAIL'} "
-            f"navigate={'PASS' if navigate_result.get('ok') is True else 'FAIL'} "
-            f"observe={'PASS' if observe_result.get('ok') is True else 'FAIL'}"
-        )
-        if navigate_result.get("ok") is not True:
-            raise AssertionError(f"{statuses}; navigate error={_tool_error(navigate_result)}")
-        if observe_result.get("ok") is not True:
-            raise AssertionError(f"{statuses}; observe error={_tool_error(observe_result)}")
-        return statuses
-    finally:
-        if session_created:
-            try:
-                await session_tools.skyvern_browser_session_close()
-            except Exception:
-                pass
-        if previous_browser_type is None:
-            os.environ.pop(BROWSER_TYPE_ENV, None)
-        else:
-            os.environ[BROWSER_TYPE_ENV] = previous_browser_type
+        async def call_tool(name: str, arguments: dict[str, object] | None = None) -> dict[str, object]:
+            return unwrap_tool_result(await client.call_tool_mcp(name, arguments or {}))
+
+        try:
+            session_result = await call_tool("skyvern_browser_session_create")
+            if session_result.get("ok") is not True:
+                raise AssertionError(f"session create failed: {_tool_error(session_result)}")
+            session_created = True
+            assert pairing_token not in repr(session_result)
+            assert CDP_URL_PATTERN.search(repr(session_result)) is None
+
+            navigate_result = await call_tool("skyvern_navigate", {"url": fixture_url})
+            observe_result = await call_tool("skyvern_observe", {"selector": "body", "interactive_only": True})
+            statuses = (
+                f"session={'PASS' if session_result.get('ok') is True else 'FAIL'} "
+                f"navigate={'PASS' if navigate_result.get('ok') is True else 'FAIL'} "
+                f"observe={'PASS' if observe_result.get('ok') is True else 'FAIL'}"
+            )
+            if navigate_result.get("ok") is not True:
+                raise AssertionError(f"{statuses}; navigate error={_tool_error(navigate_result)}")
+            if observe_result.get("ok") is not True:
+                raise AssertionError(f"{statuses}; observe error={_tool_error(observe_result)}")
+            report.pass_check("mcp session/navigate/observe", statuses)
+
+            fixture_page = await _wait_for_fixture_page(context, fixture_url)
+            button_bounds = await fixture_page.locator("#smoke-button").bounding_box()
+            assert button_bounds is not None, "MCP fixture button has no bounding box"
+            click_x = button_bounds["x"] + button_bounds["width"] / 2
+            click_y = button_bounds["y"] + button_bounds["height"] / 2
+            click_result = await call_tool("skyvern_click", {"x": click_x, "y": click_y})
+            click_data = click_result.get("data")
+            assert click_result.get("ok") is True, _tool_error(click_result)
+            assert isinstance(click_data, dict)
+            assert click_data.get("x") == click_x
+            assert click_data.get("y") == click_y
+            assert click_data.get("resolved_target")
+            assert await fixture_page.locator("#click-result").text_content() == "clicked:1"
+            report.pass_check("mcp coordinate click", f"x={click_x:.1f}, y={click_y:.1f}")
+
+            input_bounds = await fixture_page.locator("#text-input").bounding_box()
+            assert input_bounds is not None, "MCP fixture input has no bounding box"
+            type_x = input_bounds["x"] + input_bounds["width"] / 2
+            type_y = input_bounds["y"] + input_bounds["height"] / 2
+            type_result = await call_tool("skyvern_type", {"x": type_x, "y": type_y, "text": SMOKE_TEXT})
+            type_data = type_result.get("data")
+            assert type_result.get("ok") is True, _tool_error(type_result)
+            assert isinstance(type_data, dict)
+            assert type_data.get("x") == type_x
+            assert type_data.get("y") == type_y
+            assert type_data.get("resolved_target")
+            assert await fixture_page.locator("#text-input").input_value() == SMOKE_TEXT
+            report.pass_check("mcp coordinate type", f"x={type_x:.1f}, y={type_y:.1f}")
+        finally:
+            if session_created:
+                close_result = await call_tool("skyvern_browser_session_close")
+                assert close_result.get("ok") is True, _tool_error(close_result)
 
 
 async def _pair_extension(
@@ -286,15 +359,8 @@ async def _pair_extension(
 async def _exercise_page(page: Page, report: SmokeReport, screenshot_path: Path) -> FixtureServers:
     servers = await _start_fixture_servers()
     try:
-        try:
-            await page.goto("https://example.com", wait_until="domcontentloaded")
-            title = await page.title()
-            assert "Example" in title, f"unexpected example.com title: {title!r}"
-        except Exception:
-            await page.goto(servers.outer_url, wait_until="domcontentloaded")
-            report.pass_check("navigate", "loopback fallback")
-        else:
-            report.pass_check("navigate", f"title={title!r}")
+        await page.goto(servers.outer_url, wait_until="domcontentloaded")
+        report.pass_check("navigate", "loopback fixture")
 
         await page.screenshot(path=screenshot_path)
         assert screenshot_path.is_file() and screenshot_path.stat().st_size > 0
@@ -308,24 +374,7 @@ async def _exercise_page(page: Page, report: SmokeReport, screenshot_path: Path)
         assert selector_state.get("lastTrusted") is True
         report.pass_check("trusted selector click")
 
-        button = page.locator("#smoke-button")
-        bounds = await button.bounding_box()
-        assert bounds is not None, "button has no bounding box"
-        x = bounds["x"] + bounds["width"] / 2
-        y = bounds["y"] + bounds["height"] / 2
-        await page.mouse.click(x, y)
-        coordinate_state = await page.evaluate("() => ({...window.smokeState})")
-        assert isinstance(coordinate_state, dict)
-        assert coordinate_state.get("clickCount") == 2
-        assert coordinate_state.get("lastTrusted") is True
-        report.pass_check("coordinate click", f"x={x:.1f}, y={y:.1f}")
-
-        text_input = page.locator("#text-input")
-        await text_input.focus()
-        await page.keyboard.type(SMOKE_TEXT)
-        assert await text_input.input_value() == SMOKE_TEXT
         assert await page.locator("#password-input").count() == 1
-        report.pass_check("type")
 
         iframe_element = await page.wait_for_selector("#smoke-frame")
         frame = await iframe_element.content_frame()
@@ -350,6 +399,8 @@ async def _cleanup(
     runtime: BrowserExtensionRuntime | None,
     playwright: Playwright | None,
     profile_dir: tempfile.TemporaryDirectory[str] | None,
+    evidence_dir: tempfile.TemporaryDirectory[str] | None,
+    broker_port: int | None,
 ) -> list[str]:
     errors: list[str] = []
     cleanup_steps: list[tuple[str, Callable[[], Awaitable[object]]]] = []
@@ -363,38 +414,69 @@ async def _cleanup(
         cleanup_steps.append(("extension runtime", runtime.shutdown))
     if playwright is not None:
         cleanup_steps.append(("playwright", playwright.stop))
+    if broker_port is not None:
+        cleanup_steps.append(("broker daemon", lambda: _stop_broker(broker_port)))
     for label, cleanup_step in cleanup_steps:
         try:
             await cleanup_step()
         except Exception as exc:
             errors.append(f"{label}: {type(exc).__name__}: {exc}")
-    if profile_dir is not None:
-        try:
-            profile_dir.cleanup()
-        except Exception as exc:
-            errors.append(f"temporary profile: {type(exc).__name__}: {exc}")
+    for label, temp_dir in (("temporary profile", profile_dir), ("temporary evidence", evidence_dir)):
+        if temp_dir is not None:
+            try:
+                temp_dir.cleanup()
+            except Exception as exc:
+                errors.append(f"{label}: {type(exc).__name__}: {exc}")
     return errors
 
 
-async def run_smoke() -> int:
+async def _stop_broker(port: int) -> None:
+    async def ignore_event(_event: str, _params: dict) -> None:
+        return None
+
+    client = BrokerClient(port, ignore_event, auto_spawn=False, operator=True)
+    try:
+        await client.start()
+        await client.stop_broker()
+    finally:
+        await client.stop()
+
+
+async def run_smoke(*, legacy_mode: bool) -> int:
     report = SmokeReport()
-    pairing_token = secrets.token_urlsafe(32)
+    pairing_token = secrets.token_urlsafe(32) if legacy_mode else None
     previous_token = os.environ.get(TOKEN_ENV)
-    os.environ[TOKEN_ENV] = pairing_token
-    redactions = [pairing_token]
+    if legacy_mode:
+        assert pairing_token is not None
+        os.environ[TOKEN_ENV] = pairing_token
+    else:
+        os.environ.pop(TOKEN_ENV, None)
+    redactions = [pairing_token] if pairing_token is not None else []
     runtime: BrowserExtensionRuntime | None = None
     playwright: Playwright | None = None
     persistent_context: BrowserContext | None = None
     bridge_browser: Browser | None = None
     fixture_servers: FixtureServers | None = None
     profile_dir: tempfile.TemporaryDirectory[str] | None = None
-    screenshot_dir = Path(tempfile.mkdtemp(prefix="skyvern-extension-smoke-evidence-"))
-    screenshot_path = (screenshot_dir / "smoke_navigate.png").resolve()
+    evidence_dir = tempfile.TemporaryDirectory(prefix="skyvern-extension-smoke-evidence-")
+    screenshot_path = (Path(evidence_dir.name) / "smoke_navigate.png").resolve()
+    broker_port: int | None = None
 
     try:
+        if legacy_mode and os.environ.get(BROKER_ENV) != "0":
+            raise RuntimeError(f"legacy smoke requires {BROKER_ENV}=0")
+        if not legacy_mode and BROKER_ENV in os.environ:
+            raise RuntimeError(f"broker-default smoke requires {BROKER_ENV} to be unset")
         port_reservation, relay_port = _reserve_free_port()
         port_reservation.close()
         runtime = await BrowserExtensionRuntime.get_or_start(port=relay_port)
+        if legacy_mode:
+            assert pairing_token is not None
+        else:
+            broker_port = relay_port
+            assert TOKEN_ENV not in os.environ
+            pairing_token = read_extension_secret(broker_paths(relay_port))
+            redactions.append(pairing_token)
         redactions.append(runtime.cdp_ws_url)
         extension_dir = BrowserExtensionRuntime.extension_dir().resolve()
         derived_extension_id = _extension_id_from_manifest(extension_dir)
@@ -419,9 +501,10 @@ async def run_smoke() -> int:
             print(f"WARN extension ID mismatch: expected {EXPECTED_EXTENSION_ID}, discovered {discovered_extension_id}")
         assert discovered_extension_id == EXPECTED_EXTENSION_ID
         extension_id = discovered_extension_id
-        report.pass_check("setup", f"relay port={relay_port}, extension ID={extension_id}")
+        mode = "legacy opt-out" if legacy_mode else "broker default"
+        report.pass_check("setup", f"mode={mode}, relay port={relay_port}, extension ID={extension_id}")
 
-        await _pair_extension(persistent_context, runtime, extension_id, relay_port, pairing_token)
+        popup_page = await _pair_extension(persistent_context, runtime, extension_id, relay_port, pairing_token)
         assert runtime.extension_connected
         report.pass_check("extension paired")
 
@@ -449,12 +532,17 @@ async def run_smoke() -> int:
         assert runtime.extension_connected
         report.pass_check("chrome survives disconnect")
 
-        try:
-            mcp_statuses = await _run_mcp_phase(fixture_servers.outer_url)
-        except McpUnavailableError as exc:
-            report.skip_check("mcp session/navigate/observe", _safe_text(exc, redactions))
-        else:
-            report.pass_check("mcp session/navigate/observe", mcp_statuses)
+        await runtime.shutdown()
+        runtime = None
+        await _run_mcp_phase(
+            persistent_context,
+            popup_page,
+            fixture_servers.outer_url,
+            relay_port,
+            pairing_token,
+            legacy_mode,
+            report,
+        )
     except Exception as exc:
         failed_check = next((label for label in CHECKS if label not in report.recorded), "smoke")
         report.fail_check(failed_check, _safe_text(f"{type(exc).__name__}: {exc}", redactions))
@@ -467,6 +555,8 @@ async def run_smoke() -> int:
             runtime,
             playwright,
             profile_dir,
+            evidence_dir,
+            broker_port,
         )
         if cleanup_errors:
             report.fail_check("cleanup", _safe_text("; ".join(cleanup_errors), redactions))
@@ -498,10 +588,11 @@ def _dry_run_helpers() -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the real Chrome extension bridge smoke test")
     parser.add_argument("--dry-run-helpers", action="store_true", help="validate pure-Python helpers only")
+    parser.add_argument("--legacy", action="store_true", help="exercise the explicit broker opt-out path")
     args = parser.parse_args(argv)
     if args.dry_run_helpers:
         return _dry_run_helpers()
-    return asyncio.run(run_smoke())
+    return asyncio.run(run_smoke(legacy_mode=args.legacy))
 
 
 if __name__ == "__main__":
