@@ -53,13 +53,24 @@ async def test_run_local_screencast_happy_path(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("current_status", "expected_status"),
+    [
+        ("running", "timeout"),
+        ("session_expired", "session_expired"),
+        ("completed", "completed"),
+        ("failed", "failed"),
+    ],
+)
 async def test_run_local_screencast_timeout_when_browser_state_not_available(
     monkeypatch: pytest.MonkeyPatch,
+    current_status: str,
+    expected_status: str,
 ) -> None:
     websocket = object()
     wait_for_running = AsyncMock(return_value=None)
     check_finalized = AsyncMock(return_value=False)
-    get_current_status = AsyncMock(return_value="completed")
+    get_current_status = AsyncMock(return_value=current_status)
     wait_for_browser_state_mock = AsyncMock(return_value=None)
     start_screencast_loop_mock = AsyncMock()
     send_status_mock = AsyncMock()
@@ -85,8 +96,103 @@ async def test_run_local_screencast_timeout_when_browser_state_not_available(
         organization_id="org_123",
     )
     start_screencast_loop_mock.assert_not_awaited()
-    get_current_status.assert_not_awaited()
-    send_status_mock.assert_awaited_once_with(websocket, "browser_session_id", "bs_123", "timeout")
+    get_current_status.assert_awaited_once()
+    send_status_mock.assert_awaited_once_with(websocket, "browser_session_id", "bs_123", expected_status)
+
+
+@pytest.mark.asyncio
+async def test_expired_browser_session_is_distinct_from_stream_launch_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    websocket = object()
+    wait_for_browser_state_mock = AsyncMock()
+    send_status_mock = AsyncMock()
+    monkeypatch.setattr(
+        screenshot,
+        "app",
+        SimpleNamespace(
+            PERSISTENT_SESSIONS_MANAGER=SimpleNamespace(
+                get_session=AsyncMock(return_value=SimpleNamespace(status="timeout"))
+            )
+        ),
+    )
+    monkeypatch.setattr(screenshot, "wait_for_browser_state", wait_for_browser_state_mock)
+    monkeypatch.setattr(screenshot, "_send_status", send_status_mock)
+    monkeypatch.setattr(screenshot, "release_browser_state", AsyncMock())
+
+    await screenshot._local_screencast_for_browser_session(websocket, "pbs_123", "org_123")
+
+    wait_for_browser_state_mock.assert_not_awaited()
+    send_status_mock.assert_awaited_once_with(
+        websocket,
+        "browser_session_id",
+        "pbs_123",
+        "session_expired",
+    )
+
+
+@pytest.mark.asyncio
+async def test_browser_session_expiring_while_waiting_for_browser_state_is_distinct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    websocket = object()
+    get_session = AsyncMock(
+        side_effect=[
+            SimpleNamespace(status="running"),
+            SimpleNamespace(status="timeout"),
+        ]
+    )
+    send_status_mock = AsyncMock()
+    monkeypatch.setattr(
+        screenshot,
+        "app",
+        SimpleNamespace(
+            PERSISTENT_SESSIONS_MANAGER=SimpleNamespace(get_session=get_session),
+        ),
+    )
+    monkeypatch.setattr(screenshot, "wait_for_browser_state", AsyncMock(return_value=None))
+    monkeypatch.setattr(screenshot, "_send_status", send_status_mock)
+    monkeypatch.setattr(screenshot, "release_browser_state", AsyncMock())
+
+    await screenshot._local_screencast_for_browser_session(websocket, "pbs_123", "org_123")
+
+    send_status_mock.assert_awaited_once_with(
+        websocket,
+        "browser_session_id",
+        "pbs_123",
+        "session_expired",
+    )
+
+
+@pytest.mark.asyncio
+async def test_browser_state_timeout_survives_status_refresh_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    websocket = object()
+    get_session = AsyncMock(
+        side_effect=[
+            SimpleNamespace(status="running"),
+            RuntimeError("status unavailable"),
+        ]
+    )
+    send_status_mock = AsyncMock()
+    monkeypatch.setattr(
+        screenshot,
+        "app",
+        SimpleNamespace(
+            PERSISTENT_SESSIONS_MANAGER=SimpleNamespace(get_session=get_session),
+        ),
+    )
+    monkeypatch.setattr(screenshot, "wait_for_browser_state", AsyncMock(return_value=None))
+    monkeypatch.setattr(screenshot, "_send_status", send_status_mock)
+    monkeypatch.setattr(screenshot, "release_browser_state", AsyncMock())
+
+    await screenshot._local_screencast_for_browser_session(websocket, "pbs_123", "org_123")
+
+    send_status_mock.assert_awaited_once_with(
+        websocket,
+        "browser_session_id",
+        "pbs_123",
+        "timeout",
+    )
 
 
 @pytest.mark.asyncio

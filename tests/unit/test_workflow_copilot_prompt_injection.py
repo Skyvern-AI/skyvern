@@ -7,7 +7,6 @@ Both sets of tests remain live while ENABLE_WORKFLOW_COPILOT_V2 is gating
 the dispatch.
 """
 
-import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -18,16 +17,10 @@ from skyvern.forge.sdk.copilot.agent import (
     _build_user_context,
     _build_workflow_summary,
 )
-from skyvern.forge.sdk.copilot.context import (
-    LoadedResultTargetContext,
-    StructuredContext,
-)
-from skyvern.forge.sdk.copilot.result_evidence import loaded_result_target_structure_signature
-from skyvern.forge.sdk.routes.workflow_copilot import _auto_correct_workflow_yaml, copilot_call_llm
+from skyvern.forge.sdk.routes.workflow_copilot import copilot_call_llm
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 from skyvern.utils.strings import escape_code_fences
 from tests.unit.conftest import render_agent_prompt
-from tests.unit.copilot_test_helpers import make_raw_loaded_result_context
 
 
 class TestSystemTemplateSecurity:
@@ -252,110 +245,6 @@ class TestCopilotCallLLMWiring:
         prompt_value = call_kwargs.kwargs.get("prompt") or call_kwargs.args[0]
         assert "SECURITY RULES:" not in prompt_value, "user prompt must not contain system instructions"
 
-    @pytest.mark.asyncio
-    async def test_copilot_call_llm_sanitizes_loaded_result_context_in_legacy_prompt_and_return(self) -> None:
-        expected_signature = loaded_result_target_structure_signature(is_table=True, row_count=2)
-        raw_context = make_raw_loaded_result_context(include_sample_rows=True, include_text=True)
-        mock_handler = AsyncMock(
-            return_value={
-                "type": "REPLY",
-                "user_response": "ok",
-                "global_llm_context": raw_context,
-            }
-        )
-        mock_stream = MagicMock()
-        mock_stream.is_disconnected = AsyncMock(return_value=False)
-
-        chat_request = WorkflowCopilotChatRequest(
-            workflow_permanent_id="wpid_test",
-            workflow_id="w_test",
-            message="hello",
-            workflow_yaml="title: Test\nworkflow_definition:\n  blocks: []",
-        )
-
-        mock_agent_fn = MagicMock()
-        mock_agent_fn.get_copilot_security_rules.return_value = "SECURITY RULES:\n- Test rule"
-
-        with (
-            patch(
-                "skyvern.forge.sdk.routes.workflow_copilot.resolve_main_copilot_handler",
-                return_value=mock_handler,
-            ),
-            patch("skyvern.forge.sdk.routes.workflow_copilot.app") as mock_app,
-        ):
-            mock_app.AGENT_FUNCTION = mock_agent_fn
-            _user_response, _updated_workflow, returned_context, _workflow_yaml = await copilot_call_llm(
-                stream=mock_stream,
-                organization_id="o_test",
-                chat_request=chat_request,
-                chat_history=[],
-                global_llm_context=raw_context,
-                debug_run_info_text="",
-            )
-
-        prompt_value = mock_handler.call_args.kwargs["prompt"]
-        assert returned_context is not None
-        assert "LOADED RESULT EXTRACTION TARGETS" in prompt_value
-        assert "Author an extraction or validation block from these loaded-result targets" in prompt_value
-        assert "Do not call evaluate just to re-read the same loaded results" in prompt_value
-        assert "table: true" in prompt_value
-        assert "row_count: 2" in prompt_value
-        assert f"structure_signature: {expected_signature}" in prompt_value
-        for value in (
-            "Jane",
-            "Customer",
-            "123456",
-            "987654321",
-            "sample_rows",
-            "statement results",
-            "legacy-selector-derived-sig",
-        ):
-            assert value not in prompt_value
-            assert value not in returned_context
-        assert '"row_count": 2' in prompt_value
-        assert '"row_count": 2' in returned_context
-        assert expected_signature in returned_context
-
-    @pytest.mark.asyncio
-    async def test_auto_correct_workflow_yaml_sanitizes_loaded_result_context_in_legacy_prompt(self) -> None:
-        expected_signature = loaded_result_target_structure_signature(is_table=True, row_count=2)
-        raw_context = make_raw_loaded_result_context(include_sample_rows=True, include_text=True)
-        mock_handler = AsyncMock(return_value={"type": "REPLACE_WORKFLOW", "workflow_yaml": "title: Fixed"})
-        mock_agent_fn = MagicMock()
-        mock_agent_fn.get_copilot_security_rules.return_value = "SECURITY RULES:\n- Test rule"
-
-        with patch("skyvern.forge.sdk.routes.workflow_copilot.app") as mock_app:
-            mock_app.AGENT_FUNCTION = mock_agent_fn
-            corrected_yaml = await _auto_correct_workflow_yaml(
-                llm_api_handler=mock_handler,
-                organization_id="o_test",
-                user_response="drafted",
-                workflow_yaml="title: Broken",
-                chat_history=[],
-                global_llm_context=raw_context,
-                debug_run_info_text="",
-                error=ValueError("bad yaml"),
-            )
-
-        assert corrected_yaml == "title: Fixed"
-        prompt_value = mock_handler.call_args.kwargs["prompt"]
-        assert "LOADED RESULT EXTRACTION TARGETS" in prompt_value
-        assert "Author an extraction or validation block from these loaded-result targets" in prompt_value
-        assert "Do not call evaluate just to re-read the same loaded results" in prompt_value
-        assert "table: true" in prompt_value
-        assert "row_count: 2" in prompt_value
-        assert f"structure_signature: {expected_signature}" in prompt_value
-        for value in (
-            "Jane",
-            "Customer",
-            "123456",
-            "987654321",
-            "sample_rows",
-            "statement results",
-            "legacy-selector-derived-sig",
-        ):
-            assert value not in prompt_value
-
 
 class TestAgentTemplateSecurity:
     """Verify the agent template renders security rules correctly."""
@@ -383,16 +272,15 @@ class TestAgentTemplateSecurity:
         assert "DEBUGGER RUN INFORMATION:" not in rendered
 
 
-class TestAgentTemplateParameterizedRequestsRule:
-    def test_agent_template_has_parameterized_requests_section(self) -> None:
+class TestAgentTemplateCredentialHandlingRule:
+    def test_agent_template_keeps_raw_credential_deferral(self) -> None:
         rendered = render_agent_prompt()
-        assert "PARAMETERIZED REQUESTS WITHOUT A SAMPLE VALUE:" in rendered
+        assert "CREDENTIAL HANDLING - CRITICAL:" in rendered
+        assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in rendered
 
-    def test_agent_template_keeps_sample_anchor_word(self) -> None:
-        # Eval cases with `clarification_must_mention=["sample"]` silently break
-        # if this word is dropped from the prompt; assertion surfaces it locally.
+    def test_agent_template_does_not_reintroduce_sample_value_refusal_rule(self) -> None:
         rendered = render_agent_prompt()
-        assert "sample" in rendered.lower()
+        assert "PARAMETERIZED REQUESTS WITHOUT A SAMPLE VALUE:" not in rendered
 
 
 class TestBuildSystemPromptSecurityRules:
@@ -429,7 +317,7 @@ class TestBuildUserContext:
         )
         assert "title: Test" in rendered
         assert "user: hello" in rendered
-        assert '{"user_goal": "test"}' in rendered
+        assert '"user_goal": "test"' in rendered
         assert "Block: nav (navigation) — completed" in rendered
         assert "build me a workflow" in rendered
 
@@ -496,101 +384,6 @@ class TestBuildUserContext:
             user_message="hello",
         )
         assert "USER WORKFLOW CHANGES SINCE LAST COPILOT TURN" not in rendered
-
-    def test_repeated_reply_warning_slot_renders_when_present(self) -> None:
-        rendered = _build_user_context(
-            workflow_yaml="title: t",
-            chat_history_text="",
-            global_llm_context="",
-            debug_run_info_text="",
-            user_message="hello",
-            repeated_reply_warning="repeated_reply_detected: your last 2 replies were near-identical.",
-        )
-        assert "REPEATED REPLY WARNING" in rendered
-        assert "repeated_reply_detected" in rendered
-
-    def test_repeated_reply_warning_slot_omitted_when_empty(self) -> None:
-        rendered = _build_user_context(
-            workflow_yaml="title: t",
-            chat_history_text="",
-            global_llm_context="",
-            debug_run_info_text="",
-            user_message="hello",
-        )
-        assert "REPEATED REPLY WARNING" not in rendered
-
-    def test_repeated_reply_warning_is_fence_escaped(self) -> None:
-        rendered = _build_user_context(
-            workflow_yaml="",
-            chat_history_text="",
-            global_llm_context="",
-            debug_run_info_text="",
-            user_message="hello",
-            repeated_reply_warning="``` injected ```",
-        )
-        assert "``` injected ```" not in rendered
-
-    def test_loaded_result_targets_render_authoring_instruction(self) -> None:
-        expected_signature = loaded_result_target_structure_signature(is_table=True, row_count=2)
-        context = StructuredContext(
-            loaded_result_targets=[
-                LoadedResultTargetContext(
-                    is_table=True,
-                    row_count=2,
-                    structure_signature="sig-1",
-                )
-            ]
-        )
-
-        rendered = _build_user_context(
-            workflow_yaml="",
-            chat_history_text="",
-            global_llm_context=context.to_json_str(),
-            debug_run_info_text="",
-            user_message="build it",
-        )
-
-        assert "LOADED RESULT EXTRACTION TARGETS" in rendered
-        assert "Author an extraction or validation block from these loaded-result targets" in rendered
-        assert "Do not call evaluate just to re-read the same loaded results" in rendered
-        assert "selector: #results" not in rendered
-        assert "row_selector: tr.statement" not in rendered
-        assert "table: true" in rendered
-        assert "row_count: 2" in rendered
-        assert f"structure_signature: {expected_signature}" in rendered
-
-    def test_loaded_result_prompt_does_not_render_persisted_selectors_or_legacy_signature(self) -> None:
-        context = StructuredContext(
-            loaded_result_targets=[
-                LoadedResultTargetContext(
-                    selector='#account-123456-JaneCustomer-results[data-customer="Jane Customer"]',
-                    is_table=True,
-                    row_selector='tr[data-account="987654321"]',
-                    row_count=2,
-                    structure_signature="legacy-selector-derived-sig",
-                )
-            ]
-        )
-        raw_context = json.dumps(context.model_dump(mode="json"))
-
-        rendered = _build_user_context(
-            workflow_yaml="",
-            chat_history_text="",
-            global_llm_context=raw_context or "",
-            debug_run_info_text="",
-            user_message="build it",
-        )
-
-        assert "LOADED RESULT EXTRACTION TARGETS" in rendered
-        assert "table: true" in rendered
-        assert "row_count: 2" in rendered
-        assert "legacy-selector-derived-sig" not in rendered
-        assert '#account-123456-JaneCustomer-results[data-customer="Jane Customer"]' not in rendered
-        assert 'tr[data-account="987654321"]' not in rendered
-        assert "Jane" not in rendered
-        assert "Customer" not in rendered
-        assert "123456" not in rendered
-        assert "987654321" not in rendered
 
     def test_workflow_summary_indexes_block_labels_and_error_mappings(self) -> None:
         workflow_yaml = """

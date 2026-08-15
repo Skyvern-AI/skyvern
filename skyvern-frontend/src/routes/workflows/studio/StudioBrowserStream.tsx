@@ -78,6 +78,10 @@ export function StudioBrowserStream() {
         browserSessionId={browserSessionId}
         interactive={false}
         showControlButtons={debugStreamShown}
+        // The CDP transport streams the page viewport only, so unlike the VNC
+        // panel there is no browser address bar to type into and a session
+        // resting on about:blank has no way out (SKY-13705).
+        enableUrlInput={true}
         isRecording={isRecording}
         // While recording, the Copilot pane hosts the live-drafts panel, whose
         // header already shows the timer + step count — the REC pill would

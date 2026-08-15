@@ -3,7 +3,7 @@ name = "skyvern"
 version = "1.0.48"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.15"
 readme = "README.md"
 
 dependencies = [
@@ -35,9 +35,9 @@ local = [
     "toml>=0.10.2,<0.11",
     "jinja2>=3.1.6,<4",
     "litellm>=1.84.0",
-    "playwright>1.46.0 ; python_version >= '3.12' and python_version < '3.14'",
+    "playwright>1.46.0 ; python_version >= '3.12'",
     "playwright==1.46.0 ; python_version >= '3.11' and python_version < '3.12'",
-    "greenlet>3.0.3 ; python_version >= '3.12' and python_version < '3.14'",
+    "greenlet>3.0.3 ; python_version >= '3.12'",
     "greenlet==3.0.3 ; python_version >= '3.11' and python_version < '3.12'",
     "pillow>=12.3.0",
     "starlette-context>=0.3.6,<0.6",
@@ -107,15 +107,15 @@ server = [
     "jinja2>=3.1.6,<4",
     "uvicorn[standard]>=0.44.0",
     "litellm>=1.84.0",
-    "playwright>1.46.0 ; python_version >= '3.12' and python_version < '3.14'",
+    "playwright>1.46.0 ; python_version >= '3.12'",
     "playwright==1.46.0 ; python_version >= '3.11' and python_version < '3.12'",
-    "greenlet>3.0.3 ; python_version >= '3.12' and python_version < '3.14'",
+    "greenlet>3.0.3 ; python_version >= '3.12'",
     "greenlet==3.0.3 ; python_version >= '3.11' and python_version < '3.12'",
     "pillow>=12.3.0",
     "starlette-context>=0.3.6,<0.6",
     "fastapi>=0.136.1,<0.137",
     "psycopg[binary, pool]==3.1.18 ; python_version >= '3.11' and python_version < '3.13'",
-    "psycopg[binary, pool]>=3.2.2,<3.3.0 ; python_version >= '3.13' and python_version < '3.14'",
+    "psycopg[binary, pool]>=3.2.2,<3.3.0 ; python_version >= '3.13'",
     "alembic>=1.12.1,<2",
     "PyJWT[crypto]>=2.13.0,<3",
     "aioboto3>=14.3.0,<15",
@@ -310,6 +310,8 @@ build-backend = "hatchling.build"
 
 [tool.ruff]
 exclude = [
+    # vendored third-party judge, kept byte-identical to upstream on purpose
+    "scripts/benchmark/evaluators/_odysseys_upstream_full_traj.py",
     ".bzr",
     ".direnv",
     ".eggs",

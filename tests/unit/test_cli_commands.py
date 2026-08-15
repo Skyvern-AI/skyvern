@@ -140,10 +140,19 @@ class TestResolveConnection:
     def test_explicit_cdp_wins(self) -> None:
         from skyvern.cli.commands.browser import _resolve_connection
 
-        result = _resolve_connection(None, "ws://localhost:9222/devtools/browser/abc")
+        cdp_url = "wss://browser.test/devtools/browser/pbs_123"
+        result = _resolve_connection(None, cdp_url)
         assert result.mode == "cdp"
         assert result.session_id is None
-        assert result.cdp_url == "ws://localhost:9222/devtools/browser/abc"
+        assert result.cdp_url == cdp_url
+
+    def test_bare_session_id_in_explicit_cdp_routes_to_cloud(self) -> None:
+        from skyvern.cli.commands.browser import _resolve_connection
+
+        result = _resolve_connection(None, "pbs_explicit")
+        assert result.mode == "cloud"
+        assert result.session_id == "pbs_explicit"
+        assert result.cdp_url is None
 
     def test_rejects_both_connection_flags(self) -> None:
         from skyvern.cli.commands.browser import _resolve_connection
@@ -160,14 +169,29 @@ class TestResolveConnection:
         assert result.mode == "cloud"
         assert result.session_id == "pbs_from_state"
 
-    def test_state_fallback_cdp(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("mode", ["cdp", None])
+    def test_state_fallback_cdp(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str | None) -> None:
         from skyvern.cli.commands.browser import _resolve_connection
 
         _patch_state_dir(monkeypatch, tmp_path)
-        save_state(CLIState(session_id=None, cdp_url="ws://localhost:9222/devtools/browser/abc", mode="cdp"))
+        cdp_url = "wss://browser.test/devtools/browser/pbs_123"
+        save_state(CLIState(session_id=None, cdp_url=cdp_url, mode=mode))
         result = _resolve_connection(None, None)
         assert result.mode == "cdp"
-        assert result.cdp_url == "ws://localhost:9222/devtools/browser/abc"
+        assert result.cdp_url == cdp_url
+
+    @pytest.mark.parametrize("mode", ["cdp", None])
+    def test_bare_session_id_in_cdp_state_routes_to_cloud(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str | None
+    ) -> None:
+        from skyvern.cli.commands.browser import _resolve_connection
+
+        _patch_state_dir(monkeypatch, tmp_path)
+        save_state(CLIState(session_id=None, cdp_url="pbs_from_state", mode=mode))
+        result = _resolve_connection(None, None)
+        assert result.mode == "cloud"
+        assert result.session_id == "pbs_from_state"
+        assert result.cdp_url is None
 
     def test_no_session_raises(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.cli.commands.browser import _resolve_connection

@@ -23,9 +23,12 @@ import typer
 
 from skyvern._cli_bootstrap import prepare_cli_runtime
 from skyvern.browser_extension.auth import load_or_create_pairing_token
-from skyvern.browser_extension.broker.protocol import BROKER_HEALTH_PATH
-from skyvern.browser_extension.errors import BrowserExtensionError
-from skyvern.browser_extension.runtime import BrowserExtensionRuntime, broker_enabled
+from skyvern.browser_extension.broker_client import BrokerClient
+from skyvern.browser_extension.broker_protocol import is_valid_nonce
+from skyvern.browser_extension.broker_server import run_broker_daemon
+from skyvern.browser_extension.broker_state import enable_broker_state
+from skyvern.browser_extension.errors import BrowserExtensionBrokerError, BrowserExtensionError
+from skyvern.browser_extension.runtime import BrowserExtensionRuntime, broker_mode_enabled
 from skyvern.cli.commands._output import (
     console,
 )
@@ -86,8 +89,10 @@ browser_app.add_typer(network_app, name="network")
 
 
 @browser_app.callback()
-def browser_callback() -> None:
+def browser_callback(ctx: typer.Context) -> None:
     """Load environment and mark the CLI runtime so credential-bearing clients hit the base-URL guard."""
+    if ctx.invoked_subcommand == "extension-broker-daemon":
+        return
     prepare_cli_runtime(intent=EnvIntent.CLOUD)
 
 
@@ -105,15 +110,21 @@ def _resolve_connection(session: str | None, cdp: str | None) -> ConnectionTarge
     if session:
         return ConnectionTarget(mode="cloud", session_id=session)
     if cdp:
+        if cdp.startswith("pbs_"):
+            return ConnectionTarget(mode="cloud", session_id=cdp)
         return ConnectionTarget(mode="cdp", cdp_url=cdp)
 
     state = load_state()
     if state:
         if state.mode == "cdp" and state.cdp_url:
+            if state.cdp_url.startswith("pbs_"):
+                return ConnectionTarget(mode="cloud", session_id=state.cdp_url)
             return ConnectionTarget(mode="cdp", cdp_url=state.cdp_url)
         if state.session_id:
             return ConnectionTarget(mode="cloud", session_id=state.session_id)
         if state.cdp_url:
+            if state.cdp_url.startswith("pbs_"):
+                return ConnectionTarget(mode="cloud", session_id=state.cdp_url)
             return ConnectionTarget(mode="cdp", cdp_url=state.cdp_url)
 
     raise typer.BadParameter(
@@ -282,26 +293,6 @@ def _bridge_is_listening(port: int) -> bool:
     return True
 
 
-def _bridge_mode(port: int) -> Literal["broker", "legacy", "none"]:
-    """Tell a shared broker daemon apart from a pre-broker single-owner MCP session."""
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1.0)
-    try:
-        connection.request("GET", BROKER_HEALTH_PATH)
-        response = connection.getresponse()
-        body = response.read(4096)
-    except OSError:
-        return "none"
-    finally:
-        connection.close()
-    if response.status != 200:
-        return "legacy"
-    try:
-        payload = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return "legacy"
-    return "broker" if isinstance(payload, dict) and payload.get("broker") is True else "legacy"
-
-
 def _request_pairing_nonce(port: int, token: str) -> str:
     proof = hmac.new(token.encode("utf-8"), b"skyvern-pair-begin-v1", hashlib.sha256).hexdigest()
     body = json.dumps({"v": 1, "proof": proof}, separators=(",", ":"))
@@ -345,6 +336,58 @@ def _launch_extension_pairing(port: int) -> None:
     console.print("Approve the pairing in your browser.")
 
 
+async def _broker_client(port: int, *, auto_spawn: bool = True, operator: bool = False) -> BrokerClient:
+    async def _ignore_event(_event: str, _params: dict) -> None:
+        return None
+
+    client = BrokerClient(port, _ignore_event, auto_spawn=auto_spawn, operator=operator)
+    await client.start()
+    return client
+
+
+def _broker_status_output(port: int) -> None:
+    async def _run() -> dict[str, Any]:
+        client = await _broker_client(port, auto_spawn=False, operator=True)
+        try:
+            return await client.broker_status()
+        finally:
+            await client.stop()
+
+    try:
+        status = asyncio.run(_run())
+    except (BrowserExtensionError, OSError) as exc:
+        console.print(f"broker not running ({exc})")
+        return
+    console.print("bridge mode: persistent broker")
+    console.print(f"broker ready on {port}")
+    console.print(f"extension connected: {'yes' if status.get('extensionConnected') else 'no'}")
+    console.print(f"authenticated clients: {status.get('clientCount', 0)}")
+
+
+def _begin_broker_pairing(port: int, *, cancel_pending: bool) -> None:
+    async def _run() -> dict[str, Any]:
+        client = await _broker_client(port, operator=True)
+        try:
+            if cancel_pending:
+                await client.cancel_pairing()
+            return await client.begin_pairing()
+        finally:
+            await client.stop()
+
+    result = asyncio.run(_run())
+    if result.get("opened") is not True:
+        pairing_url = result.get("pairingUrl")
+        prefix = f"http://127.0.0.1:{port}/pair#"
+        nonce = pairing_url.removeprefix(prefix) if isinstance(pairing_url, str) else ""
+        if not isinstance(pairing_url, str) or not pairing_url.startswith(prefix) or not is_valid_nonce(nonce):
+            raise BrowserExtensionBrokerError(
+                "PAIRING_OPEN_FAILED",
+                "The broker could not open the pairing page in Chrome or return a safe fallback URL",
+            )
+        console.print(pairing_url, markup=False, soft_wrap=True)
+    console.print("Approve the pairing in your browser.")
+
+
 @browser_app.command("extension-path")
 def extension_path() -> None:
     console.print(str(BrowserExtensionRuntime.extension_dir().resolve()), markup=False, soft_wrap=True)
@@ -353,6 +396,9 @@ def extension_path() -> None:
 @browser_app.command("extension-token")
 def extension_token() -> None:
     """Copy the pairing token for manual popup-paste fallback."""
+    if broker_mode_enabled():
+        console.print("The extension credential is broker-owned and cannot be copied in broker mode.")
+        raise typer.Exit(code=1)
     token = load_or_create_pairing_token()
     if _copy_pairing_token_to_clipboard(token):
         console.print("Pairing token copied to clipboard.")
@@ -373,6 +419,15 @@ def extension_status() -> None:
         soft_wrap=True,
     )
 
+    if broker_mode_enabled():
+        try:
+            port = BrowserExtensionRuntime.configured_port()
+        except BrowserExtensionError as exc:
+            console.print(f"broker configuration invalid ({exc})")
+            return
+        _broker_status_output(port)
+        return
+
     environment_configured = bool(os.environ.get("SKYVERN_BROWSER_EXTENSION_TOKEN", "").strip())
     token_file_exists, permissions = _pairing_token_file_status()
     if environment_configured:
@@ -389,25 +444,27 @@ def extension_status() -> None:
         console.print(f"bridge configuration invalid ({exc})")
         return
 
-    console.print(f"shared broker: {'enabled' if broker_enabled() else 'disabled (SKYVERN_BROWSER_EXTENSION_BROKER)'}")
-
-    mode = _bridge_mode(port)
-    if mode == "none":
+    if not _bridge_is_listening(port):
         console.print("bridge not running (start your MCP server with --browser-extension)")
-    elif mode == "broker":
-        console.print(f"bridge listening on {port} (shared broker daemon)")
     else:
-        console.print(f"bridge listening on {port} (single-owner session)")
-        console.print("restart that session on this version so every agent can share the bridge")
+        console.print(f"bridge listening on {port}")
 
 
-@browser_app.command("extension-pair")
-def extension_pair() -> None:
+def _extension_pair(cancel_pending: bool) -> None:
     try:
         port = BrowserExtensionRuntime.configured_port()
     except BrowserExtensionError:
         console.print("Start your MCP server first: skyvern run mcp --browser-extension")
         raise typer.Exit(code=1) from None
+    if broker_mode_enabled():
+        if cancel_pending and not typer.confirm("Cancel the pending broker pairing flow and start a new one?"):
+            raise typer.Exit(code=1)
+        try:
+            _begin_broker_pairing(port, cancel_pending=cancel_pending)
+        except (BrowserExtensionError, OSError) as exc:
+            console.print(str(exc))
+            raise typer.Exit(code=1) from None
+        return
     if not _bridge_is_listening(port):
         console.print("Start your MCP server first: skyvern run mcp --browser-extension")
         raise typer.Exit(code=1)
@@ -418,10 +475,113 @@ def extension_pair() -> None:
         raise typer.Exit(code=1) from None
 
 
+@browser_app.command("extension-pair")
+def extension_pair(
+    cancel_pending: bool = typer.Option(False, "--cancel-pending", help="Cancel an existing broker pairing flow."),
+) -> None:
+    _extension_pair(cancel_pending)
+
+
+def extension_broker_enable() -> None:
+    """Idempotently enable and start the default persistent POSIX extension broker."""
+    try:
+        port = BrowserExtensionRuntime.configured_port()
+        _paths, source = enable_broker_state(port)
+
+        async def _run() -> None:
+            client = await _broker_client(port, operator=True)
+            await client.stop()
+
+        asyncio.run(_run())
+    except (BrowserExtensionError, OSError) as exc:
+        console.print(str(exc))
+        raise typer.Exit(code=1) from None
+    console.print(f"Browser-extension broker enabled on port {port} ({source} credential).")
+    console.print(
+        "Broker-backed extension sessions are the default; set SKYVERN_BROWSER_EXTENSION_BROKER=0 to opt out."
+    )
+
+
+def extension_broker_pair(
+    cancel_pending: bool = typer.Option(False, "--cancel-pending", help="Cancel an existing pairing flow."),
+) -> None:
+    """Start an explicit pairing flow through authenticated broker control."""
+    if cancel_pending and not typer.confirm("Cancel the pending broker pairing flow and start a new one?"):
+        raise typer.Exit(code=1)
+    try:
+        _begin_broker_pairing(BrowserExtensionRuntime.configured_port(), cancel_pending=cancel_pending)
+    except (BrowserExtensionError, OSError) as exc:
+        console.print(str(exc))
+        raise typer.Exit(code=1) from None
+
+
+def extension_broker_status() -> None:
+    """Report sanitized broker and extension connectivity status."""
+    try:
+        port = BrowserExtensionRuntime.configured_port()
+    except BrowserExtensionError as exc:
+        console.print(f"broker configuration invalid ({exc})")
+        return
+    _broker_status_output(port)
+
+
+def extension_broker_stop() -> None:
+    """Explicitly stop the persistent broker and release its configured port."""
+    port = BrowserExtensionRuntime.configured_port()
+
+    async def _run() -> None:
+        client = await _broker_client(port, auto_spawn=False, operator=True)
+        try:
+            await client.stop_broker()
+        finally:
+            await client.stop()
+
+    try:
+        asyncio.run(_run())
+    except (BrowserExtensionError, OSError) as exc:
+        console.print(str(exc))
+        raise typer.Exit(code=1) from None
+    console.print(f"Browser-extension broker stop requested; port {port} will no longer be reserved.")
+
+
+def extension_broker_daemon(
+    port: int = typer.Option(..., "--port", min=1, max=65535),
+) -> None:
+    """Internal fixed-command entry point for the persistent broker."""
+    try:
+        asyncio.run(run_broker_daemon(port))
+    except BrowserExtensionBrokerError as exc:
+        if os.environ.get("SKYVERN_BROWSER_EXTENSION_BROKER_READY_FD") is None:
+            console.print(str(exc))
+        raise typer.Exit(code=1) from None
+
+
+browser_app.command("extension-broker-enable")(extension_broker_enable)
+browser_app.command("extension-broker-pair")(extension_broker_pair)
+browser_app.command("extension-broker-status")(extension_broker_status)
+browser_app.command("extension-broker-stop")(extension_broker_stop)
+browser_app.command("extension-broker-daemon", hidden=True)(extension_broker_daemon)
+
+
 @browser_app.command("extension-install")
 def extension_install() -> None:
     extension_dir = BrowserExtensionRuntime.extension_dir().resolve()
     console.print(str(extension_dir), markup=False, soft_wrap=True)
+
+    if broker_mode_enabled():
+        if _open_chrome_extensions():
+            console.print("Opened chrome://extensions.")
+        else:
+            console.print("chrome://extensions", markup=False)
+        console.print("1. Enable Developer mode.")
+        console.print("2. Click Load unpacked.")
+        console.print(f"3. Select {extension_dir}.", markup=False, soft_wrap=True)
+        console.print(
+            "4. Start your extension-mode MCP server; its first broker start enables broker state automatically."
+        )
+        console.print("5. Run skyvern browser extension-pair to start explicit pairing.")
+        console.print('6. Add tabs to the "Skyvern Controlled" group.')
+        return
 
     try:
         port = BrowserExtensionRuntime.configured_port()

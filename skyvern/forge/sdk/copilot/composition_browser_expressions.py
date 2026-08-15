@@ -158,7 +158,7 @@ def role_name_match_count_expression(role: str, name: str) -> str:
         "    for (const el of nodes) {"
         "      const role = text(el.getAttribute('role')) || implicitRole(el);"
         "      if (role !== targetRole) continue;"
-        "      if (accessibleName(el, role) === targetName) { count++; if (count > 1) break; }"
+        "      if (accessibleName(el, role) === targetName) count++;"
         "    }"
         "    return count;"
         "  } catch (e) { return -1; }"
@@ -171,6 +171,39 @@ def role_name_match_count_expression(role: str, name: str) -> str:
 def selector_match_count_expression(css_selector: str) -> str:
     sel = json.dumps(css_selector)
     return f"(() => {{  try {{ return document.querySelectorAll({sel}).length; }}  catch (e) {{ return -1; }}}})()"
+
+
+def selector_candidates_expression(css_selector: str) -> str:
+    """Return every bounded CSS identity observed for the selected source-page element.
+
+    Candidate order is capture order only. The result does not rank, filter by uniqueness, or choose
+    a replacement for the selector supplied by the model.
+    """
+    sel = json.dumps(css_selector)
+    return (
+        "(() => {"
+        f"  const requested = {sel};"
+        "  let el = null; try { el = document.querySelector(requested); } catch (e) { return []; }"
+        "  if (!el) return [];"
+        "  const esc = (v) => window.CSS && CSS.escape ? CSS.escape(String(v)) : String(v);"
+        "  const attr = (n, k) => n && n.getAttribute ? String(n.getAttribute(k) || '') : '';"
+        "  const tag = (el.tagName || '*').toLowerCase();"
+        "  const candidates = [];"
+        "  const add = (selector, source) => {"
+        "    if (!selector || candidates.some((item) => item.selector === selector)) return;"
+        "    let matches = []; try { matches = Array.from(document.querySelectorAll(selector)); } catch (e) { return; }"
+        "    if (matches.includes(el)) candidates.push({selector: selector, source: source});"
+        "  };"
+        "  add(requested, 'requested');"
+        "  const id = attr(el, 'id'); if (id) add('#' + esc(id), 'id');"
+        "  const name = attr(el, 'name'); if (name) add(tag + '[name=\"' + name.replaceAll('\\\\', '\\\\\\\\').replaceAll('\"', '\\\"') + '\"]', 'name');"
+        "  const aria = attr(el, 'aria-label'); if (aria) add(tag + '[aria-label=\"' + aria.replaceAll('\\\\', '\\\\\\\\').replaceAll('\"', '\\\"') + '\"]', 'aria_label');"
+        "  const type = attr(el, 'type'); if (type) add(tag + '[type=\"' + type.replaceAll('\\\\', '\\\\\\\\').replaceAll('\"', '\\\"') + '\"]', 'type');"
+        "  const classes = Array.from(el.classList || []).filter(Boolean);"
+        "  if (classes.length) add(tag + classes.map((value) => '.' + esc(value)).join(''), 'class_list');"
+        "  return candidates;"
+        "})()"
+    )
 
 
 # Submit controls belonging to the form that contains a just-filled field. A login page often
@@ -201,81 +234,6 @@ def enclosing_form_submit_controls_expression(css_selector: str) -> str:
         "    }"
         "    return out;"
         "  } catch (e) { return []; }"
-        "})()"
-    )
-
-
-def scout_dynamic_row_evidence_expression(selector: str) -> str:
-    """Capture a bounded, source-page row identity for an exact positional click target.
-
-    Period capture intentionally recognizes English ``Month D, YYYY`` labels only. Keep this browser
-    parser in lockstep with ``_ROW_PERIOD_DATE_RE`` when adding formats; do not add site-specific cases.
-    """
-    sel = json.dumps(selector)
-    return (
-        "(() => {"
-        f"  const targetSelector = {sel};"
-        "  const text = (value) => String(value || '').replace(/\\s+/g, ' ').trim().slice(0, 500);"
-        "  const months = { january: 1, february: 2, march: 3, april: 4, may: 5, june: 6, "
-        "july: 7, august: 8, september: 9, october: 10, november: 11, december: 12 };"
-        "  const daysInMonth = (year, month) => month === 2 ? "
-        "(year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28) : "
-        "([4, 6, 9, 11].includes(month) ? 30 : 31);"
-        "  const periods = (value) => {"
-        "    const found = [];"
-        "    const pattern = /\\b(January|February|March|April|May|June|July|August|September|October|November|December)\\s+(0?[1-9]|[12][0-9]|3[01]),\\s+([0-9]{4})\\b/gi;"
-        "    for (const match of String(value || '').matchAll(pattern)) {"
-        "      const month = months[match[1].toLowerCase()];"
-        "      const day = Number(match[2]); const year = Number(match[3]);"
-        "      if (year >= 1 && day <= daysInMonth(year, month)) "
-        "found.push(match[3] + '-' + String(month).padStart(2, '0'));"
-        "    }"
-        "    return found;"
-        "  };"
-        "  const escapeCss = (value) => window.CSS && CSS.escape ? CSS.escape(value) : "
-        "String(value).replace(/[^A-Za-z0-9_-]/g, (ch) => '\\\\' + ch);"
-        "  let target = null;"
-        "  let indexed = null;"
-        "  try {"
-        "    if (/^\\s*(xpath=|\\(?\\/)/.test(targetSelector)) {"
-        "      const xpath = targetSelector.replace(/^\\s*xpath=/, '');"
-        "      const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);"
-        "      target = result ? result.singleNodeValue : null;"
-        "    } else {"
-        "      indexed = targetSelector.match(/^(.*)\\s*>>\\s*nth=(\\d+)\\s*$/);"
-        "      if (indexed) target = document.querySelectorAll(indexed[1].trim())[Number(indexed[2])] || null;"
-        "      else target = document.querySelector(targetSelector);"
-        "    }"
-        "  } catch (e) { return null; }"
-        "  if (!target || !target.tagName) return null;"
-        "  const tag = target.tagName.toLowerCase();"
-        "  const id = target.getAttribute('id') || '';"
-        "  const classes = Array.from(target.classList || []).map(String).filter(Boolean);"
-        "  let rowSelector = indexed ? indexed[1].trim() : '';"
-        "  if (!rowSelector && id) rowSelector = '#' + escapeCss(id);"
-        "  else if (!rowSelector && classes.length) "
-        "rowSelector = tag + classes.map((name) => '.' + escapeCss(name)).join('');"
-        "  else if (!rowSelector) rowSelector = tag;"
-        "  let rows = [];"
-        "  try { rows = Array.from(document.querySelectorAll(rowSelector)); } catch (e) { return null; }"
-        "  if (rows.length < 2 || rows.length > 100) return null;"
-        "  const selectedIndex = rows.indexOf(target);"
-        "  if (selectedIndex < 0) return null;"
-        "  const rowText = text(target.textContent);"
-        "  if (!rowText) return null;"
-        "  const rowTextMatchCount = rows.reduce((count, row) => count + (text(row.textContent) === rowText ? 1 : 0), 0);"
-        "  const rowPeriods = rows.map((row) => periods(text(row.textContent)));"
-        "  const selectedPeriods = rowPeriods[selectedIndex];"
-        "  const uniqueSelectedPeriods = Array.from(new Set(selectedPeriods)).sort();"
-        "  if (uniqueSelectedPeriods.length > 20) return null;"
-        "  const periodMatches = uniqueSelectedPeriods.map((period) => ({"
-        "    period,"
-        "    selected_row_match_count: selectedPeriods.filter((candidate) => candidate === period).length,"
-        "    row_match_count: rowPeriods.filter((candidates) => candidates.includes(period)).length"
-        "  }));"
-        "  return { target_selector: targetSelector, row_selector: rowSelector, row_text: rowText, "
-        "row_selector_count: rows.length, row_text_match_count: rowTextMatchCount, period_matches: periodMatches, "
-        "selected_index: selectedIndex };"
         "})()"
     )
 
@@ -439,10 +397,10 @@ const structuralPath = (el) => {
   }
   return full;
 };
-// The selector is a contract: the model clicks it and authors it into generated blocks, so an
+// The selector is a contract: the model clicks it and authors it into submitted blocks, so an
 // ambiguous or unresolvable guess costs a failed run rather than a retry. Every candidate is
 // verified to match this exact node and nothing else before it is handed out.
-const selectorFor = (el) => {
+const selectorCandidatesFor = (el) => {
   const tag = (el.tagName || '*').toLowerCase();
   const candidates = [];
   const id = attr(el, 'id');
@@ -452,17 +410,26 @@ const selectorFor = (el) => {
   const classes = classesFor(el); const cs = classSelector(classes);
   if (cs && value) candidates.push(tag + cs + '[value="' + cssAttr(value) + '"]');
   if (name) candidates.push(tag + '[name="' + cssAttr(name) + '"]');
+  const ariaLabel = attr(el, 'aria-label');
+  if (ariaLabel) candidates.push(tag + '[aria-label="' + cssAttr(ariaLabel) + '"]');
   const href = attr(el, 'href');
   if (tag === 'a' && href) candidates.push('a[href="' + cssAttr(href) + '"]');
   if (cs) candidates.push(tag + cs);
   const type = attr(el, 'type');
   if (cs && type) candidates.push(tag + cs + '[type="' + cssAttr(type) + '"]');
+  const path = structuralPath(el);
+  if (path && !candidates.includes(path)) candidates.push(path);
+  return candidates.filter((selector, index) => {
+    if (!selector || candidates.indexOf(selector) !== index) return false;
+    try { return Array.from(document.querySelectorAll(selector)).includes(el); } catch (e) { return false; }
+  }).map((selector) => ({ selector: selector, source: 'browser' }));
+};
+const selectorFor = (el) => {
+  const candidates = selectorCandidatesFor(el).map((item) => item.selector);
   for (let i = 0; i < candidates.length; i++) {
     if (resolvesUniquely(candidates[i], el)) return candidates[i];
   }
-  const path = structuralPath(el);
-  if (resolvesUniquely(path, el)) return path;
-  return candidates.length ? candidates[0] : tag;
+  return candidates.length ? candidates[0] : (el.tagName || '*').toLowerCase();
 };
 // A submit control with no text still has an identity in title/aria-label/alt (an icon-only
 // "Sign in with Google" is the common shape). Reporting it as an empty string offers the model an
@@ -564,6 +531,13 @@ const isHiddenModal = (el) => {
   }
   return false;
 };
+const controlVisible = (node) => {
+  if (!node || !node.getBoundingClientRect) return false;
+  let style; try { style = window.getComputedStyle(node); } catch (e) { return false; }
+  const rect = node.getBoundingClientRect();
+  // Match Playwright for form-control readiness: opacity alone does not make a control hidden.
+  return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+};
 const modalDismissControls = (node) => {
   const out = [];
   const seen = new Set();
@@ -576,7 +550,7 @@ const modalDismissControls = (node) => {
     // a modal it has no way to clear.
     const text = controlLabel(c);
     seen.add(selector);
-    out.push({ tag: (c.tagName || '').toLowerCase(), text: text, aria_label: attr(c, 'aria-label'), title: attr(c, 'title'), selector: selector, type: attr(c, 'type') });
+    out.push({ tag: (c.tagName || '').toLowerCase(), text: text, aria_label: attr(c, 'aria-label'), title: attr(c, 'title'), selector: selector, selector_candidates: selectorCandidatesFor(c), type: attr(c, 'type') });
   }
   return out;
 };
@@ -597,11 +571,11 @@ for (const form of document.querySelectorAll('form')) {
       : (declaredType || tag || 'text');
     if (tag === 'input' && (fieldType === 'hidden' || fieldType === 'reset')) continue;
     if (tag === 'button' || fieldType === 'submit' || fieldType === 'button') {
-      submitControls.push({ text: controlLabel(node), name: attr(node, 'name'), id: attr(node, 'id'), value: attr(node, 'value'), class: classesFor(node), type: fieldType, disabled: controlDisabled(node), selector: selectorFor(node) });
+      submitControls.push({ text: controlLabel(node), name: attr(node, 'name'), id: attr(node, 'id'), value: attr(node, 'value'), class: classesFor(node), type: fieldType, disabled: controlDisabled(node), visible: controlVisible(node), selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node) });
       continue;
     }
     if (fields.length >= MAX_FIELDS_PER_FORM) continue;
-    fields.push({ name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), filled: isFilled(node), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), checked: node.hasAttribute('checked'), options: tag === 'select' ? selectOptions(node) : [], selector: selectorFor(node) });
+    fields.push({ name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), filled: isFilled(node), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), visible: controlVisible(node), checked: node.hasAttribute('checked'), options: tag === 'select' ? selectOptions(node) : [], selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node) });
   }
   forms.push({ id: attr(form, 'id'), name: attr(form, 'name'), action: attr(form, 'action'), method: attr(form, 'method'), fields: fields, submit_controls: submitControls });
 }
@@ -615,7 +589,7 @@ for (const link of document.querySelectorAll('a[href]')) {
   let resolved; try { resolved = new URL(rawHref, location.href).href; } catch (e) { continue; }
   let host; try { host = new URL(resolved).host.toLowerCase(); } catch (e) { continue; }
   if (!host || host !== baseHost) continue;
-  const entry = { text: nodeText(link), href: resolved, selector: selectorFor(link) };
+  const entry = { text: nodeText(link), href: resolved, selector: selectorFor(link), selector_candidates: selectorCandidatesFor(link) };
   if (link.hasAttribute('download')) entry.has_download_attr = true;
   navTargets.push(entry);
 }
@@ -654,7 +628,7 @@ for (const el of document.querySelectorAll('button,[role="button"],[data-action]
   let unique = false;
   if (selector) { try { unique = document.querySelectorAll(selector).length === 1; } catch (e) { unique = false; } }
   if (selector && unique && !usedClickableSelectors.has(selector)) {
-    clickableControls.push({ text: text, selector: selector, tag: tag });
+    clickableControls.push({ text: text, selector: selector, selector_candidates: selectorCandidatesFor(el), tag: tag });
     usedClickableSelectors.add(selector);
     if (text) seenClickableText.add(text);
     continue;
@@ -673,7 +647,7 @@ const resultRowTextIsContent = (s) => {
 };
 const resultEntry = (node, tag) => {
   const selector = selectorFor(node);
-  const entry = { tag: tag, id: attr(node, 'id'), selector: selector, selector_match_count: selectorMatchCount(selector), visible: elementVisible(node), is_table: tag === 'table' };
+  const entry = { tag: tag, id: attr(node, 'id'), selector: selector, selector_candidates: selectorCandidatesFor(node), selector_match_count: selectorMatchCount(selector), visible: elementVisible(node), is_table: tag === 'table' };
 	  if (tag === 'table') {
 	    let rows = Array.from(node.querySelectorAll(':scope > tbody > tr')).filter((r) => r.querySelector(':scope > td'));
 	    if (!rows.length) rows = Array.from(node.querySelectorAll(':scope > tr')).filter((r) => r.querySelector(':scope > td'));

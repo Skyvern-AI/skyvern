@@ -653,6 +653,10 @@ def run_mcp(
             help="MCP transport: stdio (default), sse, or streamable-http.",
         ),
     ] = "stdio",
+    scope: Annotated[
+        Literal["all", "operate", "build", "browser", "lean"],
+        typer.Option("--scope", help="MCP tool scope: all (default), operate, build, browser, or lean."),
+    ] = "all",
     host: Annotated[
         str, typer.Option("--host", help="Host for HTTP transports.")
     ] = _default_host(),  # sys.platform is constant; safe at import time
@@ -706,9 +710,15 @@ def run_mcp(
         set_stdio_local_file_access_enabled,
     )
     from skyvern.cli.mcp_tools import mcp  # noqa: PLC0415
+    from skyvern.cli.mcp_tools.instructions import instructions_for_scope  # noqa: PLC0415
     from skyvern.cli.mcp_tools.telemetry import configure_mcp_telemetry_runtime  # noqa: PLC0415
 
+    mcp.instructions = instructions_for_scope(scope)
     imports_finished_at = time.monotonic()
+    if scope != "all":
+        from skyvern.cli.mcp_tools.scopes import apply_scope  # noqa: PLC0415
+
+        apply_scope(mcp, scope)
     path = _normalize_mcp_path(path)
     stateless_http_enabled = transport != "stdio" and stateless_http
     boot_ready_logged = False

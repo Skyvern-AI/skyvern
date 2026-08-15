@@ -5,11 +5,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 import structlog.testing
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 
 from skyvern.forge.sdk.routes import credentials
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
+from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType, TotpType
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCodeCreate
+from skyvern.forge.sdk.services.credential.custom_credential_vault_service import CustomCredentialNotConfiguredError
 from skyvern.services.otp_service import OTPValue
 
 
@@ -400,3 +402,50 @@ async def test_send_totp_code_parse_miss_over_cap_stays_400(monkeypatch: pytest.
     assert exc_info.value.detail == "Failed to parse otp login"
     create_otp_code.assert_not_awaited()
     create_raw_otp_code.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_totp_code_preview_refuses_unconfigured_custom_vault_without_error_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    credential = Credential(
+        credential_id="cred_unconfigured_custom",
+        organization_id="o_test",
+        name="Login",
+        vault_type=CredentialVaultType.CUSTOM,
+        item_id="item_test",
+        credential_type=CredentialType.PASSWORD,
+        username="user_test",
+        totp_type=TotpType.AUTHENTICATOR,
+        card_last4=None,
+        card_brand=None,
+        created_at=now,
+        modified_at=now,
+    )
+    monkeypatch.setattr(
+        credentials.app,
+        "DATABASE",
+        SimpleNamespace(credentials=SimpleNamespace(get_credential=AsyncMock(return_value=credential))),
+    )
+    monkeypatch.setattr(
+        credentials,
+        "_get_credential_vault_service",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                get_credential_item=AsyncMock(side_effect=CustomCredentialNotConfiguredError("o_test"))
+            )
+        ),
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        with pytest.raises(HTTPException) as exc_info:
+            await credentials.get_credential_totp_code(
+                response=Response(),
+                credential_id=credential.credential_id,
+                current_org=SimpleNamespace(organization_id="o_test"),
+            )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Custom credential service is not configured for this organization"
+    assert not [record for record in logs if record.get("log_level") == "error"]

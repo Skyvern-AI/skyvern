@@ -7,7 +7,9 @@ from urllib.parse import urlsplit
 
 from skyvern.browser_extension.errors import BrowserExtensionError
 
-PROTOCOL_VERSION = 1
+LEGACY_PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
+SUPPORTED_PROTOCOL_VERSIONS = frozenset({LEGACY_PROTOCOL_VERSION, PROTOCOL_VERSION})
 EXTENSION_ID = "dhommdmblflboaledbbfkdaapkadphlp"
 
 ALLOWED_OPS = frozenset(
@@ -95,12 +97,13 @@ RESTRICTED_URL_PREFIXES = (
     "file://",
 )
 
-MessageKind = Literal["response", "event", "pong", "ping", "auth.proof"]
+MessageKind = Literal["response", "event", "pong", "ping", "auth.proof", "extension.reset_ack"]
 
 
 @dataclass(frozen=True, slots=True)
 class ParsedMessage:
     kind: MessageKind
+    protocol_version: int
     request_id: str | None = None
     ok: bool | None = None
     result: dict | None = None
@@ -111,16 +114,21 @@ class ParsedMessage:
     params: dict | None = None
     client_nonce: str | None = None
     proof: str | None = None
+    reset_epoch: str | None = None
+    generation: int | None = None
+    failed_tab_count: int | None = None
 
 
-def build_request(request_id: str, op: str, args: dict) -> dict:
+def build_request(request_id: str, op: str, args: dict, *, protocol_version: int = PROTOCOL_VERSION) -> dict:
     if not isinstance(request_id, str) or not request_id:
         raise BrowserExtensionError("Request id must be a non-empty string")
     if not isinstance(op, str) or op not in ALLOWED_OPS:
         raise BrowserExtensionError(f"Operation is not allowed: {op}")
     if not isinstance(args, dict):
         raise BrowserExtensionError("Request args must be an object")
-    return {"v": PROTOCOL_VERSION, "type": "request", "id": request_id, "op": op, "args": args}
+    if protocol_version not in SUPPORTED_PROTOCOL_VERSIONS:
+        raise BrowserExtensionError("Unsupported extension protocol version")
+    return {"v": protocol_version, "type": "request", "id": request_id, "op": op, "args": args}
 
 
 def parse_extension_message(raw: str) -> ParsedMessage:
@@ -131,23 +139,46 @@ def parse_extension_message(raw: str) -> ParsedMessage:
 
     if not isinstance(payload, dict):
         raise BrowserExtensionError("Extension frame must be an object")
-    if type(payload.get("v")) is not int or payload["v"] != PROTOCOL_VERSION:
+    protocol_version = payload.get("v")
+    if type(protocol_version) is not int or protocol_version not in SUPPORTED_PROTOCOL_VERSIONS:
         raise BrowserExtensionError("Unsupported extension protocol version")
 
     frame_type = payload.get("type")
     if frame_type == "response":
-        return _parse_response(payload)
+        return _parse_response(payload, protocol_version)
     if frame_type == "event":
-        return _parse_event(payload)
+        return _parse_event(payload, protocol_version)
     if frame_type == "ping":
-        return ParsedMessage(kind="ping")
+        return ParsedMessage(kind="ping", protocol_version=protocol_version)
     if frame_type == "pong":
-        return ParsedMessage(kind="pong")
+        return ParsedMessage(kind="pong", protocol_version=protocol_version)
     if frame_type == "auth.proof":
         return ParsedMessage(
             kind="auth.proof",
+            protocol_version=protocol_version,
             client_nonce=_required_string(payload, "clientNonce"),
             proof=_required_string(payload, "proof"),
+        )
+    if frame_type == "extension.reset_ack" and protocol_version == PROTOCOL_VERSION:
+        reset_epoch = _required_string(payload, "epoch")
+        generation = payload.get("generation")
+        if type(generation) is not int or generation < 0:
+            raise BrowserExtensionError("Extension reset generation must be a non-negative integer")
+        ok = payload.get("ok")
+        if type(ok) is not bool:
+            raise BrowserExtensionError("Extension reset ok must be a boolean")
+        failed_tab_count = payload.get("failedTabCount", 0)
+        if type(failed_tab_count) is not int or failed_tab_count < 0 or (not ok and failed_tab_count == 0):
+            raise BrowserExtensionError("Extension reset failedTabCount must describe failed detachments")
+        if ok and failed_tab_count != 0:
+            raise BrowserExtensionError("Successful extension reset cannot contain failed detachments")
+        return ParsedMessage(
+            kind="extension.reset_ack",
+            protocol_version=protocol_version,
+            reset_epoch=reset_epoch,
+            generation=generation,
+            ok=ok,
+            failed_tab_count=failed_tab_count,
         )
     raise BrowserExtensionError("Unknown extension frame type")
 
@@ -173,7 +204,7 @@ def is_restricted_url(url: str) -> bool:
         return False
 
 
-def _parse_response(payload: dict) -> ParsedMessage:
+def _parse_response(payload: dict, protocol_version: int) -> ParsedMessage:
     request_id = _required_string(payload, "id")
     ok = payload.get("ok")
     if type(ok) is not bool:
@@ -181,7 +212,9 @@ def _parse_response(payload: dict) -> ParsedMessage:
 
     if ok:
         result = _required_dict(payload, "result")
-        return ParsedMessage(kind="response", request_id=request_id, ok=True, result=result)
+        return ParsedMessage(
+            kind="response", protocol_version=protocol_version, request_id=request_id, ok=True, result=result
+        )
 
     error = _required_dict(payload, "error")
     error_code = _required_string(error, "code")
@@ -190,6 +223,7 @@ def _parse_response(payload: dict) -> ParsedMessage:
         raise BrowserExtensionError("Response contains an unknown error code")
     return ParsedMessage(
         kind="response",
+        protocol_version=protocol_version,
         request_id=request_id,
         ok=False,
         error=error,
@@ -198,11 +232,18 @@ def _parse_response(payload: dict) -> ParsedMessage:
     )
 
 
-def _parse_event(payload: dict) -> ParsedMessage:
+def _parse_event(payload: dict, protocol_version: int) -> ParsedMessage:
     event = _required_string(payload, "event")
     if event not in ALLOWED_EVENTS:
         raise BrowserExtensionError("Unknown extension event")
-    return ParsedMessage(kind="event", event=event, params=_required_dict(payload, "params"))
+    params = _required_dict(payload, "params")
+    if event == "extension.hello":
+        reported_version = params.get("protocolVersion")
+        if protocol_version == PROTOCOL_VERSION and reported_version != protocol_version:
+            raise BrowserExtensionError("Extension hello protocolVersion must match the frame version")
+        if reported_version is not None and reported_version != protocol_version:
+            raise BrowserExtensionError("Extension hello protocolVersion must match the frame version")
+    return ParsedMessage(kind="event", protocol_version=protocol_version, event=event, params=params)
 
 
 def _required_string(payload: dict, field: str) -> str:

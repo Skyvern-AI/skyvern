@@ -122,7 +122,7 @@ def _terminal_payload(
     verified: bool,
     workflow_applied: bool,
     workflow_mutated: bool = True,
-    turn_outcome_response_kind: str = "build",
+    workflow_attempted: bool = True,
 ) -> dict[str, Any]:
     envelope = assemble_terminal_envelope(
         response_type="REPLY",
@@ -134,7 +134,7 @@ def _terminal_payload(
         halt_kind=None,
         attempted="Attempted full run.",
         workflow_mutated=workflow_mutated,
-        turn_outcome_response_kind=turn_outcome_response_kind,
+        workflow_attempted=workflow_attempted,
     )
     assert envelope is not None
     return envelope.model_dump(mode="json")
@@ -397,6 +397,35 @@ def test_chat_history_preserves_terminal_envelope() -> None:
     assert served["terminalEnvelope"]["rendered_from_envelope"] is True
 
 
+def test_finalized_terminal_envelope_omits_recorded_output_from_telemetry() -> None:
+    output_report = 'Recorded output from the latest completed run: {"customer_record":"synthetic"}'
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=None,
+        global_llm_context=None,
+        response_type="REPLY",
+        terminal_envelope={
+            **_terminal_payload(verified=False, workflow_applied=False),
+            "run_output_report": output_report,
+        },
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        finalized = workflow_copilot_route._finalized_terminal_envelope(
+            agent_result,
+            workflow_applied=False,
+            final_message="done",
+            response_type="REPLY",
+        )
+
+    assert finalized is not None
+    _, payload = finalized
+    assert payload["run_output_report"] == output_report
+    terminal_log = next(log for log in logs if log["event"] == "copilot_terminal_envelope")
+    assert "run_output_report" not in terminal_log
+    assert output_report not in str(terminal_log)
+
+
 @pytest.mark.asyncio
 async def test_cancel_turn_finalizes_terminal_envelope_to_non_completed_state(
     monkeypatch: pytest.MonkeyPatch,
@@ -585,7 +614,7 @@ async def test_finalise_normal_turn_preserves_and_persists_answer_outcome(
             verified=False,
             workflow_applied=False,
             workflow_mutated=False,
-            turn_outcome_response_kind="answer",
+            workflow_attempted=False,
         ),
     )
     setup_workflow = SimpleNamespace(workflow_id="wf-canonical")
@@ -1542,6 +1571,57 @@ async def test_route_error_after_restore_reports_workflow_not_modified(
     update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
     clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
     assert len(clear_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_pre_agent_config_error_uses_default_turn_index_during_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = SimpleNamespace(
+        user_response="unused",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        unvalidated=False,
+        turn_outcome=None,
+    )
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    app.AGENT_FUNCTION.get_copilot_config_for_request = AsyncMock(side_effect=RuntimeError("config boom"))
+
+    response = await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
+    assert response is captured["sentinel"]
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(copilot_stream)
+
+    assistant_rows = [
+        call
+        for call in app.DATABASE.workflow_params.create_workflow_copilot_chat_message.await_args_list
+        if call.kwargs.get("sender") == WorkflowCopilotChatSender.AI
+    ]
+    assert len(assistant_rows) == 1
+    assert assistant_rows[0].kwargs["narrative_payload"]["turnIndex"] == 0
 
 
 @pytest.mark.asyncio
@@ -3590,7 +3670,7 @@ async def test_finalise_normal_turn_persists_deadline_cause_and_keeps_timeout_co
         halt_kind=None,
         attempted=None,
         workflow_mutated=False,
-        turn_outcome_response_kind=None,
+        workflow_attempted=False,
         terminal_cause="deadline_expired",
     )
     assert envelope is not None

@@ -26,6 +26,13 @@ class CredentialVaultService(ABC):
     from different vault providers (e.g., Bitwarden, OnePassword, AWS Secrets Manager).
     """
 
+    async def validate_organization_configuration(self, organization_id: str) -> None:
+        """Raise if the organization cannot use this vault, without calling the vault itself.
+
+        Vaults configured process-wide have nothing per-organization to check, so this is a no-op.
+        """
+        return None
+
     @abstractmethod
     async def create_credential(self, organization_id: str, data: CreateCredentialRequest) -> Credential:
         """Create a new credential in the vault and database."""

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -48,7 +48,6 @@ class TurnOutcome(BaseModel):
     # does not make older readers silently treat freshly-written rows as None.
     model_config = ConfigDict(extra="ignore", frozen=True)
 
-    turn_intent_summary: dict[str, Any] = Field(default_factory=dict)
     response_kind: ResponseKind
     reason_code: str = ""
     actuation_obligation_key: str = ""

@@ -14,7 +14,14 @@ from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 
 from .console import console
-from .setup_commands import setup_claude, setup_claude_code, setup_cursor, setup_windsurf
+from .setup_commands import (
+    MCPToolScope,
+    _prompt_mcp_scope_for_wizard,
+    setup_claude,
+    setup_claude_code,
+    setup_cursor,
+    setup_windsurf,
+)
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.schemas.organizations import Organization
@@ -206,6 +213,7 @@ def setup_mcp(
     local: bool = False,
     browser_type: str | None = None,
     browser_remote_debugging_url: str | None = None,
+    scope: MCPToolScope | str = MCPToolScope.all,
 ) -> None:
     console.print(Panel("[bold green]MCP Server Setup[/bold green]", border_style="green"))
     if local:
@@ -216,12 +224,15 @@ def setup_mcp(
     else:
         console.print("[italic]This configures Skyvern Cloud MCP in your AI tools.[/italic]")
 
+    scope = _prompt_mcp_scope_for_wizard(local=local, scope=scope)
+
     if Confirm.ask("Would you like to set up MCP integration for Claude Code?", default=True):
         setup_claude_code(
             api_key=None,
             dry_run=False,
             yes=True,
             local=local,
+            scope=scope,
             use_python_path=True,
             url=None,
             project=False,
@@ -237,6 +248,7 @@ def setup_mcp(
             dry_run=False,
             yes=True,
             local=local,
+            scope=scope,
             use_python_path=True,
             url=None,
             browser_type=browser_type,
@@ -249,6 +261,7 @@ def setup_mcp(
             dry_run=False,
             yes=True,
             local=local,
+            scope=scope,
             use_python_path=True,
             url=None,
             browser_type=browser_type,
@@ -261,6 +274,7 @@ def setup_mcp(
             dry_run=False,
             yes=True,
             local=local,
+            scope=scope,
             use_python_path=True,
             url=None,
             browser_type=browser_type,

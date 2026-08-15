@@ -127,6 +127,16 @@ class SkyvernPage(Page):
             return frame
         return object.__getattribute__(self, "page")
 
+    @property
+    def locator_scope(self) -> Page | Frame:
+        """Public read-only view of the current locator scope for callers outside this class."""
+        return self._locator_scope
+
+    @property
+    def working_frame(self) -> Frame | None:
+        """Public read-only view of the working iframe (None means the main frame)."""
+        return object.__getattribute__(self, "_working_frame")
+
     async def _decorate_call(
         self,
         fn: Callable,

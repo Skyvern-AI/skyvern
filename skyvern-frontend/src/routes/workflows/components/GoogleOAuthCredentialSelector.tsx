@@ -23,16 +23,19 @@ type Props = {
   value: string;
   onChange: (value: string) => void;
   requiredScopes: readonly string[];
+  optional?: boolean;
 };
 
 const ADVANCED_OPTION = "__advanced__";
 const SETTINGS_OPTION = "__settings__";
+const NONE_OPTION = "__none__";
 
 function GoogleOAuthCredentialSelector({
   nodeId,
   value,
   onChange,
   requiredScopes,
+  optional = false,
 }: Readonly<Props>) {
   const {
     credentials: allCredentials,
@@ -66,7 +69,7 @@ function GoogleOAuthCredentialSelector({
       (c) => c.id === value && !isGoogleOAuthCredentialActive(c),
     );
   const firstValidId = getDefaultGoogleOAuthCredentialId(credentials);
-  const needsAutoFill = !value;
+  const needsAutoFill = !optional && !value;
 
   useEffect(() => {
     if (
@@ -82,6 +85,10 @@ function GoogleOAuthCredentialSelector({
   }, [isLoading, isFetching, hasCredentials, needsAutoFill, firstValidId]);
 
   const handlePickerValueChange = (selected: string) => {
+    if (selected === NONE_OPTION) {
+      onChange("");
+      return;
+    }
     if (selected === ADVANCED_OPTION) {
       setShowAdvanced(true);
       return;
@@ -153,6 +160,10 @@ function GoogleOAuthCredentialSelector({
               <SelectValue placeholder="Select a Google account" />
             </SelectTrigger>
             <SelectContent>
+              {optional ? (
+                <SelectItem value={NONE_OPTION}>No Google account</SelectItem>
+              ) : null}
+
               {credentials.map((cred) => (
                 <CustomSelectItem key={cred.id} value={cred.id}>
                   <div className="space-y-0.5">

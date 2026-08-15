@@ -155,11 +155,15 @@ async def navigate_with_retry(
                 raise FailedToNavigateToUrl(url=url, error_message=error_str) from error
 
             if attempt >= retry_times - 1:
-                LOG.exception(
+                # Terminal navigation failure is re-raised as FailedToNavigateToUrl and surfaced
+                # via the run's failure_reason; logging at error here double-logs an external
+                # (site-unreachable) outcome. Keep the traceback, drop the error level.
+                LOG.warning(
                     "Failed to navigate after retries",
                     url=url,
                     retry_times=retry_times,
                     error=error_str,
+                    exc_info=True,
                 )
                 raise FailedToNavigateToUrl(url=url, error_message=error_str) from error
 

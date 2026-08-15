@@ -11,6 +11,7 @@ never declared an outcome.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import structlog
@@ -107,6 +108,38 @@ def contract_from_request_criteria(criteria: object) -> dict[str, object] | None
         "schema_version": 1,
         "criteria": [{"id": "requested_download", "kind": CRITERION_REGISTERED_DOWNLOAD, "min_count": 1}],
     }
+
+
+def contract_from_code_artifact_metadata(metadata: object) -> dict[str, object] | None:
+    """Project the acting model's structured deliverable declaration into the runtime contract.
+
+    Interactive request classification is retired. Code-artifact metadata is the model-owned,
+    machine-generated statement of what an authored artifact promises; the server validates the
+    closed enum and never infers that promise from prose or code shape.
+    """
+    if not isinstance(metadata, Mapping):
+        return None
+    seen_ids: set[str] = set()
+    criteria: list[dict[str, object]] = []
+    for artifact in metadata.values():
+        if not isinstance(artifact, Mapping):
+            continue
+        raw_criteria = artifact.get("completion_criteria")
+        if not isinstance(raw_criteria, list):
+            continue
+        for item in raw_criteria:
+            if not isinstance(item, Mapping) or item.get("deliverable_kind") != CRITERION_REGISTERED_DOWNLOAD:
+                continue
+            identifier = (
+                str(item.get("id") or CRITERION_REGISTERED_DOWNLOAD).strip() or CRITERION_REGISTERED_DOWNLOAD
+            )[:_MAX_ID_CHARS]
+            if identifier in seen_ids:
+                continue
+            seen_ids.add(identifier)
+            criteria.append({"id": identifier, "kind": CRITERION_REGISTERED_DOWNLOAD, "min_count": 1})
+    if not criteria:
+        return None
+    return {"schema_version": 1, "criteria": criteria}
 
 
 def carried_contract(existing_definition: object) -> dict[str, object] | None:

@@ -12,6 +12,17 @@ from skyvern.cli.credential_placeholders import (
 )
 
 
+class _StreamConnection:
+    async def __aenter__(self) -> _StreamConnection:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def recv(self) -> str:
+        return '{"status":"session_expired"}'
+
+
 def _prepare_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.chdir(tmp_path)
     frontend = tmp_path / "skyvern-frontend"
@@ -124,3 +135,11 @@ def test_frontend_api_key_placeholder_only_filter_is_consistent() -> None:
     assert is_frontend_api_key_placeholder("YOUR_API_KEY")
     assert is_frontend_api_key_placeholder("")
     assert is_frontend_api_key_placeholder("PLACEHOLDER") is False
+
+
+@pytest.mark.asyncio
+async def test_stream_doctor_stops_when_browser_session_has_expired(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("websockets.connect", lambda *args, **kwargs: _StreamConnection())
+
+    with pytest.raises(RuntimeError, match="stream ended before a frame arrived: session_expired"):
+        await doctor._wait_for_stream_frame("ws://example.test", timeout_seconds=1)

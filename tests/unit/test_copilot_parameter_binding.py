@@ -20,13 +20,6 @@ import pytest
 
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.enforcement import (
-    REPEATED_FRONTIER_STREAK_ESCALATE_AT,
-    REPEATED_FRONTIER_STREAK_STOP_AT,
-    _repeated_frontier_failure_nudge,
-    enforcement_decision,
-)
-from skyvern.forge.sdk.copilot.failure_tracking import compute_failure_signature
 from skyvern.forge.sdk.copilot.tools import _analyze_run_blocks, _parameter_binding_invariant_error
 from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
@@ -100,8 +93,9 @@ def test_analyze_run_blocks_returns_precomputed_categories() -> None:
     assert empty_data is False
 
 
-def test_analyze_run_blocks_falls_through_when_no_precomputed() -> None:
-    # A failure-reason on a block should still be classified by the fallback.
+def test_analyze_run_blocks_does_not_classify_unstructured_failure_prose() -> None:
+    # The failed run's verbatim evidence belongs in repair context, not in a second
+    # classifier plane that invents a category from browser/block prose.
     result = {
         "ok": False,
         "data": {
@@ -116,8 +110,7 @@ def test_analyze_run_blocks_falls_through_when_no_precomputed() -> None:
         },
     }
     _, _, categories = _analyze_run_blocks(result)
-    assert categories is not None
-    assert categories[0]["category"] == "ELEMENT_NOT_FOUND"
+    assert categories is None
 
 
 # --------------------------------------------------------------------------- #
@@ -237,120 +230,6 @@ def _param_binding_categories() -> list[dict]:
     return [{"category": "PARAMETER_BINDING_ERROR", "confidence_float": 0.95}]
 
 
-def test_signature_non_category_only_failure_preserves_selector_shape() -> None:
-    sig_a = compute_failure_signature(
-        frontier_start_label="extract",
-        failure_reason="Element not found for selector: #foo",
-        failure_categories=[{"category": "ELEMENT_NOT_FOUND", "confidence_float": 0.8}],
-        suspicious_success=False,
-    )
-    sig_b = compute_failure_signature(
-        frontier_start_label="extract",
-        failure_reason="Element not found for selector: #bar",
-        failure_categories=[{"category": "ELEMENT_NOT_FOUND", "confidence_float": 0.8}],
-        suspicious_success=False,
-    )
-    assert sig_a is not None and sig_b is not None
-    assert sig_a != sig_b
-
-
-def test_signature_success_returns_none() -> None:
-    assert compute_failure_signature(None, None, None, False) is None
-
-
 # --------------------------------------------------------------------------- #
 # Enforcement nudge selection                                                 #
 # --------------------------------------------------------------------------- #
-
-
-@pytest.mark.parametrize(
-    "streak, emitted_at, category, expected_nudge",
-    [
-        pytest.param(
-            REPEATED_FRONTIER_STREAK_ESCALATE_AT,
-            0,
-            "PARAMETER_BINDING_ERROR",
-            "post_parameter_binding_warn",
-            id="warn_parameter_binding",
-        ),
-        pytest.param(
-            REPEATED_FRONTIER_STREAK_STOP_AT,
-            REPEATED_FRONTIER_STREAK_ESCALATE_AT,
-            "PARAMETER_BINDING_ERROR",
-            "post_parameter_binding_stop",
-            id="stop_parameter_binding",
-        ),
-        pytest.param(
-            REPEATED_FRONTIER_STREAK_ESCALATE_AT,
-            0,
-            "ELEMENT_NOT_FOUND",
-            "post_repeated_frontier_failure_warn",
-            id="warn_generic",
-        ),
-        pytest.param(
-            REPEATED_FRONTIER_STREAK_STOP_AT,
-            REPEATED_FRONTIER_STREAK_ESCALATE_AT,
-            "ANTI_BOT_DETECTION",
-            "post_repeated_frontier_failure_stop",
-            id="stop_generic",
-        ),
-    ],
-)
-def test_nudge_selection_matrix(streak: int, emitted_at: int, category: str, expected_nudge: Any) -> None:
-    ctx = _make_ctx()
-    ctx.repeated_failure_streak_count = streak
-    ctx.repeated_failure_nudge_emitted_at_streak = emitted_at
-    ctx.last_failure_category_top = category
-    assert _repeated_frontier_failure_nudge(ctx) == expected_nudge
-
-
-def test_nudge_below_threshold_returns_none() -> None:
-    ctx = _make_ctx()
-    ctx.repeated_failure_streak_count = 1
-    ctx.last_failure_category_top = "PARAMETER_BINDING_ERROR"
-    assert _repeated_frontier_failure_nudge(ctx) is None
-
-
-def test_enforcement_decision_latches_parameter_binding_stop_at_stop_level() -> None:
-    """Regression: POST_PARAMETER_BINDING_STOP_NUDGE must latch at STOP_AT.
-
-    Without the latch, the stop nudge re-fires every turn once streak reaches
-    STOP_AT because emitted stays at ESCALATE_AT. The latch ensures the stop
-    nudge emits once, then _repeated_frontier_failure_nudge returns None until
-    a different streak/category appears.
-    """
-    ctx = _make_ctx()
-    ctx.repeated_failure_streak_count = REPEATED_FRONTIER_STREAK_STOP_AT
-    ctx.repeated_failure_nudge_emitted_at_streak = REPEATED_FRONTIER_STREAK_ESCALATE_AT
-    ctx.last_failure_category_top = "PARAMETER_BINDING_ERROR"
-    ctx.last_test_ok = False
-    ctx.test_after_update_done = True
-
-    first = enforcement_decision(ctx)
-    assert first is not None
-    assert first.rule == "post_parameter_binding_stop"
-    assert ctx.repeated_failure_nudge_emitted_at_streak == REPEATED_FRONTIER_STREAK_STOP_AT
-
-    # Same state — streak still STOP_AT. Without the latch fix the stop nudge
-    # would fire a second time. With the latch it should return None (and let
-    # other enforcement branches handle follow-up behavior, e.g. failed-test
-    # nudge counting).
-    ctx.last_test_ok = False
-    assert _repeated_frontier_failure_nudge(ctx) is None
-
-
-def test_enforcement_decision_latches_generic_stop_at_stop_level() -> None:
-    """The generic stop nudge must also latch; ensures the refactor preserved
-    prior behavior for non-parameter-binding categories."""
-    ctx = _make_ctx()
-    ctx.repeated_failure_streak_count = REPEATED_FRONTIER_STREAK_STOP_AT
-    ctx.repeated_failure_nudge_emitted_at_streak = REPEATED_FRONTIER_STREAK_ESCALATE_AT
-    ctx.last_failure_category_top = "ELEMENT_NOT_FOUND"
-    ctx.last_test_ok = False
-    ctx.test_after_update_done = True
-
-    first = enforcement_decision(ctx)
-    assert first is not None
-    assert first.rule == "post_repeated_frontier_failure_stop"
-    assert ctx.repeated_failure_nudge_emitted_at_streak == REPEATED_FRONTIER_STREAK_STOP_AT
-    assert _repeated_frontier_failure_nudge(ctx) is None

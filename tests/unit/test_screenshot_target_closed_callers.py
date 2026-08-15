@@ -131,7 +131,7 @@ class TestScrapeWebsiteTargetClosed:
         log.warning.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_other_scrape_failures_still_log_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_other_scrape_failures_log_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(scraper_mod, "scrape_web_unsafe", AsyncMock(side_effect=RuntimeError("boom")))
         monkeypatch.setattr(scraper_mod, "build_scraping_failed_reason", AsyncMock(return_value="reason"))
         log = MagicMock()
@@ -145,7 +145,8 @@ class TestScrapeWebsiteTargetClosed:
                 max_retries=0,
             )
 
-        assert any("Scraping failed after max retries" in str(call.args[0]) for call in log.error.call_args_list)
+        assert any("Scraping failed after max retries" in str(call.args[0]) for call in log.warning.call_args_list)
+        log.error.assert_not_called()
 
 
 class TestScrapeRetryLoopTargetClosed:

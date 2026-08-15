@@ -8,6 +8,7 @@ import {
 export type CodeBlockNodeData = NodeBaseData & {
   code: string;
   parameterKeys: Array<string> | null;
+  errorCodeMapping: string;
   prompt: string | null;
   steps: Array<CodeBlockStep> | null;
 };
@@ -32,6 +33,7 @@ export const codeBlockNodeDefaultData: CodeBlockNodeData = {
   code: codeLead,
   continueOnFailure: false,
   parameterKeys: null,
+  errorCodeMapping: "null",
   prompt: "",
   steps: null,
   model: null,

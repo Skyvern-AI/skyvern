@@ -13,7 +13,6 @@ from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.self_heal_recovery import run_self_heal_recovery
 from skyvern.forge.sdk.copilot.tools import _authority_tool_error
-from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 
 
@@ -637,10 +636,6 @@ def test_runtime_self_heal_guardrail_rejects_native_tool_call() -> None:
         browser_session_id=None,
         stream=SimpleNamespace(),  # type: ignore[arg-type]
         turn_origin=TurnOrigin.runtime_self_heal,
-        turn_intent=TurnIntent(
-            mode=TurnIntentMode.BUILD,
-            authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
-        ),
     )
 
     payload = _authority_tool_error(ctx, "update_workflow")

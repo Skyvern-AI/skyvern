@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { RunEngine } from "@/api/types";
 import type { FileDownloadNode } from "../../nodes/FileDownloadNode/types";
+import type * as WorkflowEditorUtilsModule from "../../workflowEditorUtils";
 import type {
   FileDownloadBlock,
   WorkflowApiResponse,
@@ -109,6 +110,21 @@ vi.mock("@/components/EngineSelector", () => ({
 
 vi.mock("@/components/HelpTooltip", () => ({
   HelpTooltip: () => <span data-testid="help-tooltip" />,
+}));
+
+vi.mock("@/routes/workflows/components/GoogleOAuthCredentialSelector", () => ({
+  GoogleOAuthCredentialSelector: (props: {
+    value: string;
+    onChange: (value: string) => void;
+    optional?: boolean;
+  }) => (
+    <button
+      data-testid="google-oauth-credential-selector"
+      data-value={props.value}
+      data-optional={String(props.optional)}
+      onClick={() => props.onChange("goac-source")}
+    />
+  ),
 }));
 
 vi.mock("../../nodes/TaskNode/ParametersMultiSelect", () => ({
@@ -316,6 +332,26 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
     expect(screen.queryByText("SFTP Host")).toBeNull();
   });
 
+  test("selects a Google Drive source account for SFTP delivery", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      googleCredentialId: "goac-existing",
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(
+      screen.getByText("Google Drive Source Account (Optional)"),
+    ).toBeDefined();
+    const selector = screen.getByTestId("google-oauth-credential-selector");
+    expect(selector.dataset.value).toBe("goac-existing");
+    expect(selector.dataset.optional).toBe("true");
+    fireEvent.click(selector);
+
+    expect(updateNodeData).toHaveBeenCalledWith("d1", {
+      googleCredentialId: "goac-source",
+    });
+  });
+
   test("editing url propagates", () => {
     setFileDownloadNode("d1");
     render(<FileDownloadBlockForm blockId="d1" />);
@@ -507,7 +543,7 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
 describe("file download serialization", () => {
   test("omits destination fields for website downloads in saved and exported YAML", async () => {
     const { convert, getWorkflowBlocks } = await vi.importActual<
-      typeof import("../../workflowEditorUtils")
+      typeof WorkflowEditorUtilsModule
     >("../../workflowEditorUtils");
     const destinationFields = [
       "download_target",
@@ -572,4 +608,47 @@ describe("file download serialization", () => {
       expect(exportedBlock).not.toHaveProperty(field);
     }
   });
+
+  test.each(["s3", "azure", "sftp"] as const)(
+    "preserves a Google Drive source credential for %s delivery",
+    async (downloadTarget) => {
+      const { convert, getWorkflowBlocks } = await vi.importActual<
+        typeof WorkflowEditorUtilsModule
+      >("../../workflowEditorUtils");
+      setFileDownloadNode("d1", {
+        downloadTarget,
+        googleCredentialId: "goac-source",
+        s3Bucket: "bucket",
+        awsAccessKeyId: "access-key",
+        awsSecretAccessKey: "secret-key",
+        azureStorageAccountName: "account",
+        azureStorageAccountKey: "account-key",
+        azureBlobContainerName: "container",
+        sftpHost: "sftp.example.com",
+        sftpUsername: "skyvern",
+        sftpPassword: "password",
+      });
+      const node = mockNodes.get("d1") as FileDownloadNode;
+      const [savedBlock] = getWorkflowBlocks([node], []);
+
+      const apiBlock = {
+        ...savedBlock,
+        parameters: [],
+        output_parameter: {},
+      } as unknown as FileDownloadBlock;
+      const exportedBlock = convert({
+        workflow_definition: {
+          version: 2,
+          parameters: [],
+          blocks: [apiBlock],
+        },
+      } as unknown as WorkflowApiResponse).workflow_definition.blocks[0];
+
+      expect(savedBlock).toHaveProperty("google_credential_id", "goac-source");
+      expect(exportedBlock).toHaveProperty(
+        "google_credential_id",
+        "goac-source",
+      );
+    },
+  );
 });

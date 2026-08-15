@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 
 import {
+  type CopilotPaneSelection,
   type StudioLayoutClass,
   type StudioPaneId,
 } from "@/routes/workflows/studio/panes";
@@ -14,6 +15,11 @@ type StudioShellState = {
   paneWidths: PaneWidths;
   // Last user-gesture pane list per layout class; used to restore defaults.
   paneLayouts: Partial<Record<StudioLayoutClass, StudioPaneId[]>>;
+  // Copilot is selected independently for live editing and inspected runs.
+  // This state is intentionally excluded from persisted storage.
+  copilotSelectionByLayout: Partial<
+    Record<StudioLayoutClass, CopilotPaneSelection>
+  >;
   setPipMinimized: (minimized: boolean) => void;
   togglePip: () => void;
   setPaneWidths: (widths: PaneWidths) => void;
@@ -22,6 +28,10 @@ type StudioShellState = {
     cls: StudioLayoutClass,
     panes: readonly StudioPaneId[],
   ) => void;
+  setCopilotSelection: (
+    cls: StudioLayoutClass,
+    selection: CopilotPaneSelection,
+  ) => void;
   reset: () => void;
 };
 
@@ -29,6 +39,9 @@ const DEFAULTS = {
   pipMinimized: false,
   paneWidths: {} as PaneWidths,
   paneLayouts: {} as Partial<Record<StudioLayoutClass, StudioPaneId[]>>,
+  copilotSelectionByLayout: {} as Partial<
+    Record<StudioLayoutClass, CopilotPaneSelection>
+  >,
 };
 
 export const STUDIO_SHELL_STORAGE_KEY = "skyvern.studioShell";
@@ -64,6 +77,13 @@ export const useStudioShellStore = create<StudioShellState>()(
           paneLayouts: { ...state.paneLayouts, [cls]: [...panes] },
         }));
       },
+      setCopilotSelection: (cls, selection) =>
+        set((state) => ({
+          copilotSelectionByLayout: {
+            ...state.copilotSelectionByLayout,
+            [cls]: selection,
+          },
+        })),
       reset: () => set(DEFAULTS),
     }),
     {

@@ -24,7 +24,7 @@ from skyvern.schemas.runs import ProxyLocationInput, _validate_browser_address
 from skyvern.utils.prompt_truncation import EXTRACTION_GOAL_MAX_TOKENS
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.token_counter import count_tokens
-from skyvern.utils.url_validators import validate_url
+from skyvern.utils.url_validators import WebhookUrl, validate_url
 
 
 class TaskBase(BaseModel):
@@ -152,7 +152,7 @@ class TaskRequest(TaskBase):
         description="Starting URL for the task.",
         examples=["https://www.geico.com"],
     )
-    webhook_callback_url: str | None = Field(
+    webhook_callback_url: WebhookUrl | None = Field(
         default=None,
         description="The URL to call when the task is completed.",
         examples=["https://my-webhook.com"],
@@ -195,9 +195,9 @@ class TaskRequest(TaskBase):
     def validate_browser_address(cls, browser_address: str | None) -> str | None:
         return _validate_browser_address(browser_address)
 
-    @field_validator("webhook_callback_url", "totp_verification_url")
+    @field_validator("totp_verification_url")
     @classmethod
-    def validate_optional_urls(cls, url: str | None) -> str | None:
+    def validate_totp_verification_url(cls, url: str | None) -> str | None:
         if not url:
             return url
 

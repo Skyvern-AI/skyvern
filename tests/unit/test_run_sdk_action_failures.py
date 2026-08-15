@@ -250,6 +250,7 @@ async def test_minted_workflow_run_is_marked_synthetic_on_context(
 
     replaced_context = mock_ctx.replace.call_args.args[0]
     assert replaced_context.workflow_run_is_synthetic is True
+    assert replaced_context.is_sdk_inline_action is True
 
 
 @pytest.mark.asyncio
@@ -273,6 +274,9 @@ async def test_client_provided_workflow_run_is_not_marked_synthetic(
 
     replaced_context = mock_ctx.replace.call_args.args[0]
     assert replaced_context.workflow_run_is_synthetic is False
+    # Even though the reused run is not synthetic, it is still an inline SDK action the caller drives,
+    # so the context must mark it so its allocation classifies client_owned (never an early-reap input).
+    assert replaced_context.is_sdk_inline_action is True
 
 
 @pytest.mark.asyncio

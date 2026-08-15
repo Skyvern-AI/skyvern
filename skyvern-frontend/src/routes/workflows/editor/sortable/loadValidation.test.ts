@@ -38,6 +38,7 @@ function code(label: string, next: string | null): CodeBlock {
     output_parameter: op(label),
     code: `# ${label}`,
     parameters: [],
+    error_code_mapping: null,
   };
 }
 

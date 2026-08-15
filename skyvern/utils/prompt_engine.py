@@ -124,6 +124,9 @@ def load_prompt_with_elements_tracked(
         **kwargs,
     )
     token_count = count_tokens(prompt)
+    # Invariant: equals count_tokens(prompt) for the current prompt; re-set on every rebuild
+    # below so the ceiling helper and telemetry can reuse it without re-encoding an identical string.
+    current_prompt_token_count = token_count
     if token_count > DEFAULT_MAX_TOKENS and element_tree_builder.support_economy_elements_tree():
         # get rid of all the secondary elements like SVG, etc
         # NOTE: economy fallback drops the lean recipe — context-overflow firefighting
@@ -134,6 +137,7 @@ def load_prompt_with_elements_tracked(
         )
         prompt = prompt_engine.load_prompt(template_name, elements=elements, **kwargs)
         economy_token_count = count_tokens(prompt)
+        current_prompt_token_count = economy_token_count
         LOG.warning(
             "Prompt is longer than the max tokens. Going to use the economy elements tree.",
             template_name=template_name,
@@ -153,6 +157,7 @@ def load_prompt_with_elements_tracked(
             )
             prompt = prompt_engine.load_prompt(template_name, elements=elements, **kwargs)
             token_count_after_dump = count_tokens(prompt)
+            current_prompt_token_count = token_count_after_dump
             LOG.warning(
                 "Prompt is still longer than the max tokens. Will only keep the first 2/3 of the html context.",
                 template_name=template_name,
@@ -162,26 +167,21 @@ def load_prompt_with_elements_tracked(
                 max_tokens=DEFAULT_MAX_TOKENS,
             )
 
-    final_prompt, final_kwargs = enforce_prompt_ceiling_tracked(
+    final_prompt, final_kwargs, final_token_count = _enforce_prompt_ceiling_counted(
         prompt,
         prompt_engine=prompt_engine,
         template_name=template_name,
         kwargs=kwargs,
         elements=elements,
+        precomputed_token_count=current_prompt_token_count,
     )
 
-    # SKY-9718: stash per-prompt token breakdown on SkyvernContext so the
-    # downstream LLM API handler log can attach html_token_count / html_pct
-    # alongside input_tokens / llm_cost.
+    # SKY-9718: stash the locally-counted prompt size on SkyvernContext so the downstream
+    # LLM API handler log can attach it alongside the provider's input_tokens / llm_cost.
     ctx = skyvern_context.current()
     if ctx is not None:
-        html_tokens = count_tokens(elements) if elements else 0
-        total_tokens_local = count_tokens(final_prompt)
-        html_pct = (html_tokens / total_tokens_local) if total_tokens_local else None
         ctx.last_prompt_breakdown = {
-            "html_token_count": html_tokens,
-            "total_tokens_local": total_tokens_local,
-            "html_pct": round(html_pct, 4) if html_pct is not None else None,
+            "total_tokens_local": final_token_count,
             "template_name": template_name,
         }
 
@@ -214,24 +214,25 @@ def load_prompt_with_elements(
     return prompt
 
 
-def enforce_prompt_ceiling_tracked(
+def _enforce_prompt_ceiling_counted(
     prompt: str,
     *,
     prompt_engine: PromptEngine,
     template_name: str,
     kwargs: dict[str, Any],
     elements: Any | None = None,
-) -> tuple[str, dict[str, Any]]:
-    """Same as enforce_prompt_ceiling but also returns post-drop kwargs.
+    precomputed_token_count: int | None = None,
+) -> tuple[str, dict[str, Any], int]:
+    """Count-aware core of the hard-ceiling enforcement, returning the final prompt's token count.
 
-    Callers that derive a cache key from the prompt inputs should hash the
-    returned kwargs so requests that render to the same final LLM prompt
-    (because dropped fields differed but were both dropped) share a key.
+    ``precomputed_token_count`` is trusted only for the first ceiling check and must be the count
+    of exactly this ``prompt``. Any prompt mutation inside the drop loop is re-encoded — a count is
+    never reused across a changed prompt.
     """
     working_kwargs = dict(kwargs)
-    final_token_count = count_tokens(prompt)
+    final_token_count = precomputed_token_count if precomputed_token_count is not None else count_tokens(prompt)
     if final_token_count <= PROMPT_HARD_CEILING_TOKENS:
-        return prompt, working_kwargs
+        return prompt, working_kwargs, final_token_count
     fallback_keys = CEILING_FALLBACK_KEYS_BY_TEMPLATE.get(template_name, [])
     drops_applied = 0
     for drop_key in fallback_keys:
@@ -252,10 +253,7 @@ def enforce_prompt_ceiling_tracked(
             prompt = prompt_engine.load_prompt(template_name, elements=elements, **working_kwargs)
         final_token_count = count_tokens(prompt)
         if final_token_count <= PROMPT_HARD_CEILING_TOKENS:
-            return prompt, working_kwargs
-    # The breakdown normally stashed on SkyvernContext is computed after this
-    # function returns, so the prompt that actually failed never reports one.
-    html_token_count = count_tokens(elements) if elements else None
+            return prompt, working_kwargs, final_token_count
     LOG.error(
         "Prompt still exceeds hard ceiling",
         template_name=template_name,
@@ -263,10 +261,33 @@ def enforce_prompt_ceiling_tracked(
         hard_ceiling=PROMPT_HARD_CEILING_TOKENS,
         fallback_keys_configured=len(fallback_keys),
         drops_applied=drops_applied,
-        html_token_count=html_token_count,
-        html_pct=round(html_token_count / final_token_count, 4) if html_token_count and final_token_count else None,
+        elements_char_count=len(elements) if elements else None,
     )
     raise SkyvernContextWindowExceededError(prompt_name=template_name)
+
+
+def enforce_prompt_ceiling_tracked(
+    prompt: str,
+    *,
+    prompt_engine: PromptEngine,
+    template_name: str,
+    kwargs: dict[str, Any],
+    elements: Any | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Same as enforce_prompt_ceiling but also returns post-drop kwargs.
+
+    Callers that derive a cache key from the prompt inputs should hash the
+    returned kwargs so requests that render to the same final LLM prompt
+    (because dropped fields differed but were both dropped) share a key.
+    """
+    final_prompt, working_kwargs, _ = _enforce_prompt_ceiling_counted(
+        prompt,
+        prompt_engine=prompt_engine,
+        template_name=template_name,
+        kwargs=kwargs,
+        elements=elements,
+    )
+    return final_prompt, working_kwargs
 
 
 def enforce_prompt_ceiling(

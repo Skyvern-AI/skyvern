@@ -2,18 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from collections.abc import Set as AbstractSet
-from typing import Any
 
 import structlog
 
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
-from skyvern.forge.sdk.copilot.turn_intent import (
-    REGISTERED_DOWNLOAD_OUTPUT_PATH,
-    turn_intent_authorizes_registered_download,
-)
 
 LOG = structlog.get_logger(__name__)
 
@@ -24,28 +19,8 @@ def _page_key(url: object) -> str | None:
     return url.strip().split("#", 1)[0].rstrip("/")
 
 
-def _credential_fill_page_keys(ctx: AgentContext) -> set[str] | None:
-    """Pages where a credential fill happened, or None when no fill has happened at all."""
-    keys: set[str] = set()
-    fills = 0
-    entries: list[dict[str, Any]] = [dict(interaction) for interaction in ctx.scout_trajectory]
-    entries.extend(entry for entry in ctx.prior_fill_carry if isinstance(entry, dict))
-    for entry in entries:
-        if entry.get("tool_name") != "fill_credential_field":
-            continue
-        fills += 1
-        key = _page_key(entry.get("source_url"))
-        if key:
-            keys.add(key)
-    return keys if fills else None
-
-
 def _interaction_reached_page_keys(ctx: AgentContext) -> set[str]:
-    """Pages reached by actually interacting, not just looking — the only evidence that counts as login progress.
-
-    Heuristic ceiling: any interaction-reached page off the fill page counts, so a non-submit
-    navigation (e.g. a forgot-password link) can suppress the login line without a real login.
-    """
+    """Pages reached by actually interacting, not just looking."""
     keys: set[str] = set()
     for page in ctx.prior_observed_acted_pages:
         if isinstance(page, dict) and page.get("reached_via") == "interaction":
@@ -63,18 +38,6 @@ def _interaction_reached_page_keys(ctx: AgentContext) -> set[str]:
         if key:
             keys.add(key)
     return keys
-
-
-def _login_line(ctx: AgentContext) -> str | None:
-    policy = ctx.request_policy
-    if not isinstance(policy, RequestPolicy) or not policy.login_intent or not policy.resolved_credentials:
-        return None
-    fill_pages = _credential_fill_page_keys(ctx)
-    if fill_pages is None:
-        return "Login: credential resolved but login not yet attempted"
-    if _interaction_reached_page_keys(ctx) - fill_pages:
-        return None
-    return "Login: credential resolved but login not completed (no page reached by interaction yet)"
 
 
 def _minted_criteria(ctx: AgentContext) -> list[CompletionCriterion]:
@@ -122,7 +85,7 @@ def _outputs_line(ctx: AgentContext) -> str | None:
 
 
 def _interactions_line(ctx: AgentContext) -> str | None:
-    if ctx.scout_trajectory or ctx.prior_fill_carry or _interaction_reached_page_keys(ctx):
+    if ctx.scout_trajectory or ctx.prior_carried_trajectory or _interaction_reached_page_keys(ctx):
         return None
     return "The site has not been acted on yet (0 interactions recorded)"
 
@@ -155,57 +118,14 @@ def unmet_action_deliverable_criteria_from(
 
 def unmet_action_deliverable_criteria(ctx: AgentContext) -> list[CompletionCriterion]:
     minted = _minted_criteria(ctx)
-    unmet = unmet_action_deliverable_criteria_from(minted, _inapplicable_criterion_ids(ctx))
-    if unmet or any(
-        "registered_download" in (criterion.deliverable_kind, criterion.declared_deliverable_kind)
-        and criterion.level == "run"
-        for criterion in minted
-    ):
-        return unmet
-    if not turn_intent_authorizes_registered_download(getattr(ctx, "turn_intent", None)):
-        return []
-    if _registered_download_delivered(ctx):
-        return []
-    return [
-        CompletionCriterion(
-            id="__copilot_turn_intent_registered_download__",
-            outcome="the requested file is registered as a browser download",
-            deliverable_kind="registered_download",
-            declared_deliverable_kind="registered_download",
-            output_path=REGISTERED_DOWNLOAD_OUTPUT_PATH,
-        )
-    ]
-
-
-def _registered_download_delivered(ctx: AgentContext) -> bool:
-    # Offline replay probes deliberately use a lightweight context that omits optional
-    # runtime-evidence carriers until they are observed.
-    reached = getattr(ctx, "reached_download_target", None)
-    if reached is not None and getattr(reached, "already_registered", False):
-        return True
-    output_maps = (
-        getattr(ctx, "verified_terminal_block_outputs", None),
-        getattr(ctx, "verified_block_outputs", None),
-    )
-    count_keys = ("downloaded_file_count", "downloaded_file_url_count", "downloaded_file_artifact_count")
-    for outputs in output_maps:
-        if not isinstance(outputs, Mapping):
-            continue
-        for payload in outputs.values():
-            if not isinstance(payload, Mapping) or payload.get("download_registered") is not True:
-                continue
-            if any(
-                isinstance(payload.get(key), int) and not isinstance(payload.get(key), bool) and payload.get(key, 0) > 0
-                for key in count_keys
-            ):
-                return True
-    return False
+    return unmet_action_deliverable_criteria_from(minted, _inapplicable_criterion_ids(ctx))
 
 
 def render_todo_list(ctx: AgentContext) -> str | None:
-    lines = [line for line in (_login_line(ctx), _outputs_line(ctx)) if line]
-    if not lines:
+    outputs = _outputs_line(ctx)
+    if not outputs:
         return None
+    lines = [outputs]
     interactions = _interactions_line(ctx)
     if interactions:
         lines.append(interactions)

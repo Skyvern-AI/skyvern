@@ -1,6 +1,7 @@
 import { ActionsApiResponse, Status as WorkflowRunStatus } from "@/api/types";
 import { BrowserStream } from "@/components/BrowserStream";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
+import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
 import { ActionScreenshot } from "@/routes/tasks/detail/ActionScreenshot";
 import { statusIsFinalized } from "@/routes/tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
@@ -148,10 +149,21 @@ function WorkflowRunOverview() {
             onClose={handleVncClose}
           />
         )}
+        {/* The per-run stream is fed only by display capture on the worker, which stops as soon
+            as a run has a browser_session_id — so a session-backed run streams the session. */}
+        {shouldShowScreencastFallback && (
+          <BrowserSessionStream
+            key={browserSessionId}
+            browserSessionId={browserSessionId!}
+            interactive={isPaused}
+            showControlButtons={isPaused}
+            centered
+          />
+        )}
         {!shouldShowBrowserStream &&
-          (shouldShowScreencastFallback || selection === "stream") && (
+          !shouldShowScreencastFallback &&
+          selection === "stream" && (
             <WorkflowRunStream
-              alwaysShowStream={shouldShowScreencastFallback}
               interactive={isPaused}
               showControlButtons={isPaused}
             />

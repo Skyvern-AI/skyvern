@@ -1,5 +1,3 @@
-import inspect
-
 from skyvern.forge.sdk.copilot.mcp_adapter import _requested_output_path_choices
 
 
@@ -35,21 +33,6 @@ class TestRequestedOutputPathChoices:
 
     def test_a_turn_owing_no_output_leaves_the_schema_alone(self) -> None:
         assert _requested_output_path_choices(_schema(), []) == _schema()
-
-
-class TestClaimedOutputWithoutValue:
-    def test_a_declared_read_that_gathered_candidates_is_told_what_to_do_next(self) -> None:
-        # Live shape (SKY-13226): the read named the requested path and returned a filtered list of
-        # every matching line on the page, so no single value was recorded. The bare fact was emitted
-        # six times in one turn and went unacted on; the sibling signal carrying a hint was followed.
-        from skyvern.forge.sdk.copilot.tools import mcp_hooks
-
-        source = inspect.getsource(mcp_hooks)
-        marker = source.index('data["claimed_output_without_a_single_value"]')
-        following = source[marker : marker + 700]
-
-        assert "claimed_output_read_hint" in following
-        assert "output_path=" in following
 
 
 def test_the_declared_path_says_the_expression_is_that_value() -> None:

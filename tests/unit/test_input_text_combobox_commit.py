@@ -157,6 +157,14 @@ def _typed_values(el: MagicMock) -> list[str]:
     return [call.args[0] if call.args else call.kwargs["text"] for call in el.input_sequentially.call_args_list]
 
 
+def _written_values(el: MagicMock) -> list[str]:
+    # Write-method-agnostic: after the fill-first flip (SKY-13821) a signal-less input writes its fall-through
+    # value with one atomic fill, while a search-bar/combobox keeps per-character typing. Tests that only care
+    # that the value was written on fall-through use this instead of asserting the write mechanism.
+    calls = [*el.input_sequentially.call_args_list, *el.input_fill.call_args_list]
+    return [call.args[0] if call.args else call.kwargs["text"] for call in calls]
+
+
 async def _run_combobox_input(
     *,
     attrs: dict[str, object],
@@ -381,6 +389,48 @@ async def test_secret_valued_action_does_not_trigger_select() -> None:
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
 
 
+@pytest.mark.asyncio
+async def test_secret_valued_search_bar_does_not_trigger_select() -> None:
+    """A secret in a search bar must not enter the custom-select path either: it logs target_value=... and
+    feeds it into the LLM prompt. Mirrors the secret-combobox guard so secret typed-widgets type sequentially
+    and rely on the Tab hack instead of the logging select (SKY-13821)."""
+    with patch.object(
+        handler.app.WORKFLOW_CONTEXT_MANAGER,
+        "mask_secrets_enabled_for_run",
+        MagicMock(return_value=True),
+    ):
+        results, el, select_mock = await _run_combobox_input(
+            attrs={"role": "textbox", "aria-autocomplete": None, "aria-invalid": "false"},
+            options=_listbox_with_option(_TARGET),
+            select_success=True,
+            stop_flag=True,
+            is_search_bar=True,
+            is_secret=True,
+        )
+    select_mock.assert_not_awaited()
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+
+
+@pytest.mark.asyncio
+async def test_maxlength_short_secret_does_not_trigger_select() -> None:
+    """A maxlength-constrained secret routes to sequential auto-advance entry; even if a dropdown surfaces, a
+    plain (non-typeahead) field must not enter the custom-select that logs target_value (SKY-13821)."""
+    with patch.object(
+        handler.app.WORKFLOW_CONTEXT_MANAGER,
+        "mask_secrets_enabled_for_run",
+        MagicMock(return_value=True),
+    ):
+        results, el, select_mock = await _run_combobox_input(
+            attrs={"role": None, "aria-autocomplete": None, "aria-invalid": "false", "maxlength": "4"},
+            options=_listbox_with_option(_TARGET),
+            select_success=True,
+            stop_flag=True,
+            is_secret=True,
+        )
+    select_mock.assert_not_awaited()
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+
+
 # --------------------------------------------------------------------------- #
 # handle_input_text_action — runtime prefilter_typeahead flag drives type-before-match
 #
@@ -479,7 +529,7 @@ async def test_nonterminal_skip_carrier_falls_through_each_input_text_caller(
     assert len(results) == 1
     assert isinstance(results[0], ActionSuccess)
     assert results[0] is not select_mock.return_value.action_result
-    assert _typed_values(el) == [_TARGET]
+    assert _written_values(el) == [_TARGET]
 
 
 @pytest.mark.asyncio
@@ -517,7 +567,7 @@ async def test_date_related_failure_with_skip_falls_through_each_input_text_call
     assert len(results) == 1
     assert isinstance(results[0], ActionSuccess)
     assert results[0] is not select_mock.return_value.action_result
-    assert _typed_values(el) == [_TARGET]
+    assert _written_values(el) == [_TARGET]
 
 
 @pytest.mark.asyncio

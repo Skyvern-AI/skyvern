@@ -105,6 +105,11 @@ class SkyvernContext:
     # Set only by run_sdk_action when it mints a bookkeeping run for a standalone action. A minted
     # run never begins the browser session, so it must not be presented as the expected owner.
     workflow_run_is_synthetic: bool = False
+    # Set by run_sdk_action for EVERY inline action, whether it minted the run or the caller supplied an
+    # existing (possibly already-terminal) run id. The browser is driven directly by the caller across
+    # calls, so a run-scoped external allocation under it must never be an owner-terminal early-reap
+    # input — unlike workflow_run_is_synthetic, this stays true for the supplied-run reuse path too.
+    is_sdk_inline_action: bool = False
     browser_runtime: str | None = None
     browser_address_is_server_assigned: bool = False
     tz_info: ZoneInfo | None = None
@@ -264,8 +269,8 @@ class SkyvernContext:
     # Per-step prompt token breakdown (SKY-9718). Written by prompt-build sites
     # (prompt_engine.load_prompt_with_elements_tracked + the cached extract-action
     # path in agent.py); read + cleared by the LLM API handler when emitting the
-    # "LLM API handler duration metrics" log so html_token_count / html_pct land
-    # alongside the existing input_tokens / llm_cost on the same row.
+    # "LLM API handler duration metrics" log so the locally-counted prompt size
+    # lands alongside the provider's input_tokens / llm_cost on the same row.
     last_prompt_breakdown: dict[str, Any] | None = None
 
     # Deferred file chooser listener — survives across steps so a popup-intercepted upload

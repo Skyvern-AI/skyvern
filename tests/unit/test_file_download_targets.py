@@ -12,9 +12,10 @@ from urllib.parse import urlparse
 
 import pytest
 
-from skyvern.exceptions import AzureConfigurationError
+from skyvern.exceptions import AzureConfigurationError, DownloadSaveIncompleteError
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
-from skyvern.forge.sdk.services import google_oauth_service
+from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, FileDownloadBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
@@ -86,9 +87,18 @@ async def _execute_file_download(
     secret_values: dict[str, str] | None = None,
     downloads_during_execute: tuple[str, ...] = (),
     during_execute: Callable[[], None] | None = None,
+    drive_download_side_effect: Callable[..., object] | BaseException | None = None,
+    downloaded_file_infos: list[FileInfo] | None = None,
+    storage_save_side_effect: BaseException | None = None,
 ) -> SimpleNamespace:
     workflow_run_context = MagicMock()
     workflow_run_context.organization_id = "organization-id"
+    workflow_run_context.values = {}
+    workflow_run_context.secrets = {}
+    workflow_run_context.include_secrets_in_templates = False
+    workflow_run_context.get_block_metadata.return_value = {}
+    workflow_run_context.has_parameter.return_value = False
+    workflow_run_context.has_value.return_value = False
     if secret_values is None:
         secret_values = {
             value: value
@@ -98,12 +108,14 @@ async def _execute_file_download(
                 block.sftp_password,
                 block.sftp_private_key,
                 block.sftp_private_key_passphrase,
+                block.google_credential_id,
             )
             if value
         }
     workflow_run_context.get_original_secret_value_or_none.side_effect = secret_values.get
     upload = AsyncMock(return_value="customer://uploaded-file", side_effect=upload_side_effect)
     select_files = AsyncMock()
+    drive_download = AsyncMock(side_effect=drive_download_side_effect)
     if selection_result is not None:
         select_files.return_value = selection_result
     recorded_output = SimpleNamespace(value=None)
@@ -140,6 +152,7 @@ async def _execute_file_download(
             return_value=download_dir,
         ),
         patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None),
+        patch.object(google_drive_service, "download_file", drive_download),
         patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
     ):
         mock_app.AGENT_FUNCTION.upload_file_to_customer_storage = upload
@@ -147,6 +160,8 @@ async def _execute_file_download(
             return_value=SimpleNamespace(token="google-access-token")
         )
         mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+        mock_app.STORAGE.save_downloaded_files = AsyncMock(side_effect=storage_save_side_effect)
+        mock_app.STORAGE.get_downloaded_files = AsyncMock(return_value=downloaded_file_infos or [])
         result = await block.execute(
             workflow_run_id="workflow-run-id",
             workflow_run_block_id="workflow-run-block-id",
@@ -161,6 +176,8 @@ async def _execute_file_download(
         workflow_run_context=workflow_run_context,
         record_output=record_output,
         recorded_output=recorded_output,
+        drive_download=drive_download,
+        storage_save=mock_app.STORAGE.save_downloaded_files,
         get_google_workspace_credentials=mock_app.AGENT_FUNCTION.get_google_workspace_credentials,
     )
 
@@ -175,6 +192,217 @@ async def test_website_target_returns_browser_result_without_dispatch(tmp_path: 
     assert execution.result is browser_result
     execution.browser_execute.assert_awaited_once()
     execution.upload.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_google_drive_target_downloads_private_drive_source_without_browser(tmp_path: Path) -> None:
+    download_dir = tmp_path / "downloads"
+    block = _file_download_block(
+        FileDownloadTarget.GOOGLE_DRIVE,
+        url="https://drive.google.com/file/d/file_123/view?resourcekey=resource_key_123",
+        google_credential_id="google-credential-id",
+        google_drive_folder_id="folder-id",
+    )
+    downloaded_file = FileInfo(
+        url="https://app.example.test/artifacts/private",
+        filename="private.pdf",
+        file_size=13,
+        artifact_id="artifact-private",
+    )
+
+    async def download_private_file(**kwargs: object) -> str:
+        assert kwargs["access_token"] == "google-access-token"
+        assert kwargs["file_id"] == "file_123"
+        assert kwargs["resource_key"] == "resource_key_123"
+        target = Path(str(kwargs["output_dir"])) / "private.pdf"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"private-drive")
+        return str(target)
+
+    execution = await _execute_file_download(
+        block,
+        _browser_result(block),
+        download_dir,
+        drive_download_side_effect=download_private_file,
+        downloaded_file_infos=[downloaded_file],
+    )
+
+    assert execution.result.success is True
+    assert execution.result.output_parameter_value is not None
+    assert execution.result.output_parameter_value["file_name"] == "private.pdf"
+    assert execution.result.output_parameter_value["downloaded_files"][0]["filename"] == "private.pdf"
+    execution.browser_execute.assert_not_awaited()
+    execution.drive_download.assert_awaited_once()
+    execution.get_google_workspace_credentials.assert_awaited_once_with(
+        organization_id="organization-id",
+        credential_id="google-credential-id",
+        required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+    )
+    execution.storage_save.assert_awaited_once_with(
+        organization_id="organization-id",
+        run_id="workflow-run-id",
+    )
+    execution.upload.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sftp_target_downloads_private_drive_source_without_browser(tmp_path: Path) -> None:
+    download_dir = tmp_path / "downloads"
+    block = _file_download_block(
+        FileDownloadTarget.SFTP,
+        url="https://drive.google.com/file/d/file_123/view",
+        google_credential_id="google-credential-id",
+        sftp_host="sftp.example.com",
+        sftp_username="skyvern",
+        sftp_password="password",
+    )
+    payload = b"private-drive"
+    downloaded_file = FileInfo(
+        url="https://app.example.test/artifacts/private",
+        checksum=hashlib.sha256(payload).hexdigest(),
+        filename="private.pdf",
+        file_size=len(payload),
+        artifact_id="artifact-private",
+    )
+
+    async def download_private_file(**kwargs: object) -> str:
+        target = Path(str(kwargs["output_dir"])) / "private.pdf"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+        return str(target)
+
+    execution = await _execute_file_download(
+        block,
+        _browser_result(block),
+        download_dir,
+        drive_download_side_effect=download_private_file,
+        downloaded_file_infos=[downloaded_file],
+    )
+
+    assert execution.result.success is True
+    execution.browser_execute.assert_not_awaited()
+    execution.drive_download.assert_awaited_once()
+    execution.upload.assert_awaited_once()
+    assert execution.upload.await_args.kwargs["destination"].storage_type == FileStorageType.SFTP
+
+
+@pytest.mark.asyncio
+async def test_google_drive_registration_prefers_exact_checksum_over_legacy_same_name(tmp_path: Path) -> None:
+    block = _file_download_block(
+        FileDownloadTarget.GOOGLE_DRIVE,
+        url="https://drive.google.com/file/d/file_123/view",
+        google_credential_id="google-credential-id",
+        google_drive_folder_id="folder-id",
+    )
+    payload = b"private-drive"
+    stale_file = FileInfo(
+        url="https://app.example.test/artifacts/stale",
+        filename="private.pdf",
+        artifact_id="artifact-stale",
+    )
+    current_file = FileInfo(
+        url="https://app.example.test/artifacts/current",
+        checksum=hashlib.sha256(payload).hexdigest(),
+        filename="private.pdf",
+        artifact_id="artifact-current",
+    )
+
+    async def download_private_file(**kwargs: object) -> str:
+        target = Path(str(kwargs["output_dir"])) / "private.pdf"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+        return str(target)
+
+    execution = await _execute_file_download(
+        block,
+        _browser_result(block),
+        tmp_path / "downloads",
+        drive_download_side_effect=download_private_file,
+        downloaded_file_infos=[stale_file, current_file],
+    )
+
+    assert execution.result.success is True
+    assert execution.result.output_parameter_value["downloaded_file_urls"] == [current_file.url]
+    assert execution.result.output_parameter_value["downloaded_file_artifact_ids"] == [current_file.artifact_id]
+
+
+@pytest.mark.asyncio
+async def test_google_drive_partial_registration_still_delivers_file_for_finalization_retry(tmp_path: Path) -> None:
+    block = _file_download_block(
+        FileDownloadTarget.GOOGLE_DRIVE,
+        url="https://drive.google.com/file/d/file_123/view",
+        google_credential_id="google-credential-id",
+        google_drive_folder_id="folder-id",
+    )
+
+    async def download_private_file(**kwargs: object) -> str:
+        target = Path(str(kwargs["output_dir"])) / "private.pdf"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"private-drive")
+        return str(target)
+
+    execution = await _execute_file_download(
+        block,
+        _browser_result(block),
+        tmp_path / "downloads",
+        drive_download_side_effect=download_private_file,
+        storage_save_side_effect=DownloadSaveIncompleteError(["private.pdf"]),
+    )
+
+    assert execution.result.success is True
+    assert execution.result.output_parameter_value == {"file_name": "private.pdf"}
+    execution.browser_execute.assert_not_awaited()
+    execution.upload.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_google_drive_native_document_falls_back_to_browser(tmp_path: Path) -> None:
+    block = _file_download_block(
+        FileDownloadTarget.GOOGLE_DRIVE,
+        url="https://drive.google.com/file/d/native_123/view",
+        google_credential_id="google-credential-id",
+        google_drive_folder_id="folder-id",
+    )
+    browser_result = _browser_result(block)
+
+    execution = await _execute_file_download(
+        block,
+        browser_result,
+        tmp_path / "downloads",
+        drive_download_side_effect=google_drive_service.GoogleDriveNativeDocumentError(),
+    )
+
+    assert execution.result is browser_result
+    execution.drive_download.assert_awaited_once()
+    execution.browser_execute.assert_awaited_once()
+    execution.upload.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_google_drive_api_file_not_downloadable_does_not_fall_back_to_browser(tmp_path: Path) -> None:
+    block = _file_download_block(
+        FileDownloadTarget.GOOGLE_DRIVE,
+        url="https://drive.google.com/file/d/file_123/view",
+        google_credential_id="google-credential-id",
+        google_drive_folder_id="folder-id",
+    )
+
+    execution = await _execute_file_download(
+        block,
+        _browser_result(block),
+        tmp_path / "downloads",
+        drive_download_side_effect=google_drive_service.GoogleDriveAPIError(
+            status=403,
+            code="fileNotDownloadable",
+            message="Drive rejected a regular blob download",
+        ),
+    )
+
+    assert execution.result.success is False
+    assert execution.result.failure_reason is not None
+    assert "Drive rejected a regular blob download" in execution.result.failure_reason
+    execution.browser_execute.assert_not_awaited()
+    execution.record_output.assert_awaited_once()
 
 
 @pytest.mark.asyncio

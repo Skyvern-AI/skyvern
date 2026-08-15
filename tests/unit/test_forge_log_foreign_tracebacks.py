@@ -8,12 +8,14 @@ from collections.abc import Iterator
 import pytest
 import structlog
 
+import skyvern.forge.sdk.forge_log as forge_log
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import secret_scrub
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.forge_log import setup_logger
 
 _REGISTERED_CREDENTIAL = "fake-registered-pa55w0rd-9f3c1a"
+_MAX_EMITTED_JSON_BYTES = 64 * 1024
 
 
 @pytest.fixture
@@ -58,6 +60,67 @@ def test_foreign_stdlib_exception_renders_single_structured_line(json_stream: io
     assert record["error_type"] == "builtins.ValueError"
     assert record["error_category"] == "ERROR"
     assert record["exception_hash"]
+
+
+def test_oversized_structured_payload_is_bounded_to_one_log_record(json_stream: io.StringIO) -> None:
+    structlog.get_logger("oversized-test").error(
+        "oversized_payload", payload="x" * 100_000, status="failed", error="payload rejected"
+    )
+
+    lines = json_stream.getvalue().strip().splitlines()
+    assert len(lines) == 1
+    assert len(lines[0].encode()) <= _MAX_EMITTED_JSON_BYTES
+
+    record = json.loads(lines[0])
+    assert record["msg"] == "oversized_payload"
+    assert record["event_status"] == "failed"
+    assert record["error"] == "payload rejected"
+    assert record["log_truncated"] is True
+    assert record["original_size_bytes"] > _MAX_EMITTED_JSON_BYTES
+    assert "payload" in record["omitted_fields"]
+
+
+def test_control_heavy_oversized_log_keeps_correlation_fields() -> None:
+    expanded = "\0" * 10_000
+    rendered = forge_log.render_bounded_json(
+        None,  # type: ignore[arg-type]
+        "error",
+        {
+            "msg": expanded,
+            "exception": expanded,
+            "logger": expanded,
+            "entrypoint": expanded,
+            "env": expanded,
+            "version": expanded,
+            "pathname": expanded,
+            "filename": expanded,
+            "request_id": "req_test",
+            "task_id": "tsk_test",
+        },
+    )
+
+    assert len(rendered.encode()) <= _MAX_EMITTED_JSON_BYTES
+    record = json.loads(rendered)
+    assert record["request_id"] == "req_test"
+    assert record["task_id"] == "tsk_test"
+    assert record["log_truncated"] is True
+    assert record["omitted_field_count"] == 1
+
+
+def test_oversized_numeric_fields_are_bounded() -> None:
+    class ShortStringInteger(int):
+        def __str__(self) -> str:
+            return "1"
+
+    huge_number = ShortStringInteger(10**3999)
+    rendered = forge_log.render_bounded_json(
+        None,  # type: ignore[arg-type]
+        "error",
+        {key: huge_number for key in forge_log._OVERSIZED_LOG_FIELDS},
+    )
+
+    assert len(rendered.encode()) <= _MAX_EMITTED_JSON_BYTES
+    assert json.loads(rendered)["log_truncated"] is True
 
 
 def test_exception_log_fields_matches_processor_output_for_raised_exception() -> None:

@@ -17,18 +17,18 @@ from skyvern.exceptions import BlockedNavigationDestination, InvalidUrl
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.streaming.auth import auth, require_client_id
-from skyvern.forge.sdk.routes.streaming.registries import (
-    add_cdp_input_channel,
-    del_cdp_input_channel,
-    stream_ref_dec,
-    try_stream_ref_inc,
-)
 from skyvern.forge.sdk.routes.streaming.screencast import (
     _resolve_working_page,
     release_browser_state,
     wait_for_browser_state,
 )
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
+from skyvern.forge.sdk.streaming.registries import (
+    add_cdp_input_channel,
+    del_cdp_input_channel,
+    stream_ref_dec,
+    try_stream_ref_inc,
+)
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.browser_state import BrowserState
@@ -303,6 +303,55 @@ async def _dispatch_navigate_event(
         await websocket.send_json({"kind": "navigate-error", "reason": "blocked"})
 
 
+_HISTORY_EVENT_OFFSETS = {"goBackEvent": -1, "goForwardEvent": 1, "reloadEvent": 0}
+
+
+async def _dispatch_history_event(
+    cdp_session: CDPSession,
+    kind: str,
+    log_id_key: str,
+    log_id_value: str,
+    websocket: WebSocket,
+) -> None:
+    history = await cdp_session.send("Page.getNavigationHistory", {})
+    entries = history.get("entries") or [] if isinstance(history, dict) else []
+    current_index = history.get("currentIndex") if isinstance(history, dict) else None
+    if not isinstance(current_index, int):
+        return
+
+    target_index = current_index + _HISTORY_EVENT_OFFSETS[kind]
+    if not 0 <= target_index < len(entries):
+        # Nothing in that direction. A real browser greys the button out rather than erroring,
+        # and the frontend mirrors that from canGoBack/canGoForward.
+        return
+
+    entry = entries[target_index]
+    url = entry.get("url")
+    entry_id = entry.get("id")
+    if not isinstance(url, str) or not isinstance(entry_id, int):
+        return
+
+    try:
+        # A destination blocked mid-redirect leaves its entry in the back stack -- the navigate
+        # guard resets the page, not the history -- so replaying an entry unvalidated would
+        # reopen exactly the SSRF that _dispatch_navigate_event closes.
+        await asyncio.to_thread(validate_navigation_destination, url)
+    except BlockedNavigationDestination as error:
+        LOG.info(
+            "CDP input: history navigation blocked",
+            **{log_id_key: log_id_value},
+            kind=kind,
+            reason=error.reason,
+        )
+        await websocket.send_json({"kind": "navigate-error", "reason": "blocked"})
+        return
+
+    if kind == "reloadEvent":
+        await cdp_session.send("Page.reload", {})
+    else:
+        await cdp_session.send("Page.navigateToHistoryEntry", {"entryId": entry_id})
+
+
 async def _dispatch_event(
     cdp_session: CDPSession,
     page: object,
@@ -314,6 +363,10 @@ async def _dispatch_event(
 ) -> None:
     if kind == "navigateEvent":
         await _dispatch_navigate_event(page, msg, log_id_key, log_id_value, websocket)
+        return
+
+    if kind in _HISTORY_EVENT_OFFSETS:
+        await _dispatch_history_event(cdp_session, kind, log_id_key, log_id_value, websocket)
         return
 
     entry = _EVENT_DISPATCH_MAP.get(kind)

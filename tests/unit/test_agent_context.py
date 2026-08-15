@@ -7,8 +7,103 @@ from typing import Any
 
 from skyvern.forge.sdk.agents.context import (
     compact_agent_messages_for_llm,
+    pair_tool_calls_with_outputs,
     sanitize_agent_tool_result_for_llm,
 )
+
+
+def _call(call_id: str, name: str = "inspect_page") -> dict[str, Any]:
+    return {"type": "function_call", "call_id": call_id, "name": name, "arguments": "{}"}
+
+
+def _output(call_id: str, text: str = "ok") -> dict[str, Any]:
+    return {"type": "function_call_output", "call_id": call_id, "output": text}
+
+
+def test_pair_tool_calls_reseats_a_result_that_drifted_past_an_assistant_turn() -> None:
+    """The call stays put and its result lands after a later message."""
+    items = [
+        {"role": "user", "content": "goal"},
+        _call("a"),
+        _call("b"),
+        _output("b"),
+        {"type": "message", "content": "thinking out loud"},
+        _output("a"),
+    ]
+
+    repaired = pair_tool_calls_with_outputs(items)
+
+    assert [item.get("type") or item.get("role") for item in repaired] == [
+        "user",
+        "function_call",
+        "function_call_output",
+        "function_call",
+        "function_call_output",
+        "message",
+    ]
+    assert repaired[1]["call_id"] == "a"
+    assert repaired[2]["call_id"] == "a"
+
+
+def test_pair_tool_calls_keeps_every_result_it_moves() -> None:
+    items = [_call("a"), {"type": "message", "content": "m"}, _output("a", "browser work worth keeping")]
+
+    repaired = pair_tool_calls_with_outputs(items)
+
+    outputs = [item for item in repaired if item.get("type") == "function_call_output"]
+    assert [item["output"] for item in outputs] == ["browser work worth keeping"]
+
+
+def test_pair_tool_calls_leaves_lone_halves_where_they_are() -> None:
+    """Ordering repair never prunes: a partial slice of history is a valid input here."""
+    items = [
+        _call("a"),
+        {"type": "message", "content": "m"},
+        _output("a"),
+        _output("orphan"),
+        _call("never_answered"),
+    ]
+
+    repaired = pair_tool_calls_with_outputs(items)
+
+    assert [item.get("call_id") or item.get("type") for item in repaired] == [
+        "a",
+        "a",
+        "message",
+        "orphan",
+        "never_answered",
+    ]
+
+
+def test_pair_tool_calls_leaves_a_valid_history_untouched() -> None:
+    items = [
+        {"role": "user", "content": "goal"},
+        _call("a"),
+        _output("a"),
+        {"type": "message", "content": "done"},
+    ]
+
+    assert pair_tool_calls_with_outputs(list(items)) == items
+
+
+def test_pair_tool_calls_reports_what_it_repaired() -> None:
+    seen: list[tuple[int, int]] = []
+    items = [_call("a"), {"type": "message", "content": "m"}, _output("a"), _output("orphan")]
+
+    pair_tool_calls_with_outputs(items, on_repair=lambda *args: seen.append(args))
+
+    assert seen == [(1, 0)]
+
+
+def test_pair_tool_calls_stays_quiet_on_a_parallel_batch_the_provider_accepts() -> None:
+    """Calls and results interleaving inside one batch is valid; only a turn between them is drift."""
+    seen: list[tuple[int, int]] = []
+    items = [_call("a"), _call("b"), _output("a"), _output("b")]
+
+    repaired = pair_tool_calls_with_outputs(items, on_repair=lambda *args: seen.append(args))
+
+    assert [item["call_id"] for item in repaired] == ["a", "a", "b", "b"]
+    assert seen == []
 
 
 def test_compact_agent_messages_summarizes_old_tool_items_and_caps_recent_outputs() -> None:

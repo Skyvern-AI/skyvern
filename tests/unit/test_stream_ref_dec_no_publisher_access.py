@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from skyvern.forge.sdk.routes.streaming import registries
+from skyvern.forge.sdk.streaming import registries
 
 
 class _ExplodingPublisherStop:
