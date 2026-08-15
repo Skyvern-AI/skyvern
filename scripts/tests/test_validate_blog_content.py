@@ -13,7 +13,6 @@ from typing import Callable
 
 from scripts import validate_blog_content as validator
 
-
 TIMESTAMP = "2026-08-12T12:00:00.000Z"
 
 
@@ -159,7 +158,7 @@ class BlogValidatorTests(unittest.TestCase):
 
     def assert_invalid(
         self,
-        configure: Callable[[Path], None],
+        configure: Callable[[Path], object],
         expected_message: str,
         *,
         base_root: Path | None = None,
@@ -308,10 +307,11 @@ class BlogValidatorTests(unittest.TestCase):
         )
         for slug, body in cases:
             with self.subTest(slug=slug):
-                self.assert_invalid(
-                    lambda root, slug=slug, body=body: write_post(root, slug, body=body),
-                    "raw HTML tag is not allowed",
-                )
+
+                def configure(root: Path) -> Path:
+                    return write_post(root, slug, body=body)
+
+                self.assert_invalid(configure, "raw HTML tag is not allowed")
 
     def test_deep_blockquote_cannot_hide_script_tag(self) -> None:
         self.assert_invalid(
@@ -350,10 +350,11 @@ class BlogValidatorTests(unittest.TestCase):
         )
         for slug, body in cases:
             with self.subTest(slug=slug):
-                self.assert_invalid(
-                    lambda root, slug=slug, body=body: write_post(root, slug, body=body),
-                    "footnote label is not canonical lowercase ASCII",
-                )
+
+                def configure(root: Path) -> Path:
+                    return write_post(root, slug, body=body)
+
+                self.assert_invalid(configure, "footnote label is not canonical lowercase ASCII")
 
     def test_duplicate_gfm_footnote_definitions_fail_closed(self) -> None:
         cases = (
@@ -374,10 +375,11 @@ class BlogValidatorTests(unittest.TestCase):
         )
         for slug, body in cases:
             with self.subTest(slug=slug):
-                self.assert_invalid(
-                    lambda root, slug=slug, body=body: write_post(root, slug, body=body),
-                    "duplicate footnote definition is not allowed",
-                )
+
+                def configure(root: Path) -> Path:
+                    return write_post(root, slug, body=body)
+
+                self.assert_invalid(configure, "duplicate footnote definition is not allowed")
 
     def test_mdx_esm_forms_fail(self) -> None:
         cases = (
@@ -390,10 +392,11 @@ class BlogValidatorTests(unittest.TestCase):
         )
         for slug, body in cases:
             with self.subTest(slug=slug):
-                self.assert_invalid(
-                    lambda root, slug=slug, body=body: write_post(root, slug, body=body),
-                    "MDX import or export is not allowed",
-                )
+
+                def configure(root: Path) -> Path:
+                    return write_post(root, slug, body=body)
+
+                self.assert_invalid(configure, "MDX import or export is not allowed")
 
     def test_javascript_url_fails(self) -> None:
         self.assert_invalid(
@@ -647,12 +650,10 @@ class BlogValidatorTests(unittest.TestCase):
         self.assert_invalid(configure, "post exceeds the byte limit")
 
     def test_secret_material_fails(self) -> None:
+        private_key_label = "PRIVATE KEY"
+        private_key = f"-----BEGIN {private_key_label}-----\nnot-a-real-key\n-----END {private_key_label}-----\n"
         self.assert_invalid(
-            lambda root: write_post(
-                root,
-                "secret",
-                body="-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----\n",
-            ),
+            lambda root: write_post(root, "secret", body=private_key),
             "possible secret material",
         )
 
@@ -900,7 +901,7 @@ class BlogValidatorTests(unittest.TestCase):
             values["title"] = token
             write_post(root, "frontmatter-template", values=values)
 
-        cases: tuple[tuple[str, Callable[[Path], None]], ...] = (
+        cases: tuple[tuple[str, Callable[[Path], object]], ...] = (
             (
                 "inline-code",
                 lambda root: write_post(root, "inline-template", body=f"`{token}`\n"),
@@ -980,14 +981,11 @@ class BlogValidatorTests(unittest.TestCase):
     def test_whatwg_numeric_private_network_urls_fail(self) -> None:
         for index, url in enumerate(("http://2130706433/admin", "http://127.1/admin", "http://0x7f000001/admin")):
             with self.subTest(url=url):
-                self.assert_invalid(
-                    lambda root, value=url, slug=f"numeric-private-{index}": write_post(
-                        root,
-                        slug,
-                        body=f"See {value}\n",
-                    ),
-                    "local or private network URL",
-                )
+
+                def configure(root: Path) -> Path:
+                    return write_post(root, f"numeric-private-{index}", body=f"See {url}\n")
+
+                self.assert_invalid(configure, "local or private network URL")
 
     def test_idna_localhost_url_fails(self) -> None:
         self.assert_invalid(

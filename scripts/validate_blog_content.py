@@ -387,6 +387,10 @@ def _is_string_or_none(value: object) -> bool:
     return value is None or isinstance(value, str)
 
 
+def _as_str(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
 def _has_control_characters(value: str) -> bool:
     return any(ord(character) < 32 or ord(character) == 127 for character in value)
 
@@ -586,18 +590,19 @@ def _validate_frontmatter_types(post: Post, report: ValidationReport) -> None:
 def _validate_frontmatter_semantics(post: Post, is_new: bool, bootstrap: bool, report: ValidationReport) -> None:
     values = post.values
     path = post.path
-    slug = values.get("slug")
+    title = _as_str(values.get("title"))
+    slug = _as_str(values.get("slug"))
+    author = _as_str(values.get("author"))
+    description = _as_str(values.get("description"))
     migrated = values.get("migratedFromGhost")
     state = values.get("publicationState")
     send_newsletter = values.get("sendNewsletter")
 
-    if isinstance(values.get("title"), str) and not values["title"].strip():
+    if title is not None and not title.strip():
         report.add(path, "title must contain visible text")
-    if isinstance(slug, str) and slug != post.filename_slug:
+    if slug is not None and slug != post.filename_slug:
         report.add(path, "frontmatter slug does not match the filename")
-    if isinstance(values.get("author"), str) and (
-        len(values["author"]) > 64 or not AUTHOR_RE.fullmatch(values["author"])
-    ):
+    if author is not None and (len(author) > 64 or not AUTHOR_RE.fullmatch(author)):
         report.add(path, "author key is invalid")
     if state not in {"published", "sent", "draft"}:
         report.add(path, "publicationState is invalid")
@@ -611,11 +616,7 @@ def _validate_frontmatter_semantics(post: Post, is_new: bool, bootstrap: bool, r
         report.add(path, "migrated post must not send a newsletter")
     if migrated is False and state == "published" and send_newsletter is not True:
         report.add(path, "new published post must set sendNewsletter true")
-    if (
-        migrated is False
-        and state == "published"
-        and (not isinstance(values.get("description"), str) or not values["description"].strip())
-    ):
+    if migrated is False and state == "published" and (description is None or not description.strip()):
         report.add(path, "new published post requires a nonempty description")
     if migrated is False and state == "draft" and send_newsletter is not False:
         report.add(path, "new draft must set sendNewsletter false")
@@ -623,7 +624,7 @@ def _validate_frontmatter_semantics(post: Post, is_new: bool, bootstrap: bool, r
         report.add(path, "a new sent post is not allowed")
     if is_new and not bootstrap and migrated is not False:
         report.add(path, "a new post cannot claim migratedFromGhost")
-    if migrated is False and isinstance(slug, str):
+    if migrated is False and slug is not None:
         reserved = any(slug == segment or slug.startswith(f"{segment}-") for segment in RESERVED_SLUG_SEGMENTS)
         if len(slug) > 100 or not SLUG_RE.fullmatch(slug) or reserved:
             report.add(path, "new post slug is invalid or reserved")
@@ -1713,9 +1714,9 @@ def validate_repository(
         _validate_frontmatter_semantics(post, is_new, bootstrap, report)
         _analyze_content(post, report)
 
-    for filename_slug, base_post in base_posts.items():
-        if base_post.values.get("publicationState") == "published" and filename_slug not in posts:
-            report.add(base_post.path, "existing published post was deleted or renamed")
+    for filename_slug, published_base_post in base_posts.items():
+        if published_base_post.values.get("publicationState") == "published" and filename_slug not in posts:
+            report.add(published_base_post.path, "existing published post was deleted or renamed")
 
     for filename_slug, post in sorted(posts.items()):
         base_post = base_posts.get(filename_slug)
