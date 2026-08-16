@@ -286,6 +286,7 @@
                     "mapping": {
                       "task_v1": "#/components/schemas/TaskRunResponse",
                       "task_v2": "#/components/schemas/TaskRunResponse",
+                      "task_v3": "#/components/schemas/TaskRunResponse",
                       "openai_cua": "#/components/schemas/TaskRunResponse",
                       "anthropic_cua": "#/components/schemas/TaskRunResponse",
                       "ui_tars": "#/components/schemas/TaskRunResponse",
@@ -526,6 +527,24 @@
               "title": "X-Api-Key"
             },
             "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Idempotency-Key must contain 1 to 255 visible ASCII bytes.",
+              "title": "Idempotency-Key"
+            },
+            "description": "Idempotency-Key must contain 1 to 255 visible ASCII bytes."
           }
         ],
         "requestBody": {
@@ -548,6 +567,9 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "A create with this idempotency key is still in progress"
           },
           "422": {
             "description": "Invalid agent definition"
@@ -1440,6 +1462,7 @@
             "description": "Invalid tag key or value"
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "apply_run_tags"
       },
       "get": {
@@ -1508,6 +1531,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_run_tags"
       }
     },
@@ -1592,6 +1616,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "delete_run_tag"
       }
     },
@@ -1713,6 +1738,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_run_tag_history"
       }
     },
@@ -1770,6 +1796,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "list_tag_keys"
       }
     },
@@ -1840,6 +1867,7 @@
             "description": "Description too long"
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "update_tag_key"
       },
       "delete": {
@@ -1908,6 +1936,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "delete_tag_key"
       }
     },
@@ -1983,7 +2012,66 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "list_tag_values"
+      },
+      "post": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Create tag value",
+        "description": "Register a grouped tag (key, value) with a palette color before any workflow uses it. The label shows a zero workflow count until applied to a workflow.",
+        "operationId": "create_tag_value_v1_tag_values_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagValueCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully registered tag value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagValue"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Tag value already exists"
+          },
+          "422": {
+            "description": "Invalid key, value, or color"
+          }
+        },
+        "x-hidden": true,
+        "x-fern-sdk-method-name": "create_tag_value"
       }
     },
     "/v1/tag-values/{key}": {
@@ -2056,6 +2144,7 @@
             "description": "Invalid palette color"
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "update_tag_value"
       },
       "delete": {
@@ -2134,6 +2223,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "delete_tag_value"
       }
     },
@@ -2210,6 +2300,7 @@
             "description": "Invalid value"
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "rename_tag_value"
       }
     },
@@ -2497,6 +2588,60 @@
         },
         "x-hidden": true,
         "x-fern-sdk-method-name": "batch_get_run_tags_post"
+      }
+    },
+    "/v1/run-tag-suggestions": {
+      "get": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "List run tag suggestions",
+        "description": "List distinct (key, value) pairs ever set on a run for the organization, sourced from the run-tag event log rather than the tag-key/tag-value registry. Surfaces reserved 'skyvern.*' system keys (which are never registered) so pickers can offer them alongside user-defined tags.",
+        "operationId": "get_run_tag_suggestions_v1_run_tag_suggestions_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved run tag suggestions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunTagSuggestionsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-hidden": true,
+        "x-fern-sdk-method-name": "get_run_tag_suggestions"
       }
     },
     "/v1/artifacts/{artifact_id}/content": {
@@ -2951,6 +3096,56 @@
             }
           },
           {
+            "name": "workflow_permanent_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 50
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter to runs of these workflows (agents). Repeat the param to include multiple.",
+              "title": "Workflow Permanent Id"
+            },
+            "description": "Filter to runs of these workflows (agents). Repeat the param to include multiple."
+          },
+          {
+            "name": "tags",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 20
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only.",
+              "examples": [
+                "env:prod",
+                "production",
+                "env:*",
+                "customer:acme,env:prod"
+              ],
+              "title": "Tags"
+            },
+            "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only."
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
@@ -3133,11 +3328,11 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\n# Create a blank browser profile for future runs\nblank_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"Fresh Profile\",\n)\nprint(blank_profile)\n\n# Create a browser profile from a persistent browser session\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    browser_session_id=\"pbs_123\",\n)\nprint(browser_profile)\n\n# Or create from a workflow run with persist_browser_session=True\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    workflow_run_id=\"wr_123\",\n)\nprint(browser_profile)\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\n# Create a blank browser profile for future runs\nblank_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"Fresh Profile\",\n)\nprint(blank_profile)\n\n# Create a browser profile from a persistent browser session\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    browser_session_id=\"pbs_123\",\n)\nprint(browser_profile)\n\n# Or create from any workflow run that saved a browser (has a persisted archive)\nbrowser_profile = await skyvern.browser_profiles.create_browser_profile(\n    name=\"My Profile\",\n    workflow_run_id=\"wr_123\",\n)\nprint(browser_profile)\n"
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n// Create a blank browser profile for future runs\nconst blankProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"Fresh Profile\",\n});\nconsole.log(blankProfile);\n\n// Create a browser profile from a persistent browser session\nconst browserProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    browser_session_id: \"pbs_123\",\n});\nconsole.log(browserProfile);\n\n// Or create from a workflow run with persist_browser_session=True\nconst browserProfile2 = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    workflow_run_id: \"wr_123\",\n});\nconsole.log(browserProfile2);\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n// Create a blank browser profile for future runs\nconst blankProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"Fresh Profile\",\n});\nconsole.log(blankProfile);\n\n// Create a browser profile from a persistent browser session\nconst browserProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    browser_session_id: \"pbs_123\",\n});\nconsole.log(browserProfile);\n\n// Or create from any workflow run that saved a browser (has a persisted archive)\nconst browserProfile2 = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    workflow_run_id: \"wr_123\",\n});\nconsole.log(browserProfile2);\n"
               }
             ]
           }
@@ -3541,6 +3736,76 @@
         ]
       }
     },
+    "/v1/browser_profiles/{profile_id}/usage": {
+      "get": {
+        "tags": [
+          "Browser Profiles"
+        ],
+        "summary": "Get browser profile usage",
+        "description": "List the workflows, credentials, and recent runs that depend on a browser profile.",
+        "operationId": "get_browser_profile_usage_v1_browser_profiles__profile_id__usage_get",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The ID of the browser profile. browser_profile_id starts with `bp_`",
+              "examples": [
+                "bp_123456"
+              ],
+              "title": "Profile Id"
+            },
+            "description": "The ID of the browser profile. browser_profile_id starts with `bp_`"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved browser profile usage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserProfileUsage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Browser profile not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_browser_profile_usage"
+      }
+    },
     "/v1/browser_sessions": {
       "post": {
         "tags": [
@@ -3576,7 +3841,8 @@
                 "$ref": "#/components/schemas/CreateBrowserSessionRequest",
                 "default": {
                   "timeout": 60,
-                  "generate_browser_profile": false
+                  "generate_browser_profile": false,
+                  "needs_live_view": false
                 }
               }
             }
@@ -3936,6 +4202,39 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Downloaded files could not be returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "detail"
+                  ],
+                  "properties": {
+                    "detail": {
+                      "type": "object",
+                      "required": [
+                        "code",
+                        "retryable"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "downloaded_files_unavailable"
+                          ]
+                        },
+                        "retryable": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "x-fern-sdk-method-name": "get_browser_session",
@@ -4003,6 +4302,9 @@
                 }
               }
             }
+          },
+          "402": {
+            "description": "Insufficient credits to parse OTP content"
           },
           "422": {
             "description": "Validation Error",
@@ -4613,6 +4915,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "list_custom_llms"
       },
       "post": {
@@ -4674,6 +4977,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "create_custom_llm"
       }
     },
@@ -4748,6 +5052,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "update_custom_llm"
       },
       "delete": {
@@ -4810,6 +5115,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "delete_custom_llm"
       }
     },
@@ -5079,6 +5385,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "create_script"
       },
       "get": {
@@ -5166,6 +5473,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_scripts"
       }
     },
@@ -5233,6 +5541,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_script"
       }
     },
@@ -5310,6 +5619,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "deploy_script"
       }
     },
@@ -5374,7 +5684,8 @@
               }
             }
           }
-        }
+        },
+        "x-hidden": true
       }
     },
     "/v1/sdk/run_action": {
@@ -5708,6 +6019,7 @@
             "description": "Invalid tag key or value"
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "apply_workflow_tags"
       },
       "get": {
@@ -5776,6 +6088,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_workflow_tags"
       }
     },
@@ -5860,6 +6173,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "delete_workflow_tag"
       }
     },
@@ -5981,6 +6295,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_workflow_tag_history"
       }
     },
@@ -6389,6 +6704,34 @@
               "title": "Created At End"
             },
             "description": "Only include runs created strictly before this UTC timestamp (ISO 8601)."
+          },
+          {
+            "name": "tags",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 20
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only.",
+              "examples": [
+                "env:prod",
+                "production",
+                "env:*",
+                "customer:acme,env:prod"
+              ],
+              "title": "Tags"
+            },
+            "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only."
           },
           {
             "name": "x-api-key",
@@ -7719,6 +8062,30 @@
             "title": "Skip Auto Complete Tab",
             "default": false
           },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
           "created_at": {
             "anyOf": [
               {
@@ -7856,6 +8223,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -8280,6 +8652,7 @@
         "enum": [
           "click",
           "input_text",
+          "paste_text",
           "upload_file",
           "download_file",
           "select_option",
@@ -8507,13 +8880,18 @@
           "recording",
           "audio",
           "session_replay",
+          "eval_score",
+          "eval_trajectory",
+          "eval_rubrics",
           "browser_console_log",
+          "browser_session_action_log",
           "skyvern_log",
           "skyvern_log_raw",
           "screenshot",
           "screenshot_llm",
           "screenshot_action",
           "screenshot_final",
+          "screenshot_proxy",
           "llm_prompt",
           "llm_request",
           "llm_response",
@@ -9550,6 +9928,29 @@
               }
             ],
             "title": "Deleted At"
+          },
+          "last_verified_login_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Verified Login At"
+          },
+          "linked_credential_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Linked Credential Name"
           }
         },
         "type": "object",
@@ -9561,6 +9962,87 @@
           "modified_at"
         ],
         "title": "BrowserProfile"
+      },
+      "BrowserProfileUsage": {
+        "properties": {
+          "workflows": {
+            "items": {
+              "$ref": "#/components/schemas/BrowserProfileUsageWorkflow"
+            },
+            "type": "array",
+            "title": "Workflows",
+            "default": []
+          },
+          "credentials": {
+            "items": {
+              "$ref": "#/components/schemas/BrowserProfileUsageCredential"
+            },
+            "type": "array",
+            "title": "Credentials",
+            "default": []
+          },
+          "recent_seeded_run_count": {
+            "type": "integer",
+            "title": "Recent Seeded Run Count",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "title": "BrowserProfileUsage"
+      },
+      "BrowserProfileUsageCredential": {
+        "properties": {
+          "credential_id": {
+            "type": "string",
+            "title": "Credential Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          }
+        },
+        "type": "object",
+        "required": [
+          "credential_id",
+          "name"
+        ],
+        "title": "BrowserProfileUsageCredential"
+      },
+      "BrowserProfileUsageWorkflow": {
+        "properties": {
+          "workflow_permanent_id": {
+            "type": "string",
+            "title": "Workflow Permanent Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "via": {
+            "type": "string",
+            "title": "Via"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_permanent_id",
+          "title",
+          "via"
+        ],
+        "title": "BrowserProfileUsageWorkflow"
+      },
+      "BrowserSeedSource": {
+        "type": "string",
+        "enum": [
+          "override",
+          "picked",
+          "own_memory",
+          "credential",
+          "fresh",
+          "degraded_fresh"
+        ],
+        "title": "BrowserSeedSource",
+        "description": "Which layer of the seed-precedence chain seeded a run's browser (provenance).\n\nResolved once at run setup, before any browser creation, for all run types (C-semantics).\n- override: explicit request browser_profile_id (one-run-only pick via API)\n- picked: the workflow's explicit profile pick (workflows.browser_profile_id) — \"always start here\"\n- own_memory: the workflow's own auto-profile (no pick + persist_browser_session)\n- credential: the run's selected credential's profile (rotation-aware; also the empty-own boot)\n- fresh: no seed profile\n- degraded_fresh: a resolved profile failed to load; ran fresh"
       },
       "BrowserSessionResponse": {
         "properties": {
@@ -9724,6 +10206,22 @@
             "title": "Vnc Streaming Supported",
             "description": "Whether the browser session supports VNC streaming",
             "default": false
+          },
+          "stream_transport": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stream Transport",
+            "description": "Live-view transport for this session: \"vnc\" or \"cdp\". Resolved on the single-session fetch only; null elsewhere.",
+            "examples": [
+              "vnc",
+              "cdp"
+            ]
           },
           "download_path": {
             "anyOf": [
@@ -9965,6 +10463,17 @@
               }
             ],
             "title": "Single Option Click"
+          },
+          "desired_state": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Desired State"
           }
         },
         "type": "object",
@@ -10091,6 +10600,20 @@
             "type": "array",
             "title": "Parameters",
             "default": []
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
           },
           "prompt": {
             "anyOf": [
@@ -10291,6 +10814,20 @@
             "type": "string",
             "title": "Code"
           },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
+          },
           "parameter_keys": {
             "anyOf": [
               {
@@ -10314,7 +10851,8 @@
                 "type": "null"
               }
             ],
-            "title": "Prompt"
+            "title": "Prompt",
+            "description": "Plain-language goal of this code block, shown as the block's Goal in the editor"
           },
           "steps": {
             "anyOf": [
@@ -10328,7 +10866,8 @@
                 "type": "null"
               }
             ],
-            "title": "Steps"
+            "title": "Steps",
+            "description": "Plain-language step outline mapped to code line ranges; derived from the code when omitted"
           }
         },
         "type": "object",
@@ -10799,6 +11338,12 @@
             "title": "Generate Browser Profile",
             "description": "When true, the session's browser profile (cookies, localStorage, etc.) is saved to storage when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid storing profiles for sessions that never need them. Sessions started with a browser_profile_id always persist their profile regardless of this flag.",
             "default": false
+          },
+          "needs_live_view": {
+            "type": "boolean",
+            "title": "Needs Live View",
+            "description": "Whether a person will watch this session's browser live. Defaults to false, which suits unattended automation; the Skyvern app sets it because a session opened in the UI is watched. It requests a capability, not a particular browser, and cannot be used to select where the session runs.",
+            "default": false
           }
         },
         "type": "object",
@@ -10892,6 +11437,42 @@
             "title": "Rotate Proxy Session Id",
             "description": "Rotate the Skyvern-managed proxy sticky-session id when updating this credential.",
             "default": false
+          },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id",
+            "description": "Optional plain browser profile to link as this credential's saved profile. Must be an unmanaged profile in your organization that no other credential already owns."
+          },
+          "auto_profile_disabled": {
+            "type": "boolean",
+            "title": "Auto Profile Disabled",
+            "description": "Disable automatic saving and reuse of this credential's browser profile.",
+            "default": false
+          },
+          "pin_saved_session_ip": {
+            "type": "boolean",
+            "title": "Pin Saved Session Ip",
+            "description": "Keep the same IP across sign-ins that reuse this credential's saved profile.",
+            "default": false
+          },
+          "tested_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tested Url",
+            "description": "Login page URL used during the credential test"
           }
         },
         "type": "object",
@@ -11082,6 +11663,31 @@
             ],
             "title": "Selection Strategy"
           },
+          "fallback_credential_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fallback Credential Ids"
+          },
+          "fallback_trigger": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fallback Trigger"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -11167,6 +11773,31 @@
               }
             ],
             "title": "Selection Strategy"
+          },
+          "fallback_credential_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fallback Credential Ids"
+          },
+          "fallback_trigger": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fallback Trigger"
           }
         },
         "type": "object",
@@ -11236,6 +11867,24 @@
             "title": "Browser Profile Id",
             "description": "Browser profile ID linked to this credential"
           },
+          "auto_profile_disabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auto Profile Disabled",
+            "description": "Whether automatic saving and reuse of this credential's browser profile is disabled."
+          },
+          "pin_saved_session_ip": {
+            "type": "boolean",
+            "title": "Pin Saved Session Ip",
+            "description": "Whether sign-ins reusing this credential's saved profile keep the same IP",
+            "default": false
+          },
           "tested_url": {
             "anyOf": [
               {
@@ -11271,6 +11920,11 @@
             ],
             "title": "Save Browser Session Intent",
             "description": "Whether the user intends to save a browser session, regardless of test outcome"
+          },
+          "run_sequentially": {
+            "type": "boolean",
+            "title": "Run Sequentially",
+            "default": false
           },
           "folder_id": {
             "anyOf": [
@@ -11641,6 +12295,11 @@
               }
             ],
             "title": "Reasoning Effort"
+          },
+          "extra_parameters": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Extra Parameters"
           }
         },
         "type": "object",
@@ -11684,7 +12343,8 @@
         "enum": [
           "openai_compatible",
           "ollama",
-          "openrouter"
+          "openrouter",
+          "gemini"
         ],
         "title": "CustomLLMProvider"
       },
@@ -11838,6 +12498,12 @@
             ],
             "title": "Browser Profile Id",
             "description": "ID of a browser profile to reuse for this run"
+          },
+          "start_fresh_browser": {
+            "type": "boolean",
+            "title": "Start Fresh Browser",
+            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory — no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
+            "default": false
           },
           "browser_address": {
             "anyOf": [
@@ -12637,6 +13303,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -13041,6 +13712,222 @@
             "title": "Next Loop On Failure",
             "default": false
           },
+          "s3_bucket": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "S3 Bucket"
+          },
+          "aws_access_key_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aws Access Key Id"
+          },
+          "aws_secret_access_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aws Secret Access Key"
+          },
+          "region_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region Name"
+          },
+          "azure_storage_account_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Storage Account Name"
+          },
+          "azure_storage_account_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Storage Account Key"
+          },
+          "azure_blob_container_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Blob Container Name"
+          },
+          "google_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Credential Id"
+          },
+          "google_drive_folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Drive Folder Id"
+          },
+          "sftp_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Host"
+          },
+          "sftp_port": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Port"
+          },
+          "sftp_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Username"
+          },
+          "sftp_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Password"
+          },
+          "sftp_private_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Private Key"
+          },
+          "sftp_private_key_passphrase": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Private Key Passphrase"
+          },
+          "sftp_remote_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Remote Path"
+          },
+          "sftp_host_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Host Key"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt",
+            "description": "Optional natural-language control over which downloaded files are uploaded; empty means upload all."
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "continue_on_empty": {
+            "type": "boolean",
+            "title": "Continue On Empty",
+            "description": "When the run download directory has no files, allow the empty upload only after confirming no registered, browser-session, or alternate candidate downloads exist (False, default). Set True to always allow an empty upload.",
+            "default": false
+          },
           "task_type": {
             "type": "string",
             "title": "Task Type",
@@ -13076,6 +13963,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -13280,6 +14172,10 @@
             "type": "boolean",
             "title": "Include Extracted Text",
             "default": true
+          },
+          "download_target": {
+            "$ref": "#/components/schemas/FileDownloadTarget",
+            "default": "website"
           }
         },
         "type": "object",
@@ -13339,6 +14235,224 @@
           "next_loop_on_failure": {
             "type": "boolean",
             "title": "Next Loop On Failure",
+            "default": false
+          },
+          "download_target": {
+            "$ref": "#/components/schemas/FileDownloadTarget",
+            "default": "website"
+          },
+          "s3_bucket": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "S3 Bucket"
+          },
+          "aws_access_key_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aws Access Key Id"
+          },
+          "aws_secret_access_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aws Secret Access Key"
+          },
+          "region_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region Name"
+          },
+          "azure_storage_account_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Storage Account Name"
+          },
+          "azure_storage_account_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Storage Account Key"
+          },
+          "azure_blob_container_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Blob Container Name"
+          },
+          "google_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Credential Id"
+          },
+          "google_drive_folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Google Drive Folder Id"
+          },
+          "sftp_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Host"
+          },
+          "sftp_port": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Port"
+          },
+          "sftp_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Username"
+          },
+          "sftp_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Password"
+          },
+          "sftp_private_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Private Key"
+          },
+          "sftp_private_key_passphrase": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Private Key Passphrase"
+          },
+          "sftp_remote_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Remote Path"
+          },
+          "sftp_host_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Host Key"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "continue_on_empty": {
+            "type": "boolean",
+            "title": "Continue On Empty",
             "default": false
           },
           "navigation_goal": {
@@ -13465,6 +14579,17 @@
           "navigation_goal"
         ],
         "title": "FileDownloadBlockYAML"
+      },
+      "FileDownloadTarget": {
+        "type": "string",
+        "enum": [
+          "website",
+          "s3",
+          "azure",
+          "google_drive",
+          "sftp"
+        ],
+        "title": "FileDownloadTarget"
       },
       "FileEncoding": {
         "type": "string",
@@ -13876,10 +15001,6 @@
             "title": "Next Loop On Failure",
             "default": false
           },
-          "storage_type": {
-            "$ref": "#/components/schemas/FileStorageType",
-            "default": "s3"
-          },
           "s3_bucket": {
             "anyOf": [
               {
@@ -14095,6 +15216,10 @@
             "title": "Continue On Empty",
             "description": "When the run download directory has no files, allow the empty upload only after confirming no registered, browser-session, or alternate candidate downloads exist (False, default). Set True to always allow an empty upload.",
             "default": false
+          },
+          "storage_type": {
+            "$ref": "#/components/schemas/FileStorageType",
+            "default": "s3"
           }
         },
         "type": "object",
@@ -16182,6 +17307,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -16871,6 +18001,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -17269,6 +18404,11 @@
             "title": "Complete Verification",
             "default": true
           },
+          "include_action_history_in_verification": {
+            "type": "boolean",
+            "title": "Include Action History In Verification",
+            "default": false
+          },
           "skip_saved_profile": {
             "type": "boolean",
             "title": "Skip Saved Profile",
@@ -17368,6 +18508,12 @@
             ],
             "title": "Browser Profile Id",
             "description": "ID of a browser profile to reuse for this run"
+          },
+          "start_fresh_browser": {
+            "type": "boolean",
+            "title": "Start Fresh Browser",
+            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory — no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
+            "default": false
           },
           "browser_address": {
             "anyOf": [
@@ -17656,6 +18802,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -18037,6 +19188,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -18243,6 +19399,21 @@
               "user@example.com",
               "+14155550123"
             ]
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata",
+            "description": "Optional additional password credential metadata fields"
           }
         },
         "type": "object",
@@ -19499,6 +20670,7 @@
         "enum": [
           "skyvern-1.0",
           "skyvern-2.0",
+          "skyvern-3.0",
           "openai-cua",
           "anthropic-cua",
           "ui-tars",
@@ -19666,6 +20838,40 @@
         ],
         "title": "RunTagHistoryResponse"
       },
+      "RunTagSuggestionsResponse": {
+        "properties": {
+          "keys": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Keys",
+            "description": "Distinct grouped tag keys seen on runs."
+          },
+          "values_by_key": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": "object",
+            "title": "Values By Key",
+            "description": "Values seen for each grouped key."
+          },
+          "labels": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Labels",
+            "description": "Distinct standalone (keyless) labels seen on runs."
+          }
+        },
+        "type": "object",
+        "title": "RunTagSuggestionsResponse",
+        "description": "Response for ``GET /v1/run-tag-suggestions``: distinct (key, value) pairs\never set on a run for the org, sourced from the event log rather than the\ntag-key/tag-value registry so reserved ``skyvern.*`` system keys (never\nregistered) reach the pickers too."
+      },
       "RunTagsBatchRequest": {
         "properties": {
           "workflow_run_ids": {
@@ -19728,6 +20934,7 @@
         "enum": [
           "task_v1",
           "task_v2",
+          "task_v3",
           "workflow_run",
           "openai_cua",
           "anthropic_cua",
@@ -20242,6 +21449,52 @@
             "type": "array",
             "title": "File Attachments",
             "default": []
+          },
+          "custom_smtp_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Host"
+          },
+          "custom_smtp_port": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 65535,
+                "minimum": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Port"
+          },
+          "custom_smtp_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Username"
+          },
+          "custom_smtp_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Password"
           }
         },
         "type": "object",
@@ -20312,20 +21565,94 @@
             "default": false
           },
           "smtp_host_secret_parameter_key": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Smtp Host Secret Parameter Key"
           },
           "smtp_port_secret_parameter_key": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Smtp Port Secret Parameter Key"
           },
           "smtp_username_secret_parameter_key": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Smtp Username Secret Parameter Key"
           },
           "smtp_password_secret_parameter_key": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Smtp Password Secret Parameter Key"
+          },
+          "custom_smtp_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Host"
+          },
+          "custom_smtp_port": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 65535,
+                "minimum": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Port"
+          },
+          "custom_smtp_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Username"
+          },
+          "custom_smtp_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Password"
           },
           "sender": {
             "type": "string",
@@ -20364,10 +21691,6 @@
         "type": "object",
         "required": [
           "label",
-          "smtp_host_secret_parameter_key",
-          "smtp_port_secret_parameter_key",
-          "smtp_username_secret_parameter_key",
-          "smtp_password_secret_parameter_key",
           "sender",
           "recipients",
           "subject",
@@ -21265,6 +22588,39 @@
         "title": "TagValue",
         "description": "Tag-value color registry entry: the palette color assigned to a grouped\n(key, value) pair."
       },
+      "TagValueCreate": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key",
+            "description": "Tag key (group) for the new label."
+          },
+          "value": {
+            "type": "string",
+            "title": "Value",
+            "description": "Tag value (label) to register under the key."
+          },
+          "color": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Color",
+            "description": "Palette color name for the label; a random palette color when omitted."
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "value"
+        ],
+        "title": "TagValueCreate",
+        "description": "Body for ``POST /v1/tag-values``: register a grouped label before any\nworkflow uses it. The label shows a zero workflow count until applied."
+      },
       "TagValueDelete": {
         "properties": {
           "value": {
@@ -21502,6 +22858,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -22243,6 +23604,24 @@
               "pbs_123"
             ]
           },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id",
+            "description": "ID of a browser profile to reuse for this task"
+          },
+          "start_fresh_browser": {
+            "type": "boolean",
+            "title": "Start Fresh Browser",
+            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory — no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
+            "default": false
+          },
           "model": {
             "anyOf": [
               {
@@ -22545,6 +23924,24 @@
               "pbs_123"
             ]
           },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id",
+            "description": "ID of a browser profile to reuse for this task"
+          },
+          "start_fresh_browser": {
+            "type": "boolean",
+            "title": "Start Fresh Browser",
+            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory — no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
+            "default": false
+          },
           "model": {
             "anyOf": [
               {
@@ -22678,6 +24075,7 @@
               "created",
               "queued",
               "running",
+              "paused",
               "timed_out",
               "failed",
               "terminated",
@@ -22924,6 +24322,7 @@
             "enum": [
               "task_v1",
               "task_v2",
+              "task_v3",
               "openai_cua",
               "anthropic_cua",
               "ui_tars",
@@ -24126,6 +25525,11 @@
             ],
             "title": "Complete Criterion"
           },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
+          },
           "terminate_criterion": {
             "anyOf": [
               {
@@ -24563,6 +25967,11 @@
               }
             ],
             "title": "Complete Criterion"
+          },
+          "complete_criterion_is_untrusted": {
+            "type": "boolean",
+            "title": "Complete Criterion Is Untrusted",
+            "default": false
           },
           "terminate_criterion": {
             "anyOf": [
@@ -25355,7 +26764,7 @@
           "condition"
         ],
         "title": "WhileLoopBlock",
-        "description": "Loop block driven by a runtime condition. Iterates while ``condition`` evaluates truthy.\n\nTop-of-loop semantics: the condition is evaluated *before* each iteration (including the\nfirst). If the condition is false on the first check, the body never runs and the block\nreturns success with an empty output list.\n\nSafety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (500). Reaching the cap is\ntreated as a failure so that a misbehaving condition can never spin forever."
+        "description": "Loop block driven by a runtime condition. Iterates while ``condition`` evaluates truthy.\n\nTop-of-loop semantics: the condition is evaluated *before* each iteration (including the\nfirst). If the condition is false on the first check, the body never runs and the block\nreturns success with an empty output list.\n\nSafety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (1000). Reaching the cap is\ntreated as a failure so that a misbehaving condition can never spin forever."
       },
       "WhileLoopBlockYAML": {
         "properties": {
@@ -25618,6 +27027,11 @@
           "persist_browser_session": {
             "type": "boolean",
             "title": "Persist Browser Session",
+            "default": false
+          },
+          "mask_secrets": {
+            "type": "boolean",
+            "title": "Mask Secrets",
             "default": false
           },
           "pin_saved_session_ip": {
@@ -25947,6 +27361,18 @@
             "type": "boolean",
             "title": "Persist Browser Session",
             "default": false
+          },
+          "mask_secrets": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mask Secrets",
+            "description": "Mask secret values across this workflow's runs: hide them while they are typed (screenshots, recordings, live view) and redact them from stored artifacts, network logs, and LLM-bound text."
           },
           "pin_saved_session_ip": {
             "type": "boolean",
@@ -26374,6 +27800,19 @@
               }
             ],
             "title": "Workflow System Prompt"
+          },
+          "completion_contract": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completion Contract",
+            "description": "Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand."
           }
         },
         "type": "object",
@@ -26617,6 +28056,19 @@
               }
             ],
             "title": "Workflow System Prompt"
+          },
+          "completion_contract": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completion Contract",
+            "description": "Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand."
           }
         },
         "type": "object",
@@ -26866,6 +28318,38 @@
             ],
             "title": "Browser Profile Id"
           },
+          "browser_seed_source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSeedSource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "browser_sink_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Sink Profile Id"
+          },
+          "start_fresh_browser": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Fresh Browser"
+          },
           "debug_session_id": {
             "anyOf": [
               {
@@ -26996,6 +28480,28 @@
             ],
             "title": "Failure Category"
           },
+          "retried_from_workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retried From Workflow Run Id"
+          },
+          "fallback_attempt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fallback Attempt"
+          },
           "parent_workflow_run_id": {
             "anyOf": [
               {
@@ -27104,6 +28610,17 @@
               }
             ],
             "title": "Sequential Key"
+          },
+          "sequential_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sequential Credential Id"
           },
           "ai_fallback": {
             "anyOf": [
@@ -27379,6 +28896,17 @@
               }
             ],
             "title": "Url"
+          },
+          "final_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Final Url"
           },
           "navigation_goal": {
             "anyOf": [
@@ -27836,6 +29364,12 @@
             "title": "Browser Profile Id",
             "description": "ID of a browser profile to reuse for this workflow run"
           },
+          "start_fresh_browser": {
+            "type": "boolean",
+            "title": "Start Fresh Browser",
+            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory — no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
+            "default": false
+          },
           "max_screenshot_scrolls": {
             "anyOf": [
               {
@@ -28081,6 +29615,12 @@
             "title": "Browser Profile Id",
             "description": "ID of a browser profile to reuse for this workflow run"
           },
+          "start_fresh_browser": {
+            "type": "boolean",
+            "title": "Start Fresh Browser",
+            "description": "When true, start this run from a fresh, empty browser and ignore any saved browser memory — no memory is read or written. A verified sign-in during the run still updates the credential's saved login.",
+            "default": false
+          },
           "max_screenshot_scrolls": {
             "anyOf": [
               {
@@ -28222,6 +29762,7 @@
               "created",
               "queued",
               "running",
+              "paused",
               "timed_out",
               "failed",
               "terminated",
@@ -28502,6 +30043,22 @@
             ],
             "title": "Script Id",
             "description": "ID of the cached script used for this workflow run, if any."
+          },
+          "browser_seed_source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSeedSource"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which layer of the seed-precedence chain seeded this run's browser (provenance).",
+            "examples": [
+              "credential",
+              "own_memory",
+              "fresh"
+            ]
           },
           "run_request": {
             "anyOf": [
