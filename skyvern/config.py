@@ -633,6 +633,12 @@ class Settings(BaseSettings):
     OPENROUTER_MODEL: str | None = None
     OPENROUTER_API_BASE: str = "https://openrouter.ai/api/v1"
 
+    # TRUSTEDROUTER
+    ENABLE_TRUSTEDROUTER: bool = False
+    TRUSTEDROUTER_API_KEY: str | None = None
+    TRUSTEDROUTER_MODEL: str | None = None
+    TRUSTEDROUTER_API_BASE: str = "https://api.trustedrouter.com/v1"
+
     # GROQ
     ENABLE_GROQ: bool = False
     GROQ_API_KEY: str | None = None
