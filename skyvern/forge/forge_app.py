@@ -117,6 +117,11 @@ def create_forge_app() -> ForgeApp:
     """Create and initialize a ForgeApp instance with all services"""
     settings: Settings = SettingsManager.get_settings()
 
+    if not settings.LLM_KEY:
+        raise RuntimeError(
+            "LLM_KEY is not set. Please set LLM_KEY in your .env file. "
+            "See docs: https://www.skyvern.com/docs/self-hosted/llm-configuration"
+        )
     app = ForgeApp()
 
     app.SETTINGS_MANAGER = settings
@@ -170,7 +175,7 @@ def create_forge_app() -> ForgeApp:
     app.LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(settings.LLM_KEY)
     app.OPENAI_CUA_MODEL = settings.OPENAI_CUA_MODEL
     app.OPENAI_CLIENT = AsyncOpenAI(
-        api_key=settings.OPENAI_API_KEY or "dummy",
+        api_key=settings.OPENAI_API_KEY if settings.ENABLE_OPENAI else "sk-dummy-not-used",
         http_client=ForgeAsyncHttpxClientWrapper(),
     )
     if settings.ENABLE_AZURE_CUA:
