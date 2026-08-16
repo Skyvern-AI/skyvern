@@ -8,10 +8,65 @@ class Constants:
     MissingVariablePattern = var_pattern = r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_.\[\]'\"]*)\s*\}\}"
 
 
+# Characters that may precede a full-token occurrence of a key (identifier chars would
+# make it a longer identifier; a dot would make it an attribute access like foo.key).
+_TOKEN_BOUNDARY_BEFORE = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.")
+# Characters that may not follow a full-token occurrence (identifier continuation).
+_TOKEN_BOUNDARY_AFTER = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+
+
+def _rewrite_span_tokens(span: str, old_key: str, new_key: str) -> str:
+    """Rewrites full-token occurrences of old_key in one Jinja span, skipping string literals.
+
+    Single left-to-right pass. Quoted regions ('...' or "...", honoring backslash escapes)
+    are copied verbatim, so a key embedded anywhere inside a string literal is never touched.
+    """
+    parts: list[str] = []
+    i = 0
+    n = len(span)
+    key_len = len(old_key)
+    while i < n:
+        if span.startswith(old_key, i):
+            prev = span[i - 1] if i > 0 else ""
+            nxt = span[i + key_len] if i + key_len < n else ""
+            if (not prev or prev not in _TOKEN_BOUNDARY_BEFORE) and (not nxt or nxt not in _TOKEN_BOUNDARY_AFTER):
+                parts.append(new_key)
+                i += key_len
+                continue
+        char = span[i]
+        parts.append(char)
+        i += 1
+        if char in "'\"":
+            # Copy the whole string literal verbatim (backslash escapes included) so
+            # embedded occurrences of the key are never rewritten.
+            quote = char
+            while i < n:
+                literal_char = span[i]
+                parts.append(literal_char)
+                i += 1
+                if literal_char == "\\" and i < n:
+                    parts.append(span[i])
+                    i += 1
+                elif literal_char == quote:
+                    break
+    return "".join(parts)
+
+
 def replace_jinja_reference(text: str, old_key: str, new_key: str) -> str:
     """Replaces jinja-style references in a string.
 
-    Handles patterns like {{oldKey}}, {{oldKey.field}}, {{oldKey | filter}}, {{oldKey[0]}}
+    Rewrites the key wherever it appears as a full token inside {{ ... }} expressions or
+    {% ... %} statements: {{oldKey}}, {{oldKey.field}}, {{oldKey | filter}}, {{oldKey[0]}},
+    {{ other < oldKey }}, {% if oldKey %}, {% for x in oldKey %}.
+
+    Left untouched: occurrences outside Jinja delimiters, attribute accesses (foo.oldKey),
+    anything inside quoted string literals ('...oldKey...'), and longer identifiers that
+    merely contain the key (oldKeyExtended).
+
+    The scan is a single left-to-right pass: each span search resumes where the previous
+    span ended, and an unclosed opener is stepped over after its leading-position rewrite,
+    so malformed input (e.g. thousands of unmatched braces) stays linear while well-formed
+    spans after an unclosed opener are still fully rewritten.
 
     Args:
         text: The text to search in
@@ -21,13 +76,55 @@ def replace_jinja_reference(text: str, old_key: str, new_key: str) -> str:
     Returns:
         The text with references replaced
     """
-    # Match {{oldKey}} or {{oldKey.something}} or {{oldKey | filter}} or {{oldKey[0]}} etc.
-    # Use negative lookahead to ensure key is not followed by identifier characters,
-    # which prevents matching {{keyOther}} when searching for {{key}}
-    # Capture whitespace after {{ to preserve formatting (e.g., "{{ key }}" stays "{{ newKey }}")
     escaped_old_key = re.escape(old_key)
-    pattern = rf"\{{\{{(\s*){escaped_old_key}(?![a-zA-Z0-9_])"
-    return re.sub(pattern, rf"{{{{\1{new_key}", text)
+    # An unclosed "{{ oldKey" has always been rewritten at the leading position; openers
+    # that never close get this legacy leading-position rewrite. The pattern is anchored
+    # on the literal "{{" with no wildcards, so it scans linearly.
+    leading_pattern = re.compile(rf"\{{\{{(\s*){escaped_old_key}(?![a-zA-Z0-9_])")
+
+    parts: list[str] = []
+    i = 0
+    n = len(text)
+    # Opener positions are cached until the scan passes them, and a closer type known to
+    # be absent from the rest of the text is never searched for again, so every find()
+    # covers a distinct stretch of input — the scan stays linear even when thousands of
+    # openers never close.
+    expr_start = text.find("{{")
+    stmt_start = text.find("{%")
+    have_expr_closer = True
+    have_stmt_closer = True
+    while i < n:
+        if expr_start != -1 and expr_start < i:
+            expr_start = text.find("{{", i)
+        if stmt_start != -1 and stmt_start < i:
+            stmt_start = text.find("{%", i)
+        starts = [pos for pos in (expr_start, stmt_start) if pos != -1]
+        if not starts:
+            parts.append(text[i:])
+            break
+        start = min(starts)
+        parts.append(text[i:start])
+        if text.startswith("{{", start):
+            end = text.find("}}", start + 2) if have_expr_closer else -1
+            have_expr_closer = end != -1
+        else:
+            end = text.find("%}", start + 2) if have_stmt_closer else -1
+            have_stmt_closer = end != -1
+        if end == -1:
+            # Unclosed opener: apply the legacy leading-position rewrite at this opener
+            # only, then keep scanning — later well-formed spans still get full coverage.
+            head = leading_pattern.match(text, start)
+            if head is not None:
+                parts.append("{{" + head.group(1) + new_key)
+                i = head.end()
+            else:
+                parts.append(text[start : start + 2])
+                i = start + 2
+            continue
+        span_end = end + 2
+        parts.append(_rewrite_span_tokens(text[start:span_end], old_key, new_key))
+        i = span_end
+    return "".join(parts)
 
 
 def get_missing_variables(template_source: str, template_data: dict) -> set[str]:
