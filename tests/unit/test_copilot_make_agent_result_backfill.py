@@ -1,6 +1,4 @@
-"""`_make_agent_result` back-fills the typed terminal adjudication onto the
-narrative payload: ``responseKind`` from ``TurnOutcome.response_kind`` and
-``verifiedSuccess`` from ``enforcement.verified_goal_satisfied_context``."""
+"""`_make_agent_result` back-fills concrete terminal facts onto the narrative payload."""
 
 from __future__ import annotations
 
@@ -22,15 +20,7 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOut
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage, WorkflowCopilotChatSender
 from tests.unit.copilot_test_helpers import failed_second_factor_run
 from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
-from tests.unit.copilot_test_helpers import make_verified_goal_contract, passing_run, two_page_login_yaml
-
-
-def _verified_goal_ctx() -> CopilotContext:
-    return _ctx(
-        last_test_ok=True,
-        last_full_workflow_test_ok=True,
-        latest_diagnosis_repair_contract=make_verified_goal_contract(),
-    )
+from tests.unit.copilot_test_helpers import passing_run, two_page_login_yaml
 
 
 def _outcome(kind: ResponseKind) -> TurnOutcome:
@@ -65,60 +55,81 @@ def _result(ctx: CopilotContext | None, **kwargs: object):
     return _make_agent_result(ctx, **kwargs)
 
 
-def test_backfill_writes_both_fields_together() -> None:
+def test_plain_reply_backfill_uses_concrete_answer_kind() -> None:
     result = _result(_ctx(), turn_outcome=_outcome(ResponseKind.CLARIFY), narrative_payload=_payload())
     assert result.narrative_payload is not None
-    assert result.narrative_payload["responseKind"] == "clarify"
-    assert result.narrative_payload["verifiedSuccess"] is False
-
-
-def test_backfill_verified_success_requires_adjudicated_evidence() -> None:
-    # The legacy run-status conjunction still ends the turn but no longer backs
-    # a verified-success claim: without judge-confirmed outcome evidence the
-    # claim tier renders built-but-unverified.
-    result = _result(_verified_goal_ctx(), turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=_payload())
-    assert result.narrative_payload is not None
-    assert result.narrative_payload["responseKind"] == "build"
-    assert result.narrative_payload["verifiedSuccess"] is False
-
-
-def test_backfill_verified_success_true_when_outcome_fully_verified() -> None:
-    from skyvern.forge.sdk.copilot.completion_verification import (
-        CompletionVerificationResult,
-        CriterionVerdict,
-    )
-
-    ctx = _verified_goal_ctx()
-    ctx.completion_verification_result = CompletionVerificationResult(
-        status="evaluated",
-        criterion_ids=["c0"],
-        verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
-    )
-    result = _result(ctx, turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=_payload())
-    assert result.narrative_payload is not None
-    assert result.narrative_payload["verifiedSuccess"] is True
+    assert result.narrative_payload["responseKind"] == "answer"
 
 
 def test_backfill_never_overwrites_explicit_values() -> None:
-    payload = _payload(responseKind="refuse", verifiedSuccess=True)
+    payload = _payload(responseKind="refuse")
     result = _result(_ctx(), turn_outcome=_outcome(ResponseKind.CLARIFY), narrative_payload=payload)
     assert result.narrative_payload is not None
     assert result.narrative_payload["responseKind"] == "refuse"
-    assert result.narrative_payload["verifiedSuccess"] is True
 
 
 def test_backfill_tolerates_turn_outcome_none() -> None:
     result = _result(_ctx(), turn_outcome=None, narrative_payload=_payload())
     assert result.narrative_payload is not None
     assert "responseKind" not in result.narrative_payload
-    assert result.narrative_payload["verifiedSuccess"] is False
+
+
+@pytest.mark.parametrize(
+    "classifier_kind",
+    [ResponseKind.ANSWER, ResponseKind.BUILD, ResponseKind.CLARIFY, ResponseKind.DIAGNOSE, ResponseKind.REFUSE],
+)
+def test_classifier_response_kind_does_not_terminalize_identical_plain_reply(
+    classifier_kind: ResponseKind,
+) -> None:
+    result = _result(
+        _ctx(),
+        turn_outcome=_outcome(classifier_kind),
+        response_type="REPLY",
+        narrative_payload=_payload(),
+    )
+
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["response_kind"] == "answer"
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["responseKind"] == "answer"
+
+
+@pytest.mark.parametrize(
+    "classifier_kind",
+    [ResponseKind.ANSWER, ResponseKind.BUILD, ResponseKind.CLARIFY, ResponseKind.DIAGNOSE, ResponseKind.REFUSE],
+)
+def test_concrete_workflow_attempt_terminalizes_independently_of_classifier_kind(
+    classifier_kind: ResponseKind,
+) -> None:
+    ctx = _ctx()
+    ctx.update_workflow_called = True
+
+    result = _result(
+        ctx,
+        turn_outcome=_outcome(classifier_kind),
+        response_type="REPLY",
+        narrative_payload=_payload(),
+    )
+
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["response_kind"] == "stopped"
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["responseKind"] == "build"
 
 
 def test_backfill_tolerates_ctx_none() -> None:
     result = _result(None, turn_outcome=_outcome(ResponseKind.REFUSE), narrative_payload=_payload())
     assert result.narrative_payload is not None
     assert result.narrative_payload["responseKind"] == "refuse"
-    assert "verifiedSuccess" not in result.narrative_payload
+
+
+def test_result_carries_exact_model_contract_deletion_to_auto_accept() -> None:
+    ctx = _ctx()
+    ctx.clear_persisted_completion_contract = True
+
+    result = _result(ctx, turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=_payload())
+
+    assert result.clear_persisted_completion_contract is True
 
 
 def test_backfill_tolerates_missing_payload() -> None:
@@ -145,7 +156,7 @@ def test_blocker_override_path_adds_credential_prompt_from_request_policy() -> N
         agent_steering_text="Reply to the user without updating the workflow.",
         user_facing_reason="I couldn't find the required credentials for the existing workflow.",
         recovery_hint="report_blocker_to_user",
-        internal_reason_code="turn_intent_no_mutation_run_blocked",
+        internal_reason_code="no_mutation_run_blocked",
         blocked_tool="update_workflow",
     )
     pre_override = AgentResult(user_response="agent reply", updated_workflow=None, global_llm_context=None)
@@ -251,6 +262,7 @@ def test_build_turn_reports_the_failure_no_later_run_re_exercised() -> None:
     result = _result(
         ctx,
         user_response="Built it. The workflow reads the visitor count.",
+        updated_workflow=object(),
         turn_outcome=_outcome(ResponseKind.BUILD),
         narrative_payload=_payload(),
     )
@@ -271,6 +283,7 @@ def test_the_qualified_turn_is_still_a_success() -> None:
     result = _result(
         ctx,
         user_response="Built it.",
+        updated_workflow=object(),
         turn_outcome=_outcome(ResponseKind.BUILD),
         narrative_payload=_payload(),
     )
@@ -287,6 +300,7 @@ def test_a_re_exercised_failure_leaves_the_reply_and_outcome_unqualified() -> No
     result = _result(
         ctx,
         user_response="Built it.",
+        updated_workflow=object(),
         turn_outcome=_outcome(ResponseKind.BUILD),
         narrative_payload=_payload(),
     )
@@ -311,6 +325,21 @@ def test_a_clarifying_turn_is_never_qualified() -> None:
     assert result.user_response == "Which metric did you want?"
 
 
+def test_classifier_build_does_not_qualify_plain_reply_without_concrete_attempt() -> None:
+    ctx = _ctx_with_open_second_factor_failure(later_run_labels=["read_metric"])
+
+    result = _result(
+        ctx,
+        user_response="Here is the information you requested.",
+        turn_outcome=_outcome(ResponseKind.BUILD),
+        narrative_payload=_payload(),
+    )
+
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.unresolved_runtime_failure is None
+    assert result.user_response == "Here is the information you requested."
+
+
 def test_the_qualification_also_rides_the_narrative_terminal_message() -> None:
     """The chat panel renders the narrative card, not the raw reply, so both carry the note."""
     ctx = _ctx_with_open_second_factor_failure(later_run_labels=["read_metric"])
@@ -318,6 +347,7 @@ def test_the_qualification_also_rides_the_narrative_terminal_message() -> None:
     result = _result(
         ctx,
         user_response="Built it.",
+        updated_workflow=object(),
         turn_outcome=_outcome(ResponseKind.BUILD),
         narrative_payload=_payload(terminalMessage="All done.", narrativeSummary="All done."),
     )

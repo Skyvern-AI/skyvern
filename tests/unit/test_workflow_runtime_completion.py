@@ -16,6 +16,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.runtime_completion import (
     CompletionCriterion,
     carried_contract,
+    contract_from_code_artifact_metadata,
     contract_from_request_criteria,
     grade_completion_contract,
     parse_completion_contract,
@@ -249,6 +250,43 @@ def test_requested_contract_round_trips_through_the_parser() -> None:
     assert [c.kind for c in criteria] == ["registered_download"]
     assert grade_completion_contract(criteria, registered_download_count=0).satisfied is False
     assert grade_completion_contract(criteria, registered_download_count=1).satisfied is True
+
+
+def test_download_contract_comes_from_model_declared_artifact_metadata() -> None:
+    metadata = {
+        "download_statement": {
+            "completion_criteria": [
+                {
+                    "id": "deliver_statement",
+                    "text": "The requested statement is delivered as a registered file.",
+                    "deliverable_kind": "registered_download",
+                }
+            ]
+        }
+    }
+
+    contract = contract_from_code_artifact_metadata(metadata)
+
+    assert contract == {
+        "schema_version": 1,
+        "criteria": [{"id": "deliver_statement", "kind": "registered_download", "min_count": 1}],
+    }
+
+
+def test_ordinary_artifact_criterion_does_not_create_a_download_contract() -> None:
+    metadata = {
+        "extract_status": {
+            "completion_criteria": [
+                {
+                    "id": "return_status",
+                    "text": "The current status is returned.",
+                    "output_path": "output.status",
+                }
+            ]
+        }
+    }
+
+    assert contract_from_code_artifact_metadata(metadata) is None
 
 
 @pytest.mark.asyncio

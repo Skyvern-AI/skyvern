@@ -250,6 +250,53 @@ class SecretInputMismatch(SkyvernException):
         super().__init__("Secret input read-back mismatch after atomic re-entry.")
 
 
+class FreeTextInputMismatch(SkyvernException):
+    def __init__(
+        self,
+        *,
+        element_id: str,
+        intended_length: int,
+        declared_max_length: int | None = None,
+        declared_constraint: str | None = None,
+    ):
+        self.element_id = element_id
+        self.intended_length = intended_length
+        self.declared_max_length = declared_max_length
+        self.declared_constraint = declared_constraint
+        # Safe metadata only -- an element id, one intended length, and (on the static path) one declared
+        # length or a coarse declared-constraint label. Never the raw intended/rendered value, a substring, a
+        # rejected character, a position, or category counts.
+        if declared_max_length is not None or declared_constraint is not None:
+            # Static retention-only fast path: only a browser-declared constraint that demonstrably affects
+            # value RETENTION in this seam -- a maxlength, or a number input sanitizing a non-numeric value --
+            # produces this branch. HTML pattern / email-url validity do NOT prevent retention and never reach it.
+            if declared_max_length is not None:
+                # HTML maxlength counts UTF-16 code units, so state the unit explicitly (a supplementary code
+                # point such as an emoji is two units).
+                detail = f"the field declares a maximum length of {declared_max_length} UTF-16 code units"
+                guidance = f"Propose a value within {declared_max_length} UTF-16 code units."
+            elif declared_constraint == "number":
+                detail = "the field is a number input, which does not retain a non-numeric value"
+                guidance = "Propose a valid number."
+            else:
+                detail = "the value does not satisfy the field's declared constraints"
+                guidance = "Propose a value that satisfies the field's declared constraints."
+            message = (
+                f"Free-text input for element(id={element_id}) did not retain the intended value after "
+                f"re-entry. The field's declared constraints explain the rejection: {detail}. {guidance}"
+            )
+        else:
+            # No declared retention constraint explains the rejection (including the incident, which declares
+            # nothing). No live-field diagnostic probe is run, so there are no per-candidate character
+            # observations -- fail closed with a generic, privacy-safe, still-actionable reason.
+            message = (
+                f"Free-text input for element(id={element_id}) did not retain the intended "
+                f"{intended_length}-character value after re-entry; the field likely rejects this value's "
+                "format, so re-entering the same value is unlikely to succeed."
+            )
+        super().__init__(message)
+
+
 class ConditionalBranchEvaluationError(SkyvernException):
     """A conditional block could not resolve which branch to take."""
 
@@ -974,20 +1021,6 @@ class TaskTerminationError(TerminationError):
         super().__init__(f"Task {task_id} failed. Reason: {reason}")
 
 
-class ActionPolicyBlocked(BaseException):
-    """Fail-closed signal raised when an extension policy blocks a browser action.
-
-    Deliberately derives from BaseException so broad action-recovery handlers cannot convert a policy
-    decision into a retry or fallback. It is caught only at the run's explicit termination boundaries.
-    """
-
-    def __init__(self, reason: str, step_id: str | None = None, task_id: str | None = None) -> None:
-        self.message = f"Browser action blocked by policy. Reason: {reason}"
-        self.step_id = step_id
-        self.task_id = task_id
-        super().__init__(self.message)
-
-
 class BlockTerminationError(SkyvernException):
     def __init__(self, workflow_run_block_id: str, workflow_run_id: str, reason: str) -> None:
         super().__init__(
@@ -1546,9 +1579,16 @@ class ScriptTerminationException(SkyvernException):
 
 
 class InProcessScriptExecutionDenied(SkyvernException):
-    def __init__(self, *, seam: str, selection_reason: str) -> None:
+    """Refusal to load a cached script into the worker process.
+
+    ``fail_closed`` separates an integrity verdict the caller must not work around from a
+    routing verdict it should absorb by running the workflow through the agent instead.
+    """
+
+    def __init__(self, *, seam: str, selection_reason: str, fail_closed: bool = True) -> None:
         self.seam = seam
         self.selection_reason = selection_reason
+        self.fail_closed = fail_closed
         super().__init__(f"In-process script execution denied at {seam}: {selection_reason}")
 
 

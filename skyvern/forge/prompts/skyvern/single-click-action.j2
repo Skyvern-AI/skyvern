@@ -19,6 +19,9 @@ Reply in JSON format with the following keys:
         "double_click": bool, // True only when the element requires a double-click to activate (e.g., opening a file in a file manager, entering edit mode in a spreadsheet cell, or expanding a tree node). Defaults to false for normal clicks. Do not use double-click for regular buttons, links, form elements, clickable grid rows, icons, or dashboard cards.
         "download": bool, // If true, the browser will trigger a download by clicking the element. If false, the browser will click the element without triggering a download.
         "file_url": str, // The url of the file to upload if applicable. This field can be present for CLICK only if the click is to upload the file. It should be null otherwise.
+        "click_context": {  // Context for driving a selectable/toggle control to a terminal state. null for ordinary clicks.
+            "desired_state": bool // Set this ONLY when the click is meant to drive a selectable/toggle control — a checkbox, switch, radio, or an option/tab that reports a selected state — to a terminal on/off state. true means leave the control selected/checked/on; false means leave it unselected/unchecked/off. Use null for ordinary buttons, links, a click that only opens a dropdown/menu, or anything that is not setting a control to a terminal on/off state.
+        }
     }]
 }
 

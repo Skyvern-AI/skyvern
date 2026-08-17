@@ -12,6 +12,7 @@ import pytest
 from skyvern.cli.core import session_manager
 from skyvern.cli.core.result import BrowserContext as MCPBrowserContext
 from skyvern.cli.core.session_manager import SessionState, scoped_session
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext, mcp_to_copilot
 from skyvern.forge.sdk.copilot.tools import _same_page_ignoring_fragment
 
@@ -544,7 +545,11 @@ class TestUpdateWorkflowDirect:
         """update_workflow uses direct path even when api_key is set."""
         from skyvern.forge.sdk.copilot.tools import _update_workflow
 
-        ctx = _make_ctx(api_key="sk-test-key", workflow_permanent_id="wpid_abc123")
+        ctx = _make_ctx(
+            api_key="sk-test-key",
+            workflow_permanent_id="wpid_abc123",
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        )
 
         mock_workflow = MagicMock()
         mock_workflow.title = "Test"
@@ -576,7 +581,10 @@ class TestUpdateWorkflowDirect:
         """update_workflow uses direct path when api_key is None."""
         from skyvern.forge.sdk.copilot.tools import _update_workflow
 
-        ctx = _make_ctx(api_key=None)
+        ctx = _make_ctx(
+            api_key=None,
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        )
 
         mock_workflow = MagicMock()
         mock_workflow.title = "Test"
@@ -606,7 +614,10 @@ class TestUpdateWorkflowDirect:
 
         from skyvern.forge.sdk.copilot.tools import _update_workflow
 
-        ctx = _make_ctx(api_key="sk-test-key")
+        ctx = _make_ctx(
+            api_key="sk-test-key",
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        )
 
         def raise_yaml_error(**kwargs: Any) -> None:
             raise _yaml.YAMLError("bad yaml")

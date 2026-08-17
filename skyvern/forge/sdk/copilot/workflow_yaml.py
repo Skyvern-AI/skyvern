@@ -11,7 +11,10 @@ from skyvern.constants import DEFAULT_LOGIN_PROMPT, DEFAULT_WORKFLOW_TITLES
 from skyvern.exceptions import WorkflowNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
-from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps_in_yaml
+from skyvern.forge.sdk.copilot.code_block_steps import (
+    bind_referenced_parameters_in_yaml,
+    derive_code_block_steps_in_yaml,
+)
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
@@ -31,6 +34,41 @@ LOG = structlog.get_logger()
 
 # Wide enough that safe_dump never folds a title onto a second line.
 _YAML_NO_FOLD_WIDTH = 1 << 30
+
+
+def reconcile_workflow_completion_contract(
+    workflow_yaml: str,
+    contract: dict[str, object] | None,
+    *,
+    previous_contract: dict[str, object] | None = None,
+) -> tuple[str, bool]:
+    """Reconcile an exact model-derived runtime contract and report an authoritative deletion.
+
+    The contract comes from validated model-authored tool metadata. Parsing here interprets only
+    machine-generated YAML structure; it does not classify user prose or generated code. Removing
+    a declaration deletes only the exact prior model-derived contract, so an unrelated contract is
+    never mistaken for metadata this seam owns. The boolean is the persistence-layer clear signal.
+    """
+    if contract is None and previous_contract is None:
+        return workflow_yaml, False
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except Exception:
+        return workflow_yaml, False
+    if not isinstance(parsed, dict):
+        return workflow_yaml, False
+    definition = parsed.get("workflow_definition")
+    if not isinstance(definition, dict):
+        return workflow_yaml, False
+    if contract is None:
+        if definition.get("completion_contract") != previous_contract:
+            return workflow_yaml, False
+        definition.pop("completion_contract", None)
+        return yaml.safe_dump(parsed, sort_keys=False, allow_unicode=True, width=_YAML_NO_FOLD_WIDTH), True
+    if definition.get("completion_contract") == contract:
+        return workflow_yaml, False
+    definition["completion_contract"] = contract
+    return yaml.safe_dump(parsed, sort_keys=False, allow_unicode=True, width=_YAML_NO_FOLD_WIDTH), False
 
 
 def _proxy_location_alias_key(value: str) -> str:
@@ -444,15 +482,20 @@ def workflow_yaml_title(workflow_yaml: str | None) -> str | None:
     return title.strip() if isinstance(title, str) and title.strip() else None
 
 
-def _redact_credentials_before_persistence(
+def redact_credentials_in_workflow_yaml(
     workflow_yaml: str, workflow_permanent_id: str, credential_values: Collection[str]
 ) -> str:
-    """Last line of defence before a workflow reaches the database.
+    """The one document that gets persisted, anchored against, and shown to the model.
 
     A credential value should already have been rebound to a parameter reference upstream; reaching
     here with a live value means that failed, so redact rather than store it. The redacted workflow
     will not run as authored — that is the intended trade, and the error line is the signal to fix
     the upstream rebind.
+
+    Apply this exactly once per document, at the write seam, before the draft is stored on the
+    context and before it is persisted. A second application over its own output cannot be made
+    faithful: a credential value that overlaps ``[REDACTED_SECRET]`` is indistinguishable from a
+    marker the first pass wrote.
 
     ``credential_values`` must be scoped to the authoring session. Replacing values registered by
     other sessions would let one org's short secret rewrite another org's stored workflow.
@@ -462,15 +505,22 @@ def _redact_credentials_before_persistence(
     redactable = {
         value for value in credential_values if isinstance(value, str) and len(value) >= MIN_PERSISTED_REDACTION_LENGTH
     }
+    # Redact to a marker no input can contain, then swap it for the placeholder at the end, so one
+    # secret is never matched inside the placeholder another secret just produced.
+    marker = "\x00"
+    while marker in workflow_yaml or any(marker in secret for secret in redactable):
+        marker += "\x00"
     redacted_count = 0
     # Longest first so an overlapping shorter value never splits a longer one.
     for secret in sorted(redactable, key=len, reverse=True):
-        if secret in workflow_yaml:
-            redacted_count += workflow_yaml.count(secret)
-            workflow_yaml = workflow_yaml.replace(secret, REDACTED_SECRET_PLACEHOLDER)
+        occurrences = workflow_yaml.count(secret)
+        if occurrences:
+            redacted_count += occurrences
+            workflow_yaml = workflow_yaml.replace(secret, marker)
+    workflow_yaml = workflow_yaml.replace(marker, REDACTED_SECRET_PLACEHOLDER)
     if redacted_count:
         LOG.error(
-            "copilot redacted a raw credential value at the workflow persistence seam",
+            "copilot redacted a raw credential value at the workflow write seam",
             workflow_permanent_id=workflow_permanent_id,
             redacted_occurrences=redacted_count,
         )
@@ -484,16 +534,15 @@ async def _process_workflow_yaml(
     workflow_yaml: str,
     settings_fallback_yaml: str | None = None,
     settings_fallback_workflow: Workflow | None = None,
-    credential_scrub_values: Collection[str] = (),
 ) -> Workflow:
     # Single seam every copilot YAML->Workflow conversion passes through, so code
     # blocks get their plain-view steps regardless of which path produced the YAML
     # (the update_workflow tool derives them upstream; the inline REPLACE_WORKFLOW
     # fallbacks would otherwise surface "No steps yet").
-    workflow_yaml = _redact_credentials_before_persistence(
-        workflow_yaml, workflow_permanent_id, credential_scrub_values
-    )
     workflow_yaml = derive_code_block_steps_in_yaml(workflow_yaml)
+    # Same reasoning one field over: a block whose code names a declared parameter but omits it
+    # from parameter_keys gets no value at runtime and dies on NameError mid-login.
+    workflow_yaml = bind_referenced_parameters_in_yaml(workflow_yaml)
     workflow_yaml_request = _normalize_copilot_yaml(workflow_yaml)
 
     updated_workflow_definition = convert_workflow_definition(
@@ -620,6 +669,38 @@ def _block_by_label(blocks: list[Any], label: str) -> dict[str, Any]:
     return matches[0]
 
 
+def stored_workflow_yaml(copilot_ctx: Any) -> str:
+    """The workflow a block-scoped edit is applied to: the last accepted write, else the turn's draft.
+
+    Every surface that shows the model a block's code must read it from here, or the code it reads
+    and the code its edit is anchored against can be two different things.
+    """
+    latest = getattr(copilot_ctx, "last_workflow_yaml", None)
+    if isinstance(latest, str) and latest.strip():
+        return latest
+    stored = getattr(copilot_ctx, "workflow_yaml", None)
+    return stored if isinstance(stored, str) else ""
+
+
+def stored_block_code(stored_yaml: str, label: str) -> str | None:
+    """The code ``apply_block_edit`` would anchor an edit to ``label`` against, if any."""
+    if not label or not stored_yaml.strip():
+        return None
+    try:
+        parsed = safe_load_no_dates(stored_yaml)
+    except Exception:
+        return None
+    blocks = _workflow_blocks(parsed)
+    if blocks is None:
+        return None
+    try:
+        block = _block_by_label(blocks, label)
+    except BlockEditError:
+        return None
+    code = block.get("code")
+    return code if isinstance(code, str) and code.strip() else None
+
+
 def apply_block_edit(
     stored_yaml: str,
     label: str,
@@ -665,6 +746,72 @@ def apply_block_edit(
     for key, value in (fields or {}).items():
         block[key] = value
 
+    return yaml.safe_dump(parsed, sort_keys=False)
+
+
+def _merge_new_workflow_parameters(parsed: dict[str, Any], parameters: list[Any]) -> None:
+    definition = parsed["workflow_definition"]
+    existing = definition.get("parameters")
+    if not isinstance(existing, list):
+        existing = []
+    declared = {str(p.get("key") or "") for p in existing if isinstance(p, dict)}
+    for parameter in parameters:
+        if not isinstance(parameter, dict):
+            raise BlockEditError("Each entry in parameters must be a mapping with a key.")
+        key = str(parameter.get("key") or "")
+        if not key:
+            raise BlockEditError("Each entry in parameters needs a key.")
+        # Declaring is additive only: a key the workflow already has keeps its current definition.
+        if key in declared:
+            continue
+        existing.append(parameter)
+        declared.add(key)
+    definition["parameters"] = existing
+
+
+def add_block_to_workflow(
+    stored_yaml: str,
+    after_label: str,
+    block_yaml: str,
+    *,
+    parameters: list[Any] | None = None,
+) -> str:
+    """Splice one new block in after ``after_label`` and return the whole workflow.
+
+    The predecessor hands its ``next_block_label`` to the new block and points at it instead, so the
+    chain stays intact without the model retyping the blocks it is not changing.
+    """
+    try:
+        parsed = safe_load_no_dates(stored_yaml)
+    except Exception as exc:
+        raise BlockEditError(f"The stored workflow is not parseable: {exc}") from exc
+    blocks = _workflow_blocks(parsed)
+    if blocks is None:
+        raise BlockEditError("The stored workflow has no workflow_definition.blocks to edit.")
+    predecessor = _block_by_label(blocks, after_label)
+
+    try:
+        new_block = safe_load_no_dates(block_yaml)
+    except Exception as exc:
+        raise BlockEditError(f"block_yaml is not parseable: {exc}") from exc
+    if not isinstance(new_block, dict):
+        raise BlockEditError("block_yaml must be a single block mapping.")
+    new_label = str(new_block.get("label") or "")
+    if not new_label:
+        raise BlockEditError("The new block needs a label.")
+    known = sorted(str(b.get("label") or "") for b in blocks if isinstance(b, dict))
+    if new_label in known:
+        raise BlockEditError(
+            f"A block labelled {new_label!r} already exists. The workflow has: {', '.join(known)}. "
+            "Use edit_block to change it, or give the new block a different label."
+        )
+
+    new_block["next_block_label"] = predecessor.get("next_block_label")
+    predecessor["next_block_label"] = new_label
+    blocks.insert(blocks.index(predecessor) + 1, new_block)
+
+    if parameters:
+        _merge_new_workflow_parameters(parsed, parameters)
     return yaml.safe_dump(parsed, sort_keys=False)
 
 

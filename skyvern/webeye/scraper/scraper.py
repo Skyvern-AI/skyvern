@@ -21,7 +21,6 @@ from skyvern.exceptions import (
     UnknownElementTreeFormat,
 )
 from skyvern.experimentation.wait_utils import empty_page_retry_wait
-from skyvern.forge import app
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.browser_action_preflight import advance_observation_epoch
 from skyvern.forge.sdk.core import skyvern_context
@@ -50,15 +49,6 @@ if TYPE_CHECKING:
     from skyvern.webeye.browser_engine import BrowserEngineSelection
 
 LOG = structlog.get_logger()
-
-
-async def _inspect_browser_observation(
-    inner_text: str,
-    element_tree: list[dict],
-    *,
-    semantic_text: str | None = None,
-) -> None:
-    await app.AGENT_FUNCTION.inspect_browser_observation(inner_text, element_tree, semantic_text)
 
 
 async def build_scraping_failed_reason(
@@ -203,22 +193,37 @@ _ELEMENT_TREE_IMMUTABLE_LEAF = (str, bytes, bool, int, float, type(None))
 def _deepcopy_element_tree(element_tree: list[dict]) -> list[dict]:
     """Deep copy the scraped element tree without ``copy.deepcopy``'s generic overhead.
 
-    The tree is pure JSON-like data (acyclic; only dict/list mutable containers with immutable
+    The tree is normally pure JSON-like data (only dict/list mutable containers with immutable
     leaves, as proven by ``hash_element``'s ``json.dumps``), so recursing dict/list and sharing
-    immutable leaves is equivalent to ``copy.deepcopy``. Any unexpected non-scalar leaf falls back
-    to ``copy.deepcopy`` to preserve exact semantics.
+    immutable leaves is equivalent to ``copy.deepcopy``. A page-controlled payload can, however,
+    introduce cycles or repeated/shared containers, so a memo keyed by object id preserves cycle
+    and alias identity exactly as ``copy.deepcopy`` does. Any unexpected non-scalar leaf falls back
+    to ``copy.deepcopy`` sharing the same memo to keep aliasing consistent across both paths.
     """
 
+    memo: dict[int, Any] = {}
+
     def copy_value(value: Any) -> Any:
-        if isinstance(value, dict):
-            return {key: copy_value(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [copy_value(item) for item in value]
         if isinstance(value, _ELEMENT_TREE_IMMUTABLE_LEAF):
             return value
-        return copy.deepcopy(value)
+        existing = memo.get(id(value))
+        if existing is not None:
+            return existing
+        if isinstance(value, dict):
+            copied_dict: dict = {}
+            memo[id(value)] = copied_dict
+            for key, item in value.items():
+                copied_dict[key] = copy_value(item)
+            return copied_dict
+        if isinstance(value, list):
+            copied_list: list = []
+            memo[id(value)] = copied_list
+            for item in value:
+                copied_list.append(copy_value(item))
+            return copied_list
+        return copy.deepcopy(value, memo)
 
-    return [copy_value(element) for element in element_tree]
+    return copy_value(element_tree)
 
 
 def hash_element(element: dict) -> str:
@@ -291,8 +296,8 @@ async def scrape_website(
 
     :raises Exception: When scraping fails after maximum retries.
     """
-    try:
-        num_retry += 1
+
+    async def scrape_once() -> ScrapedPage:
         return await scrape_web_unsafe(
             browser_state=browser_state,
             url=url,
@@ -307,6 +312,25 @@ async def scrape_website(
             must_included_tags=must_included_tags,
             allow_transient_ui_suppression=allow_transient_ui_suppression,
         )
+
+    try:
+        num_retry += 1
+        try:
+            return await scrape_once()
+        except NoElementFound:
+            LOG.info("Retrying scrape after empty element tree", url=url, attempt=1)
+            await asyncio.sleep(3)
+
+        try:
+            return await scrape_once()
+        except NoElementFound:
+            LOG.info("Retrying scrape after empty element tree", url=url, attempt=2)
+            page = await browser_state.must_get_working_page()
+            # Re-fetch with an explicit GET: page.reload() on a POST-result document can resubmit the form.
+            await page.goto(page.url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+            await asyncio.sleep(3)
+
+        return await scrape_once()
     except ScrapingFailedBlankPage:
         raise
     except Exception as e:
@@ -318,7 +342,7 @@ async def scrape_website(
                 # its own terminal record.
                 LOG.warning("Scraping stopped because the browser target closed", url=url)
                 raise e
-            LOG.error(
+            LOG.warning(
                 "Scraping failed after max retries, aborting.",
                 max_retries=max_retries,
                 num_retry=num_retry,
@@ -371,7 +395,6 @@ async def get_frame_text(iframe: Frame, scrape_exclude: ScrapeExcludeFunc | None
             "failed to get text from iframe",
             exc_info=True,
         )
-        app.AGENT_FUNCTION.record_browser_observation_failure("inner_text_extraction_error")
         return ""
 
     for child_frame in iframe.child_frames:
@@ -389,7 +412,6 @@ async def get_frame_text(iframe: Frame, scrape_exclude: ScrapeExcludeFunc | None
                 "Unable to get child_frame_element",
                 exc_info=True,
             )
-            app.AGENT_FUNCTION.record_browser_observation_failure("child_frame_text_extraction_error")
             continue
 
         # it will get stuck when we `frame.evaluate()` on an invisible iframe
@@ -625,13 +647,7 @@ async def scrape_web_unsafe(
     if not elements and not support_empty_page:
         raise NoElementFound()
 
-    app.AGENT_FUNCTION.begin_browser_observation()
     text_content = await get_frame_text(page.main_frame, scrape_exclude)
-    await _inspect_browser_observation(
-        f"{page.url}\n{text_content}",
-        element_tree_trimmed,
-        semantic_text=text_content,
-    )
 
     html = ""
     window_dimension = None
@@ -734,6 +750,17 @@ async def filter_frames(
     return filtered_frames, placeholder_nodes
 
 
+def _attach_frame_subtree(nodes: list[dict], skyvern_id: str, subtree: list[dict]) -> bool:
+    """Give the nested tree's iframe node its frame's children. True when the node was found."""
+    for node in nodes:
+        if node.get("id") == skyvern_id:
+            node["children"] = subtree
+            return True
+        if _attach_frame_subtree(node.get("children") or [], skyvern_id, subtree):
+            return True
+    return False
+
+
 async def add_frame_interactable_elements(
     frame: Frame,
     frame_index: int,
@@ -776,9 +803,26 @@ async def add_frame_interactable_elements(
         )
         destinations.update(frame_destinations)
 
+        # Both structures have to be written. `elements` is flat and `element_tree` is nested, and
+        # buildTreeFromBody returns the same dict objects in both -- but only some engines preserve
+        # that sharing across the evaluate boundary. Playwright's deserializer revives repeated
+        # objects by reference, so one write used to reach both; a raw-CDP `returnByValue` is a JSON
+        # round-trip, which copies them, so the flat write left the tree's iframe node empty and the
+        # model was shown `<iframe></iframe>`. Writing both is a no-op on an aliasing engine.
+        attached_to_tree = _attach_frame_subtree(element_tree, skyvern_id, frame_element_tree)
         for element in elements:
             if element["id"] == skyvern_id:
                 element["children"] = frame_element_tree
+
+        if not attached_to_tree:
+            # The iframe is in the flat list but absent from the nested tree, so its contents would be
+            # invisible to the model with nothing in the logs to say why. That is the failure this
+            # whole function exists to avoid, so it is worth a line.
+            LOG.warning(
+                "Frame subtree could not be attached: no matching node in the element tree",
+                frame_id=skyvern_id,
+                frame_index=frame_index,
+            )
 
         elements = elements + frame_elements
     except Exception:
@@ -870,13 +914,6 @@ class IncrementalScrapePage(ElementTreeBuilder):
         self,
         cleanup_element_tree: CleanupElementTreeFunc,
     ) -> list[dict]:
-        try:
-            return await self._get_incremental_element_tree(cleanup_element_tree)
-        except Exception:
-            app.AGENT_FUNCTION.record_browser_observation_failure("incremental_scrape_error")
-            raise
-
-    async def _get_incremental_element_tree(self, cleanup_element_tree: CleanupElementTreeFunc) -> list[dict]:
         frame = self.skyvern_frame.get_frame()
 
         try:
@@ -898,17 +935,11 @@ class IncrementalScrapePage(ElementTreeBuilder):
 
         self.elements = incremental_elements
 
-        incremental_tree = await cleanup_element_tree(frame, frame.url, copy.deepcopy(incremental_tree))
-        trimmed_element_tree = trim_element_tree(copy.deepcopy(incremental_tree))
+        incremental_tree = await cleanup_element_tree(frame, frame.url, _deepcopy_element_tree(incremental_tree))
+        trimmed_element_tree = trim_element_tree(_deepcopy_element_tree(incremental_tree))
 
         self.element_tree = incremental_tree
         self.element_tree_trimmed = trimmed_element_tree
-        semantic_text = await get_frame_text(frame) if app.AGENT_FUNCTION.needs_browser_observation_text() else None
-        await _inspect_browser_observation(
-            frame.url,
-            trimmed_element_tree,
-            semantic_text=semantic_text,
-        )
 
         return self.element_tree_trimmed
 

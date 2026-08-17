@@ -5,10 +5,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.exceptions import PhoneNumberInputMismatch
+from skyvern.exceptions import InvalidElementForTextInput, PhoneNumberInputMismatch
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
-from skyvern.webeye.actions.actions import InputTextAction
+from skyvern.webeye.actions.actions import InputOrSelectContext, InputTextAction
 from skyvern.webeye.actions.handler import handle_input_text_action
 from skyvern.webeye.actions.responses import ActionFailure, ActionSuccess
 from tests.unit.conftest import make_input_element_mock
@@ -37,7 +37,11 @@ async def _run_input_text(
     tel_verify_side_effect: list[Exception | None] | None = None,
     tag_name: str = "input",
     blocker: MagicMock | None = None,
+    input_or_select_context: InputOrSelectContext | None = None,
 ) -> tuple[list, AsyncMock, AsyncMock, AsyncMock, MagicMock, AsyncMock]:
+    # Production always parses a real InputOrSelectContext (the parse never returns None), so default to an
+    # ordinary all-unset context here -- a None default would exercise a branch that cannot occur in prod.
+    resolved_context = input_or_select_context if input_or_select_context is not None else InputOrSelectContext()
     dom_instance = MagicMock()
     dom_instance.get_skyvern_element_by_id = AsyncMock(return_value=el)
     if blocker is not None:
@@ -72,7 +76,10 @@ async def _run_input_text(
             "skyvern.webeye.actions.handler.get_actual_value_of_parameter_if_secret_with_task",
             return_value=secret_return,
         ),
-        patch("skyvern.webeye.actions.handler._get_input_or_select_context", new=AsyncMock(return_value=None)),
+        patch(
+            "skyvern.webeye.actions.handler._get_input_or_select_context",
+            new=AsyncMock(return_value=resolved_context),
+        ),
         patch("skyvern.webeye.actions.handler._is_tel_digit_fix_enabled", new=AsyncMock(return_value=tel_fix_enabled)),
         patch("skyvern.webeye.actions.handler.check_phone_number_format", new=phone_format),
         patch("skyvern.webeye.actions.handler._fill_card_number_with_readback", new=card_readback),
@@ -264,6 +271,7 @@ async def test_secret_tel_value_uses_tel_verifier_not_secret_readback() -> None:
 async def test_single_character_secret_skips_readback() -> None:
     # A one-character secret cannot be order-scrambled, so even a password input skips the read-back
     # (e.g. a multi-field TOTP digit routed into a masked box: is_secret_value True, is_totp_value False).
+    # It is an ordinary native input, so it is populated with one atomic fill.
     el = _mock_input({"type": "password", "autocomplete": None, "name": "otp-digit"})
 
     results, card_readback, tel_verify, phone_format, _, secret_readback = await _run_input_text(
@@ -271,7 +279,8 @@ async def test_single_character_secret_skips_readback() -> None:
     )
 
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
-    el.input_sequentially.assert_awaited_once_with(text="5")
+    el.input_fill.assert_awaited_once_with("5")
+    el.input_sequentially.assert_not_awaited()
     secret_readback.assert_not_awaited()
     tel_verify.assert_not_awaited()
     card_readback.assert_not_awaited()
@@ -352,6 +361,7 @@ async def test_secret_in_exact_value_input_uses_readback(input_type: str | None)
         input_type=input_type or "",
         maxlength=None,
         engine_selection=None,
+        sequential_first=False,
     )
     el.input_sequentially.assert_not_awaited()
 
@@ -359,9 +369,10 @@ async def test_secret_in_exact_value_input_uses_readback(input_type: str | None)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("input_type", ["number", "datetime-local", "month", "week"])
 async def test_secret_in_non_exact_value_input_skips_readback(input_type: str) -> None:
-    # number/date-like inputs normalize or reformat their value, so an exact read-back is not meaningful;
-    # they keep the plain sequential fill, not the exact read-back. (type=date has its own dedicated fill
-    # path earlier and never reaches this gate.)
+    # number/date-like inputs normalize or reformat their value, so an exact read-back is not meaningful; the
+    # read-back is skipped. They also hard-throw in locator.fill() on a non-canonical value, so they keep the
+    # per-character seam rather than an atomic fill (SKY-13821). (type=date has its own dedicated fill path
+    # earlier and never reaches this gate.)
     el = _mock_input({"type": input_type, "autocomplete": None, "name": "field"})
 
     results, card_readback, tel_verify, phone_format, _, secret_readback = await _run_input_text(
@@ -370,6 +381,7 @@ async def test_secret_in_non_exact_value_input_skips_readback(input_type: str) -
 
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
     el.input_sequentially.assert_awaited_once_with(text="mysecretvalue")
+    el.input_fill.assert_not_awaited()
     secret_readback.assert_not_awaited()
 
 
@@ -377,7 +389,8 @@ async def test_secret_in_non_exact_value_input_skips_readback(input_type: str) -
 async def test_secret_readback_skips_when_retargeted_to_out_of_scope_blocker() -> None:
     # find_blocking_element() can retarget the fill to an editable blocker; the credential read-back gate
     # must be re-evaluated on the actual (blocker) element. A number blocker is out of the exact-value
-    # scope, so no read-back runs even though the original element was in scope.
+    # scope, so no read-back runs even though the original element was in scope; it also stays on the
+    # per-character seam because number hard-throws in locator.fill() (SKY-13821).
     el = _mock_input({"type": "text", "autocomplete": None, "name": "credential"})
     blocker = _mock_input({"type": "number", "autocomplete": None, "name": "overlay"})
 
@@ -387,6 +400,7 @@ async def test_secret_readback_skips_when_retargeted_to_out_of_scope_blocker() -
 
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
     blocker.input_sequentially.assert_awaited_once_with(text="mysecretvalue")
+    blocker.input_fill.assert_not_awaited()
     secret_readback.assert_not_awaited()
     el.input_sequentially.assert_not_awaited()
 
@@ -410,13 +424,14 @@ async def test_secret_readback_runs_on_retargeted_element_type() -> None:
         input_type="password",
         maxlength=None,
         engine_selection=None,
+        sequential_first=False,
     )
 
 
 @pytest.mark.asyncio
 async def test_non_secret_exact_value_input_skips_readback() -> None:
     # A non-secret value in an exact-value input is not a credential, so the read-back verifier never runs;
-    # only secrets are read back.
+    # only secrets are read back. It is an ordinary native input, so it is populated with one atomic fill.
     el = _mock_input({"type": "text", "autocomplete": None, "name": "search"})
 
     results, card_readback, tel_verify, phone_format, _, secret_readback = await _run_input_text(
@@ -424,7 +439,8 @@ async def test_non_secret_exact_value_input_skips_readback() -> None:
     )
 
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
-    el.input_sequentially.assert_awaited_once_with(text="not a secret value")
+    el.input_fill.assert_awaited_once_with("not a secret value")
+    el.input_sequentially.assert_not_awaited()
     secret_readback.assert_not_awaited()
 
 
@@ -444,3 +460,281 @@ async def test_totp_value_short_circuits_before_secret_readback() -> None:
     assert results[0].exception_type == "NoTOTPSecretFound"
     secret_readback.assert_not_awaited()
     card_readback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_native_freetext_uses_atomic_fill() -> None:
+    # SKY-13821 fill-first: an ordinary native input (non-secret, non-tel, no select context) is populated with
+    # a single atomic fill instead of the per-character fill/type seam, so the caret race cannot reorder it.
+    el = _mock_input({"type": "text", "autocomplete": None, "name": "full-name"})
+
+    results, _, tel_verify, _, _, secret_readback = await _run_input_text(el, "Ada Lovelace")
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_fill.assert_awaited_once_with("Ada Lovelace")
+    el.input_sequentially.assert_not_awaited()
+    tel_verify.assert_not_awaited()
+    secret_readback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_residual_sequential_path_runs_truncation_heal() -> None:
+    # SKY-13631 coverage preserved after the fill-first flip: a path still typed character-by-character (here a
+    # tel field with the digit fix off) runs the observational truncation heal right after input_sequentially.
+    el = _mock_input({"type": "tel", "autocomplete": None, "name": "phone"})
+
+    with patch("skyvern.webeye.actions.handler._heal_truncated_freetext_input", new=AsyncMock()) as heal:
+        results, *_ = await _run_input_text(el, "224-555-0199", tel_fix_enabled=False)
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_sequentially.assert_awaited_once_with(text="224-555-0199")
+    heal.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_atomic_fill_path_skips_truncation_heal() -> None:
+    # The atomic fill has no per-character seam to lose a prefix, so the truncation heal must not run after it.
+    el = _mock_input({"type": "text", "autocomplete": None, "name": "full-name"})
+
+    with patch("skyvern.webeye.actions.handler._heal_truncated_freetext_input", new=AsyncMock()) as heal:
+        results, *_ = await _run_input_text(el, "Ada Lovelace")
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_fill.assert_awaited_once_with("Ada Lovelace")
+    heal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_search_bar_input_keeps_sequential_typing() -> None:
+    # A search-bar surfaces its options only as the value is typed, so it keeps the per-character seam.
+    el = _mock_input({"type": "text", "autocomplete": None, "name": "q"})
+
+    results, *_ = await _run_input_text(
+        el, "engineer", input_or_select_context=InputOrSelectContext(is_search_bar=True)
+    )
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_sequentially.assert_awaited_once_with(text="engineer")
+    el.input_fill.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_location_input_keeps_sequential_typing() -> None:
+    # A location/address field is an autocomplete widget, so it keeps the per-character seam.
+    el = _mock_input({"type": "text", "autocomplete": None, "name": "address"})
+
+    results, *_ = await _run_input_text(
+        el, "123 Main", input_or_select_context=InputOrSelectContext(is_location_input=True)
+    )
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_sequentially.assert_awaited_once_with(text="123 Main")
+    el.input_fill.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_input_keeps_sequential_typing() -> None:
+    # An is_auto_completion_input() field surfaces suggestions as the value is typed, so it keeps the seam.
+    el = _mock_input({"type": "text", "autocomplete": None, "name": "skill"})
+    el.is_auto_completion_input = AsyncMock(return_value=True)
+
+    results, *_ = await _run_input_text(el, "engineer")
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_sequentially.assert_awaited_once_with(text="engineer")
+    el.input_fill.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fill_gate_recomputes_is_tel_after_blocking_retarget() -> None:
+    # find_blocking_element can retarget the fill to a different element; the fill/type decision must read the
+    # retargeted element's tel-ness, not the original's stale value. A plain text field fronting a tel blocker
+    # must keep the tel blocker on the per-character seam, not atomically fill it.
+    original = _mock_input({"type": "text", "autocomplete": None, "name": "phone-wrapper"})
+    blocker = _mock_input({"type": "tel", "autocomplete": None, "name": "phone"})
+    blocker.get_id.return_value = "BLOCKING"
+
+    results, *_ = await _run_input_text(original, "sometext", blocker=blocker)
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    blocker.input_sequentially.assert_awaited_once_with(text="sometext")
+    blocker.input_fill.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_commit_required_combobox_keeps_sequential_typing() -> None:
+    # A role=combobox field that is still aria-invalid after typing commits only by picking a rendered option,
+    # so it keeps the per-character seam that surfaces those options.
+    el = _mock_input({"type": "text", "role": "combobox", "aria-invalid": "true", "name": "title"})
+
+    results, *_ = await _run_input_text(el, "engineer")
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_sequentially.assert_awaited_once_with(text="engineer")
+    el.input_fill.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "combobox_attrs",
+    [
+        {"role": "combobox"},  # role=combobox, aria-invalid absent -> still keyboard-driven
+        {"aria-autocomplete": "both"},  # aria-autocomplete=both (is_auto_completion_input only matches "list")
+        {"aria-autocomplete": "inline"},  # role-less inline completion still depends on keyboard events
+        {"role": "combobox", "aria-invalid": "false"},  # explicitly valid combobox before input
+    ],
+)
+async def test_combobox_identity_keeps_seam_even_when_valid(combobox_attrs: dict[str, str | None]) -> None:
+    # A role=combobox / aria-autocomplete=both control opens or filters its options only via key events; its
+    # pre-input aria-invalid state must not pick the write strategy. Keep the per-character seam by structural
+    # identity, or an atomic fill emits no keys and no option is ever surfaced (SKY-13821).
+    el = _mock_input({"type": "text", "name": "job-title", **combobox_attrs})
+
+    results, *_ = await _run_input_text(el, "Backend Engineer")
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_sequentially.assert_awaited_once_with(text="Backend Engineer")
+    el.input_fill.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("input_type", ["number", "time", "month", "week", "datetime-local"])
+async def test_non_text_native_input_types_keep_the_seam(input_type: str) -> None:
+    # locator.fill() hard-throws on a non-canonical value for these native input types ("Cannot type text into
+    # input[type=number]" / "Malformed value"); the per-character seam tolerated them. Keep them off the
+    # atomic branch (SKY-13821).
+    el = _mock_input({"type": input_type, "autocomplete": None, "name": "when"})
+
+    results, *_ = await _run_input_text(el, "3")
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_sequentially.assert_awaited_once_with(text="3")
+    el.input_fill.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_invalid_element_for_text_input_is_not_swallowed_into_success() -> None:
+    # If the live node disagrees with the scraped tag, input_fill raises InvalidElementForTextInput -- a
+    # SkyvernException, not a PlaywrightError -- so the broad incremental handler falls to its swallow arm and
+    # returns ActionSuccess with the credential never written. It must fail closed, matching the explicit
+    # re-raise already added for SkyvernPageAnalysisTimeout (SKY-13821).
+    el = _mock_input({"type": "text", "autocomplete": None, "name": "field"})
+    el.input_fill = AsyncMock(side_effect=InvalidElementForTextInput(element_id="AADC", tag_name="input"))
+
+    with pytest.raises(InvalidElementForTextInput):
+        await _run_input_text(el, "some value")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("typed_widget_attrs", [{"role": "combobox"}, {"aria-autocomplete": "inline"}])
+async def test_secret_valued_typed_widget_keeps_keyboard_path_with_readback(
+    typed_widget_attrs: dict[str, str],
+) -> None:
+    el = _mock_input({"type": "text", "name": "title", **typed_widget_attrs})
+
+    results, card_readback, tel_verify, phone_format, _, secret_readback = await _run_input_text(
+        el, "{{ sec }}", resolved="mysecretvalue"
+    )
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    secret_readback.assert_awaited_once_with(
+        skyvern_element=el,
+        tag_name="input",
+        text="mysecretvalue",
+        input_type="text",
+        maxlength=None,
+        engine_selection=None,
+        sequential_first=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_secret_valued_search_bar_keeps_keyboard_path() -> None:
+    # Same for a secret entered into a search-bar context: select sequential transport inside the verifier.
+    el = _mock_input({"type": "text", "name": "q"})
+
+    results, card_readback, tel_verify, phone_format, _, secret_readback = await _run_input_text(
+        el, "{{ sec }}", resolved="mysecretvalue", input_or_select_context=InputOrSelectContext(is_search_bar=True)
+    )
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    secret_readback.assert_awaited_once_with(
+        skyvern_element=el,
+        tag_name="input",
+        text="mysecretvalue",
+        input_type="text",
+        maxlength=None,
+        engine_selection=None,
+        sequential_first=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_secret_valued_plain_native_input_still_uses_atomic_readback() -> None:
+    # Contrast (must keep working): a secret in a plain native input with NO typed-widget signal still takes
+    # the atomic secret read-back path -- the fix narrows only the typed-widget cases.
+    el = _mock_input({"type": "text", "name": "credential"})
+
+    results, card_readback, tel_verify, phone_format, _, secret_readback = await _run_input_text(
+        el, "{{ sec }}", resolved="mysecretvalue"
+    )
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    secret_readback.assert_awaited_once_with(
+        skyvern_element=el,
+        tag_name="input",
+        text="mysecretvalue",
+        input_type="text",
+        maxlength=None,
+        engine_selection=None,
+        sequential_first=False,
+    )
+    el.input_sequentially.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_secret_in_maxlength_short_input_uses_sequential_not_atomic_readback() -> None:
+    # An ordinary secret whose value exceeds a positive maxlength (an auto-advancing split field, e.g. SSN /
+    # account boxes) must type sequentially so the per-key focus advance carries the remaining characters to
+    # the sibling boxes. The atomic read-back would leave only a truncated prefix in the first box and, since
+    # the value cannot round-trip, report success without verification (SKY-13821).
+    el = _mock_input({"type": "text", "maxlength": "4", "name": "ssn"})
+
+    results, card_readback, tel_verify, phone_format, warning_log, secret_readback = await _run_input_text(
+        el, "{{ sec }}", resolved="123456789"
+    )
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_sequentially.assert_awaited_once_with(text="123456789")
+    secret_readback.assert_not_awaited()
+    el.input_fill.assert_not_awaited()
+    # no secret leakage: the resolved value never reaches the warning log
+    assert all("123456789" not in str(call) for call in warning_log.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_secret_in_capacity_fitting_input_still_uses_atomic_readback() -> None:
+    # Contrast (must keep working): a secret that fits its capacity (maxlength >= value length) keeps the
+    # atomic read-back path -- only truncating capacity reroutes to the seam.
+    el = _mock_input({"type": "text", "maxlength": "20", "name": "credential"})
+
+    results, card_readback, tel_verify, phone_format, _, secret_readback = await _run_input_text(
+        el, "{{ sec }}", resolved="123456789"
+    )
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    secret_readback.assert_awaited_once()
+    el.input_sequentially.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_value_in_maxlength_short_input_uses_sequential() -> None:
+    # The same auto-advance routing for a non-secret ordinary value into a positive-maxlength split field:
+    # atomic fill would truncate it, the per-character seam distributes it across the boxes.
+    el = _mock_input({"type": "text", "maxlength": "1", "name": "digit"})
+
+    results, *_ = await _run_input_text(el, "123456")
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_sequentially.assert_awaited_once_with(text="123456")
+    el.input_fill.assert_not_awaited()

@@ -7,20 +7,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.forge.sdk.copilot import agent as agent_module
-from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
-from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
 from skyvern.forge.sdk.copilot.tools import (
     _evaluate_post_hook,
     _inspect_page_for_composition_impl,
     _mark_pending_browser_interaction_observation,
 )
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
-from skyvern.forge.sdk.copilot.tools.blockers import _tool_loop_error
-from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
-from skyvern.forge.sdk.schemas.credentials import CredentialType
+from skyvern.forge.sdk.schemas.credentials import CredentialType, TotpType
 
 
 def _ctx() -> CopilotContext:
@@ -32,39 +28,7 @@ def _ctx() -> CopilotContext:
         browser_session_id=None,
         stream=MagicMock(),
         request_policy=RequestPolicy(),
-        build_phase=BuildPhase.COMPOSING,
-        turn_intent=TurnIntent(
-            mode=TurnIntentMode.BUILD,
-            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
-        ),
     )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "result",
-    [
-        {"ok": False, "error": "evaluate failed"},
-        {"ok": True},
-        {"ok": True, "data": {}},
-        {"ok": True, "data": []},
-    ],
-)
-async def test_evaluate_post_hook_resets_steer_on_unusable_result(result: dict[str, object]) -> None:
-    ctx = _ctx()
-    ctx.last_evaluate_actionable_signature = "stale-signature"
-    ctx.last_evaluate_actionable_url = "https://example.test/old"
-    ctx.latest_evaluate_result_composition_steer = LoadedResultCompositionEvidence(
-        result_container_count=1,
-        table_result_container_count=1,
-    )
-
-    updated = await _evaluate_post_hook(result, raw={}, ctx=ctx)
-
-    assert updated is result
-    assert ctx.last_evaluate_actionable_signature is None
-    assert ctx.last_evaluate_actionable_url is None
-    assert ctx.latest_evaluate_result_composition_steer is None
 
 
 @pytest.mark.asyncio
@@ -145,42 +109,6 @@ async def test_evaluate_turnstile_key_records_challenge_observation_step() -> No
     assert evidence["challenge_state"]["gated_submit_controls"][0]["disabled"] is True
     assert "turnstile" in evidence["anti_bot_indicators"]
     assert ctx.composition_page_evidence is evidence
-
-
-@pytest.mark.asyncio
-async def test_evaluate_nested_challenge_payload_does_not_block_before_attempt() -> None:
-    ctx = _ctx()
-
-    result = {
-        "ok": True,
-        "data": {
-            "url": "https://example.test/certificant-search",
-            "title": "Certificant Search",
-            "buttons": [{"text": "Search", "disabled": True, "selector": "#search-button"}],
-            "fields": [
-                {
-                    "label": "Verification code",
-                    "name": "captcha_response",
-                    "placeholder": "Enter verification code",
-                }
-            ],
-        },
-    }
-
-    await _evaluate_post_hook(result, raw={}, ctx=ctx)
-
-    evidence = ctx.composition_page_evidence
-    assert evidence is not None
-    assert evidence["source_tool"] == "evaluate"
-    assert evidence["challenge_state"]["detected"] is True
-    assert evidence["challenge_state"]["requires_human_verification"] is True
-    assert evidence["challenge_state"]["gates_submit_controls"] is True
-    assert evidence["challenge_state"]["gated_submit_controls"][0]["disabled"] is True
-
-    msg = _tool_loop_error(ctx, "update_and_run_blocks", {"block_labels": ["search_lookup"]})
-
-    assert msg is None
-    assert ctx.turn_halt is None
 
 
 @pytest.mark.asyncio
@@ -292,9 +220,6 @@ async def test_current_page_inspection_finalizes_runtime_repair_context_for_next
             None,
         )
 
-    async def no_completion_verification(*_args: object, **_kwargs: object) -> None:
-        return None
-
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.tools.composition_capture._fallback_page_info",
         fallback_page_info,
@@ -303,11 +228,6 @@ async def test_current_page_inspection_finalizes_runtime_repair_context_for_next
         "skyvern.forge.sdk.copilot.tools.composition_capture._capture_composition_evidence",
         capture_evidence,
     )
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.composition_capture._maybe_run_completion_verification_from_page_observation",
-        no_completion_verification,
-    )
-
     result = await _inspect_page_for_composition_impl(ctx, "current_page")
     prompt = agent_module._code_authoring_repair_context_prompt(ctx)
 
@@ -316,7 +236,8 @@ async def test_current_page_inspection_finalizes_runtime_repair_context_for_next
     assert ctx.last_code_authoring_repair_context is not None
     assert ctx.last_code_authoring_repair_context.current_origin == "https://example.test"
     assert ctx.last_code_authoring_repair_context.page_result_summaries == ["#results No matching records"]
-    assert "runtime_failure_class: timeout_waiting_for_selector" in prompt
+    assert "runtime_failure_class:" not in prompt
+    assert 'runtime_failure_reason: Timeout waiting for locator("#results")' in prompt
     assert "page_results: #results No matching records" in prompt
     assert "case=secret" not in ctx.last_code_authoring_repair_context.model_dump_json()
 
@@ -339,6 +260,19 @@ async def test_live_seam_evaluate_records_scouted_read_from_prehook_stash() -> N
     assert reads[0]["read_expression"] == "document.querySelector('#count').textContent"
     assert reads[0]["read_result_shape"] == "str"
     assert ctx.pending_scout_read_expression is None
+
+
+@pytest.mark.asyncio
+async def test_evaluate_click_expression_is_not_refused_by_the_prehook() -> None:
+    from skyvern.forge.sdk.copilot.tools.mcp_hooks import _evaluate_pre_hook
+
+    ctx = _ctx()
+    expression = "document.querySelector('#submit').click()"
+
+    result = await _evaluate_pre_hook({"expression": expression}, ctx)
+
+    assert result is None
+    assert ctx.pending_scout_read_expression == expression
 
 
 @pytest.mark.asyncio
@@ -556,7 +490,45 @@ async def test_a_declared_read_holding_no_single_value_leaves_its_output_unread(
     )
 
     assert gathered["data"]["claimed_output_without_a_single_value"] == "output.visitors"
+    assert gathered["data"]["requested_output_designation_capability"] == {
+        "tool": "inspect_page_for_composition",
+        "argument": "requested_output_reads",
+        "page_reference": "current_page",
+        "citation_fields": ["output_path", "value_text", "label"],
+        "effect": "browser verifies the cited rendered value and returns selector candidates with cardinality",
+    }
     assert gathered["data"]["requested_outputs_still_unread"] == ["output.sessions", "output.visitors"]
+
+
+@pytest.mark.asyncio
+async def test_a_non_scalar_read_returns_visible_designation_candidates_as_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.forge.sdk.copilot.tools import mcp_hooks
+    from skyvern.forge.sdk.copilot.tools.mcp_hooks import _evaluate_pre_hook
+
+    ctx = _ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(id="c0", outcome="the number of visitors", output_path="output.visitors")
+        ]
+    )
+    monkeypatch.setattr(mcp_hooks, "unbound_candidate_relations", lambda _evidence: [("Visitors", "8.89K")])
+
+    await _evaluate_pre_hook({"expression": "document.body.innerText", "output_path": "output.visitors"}, ctx)
+    gathered = await _evaluate_post_hook(
+        {
+            "ok": True,
+            "data": {
+                "result": {"label": "Visitors", "value": "8.89K"},
+                "url": "https://dash.example.test/web",
+            },
+        },
+        raw={"name": "evaluate"},
+        ctx=ctx,
+    )
+
+    assert gathered["data"]["requested_output_designation_candidates"] == [{"label": "Visitors", "value_text": "8.89K"}]
 
 
 @pytest.mark.asyncio
@@ -676,6 +648,7 @@ async def test_inspecting_a_login_page_binds_the_credential_that_page_vouches_fo
             name="analytics",
             tested_url="https://analytics.example.test/login",
             credential_type=CredentialType.PASSWORD,
+            totp_type=TotpType.NONE,
         )
     ]
 

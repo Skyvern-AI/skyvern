@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import structlog
 import tldextract
@@ -18,7 +20,12 @@ from skyvern.forge.sdk.copilot.request_policy import (
     admit_credential_for_live_page,
     loggable_origin,
 )
-from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session, mcp_browser_context
+from skyvern.forge.sdk.copilot.runtime import (
+    AgentContext,
+    ScoutedSelectorCandidate,
+    ensure_browser_session,
+    mcp_browser_context,
+)
 from skyvern.forge.sdk.copilot.secret_scrub import (
     REDACTED_SECRET_PLACEHOLDER,
     register_secret_scrub_value,
@@ -34,14 +41,15 @@ from skyvern.forge.sdk.schemas.credentials import (
 from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize_totp_config
 
 from .banned_blocks import _copilot_block_authoring_policy
-from .blockers import _tool_loop_error
 from .credentials import _missing_credential_reference_tool_error
 from .guardrails import _authority_tool_error
 from .mcp_hooks import _verify_scout_type_landed
 from .scouting import (
+    _attach_scout_observation_step,
     _capture_element_fingerprint,
     _capture_enclosing_form_submits,
     _capture_post_interaction_screenshot,
+    _capture_scout_selector_candidates,
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
     _consume_scout_source_url,
@@ -50,6 +58,8 @@ from .scouting import (
     _record_scouted_interaction,
     _register_scout_interaction_observation,
     _resolve_scout_role_name,
+    _role_name_match_count,
+    _selector_live_match_count,
 )
 
 LOG = structlog.get_logger()
@@ -98,11 +108,8 @@ def _credential_fill_prerequisite_error(copilot_ctx: AgentContext, credential_id
             "Author a `login` block bound to the credential parameter instead."
         )
     policy = getattr(copilot_ctx, "request_policy", None)
-    if not isinstance(policy, RequestPolicy) or not policy.allow_run_blocks:
-        return (
-            "Saved-credential scouting is not authorized for this request. "
-            "Ask the user for the required credential or clarification before filling credential fields."
-        )
+    if not isinstance(policy, RequestPolicy) or policy.raw_secret_detected:
+        return "Saved-credential scouting is unavailable because this turn has no safe credential provenance."
     return None
 
 
@@ -415,7 +422,7 @@ async def _resolve_credential_fill_value(
             # A saved OTP identifier means the code is delivered out-of-band;
             # only runtime polling has the run/task context needed to resolve it.
             if credential.totp_identifier or credential.totp_type in {TotpType.EMAIL, TotpType.TEXT}:
-                return None, "", _runtime_otp_steering_error(credential_id)
+                return None, credential_item.name, _runtime_otp_steering_error(credential_id)
             return None, "", f"Credential `{credential_id}` has no TOTP secret configured."
         try:
             value = generate_totp_code(
@@ -452,15 +459,26 @@ async def _fill_credential_field_impl(
     credential_id: str,
     field: str,
 ) -> dict[str, Any]:
+    lock = getattr(copilot_ctx, "credential_fill_lock", None)
+    if not isinstance(lock, asyncio.Lock):
+        lock = asyncio.Lock()
+        copilot_ctx.credential_fill_lock = lock
+    async with lock:
+        return await _fill_credential_field_impl_serial(copilot_ctx, selector, credential_id, field)
+
+
+async def _fill_credential_field_impl_serial(
+    copilot_ctx: AgentContext,
+    selector: str,
+    credential_id: str,
+    field: str,
+) -> dict[str, Any]:
     arguments = {"selector": selector, "credential_id": credential_id, "field": field}
 
     def finish(result: dict[str, Any]) -> dict[str, Any]:
         record_tool_step_result_for_ctx(copilot_ctx, "fill_credential_field", arguments, result)
         return result
 
-    loop_error = _tool_loop_error(copilot_ctx, "fill_credential_field", arguments)
-    if loop_error:
-        return {"ok": False, "error": loop_error}
     authority_error = _authority_tool_error(copilot_ctx, "fill_credential_field")
     if authority_error:
         return finish({"ok": False, "error": authority_error})
@@ -484,12 +502,38 @@ async def _fill_credential_field_impl(
 
     value, credential_name, resolve_error = await _resolve_credential_fill_value(copilot_ctx, credential_id, field)
     if resolve_error or value is None:
-        return finish({"ok": False, "error": resolve_error or "Could not resolve the credential value."})
+        error_result: dict[str, Any] = {
+            "ok": False,
+            "error": resolve_error or "Could not resolve the credential value.",
+        }
+        if credential_name:
+            error_result["data"] = {
+                "credential_id": credential_id,
+                "credential_name": credential_name,
+                "credential_field": field,
+            }
+        return finish(error_result)
 
     session_error = await ensure_browser_session(copilot_ctx)
     if session_error:
         return finish(session_error)
     await _capture_scout_source_url(copilot_ctx)
+    # Capture the target's factual identity before the secret-bearing action. A fill can change
+    # attributes, trigger framework replacement, or navigate; post-fill inspection would then
+    # describe a different element. These facts never include the credential value.
+    await _capture_scout_selector_candidates(copilot_ctx, selector)
+    captured_selector_candidates = getattr(copilot_ctx, "pending_scout_selector_candidates", None)
+    copilot_ctx.pending_scout_selector_candidates = None
+    selector_candidates: list[ScoutedSelectorCandidate] = [{"selector": selector, "source": "requested"}]
+    for candidate in captured_selector_candidates or []:
+        if candidate not in selector_candidates:
+            selector_candidates.append(candidate)
+    role, accessible_name = await _resolve_scout_role_name(copilot_ctx, selector)
+    selector_match_count = await _selector_live_match_count(copilot_ctx, selector)
+    role_name_match_count = (
+        await _role_name_match_count(copilot_ctx, role, accessible_name) if role and accessible_name else None
+    )
+    fingerprint = await _capture_element_fingerprint(copilot_ctx, selector)
     try:
         async with mcp_browser_context(copilot_ctx):
             page, _ = await get_page(session_id=copilot_ctx.browser_session_id)
@@ -535,16 +579,19 @@ async def _fill_credential_field_impl(
         return finish(landing_failure)
     url = await _live_working_page_url(copilot_ctx) or ""
     _mark_pending_browser_interaction_observation(copilot_ctx, tool_name="fill_credential_field", url=url)
-    role, accessible_name = await _resolve_scout_role_name(copilot_ctx, selector)
-    fingerprint = await _capture_element_fingerprint(copilot_ctx, selector)
     _record_scouted_interaction(
         copilot_ctx,
         tool_name="fill_credential_field",
         selector=selector,
+        selector_candidates=selector_candidates,
+        selector_match_count=selector_match_count,
         source_url=source_url,
+        result_url=url,
+        observed_effects={"value_landed": True},
         typed_length=len(value),
         role=role,
         accessible_name=accessible_name,
+        role_name_match_count=role_name_match_count,
         credential_id=credential_id,
         credential_field=field,
         credential_name=credential_name,
@@ -566,13 +613,22 @@ async def _fill_credential_field_impl(
     observation_step, _ = await _register_scout_interaction_observation(
         copilot_ctx, tool_name="fill_credential_field", selector=selector, source_url=source_url, url=url
     )
+    _attach_scout_observation_step(
+        copilot_ctx,
+        tool_name="fill_credential_field",
+        selector=selector,
+        observation_step=observation_step,
+    )
     data: dict[str, Any] = {
         "selector": selector,
         "credential_id": credential_id,
         "field": field,
         "typed_length": len(value),
         "url": url,
+        "credential_name": credential_name,
     }
+    if observation_step is not None:
+        data["observation_step"] = observation_step
     form_submits = await _capture_enclosing_form_submits(copilot_ctx, selector)
     if form_submits:
         data["form_submit_controls"] = form_submits

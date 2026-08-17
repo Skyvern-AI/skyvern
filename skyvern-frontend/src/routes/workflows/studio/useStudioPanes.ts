@@ -6,9 +6,9 @@ import {
 } from "react-router-dom";
 
 import { useStudioShellStore } from "@/store/StudioShellStore";
-
-import { liveSearch } from "./liveSearch";
+import { liveLocationState, liveSearch } from "./liveSearch";
 import {
+  copilotContextForSearch,
   layoutClassForSearch,
   panesListEqual,
   panesWithoutDeletedBlocked,
@@ -16,8 +16,10 @@ import {
   searchWithPanes,
   searchWithRunReference,
   togglePane as togglePaneIn,
+  withCopilotSelection,
   withPaneClosed,
   withPaneOpen,
+  type CopilotPaneSelection,
   type StudioPaneId,
 } from "./panes";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
@@ -31,28 +33,42 @@ type ApplyPanesOptions = Pick<NavigateOptions, "state"> & {
   learn?: boolean;
 };
 
+type PaneWriteKind = "normal" | "copilot-only" | "exact" | "reorder";
+
+function withUrlCopilotPreserved(
+  nonCopilotPanes: readonly StudioPaneId[],
+  urlPanes: readonly StudioPaneId[],
+): StudioPaneId[] {
+  const next = [...nonCopilotPanes];
+  const copilotIndex = urlPanes.indexOf("copilot");
+  if (copilotIndex !== -1) {
+    next.splice(Math.min(copilotIndex, next.length), 0, "copilot");
+  }
+  return next;
+}
+
 /**
- * Pane state lives in the URL (?panes=), so the open set and its order are
- * shareable and can never drift from navigation. Writes merge against the live
- * URL rather than this render's closure: pushState is synchronous, so a
- * concurrent navigate() (e.g. a block-run launch) is already visible there.
+ * Non-Copilot pane state remains shareable in `?panes=`. Copilot selection is
+ * runtime-only, with independent edit and run memories layered over that URL.
+ * Cross-route writers continue to receive only the committed URL/default list.
  */
 export function useStudioPanes() {
   const location = useLocation();
   const navigate = useNavigate();
-  // Under /runs/{wr} the focused run is the path, not ?wr=; fold it into the
-  // search used for resolution so the run layout (not the edit default) opens.
   const studioRunId = useStudioRunId();
+  const effectiveSearch = searchWithRunReference(location.search, studioRunId);
+  const copilotContext = copilotContextForSearch(effectiveSearch);
+  const copilotSelection = useStudioShellStore(
+    (state) => state.copilotSelectionByLayout[copilotContext],
+  );
+  const setCopilotSelection = useStudioShellStore(
+    (state) => state.setCopilotSelection,
+  );
+  const setPaneLayout = useStudioShellStore((state) => state.setPaneLayout);
   const { defaultPanes, clamp, notePaneWrite, learnedRunPanes } =
     useStudioPaneDefaults();
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
-  const setPaneLayout = useStudioShellStore((s) => s.setPaneLayout);
 
-  // The mount-time viewport clamp only masks the exact pane list the URL
-  // carried at mount; any other list means someone navigated, so present it
-  // as-is. The first write clears the clamp for good. A deleted source agent
-  // additionally drops the workflow-mutating panes, on reads and writes alike,
-  // so deep links and openPane callers degrade to the run-viewing surfaces.
   const present = useCallback(
     (resolved: StudioPaneId[]): StudioPaneId[] => {
       const presented =
@@ -66,109 +82,271 @@ export function useStudioPanes() {
     [clamp, workflowDeleted],
   );
 
-  const panes = useMemo(
-    () =>
-      present(
-        resolveOpenPanes(
-          searchWithRunReference(location.search, studioRunId),
-          defaultPanes,
-          learnedRunPanes,
-        ),
-      ),
-    [location.search, studioRunId, defaultPanes, present, learnedRunPanes],
+  const presentUrlPanes = useCallback(
+    (resolved: StudioPaneId[]): StudioPaneId[] => {
+      const presented =
+        clamp && panesListEqual(resolved, clamp.urlSource)
+          ? [...clamp.urlPresented]
+          : resolved;
+      return workflowDeleted
+        ? panesWithoutDeletedBlocked(presented)
+        : presented;
+    },
+    [clamp, workflowDeleted],
   );
 
-  // The open list as the live URL resolves it right now — what cross-route
-  // writers (block ▶, the Run form round-trip) must build on, per the
-  // continuity rule: in-app actions append, never rearrange or close.
-  const resolveLivePanes = useCallback(
-    (): StudioPaneId[] =>
-      present(
-        resolveOpenPanes(
-          searchWithRunReference(liveSearch(location.search), studioRunId),
-          defaultPanes,
-          learnedRunPanes,
-        ),
-      ),
-    [location.search, studioRunId, defaultPanes, present, learnedRunPanes],
-  );
+  const panes = useMemo(() => {
+    const committed = resolveOpenPanes(
+      effectiveSearch,
+      defaultPanes,
+      learnedRunPanes,
+    );
+    const selected = workflowDeleted
+      ? committed
+      : withCopilotSelection(committed, copilotSelection);
+    return present(selected);
+  }, [
+    copilotSelection,
+    defaultPanes,
+    effectiveSearch,
+    learnedRunPanes,
+    present,
+    workflowDeleted,
+  ]);
+
+  // Keep the established URL/default-only contract for block-run and run-form
+  // transitions. A runtime Copilot choice must not leak into a destination URL.
+  const resolveLivePanes = useCallback((): StudioPaneId[] => {
+    const search = searchWithRunReference(
+      liveSearch(location.search),
+      studioRunId,
+    );
+    return presentUrlPanes(
+      resolveOpenPanes(search, defaultPanes, learnedRunPanes),
+    );
+  }, [
+    defaultPanes,
+    learnedRunPanes,
+    location.search,
+    presentUrlPanes,
+    studioRunId,
+  ]);
 
   const applyPanes = useCallback(
     (
       compute: (current: StudioPaneId[]) => StudioPaneId[],
       options?: ApplyPanesOptions,
+      writeKind: PaneWriteKind = "normal",
     ) => {
       const search = liveSearch(location.search);
-      const current = resolveLivePanes();
+      const resolvedSearch = searchWithRunReference(search, studioRunId);
+      const context = copilotContextForSearch(resolvedSearch);
+      const urlPanes = resolveOpenPanes(
+        resolvedSearch,
+        defaultPanes,
+        learnedRunPanes,
+      );
+      const storedSelection =
+        useStudioShellStore.getState().copilotSelectionByLayout[context];
+      const selected = workflowDeleted
+        ? urlPanes
+        : withCopilotSelection(urlPanes, storedSelection);
+      const current = present(selected);
+      const currentCopilotIndex = current.indexOf("copilot");
+      const rememberedCopilotIndex =
+        storedSelection?.index ??
+        (currentCopilotIndex === -1 ? undefined : currentCopilotIndex);
       const computed = compute(current);
-      const next = workflowDeleted
+      let next = workflowDeleted
         ? panesWithoutDeletedBlocked(computed)
         : computed;
-      notePaneWrite({ previous: current, next });
-      navigate(
-        { search: searchWithPanes(search, next) },
-        { replace: true, state: options?.state },
+
+      // Opening Copilot restores its remembered position instead of appending.
+      if (
+        writeKind === "copilot-only" &&
+        currentCopilotIndex === -1 &&
+        next.includes("copilot") &&
+        rememberedCopilotIndex !== undefined
+      ) {
+        next = withCopilotSelection(next, {
+          open: true,
+          index: rememberedCopilotIndex,
+        });
+      }
+
+      const nextCopilotIndex = next.indexOf("copilot");
+      let nextSelection = storedSelection;
+      if (!workflowDeleted) {
+        let selection: CopilotPaneSelection | undefined;
+        if (writeKind === "copilot-only" || writeKind === "exact") {
+          selection = {
+            open: nextCopilotIndex !== -1,
+            index:
+              nextCopilotIndex === -1
+                ? rememberedCopilotIndex
+                : nextCopilotIndex,
+          };
+        } else if (writeKind === "reorder" && nextCopilotIndex !== -1) {
+          selection = { open: true, index: nextCopilotIndex };
+        } else if (
+          writeKind === "normal" &&
+          storedSelection !== undefined &&
+          nextCopilotIndex !== -1
+        ) {
+          selection = { open: true, index: nextCopilotIndex };
+        }
+        if (selection !== undefined) {
+          nextSelection = selection;
+        }
+        if (
+          selection !== undefined &&
+          (selection.open !== storedSelection?.open ||
+            selection.index !== storedSelection?.index)
+        ) {
+          setCopilotSelection(context, selection);
+        }
+      }
+
+      const currentWithoutCopilot = current.filter(
+        (pane) => pane !== "copilot",
       );
-      if (options?.learn && next.length > 0 && !workflowDeleted) {
-        const cls = layoutClassForSearch(
-          searchWithRunReference(search, studioRunId),
-        );
+      const nextWithoutCopilot = next.filter((pane) => pane !== "copilot");
+      const urlPanesForWrite = workflowDeleted
+        ? panesWithoutDeletedBlocked(urlPanes)
+        : urlPanes;
+      // An exact override replaces the full committed non-Copilot set, even
+      // when the viewport clamp currently hides part of that set. Other
+      // operations build on the panes the user can see.
+      const nonCopilotBaseline =
+        writeKind === "exact"
+          ? urlPanesForWrite.filter((pane) => pane !== "copilot")
+          : currentWithoutCopilot;
+      const nonCopilotChanged = !panesListEqual(
+        nonCopilotBaseline,
+        nextWithoutCopilot,
+      );
+      if (!panesListEqual(current, next)) {
+        notePaneWrite({
+          previous: current,
+          next,
+          nextRuntimeSource:
+            !nonCopilotChanged && !workflowDeleted
+              ? withCopilotSelection(urlPanes, nextSelection)
+              : undefined,
+        });
+      }
+      if (!nonCopilotChanged && writeKind !== "normal") {
+        if (options !== undefined && "state" in options) {
+          navigate(
+            {
+              pathname: location.pathname,
+              search,
+              hash: location.hash,
+            },
+            { replace: true, state: options.state },
+          );
+        }
+        return;
+      }
+
+      // Until the user makes a Copilot choice, its URL position is still the
+      // source of truth. Preserve the existing write behavior for normal
+      // non-Copilot actions. Once runtime memory exists, keep it out of the URL.
+      const urlNext =
+        writeKind === "normal" && storedSelection === undefined
+          ? next
+          : withUrlCopilotPreserved(nextWithoutCopilot, urlPanesForWrite);
+      navigate(
+        {
+          pathname: location.pathname,
+          search: searchWithPanes(search, urlNext),
+          hash: location.hash,
+        },
+        {
+          replace: true,
+          state:
+            options !== undefined && "state" in options
+              ? options.state
+              : liveLocationState(location.search, location.state),
+        },
+      );
+      if (options?.learn && urlNext.length > 0 && !workflowDeleted) {
+        const cls = layoutClassForSearch(resolvedSearch);
         if (cls !== null) {
-          setPaneLayout(cls, next);
+          setPaneLayout(cls, urlNext);
         }
       }
     },
     [
-      navigate,
+      defaultPanes,
+      learnedRunPanes,
+      location.hash,
+      location.pathname,
       location.search,
-      studioRunId,
-      resolveLivePanes,
+      location.state,
+      navigate,
       notePaneWrite,
-      workflowDeleted,
+      present,
+      setCopilotSelection,
       setPaneLayout,
+      workflowDeleted,
+      studioRunId,
     ],
   );
 
   const togglePane = useCallback(
     (id: StudioPaneId, opts?: Pick<ApplyPanesOptions, "learn">) =>
-      applyPanes((current) => togglePaneIn(current, id), opts),
+      applyPanes(
+        (current) => togglePaneIn(current, id),
+        opts,
+        id === "copilot" ? "copilot-only" : "normal",
+      ),
     [applyPanes],
   );
 
   const openPane = useCallback(
     (id: StudioPaneId, options?: ApplyPanesOptions) =>
-      applyPanes((current) => withPaneOpen(current, id), options),
+      applyPanes(
+        (current) => withPaneOpen(current, id),
+        options,
+        id === "copilot" ? "copilot-only" : "normal",
+      ),
     [applyPanes],
   );
 
   const closePane = useCallback(
     (id: StudioPaneId, opts?: Pick<ApplyPanesOptions, "learn">) =>
-      applyPanes((current) => withPaneClosed(current, id), opts),
+      applyPanes(
+        (current) => withPaneClosed(current, id),
+        opts,
+        id === "copilot" ? "copilot-only" : "normal",
+      ),
     [applyPanes],
   );
 
-  // Layout override: open exactly this list (explicit moments like the
-  // version-history editor-only view), replacing whatever is open.
   const setOpenPanes = useCallback(
-    (panes: readonly StudioPaneId[]) => applyPanes(() => [...panes]),
+    (panes: readonly StudioPaneId[]) =>
+      applyPanes(() => [...panes], undefined, "exact"),
     [applyPanes],
   );
 
-  // Reorder-only write (drag-and-drop / keyboard move): the live URL keeps
-  // deciding WHICH panes are open; `order` only decides where they sit.
   const setPanesOrder = useCallback(
     (order: readonly StudioPaneId[], opts?: Pick<ApplyPanesOptions, "learn">) =>
-      applyPanes((current) => {
-        const next = order.filter(
-          (id, index) => current.includes(id) && order.indexOf(id) === index,
-        );
-        for (const id of current) {
-          if (!next.includes(id)) {
-            next.push(id);
+      applyPanes(
+        (current) => {
+          const next = order.filter(
+            (id, index) => current.includes(id) && order.indexOf(id) === index,
+          );
+          for (const id of current) {
+            if (!next.includes(id)) {
+              next.push(id);
+            }
           }
-        }
-        return next;
-      }, opts),
+          return next;
+        },
+        opts,
+        "reorder",
+      ),
     [applyPanes],
   );
 

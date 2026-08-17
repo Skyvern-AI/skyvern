@@ -17,18 +17,28 @@ def _org_defaults_suppress_experiments() -> bool:
     return context is not None and bool(context.org_default_llm_key or context.org_default_secondary_llm_key)
 
 
+def _prompt_type_flag_properties(organization_id: str | None) -> dict[str, str | bool | None]:
+    properties: dict[str, str | bool | None] = {"organization_id": organization_id}
+    context = skyvern_context.current()
+    if context and (context.workflow_run_id or context.workflow_permanent_id):
+        properties["workflow_permanent_id"] = context.workflow_permanent_id
+        properties["script_mode"] = context.script_mode
+    return properties
+
+
 async def get_llm_config_by_prompt_type(distinct_id: str, organization_id: str | None = None) -> dict[str, str] | None:
     """Return PostHog-configured LLM mapping for each prompt type."""
     if _org_defaults_suppress_experiments():
         return None
+    properties = _prompt_type_flag_properties(organization_id)
     llm_config_experiment = await app.EXPERIMENTATION_PROVIDER.get_value_cached(
-        "LLM_CONFIG_BY_PROMPT_TYPE", distinct_id, properties={"organization_id": organization_id}
+        "LLM_CONFIG_BY_PROMPT_TYPE", distinct_id, properties=properties
     )
     if llm_config_experiment in (False, "False") or not llm_config_experiment:
         return None
 
     payload = await app.EXPERIMENTATION_PROVIDER.get_payload_cached(
-        "LLM_CONFIG_BY_PROMPT_TYPE", distinct_id, properties={"organization_id": organization_id}
+        "LLM_CONFIG_BY_PROMPT_TYPE", distinct_id, properties=properties
     )
     if not payload:
         LOG.warning(

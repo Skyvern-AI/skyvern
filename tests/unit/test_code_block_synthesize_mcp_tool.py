@@ -283,6 +283,9 @@ async def test_synthesize_mcp_schema_keeps_both_sources_optional_and_trajectory_
     assert list(schema["properties"]) == ["trajectory_json", "strict_selectors", "session_id"]
     assert "trajectory_json" not in schema.get("required", [])
     assert "session_id" not in schema.get("required", [])
+    trajectory_description = schema["properties"]["trajectory_json"]["description"]
+    assert "typed_length" in trajectory_description
+    assert "typed_value" not in trajectory_description
 
 
 @pytest.mark.asyncio

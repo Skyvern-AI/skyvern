@@ -37,7 +37,6 @@ const terminalBuildTurn = (): TurnNarrativeState => ({
   ...EMPTY_NARRATIVE,
   turnId: "turn-1",
   turnIndex: 0,
-  mode: "build",
   designStarted: true,
   designEnded: true,
   draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
@@ -52,7 +51,6 @@ const inFlightTurn = (): TurnNarrativeState => ({
   ...EMPTY_NARRATIVE,
   turnId: "turn-2",
   turnIndex: 1,
-  mode: "build",
   terminal: null,
 });
 
@@ -77,7 +75,6 @@ const interimRunTurn = (): TurnNarrativeState => ({
     verdict: "not_demonstrated",
     role: "interim_build_test",
     displayReason: SHORT_OUTCOME_REASON,
-    activitySeqAtVerdict: 0,
   },
 });
 
@@ -138,9 +135,7 @@ describe("NarrativeView collapse default", () => {
     render(<NarrativeView turn={inFlightTurn()} />);
 
     expect(screen.queryByText(HEADLINE)).toBeNull();
-    expect(
-      screen.getByText("Waiting for the first block to start…"),
-    ).toBeTruthy();
+    expect(screen.getByText("Working…")).toBeTruthy();
   });
 
   it.each([false, true])(
@@ -180,7 +175,6 @@ describe("NarrativeView collapse default", () => {
     const hydrated = hydrateNarrativeFromPayload({
       turnId: "turn-hydrated-interim",
       turnIndex: 0,
-      mode: "build",
       blocks: [
         {
           ...completedBlock("block_1"),
@@ -267,7 +261,6 @@ describe("NarrativeView collapse default", () => {
           lastRunOutcome: {
             verdict: "not_demonstrated",
             displayReason: LONG_OUTCOME_REASON,
-            activitySeqAtVerdict: 8,
           },
         }}
       />,
@@ -285,7 +278,6 @@ describe("NarrativeView collapse default", () => {
     const hydrated = hydrateNarrativeFromPayload({
       turnId: "turn-hydrated",
       turnIndex: 0,
-      mode: "build",
       responseType: "REPLY",
       designStarted: true,
       designEnded: true,
@@ -323,7 +315,6 @@ describe("NarrativeView collapse default", () => {
           lastRunOutcome: {
             verdict: "not_demonstrated",
             displayReason: SHORT_OUTCOME_REASON,
-            activitySeqAtVerdict: 9,
           },
         }}
       />,
@@ -348,7 +339,6 @@ describe("NarrativeView collapse default", () => {
           lastRunOutcome: {
             verdict: "not_demonstrated",
             displayReason: LONG_OUTCOME_REASON,
-            activitySeqAtVerdict: 9,
           },
         }}
       />,
@@ -368,7 +358,6 @@ describe("NarrativeView collapse default", () => {
           lastRunOutcome: {
             verdict: "not_demonstrated",
             displayReason: SHORT_OUTCOME_REASON,
-            activitySeqAtVerdict: 9,
           },
         }}
       />,
@@ -391,7 +380,6 @@ describe("NarrativeView collapse default", () => {
           lastRunOutcome: {
             verdict: "not_demonstrated",
             displayReason: SHORT_OUTCOME_REASON,
-            activitySeqAtVerdict: 9,
           },
         }}
       />,
@@ -415,7 +403,6 @@ describe("NarrativeView collapse default", () => {
     const hydrated = hydrateNarrativeFromPayload({
       turnId: "turn-hydrated-legacy",
       turnIndex: 0,
-      mode: "build",
       responseType: "REPLY",
       designStarted: true,
       designEnded: true,
@@ -438,7 +425,6 @@ const pureAskTurn = (): TurnNarrativeState => ({
   ...EMPTY_NARRATIVE,
   turnId: "turn-ask",
   turnIndex: 0,
-  mode: "clarify",
   responseType: "ASK_QUESTION",
   terminal: "response",
   narrativeSummary: "Which login should I use?",

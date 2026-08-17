@@ -14,7 +14,6 @@ import yaml
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tools as tools_module
-from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     ChallengeEvidenceSource,
     artifact_challenge_flag_key,
@@ -43,20 +42,13 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     parse_composition_structured,
 )
 from skyvern.forge.sdk.copilot.output_extraction_plan import _relation_label_child_index
-from skyvern.forge.sdk.copilot.result_evidence import (
-    loaded_result_composition_evidence_from_page,
-    loaded_result_composition_target_summary,
-)
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.blockers import _artifact_challenge_flag_from_result
-from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentMode
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
 
 @dataclass
 class _Ctx:
-    build_phase: BuildPhase = BuildPhase.COMPOSING
-    turn_intent: TurnIntent = field(default_factory=lambda: TurnIntent(mode=TurnIntentMode.BUILD))
     composition_page_evidence: dict | None = None
     workflow_yaml: str | None = None
     flow_evidence: list[dict] = field(default_factory=list)
@@ -903,6 +895,23 @@ def test_composition_gate_requires_page_evidence_before_page_dependent_blocks() 
     assert "search_lookup" in error
 
 
+def test_composition_finding_does_not_depend_on_a_phase_gate() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "search_lookup",
+            "navigation_goal": "Enter a name and click Search.",
+        },
+    )
+    ctx = _Ctx()
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is not None
+    assert "search_lookup" in error
+
+
 def test_composition_gate_requires_page_evidence_before_no_url_action_blocks() -> None:
     # action / file_download / file_upload act on the reached page like a no-url navigation,
     # and the KB steers single clicks toward `action`, so they must be gated the same way.
@@ -1351,132 +1360,6 @@ def test_composition_gate_allows_extraction_after_matching_current_page_evidence
     assert error is None
 
 
-def test_composition_gate_rejects_post_budget_result_url_as_new_goto_url() -> None:
-    existing_yaml = _yaml(
-        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
-        {
-            "block_type": "navigation",
-            "label": "search_sample_record",
-            "url": "https://example.com/lookup",
-            "navigation_goal": "Fill the observed first-name and last-name fields and submit.",
-        },
-    )
-    workflow_yaml = _yaml(
-        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
-        {
-            "block_type": "navigation",
-            "label": "search_sample_record",
-            "url": "https://example.com/lookup",
-            "navigation_goal": "Fill the observed first-name and last-name fields and submit.",
-        },
-        {
-            "block_type": "goto_url",
-            "label": "open_sample_record_detail",
-            "url": "https://example.com/lookup?record_id=494764",
-        },
-        {
-            "block_type": "extraction",
-            "label": "extract_credential_details",
-            "data_extraction_goal": "Extract visible credential details.",
-        },
-    )
-    evidence = {
-        "inspected_url": "current_page",
-        "current_url": "https://example.com/lookup?record_id=494764",
-        "result_containers": [{"selector": "#results"}],
-        "source_tool": "inspect_page_for_composition",
-        "observed_after_workflow_run": True,
-    }
-    ctx = _Ctx(composition_page_evidence=evidence)
-    ctx.workflow_yaml = existing_yaml
-    ctx.per_tool_budget_problem_block_labels = ["search_sample_record"]
-
-    error = composition_page_evidence_error(ctx, workflow_yaml)
-
-    assert error is not None
-    assert "post-run browser URL" in error
-    assert "open_sample_record_detail" in error
-    assert "split or replace the budgeted frontier" in error
-
-
-def test_composition_gate_rejects_post_budget_path_result_url_as_new_goto_url() -> None:
-    existing_yaml = _yaml(
-        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
-        {
-            "block_type": "navigation",
-            "label": "search_person",
-            "navigation_goal": "Submit the observed search form.",
-        },
-    )
-    workflow_yaml = _yaml(
-        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
-        {
-            "block_type": "navigation",
-            "label": "search_person",
-            "navigation_goal": "Submit the observed search form.",
-        },
-        {
-            "block_type": "goto_url",
-            "label": "open_result_detail",
-            "url": "https://example.com/results/494764",
-        },
-    )
-    evidence = {
-        "inspected_url": "current_page",
-        "current_url": "https://example.com/results/494764",
-        "source_tool": "inspect_page_for_composition",
-        "observed_after_workflow_run": True,
-    }
-    ctx = _Ctx(composition_page_evidence=evidence)
-    ctx.workflow_yaml = existing_yaml
-    ctx.per_tool_budget_problem_block_labels = ["search_person"]
-
-    error = composition_page_evidence_error(ctx, workflow_yaml)
-
-    assert error is not None
-    assert "open_result_detail" in error
-
-
-def test_composition_gate_allows_extraction_from_post_budget_current_page() -> None:
-    existing_yaml = _yaml(
-        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
-        {
-            "block_type": "navigation",
-            "label": "search_sample_record",
-            "url": "https://example.com/lookup",
-            "navigation_goal": "Fill the observed first-name and last-name fields and submit.",
-        },
-    )
-    workflow_yaml = _yaml(
-        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
-        {
-            "block_type": "navigation",
-            "label": "search_sample_record",
-            "url": "https://example.com/lookup",
-            "navigation_goal": "Fill the observed first-name and last-name fields and submit.",
-        },
-        {
-            "block_type": "extraction",
-            "label": "extract_visible_credentials",
-            "data_extraction_goal": "Extract credential details visible on the observed current page.",
-        },
-    )
-    evidence = {
-        "inspected_url": "current_page",
-        "current_url": "https://example.com/lookup?record_id=494764",
-        "result_containers": [{"selector": "#results"}],
-        "source_tool": "inspect_page_for_composition",
-        "observed_after_workflow_run": True,
-    }
-    ctx = _Ctx(composition_page_evidence=evidence)
-    ctx.workflow_yaml = existing_yaml
-    ctx.per_tool_budget_problem_block_labels = ["search_sample_record"]
-
-    error = composition_page_evidence_error(ctx, workflow_yaml)
-
-    assert error is None
-
-
 def test_composition_gate_targets_nearest_url_before_new_page_block() -> None:
     existing_yaml = _yaml(
         {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
@@ -1585,7 +1468,6 @@ def test_composition_gate_applies_to_edit_turns_that_add_page_dependent_blocks()
         },
     )
     ctx = _Ctx(
-        turn_intent=TurnIntent(mode=TurnIntentMode.EDIT),
         composition_page_evidence=None,
         workflow_yaml=existing_yaml,
     )
@@ -2256,6 +2138,48 @@ def test_structured_parses_forms_labels_options_and_submit() -> None:
     assert has_bounded_page_schema(parsed) is True
 
 
+def test_structured_preserves_observed_form_control_visibility_and_disabled_state() -> None:
+    payload = _structured_form_payload()
+    payload["forms"][0]["fields"][0]["visible"] = True
+    payload["forms"][0]["fields"][1]["visible"] = False
+    payload["forms"][0]["fields"][1]["disabled"] = True
+    payload["forms"][0]["submit_controls"][0]["visible"] = False
+
+    parsed = parse_composition_structured(
+        payload,
+        inspected_url="https://example.com/lookup",
+        current_url="https://example.com/lookup",
+    )
+
+    assert parsed is not None
+    fields = parsed["forms"][0]["fields"]
+    assert fields[0]["visible"] is True
+    assert fields[1]["visible"] is False
+    assert fields[1]["disabled"] is True
+    assert parsed["forms"][0]["submit_controls"][0]["visible"] is False
+
+
+def test_static_html_omits_computed_control_visibility() -> None:
+    html = """
+    <html><head><style>.progressive { display: none; }</style></head><body>
+      <form>
+        <label for="breed">Breed</label>
+        <select id="breed" class="progressive"><option>Beagle</option></select>
+        <button id="submit" class="progressive">Submit</button>
+      </form>
+    </body></html>
+    """
+
+    parsed = parse_composition_html(
+        html,
+        inspected_url="https://example.test/form",
+        current_url="https://example.test/form",
+    )
+
+    assert "visible" not in parsed["forms"][0]["fields"][0]
+    assert "visible" not in parsed["forms"][0]["submit_controls"][0]
+
+
 def test_structured_preserves_populated_result_container_content() -> None:
     payload = {
         "page_title": "Lookup",
@@ -2898,7 +2822,7 @@ def test_clickable_controls_with_shared_class_fall_back_to_text_only() -> None:
 
 
 def test_clickable_controls_key_absent_when_channel_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_CLICK_REPERCEPTION_ATTACH_ENABLED", False)
+    monkeypatch.setattr(settings, "COPILOT_CLICKABLE_CONTROLS_EVIDENCE_ENABLED", False)
     parsed = parse_composition_html(
         _STANDALONE_CONTROLS_HTML,
         inspected_url=_STANDALONE_CONTROLS_URL,
@@ -2909,7 +2833,7 @@ def test_clickable_controls_key_absent_when_channel_disabled(monkeypatch: pytest
 
 
 def test_structured_clickable_controls_key_absent_when_channel_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_CLICK_REPERCEPTION_ATTACH_ENABLED", False)
+    monkeypatch.setattr(settings, "COPILOT_CLICKABLE_CONTROLS_EVIDENCE_ENABLED", False)
     parsed = parse_composition_structured(
         {"page_title": "Account", "clickable_controls": [{"selector": "#biz-tile", "text": "Business"}]},
         inspected_url=_STANDALONE_CONTROLS_URL,
@@ -3044,6 +2968,58 @@ async def _capture_live_dom(url: str, html: str, wait_selector: str) -> tuple[st
         await browser.close()
 
     return raw, content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_structured_browser_packet_preserves_every_selector_candidate() -> None:
+    url = "https://test.example.com/login"
+    raw, _ = await _capture_live_dom(
+        url,
+        """
+        <html><body><form id="login-form">
+          <label for="email">Email</label>
+          <input id="email" name="account_email" aria-label="Work email" class="field primary" />
+          <button id="continue" class="primary" type="submit">Continue</button>
+        </form></body></html>
+        """,
+        "#email",
+    )
+
+    packet = json.loads(raw)
+    field = packet["forms"][0]["fields"][0]
+    selectors = [candidate["selector"] for candidate in field["selector_candidates"]]
+
+    assert "#email" in selectors
+    assert 'input[name="account_email"]' in selectors
+    assert 'input[aria-label="Work email"]' in selectors
+    assert "input.field.primary" in selectors
+    assert field["selector"] in selectors
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_structured_control_visibility_matches_playwright_opacity_semantics() -> None:
+    url = "https://test.example.com/progressive"
+    html = """
+    <html><body><form>
+      <label for="next">Next value</label>
+      <input id="next" style="opacity: 0" />
+    </form>
+    <button id="opacity-zero-action" style="opacity: 0">Transparent action</button>
+    </body></html>
+    """
+
+    raw, _ = await _capture_live_dom(url, html, "#next")
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+
+    assert structured is not None
+    # Playwright considers an opacity-zero element visible/actionable. Recording it as hidden would
+    # synthesize a wait_for(visible) precondition that returns immediately and bears no useful load.
+    assert structured["forms"][0]["fields"][0]["visible"] is True
+    # The readiness signal is form-control-specific. Preserve the existing opacity filter for the
+    # generic clickable inventory so this change does not widen a second perception channel.
+    assert "#opacity-zero-action" not in {control.get("selector") for control in structured["clickable_controls"]}
 
 
 @_skip_no_browser
@@ -3630,22 +3606,6 @@ def test_structured_passes_value_text_and_cell_text_with_caps() -> None:
     assert len(parsed["result_containers"][0]["rows"][0]["cells"][0]["text"]) <= 120
 
 
-def test_captured_value_and_cell_text_stay_out_of_loaded_result_summary() -> None:
-    details = """
-    <div class="kv"><div>Reference</div><div>secret-ref-value</div></div>
-    <table id="records">
-      <thead><tr><th>Address</th></tr></thead>
-      <tbody><tr><td>secret-cell-value</td></tr></tbody>
-    </table>
-    """
-    parsed = parse_composition_html(details, inspected_url="https://example.com/r", current_url="https://example.com/r")
-    evidence = loaded_result_composition_evidence_from_page(parsed, source_tool="evaluate", source_url="u")
-    assert evidence is not None
-    serialized = json.dumps(loaded_result_composition_target_summary(evidence))
-    assert '"value_text"' not in serialized
-    assert '"cells"' not in serialized
-
-
 def _kv_value_content_packet() -> dict[str, Any]:
     return {
         "key_value_relations": [
@@ -3993,30 +3953,6 @@ def test_browser_twin_resolves_requested_targets_before_the_shape_passes() -> No
     assert "REQUESTED_TARGETS=[]" in composition_structured_evidence_expression()
 
 
-def test_a_generated_read_proves_a_non_sibling_label_at_its_own_anchor() -> None:
-    from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_extraction_suffix
-    from skyvern.forge.sdk.copilot.output_extraction_plan import derive_requested_output_extraction_plan
-
-    parsed = parse_composition_html(
-        _DEEP_TILE_HTML,
-        inspected_url="https://example.test/web",
-        current_url="https://example.test/web",
-        requested_targets=("Visitors",),
-    )
-    plan = derive_requested_output_extraction_plan(
-        flow_evidence=[{"step": 1, "reached_via": "current_page", "had_bounded_schema": True, "evidence": parsed}],
-        labels_by_path={"output.visitors": ("Visitors",)},
-    )
-
-    assert plan is not None
-    binding = plan.live_reads[0]
-    assert binding.label_selector
-    suffix = synthesize_extraction_suffix(plan)
-    assert suffix is not None
-    # The label is proven where it lives, not as the value's first sibling.
-    assert f'page.locator("{binding.label_selector}").first.inner_text()' in suffix.code
-
-
 def test_browser_twin_carries_the_non_sibling_label_anchor() -> None:
     from skyvern.forge.sdk.copilot.composition_browser_expressions import (
         composition_structured_evidence_expression,
@@ -4041,31 +3977,6 @@ def test_a_tile_that_prints_its_figure_before_its_label_records_where_the_label_
     relation = next(r for r in parsed["key_value_relations"] if r["key_text"] == "logs found")
 
     assert (relation["value_text"], relation["value_child_index"], relation["label_child_index"]) == ("1.22K", 0, 1)
-
-
-def test_a_value_first_tile_binds_by_witness_and_reads_it_without_proving_a_heading() -> None:
-    from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_extraction_suffix
-    from skyvern.forge.sdk.copilot.output_extraction_plan import derive_requested_output_extraction_plan
-
-    parsed = parse_composition_html(
-        _VALUE_FIRST_TILE_HTML, inspected_url="https://example.test/logs", current_url="https://example.test/logs"
-    )
-    plan = derive_requested_output_extraction_plan(
-        flow_evidence=[{"step": 1, "reached_via": "current_page", "had_bounded_schema": True, "evidence": parsed}],
-        labels_by_path={"output.errors": ("azure",)},
-        witnessed_by_path={"output.errors": "1.22K"},
-    )
-
-    # "azure" shares no wording with "logs found": the witnessed quantity is what joins them.
-    assert plan is not None
-    binding = plan.live_reads[0]
-    assert (binding.child_index, binding.label_child_index) == (0, 1)
-    code = synthesize_extraction_suffix(plan).code
-    # The witness chose this element by the value it showed, so re-reading the heading proves nothing
-    # about that choice — and a tile whose heading slot also carries a delta chip, or a page with no
-    # heading at all, has nothing to re-read (SKY-13226).
-    assert "logs found" not in code
-    assert "nth(0).inner_text()).strip()\n" in code or "nth(0).inner_text()).strip()" in code
 
 
 def _playwright_chromium_available() -> bool:

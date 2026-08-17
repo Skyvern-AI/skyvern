@@ -6,13 +6,11 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from skyvern.forge.sdk.copilot.repeated_reply_summary import RepeatedReplyKind, summarize_repeated_replies
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     build_transcript_context,
     redact_raw_secrets_for_prompt,
 )
-from skyvern.forge.sdk.copilot.turn_intent import RequiredContextKey, TurnIntent, TurnIntentMode
 from skyvern.forge.sdk.copilot.workflow_change_summary import WorkflowChangeKind, summarize_user_workflow_change
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatHistoryMessage, WorkflowCopilotChatSender
@@ -20,26 +18,22 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()
 
-_WORKFLOW_MODES = {
-    TurnIntentMode.BUILD,
-    TurnIntentMode.EDIT,
-    TurnIntentMode.DIAGNOSE,
-    TurnIntentMode.DRAFT_ONLY,
-    TurnIntentMode.CLARIFY,
-}
-_RUN_MODES = {TurnIntentMode.DIAGNOSE}  # Additional run-evidence modes can join here.
+TurnContextSection = Literal[
+    "current_workflow",
+    "latest_assistant_proposal",
+    "latest_run_result",
+    "credential_metadata",
+]
 
 
 class TurnContextOmission(BaseModel):
-    context_key: RequiredContextKey
-    reason: Literal["unavailable", "truncated_to_budget", "not_implemented"]
-    required: bool = True
+    context_key: TurnContextSection
+    reason: Literal["unavailable", "truncated_to_budget"]
     detail: str = ""
 
 
 class WorkflowContext(BaseModel):
     yaml: str
-    source: Literal["current", "proposed"] = "current"
     original_chars: int
     truncated: bool = False
 
@@ -59,13 +53,6 @@ class WorkflowChangeContext(BaseModel):
 class RunnableDraftContext(BaseModel):
     rendered_summary: str
     block_labels: list[str] = Field(default_factory=list)
-
-
-class RepeatedReplyContext(BaseModel):
-    kind: RepeatedReplyKind
-    rendered_summary: str
-    repeat_count: int
-    blocked_signatures: list[str] = Field(default_factory=list)
 
 
 class TranscriptContext(BaseModel):
@@ -98,13 +85,7 @@ class CredentialContext(BaseModel):
     omitted_credential_count: int = 0
 
 
-class DocsContext(BaseModel):
-    # v1 placeholder; reserves a typed slot for future docs retrieval output.
-    status: Literal["empty_hook"] = "empty_hook"
-
-
 class TurnContextPacket(BaseModel):
-    turn_intent_summary: dict[str, Any]
     workflow_context: WorkflowContext | None = None
     proposal_context: ProposalContext | None = None
     workflow_change_context: WorkflowChangeContext | None = None
@@ -112,8 +93,6 @@ class TurnContextPacket(BaseModel):
     transcript_context: TranscriptContext
     run_context: RunContext | None = None
     credential_context: CredentialContext | None = None
-    docs_context: DocsContext | None = None
-    repeated_reply_context: RepeatedReplyContext | None = None
     omissions: list[TurnContextOmission] = Field(default_factory=list)
 
     def to_trace_data(self) -> dict[str, Any]:
@@ -124,27 +103,21 @@ class TurnContextPacket(BaseModel):
             "runnable_draft_context",
             "run_context",
             "credential_context",
-            "docs_context",
-            "repeated_reply_context",
         )
         return {
-            "mode": self.turn_intent_summary.get("mode"),
             "sections": [field for field in section_fields if getattr(self, field) is not None],
-            "omissions": [omission.context_key.value for omission in self.omissions],
+            "omissions": [omission.context_key for omission in self.omissions],
             "omission_reasons": [omission.reason for omission in self.omissions],
             "workflow_truncated": bool(self.workflow_context and self.workflow_context.truncated),
             "proposal_truncated": bool(self.proposal_context and self.proposal_context.truncated),
             "run_truncated": bool(self.run_context and self.run_context.truncated),
             "workflow_change_kind": self.workflow_change_context.kind if self.workflow_change_context else None,
-            "repeated_reply_kind": self.repeated_reply_context.kind.value if self.repeated_reply_context else None,
-            "repeated_reply_count": self.repeated_reply_context.repeat_count if self.repeated_reply_context else 0,
         }
 
 
 class TurnContextInputs(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
-    turn_intent: TurnIntent
     request_policy: RequestPolicy
     user_message: str = ""
     workflow_yaml: str = ""
@@ -223,7 +196,6 @@ class TurnContextAssembler:
         self.credential_count_budget = credential_count_budget
 
     def assemble(self, inputs: TurnContextInputs) -> TurnContextPacket:
-        required = set(inputs.turn_intent.required_context)
         omissions: list[TurnContextOmission] = []
         transcript = build_transcript_context(inputs.chat_history, inputs.user_message)
         transcript_context = TranscriptContext(
@@ -237,63 +209,44 @@ class TurnContextAssembler:
         workflow_context: WorkflowContext | None = None
         proposal_context: ProposalContext | None = None
         workflow_change_context: WorkflowChangeContext | None = None
-        runnable_draft_context: RunnableDraftContext | None = None
         run_context: RunContext | None = None
-        credential_context: CredentialContext | None = None
-        docs_context: DocsContext | None = None
 
-        if self._should_include_workflow(inputs.turn_intent, required):
-            workflow_key = (
-                RequiredContextKey.PROPOSED_WORKFLOW
-                if RequiredContextKey.PROPOSED_WORKFLOW in required
-                else RequiredContextKey.CURRENT_WORKFLOW
+        if inputs.workflow_yaml.strip():
+            yaml_text, original_chars, truncated = _bounded_text(inputs.workflow_yaml, self.workflow_char_budget)
+            workflow_context = WorkflowContext(
+                yaml=yaml_text,
+                original_chars=original_chars,
+                truncated=truncated,
             )
-            if inputs.workflow_yaml.strip():
-                yaml_text, original_chars, truncated = _bounded_text(inputs.workflow_yaml, self.workflow_char_budget)
-                # The caller controls whether this is current or proposed workflow YAML.
-                workflow_context = WorkflowContext(
-                    yaml=yaml_text,
-                    source="proposed" if workflow_key == RequiredContextKey.PROPOSED_WORKFLOW else "current",
-                    original_chars=original_chars,
-                    truncated=truncated,
-                )
-                if truncated:
-                    omissions.append(
-                        TurnContextOmission(
-                            context_key=workflow_key,
-                            reason="truncated_to_budget",
-                            detail=f"workflow_yaml exceeded {self.workflow_char_budget} chars",
-                        )
-                    )
-            elif workflow_key in required:
-                omissions.append(TurnContextOmission(context_key=workflow_key, reason="unavailable"))
-
-        if RequiredContextKey.LATEST_ASSISTANT_PROPOSAL in required:
-            latest_proposal = _latest_assistant_turn(inputs.chat_history)
-            if latest_proposal:
-                proposal, original_chars, truncated = _bounded_text(latest_proposal, self.proposal_char_budget)
-                proposal_context = ProposalContext(
-                    latest_assistant_proposal=proposal,
-                    original_chars=original_chars,
-                    truncated=truncated,
-                )
-                if truncated:
-                    omissions.append(
-                        TurnContextOmission(
-                            context_key=RequiredContextKey.LATEST_ASSISTANT_PROPOSAL,
-                            reason="truncated_to_budget",
-                            detail=f"latest assistant proposal exceeded {self.proposal_char_budget} chars",
-                        )
-                    )
-            else:
+            if truncated:
                 omissions.append(
                     TurnContextOmission(
-                        context_key=RequiredContextKey.LATEST_ASSISTANT_PROPOSAL,
-                        reason="unavailable",
+                        context_key="current_workflow",
+                        reason="truncated_to_budget",
+                        detail=f"workflow_yaml exceeded {self.workflow_char_budget} chars",
+                    )
+                )
+        else:
+            omissions.append(TurnContextOmission(context_key="current_workflow", reason="unavailable"))
+
+        latest_proposal = _latest_assistant_turn(inputs.chat_history)
+        if latest_proposal:
+            proposal, original_chars, truncated = _bounded_text(latest_proposal, self.proposal_char_budget)
+            proposal_context = ProposalContext(
+                latest_assistant_proposal=proposal,
+                original_chars=original_chars,
+                truncated=truncated,
+            )
+            if truncated:
+                omissions.append(
+                    TurnContextOmission(
+                        context_key="latest_assistant_proposal",
+                        reason="truncated_to_budget",
+                        detail=f"latest assistant proposal exceeded {self.proposal_char_budget} chars",
                     )
                 )
 
-        if RequiredContextKey.WORKFLOW_CHANGE in required and inputs.prior_workflow_yaml.strip():
+        if inputs.prior_workflow_yaml.strip():
             change_summary = summarize_user_workflow_change(
                 prior_yaml=inputs.prior_workflow_yaml,
                 current_yaml=inputs.workflow_yaml,
@@ -309,51 +262,24 @@ class TurnContextAssembler:
 
         runnable_draft_context = self._runnable_draft_context(inputs)
 
-        if self._should_include_run_context(inputs.turn_intent, required):
-            if inputs.debug_run_info_text.strip():
-                summary, original_chars, truncated = _bounded_text(inputs.debug_run_info_text, self.run_char_budget)
-                run_context = RunContext(summary=summary, original_chars=original_chars, truncated=truncated)
-                if truncated:
-                    omissions.append(
-                        TurnContextOmission(
-                            context_key=RequiredContextKey.LATEST_RUN_RESULT,
-                            reason="truncated_to_budget",
-                            detail=f"run context exceeded {self.run_char_budget} chars",
-                        )
-                    )
-            elif RequiredContextKey.LATEST_RUN_RESULT in required:
+        if inputs.debug_run_info_text.strip():
+            summary, original_chars, truncated = _bounded_text(inputs.debug_run_info_text, self.run_char_budget)
+            run_context = RunContext(summary=summary, original_chars=original_chars, truncated=truncated)
+            if truncated:
                 omissions.append(
-                    TurnContextOmission(context_key=RequiredContextKey.LATEST_RUN_RESULT, reason="unavailable")
+                    TurnContextOmission(
+                        context_key="latest_run_result",
+                        reason="truncated_to_budget",
+                        detail=f"run context exceeded {self.run_char_budget} chars",
+                    )
                 )
+        else:
+            omissions.append(TurnContextOmission(context_key="latest_run_result", reason="unavailable"))
 
-        if RequiredContextKey.CREDENTIAL_METADATA in required:
-            credential_context, credential_omissions = self._credential_context(inputs.request_policy)
-            omissions.extend(credential_omissions)
-
-        if RequiredContextKey.DOCS_CONTEXT in required:
-            docs_context = DocsContext()
-
-        repeated_reply_context: RepeatedReplyContext | None = None
-        repeated_reply = summarize_repeated_replies(inputs.chat_history, inputs.turn_intent)
-        if repeated_reply.kind is RepeatedReplyKind.REPEATED_REPLY_DETECTED:
-            repeated_reply_context = RepeatedReplyContext(
-                kind=repeated_reply.kind,
-                rendered_summary=repeated_reply.render_prompt_block(),
-                repeat_count=repeated_reply.repeat_count,
-                blocked_signatures=list(repeated_reply.blocked_signatures),
-            )
-
-        if RequiredContextKey.BROWSER_STATE in required:
-            omissions.append(
-                TurnContextOmission(
-                    context_key=RequiredContextKey.BROWSER_STATE,
-                    reason="not_implemented",
-                    detail="browser state context packet section is reserved for a future assembler revision",
-                )
-            )
+        credential_context, credential_omissions = self._credential_context(inputs.request_policy)
+        omissions.extend(credential_omissions)
 
         packet = TurnContextPacket(
-            turn_intent_summary=inputs.turn_intent.to_trace_data(),
             workflow_context=workflow_context,
             proposal_context=proposal_context,
             workflow_change_context=workflow_change_context,
@@ -361,8 +287,6 @@ class TurnContextAssembler:
             transcript_context=transcript_context,
             run_context=run_context,
             credential_context=credential_context,
-            docs_context=docs_context,
-            repeated_reply_context=repeated_reply_context,
             omissions=omissions,
         )
 
@@ -372,17 +296,8 @@ class TurnContextAssembler:
         )
         return packet
 
-    def _should_include_workflow(self, intent: TurnIntent, required: set[RequiredContextKey]) -> bool:
-        if intent.mode == TurnIntentMode.ANSWER:
-            return False
-        # Edit-capable turns still need workflow context even when the shadow classifier
-        # did not include a specific workflow key yet.
-        return bool(required & {RequiredContextKey.CURRENT_WORKFLOW, RequiredContextKey.PROPOSED_WORKFLOW}) or (
-            intent.mode in _WORKFLOW_MODES and intent.authority.may_update_workflow
-        )
-
     def _runnable_draft_context(self, inputs: TurnContextInputs) -> RunnableDraftContext | None:
-        if not inputs.turn_intent.authority.may_run_blocks:
+        if not inputs.request_policy.allow_run_blocks:
             return None
         if _top_level_block_labels(inputs.workflow_yaml):
             return None
@@ -398,11 +313,6 @@ class TurnContextAssembler:
         )
         return RunnableDraftContext(rendered_summary=summary, block_labels=labels)
 
-    def _should_include_run_context(self, intent: TurnIntent, required: set[RequiredContextKey]) -> bool:
-        if intent.mode == TurnIntentMode.ANSWER:
-            return False
-        return RequiredContextKey.LATEST_RUN_RESULT in required or intent.mode in _RUN_MODES
-
     def _credential_context(self, request_policy: RequestPolicy) -> tuple[CredentialContext, list[TurnContextOmission]]:
         omissions: list[TurnContextOmission] = []
         credentials = request_policy.resolved_credentials[: self.credential_count_budget]
@@ -410,15 +320,13 @@ class TurnContextAssembler:
         if omitted_count:
             omissions.append(
                 TurnContextOmission(
-                    context_key=RequiredContextKey.CREDENTIAL_METADATA,
+                    context_key="credential_metadata",
                     reason="truncated_to_budget",
                     detail=f"{omitted_count} credential metadata entries omitted",
                 )
             )
         if not request_policy.resolved_credentials and not request_policy.credential_refs:
-            omissions.append(
-                TurnContextOmission(context_key=RequiredContextKey.CREDENTIAL_METADATA, reason="unavailable")
-            )
+            omissions.append(TurnContextOmission(context_key="credential_metadata", reason="unavailable"))
         return CredentialContext(
             requested_refs=_dedupe_nonempty(request_policy.credential_refs),
             invalid_credential_ids=_dedupe_nonempty(request_policy.invalid_credential_ids),

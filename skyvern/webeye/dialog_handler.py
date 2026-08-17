@@ -32,8 +32,7 @@ async def _handle_dialog(dialog: Dialog, page: Page | None = None) -> None:
     For alert and beforeunload dialogs, always accepts without calling the LLM.
     For confirm/prompt dialogs with no task context, auto-accepts (no LLM round-trip needed).
     For confirm/prompt dialogs with task context, calls the secondary LLM handler to decide.
-    Falls back to accept on any error (safer than dismiss for form submissions). An extension policy
-    may require confirm/prompt dialogs to be dismissed before the LLM decision path runs.
+    Falls back to accept on any error (safer than dismiss for form submissions).
 
     ``page`` is the page this handler was registered on — the dialog's originating page. Every
     response this handler gives except an alert's (which has no alternative) routes through
@@ -62,22 +61,6 @@ async def _handle_dialog(dialog: Dialog, page: Page | None = None) -> None:
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
     )
-
-    should_dismiss = app.AGENT_FUNCTION.should_dismiss_browser_dialog(
-        dialog_type,
-        dialog_message,
-        default_value,
-    )
-    if not should_dismiss:
-        should_dismiss = await app.AGENT_FUNCTION.inspect_browser_dialog(
-            dialog_type,
-            dialog_message,
-            default_value,
-        )
-    if should_dismiss:
-        log.warning("Browser dialog dismissed by extension policy")
-        await dialog.dismiss()
-        return
 
     # Record alert only — beforeunload is informational ("Changes you made may not
     # be saved") and would misfit the "field rejection" prompt copy; confirm/prompt

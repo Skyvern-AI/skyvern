@@ -462,6 +462,20 @@ class TestDoObserve:
         assert "value" not in country
 
     @pytest.mark.asyncio
+    async def test_document_reload_during_observe_refuses_durability(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKYVERN_MCP_OBSERVE_V2", "1")
+        page = _make_page()
+        document_ids = AsyncMock(side_effect=["cdp:doc-a", "cdp:doc-b"])
+        monkeypatch.setattr(browser_ops, "get_observe_document_id", document_ids)
+
+        result = await do_observe(page)
+
+        # The marker bracket refuses durability instead of failing the observe: elements stay
+        # usable via selectors, but no document identity is certified for durable refs.
+        assert result.document_id is None
+        assert document_ids.await_count == 2
+
+    @pytest.mark.asyncio
     async def test_dom_interactables_are_merged_with_selectors(self) -> None:
         page = _make_page(_make_a11y_tree(children=[{"role": "textbox", "name": "City", "value": ""}]))
         page.evaluate = _mock_dom_evaluate(
@@ -1022,13 +1036,106 @@ class TestSkyvernObserveMCP:
         )
 
     @pytest.mark.asyncio
-    async def test_observe_no_browser(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_observe_no_browser_clears_existing_refs(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.cli.mcp_tools._session import BrowserNotAvailableError
 
+        monkeypatch.setenv("SKYVERN_MCP_OBSERVE_V2", "1")
+        ctx = BrowserContext(mode="local")
+        state = make_session_state(context=ctx)
+        state._observed_refs = {"e0": {"ref": "e0", "selector": "#stale"}}
+        state._observe_v2_state.refs = dict(state._observed_refs)
         monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(side_effect=BrowserNotAvailableError("no browser")))
 
-        result = await mcp_browser.skyvern_observe()
+        async with scoped_session(state):
+            result = await mcp_browser.skyvern_observe()
+
         assert result["ok"] is False
+        assert state._observed_refs == {}
+        assert state._observe_v2_state.refs == {}
+
+    @pytest.mark.asyncio
+    async def test_cancelled_observe_page_lookup_clears_existing_refs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKYVERN_MCP_OBSERVE_V2", "1")
+        ctx = BrowserContext(mode="local")
+        state = make_session_state(context=ctx)
+        state._observed_refs = {"e0": {"ref": "e0", "selector": "#stale"}}
+        state._observe_v2_state.refs = dict(state._observed_refs)
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(side_effect=asyncio.CancelledError))
+
+        async with scoped_session(state):
+            with pytest.raises(asyncio.CancelledError):
+                await mcp_browser.skyvern_observe()
+
+        assert state._observed_refs == {}
+        assert state._observe_v2_state.refs == {}
+
+    @pytest.mark.asyncio
+    async def test_generic_observe_failure_clears_existing_refs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKYVERN_MCP_OBSERVE_V2", "1")
+        page = _make_page()
+        ctx = BrowserContext(mode="local")
+        state = make_session_state(context=ctx)
+        state._observed_refs = {"e0": {"ref": "e0", "selector": "#stale"}}
+        state._observe_v2_state.refs = dict(state._observed_refs)
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+        monkeypatch.setattr(mcp_browser, "do_observe", AsyncMock(side_effect=RuntimeError("snapshot failed")))
+
+        async with scoped_session(state):
+            result = await mcp_browser.skyvern_observe()
+
+        assert result["ok"] is False
+        assert state._observed_refs == {}
+        assert state._observe_v2_state.refs == {}
+
+    @pytest.mark.asyncio
+    async def test_cancelled_observe_snapshot_clears_existing_refs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKYVERN_MCP_OBSERVE_V2", "1")
+        page = _make_page()
+        ctx = BrowserContext(mode="local")
+        state = make_session_state(context=ctx)
+        state._observed_refs = {"e0": {"ref": "e0", "selector": "#stale"}}
+        state._observe_v2_state.refs = dict(state._observed_refs)
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+        monkeypatch.setattr(mcp_browser, "do_observe", AsyncMock(side_effect=asyncio.CancelledError))
+
+        async with scoped_session(state):
+            with pytest.raises(asyncio.CancelledError):
+                await mcp_browser.skyvern_observe()
+
+        assert state._observed_refs == {}
+        assert state._observe_v2_state.refs == {}
+
+    @pytest.mark.asyncio
+    async def test_cancelled_observe_publication_clears_existing_refs(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SKYVERN_MCP_OBSERVE_V2", "1")
+        page = _make_page()
+        ctx = BrowserContext(mode="local")
+        state = make_session_state(context=ctx)
+        state._observed_refs = {"e0": {"ref": "e0", "selector": "#stale"}}
+        state._observe_v2_state.refs = dict(state._observed_refs)
+        observe_result = ObserveResult(
+            url=page.url,
+            title="Login Page",
+            elements=[],
+            element_count=0,
+            total_on_page=0,
+            document_id="doc-1",
+        )
+        publish = AsyncMock(side_effect=asyncio.CancelledError)
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+        monkeypatch.setattr(mcp_browser, "do_observe", AsyncMock(return_value=observe_result))
+        monkeypatch.setattr(mcp_browser, "_publish_observe_v2_refs", publish)
+
+        async with scoped_session(state):
+            with pytest.raises(asyncio.CancelledError):
+                await mcp_browser.skyvern_observe()
+
+        publish.assert_awaited_once()
+        assert state._observed_refs == {}
+        assert state._observe_v2_state.refs == {}
 
     @pytest.mark.asyncio
     async def test_non_evaluable_working_frame_returns_structured_error(
@@ -1546,6 +1653,41 @@ class TestSkyvernExecuteMCP:
             assert session_manager.get_session_ref("e0", session_id=ctx.session_id) is None
 
     @pytest.mark.asyncio
+    async def test_newer_publication_reservation_rejects_older_commit_and_clear(self) -> None:
+        ctx = BrowserContext(mode="cloud_session", session_id="pbs_publication_cas")
+        page_key = (1, None, "https://example.com", None)
+        older = {"ref": "e0", "selector": "#older"}
+        newer = {"ref": "e1", "selector": "#newer"}
+
+        async with scoped_session(make_session_state(context=ctx)):
+            older_generation = session_manager.begin_session_ref_publication(session_id=ctx.session_id)
+            newer_generation = session_manager.begin_session_ref_publication(session_id=ctx.session_id)
+
+            assert session_manager.replace_session_ref_map(
+                {"e1": newer},
+                session_id=ctx.session_id,
+                generation=newer_generation,
+                page_key=page_key,
+            )
+            committed_generation = session_manager.session_ref_generation(session_id=ctx.session_id)
+            assert committed_generation > newer_generation
+            assert not session_manager.clear_session_ref_map(
+                session_id=ctx.session_id,
+                generation=newer_generation,
+            )
+            assert not session_manager.replace_session_ref_map(
+                {"e0": older},
+                session_id=ctx.session_id,
+                generation=older_generation,
+                page_key=page_key,
+            )
+            assert not session_manager.clear_session_ref_map(
+                session_id=ctx.session_id,
+                generation=older_generation,
+            )
+            assert session_manager.get_session_ref("e1", session_id=ctx.session_id, page_key=page_key) == newer
+
+    @pytest.mark.asyncio
     async def test_rejected_batch_observe_does_not_install_local_refs(self) -> None:
         """If session publication rejects an observe snapshot, the batch must not act on it either."""
 
@@ -1564,7 +1706,55 @@ class TestSkyvernExecuteMCP:
         )
 
         assert result.error_step == 1
+        assert result.results[0].ok is True
         assert "Unknown ref 'e0'" in str(result.results[1].error)
+        assert len(result.results) == 2
+
+    @pytest.mark.asyncio
+    async def test_strict_rejected_batch_observe_fails_before_ref_step(self) -> None:
+        async def dispatch(step: ExecuteStep, ref_map: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+            if step.tool == "observe":
+                return {"elements": [{"ref": "e0", "role": "button", "name": "Sign In"}], "element_count": 1}
+            if ref := step.params.get("ref"):
+                if ref not in ref_map:
+                    raise ValueError(f"Unknown ref '{ref}' — call observe first or check ref exists")
+            return None
+
+        result = await do_execute(
+            dispatch,
+            [ExecuteStep(tool="observe"), ExecuteStep(tool="click", params={"ref": "e0"})],
+            on_ref_map_update=lambda ref_map: False,
+            fail_on_ref_map_rejection=True,
+        )
+
+        assert result.error_step == 0
+        assert "observe_snapshot_superseded" in str(result.results[0].error)
+        assert len(result.results) == 1
+
+    @pytest.mark.asyncio
+    async def test_batch_observe_awaits_async_ref_publication(self) -> None:
+        async def dispatch(step: ExecuteStep, ref_map: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+            if step.tool == "observe":
+                return {"elements": [{"ref": "e0", "role": "button", "name": "Sign In"}], "element_count": 1}
+            if step.params["ref"] not in ref_map:
+                raise ValueError("missing accepted ref")
+            return None
+
+        publication_started = False
+
+        async def publish(_ref_map: dict[str, dict[str, Any]]) -> bool:
+            nonlocal publication_started
+            publication_started = True
+            return True
+
+        result = await do_execute(
+            dispatch,
+            [ExecuteStep(tool="observe"), ExecuteStep(tool="click", params={"ref": "e0"})],
+            on_ref_map_update=publish,
+        )
+
+        assert publication_started is True
+        assert result.error_step is None
 
     @pytest.mark.asyncio
     async def test_observe_started_during_navigation_is_discarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1595,15 +1785,19 @@ class TestSkyvernExecuteMCP:
 
     @pytest.mark.asyncio
     async def test_popup_mid_batch_invalidates_batch_refs(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A page change between an in-batch observe and a ref step must not resolve stale refs."""
+        """A page change before ref publication rejects the unpublished observe snapshot."""
+        monkeypatch.delenv("SKYVERN_MCP_OBSERVE_V2", raising=False)
         page_a = _make_page()
         page_b = _make_page()
         ctx = BrowserContext(mode="cloud_session", session_id="pbs_popup_batch")
-        monkeypatch.setattr(
-            mcp_browser,
-            "get_page",
-            AsyncMock(side_effect=[(page_a, ctx), (page_a, ctx), (page_b, ctx)]),
-        )
+        calls = 0
+
+        async def get_page(**_kwargs: Any) -> tuple[Any, BrowserContext]:
+            nonlocal calls
+            calls += 1
+            return (page_a, ctx) if calls <= 2 else (page_b, ctx)
+
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(side_effect=get_page))
 
         async with scoped_session(make_session_state(context=ctx)):
             result = await mcp_browser.skyvern_execute(
@@ -1614,6 +1808,9 @@ class TestSkyvernExecuteMCP:
                 session_id=ctx.session_id,
             )
 
+        assert result["ok"] is False
+        assert len(result["data"]["results"]) == 2
+        assert result["data"]["results"][0]["ok"] is True
         assert result["data"]["results"][1]["error"] == ("Unknown ref 'e0' — call observe first or check ref exists")
 
     @pytest.mark.asyncio
@@ -1626,11 +1823,14 @@ class TestSkyvernExecuteMCP:
         page_b = _make_page()
         page_b.url = "https://example.com/popup"
         ctx = BrowserContext(mode="cloud_session", session_id="pbs_popup_before_observe")
-        monkeypatch.setattr(
-            mcp_browser,
-            "get_page",
-            AsyncMock(side_effect=[(page_a, ctx), (page_b, ctx), (page_b, ctx)]),
-        )
+        calls = 0
+
+        async def get_page(**_kwargs: Any) -> tuple[Any, BrowserContext]:
+            nonlocal calls
+            calls += 1
+            return (page_a, ctx) if calls == 1 else (page_b, ctx)
+
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(side_effect=get_page))
         monkeypatch.setattr(mcp_browser, "skyvern_evaluate", AsyncMock(return_value={"ok": True, "data": None}))
         click = AsyncMock(return_value={"ok": True, "data": None})
         monkeypatch.setattr(mcp_browser, "skyvern_click", click)

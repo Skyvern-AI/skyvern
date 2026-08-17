@@ -6,6 +6,7 @@ import yaml
 from skyvern.forge.sdk.copilot.code_block_steps import (
     analyze_code_actions,
     apply_derived_code_block_steps,
+    bind_referenced_parameters_in_yaml,
     derive_code_block_steps,
     derive_code_block_steps_in_yaml,
     fill_code_block_prompts_in_yaml,
@@ -201,6 +202,94 @@ def test_derive_in_yaml_noop_on_unparseable():
     assert derive_code_block_steps_in_yaml("::not yaml::") == "::not yaml::"
 
 
+def _workflow_with(code, parameter_keys=None, parameters=(("site_credentials", "credential_id"),)):
+    block = {"block_type": "code", "label": "authenticate", "code": code}
+    if parameter_keys is not None:
+        block["parameter_keys"] = parameter_keys
+    return yaml.safe_dump(
+        {
+            "workflow_definition": {
+                "parameters": [{"key": key, "parameter_type": kind} for key, kind in parameters],
+                "blocks": [block],
+            }
+        }
+    )
+
+
+def _bound_keys(src):
+    return yaml.safe_load(bind_referenced_parameters_in_yaml(src))["workflow_definition"]["blocks"][0].get(
+        "parameter_keys"
+    )
+
+
+def test_bind_adds_a_declared_parameter_the_code_names():
+    # Recorded defect: the submission declares the parameter and the code uses it, but the
+    # block omits parameter_keys, so the name is missing from runtime scope and the block
+    # raises NameError after the login has already happened.
+    src = _workflow_with("await page.get_by_label('Email').fill(site_credentials.username)\n")
+    assert _bound_keys(src) == ["site_credentials"]
+
+
+def test_bind_keeps_existing_keys_and_appends_only_what_is_missing():
+    src = _workflow_with(
+        "print(run_id, site_credentials.password)\n",
+        parameter_keys=["run_id"],
+        parameters=(("site_credentials", "credential_id"), ("run_id", "string")),
+    )
+    assert _bound_keys(src) == ["run_id", "site_credentials"]
+
+
+def test_bind_ignores_names_the_workflow_never_declared():
+    src = _workflow_with("print(undeclared_secret)\n")
+    assert _bound_keys(src) is None
+
+
+def test_bind_does_not_match_a_declared_key_inside_a_longer_name():
+    src = _workflow_with("print(site_credentials.username)\n", parameters=(("credentials", "string"),))
+    assert _bound_keys(src) is None
+
+
+def test_bind_ignores_a_name_that_only_appears_in_a_docstring_or_string():
+    # Binding puts the real value in the block's scope, so a textual mention must not be
+    # enough: a docstring naming the key would hand a credential to code that never read it.
+    src = _workflow_with('"""Reads site_credentials from the vault."""\nprint("site_credentials")\n')
+    assert _bound_keys(src) is None
+
+
+def test_bind_ignores_a_name_the_code_only_assigns():
+    # A block defining its own name has not read the parameter; binding it there would widen
+    # the real value's scope to code that never asked for it.
+    src = _workflow_with('site_credentials = {"user": "local"}\nawait page.goto("https://x.test/")\n')
+    assert _bound_keys(src) is None
+
+
+def test_bind_skips_a_key_the_executor_reserves():
+    # `password` resolves to a bound credential's secret in the executor namespace, so binding
+    # a parameter under that name hands the block the credential instead of the parameter.
+    src = _workflow_with("print(password)\n", parameters=(("password", "string"),))
+    assert _bound_keys(src) is None
+
+
+def test_bind_noop_on_unparseable_code():
+    # Nothing is bound rather than everything: an unparseable block names no identifiers.
+    src = _workflow_with("def broken(:\n")
+    assert _bound_keys(src) is None
+
+
+def test_bind_is_idempotent_so_callers_can_bind_before_the_seam():
+    # Callers bind their own copy before conversion, or the converted workflow and the text the
+    # user accepts disagree about a block's scope: the run gets the keys, the saved document
+    # does not, and the block dies on the NameError binding exists to prevent.
+    src = _workflow_with("await page.get_by_label('Email').fill(site_credentials.username)\n")
+    once = bind_referenced_parameters_in_yaml(src)
+    assert bind_referenced_parameters_in_yaml(once) == once
+    assert yaml.safe_load(once)["workflow_definition"]["blocks"][0]["parameter_keys"] == ["site_credentials"]
+
+
+def test_bind_noop_on_unparseable():
+    assert bind_referenced_parameters_in_yaml("::not yaml::") == "::not yaml::"
+
+
 def test_fill_prompts_preserves_prior_block_prompt_across_regen():
     # Regenerating a code block replaces the whole block YAML, dropping the goal.
     # Without the prompt the editor renders the legacy code-only layout, so the
@@ -290,6 +379,34 @@ async def test_process_workflow_yaml_derives_code_block_steps_for_replace_path()
     block = wf.workflow_definition.blocks[0]
     assert block.steps is not None
     assert [s.action_type for s in block.steps] == [ActionType.GOTO_URL, ActionType.CLICK]
+
+
+@pytest.mark.asyncio
+async def test_process_workflow_yaml_binds_a_parameter_the_code_names():
+    from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+
+    yaml_str = (
+        "title: Login\n"
+        "workflow_definition:\n"
+        "  parameters:\n"
+        "  - key: site_login\n"
+        "    parameter_type: workflow\n"
+        "    workflow_parameter_type: string\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: authenticate\n"
+        "    code: |\n"
+        "      await page.get_by_label('Email').fill(site_login)\n"
+    )
+    wf = await _process_workflow_yaml(
+        workflow_id="w_1",
+        settings_fallback_yaml="enable_self_healing: false",
+        workflow_permanent_id="wpid_1",
+        organization_id="o_1",
+        workflow_yaml=yaml_str,
+    )
+    block = wf.workflow_definition.blocks[0]
+    assert [parameter.key for parameter in block.parameters] == ["site_login"]
 
 
 @pytest.mark.asyncio

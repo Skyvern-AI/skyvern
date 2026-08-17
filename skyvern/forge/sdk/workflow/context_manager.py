@@ -1,6 +1,6 @@
 import copy
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Self
 
@@ -171,6 +171,20 @@ class WorkflowRunContext:
 
             workflow_run_context.parameters[parameter.key] = parameter
             workflow_run_context.values[parameter.key] = run_parameter.value
+
+        # An at-will credential (credential_id type, no default) that was not provided has
+        # no run-parameter row (the value column is NOT NULL), so backfill it as explicit
+        # None: blocks and templates referencing it must resolve instead of raising KeyError.
+        if workflow is not None:
+            for definition_parameter in workflow.workflow_definition.parameters:
+                if (
+                    isinstance(definition_parameter, WorkflowParameter)
+                    and definition_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+                    and definition_parameter.default_value is None
+                    and definition_parameter.key not in workflow_run_context.values
+                ):
+                    workflow_run_context.parameters[definition_parameter.key] = definition_parameter
+                    workflow_run_context.values[definition_parameter.key] = None
 
         for output_parameter in workflow_output_parameters:
             if output_parameter.key in workflow_run_context.parameters:
@@ -432,6 +446,37 @@ class WorkflowRunContext:
             self.workflow_run_id,
             properties={"organization_id": self.organization_id},
         )
+
+    def credential_template_entries(
+        self,
+        declared_parameter_keys: Iterable[str],
+        *,
+        resolve_credential_dicts: bool,
+    ) -> dict[str, Any]:
+        """Template entries for the credential parameters a block declares. Secrets never enter
+        template data for parameters the block did not declare — the same boundary the block
+        execution namespace applies — so the copilot approval gate can scope to declared references."""
+        entries: dict[str, Any] = {}
+        for key in declared_parameter_keys:
+            value = self.values.get(key)
+            if not isinstance(value, dict) or "context" not in value:
+                continue
+            has_password_shape = "username" in value and "password" in value
+            if not has_password_shape and "secret_value" not in value:
+                continue
+            entries[f"{key}_real_username"] = self.secrets.get(value.get("username", ""), "")
+            entries[f"{key}_real_password"] = self.secrets.get(value.get("password", ""), "")
+            if resolve_credential_dicts:
+                resolved_credential = value.copy()
+                for credential_field, credential_placeholder in value.items():
+                    if credential_field == "context":
+                        continue
+                    secret_value = self.get_original_secret_value_or_none(credential_placeholder)
+                    if secret_value is not None:
+                        resolved_credential[credential_field] = secret_value
+                resolved_credential.pop("context", None)
+                entries[key] = resolved_credential
+        return entries
 
     def get_original_secret_value_or_none(self, secret_id_or_value: Any) -> Any:
         """

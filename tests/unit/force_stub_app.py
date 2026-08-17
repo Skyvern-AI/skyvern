@@ -46,15 +46,6 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.allow_copilot_inline_code_execution = MagicMock(return_value=False)
     fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_org_lookups = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.get_mcp_request_organization_id = MagicMock(return_value=None)
-    fake_app_module.AGENT_FUNCTION.begin_browser_observation = MagicMock(return_value=None)
-    fake_app_module.AGENT_FUNCTION.record_browser_observation_failure = MagicMock(return_value=None)
-    fake_app_module.AGENT_FUNCTION.inspect_browser_observation = AsyncMock(return_value=None)
-    fake_app_module.AGENT_FUNCTION.needs_browser_observation_text = MagicMock(return_value=False)
-    fake_app_module.AGENT_FUNCTION.transform_browser_elements_for_prompt = MagicMock(side_effect=lambda value: value)
-    fake_app_module.AGENT_FUNCTION.inspect_browser_dialog = AsyncMock(return_value=False)
-    fake_app_module.AGENT_FUNCTION.should_dismiss_browser_dialog = MagicMock(return_value=False)
-    fake_app_module.AGENT_FUNCTION.should_block_browser_action = MagicMock(return_value=False)
-    fake_app_module.AGENT_FUNCTION.enforce_browser_action_policy = MagicMock(return_value=None)
     # Sync method returning a key or None — _LazyNamespace would auto-mock it as a truthy
     # AsyncMock and hijack the TextPromptBlock llm_key. Match the OSS no-op.
     fake_app_module.AGENT_FUNCTION.get_fallback_llm_key = MagicMock(return_value=None)
@@ -75,6 +66,7 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
     fake_app_module.DATABASE.tasks.get_last_task_for_workflow_run = AsyncMock()
     fake_app_module.DATABASE.workflow_runs.get_workflow_run = AsyncMock()
+    fake_app_module.DATABASE.workflow_runs.get_secure_runner_pin = AsyncMock(return_value=None)
     fake_app_module.DATABASE.observer.get_workflow_run_block = AsyncMock()
     fake_app_module.DATABASE.tasks.get_task = AsyncMock()
     fake_app_module.DATABASE.tasks.update_task = AsyncMock()

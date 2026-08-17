@@ -153,7 +153,7 @@ For local installations, run `skyvern init` to generate a local API key, which w
 <Accordion title="How do I change the LLM model?">
 **Cloud:** The model is managed by Skyvern. Contact support for custom model requirements.
 
-**Self-hosted:** Run `skyvern init` to reconfigure, or set these environment variables:
+**Self-hosted:** Run `skyvern init llm` to reconfigure, or set these environment variables:
 - `LLM_KEY`: Primary model (e.g., `OPENAI_GPT5_5`, `ANTHROPIC_CLAUDE4.7_OPUS`)
 - `SECONDARY_LLM_KEY`: Optional lightweight model for faster operations
 </Accordion>
@@ -355,7 +355,7 @@ OPENAI_API_KEY=sk-...
 LLM_KEY=OPENAI_GPT5_5
 ```
 
-Skyvern supports OpenAI, Anthropic, Azure OpenAI, AWS Bedrock, Gemini, and Ollama. Run `skyvern init` for guided configuration.
+Skyvern supports OpenAI, Anthropic, Azure OpenAI, AWS Bedrock, Gemini, and Ollama. Run `skyvern init llm` for guided configuration.
 </Accordion>
 
 ---

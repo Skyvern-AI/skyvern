@@ -14,13 +14,16 @@ def _serialize(
 ) -> dict[str, Any]:
     # Allowlist rather than a model dump: both source models are token-free today,
     # so a dump would start leaking the day either one gains a token field.
-    return {
+    result: dict[str, Any] = {
         "connection_id": credential.id,
         "provider": provider,
         "name": credential.credential_name,
         "state": credential.state,
         "scopes_granted": list(credential.scopes_granted),
     }
+    if credential.email_address:
+        result["email_address"] = credential.email_address
+    return result
 
 
 async def _list_integrations(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:

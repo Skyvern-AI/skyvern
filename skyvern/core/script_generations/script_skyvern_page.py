@@ -4,7 +4,6 @@ import asyncio
 import inspect
 import os
 import re
-import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -23,9 +22,6 @@ from skyvern.core.script_generations.skyvern_page import (
     ResolvedSensitiveValue,
     RunContext,
     SkyvernPage,
-    _get_page_ai,
-    _get_raw_page,
-    _SkyvernPageBase,
 )
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.errors.errors import UserDefinedError
@@ -44,7 +40,6 @@ from skyvern.forge.sdk.api.files import (
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.browser_action_preflight import preflight_action
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.utils import ACTION_TYPE_TO_CLASS
@@ -52,7 +47,7 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import generate_totp_code
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services.otp_service import poll_otp_value
-from skyvern.utils.url_validators import prepend_scheme_and_validate_url, validate_fetch_url
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -79,17 +74,7 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
-action_wrap = _SkyvernPageBase.action_wrap
-
-_SCRIPT_SCRAPED_PAGES: weakref.WeakKeyDictionary[object, ScrapedPage] = weakref.WeakKeyDictionary()
-
-
-def _get_scraped_page(page: object) -> ScrapedPage:
-    return _SCRIPT_SCRAPED_PAGES[page]
-
-
-def _set_scraped_page(page: object, scraped_page: ScrapedPage) -> None:
-    _SCRIPT_SCRAPED_PAGES[page] = scraped_page
+action_wrap = SkyvernPage.action_wrap
 
 
 class ScriptSkyvernPage(SkyvernPage):
@@ -109,10 +94,8 @@ class ScriptSkyvernPage(SkyvernPage):
         recorder: Callable[[ActionCall], None] | None = None,
         engine_selection: BrowserEngineSelection | None = None,
     ) -> None:
-        _SkyvernPageBase.__init__(self, page=page, ai=ai, engine_selection=engine_selection)
-        _set_scraped_page(self, scraped_page)
-        if type(ai) is RealSkyvernPageAi:
-            ai._bind_page(self)
+        super().__init__(page=page, ai=ai, engine_selection=engine_selection)
+        self.scraped_page = scraped_page
         self._record = recorder or (lambda ac: None)
 
     @classmethod
@@ -183,7 +166,7 @@ class ScriptSkyvernPage(SkyvernPage):
         cls,
         browser_session_id: str | None = None,
         url: str | None = None,
-    ) -> SkyvernPage:
+    ) -> ScriptSkyvernPage:
         scraped_page = await cls.create_scraped_page(browser_session_id=browser_session_id, url=url)
         page = await scraped_page._browser_state.must_get_working_page()
         ai = RealSkyvernPageAi(scraped_page, page)
@@ -240,76 +223,6 @@ class ScriptSkyvernPage(SkyvernPage):
             timeout=download_timeout,
         )
 
-    @staticmethod
-    def _build_policy_action(action_type: ActionType, values: dict[str, Any]) -> Action:
-        """Build the exact action model the agent sink projects for this wrapper call."""
-
-        def text(name: str, fallback: str = "") -> str:
-            value = values.get(name)
-            return value if isinstance(value, str) else fallback
-
-        fields: dict[str, Any] = {"action_type": action_type}
-        subclass = ACTION_TYPE_TO_CLASS[action_type]
-        if "element_id" in subclass.model_fields:
-            fields["element_id"] = text("selector")
-        if action_type is ActionType.INPUT_TEXT:
-            fields.update(
-                text=text("value"),
-                totp_identifier=text("totp_identifier") or None,
-                totp_url=text("totp_url") or None,
-            )
-        elif action_type is ActionType.UPLOAD_FILE:
-            fields["file_url"] = text("files")
-        elif action_type is ActionType.SELECT_OPTION:
-            fields["option"] = SelectOption(value=text("value"))
-        elif action_type is ActionType.DOWNLOAD_FILE:
-            fields.update(file_name=text("file_name", "download"), download_url=text("download_url") or None)
-        elif action_type is ActionType.GOTO_URL:
-            raw_url = text("url", "https://example.invalid/")
-            fields["url"] = prepend_scheme_and_validate_url(render_template(raw_url))
-        elif action_type is ActionType.VERIFICATION_CODE:
-            fields["verification_code"] = ""
-        elif action_type is ActionType.KEYPRESS:
-            fields["keys"] = values.get("keys") if isinstance(values.get("keys"), list) else []
-        elif action_type is ActionType.LEFT_MOUSE:
-            fields["direction"] = values.get("direction") if values.get("direction") in ("down", "up") else "down"
-
-        for name in ("x", "y", "scroll_x", "scroll_y", "start_x", "start_y", "path", "hold"):
-            if name in values and name in subclass.model_fields:
-                fields[name] = values[name]
-        if action_type is ActionType.KEYPRESS and isinstance(values.get("duration"), (int, float)):
-            fields["duration"] = int(values["duration"])
-        return subclass(**fields)
-
-    def _guard_cached_action(
-        self,
-        action_type: ActionType,
-        values: dict[str, Any],
-    ) -> Action:
-        action = self._build_policy_action(action_type, values)
-        preflight_action(action, _get_raw_page(self), site="cached_script_action")
-        app.AGENT_FUNCTION.enforce_browser_action_policy(action_type)
-        return action
-
-    def _guard_cached_call(
-        self,
-        fn: Callable,
-        action_type: ActionType,
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-    ) -> Action:
-        values = dict(kwargs)
-        try:
-            bound = inspect.signature(fn).bind_partial(self, *args, **kwargs)
-            values.update({name: value for name, value in bound.arguments.items() if name not in ("self", "kwargs")})
-            nested_kwargs = bound.arguments.get("kwargs")
-            if isinstance(nested_kwargs, dict):
-                values.update(nested_kwargs)
-        except TypeError:
-            if args:
-                values.setdefault("selector", args[0])
-        return self._guard_cached_action(action_type, values)
-
     async def _decorate_call(
         self,
         fn: Callable,
@@ -323,9 +236,6 @@ class ScriptSkyvernPage(SkyvernPage):
         Auto-creates action records in DB before action execution
         and screenshot artifacts after action execution.
         """
-        # Reuse the agent action model and emitter. Cached plans intentionally remain unstamped,
-        # so an enrolled policy denies them until a current-observation provenance seam exists.
-        self._guard_cached_call(fn, action, args, kwargs)
 
         prompt = kwargs.get("prompt", "")
 
@@ -367,8 +277,6 @@ class ScriptSkyvernPage(SkyvernPage):
             except Exception:
                 pass  # Don't block action execution if file listing fails
 
-        url_before = _get_raw_page(self).url
-        navigation_observed = action in (ActionType.RELOAD_PAGE, ActionType.GOTO_URL)
         # Stamped after the download-detection baseline (a listdir plus an awaited storage
         # lookup): the window starts at the action itself, matching finished_at's cut before
         # the post-action scan.
@@ -383,18 +291,7 @@ class ScriptSkyvernPage(SkyvernPage):
             # to inject them.  Skipping the upfront DOM scrape saves ~1-2s
             # per cached action on pages that don't need AI fallback.
 
-            try:
-                call.result = await fn(self, *args, **kwargs)
-            finally:
-                navigation_observed = navigation_observed or _get_raw_page(self).url != url_before
-
-            # Keep the scraped page current for the egress guard's next policy check. Cached scripts
-            # only run when the guard is off (should_use_cached_browser_scripts), so skip this on that
-            # path — it has no security benefit and would add a full DOM scrape per navigating action.
-            # Kept out of `finally` so a refresh failure can't mask the action error or skip the
-            # action-record/screenshot writes below.
-            if navigation_observed and not app.AGENT_FUNCTION.should_use_cached_browser_scripts():
-                await self._refresh_scraped_page_after_navigation()
+            call.result = await fn(self, *args, **kwargs)
 
             # Note: Action status would be updated to completed here if update method existed
 
@@ -504,22 +401,6 @@ class ScriptSkyvernPage(SkyvernPage):
 
             # Auto-create HTML artifact after execution
             await self._create_html_action_after_execution()
-
-    async def _refresh_scraped_page_after_navigation(self) -> None:
-        try:
-            # A benign navigation can land on a blank/interactable-less page; that is not a scan
-            # failure, so tolerate it here instead of raising and failing the whole action closed.
-            refreshed_page = await _get_scraped_page(self).generate_scraped_page(
-                take_screenshots=False, support_empty_page=True
-            )
-        except Exception:
-            app.AGENT_FUNCTION.record_browser_observation_failure("script_page_navigation_refresh_error")
-            raise
-
-        _set_scraped_page(self, refreshed_page)
-        page_ai = _get_page_ai(self)
-        if isinstance(page_ai, RealSkyvernPageAi):
-            page_ai.scraped_page = refreshed_page
 
     async def _update_action_reasoning(
         self,
@@ -930,12 +811,12 @@ class ScriptSkyvernPage(SkyvernPage):
         3. DOM stability (no significant mutations for 300ms)
         """
         try:
-            # Note: SkyvernPage uses _get_raw_page(self), not self._page
-            if not _get_raw_page(self):
+            # Note: SkyvernPage uses self.page, not self._page
+            if not self.page:
                 return
 
             skyvern_frame = await SkyvernFrame.create_instance(
-                frame=_get_raw_page(self),
+                frame=self.page,
                 engine_selection=self.engine_selection,
             )
             await skyvern_frame.wait_for_page_ready(
@@ -958,18 +839,18 @@ class ScriptSkyvernPage(SkyvernPage):
         tree before executing cached actions on a new page.
         """
         try:
-            if not _get_raw_page(self):
+            if not self.page:
                 return
 
             # Quick check: do unique_id attributes already exist?
-            has_unique_ids = await _get_raw_page(self).evaluate("() => document.querySelector('[unique_id]') !== null")
+            has_unique_ids = await self.page.evaluate("() => document.querySelector('[unique_id]') !== null")
             if has_unique_ids:
                 return
 
             # Inject domUtils.js and build the element tree to set unique_id attrs.
             # Use a short timeout since this is best-effort; we don't want to hang for 60s.
             skyvern_frame = await SkyvernFrame.create_instance(
-                frame=_get_raw_page(self),
+                frame=self.page,
                 engine_selection=self.engine_selection,
             )
             await skyvern_frame.build_tree_from_body(
@@ -1159,6 +1040,7 @@ class ScriptSkyvernPage(SkyvernPage):
 
     async def goto(self, url: str, **kwargs: Any) -> None:
         url = render_template(url)
+        url = await asyncio.to_thread(validate_fetch_url, url)
 
         # Print navigation in script mode
         context = skyvern_context.current()
@@ -1172,22 +1054,15 @@ class ScriptSkyvernPage(SkyvernPage):
         # Retry logic matching agent mode (real_browser_state.navigate_to_url)
         last_error: Exception | None = None
         for attempt in range(max_retries):
-            # Origin-authority policy runs before the network-touching SSRF/DNS check below, so a
-            # blocked origin fails closed with ActionPolicyBlocked instead of an unrelated DNS error.
-            self._guard_cached_action(ActionType.GOTO_URL, {"url": url})
-            url = await asyncio.to_thread(validate_fetch_url, url)
             try:
-                await _get_raw_page(self).goto(url, timeout=timeout, **kwargs)
+                await self.page.goto(url, timeout=timeout, **kwargs)
+                if is_script_mode:
+                    LOG.debug("Page loaded")
+                return
             except Exception as e:
                 last_error = e
-                # A timed-out navigation may still commit; refresh before the next policy check.
-                if not app.AGENT_FUNCTION.should_use_cached_browser_scripts():
-                    await self._refresh_scraped_page_after_navigation()
                 if attempt >= max_retries - 1:
                     break
-                # A timed-out request may already have committed a new document. Decide against
-                # that refreshed state before yielding, then decide again at the next live sink.
-                self._guard_cached_action(ActionType.GOTO_URL, {"url": url})
                 LOG.warning(
                     "Navigation attempt failed, retrying",
                     url=url,
@@ -1196,13 +1071,6 @@ class ScriptSkyvernPage(SkyvernPage):
                     error=str(e),
                 )
                 await asyncio.sleep(1)
-                continue
-
-            if not app.AGENT_FUNCTION.should_use_cached_browser_scripts():
-                await self._refresh_scraped_page_after_navigation()
-            if is_script_mode:
-                LOG.debug("Page loaded")
-            return
 
         if last_error is None:
             raise RuntimeError("Navigation failed but no error was captured")
@@ -1215,7 +1083,7 @@ class ScriptSkyvernPage(SkyvernPage):
         context = skyvern_context.current()
         if not context or not context.organization_id or not context.task_id or not context.step_id:
             # Fallback: solve directly without DB context
-            await app.AGENT_FUNCTION.auto_solve_captchas(_get_raw_page(self))
+            await app.AGENT_FUNCTION.auto_solve_captchas(self.page)
             return None
 
         task = await app.DATABASE.tasks.get_task(context.task_id, context.organization_id)
@@ -1227,7 +1095,7 @@ class ScriptSkyvernPage(SkyvernPage):
                 task_id=context.task_id,
                 step_id=context.step_id,
             )
-            await solve_captcha_handler(action, _get_raw_page(self), _get_scraped_page(self), task, step)
+            await solve_captcha_handler(action, self.page, self.scraped_page, task, step)
         else:
             await asyncio.sleep(30)
 
@@ -1285,8 +1153,8 @@ class ScriptSkyvernPage(SkyvernPage):
                 # AI-generated cached scripts still get LLM verification.
                 verified=bool(context.is_static_script),
             )
-            # result = await ActionHandler.handle_action(_get_scraped_page(self), task, step, _get_raw_page(self), action)
-            result = await handle_complete_action(action, _get_raw_page(self), _get_scraped_page(self), task, step)
+            # result = await ActionHandler.handle_action(self.scraped_page, task, step, self.page, action)
+            result = await handle_complete_action(action, self.page, self.scraped_page, task, step)
             if result and result[-1].success is False:
                 # Coerce empty/None messages so downstream str(e) is meaningful.
                 msg = result[-1].exception_message or "complete-verify rejected without a message"
@@ -1327,7 +1195,7 @@ class ScriptSkyvernPage(SkyvernPage):
                 reasoning="; ".join(errors) if errors else None,
             )
             try:
-                await handle_terminate_action(action, _get_raw_page(self), _get_scraped_page(self), task, step)
+                await handle_terminate_action(action, self.page, self.scraped_page, task, step)
             except Exception:
                 LOG.warning("handle_terminate_action failed during script terminate()", exc_info=True)
 

@@ -8,13 +8,7 @@ import aiohttp
 import pytest
 
 from skyvern.exceptions import BlockedHost, HttpException
-from skyvern.forge.sdk.core.aiohttp_helper import (
-    SSRFGuardedResolver,
-    aiohttp_delete,
-    aiohttp_request,
-    strip_cross_origin_redirect_credentials,
-)
-from skyvern.forge.sdk.core.http_request_authorization import RedirectHopAuthorization
+from skyvern.forge.sdk.core.aiohttp_helper import SSRFGuardedResolver, aiohttp_delete, aiohttp_request
 from skyvern.utils.url_validators import MAX_SAFE_REDIRECTS, validate_fetch_url
 
 
@@ -24,33 +18,6 @@ def public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
         return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
 
     monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_public)
-
-
-def test_redirect_credentials_strip_on_invalid_idna_host() -> None:
-    invalid_host = "a" * 64
-
-    headers, cookies = strip_cross_origin_redirect_credentials(
-        {"Authorization": "Bearer secret", "X-Keep": "1"},
-        {"session": "secret"},
-        f"https://{invalid_host}.example/start",
-        "https://other.example/final",
-        strip_cross_origin_credentials=True,
-    )
-
-    assert headers == {"X-Keep": "1"}
-    assert cookies is None
-
-
-def test_redirect_credentials_not_stripped_by_default() -> None:
-    headers, cookies = strip_cross_origin_redirect_credentials(
-        {"Authorization": "Bearer secret", "X-Keep": "1"},
-        {"session": "secret"},
-        "https://example.com/start",
-        "https://other.example/final",
-    )
-
-    assert headers == {"X-Keep": "1"}
-    assert cookies is None
 
 
 @pytest.mark.asyncio
@@ -758,83 +725,6 @@ async def test_aiohttp_request_follows_safe_redirect() -> None:
 
 
 @pytest.mark.asyncio
-async def test_aiohttp_request_authorizes_every_validated_redirect_hop() -> None:
-    redirect_one = AsyncMock()
-    redirect_one.status = 302
-    redirect_one.headers = {"Location": "/middle"}
-    redirect_one.__aenter__ = AsyncMock(return_value=redirect_one)
-    redirect_one.__aexit__ = AsyncMock(return_value=None)
-
-    redirect_two = AsyncMock()
-    redirect_two.status = 307
-    redirect_two.headers = {"Location": "https://example.com/final"}
-    redirect_two.__aenter__ = AsyncMock(return_value=redirect_two)
-    redirect_two.__aexit__ = AsyncMock(return_value=None)
-
-    final_response = AsyncMock()
-    final_response.status = 200
-    final_response.headers = {"Content-Type": "application/json"}
-    final_response.json = AsyncMock(return_value={"success": True})
-    final_response.text = AsyncMock(return_value='{"success": true}')
-    final_response.__aenter__ = AsyncMock(return_value=final_response)
-    final_response.__aexit__ = AsyncMock(return_value=None)
-
-    responses = [redirect_one, redirect_two, final_response]
-    mock_session = MagicMock()
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=None)
-    mock_session.request = MagicMock(side_effect=lambda *_args, **_kwargs: responses.pop(0))
-    authorizations: list[RedirectHopAuthorization] = []
-
-    async def authorize(authorization: RedirectHopAuthorization, dispatch: object) -> object:
-        authorizations.append(authorization)
-        return await dispatch(())  # type: ignore[operator]
-
-    with patch("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", return_value=mock_session):
-        status, _headers, body = await aiohttp_request(
-            method="POST",
-            url="https://example.com/start",
-            follow_redirects=True,
-            authorize_request_hop=authorize,
-        )
-
-    assert status == 200
-    assert body == {"success": True}
-    assert authorizations == [
-        RedirectHopAuthorization(None, "https://example.com/start", "POST"),
-        RedirectHopAuthorization("https://example.com/start", "https://example.com/middle", "GET"),
-        RedirectHopAuthorization("https://example.com/middle", "https://example.com/final", "GET"),
-    ]
-    assert mock_session.request.call_count == 3
-
-
-@pytest.mark.asyncio
-async def test_aiohttp_policy_grant_cannot_bypass_ssrf_lower_bound(monkeypatch: pytest.MonkeyPatch) -> None:
-    def resolves_private(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
-        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.42", port or 0))]
-
-    async def allow(_authorization: RedirectHopAuthorization, dispatch: object) -> object:
-        return await dispatch(())  # type: ignore[operator]
-
-    authorizer = AsyncMock(side_effect=allow)
-    client_session = MagicMock()
-    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_private)
-
-    with (
-        patch("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", client_session),
-        pytest.raises(BlockedHost),
-    ):
-        await aiohttp_request(
-            method="GET",
-            url="https://evil.example.test/secret",
-            authorize_request_hop=authorizer,
-        )
-
-    authorizer.assert_not_awaited()
-    client_session.assert_not_called()
-
-
-@pytest.mark.asyncio
 async def test_aiohttp_request_strips_credentials_on_cross_origin_redirect() -> None:
     redirect_response = AsyncMock()
     redirect_response.status = 302
@@ -871,7 +761,6 @@ async def test_aiohttp_request_strips_credentials_on_cross_origin_redirect() -> 
             headers={"Authorization": "Bearer secret", "Cookie": "sid=abc", "X-Keep": "1"},
             cookies={"session": "abc"},
             follow_redirects=True,
-            strip_cross_origin_credentials=True,
         )
 
     assert requested_headers[0]["Authorization"] == "Bearer secret"
@@ -879,125 +768,6 @@ async def test_aiohttp_request_strips_credentials_on_cross_origin_redirect() -> 
     assert requested_cookies[0] == {"session": "abc"}
     assert requested_headers[1] == {"X-Keep": "1"}
     assert requested_cookies[1] is None
-
-
-@pytest.mark.asyncio
-async def test_aiohttp_request_keeps_credentials_when_strip_is_disabled() -> None:
-    redirect_response = AsyncMock()
-    redirect_response.status = 302
-    redirect_response.headers = {"Location": "https://other.example.com/final"}
-    redirect_response.__aenter__ = AsyncMock(return_value=redirect_response)
-    redirect_response.__aexit__ = AsyncMock(return_value=None)
-
-    final_response = AsyncMock()
-    final_response.status = 200
-    final_response.headers = {"Content-Type": "application/json"}
-    final_response.json = AsyncMock(return_value={"success": True})
-    final_response.text = AsyncMock(return_value='{"success": true}')
-    final_response.__aenter__ = AsyncMock(return_value=final_response)
-    final_response.__aexit__ = AsyncMock(return_value=None)
-
-    responses = [redirect_response, final_response]
-    requested_headers: list[dict[str, str]] = []
-    requested_cookies: list[dict[str, str] | None] = []
-
-    def capture_request(*args: Any, **kwargs: Any) -> AsyncMock:
-        requested_headers.append(kwargs["headers"])
-        requested_cookies.append(kwargs["cookies"])
-        return responses.pop(0)
-
-    mock_session = MagicMock()
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=None)
-    mock_session.request = MagicMock(side_effect=capture_request)
-
-    with patch("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", return_value=mock_session):
-        await aiohttp_request(
-            method="GET",
-            url="https://example.com/start",
-            headers={"Authorization": "Bearer secret", "Cookie": "sid=abc", "X-Keep": "1"},
-            cookies={"session": "abc"},
-            follow_redirects=True,
-            strip_cross_origin_credentials=False,
-        )
-
-    assert requested_headers[0] == {"Authorization": "Bearer secret", "Cookie": "sid=abc", "X-Keep": "1"}
-    assert requested_cookies[0] == {"session": "abc"}
-    assert requested_headers[1] == {"Authorization": "Bearer secret", "Cookie": "sid=abc", "X-Keep": "1"}
-    assert requested_cookies[1] == {"session": "abc"}
-
-
-@pytest.mark.asyncio
-async def test_aiohttp_request_strips_credentials_by_default_on_cross_origin_redirect() -> None:
-    redirect_response = AsyncMock()
-    redirect_response.status = 302
-    redirect_response.headers = {"Location": "https://other.example.com/final"}
-    redirect_response.__aenter__ = AsyncMock(return_value=redirect_response)
-    redirect_response.__aexit__ = AsyncMock(return_value=None)
-
-    final_response = AsyncMock()
-    final_response.status = 200
-    final_response.headers = {"Content-Type": "application/json"}
-    final_response.json = AsyncMock(return_value={"success": True})
-    final_response.text = AsyncMock(return_value='{"success": true}')
-    final_response.__aenter__ = AsyncMock(return_value=final_response)
-    final_response.__aexit__ = AsyncMock(return_value=None)
-
-    responses = [redirect_response, final_response]
-    requested_headers: list[dict[str, str]] = []
-    requested_cookies: list[dict[str, str] | None] = []
-
-    def capture_request(*args: Any, **kwargs: Any) -> AsyncMock:
-        requested_headers.append(kwargs["headers"])
-        requested_cookies.append(kwargs["cookies"])
-        return responses.pop(0)
-
-    mock_session = MagicMock()
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=None)
-    mock_session.request = MagicMock(side_effect=capture_request)
-
-    with patch("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", return_value=mock_session):
-        await aiohttp_request(
-            method="GET",
-            url="https://example.com/start",
-            headers={"Authorization": "Bearer secret", "Cookie": "sid=abc", "X-Keep": "1"},
-            cookies={"session": "abc"},
-            follow_redirects=True,
-        )
-
-    assert requested_headers[0]["Authorization"] == "Bearer secret"
-    assert requested_headers[0]["Cookie"] == "sid=abc"
-    assert requested_cookies[0] == {"session": "abc"}
-    assert requested_headers[1] == {"X-Keep": "1"}
-    assert requested_cookies[1] is None
-
-
-@pytest.mark.asyncio
-async def test_aiohttp_request_blocks_cross_origin_redirect_when_origin_is_pinned() -> None:
-    redirect_response = AsyncMock()
-    redirect_response.status = 307
-    redirect_response.headers = {"Location": "https://other.example.com/collect?secret=value"}
-    redirect_response.__aenter__ = AsyncMock(return_value=redirect_response)
-    redirect_response.__aexit__ = AsyncMock(return_value=None)
-
-    mock_session = MagicMock()
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=None)
-    mock_session.request = MagicMock(return_value=redirect_response)
-
-    with patch("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", return_value=mock_session):
-        with pytest.raises(HttpException) as exc_info:
-            await aiohttp_request(
-                method="POST",
-                url="https://example.com/start",
-                data={"secret": "value"},
-                allowed_redirect_origin="https://example.com",
-            )
-
-    assert exc_info.value.url == "[redacted]"
-    assert exc_info.value.error_message == "Cross-origin redirect blocked by policy"
-    assert mock_session.request.call_count == 1
 
 
 @pytest.mark.asyncio

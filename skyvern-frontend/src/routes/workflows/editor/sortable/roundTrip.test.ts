@@ -6,6 +6,7 @@ import { ProxyLocation } from "@/api/types";
 import type { AppNode } from "../nodes";
 import {
   getElements,
+  convert,
   getWorkflowBlocks,
   getWorkflowSettings,
 } from "../workflowEditorUtils";
@@ -14,6 +15,7 @@ import {
   type EmailInboxBlock,
   type OutputParameter,
   type WorkflowBlock,
+  type WorkflowApiResponse,
   type WorkflowParameter,
   type WorkflowSettings,
 } from "../../types/workflowTypes";
@@ -107,6 +109,7 @@ function makeCodeBlock(
     output_parameter: makeOutputParameter(label),
     code: `# ${label}`,
     parameters: [],
+    error_code_mapping: null,
   };
 }
 
@@ -246,6 +249,7 @@ function codeYamlToWorkflowBlock(yaml: CodeBlockYAML): CodeBlock {
     output_parameter: makeOutputParameter(yaml.label),
     code: yaml.code,
     parameters: [],
+    error_code_mapping: yaml.error_code_mapping,
   };
 }
 
@@ -283,6 +287,81 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
       block_type: "email_inbox",
       parameter_keys: ["microsoft_credential_id"],
     });
+  });
+
+  test("code manifest preserves opaque keys through API, node, save, YAML, and reload", () => {
+    const codeBlock = makeCodeBlock("Guard Output", null);
+    codeBlock.error_code_mapping = {
+      lowercase_missing_output: "when output is absent",
+      "opaque.code-v1": "when the opaque condition occurs",
+    };
+
+    const { nodes, edges } = getElements([codeBlock], DEFAULT_SETTINGS, true);
+    const codeNode = nodes.find((candidate) => candidate.type === "codeBlock");
+    expect(codeNode?.data).toMatchObject({
+      errorCodeMapping: JSON.stringify(codeBlock.error_code_mapping, null, 2),
+    });
+
+    const saved = getWorkflowBlocks(nodes, edges);
+    expect(saved[0]).toMatchObject({
+      error_code_mapping: codeBlock.error_code_mapping,
+    });
+    expect(saved[0]).not.toHaveProperty("error_code");
+
+    const exported = convert({
+      workflow_definition: { version: 2, parameters: [], blocks: [codeBlock] },
+    } as unknown as WorkflowApiResponse).workflow_definition.blocks[0];
+    expect(exported).toMatchObject({
+      error_code_mapping: codeBlock.error_code_mapping,
+    });
+    expect(exported).not.toHaveProperty("error_code");
+
+    const reloaded = reloadFromSavedYaml(saved);
+    expect(getWorkflowBlocks(reloaded.nodes, reloaded.edges)[0]).toMatchObject({
+      error_code_mapping: codeBlock.error_code_mapping,
+    });
+  });
+
+  test("code manifest normalizes absent API fields to the disabled null state", () => {
+    const codeBlock = makeCodeBlock("No Manifest", null);
+    delete (codeBlock as Partial<CodeBlock>).error_code_mapping;
+
+    const { nodes, edges } = getElements([codeBlock], DEFAULT_SETTINGS, true);
+    const codeNode = nodes.find((candidate) => candidate.type === "codeBlock");
+    expect(codeNode?.data).toMatchObject({ errorCodeMapping: "null" });
+    expect(codeNode?.data).not.toHaveProperty("errorCode");
+    expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject({
+      error_code_mapping: null,
+    });
+  });
+
+  test("nested loop code manifest survives save and reload", () => {
+    const nestedCode = makeCodeBlock("Nested Guard", null);
+    nestedCode.error_code_mapping = {
+      nested_lowercase: "when the nested condition occurs",
+    };
+    const loop = {
+      label: "FOR1",
+      block_type: "for_loop",
+      continue_on_failure: false,
+      model: null,
+      next_block_label: null,
+      output_parameter: makeOutputParameter("FOR1"),
+      loop_over: { key: "items" },
+      loop_blocks: [nestedCode],
+      loop_variable_reference: null,
+      complete_if_empty: false,
+      data_schema: null,
+    } as unknown as WorkflowBlock;
+
+    const first = getElements([loop], DEFAULT_SETTINGS, true);
+    const firstSaved = getWorkflowBlocks(first.nodes, first.edges)[0] as {
+      loop_blocks: Array<CodeBlockYAML>;
+    };
+    expect(firstSaved.loop_blocks[0]?.error_code_mapping).toEqual(
+      nestedCode.error_code_mapping,
+    );
+    expect(firstSaved.loop_blocks[0]).not.toHaveProperty("error_code");
   });
 
   test("drag B3 above B1 persists as B3 → B1 → B2 → B4 → B5 chain", () => {

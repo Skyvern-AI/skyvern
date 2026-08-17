@@ -1231,6 +1231,7 @@ class WorkflowsRepository(BaseRepository):
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
         edited_by: str | None | object = _UNSET,
+        preserve_completion_contract: bool = True,
     ) -> Workflow:
         """One-session, one-commit update of the workflow row + definition-parameter rows.
 
@@ -1280,9 +1281,13 @@ class WorkflowsRepository(BaseRepository):
                 # not depend on caller-side object identity between the
                 # top-level parameters list and each block's field.
                 _align_block_output_parameters(workflow_definition)
-                definition_json = with_contract(
-                    workflow_definition.model_dump(mode="json"), carried_contract(workflow.workflow_definition)
-                )
+                definition_json = workflow_definition.model_dump(mode="json")
+                if preserve_completion_contract:
+                    definition_json = with_contract(definition_json, carried_contract(workflow.workflow_definition))
+                elif definition_json.get("completion_contract") is None:
+                    # An exact Copilot-owned deletion is authoritative. Ordinary rebuilds keep the
+                    # default above because their models omit this field without intending a clear.
+                    definition_json.pop("completion_contract", None)
                 workflow.workflow_definition = with_policy(
                     definition_json, carried_policy(workflow.workflow_definition)
                 )

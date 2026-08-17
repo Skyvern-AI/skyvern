@@ -16,29 +16,52 @@ import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from structlog.testing import capture_logs
 
+from skyvern.errors.errors import UserDefinedError
 from skyvern.forge import app
 from skyvern.forge.agent_functions import CodeBlockEngineFailure, CodeBlockEngineResult
 from skyvern.forge.sdk.copilot.self_heal_recovery import SelfHealRecoveryResult
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.models.block import BlockResult, BlockStatus, BlockType, CodeBlock, CodeBlockStep
+from skyvern.forge.sdk.workflow.models.block import (
+    BlockResult,
+    BlockStatus,
+    BlockType,
+    CodeBlock,
+    CodeBlockStep,
+    ErrorCode,
+)
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.forge.sdk.workflow.service import _merge_workflow_run_errors
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, OutputObligation
 from skyvern.webeye.actions.actions import Action
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
 
 SECRET_VALUE = "hunter2-super-secret"
+SHORT_SECRET_VALUE = "abc"
 DEFAULT_PROMPT = "Log in and download the report"
 
 ExtractedInformation = list[Any] | dict[str, Any] | str | None
+
+
+def _string_values(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [text for item in value.values() for text in _string_values(item)]
+    if isinstance(value, (list, tuple, set)):
+        return [text for item in value for text in _string_values(item)]
+    return []
 
 
 def _make_code_block(
     steps: list[CodeBlockStep] | None = None,
     prompt: str | None = DEFAULT_PROMPT,
     code: str = "await page.click('#missing')",
+    error_code_mapping: dict[str, str] | None = None,
 ) -> CodeBlock:
     now = datetime.now(timezone.utc)
     output_parameter = OutputParameter(
@@ -56,7 +79,506 @@ def _make_code_block(
         prompt=prompt,
         steps=steps,
         output_parameter=output_parameter,
+        error_code_mapping=error_code_mapping,
     )
+
+
+@pytest.mark.asyncio
+async def test_inline_declared_error_redacts_secret_reasoning() -> None:
+    block = _make_code_block(
+        code=f"raise ErrorCode('missing', 'contains {SECRET_VALUE}')",
+        error_code_mapping={"missing": "Missing"},
+    )
+    context = _make_context(with_secret=True)
+    function = block.generate_async_user_function(block.code, MagicMock())
+    with pytest.raises(ErrorCode) as exc_info:
+        await function()
+    error = block._extract_declared_error(exc_info.value, context)
+    assert error is not None
+    assert error.reasoning == "contains [redacted]"
+
+
+@pytest.mark.asyncio
+async def test_inline_caught_error_is_inert_and_undeclared_fails_closed() -> None:
+    caught = _make_code_block(
+        code="try:\n    raise ErrorCode('caught', 'reason')\nexcept ErrorCode:\n    value = 'ok'",
+        error_code_mapping={"caught": "Caught"},
+    )
+    result = await caught.generate_async_user_function(caught.code, MagicMock())()
+    assert result["value"] == "ok"
+
+    undeclared = _make_code_block(
+        code="raise ErrorCode('missing', 'reason')",
+        error_code_mapping={"other": "Other"},
+    )
+    function = undeclared.generate_async_user_function(undeclared.code, MagicMock())
+    with pytest.raises(ErrorCode) as exc_info:
+        await function()
+    assert undeclared._extract_declared_error(exc_info.value, _make_context()) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("manifest_scope", ["block", "workflow"])
+async def test_inline_declared_error_renders_effective_manifest(manifest_scope: str) -> None:
+    mapping = {"ERR_{{ id }}": "Failure for {{ id }}"}
+    block = _make_code_block(
+        code="raise ErrorCode('ERR_{{ id }}', 'region {{ region }} failed')",
+        error_code_mapping=mapping if manifest_scope == "block" else None,
+    )
+    context = _make_context()
+    context.values["id"] = 42
+    context.values["region"] = "EU"
+    if manifest_scope == "workflow":
+        context.workflow = SimpleNamespace(workflow_definition=SimpleNamespace(error_code_mapping=mapping))
+
+    block.format_potential_template_parameters(context)
+    function = block.generate_async_user_function(block.code, MagicMock())
+    with pytest.raises(ErrorCode) as exc_info:
+        await function()
+
+    error = block._extract_declared_error(exc_info.value, context)
+    assert error is not None
+    assert error.error_code == "ERR_42"
+    assert error.reasoning == "region EU failed"
+
+
+@pytest.mark.asyncio
+async def test_inline_templated_secret_error_code_fails_closed() -> None:
+    block = _make_code_block(
+        code="raise ErrorCode('{{ secret }}', 'must stay generic')",
+        error_code_mapping={"{{ secret }}": "Secret-derived code"},
+    )
+    context = _make_context(with_secret=True)
+    context.values["secret"] = SECRET_VALUE
+
+    block.format_potential_template_parameters(context)
+    function = block.generate_async_user_function(block.code, MagicMock())
+    with pytest.raises(ErrorCode) as exc_info:
+        await function()
+
+    assert block.error_code_mapping is None
+    assert block._extract_declared_error(exc_info.value, context) is None
+
+
+@pytest.mark.asyncio
+async def test_inline_extraction_rejects_secret_code_even_if_manifest_contains_it() -> None:
+    block = _make_code_block(
+        code=f"raise ErrorCode('{SECRET_VALUE}', 'must stay generic')",
+        error_code_mapping={SECRET_VALUE: "Persisted unsafe manifest"},
+    )
+    context = _make_context(with_secret=True)
+    function = block.generate_async_user_function(block.code, MagicMock())
+    with pytest.raises(ErrorCode) as exc_info:
+        await function()
+
+    assert block._extract_declared_error(exc_info.value, context) is None
+
+
+@pytest.mark.asyncio
+async def test_inline_extraction_rejects_embedded_short_secret_code() -> None:
+    block = _make_code_block(
+        code="raise ErrorCode('ERR_abc', 'must stay generic')",
+        error_code_mapping={"ERR_abc": "Persisted unsafe manifest"},
+    )
+    context = _make_context()
+    context.secrets["k_short"] = SHORT_SECRET_VALUE
+    function = block.generate_async_user_function(block.code, MagicMock())
+    with pytest.raises(ErrorCode) as exc_info:
+        await function()
+
+    assert block._extract_declared_error(exc_info.value, context) is None
+
+
+@pytest.mark.asyncio
+async def test_inline_extraction_redacts_embedded_short_secret_reasoning() -> None:
+    block = _make_code_block(
+        code="raise ErrorCode('ERR_safe', 'contains abc value')",
+        error_code_mapping={"ERR_safe": "Safe manifest"},
+    )
+    context = _make_context()
+    context.secrets["k_short"] = SHORT_SECRET_VALUE
+    function = block.generate_async_user_function(block.code, MagicMock())
+    with pytest.raises(ErrorCode) as exc_info:
+        await function()
+
+    error = block._extract_declared_error(exc_info.value, context)
+    assert error is not None
+    assert error.reasoning == "contains [redacted] value"
+
+
+def test_inline_rendered_manifest_redacts_description_and_discards_secret_key() -> None:
+    block = _make_code_block(
+        error_code_mapping={"ERR_safe": "Failure for {{ secret }}", "ERR_{{ secret }}": "Unsafe key"}
+    )
+    context = _make_context()
+    context.secrets["k_short"] = SHORT_SECRET_VALUE
+    context.values["secret"] = SHORT_SECRET_VALUE
+
+    block.format_potential_template_parameters(context)
+
+    assert block.error_code_mapping == {"ERR_safe": "Failure for [redacted]"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_value", ["x" * 129, "ERR_safe\n"])
+async def test_inline_rendered_manifest_key_fails_closed_when_invalid(invalid_value: str) -> None:
+    block = _make_code_block(
+        code="raise ErrorCode('ERR_safe', 'must stay generic')",
+        error_code_mapping={"{{ invalid_key }}": "Description"},
+    )
+    context = _make_context()
+    context.values["invalid_key"] = invalid_value
+
+    block.format_potential_template_parameters(context)
+    function = block.generate_async_user_function(block.code, MagicMock())
+    with pytest.raises(ErrorCode) as exc_info:
+        await function()
+
+    assert block._extract_declared_error(exc_info.value, context) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_value", ["x" * 2001, "unsafe\u0000value", "", "   "])
+async def test_inline_rendered_manifest_description_fails_closed_when_invalid(invalid_value: str) -> None:
+    block = _make_code_block(
+        code="raise ErrorCode('ERR_safe', 'must stay generic')",
+        error_code_mapping={"ERR_safe": "{{ invalid_description }}"},
+    )
+    context = _make_context()
+    context.values["invalid_description"] = invalid_value
+
+    block.format_potential_template_parameters(context)
+    function = block.generate_async_user_function(block.code, MagicMock())
+    with pytest.raises(ErrorCode) as exc_info:
+        await function()
+
+    assert block._extract_declared_error(exc_info.value, context) is None
+
+
+def test_rendered_manifest_discards_aggregate_overflow_in_insertion_order() -> None:
+    mapping = {f"ERR_{index}": f"{{{{ descriptions[{index}] }}}}" for index in range(17)}
+    block = _make_code_block(error_code_mapping=mapping)
+    context = _make_context()
+    context.values["descriptions"] = ["x" * 2000] * len(mapping)
+
+    block.format_potential_template_parameters(context)
+
+    assert block.error_code_mapping is not None
+    assert list(block.error_code_mapping) == [f"ERR_{index}" for index in range(16)]
+
+
+@pytest.mark.asyncio
+async def test_user_defined_failure_records_dedicated_skip_without_healing(monkeypatch: pytest.MonkeyPatch) -> None:
+    block = _make_code_block()
+    context = _make_context()
+    recorder = SimpleNamespace(finalize=AsyncMock())
+    monkeypatch.setattr(block, "_capture_failure_evidence", AsyncMock())
+    write_episode = AsyncMock()
+    monkeypatch.setattr(block, "_write_heal_episode_safe", write_episode)
+    attempt_heal = AsyncMock()
+    monkeypatch.setattr(block, "_attempt_self_heal", attempt_heal)
+
+    async def build_failure() -> BlockResult:
+        return await block.build_block_result(success=False, failure_reason="typed", status=BlockStatus.failed)
+
+    result = await block._resolve_failure_with_heal(
+        exception=ErrorCode("typed", "reason"),
+        failing_line=1,
+        build_failure_result=build_failure,
+        classification=HealClassification(healable=False, skip_reason=HealSkipReason.user_defined_error),
+        recorder=recorder,
+        workflow_run_context=context,
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id=None,
+    )
+    assert result.success is False
+    attempt_heal.assert_not_awaited()
+    assert write_episode.await_args.kwargs["skip_reason"] is HealSkipReason.user_defined_error
+
+
+def test_workflow_error_merge_does_not_replace_cross_provenance_task_error() -> None:
+    typed = {
+        "error_code": "same",
+        "reasoning": "typed",
+        "confidence_float": 1.0,
+        "error_type": "USER_DEFINED_ERROR",
+    }
+    malformed = {**typed, "error_code": "extra", "unexpected": True}
+    result = _merge_workflow_run_errors(
+        [{"error_code": "same", "reasoning": "legacy", "confidence_float": 1.0}],
+        [("wrb_code", ["same", "diagnostic"], "failure", {"errors": [typed, malformed]}, "code")],
+    )
+    assert result == [
+        {"error_code": "same", "reasoning": "legacy", "confidence_float": 1.0},
+        typed,
+        {"error_code": "diagnostic", "reasoning": "failure", "confidence_float": 1.0},
+    ]
+
+
+def test_workflow_error_merge_upgrades_only_same_block_legacy_entry() -> None:
+    first = {
+        "error_code": "same",
+        "reasoning": "first typed",
+        "confidence_float": 1.0,
+        "error_type": "USER_DEFINED_ERROR",
+    }
+    second = {**first, "reasoning": "second typed"}
+
+    assert _merge_workflow_run_errors(
+        [],
+        [
+            ("wrb_1", ["same"], "first legacy", {"errors": [first]}, "code"),
+            ("wrb_2", ["same"], "second legacy", {"errors": [second]}, "code"),
+        ],
+    ) == [first, second]
+
+
+def test_workflow_error_merge_dedupes_only_within_provenance_and_kind() -> None:
+    typed = {
+        "error_code": "same",
+        "reasoning": "same reason",
+        "confidence_float": 1.0,
+        "error_type": "USER_DEFINED_ERROR",
+    }
+    task = dict(typed)
+
+    assert _merge_workflow_run_errors(
+        [
+            {"error_code": "task_same", "reasoning": "first", "confidence_float": 1.0},
+            {"error_code": "task_same", "reasoning": "second", "confidence_float": 1.0},
+            task,
+        ],
+        [
+            ("wrb_1", ["legacy_same", "legacy_same"], "legacy reason", {"errors": [typed, typed]}, "code"),
+            ("wrb_2", ["legacy_same"], "legacy reason", {"errors": [typed]}, "code"),
+        ],
+    ) == [
+        {"error_code": "task_same", "reasoning": "first", "confidence_float": 1.0},
+        {"error_code": "task_same", "reasoning": "second", "confidence_float": 1.0},
+        task,
+        {"error_code": "legacy_same", "reasoning": "legacy reason", "confidence_float": 1.0},
+        typed,
+        {"error_code": "legacy_same", "reasoning": "legacy reason", "confidence_float": 1.0},
+        typed,
+    ]
+
+
+def test_workflow_error_merge_at_cap_skips_appends_but_allows_later_same_block_upgrade() -> None:
+    typed = {
+        "error_code": "upgrade",
+        "reasoning": "typed",
+        "confidence_float": 1.0,
+        "error_type": "USER_DEFINED_ERROR",
+    }
+    task_errors = [{"error_code": f"task_{index}", "reasoning": "task", "confidence_float": 1.0} for index in range(99)]
+
+    errors = _merge_workflow_run_errors(
+        task_errors,
+        [
+            ("wrb_upgrade", ["upgrade"], "legacy", None, "code"),
+            ("wrb_skipped", ["not_appended"], "later", {"errors": [typed]}, "code"),
+            ("wrb_upgrade", [], None, {"errors": [typed]}, "code"),
+        ],
+    )
+
+    assert len(errors) == 100
+    assert errors[-1] == typed
+    assert all(error["error_code"] != "not_appended" for error in errors)
+
+
+def test_workflow_error_merge_caps_duplicate_legacy_entries_per_row_and_processes_later_blocks() -> None:
+    errors = _merge_workflow_run_errors(
+        [],
+        [
+            ("wrb_duplicates", ["duplicate"] * 1000, "first", None, "code"),
+            ("wrb_later", ["later"], "second", None, "code"),
+        ],
+    )
+
+    assert [error["error_code"] for error in errors] == ["duplicate", "later"]
+
+
+def test_workflow_error_merge_ignores_typed_payload_beyond_per_row_candidate_cap() -> None:
+    typed = {
+        "error_code": "declared",
+        "reasoning": "typed",
+        "confidence_float": 1.0,
+        "error_type": "USER_DEFINED_ERROR",
+    }
+    errors = _merge_workflow_run_errors(
+        [],
+        [("wrb_code", ["declared"], "legacy", {"errors": [None] * 150 + [typed]}, "code")],
+    )
+
+    assert errors == [{"error_code": "declared", "reasoning": "legacy", "confidence_float": 1.0}]
+
+
+def test_workflow_error_merge_upgrades_from_early_typed_payload_after_invalid_candidates() -> None:
+    typed = {
+        "error_code": "declared",
+        "reasoning": "typed",
+        "confidence_float": 1.0,
+        "error_type": "USER_DEFINED_ERROR",
+    }
+    errors = _merge_workflow_run_errors(
+        [],
+        [("wrb_code", ["declared"], "legacy", {"errors": [None, {"bad": "shape"}, typed]}, "code")],
+    )
+
+    assert errors == [typed]
+
+
+def test_workflow_error_merge_preserves_ordinary_and_file_parser_failures() -> None:
+    result = _merge_workflow_run_errors(
+        [],
+        [
+            ("wrb_code", ["code_failed"], "code reason", None, "code"),
+            ("wrb_parser", ["file_parser_error"], "parser reason", {"errors": []}, "file_url_parser"),
+        ],
+    )
+    assert result == [
+        {"error_code": "code_failed", "reasoning": "code reason", "confidence_float": 1.0},
+        {"error_code": "file_parser_error", "reasoning": "parser reason", "confidence_float": 1.0},
+    ]
+
+
+def test_workflow_error_merge_matches_status_and_webhook_top_level_shape() -> None:
+    typed = {
+        "error_code": "declared",
+        "reasoning": f"contains {SECRET_VALUE}",
+        "confidence_float": 1.0,
+        "error_type": "USER_DEFINED_ERROR",
+    }
+    context = _make_context(with_secret=True)
+    errors = _merge_workflow_run_errors(
+        [],
+        [("wrb_code", ["diagnostic", "declared"], "failure", {"errors": [typed]}, "code")],
+        mask_reasoning=context.mask_secrets_in_data,
+    )
+    expected = [
+        {"error_code": "diagnostic", "reasoning": "failure", "confidence_float": 1.0},
+        {**typed, "reasoning": "contains *****"},
+    ]
+    assert {"errors": errors} == {"errors": expected}
+
+
+def test_workflow_error_merge_skips_typed_secret_code_when_masker_is_available() -> None:
+    typed = {
+        "error_code": SECRET_VALUE,
+        "reasoning": "typed",
+        "confidence_float": 1.0,
+        "error_type": "USER_DEFINED_ERROR",
+    }
+    context = _make_context(with_secret=True)
+
+    errors = _merge_workflow_run_errors(
+        [],
+        [("wrb_code", [], "generic failure", {"errors": [typed]}, "code")],
+        mask_reasoning=context.mask_secrets_in_data,
+    )
+
+    assert errors == []
+
+
+def test_workflow_error_merge_skips_legacy_secret_code_when_masker_is_available() -> None:
+    context = _make_context(with_secret=True)
+
+    errors = _merge_workflow_run_errors(
+        [],
+        [("wrb_code", ["first", SECRET_VALUE, "last"], "generic failure", None, "code")],
+        mask_reasoning=context.mask_secrets_in_data,
+    )
+
+    assert [error["error_code"] for error in errors] == ["first", "last"]
+
+
+def test_workflow_error_merge_without_masker_preserves_legacy_and_typed_codes() -> None:
+    typed = {
+        "error_code": SECRET_VALUE,
+        "reasoning": "typed",
+        "confidence_float": 1.0,
+        "error_type": "USER_DEFINED_ERROR",
+    }
+
+    errors = _merge_workflow_run_errors(
+        [],
+        [("wrb_legacy", [SECRET_VALUE], "legacy", None, "code"), ("wrb_typed", [], None, {"errors": [typed]}, "code")],
+        mask_reasoning=None,
+    )
+
+    assert errors == [
+        {"error_code": SECRET_VALUE, "reasoning": "legacy", "confidence_float": 1.0},
+        typed,
+    ]
+
+
+def test_workflow_error_merge_only_promotes_typed_payloads_from_code_blocks() -> None:
+    typed = {
+        "error_code": "spoofed",
+        "reasoning": "typed",
+        "confidence_float": 1.0,
+        "error_type": "USER_DEFINED_ERROR",
+    }
+    assert _merge_workflow_run_errors(
+        [],
+        [("wrb_parser", ["diagnostic"], "failure", {"errors": [typed]}, "file_url_parser")],
+    ) == [{"error_code": "diagnostic", "reasoning": "failure", "confidence_float": 1.0}]
+
+
+def test_workflow_error_merge_without_context_preserves_masked_content_with_bounds() -> None:
+    task_errors = [
+        {"error_code": f"task_{index}", "reasoning": "already ***** masked" + ("x" * 2100)} for index in range(105)
+    ]
+    task_errors.extend(
+        [
+            {"error_code": "", "reasoning": "invalid"},
+            {"error_code": "x" * 129, "reasoning": "invalid"},
+            {"error_code": 123, "reasoning": "invalid"},
+        ]
+    )
+
+    errors = _merge_workflow_run_errors(task_errors, [], mask_reasoning=None)
+
+    assert len(errors) == 100
+    assert errors[0]["error_code"] == "task_0"
+    assert errors[-1]["error_code"] == "task_99"
+    assert errors[0]["reasoning"].startswith("already ***** masked")
+    assert len(errors[0]["reasoning"]) == 2000
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_block_errors_query_has_stable_multi_block_order() -> None:
+    rows = [
+        SimpleNamespace(
+            workflow_run_block_id="wrb_1",
+            error_codes=["first"],
+            failure_reason="first reason",
+            output=None,
+            block_type="code",
+        ),
+        SimpleNamespace(
+            workflow_run_block_id="wrb_2",
+            error_codes=["second"],
+            failure_reason="second reason",
+            output=None,
+            block_type="code",
+        ),
+    ]
+    result = MagicMock()
+    result.all.return_value = rows
+    session = MagicMock()
+    session.execute = AsyncMock(return_value=result)
+    session_factory = MagicMock(return_value=AsyncMock(__aenter__=AsyncMock(return_value=session)))
+    repository = WorkflowRunsRepository(session_factory)
+
+    assert await repository.get_workflow_run_block_errors("wr_test") == [
+        ("wrb_1", ["first"], "first reason", None, "code"),
+        ("wrb_2", ["second"], "second reason", None, "code"),
+    ]
+    query = session.execute.await_args.args[0]
+    assert [clause.name for clause in query._order_by_clauses] == ["created_at", "workflow_run_block_id"]
 
 
 def _make_context(
@@ -296,14 +818,313 @@ def _patch_execute_chokepoint_environment(
     context: WorkflowRunContext,
     fake_browser_state: object,
     use_codeblock_runner: bool,
+    format_templates: bool = False,
 ) -> None:
     monkeypatch.setattr(CodeBlock, "get_workflow_run_context", MagicMock(return_value=context))
     monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", AsyncMock(return_value=fake_browser_state))
     monkeypatch.setattr(CodeBlock, "_ensure_run_recording_artifact", AsyncMock(return_value=None))
-    monkeypatch.setattr(CodeBlock, "format_potential_template_parameters", MagicMock(return_value=None))
+    if not format_templates:
+        monkeypatch.setattr(CodeBlock, "format_potential_template_parameters", MagicMock(return_value=None))
     monkeypatch.setattr(app.AGENT_FUNCTION, "validate_code_block", AsyncMock(return_value=None))
     monkeypatch.setattr(app.AGENT_FUNCTION, "should_use_codeblock_runner", AsyncMock(return_value=use_codeblock_runner))
     monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", MagicMock(return_value=fake_browser_state))
+
+
+async def _execute_inline_failure_with_download_output(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    exception: Exception,
+    download_output: dict[str, Any] | None,
+    error_code_mapping: dict[str, str] | None = None,
+    context: WorkflowRunContext | None = None,
+    format_templates: bool = False,
+    capture_failure_output: bool = False,
+) -> tuple[BlockResult, AsyncMock | None, AsyncMock]:
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    code = (
+        f"raise ErrorCode({exception.error_code!r}, {exception.reasoning!r})"
+        if type(exception) is ErrorCode
+        else "raise RuntimeError('processing failed')"
+    )
+    block = _make_code_block(code=code, error_code_mapping=error_code_mapping)
+    context = context or _make_context(enable_self_healing=False)
+    fake_page = MagicMock()
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+    )
+    _patch_execute_chokepoint_environment(
+        monkeypatch,
+        context=context,
+        fake_browser_state=fake_browser_state,
+        use_codeblock_runner=False,
+        format_templates=format_templates,
+    )
+    if type(exception) is not ErrorCode:
+        monkeypatch.setattr(CodeBlock, "execute_user_function_with_timeout", AsyncMock(side_effect=exception))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "execute_code_block_override", AsyncMock(return_value=None))
+    monkeypatch.setattr(CodeBlock, "_capture_failure_evidence", AsyncMock(return_value=None))
+    monkeypatch.setattr(CodeBlock, "_write_heal_episode_safe", AsyncMock(return_value=None))
+    record_output = AsyncMock(return_value=None)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record_output)
+
+    failure_output_with_downloads = None
+    if capture_failure_output:
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.local_download_dir_file_identities",
+            MagicMock(side_effect=[set(), {("failure-evidence.txt", 1, 1)}]),
+        )
+        monkeypatch.setattr(CodeBlock, "_read_back_downloaded_files", AsyncMock(return_value=[]))
+        monkeypatch.setattr(CodeBlock, "_register_downloaded_files", AsyncMock(return_value=([], set())))
+        monkeypatch.setattr(
+            CodeBlock,
+            "_bind_and_grade_downloads",
+            AsyncMock(return_value=(download_output, None)),
+        )
+    else:
+        failure_output_with_downloads = AsyncMock(return_value=download_output)
+        monkeypatch.setattr(CodeBlock, "_failure_output_with_downloads", failure_output_with_downloads)
+    FakeRecorder.reset(last_recorded_exception=exception)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+
+    result = await block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id="pbs_test",
+    )
+    return result, failure_output_with_downloads, record_output
+
+
+@pytest.mark.asyncio
+async def test_rendered_error_code_misuse_returns_and_records_failed_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(code="raise ErrorCode({{ arguments }})")
+    context = _make_context(enable_self_healing=False)
+    context.values["arguments"] = "code='A', reasoning='why'"
+    fake_page = MagicMock()
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+    )
+    _patch_execute_chokepoint_environment(
+        monkeypatch,
+        context=context,
+        fake_browser_state=fake_browser_state,
+        use_codeblock_runner=False,
+        format_templates=True,
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "execute_code_block_override", AsyncMock(return_value=None))
+    monkeypatch.setattr(CodeBlock, "_capture_failure_evidence", AsyncMock(return_value=None))
+    monkeypatch.setattr(CodeBlock, "_write_heal_episode_safe", AsyncMock(return_value=None))
+    monkeypatch.setattr(CodeBlock, "_attempt_self_heal", AsyncMock(return_value=None))
+    record_output = AsyncMock(return_value=None)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record_output)
+    FakeRecorder.reset()
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+
+    result = await block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id="pbs_test",
+    )
+
+    assert result.success is False
+    recorded_output = record_output.await_args.args[2]
+    assert recorded_output["status"] == "failed"
+    record_output.assert_awaited_once_with(context, "wr_test", recorded_output)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_code", "mapping", "secret", "template_value", "format_templates"),
+    [
+        ("{{ credential }}", {"{{ credential }}": "Credential failure"}, SECRET_VALUE, SECRET_VALUE, True),
+        ("ERR_abc", {"ERR_abc": "PIN failure"}, SHORT_SECRET_VALUE, None, False),
+    ],
+    ids=["templated-long-credential", "embedded-short-credential"],
+)
+async def test_inline_secret_error_code_is_generic_in_persisted_failure_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    mapping: dict[str, str],
+    secret: str,
+    template_value: str | None,
+    format_templates: bool,
+) -> None:
+    context = _make_context(enable_self_healing=False)
+    context.secrets["credential"] = secret
+    context.include_secrets_in_templates = True
+    if template_value is not None:
+        context.values["credential"] = template_value
+
+    result, _, record_output = await _execute_inline_failure_with_download_output(
+        monkeypatch,
+        exception=ErrorCode(error_code, "must stay generic"),
+        error_code_mapping=mapping,
+        context=context,
+        format_templates=format_templates,
+        capture_failure_output=True,
+        download_output={
+            "errors": [
+                {
+                    "error_code": "user_code_error",
+                    "reasoning": "CodeBlock failed while running user code.",
+                    "confidence_float": 1.0,
+                }
+            ],
+            "failure_reason": "CodeBlock failed while running user code.",
+            "status": "failed",
+        },
+    )
+
+    persisted_output = record_output.await_args.args[2]
+    record_output.assert_awaited_once_with(context, "wr_test", result.output_parameter_value)
+    assert result.failure_reason == "Failed to execute code block. Reason: ErrorCode: CodeBlock raised a declared error"
+    assert result.error_codes == []
+    assert persisted_output == result.output_parameter_value
+    assert persisted_output["errors"][0]["error_code"] == "user_code_error"
+    assert all(error.get("error_type") != "USER_DEFINED_ERROR" for error in persisted_output["errors"])
+    protected_strings = _string_values(
+        [result.failure_reason, result.error_codes, result.output_parameter_value, persisted_output]
+    )
+    if len(secret) < 5:
+        # Short secrets can collide with timestamps/IDs in repr; inspect only attacker-visible strings.
+        assert all(secret not in text for text in protected_strings)
+    else:
+        assert secret not in repr(result)
+        assert secret not in repr(persisted_output)
+        assert secret not in repr(result.error_codes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("secret", "reasoning", "extra_secrets"),
+    [
+        (SECRET_VALUE, f"credential {SECRET_VALUE} failed", {}),
+        ("587", "credential 587 failed", {}),
+        ("12", "user retried 12 times", {"card_cvv": "587"}),
+    ],
+    ids=["templated-long-credential", "short-credential", "short-card-expiry"],
+)
+async def test_inline_secret_reasoning_is_redacted_in_persisted_failure_artifacts(
+    monkeypatch: pytest.MonkeyPatch, secret: str, reasoning: str, extra_secrets: dict[str, str]
+) -> None:
+    context = _make_context(enable_self_healing=False)
+    context.secrets["credential"] = secret
+    context.secrets.update(extra_secrets)
+
+    result, _, record_output = await _execute_inline_failure_with_download_output(
+        monkeypatch,
+        exception=ErrorCode("credential_failed", reasoning),
+        error_code_mapping={"credential_failed": "Credential failure"},
+        context=context,
+        download_output=None,
+    )
+
+    record_output.assert_awaited_once_with(context, "wr_test", result.output_parameter_value)
+    persisted_output = record_output.await_args.args[2]
+    expected_reasoning = reasoning.replace(secret, "[redacted]")
+    assert result.failure_reason == expected_reasoning
+    assert result.error_codes == ["credential_failed"]
+    assert persisted_output == result.output_parameter_value
+    assert persisted_output["errors"] == [
+        {
+            "error_code": "credential_failed",
+            "reasoning": expected_reasoning,
+            "confidence_float": 1.0,
+            "error_type": "USER_DEFINED_ERROR",
+        }
+    ]
+    protected_strings = _string_values(
+        [result.failure_reason, result.error_codes, result.output_parameter_value, persisted_output]
+    )
+    if len(secret) < 5:
+        # Short secrets can collide with timestamps/IDs in repr; inspect only attacker-visible strings.
+        assert all(secret not in text for text in protected_strings)
+    else:
+        assert secret not in repr(result)
+        assert secret not in repr(result.failure_reason)
+        assert secret not in repr(persisted_output)
+        assert secret not in repr(result.error_codes)
+    # Short extra secrets can collide with timestamps/IDs in repr; inspect only attacker-visible strings.
+    assert all(value not in text for value in extra_secrets.values() for text in protected_strings)
+
+
+@pytest.mark.asyncio
+async def test_inline_declared_error_failure_preserves_download_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    typed_error = {
+        "error_code": "report_unavailable",
+        "reasoning": "report generation failed",
+        "confidence_float": 1.0,
+        "error_type": "USER_DEFINED_ERROR",
+    }
+    download_output = {
+        "errors": [typed_error],
+        "downloaded_file_urls": ["https://files.test/report.pdf"],
+        "downloaded_file_artifact_ids": ["art_report"],
+        "failure_reason": "report generation failed",
+        "status": "failed",
+    }
+
+    result, failure_output_with_downloads, record_output = await _execute_inline_failure_with_download_output(
+        monkeypatch,
+        exception=ErrorCode("report_unavailable", "report generation failed"),
+        download_output=download_output,
+        error_code_mapping={"report_unavailable": "The report could not be generated"},
+    )
+
+    assert result.output_parameter_value == download_output
+    assert result.output_parameter_value["errors"] == [typed_error]
+    assert result.error_codes == ["report_unavailable"]
+    assert failure_output_with_downloads.await_args.kwargs["result"]["errors"] == [typed_error]
+    record_output.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inline_declared_error_without_download_keeps_typed_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    result, failure_output_with_downloads, record_output = await _execute_inline_failure_with_download_output(
+        monkeypatch,
+        exception=ErrorCode("report_unavailable", "report generation failed"),
+        download_output=None,
+        error_code_mapping={"report_unavailable": "The report could not be generated"},
+    )
+
+    expected_output = {
+        "errors": [
+            {
+                "error_code": "report_unavailable",
+                "reasoning": "report generation failed",
+                "confidence_float": 1.0,
+                "error_type": "USER_DEFINED_ERROR",
+            }
+        ],
+        "failure_reason": "report generation failed",
+        "status": "failed",
+    }
+    assert result.output_parameter_value == expected_output
+    assert "downloaded_files" not in result.output_parameter_value
+    assert failure_output_with_downloads.await_args.kwargs["result"]["errors"] == expected_output["errors"]
+    record_output.assert_awaited_once()
+    assert record_output.await_args.args[1:] == ("wr_test", expected_output)
+
+
+@pytest.mark.asyncio
+async def test_inline_ordinary_exception_failure_still_preserves_download_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    download_output = {
+        "downloaded_file_urls": ["https://files.test/report.pdf"],
+        "downloaded_file_artifact_ids": ["art_report"],
+    }
+
+    result, failure_output_with_downloads, _ = await _execute_inline_failure_with_download_output(
+        monkeypatch,
+        exception=RuntimeError("processing failed"),
+        download_output=download_output,
+    )
+
+    assert result.output_parameter_value == download_output
+    assert failure_output_with_downloads.await_args.kwargs.get("result") is None
 
 
 @pytest.mark.asyncio
@@ -1392,7 +2213,9 @@ async def test_legacy_heal_success_skips_failed_write_and_ends_completed(monkeyp
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
     context = _make_context(enable_self_healing=True)
     fake_page = MagicMock()
-    fake_browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=fake_page))
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+    )
     _patch_execute_chokepoint_environment(
         monkeypatch,
         context=context,
@@ -1444,7 +2267,9 @@ async def test_heal_output_write_failure_does_not_finalize_completed(monkeypatch
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
     context = _make_context(enable_self_healing=True)
     fake_page = MagicMock()
-    fake_browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=fake_page))
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+    )
     _patch_execute_chokepoint_environment(
         monkeypatch,
         context=context,
@@ -1492,7 +2317,9 @@ async def test_secure_heal_success_skips_failed_write_and_ends_completed(monkeyp
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
     context = _make_context(enable_self_healing=True)
     fake_page = MagicMock()
-    fake_browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=fake_page))
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+    )
     _patch_execute_chokepoint_environment(
         monkeypatch,
         context=context,
@@ -1560,7 +2387,9 @@ async def test_legacy_heal_declined_writes_failed_once(monkeypatch: pytest.Monke
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
     context = _make_context(enable_self_healing=True)
     fake_page = MagicMock()
-    fake_browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=fake_page))
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+    )
     _patch_execute_chokepoint_environment(
         monkeypatch,
         context=context,
@@ -1596,7 +2425,9 @@ async def test_secure_heal_declined_writes_failed_once(monkeypatch: pytest.Monke
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
     context = _make_context(enable_self_healing=True)
     fake_page = MagicMock()
-    fake_browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=fake_page))
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+    )
     _patch_execute_chokepoint_environment(
         monkeypatch,
         context=context,
@@ -1640,13 +2471,15 @@ async def test_secure_heal_declined_writes_failed_once(monkeypatch: pytest.Monke
 
 
 @pytest.mark.asyncio
-async def test_secure_unhealable_failure_without_result_builds_failed_once(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_secure_accepted_typed_failure_preserves_adapter_block_result(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block()
     context = _make_context(enable_self_healing=False)
     fake_page = MagicMock()
-    fake_browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=fake_page))
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+    )
     _patch_execute_chokepoint_environment(
         monkeypatch,
         context=context,
@@ -1658,14 +2491,30 @@ async def test_secure_unhealable_failure_without_result_builds_failed_once(monke
         "execute_code_block_override",
         AsyncMock(
             return_value=CodeBlockEngineResult(
-                block_result=None,
+                block_result=BlockResult(
+                    success=False,
+                    output_parameter=block.output_parameter,
+                    output_parameter_value={
+                        "errors": [
+                            UserDefinedError(error_code="declared", reasoning="typed", confidence_float=1.0).model_dump(
+                                mode="json"
+                            )
+                        ]
+                    },
+                    status=BlockStatus.failed,
+                    failure_reason="typed",
+                    error_codes=["user_code_error", "declared"],
+                ),
                 failure=CodeBlockEngineFailure(
-                    error_code="timeout",
-                    safe_message="CodeBlock execution timed out.",
-                    failure_reason="CodeBlock execution timed out.",
-                    exception_class=None,
+                    error_code="user_code_error",
+                    safe_message="typed",
+                    failure_reason="typed",
+                    exception_class="codeblock.codeblock_runtime.ErrorCode",
                     failing_line=None,
                     healability_hint=False,
+                    accepted_user_defined_error=UserDefinedError(
+                        error_code="declared", reasoning="typed", confidence_float=1.0
+                    ),
                 ),
             )
         ),
@@ -1674,6 +2523,8 @@ async def test_secure_unhealable_failure_without_result_builds_failed_once(monke
     monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
     heal_mock = AsyncMock(return_value=None)
     monkeypatch.setattr(block, "_attempt_self_heal", heal_mock)
+    write_episode = AsyncMock()
+    monkeypatch.setattr(block, "_write_heal_episode_safe", write_episode)
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
 
     result = await block.execute(
@@ -1683,10 +2534,16 @@ async def test_secure_unhealable_failure_without_result_builds_failed_once(monke
         browser_session_id="pbs_test",
     )
 
-    block_statuses = _statuses_for_block(state, "wrb_test")
     assert result.success is False
+    assert result.error_codes == ["user_code_error", "declared"]
+    assert result.output_parameter_value == {
+        "errors": [
+            UserDefinedError(error_code="declared", reasoning="typed", confidence_float=1.0).model_dump(mode="json")
+        ]
+    }
     assert heal_mock.await_count == 0
-    assert block_statuses.count(BlockStatus.failed) == 1
+    assert write_episode.await_args.kwargs["skip_reason"] is HealSkipReason.user_defined_error
+    assert _statuses_for_block(state, "wrb_test") == []
     assert len(FakeRecorder.instances) == 1
     assert FakeRecorder.instances[0].finalized_success is False
 
@@ -1698,7 +2555,9 @@ async def test_secure_runner_missing_block_result_returns_generic_failure(monkey
     block = _make_code_block()
     context = _make_context(enable_self_healing=True)
     fake_page = MagicMock()
-    fake_browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=fake_page))
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+    )
     _patch_execute_chokepoint_environment(
         monkeypatch,
         context=context,
@@ -1738,7 +2597,9 @@ async def test_secure_infra_failure_without_metadata_finalizes_failed_and_record
     block = _make_code_block()
     context = _make_context(enable_self_healing=True)
     fake_page = MagicMock()
-    fake_browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=fake_page))
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+    )
     _patch_execute_chokepoint_environment(
         monkeypatch,
         context=context,

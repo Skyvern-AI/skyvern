@@ -7,13 +7,19 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { MemoryRouter, useLocation } from "react-router-dom";
+import {
+  BrowserRouter,
+  MemoryRouter,
+  parsePath,
+  useLocation,
+} from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { Status } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { WorkflowPermanentIdContext } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
+import { useStudioShellStore } from "@/store/StudioShellStore";
 
 import { StudioPaneToggles } from "./StudioPaneToggles";
 
@@ -64,12 +70,19 @@ const initialBrowserState = useStudioBrowserStore.getState();
 
 function LocationProbe() {
   const location = useLocation();
-  return <output data-testid="search">{location.search}</output>;
+  return (
+    <>
+      <output data-testid="search">{location.search}</output>
+      <output data-testid="route-state">
+        {JSON.stringify(location.state ?? null)}
+      </output>
+    </>
+  );
 }
 
-function renderAt(path = "/workflows/wpid_abc/studio") {
-  return render(
-    <MemoryRouter initialEntries={[path]}>
+function ToggleHarness() {
+  return (
+    <>
       {/* The shell provides these in production (StudioShell root / the
           workflow route resolver). */}
       <WorkflowPermanentIdContext.Provider value="wpid_abc">
@@ -78,7 +91,28 @@ function renderAt(path = "/workflows/wpid_abc/studio") {
         </TooltipProvider>
       </WorkflowPermanentIdContext.Provider>
       <LocationProbe />
+    </>
+  );
+}
+
+function renderAt(path = "/workflows/wpid_abc/studio", state?: unknown) {
+  return render(
+    <MemoryRouter
+      initialEntries={[
+        state === undefined ? path : { ...parsePath(path), state },
+      ]}
+    >
+      <ToggleHarness />
     </MemoryRouter>,
+  );
+}
+
+function renderInBrowser(path: string, state: unknown) {
+  window.history.replaceState({ usr: state, key: "seed", idx: 0 }, "", path);
+  return render(
+    <BrowserRouter>
+      <ToggleHarness />
+    </BrowserRouter>,
   );
 }
 
@@ -103,6 +137,9 @@ function currentPanes(): string | null {
 
 afterEach(cleanup);
 beforeEach(() => {
+  localStorage.clear();
+  useStudioShellStore.getState().reset();
+  window.history.replaceState(null, "", "/");
   useStudioBrowserStore.setState(initialBrowserState, true);
   runsQueryMock.mockReturnValue({ data: [] });
   runWithWorkflowMock.mockReturnValue({ data: undefined });
@@ -157,17 +194,18 @@ describe("StudioPaneToggles structure", () => {
 });
 
 describe("StudioPaneToggles pane toggling", () => {
-  test("opening a closed pane appends it in click order", () => {
+  test("opening Copilot updates runtime state without creating a panes param", () => {
     renderAt();
     fireEvent.click(tab(/^Copilot/));
-    expect(currentPanes()).toBe("editor,browser,copilot");
+    expect(currentPanes()).toBeNull();
     expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("true");
   });
 
-  test("closing an open pane splices it out, keeping the rest in order", () => {
+  test("closing Copilot keeps the committed panes URL unchanged", () => {
     renderAt("/workflows/wpid_abc/studio?panes=editor,copilot,browser");
     fireEvent.click(tab(/^Copilot/));
-    expect(currentPanes()).toBe("editor,browser");
+    expect(currentPanes()).toBe("editor,copilot,browser");
+    expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("false");
   });
 
   test("closing the last pane leaves an explicit empty list", () => {
@@ -176,7 +214,7 @@ describe("StudioPaneToggles pane toggling", () => {
     expect(currentPanes()).toBe("");
   });
 
-  test("toggling preserves unrelated params", () => {
+  test("Copilot toggling preserves unrelated params without adding panes", () => {
     runsQueryMock.mockReturnValue({ data: [{ status: Status.Completed }] });
     renderAt("/workflows/wpid_abc/studio?wr=run_1&bl=block_1");
     fireEvent.click(tab(/^Copilot/));
@@ -184,8 +222,25 @@ describe("StudioPaneToggles pane toggling", () => {
     const params = new URLSearchParams(search);
     expect(params.get("wr")).toBe("run_1");
     expect(params.get("bl")).toBe("block_1");
-    expect(params.get("panes")).toBe("editor,browser,overview,copilot");
+    expect(params.get("panes")).toBeNull();
+    expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("true");
   });
+});
+
+test("keeps MemoryRouter state when browser history has unrelated state", () => {
+  window.history.replaceState(
+    { usr: { source: "browser" }, key: "browser", idx: 0 },
+    "",
+    "/",
+  );
+  renderAt("/workflows/wpid_abc/studio?panes=editor", { source: "memory" });
+
+  fireEvent.click(tab(/^Browser/));
+
+  expect(currentPanes()).toBe("editor,browser");
+  expect(screen.getByTestId("route-state").textContent).toBe(
+    '{"source":"memory"}',
+  );
 });
 
 describe("StudioPaneToggles run tab label", () => {
@@ -290,6 +345,35 @@ describe("StudioPaneToggles run selector", () => {
     // here, but the openPane merge is exercised.
     expect(currentPanes()?.split(",")).toContain("overview");
     await waitFor(() => expect(screen.queryByText("wr_pick")).toBeNull());
+  });
+
+  test("does not carry the previous run's route state through a switch-then-open", async () => {
+    infiniteRunsMock.mockReturnValue(
+      infiniteRuns([
+        {
+          workflow_run_id: "wr_pick",
+          status: Status.Completed,
+          created_at: "2026-07-20T00:00:00Z",
+        },
+      ]),
+    );
+    renderInBrowser("/workflows/wpid_abc/studio?panes=copilot&wr=wr_other", {
+      copilotMessage: "Fix run A",
+      copilotFixOrigin: true,
+    });
+
+    fireEvent.click(tab("Past Runs"));
+    fireEvent.click(await screen.findByText("wr_pick"));
+
+    await waitFor(() => {
+      const params = new URLSearchParams(
+        screen.getByTestId("search").textContent ?? "",
+      );
+      expect(params.get("wr")).toBe("wr_pick");
+      expect(params.get("panes")?.split(",")).toContain("overview");
+      expect(screen.getByTestId("route-state").textContent).toBe("null");
+    });
+    expect(window.history.state.usr).toBeNull();
   });
 
   test("selecting the already-viewed run reopens the closed run pane", async () => {

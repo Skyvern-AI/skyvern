@@ -1,4 +1,5 @@
-export const PROTOCOL_VERSION = 1;
+export const LEGACY_PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 export const DEFAULT_BRIDGE_PORT = 19777;
 export const BRIDGE_ALARM_NAME = "skyvern-bridge-reconnect";
 
@@ -11,6 +12,8 @@ export const MESSAGE_TYPES = Object.freeze({
   EVENT: "event",
   PING: "ping",
   PONG: "pong",
+  EXTENSION_RESET: "extension.reset",
+  EXTENSION_RESET_ACK: "extension.reset_ack",
 });
 
 export const OPS = Object.freeze({

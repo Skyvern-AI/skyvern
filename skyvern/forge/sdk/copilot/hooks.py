@@ -130,6 +130,11 @@ class CopilotRunHooks(RunHooksBase):
             if tool_name == "list_credentials" and parsed.get("ok"):
                 data = parsed.get("data") or {}
                 listed = data.get("credentials", []) if isinstance(data, dict) else []
+                if not isinstance(listed, list):
+                    listed = []
+                exact = data.get("credential") if isinstance(data, dict) else None
+                if not listed and isinstance(exact, dict):
+                    listed = [exact]
                 resolved = [
                     {"credential_id": c.get("credential_id"), "name": c.get("name")}
                     for c in listed

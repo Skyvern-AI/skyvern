@@ -16,7 +16,6 @@ import {
   TurnSummary,
   computeTurnSummary,
   condenseActivityEntries,
-  effectiveMode,
   formatElapsed,
   humanizeJudgeText,
   isBlockOk,
@@ -775,19 +774,10 @@ function phaseStatusWord(status: PhaseStatus): string {
 }
 
 // While Draft is active its stream is necessarily empty (the LLM is writing
-// code, no frames arrive) — one shimmered placeholder row fills that gap,
-// naming the redraft iteration once a prior verify failed.
-function DraftPlaceholderNote({ turn }: { turn: TurnNarrativeState }) {
+// code, no frames arrive), so one shimmered placeholder row fills that gap.
+function DraftPlaceholderNote() {
   const shimmerRef = useShimmerText<HTMLSpanElement>(true);
-  const priorFailedVerdict =
-    turn.lastRunOutcome?.verdict === "not_demonstrated" ||
-    turn.lastRunOutcome?.verdict === "not_evaluated";
-  const text = priorFailedVerdict
-    ? `Draft v${turn.authoringCount + 1} — revising after failed verify: ${
-        normalizeOutcomeReason(turn.lastRunOutcome?.displayReason) ??
-        "outcome not confirmed"
-      }`
-    : "Writing the workflow code…";
+  const text = "Writing the workflow code…";
   return (
     <FSubRow glyph="▸" glyphClass="text-muted-foreground">
       <span
@@ -988,7 +978,7 @@ function FPhaseChecklist({
                         </span>
                       </FSubRow>
                     ))}
-                    {isActive ? <DraftPlaceholderNote turn={turn} /> : null}
+                    {isActive ? <DraftPlaceholderNote /> : null}
                   </>
                 ) : row.id === "test" ? (
                   <>
@@ -1293,6 +1283,7 @@ interface DetailViewProps {
   onCollapse: (() => void) | null;
   onBlockSelect?: (label: string) => void;
   uxV1?: boolean;
+  workingRowActive?: boolean;
 }
 
 function DetailView({
@@ -1300,6 +1291,7 @@ function DetailView({
   onCollapse,
   onBlockSelect,
   uxV1,
+  workingRowActive,
 }: DetailViewProps) {
   const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
   const hasBlocks = turn.blocks.length > 0;
@@ -1370,12 +1362,9 @@ function DetailView({
         </div>
       ) : null}
 
-      {!hasBlocks &&
-      !designStarted &&
-      !turn.terminal &&
-      !["docs_answer", "refuse", "clarify"].includes(effectiveMode(turn)) ? (
+      {!hasBlocks && !designStarted && !turn.terminal && !workingRowActive ? (
         <div className="pl-9 text-[12px] italic text-muted-foreground dark:text-slate-500">
-          Waiting for the first block to start…
+          Working…
         </div>
       ) : null}
 
@@ -1394,12 +1383,14 @@ interface NarrativeViewProps {
   turn: TurnNarrativeState;
   onBlockSelect?: (blockLabel: string) => void;
   uxV1?: boolean;
+  workingRowActive?: boolean;
 }
 
 export function NarrativeView({
   turn,
   onBlockSelect,
   uxV1,
+  workingRowActive,
 }: NarrativeViewProps) {
   const summary = useMemo(
     () => computeTurnSummary(turn, { uxV1 }),
@@ -1428,6 +1419,7 @@ export function NarrativeView({
       onCollapse={isComplete ? () => setUserRolled(true) : null}
       onBlockSelect={onBlockSelect}
       uxV1={uxV1}
+      workingRowActive={workingRowActive}
     />
   );
 }

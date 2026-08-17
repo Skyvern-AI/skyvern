@@ -26,7 +26,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_structure,
     scrub_secrets_from_text,
 )
-from skyvern.forge.sdk.copilot.workflow_yaml import _redact_credentials_before_persistence
+from skyvern.forge.sdk.copilot.workflow_yaml import redact_credentials_in_workflow_yaml
 
 _FAKE_PASSWORD = "fake-pa55w0rd-7x9"
 _FAKE_OTP = "392817"
@@ -322,10 +322,31 @@ class TestPersistenceSeam:
             f'      code: |\n        await page.fill("#password", "{_FAKE_PASSWORD}")\n'
         )
 
-        redacted = _redact_credentials_before_persistence(workflow_yaml, "wpid_1", registered_scrub_values(ctx))
+        redacted = redact_credentials_in_workflow_yaml(workflow_yaml, "wpid_1", registered_scrub_values(ctx))
 
         assert _FAKE_PASSWORD not in redacted
         assert REDACTED_SECRET_PLACEHOLDER in redacted
+
+    def test_a_value_that_looks_like_the_placeholder_is_still_redacted(self) -> None:
+        """A password is an arbitrary string, including one that overlaps our own marker."""
+        for secret in ("REDACTED_SECRET", f"prefix{REDACTED_SECRET_PLACEHOLDER}suffix"):
+            ctx = _agent_ctx()
+            register_secret_scrub_value(ctx, secret)
+            workflow_yaml = f'code: await page.fill("#password", "{secret}")\n'
+
+            redacted = redact_credentials_in_workflow_yaml(workflow_yaml, "wpid_1", registered_scrub_values(ctx))
+
+            assert redacted == f'code: await page.fill("#password", "{REDACTED_SECRET_PLACEHOLDER}")\n', secret
+
+    def test_one_secret_is_never_matched_inside_another_secrets_placeholder(self) -> None:
+        ctx = _agent_ctx()
+        register_secret_scrub_value(ctx, "averylongsecret")
+        register_secret_scrub_value(ctx, "REDACTED")
+        workflow_yaml = 'code: await page.fill("#password", "averylongsecret")\n'
+
+        redacted = redact_credentials_in_workflow_yaml(workflow_yaml, "wpid_1", registered_scrub_values(ctx))
+
+        assert redacted == f'code: await page.fill("#password", "{REDACTED_SECRET_PLACEHOLDER}")\n'
 
     def test_leaves_a_parameter_referenced_workflow_untouched(self) -> None:
         ctx = _agent_ctx()
@@ -338,8 +359,7 @@ class TestPersistenceSeam:
         )
 
         assert (
-            _redact_credentials_before_persistence(workflow_yaml, "wpid_1", registered_scrub_values(ctx))
-            == workflow_yaml
+            redact_credentials_in_workflow_yaml(workflow_yaml, "wpid_1", registered_scrub_values(ctx)) == workflow_yaml
         )
 
     def test_another_sessions_secret_never_rewrites_this_workflow(self) -> None:
@@ -350,7 +370,7 @@ class TestPersistenceSeam:
         workflow_yaml = f'code: await page.fill("#note", "{_FAKE_PASSWORD}")\n'
 
         assert (
-            _redact_credentials_before_persistence(workflow_yaml, "wpid_1", registered_scrub_values(authoring))
+            redact_credentials_in_workflow_yaml(workflow_yaml, "wpid_1", registered_scrub_values(authoring))
             == workflow_yaml
         )
 
@@ -362,8 +382,7 @@ class TestPersistenceSeam:
         workflow_yaml = f"code: await page.goto('https://example.com/orders/{_FAKE_OTP}')\n"
 
         assert (
-            _redact_credentials_before_persistence(workflow_yaml, "wpid_1", registered_scrub_values(ctx))
-            == workflow_yaml
+            redact_credentials_in_workflow_yaml(workflow_yaml, "wpid_1", registered_scrub_values(ctx)) == workflow_yaml
         )
 
     def test_registered_values_are_visible_across_sessions(self) -> None:
@@ -406,6 +425,16 @@ class TestPersistenceSeam:
 
         assert all_registered_secret_values() == [_FAKE_OTP]
 
+    def test_reusing_a_session_id_with_new_values_invalidates_the_cache(self) -> None:
+        ctx = _agent_ctx("pbs_a")
+        register_secret_scrub_value(ctx, _FAKE_PASSWORD)
+        assert all_registered_secret_values() == [_FAKE_PASSWORD]
+
+        clear_session_scrub_values("pbs_a")
+        register_secret_scrub_value(_agent_ctx("pbs_a"), _FAKE_OTP)
+
+        assert all_registered_secret_values() == [_FAKE_OTP]
+
     def test_appending_to_a_session_invalidates_the_cache(self) -> None:
         ctx = _agent_ctx("pbs_a")
         register_secret_scrub_value(ctx, _FAKE_PASSWORD)
@@ -418,4 +447,4 @@ class TestPersistenceSeam:
     def test_no_registered_values_leaves_the_workflow_alone(self) -> None:
         workflow_yaml = f'code: await page.fill("#password", "{_FAKE_PASSWORD}")\n'
 
-        assert _redact_credentials_before_persistence(workflow_yaml, "wpid_1", ()) == workflow_yaml
+        assert redact_credentials_in_workflow_yaml(workflow_yaml, "wpid_1", ()) == workflow_yaml

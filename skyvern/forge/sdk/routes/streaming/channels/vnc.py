@@ -33,12 +33,6 @@ from skyvern.config import settings
 from skyvern.exceptions import MissingRoutedVncAddressError
 from skyvern.forge.sdk.routes.streaming.auth import get_x_api_key
 from skyvern.forge.sdk.routes.streaming.channels.execution import execution_channel
-from skyvern.forge.sdk.routes.streaming.registries import (
-    add_vnc_channel,
-    del_vnc_channel,
-    get_message_channel,
-    get_vnc_channel,
-)
 from skyvern.forge.sdk.routes.streaming.verify import (
     loop_verify_browser_session,
     loop_verify_task,
@@ -49,6 +43,12 @@ from skyvern.forge.sdk.routes.streaming.verify import (
 )
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession
 from skyvern.forge.sdk.schemas.tasks import Task
+from skyvern.forge.sdk.streaming.registries import (
+    add_vnc_channel,
+    del_vnc_channel,
+    get_message_channel,
+    get_vnc_channel,
+)
 from skyvern.forge.sdk.utils.aio import collect
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.webeye.cdp_connection import redact_cdp_url

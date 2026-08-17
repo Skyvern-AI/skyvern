@@ -53,8 +53,6 @@ def mock_app():
     """Create a mock app with SINGLE_CLICK_AGENT_LLM_API_HANDLER."""
     mock = MagicMock()
     mock.SINGLE_CLICK_AGENT_LLM_API_HANDLER = AsyncMock(return_value={"actions": []})
-    mock.AGENT_FUNCTION.should_use_cached_browser_scripts = MagicMock(return_value=False)
-    mock.should_use_cached_browser_scripts = MagicMock(return_value=False)
     mock.DATABASE = MagicMock()
     mock.DATABASE.tasks.get_step = AsyncMock(return_value=MagicMock())
     return mock
@@ -100,24 +98,25 @@ class TestAiClickEmptyActions:
         self, mock_page, mock_scraped_page, mock_context, mock_app
     ):
         """
-        When refreshing the browser observation raises a non-operational exception and
+        When the AI path raises a non-operational exception (LLM down, etc.) and
         there's no selector to fall back to, the original exception should
         propagate so the caller surfaces it as a 500, not a 422.
         """
         real_skyvern_page_ai = RealSkyvernPageAi(mock_scraped_page, mock_page)
 
-        mock_scraped_page.generate_scraped_page = AsyncMock(side_effect=RuntimeError("scrape failed"))
+        mock_app.SINGLE_CLICK_AGENT_LLM_API_HANDLER = AsyncMock(side_effect=RuntimeError("LLM provider down"))
 
         with (
+            patch.object(real_skyvern_page_ai, "_refresh_scraped_page", new_callable=AsyncMock),
             patch(
                 "skyvern.core.script_generations.real_skyvern_page_ai.skyvern_context.ensure_context",
                 return_value=mock_context,
             ),
-            patch(
-                "skyvern.core.script_generations.real_skyvern_page_ai.skyvern_context.current",
-                return_value=mock_context,
-            ),
             patch("skyvern.core.script_generations.real_skyvern_page_ai.app", mock_app),
+            patch(
+                "skyvern.core.script_generations.real_skyvern_page_ai.prompt_engine.load_prompt",
+                return_value="mock_prompt",
+            ),
         ):
             with pytest.raises(RuntimeError) as exc_info:
                 await real_skyvern_page_ai.ai_click(
@@ -125,11 +124,8 @@ class TestAiClickEmptyActions:
                     intention="Click the download button",
                 )
 
-            assert "scrape failed" in str(exc_info.value)
+            assert "LLM provider down" in str(exc_info.value)
             assert not isinstance(exc_info.value, SkyvernActionFailed)
-            mock_app.AGENT_FUNCTION.record_browser_observation_failure.assert_called_once_with(
-                "script_page_refresh_error"
-            )
 
     @pytest.mark.asyncio
     async def test_ai_click_falls_back_to_selector_when_llm_returns_empty(

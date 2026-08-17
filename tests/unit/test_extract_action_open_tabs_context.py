@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.prompts import prompt_engine
 from skyvern.webeye.utils.page import build_open_tabs_context
@@ -365,26 +364,3 @@ class TestBuildOpenTabsContext:
             if "Tab 0" in line:
                 title_part = line.split("(", 1)[1].rstrip(")")
                 assert len(title_part) <= 80
-
-    @pytest.mark.asyncio
-    async def test_records_tab_metadata_via_inspect_for_semantic_scan(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        page0 = MagicMock()
-        page0.url = "https://example.test/main"
-        page0.title = AsyncMock(return_value="Main Page")
-
-        page1 = MagicMock()
-        page1.url = "https://example.test/viewer"
-        page1.title = AsyncMock(return_value="PDF Viewer")
-
-        browser_state = MagicMock()
-        browser_state.list_valid_pages = AsyncMock(return_value=[page0, page1])
-
-        inspect_browser_observation = AsyncMock(return_value=None)
-        monkeypatch.setattr(app.AGENT_FUNCTION, "inspect_browser_observation", inspect_browser_observation)
-
-        result = await build_open_tabs_context(browser_state, page1)
-        assert (
-            result
-            == "Tab 0: https://example.test/main (Main Page)\nTab 1 [current]: https://example.test/viewer (PDF Viewer)"
-        )
-        inspect_browser_observation.assert_awaited_once_with(result, [], semantic_text=result)

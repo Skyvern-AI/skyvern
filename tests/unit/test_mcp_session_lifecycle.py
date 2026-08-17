@@ -411,6 +411,51 @@ async def test_resolve_browser_classifies_explicit_cloud_session_localhost_reach
 
 
 @pytest.mark.asyncio
+async def test_resolve_browser_classifies_bare_browser_session_id_from_cdp_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_manager.settings, "ENV", "prod")
+    browser = MagicMock()
+    fake_skyvern = MagicMock()
+    fake_skyvern.connect_to_cloud_browser_session = AsyncMock(return_value=browser)
+    fake_skyvern.connect_to_browser_over_cdp = AsyncMock()
+    monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
+
+    resolved_browser, context = await session_manager.resolve_browser(cdp_url="pbs_123")
+
+    assert resolved_browser is browser
+    assert context == BrowserContext(mode="cloud_session", session_id="pbs_123", can_access_localhost=False)
+    fake_skyvern.connect_to_cloud_browser_session.assert_awaited_once_with("pbs_123")
+    fake_skyvern.connect_to_browser_over_cdp.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cdp_url",
+    [
+        "http://127.0.0.1:9222",
+        "wss://browser.test/devtools/browser/pbs_123",
+    ],
+)
+async def test_resolve_browser_keeps_cdp_urls_on_direct_attach_path(
+    monkeypatch: pytest.MonkeyPatch,
+    cdp_url: str,
+) -> None:
+    browser = MagicMock()
+    fake_skyvern = MagicMock()
+    fake_skyvern.connect_to_cloud_browser_session = AsyncMock()
+    fake_skyvern.connect_to_browser_over_cdp = AsyncMock(return_value=browser)
+    monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
+
+    resolved_browser, context = await session_manager.resolve_browser(cdp_url=cdp_url)
+
+    assert resolved_browser is browser
+    assert context == BrowserContext(mode="cdp", cdp_url=cdp_url)
+    fake_skyvern.connect_to_browser_over_cdp.assert_awaited_once_with(cdp_url)
+    fake_skyvern.connect_to_cloud_browser_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("organization_id", "api_key"),
     [(None, "sk_copilot_org"), ("org_copilot", "sk_other_org")],
@@ -946,6 +991,49 @@ def test_session_ref_lookup_is_scoped_to_authenticated_organization() -> None:
             )
         )
         assert session_manager.get_session_ref("e0", session_id=session_id, page_key=page_key) is None
+
+
+def test_observe_ref_generations_remain_monotonic_after_clear() -> None:
+    session_manager.set_current_session(session_manager.SessionState())
+
+    first = session_manager.begin_session_ref_publication()
+    session_manager.clear_session_ref_map(generation=first)
+    second = session_manager.begin_session_ref_publication()
+
+    assert second > first
+
+
+def test_older_publication_cannot_commit_after_newer_reservation() -> None:
+    session_manager.set_current_session(session_manager.SessionState())
+    page_key = (1, None, "https://example.com", None)
+
+    older = session_manager.begin_session_ref_publication()
+    newer = session_manager.begin_session_ref_publication()
+
+    assert not session_manager.replace_session_ref_map({"e0": {"tag": "button"}}, generation=older, page_key=page_key)
+    assert session_manager.replace_session_ref_map({"e1": {"tag": "input"}}, generation=newer, page_key=page_key)
+    assert session_manager.session_ref_generation() > newer
+
+
+def test_mutation_invalidation_clears_v2_refs_but_preserves_monotonic_ids() -> None:
+    state = session_manager.SessionState()
+    state._observe_v2_state.refs = {"e0": {"tag": "button"}}
+    state._observe_v2_state.next_ref = 7
+    session_manager.set_current_session(state)
+    page_key = (1, None, "https://example.com", None)
+    generation = session_manager.begin_session_ref_publication()
+    assert session_manager.replace_session_ref_map(
+        {"e0": {"tag": "button"}},
+        generation=generation,
+        page_key=page_key,
+    )
+
+    invalidated_generation = session_manager.invalidate_session_ref_map()
+
+    assert invalidated_generation > generation
+    assert session_manager.get_session_ref("e0", page_key=page_key) is None
+    assert state._observe_v2_state.refs == {}
+    assert state._observe_v2_state.next_ref == 7
 
 
 # ---------------------------------------------------------------------------
