@@ -35,6 +35,7 @@ function baseProps() {
       handleMouseMove: vi.fn(),
       handleKeyDown: vi.fn(),
       handleKeyUp: vi.fn(),
+      handlePaste: vi.fn(),
     },
     currentUrl: "https://example.com/",
   };
@@ -133,6 +134,25 @@ describe("InteractiveStreamView URL bar", () => {
     expect(handleKeyDown).not.toHaveBeenCalled();
   });
 
+  it("does not forward paste events from the URL input to the remote page", () => {
+    const handlePaste = vi.fn();
+    const props = baseProps();
+    render(
+      <InteractiveStreamView
+        {...props}
+        userIsControlling={true}
+        onNavigate={vi.fn()}
+        handlers={{ ...props.handlers, handlePaste }}
+      />,
+    );
+
+    fireEvent.paste(screen.getByRole("textbox"), {
+      clipboardData: { getData: () => "https://iana.org" },
+    });
+
+    expect(handlePaste).not.toHaveBeenCalled();
+  });
+
   it("shows a navigate error inline without breaking the input", () => {
     render(
       <InteractiveStreamView
@@ -215,6 +235,26 @@ describe("InteractiveStreamView URL bar", () => {
     fireEvent.submit(input.closest("form")!);
 
     expect(onNavigate).not.toHaveBeenCalled();
+  });
+});
+
+describe("InteractiveStreamView input forwarding", () => {
+  it("forwards paste events from the focused stream container", () => {
+    const handlePaste = vi.fn();
+    const props = baseProps();
+    const { container } = render(
+      <InteractiveStreamView
+        {...props}
+        handlers={{ ...props.handlers, handlePaste }}
+      />,
+    );
+
+    const streamContainer = container.querySelector('[tabindex="0"]')!;
+    fireEvent.paste(streamContainer, {
+      clipboardData: { getData: () => "from clipboard" },
+    });
+
+    expect(handlePaste).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -252,6 +252,100 @@ class TestNavigateEvent:
         assert websocket.sent_json == [{"kind": "navigate-error", "reason": "blocked"}]
 
 
+class TestInteractiveInputDispatch:
+    def test_key_event_preserves_supported_editing_commands(self) -> None:
+        assert cdp_input._validate_key_event(
+            {
+                "eventType": "rawKeyDown",
+                "key": "ArrowLeft",
+                "code": "ArrowLeft",
+                "modifiers": 4,
+                "windowsVirtualKeyCode": 37,
+                "commands": ["moveToLeftEndOfLine"],
+            }
+        ) == {
+            "type": "rawKeyDown",
+            "key": "ArrowLeft",
+            "code": "ArrowLeft",
+            "modifiers": 4,
+            "windowsVirtualKeyCode": 37,
+            "commands": ["moveToLeftEndOfLine"],
+        }
+
+    def test_key_event_drops_unknown_editing_commands(self) -> None:
+        validated = cdp_input._validate_key_event(
+            {
+                "eventType": "rawKeyDown",
+                "key": "a",
+                "code": "KeyA",
+                "commands": ["selectAll", "notARealEditingCommand"],
+            }
+        )
+
+        assert validated is not None
+        assert validated["commands"] == ["selectAll"]
+
+    def test_mouse_move_preserves_pressed_buttons(self) -> None:
+        assert cdp_input._validate_mouse_event(
+            {
+                "eventType": "mouseMoved",
+                "x": 10,
+                "y": 20,
+                "button": "left",
+                "buttons": 1,
+            }
+        ) == {
+            "type": "mouseMoved",
+            "x": 10,
+            "y": 20,
+            "button": "left",
+            "buttons": 1,
+            "clickCount": 0,
+            "modifiers": 0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_insert_text_dispatches_through_cdp(self) -> None:
+        session = _FakeSession("s")
+        input_session = _FakeInputSession(session)
+        channel = SimpleNamespace(interactor="user", client_id="c1")
+        websocket = _FakeWebSocket([json.dumps({"type": "insertText", "text": "from local clipboard"})])
+
+        await cdp_input._run_input_loop(
+            websocket,
+            channel,
+            input_session,
+            "browser_session_id",
+            "pbs_test",
+        )
+
+        assert _dispatched(session) == [("Input.insertText", {"text": "from local clipboard"})]
+
+    @pytest.mark.asyncio
+    async def test_copy_selected_text_returns_remote_selection(self) -> None:
+        class _SelectionSession(_FakeSession):
+            async def send(self, method: str, params: dict) -> dict | None:
+                self.sent.append((method, params))
+                if method == "Runtime.evaluate":
+                    return {"result": {"value": "selected remotely"}}
+                return None
+
+        session = _SelectionSession("s")
+        input_session = _FakeInputSession(session)
+        channel = SimpleNamespace(interactor="user", client_id="c1")
+        websocket = _FakeWebSocket([json.dumps({"type": "copySelectedText"})])
+
+        await cdp_input._run_input_loop(
+            websocket,
+            channel,
+            input_session,
+            "browser_session_id",
+            "pbs_test",
+        )
+
+        assert websocket.sent_json == [{"kind": "copied-text", "text": "selected remotely"}]
+
+
 def _history(current_index: int, *urls: str) -> dict:
     return {
         "currentIndex": current_index,
