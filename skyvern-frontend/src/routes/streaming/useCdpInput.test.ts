@@ -468,6 +468,29 @@ describe("useCdpInput key handling", () => {
     );
   });
 
+  it("maps Option+Enter to newline insertion", async () => {
+    const result = await renderControllingInputHook();
+
+    act(() => {
+      result.current.handlers.handleKeyDown(
+        fakeKeyboardEvent("Enter", "Enter", { altKey: true }),
+      );
+    });
+
+    expect(latestSocketSend()).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "keyEvent",
+        eventType: "rawKeyDown",
+        key: "Enter",
+        code: "Enter",
+        text: "",
+        modifiers: 1,
+        windowsVirtualKeyCode: 13,
+        commands: ["insertNewline"],
+      }),
+    );
+  });
+
   it("sends insertNewline for Shift+Enter", async () => {
     const result = await renderControllingInputHook();
 

@@ -66,6 +66,9 @@ function editingCommandsFor(e: React.KeyboardEvent): string[] {
     return ["selectAll"];
   }
   if (e.altKey && !e.metaKey && !e.ctrlKey) {
+    if (e.key === "Enter") {
+      return ["insertNewline"];
+    }
     if (e.key === "ArrowLeft") {
       return [e.shiftKey ? "moveWordLeftAndModifySelection" : "moveWordLeft"];
     }
