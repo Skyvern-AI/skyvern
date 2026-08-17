@@ -65,6 +65,14 @@ function editingCommandsFor(e: React.KeyboardEvent): string[] {
   if (isShortcut(e, "a")) {
     return ["selectAll"];
   }
+  if (e.altKey && !e.metaKey && !e.ctrlKey) {
+    if (e.key === "ArrowLeft") {
+      return [e.shiftKey ? "moveWordLeftAndModifySelection" : "moveWordLeft"];
+    }
+    if (e.key === "ArrowRight") {
+      return [e.shiftKey ? "moveWordRightAndModifySelection" : "moveWordRight"];
+    }
+  }
   if (e.metaKey && !e.ctrlKey && !e.altKey) {
     if (e.key === "ArrowLeft") {
       return [

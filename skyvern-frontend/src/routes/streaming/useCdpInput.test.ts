@@ -419,6 +419,55 @@ describe("useCdpInput key handling", () => {
     );
   });
 
+  it("maps Option+ArrowLeft to word-boundary movement", async () => {
+    const result = await renderControllingInputHook();
+
+    act(() => {
+      result.current.handlers.handleKeyDown(
+        fakeKeyboardEvent("ArrowLeft", "ArrowLeft", { altKey: true }),
+      );
+    });
+
+    expect(latestSocketSend()).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "keyEvent",
+        eventType: "rawKeyDown",
+        key: "ArrowLeft",
+        code: "ArrowLeft",
+        text: "",
+        modifiers: 1,
+        windowsVirtualKeyCode: 37,
+        commands: ["moveWordLeft"],
+      }),
+    );
+  });
+
+  it("maps Option+Shift+ArrowRight to word selection", async () => {
+    const result = await renderControllingInputHook();
+
+    act(() => {
+      result.current.handlers.handleKeyDown(
+        fakeKeyboardEvent("ArrowRight", "ArrowRight", {
+          altKey: true,
+          shiftKey: true,
+        }),
+      );
+    });
+
+    expect(latestSocketSend()).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "keyEvent",
+        eventType: "rawKeyDown",
+        key: "ArrowRight",
+        code: "ArrowRight",
+        text: "",
+        modifiers: 9,
+        windowsVirtualKeyCode: 39,
+        commands: ["moveWordRightAndModifySelection"],
+      }),
+    );
+  });
+
   it("sends insertNewline for Shift+Enter", async () => {
     const result = await renderControllingInputHook();
 

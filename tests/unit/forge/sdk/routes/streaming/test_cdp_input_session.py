@@ -285,6 +285,21 @@ class TestInteractiveInputDispatch:
         assert validated is not None
         assert validated["commands"] == ["selectAll"]
 
+    def test_key_event_preserves_word_selection_command(self) -> None:
+        validated = cdp_input._validate_key_event(
+            {
+                "eventType": "rawKeyDown",
+                "key": "ArrowRight",
+                "code": "ArrowRight",
+                "modifiers": 9,
+                "windowsVirtualKeyCode": 39,
+                "commands": ["moveWordRightAndModifySelection"],
+            }
+        )
+
+        assert validated is not None
+        assert validated["commands"] == ["moveWordRightAndModifySelection"]
+
     def test_mouse_move_preserves_pressed_buttons(self) -> None:
         assert cdp_input._validate_mouse_event(
             {
