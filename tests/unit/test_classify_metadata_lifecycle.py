@@ -102,7 +102,9 @@ def _make_page_stub(url: str = "https://example.com/x") -> SimpleNamespace:
 
 
 def _make_page_ai_stub(page: SimpleNamespace) -> RealSkyvernPageAi:
-    inst = RealSkyvernPageAi(SimpleNamespace(), page)  # type: ignore[arg-type]
+    inst = RealSkyvernPageAi.__new__(RealSkyvernPageAi)
+    inst.page = page  # type: ignore[assignment]
+    inst.scraped_page = SimpleNamespace()  # type: ignore[assignment]
     inst.current_label = "block_a"
     return inst
 

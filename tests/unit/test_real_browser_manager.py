@@ -19,7 +19,7 @@ from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.artifact.storage.recording_test_helpers import fake_prepared_recording
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.routes.streaming import registries
+from skyvern.forge.sdk.streaming import registries
 from skyvern.webeye import real_browser_manager
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding, VideoArtifact
 from skyvern.webeye.browser_engine import (
@@ -2537,3 +2537,23 @@ async def test_address_only_cross_pod_stale_cleanup_never_terminal_closes_durabl
     assert _close_true_count(wrapper_a) == 0
     # Pod B's wrapper is entirely untouched by Pod A's cleanup.
     wrapper_b.close.assert_not_awaited()
+
+
+def test_the_browser_manager_never_drags_in_the_http_route_layer() -> None:
+    """Importing this module once cost ~476MB at first measurement, because one import reached into
+    the `routes` package for a streaming registry and `routes/__init__` eagerly builds the whole API
+    surface (FastAPI, the copilot stack, the openai-agents SDK). Every worker pod paid that to run
+    zero routes. The registry now lives in `skyvern.forge.sdk.streaming`; this pins the graph so the
+    edge cannot quietly return. A subprocess because the property is about a FRESH interpreter --
+    in-process, some other test may already have imported routes.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys; import skyvern.webeye.real_browser_manager; "
+        "leaked = [m for m in sys.modules if m == 'skyvern.forge.sdk.routes' or m == 'agents']; "
+        "sys.exit(2 if leaked else 0)"
+    )
+    result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=180)
+    assert result.returncode == 0, f"route layer leaked into the browser manager import graph\n{result.stderr[-800:]}"

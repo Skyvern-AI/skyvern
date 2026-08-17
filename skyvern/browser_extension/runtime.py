@@ -8,23 +8,21 @@ import subprocess
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import structlog
 
 from skyvern.browser_extension.auth import load_or_create_pairing_token
-from skyvern.browser_extension.broker.client import BrokerTransport, LegacyBridgeOwnerError
+from skyvern.browser_extension.broker_client import BrokerClient
 from skyvern.browser_extension.errors import BrowserExtensionError
 from skyvern.browser_extension.relay import ExtensionRelayServer
 from skyvern.browser_extension.target_registry import VirtualTargetRegistry
-from skyvern.browser_extension.transport import ExtensionTransport
 
 LOG = structlog.get_logger(__name__)
 
 _PORT_ENV = "SKYVERN_BROWSER_EXTENSION_PORT"
 _BROKER_ENV = "SKYVERN_BROWSER_EXTENSION_BROKER"
 _DEFAULT_PORT = 19777
-_DISABLED_VALUES = frozenset({"0", "false", "no", "off"})
 
 
 class _Adapter(Protocol):
@@ -40,18 +38,27 @@ class _Adapter(Protocol):
     async def on_extension_disconnect(self) -> None: ...
 
 
-TransportFactory = Callable[
+class _Relay(Protocol):
+    bound_port: int
+    scoped_tabs: list[dict]
+
+    @property
+    def connected(self) -> bool: ...
+
+    async def start(self) -> None: ...
+
+    async def stop(self) -> None: ...
+
+    async def wait_connected(self, timeout: float) -> bool: ...
+
+    async def request(self, op: str, args: dict, timeout: float = 30.0) -> dict: ...
+
+
+_relay_factory: Callable[
     [str, int, Callable[[str, dict], Awaitable[None]], Callable[[], Awaitable[None]] | None],
-    ExtensionTransport,
-]
-
-_relay_factory: TransportFactory = ExtensionRelayServer
-_broker_factory: TransportFactory = BrokerTransport
-_adapter_factory: Callable[[VirtualTargetRegistry, ExtensionTransport], _Adapter] | None = None
-
-
-def broker_enabled() -> bool:
-    return os.environ.get(_BROKER_ENV, "").strip().lower() not in _DISABLED_VALUES
+    ExtensionRelayServer,
+] = ExtensionRelayServer
+_adapter_factory: Callable[[VirtualTargetRegistry, _Relay], _Adapter] | None = None
 
 
 def _open_browser_process(command: list[str], *, windows: bool) -> bool:
@@ -73,10 +80,9 @@ class BrowserExtensionRuntime:
     _instance: BrowserExtensionRuntime | None = None
     _lock = asyncio.Lock()
 
-    def __init__(self, transport: ExtensionTransport, adapter: _Adapter, *, brokered: bool) -> None:
-        self._transport = transport
+    def __init__(self, relay: _Relay, adapter: _Adapter) -> None:
+        self._relay = relay
         self._adapter = adapter
-        self._brokered = brokered
         self._stopped = False
 
     @classmethod
@@ -86,6 +92,36 @@ class BrowserExtensionRuntime:
                 return cls._instance
 
             resolved_port = _resolve_port(port)
+            if _broker_requested() and not _broker_platform_supported():
+                LOG.info(
+                    "browser_extension_broker_unsupported_platform_using_legacy",
+                    code="UNSUPPORTED_PLATFORM",
+                    platform=sys.platform,
+                )
+            if broker_mode_enabled():
+                registry = VirtualTargetRegistry()
+                broker_adapter_holder: list[_Adapter] = []
+
+                async def handle_broker_event(event: str, params: dict) -> None:
+                    await broker_adapter_holder[0].handle_extension_event(event, params)
+
+                async def on_broker_disconnect() -> None:
+                    await broker_adapter_holder[0].on_extension_disconnect()
+
+                broker = BrokerClient(resolved_port, handle_broker_event, on_broker_disconnect)
+                broker_adapter = _create_adapter(registry, broker)
+                broker_adapter_holder.append(broker_adapter)
+                try:
+                    await broker_adapter.start()
+                    await broker.start()
+                except BaseException:
+                    await _cleanup_failed_start(broker, broker_adapter)
+                    raise
+
+                runtime = cls(broker, broker_adapter)
+                cls._instance = runtime
+                return runtime
+
             token = load_or_create_pairing_token()
             registry = VirtualTargetRegistry()
             adapter_holder: list[_Adapter] = []
@@ -96,24 +132,15 @@ class BrowserExtensionRuntime:
             async def on_disconnect() -> None:
                 await adapter_holder[0].on_extension_disconnect()
 
-            brokered = broker_enabled()
-            factory = _broker_factory if brokered else _relay_factory
-            transport = factory(token, resolved_port, handle_event, on_disconnect)
-            adapter = _create_adapter(registry, transport)
+            relay = _relay_factory(token, resolved_port, handle_event, on_disconnect)
+            adapter = _create_adapter(registry, relay)
             adapter_holder.append(adapter)
 
             try:
                 await adapter.start()
-                await transport.start()
-            except LegacyBridgeOwnerError as exc:
-                await _cleanup_failed_start(transport, adapter)
-                raise BrowserExtensionError(
-                    f"An older Skyvern MCP session owns the browser-extension bridge on port {resolved_port} and "
-                    "cannot share it; restart that session on this version so every agent can attach, or set "
-                    f"{_PORT_ENV} to a free port and update the bridge port in the Skyvern extension popup to match"
-                ) from exc
+                await relay.start()
             except OSError as exc:
-                await _cleanup_failed_start(transport, adapter)
+                await _cleanup_failed_start(relay, adapter)
                 if exc.errno == errno.EADDRINUSE:
                     raise BrowserExtensionError(
                         f"Another Skyvern MCP session likely owns the browser-extension bridge on port {resolved_port}; "
@@ -122,10 +149,10 @@ class BrowserExtensionRuntime:
                     ) from exc
                 raise
             except BaseException:
-                await _cleanup_failed_start(transport, adapter)
+                await _cleanup_failed_start(relay, adapter)
                 raise
 
-            runtime = cls(transport, adapter, brokered=brokered)
+            runtime = cls(relay, adapter)
             cls._instance = runtime
             return runtime
 
@@ -139,14 +166,10 @@ class BrowserExtensionRuntime:
 
     @property
     def extension_connected(self) -> bool:
-        return self._transport.connected
-
-    @property
-    def brokered(self) -> bool:
-        return self._brokered
+        return self._relay.connected
 
     async def wait_for_extension(self, timeout: float = 10.0) -> bool:
-        return await self._transport.wait_connected(timeout)
+        return await self._relay.wait_connected(timeout)
 
     @staticmethod
     def open_extension_url(url: str) -> bool:
@@ -192,13 +215,12 @@ class BrowserExtensionRuntime:
                     return True
         return False
 
-    async def open_pairing_page(self) -> bool:
-        try:
-            nonce = await self._transport.acquire_pairing_nonce()
-        except BrowserExtensionError as exc:
-            LOG.info("browser_extension_pairing_page_unavailable", error_type=type(exc).__name__)
+    def open_pairing_page(self) -> bool:
+        if isinstance(self._relay, BrokerClient):
             return False
-        url = f"http://127.0.0.1:{self._transport.bound_port}/pair#{nonce}"
+        embedded_relay = cast(ExtensionRelayServer, self._relay)
+        nonce = embedded_relay.get_or_create_pairing_nonce()
+        url = f"http://127.0.0.1:{embedded_relay.bound_port}/pair#{nonce}"
         return self.open_extension_url(url)
 
     async def shutdown(self) -> None:
@@ -208,7 +230,7 @@ class BrowserExtensionRuntime:
                 return
             self._stopped = True
             try:
-                await self._transport.stop()
+                await self._relay.stop()
             finally:
                 try:
                     await self._adapter.stop()
@@ -225,12 +247,12 @@ class BrowserExtensionRuntime:
         return _resolve_port(None)
 
 
-def _create_adapter(registry: VirtualTargetRegistry, transport: ExtensionTransport) -> _Adapter:
+def _create_adapter(registry: VirtualTargetRegistry, relay: _Relay) -> _Adapter:
     if _adapter_factory is not None:
-        return _adapter_factory(registry, transport)
+        return _adapter_factory(registry, relay)
     from skyvern.browser_extension.cdp_adapter import ExtensionCdpAdapter
 
-    return ExtensionCdpAdapter(registry, transport)
+    return ExtensionCdpAdapter(registry, relay)
 
 
 def _resolve_port(port: int | None) -> int:
@@ -250,12 +272,24 @@ def _resolve_port(port: int | None) -> int:
     return resolved_port
 
 
-async def _cleanup_failed_start(transport: ExtensionTransport, adapter: _Adapter) -> None:
+async def _cleanup_failed_start(relay: _Relay, adapter: _Adapter) -> None:
     try:
-        await transport.stop()
+        await relay.stop()
     except Exception:
         LOG.exception("failed to stop browser extension relay after startup error")
     try:
         await adapter.stop()
     except Exception:
         LOG.exception("failed to stop browser extension adapter after startup error")
+
+
+def broker_mode_enabled() -> bool:
+    return _broker_requested() and _broker_platform_supported()
+
+
+def _broker_requested() -> bool:
+    return os.environ.get(_BROKER_ENV) != "0"
+
+
+def _broker_platform_supported() -> bool:
+    return os.name == "posix" and sys.platform != "win32"

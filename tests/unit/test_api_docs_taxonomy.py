@@ -17,7 +17,7 @@ from pathlib import Path
 
 COMMITTED_SPEC = Path(__file__).resolve().parents[2] / "docs" / "api-reference" / "openapi.json"
 
-# Capitalized resource tags — kept in lockstep with .claude/skills/api-docs-audit/SKILL.md.
+# Capitalized resource tags — kept in lockstep with .agents/skills/api-docs-audit/SKILL.md.
 APPROVED_TAGS = {
     "Agents",
     "Folders",

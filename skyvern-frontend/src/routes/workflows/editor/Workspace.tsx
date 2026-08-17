@@ -40,6 +40,7 @@ import {
   isWorkflowYamlDirty,
 } from "@/store/WorkflowYamlEditorStore";
 import { getClient } from "@/api/AxiosClient";
+import { isPaymentRequiredError } from "@/api/paymentRequired";
 import { DebugSessionApiResponse, ProxyLocation } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
@@ -761,6 +762,42 @@ function Workspace({
     isRateLimited,
     keepAliveBrowserSession: true,
   });
+  const debugSessionPaymentRequired = isPaymentRequiredError(debugSessionError);
+  const debugSessionErrorPanel = (
+    <StreamStatusPanel
+      diagnostic={
+        debugSessionPaymentRequired
+          ? {
+              title: "Out of credits",
+              detail:
+                getAxiosErrorDetail(debugSessionError) ??
+                "More credits are required to start a browser session.",
+              hint: "Add credits or enable overage in Billing, then return here to start the browser session.",
+            }
+          : {
+              title: "Could not start browser session",
+              detail:
+                getAxiosErrorDetail(debugSessionError) ??
+                "The backend rejected the browser session request.",
+              hint: "Local dev only supports one browser at a time. Retry after closing other agents.",
+            }
+      }
+    >
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={() => {
+          if (debugSessionPaymentRequired) {
+            navigate("/billing");
+          } else {
+            void refetchDebugSession();
+          }
+        }}
+      >
+        {debugSessionPaymentRequired ? "Go to Billing" : "Retry"}
+      </Button>
+    </StreamStatusPanel>
+  );
   const { data: viewerState } = useActiveRunSessionQuery({
     workflowPermanentId,
     enabled:
@@ -2558,23 +2595,7 @@ function Workspace({
                     <div key={reloadKey} className="w-full flex-1">
                       {!displayBrowserSessionId ? (
                         isDebugSessionError ? (
-                          <StreamStatusPanel
-                            diagnostic={{
-                              title: "Could not start browser session",
-                              detail:
-                                getAxiosErrorDetail(debugSessionError) ??
-                                "The backend rejected the browser session request.",
-                              hint: "Local dev only supports one browser at a time. Retry after closing other agents.",
-                            }}
-                          >
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => void refetchDebugSession()}
-                            >
-                              Retry
-                            </Button>
-                          </StreamStatusPanel>
+                          debugSessionErrorPanel
                         ) : (
                           <StreamStatusPanel
                             diagnostic={{
@@ -2656,23 +2677,7 @@ function Workspace({
                     >
                       {!displayBrowserSessionId ? (
                         isDebugSessionError ? (
-                          <StreamStatusPanel
-                            diagnostic={{
-                              title: "Could not start browser session",
-                              detail:
-                                getAxiosErrorDetail(debugSessionError) ??
-                                "The backend rejected the browser session request.",
-                              hint: "Local dev only supports one browser at a time. Retry after closing other agents.",
-                            }}
-                          >
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => void refetchDebugSession()}
-                            >
-                              Retry
-                            </Button>
-                          </StreamStatusPanel>
+                          debugSessionErrorPanel
                         ) : (
                           <StreamStatusPanel
                             diagnostic={{
@@ -2687,6 +2692,11 @@ function Workspace({
                           browserSessionId={displayBrowserSessionId}
                           interactive={true}
                           showControlButtons={true}
+                          // The CDP transport streams the page viewport only, so
+                          // unlike the VNC panel there is no browser address bar
+                          // to type into and a session resting on about:blank has
+                          // no way out (SKY-13705).
+                          enableUrlInput={true}
                           onReadyChange={handleLiveBrowserReadyChange}
                         />
                       ) : (

@@ -20,7 +20,6 @@ const turnStart = (): WorkflowCopilotTurnStartUpdate => ({
   type: "turn_start",
   turn_id: "turn-1",
   turn_index: 0,
-  mode: "build",
   timestamp: "2026-06-10T00:00:00Z",
 });
 
@@ -182,7 +181,7 @@ describe("applyNarrativeEvent — authoringCount", () => {
 });
 
 describe("applyNarrativeEvent — lastRunOutcome", () => {
-  it("run_outcome sets lastRunOutcome with the pre-event activitySeq", () => {
+  it("run_outcome sets the latest factual run outcome", () => {
     let s: TurnNarrativeState = applyNarrativeEvent(
       EMPTY_NARRATIVE,
       toolCall(),
@@ -196,9 +195,8 @@ describe("applyNarrativeEvent — lastRunOutcome", () => {
     );
     expect(s.lastRunOutcome).toEqual({
       verdict: "not_demonstrated",
-      role: "adjudicated",
+      role: "recorded",
       displayReason: "outcome not confirmed",
-      activitySeqAtVerdict: 1,
     });
   });
 
@@ -209,59 +207,6 @@ describe("applyNarrativeEvent — lastRunOutcome", () => {
     );
     s = applyNarrativeEvent(s, runOutcome({ verdict: "evaluating" }));
     expect(s.lastRunOutcome?.verdict).toBe("evaluating");
-  });
-});
-
-describe("applyNarrativeEvent — activitySeq (monotonic, cap-immune)", () => {
-  it("increments on tool_call (agent-initiated steps)", () => {
-    let s: TurnNarrativeState = applyNarrativeEvent(
-      EMPTY_NARRATIVE,
-      toolCall(),
-    );
-    expect(s.activitySeq).toBe(1);
-    s = applyNarrativeEvent(s, toolCall({ tool_call_id: "call-2" }));
-    expect(s.activitySeq).toBe(2);
-  });
-
-  it("REGRESSION PIN: does NOT increment on tool_result — a failed run's own trailing tool_result must not look like new agent work (Codex catch)", () => {
-    let s: TurnNarrativeState = applyNarrativeEvent(
-      EMPTY_NARRATIVE,
-      toolCall(),
-    );
-    expect(s.activitySeq).toBe(1);
-    s = applyNarrativeEvent(s, {
-      type: "tool_result",
-      tool_name: "navigate_browser",
-      success: true,
-      summary: "done",
-      iteration: 0,
-      tool_call_id: "call-1",
-    });
-    expect(s.activitySeq).toBe(1);
-  });
-
-  it("REGRESSION PIN: does NOT increment on narration — the narrator can report on a failed run's outcome independent of new revision work (Codex catch)", () => {
-    let s: TurnNarrativeState = applyNarrativeEvent(
-      EMPTY_NARRATIVE,
-      toolCall(),
-    );
-    expect(s.activitySeq).toBe(1);
-    s = applyNarrativeEvent(s, {
-      type: "narration",
-      narration: "The run didn't confirm the goal was met.",
-      iteration: 0,
-      timestamp: "2026-06-10T00:00:00Z",
-    });
-    expect(s.activitySeq).toBe(1);
-  });
-
-  it("REGRESSION PIN: keeps incrementing past the MAX_DESIGN_ACTIVITY_ENTRIES cap, unlike designActivity.length", () => {
-    let s: TurnNarrativeState = EMPTY_NARRATIVE;
-    for (let i = 0; i < 55; i++) {
-      s = applyNarrativeEvent(s, toolCall({ tool_call_id: `c${i}` }));
-    }
-    expect(s.designActivity.length).toBe(50);
-    expect(s.activitySeq).toBe(55);
   });
 });
 
@@ -281,7 +226,6 @@ describe("applyNarrativeEvent — response hydration resets phase-hint fields", 
         narrative_payload: {
           turnId: "turn-1",
           turnIndex: 0,
-          mode: "build",
           designStarted: true,
           designEnded: true,
           draft: null,
@@ -312,7 +256,6 @@ describe("applyNarrativeEvent — response hydration resets phase-hint fields", 
         narrative_payload: {
           turnId: "turn-2",
           turnIndex: 1,
-          mode: "build",
           designStarted: true,
           designEnded: true,
           draft: null,
@@ -330,7 +273,7 @@ describe("applyNarrativeEvent — response hydration resets phase-hint fields", 
     expect(s.draftingSignaledAt).toBeNull();
   });
 
-  it("authoringCount is grafted across the terminal swap (SKY-12969 parity); lastRunOutcome/activitySeq are not", () => {
+  it("authoringCount is grafted across the terminal swap; lastRunOutcome is not", () => {
     let s: TurnNarrativeState = applyNarrativeEvent(
       EMPTY_NARRATIVE,
       turnStart(),
@@ -347,7 +290,6 @@ describe("applyNarrativeEvent — response hydration resets phase-hint fields", 
         narrative_payload: {
           turnId: "turn-1",
           turnIndex: 0,
-          mode: "build",
           designStarted: true,
           designEnded: true,
           draft: null,
@@ -366,9 +308,8 @@ describe("applyNarrativeEvent — response hydration resets phase-hint fields", 
     // payload's capped designActivity has aged out the authoring entry, so
     // Explore stays resolved at the swap rather than flipping back.
     expect(s.authoringCount).toBe(1);
-    // Still not grafted — a cancel-mid-redraft marks Test stopped, not Draft.
+    // Still not grafted: the terminal payload owns the final run fact.
     expect(s.lastRunOutcome).toBeNull();
-    expect(s.activitySeq).toBe(0);
   });
 });
 
@@ -476,7 +417,6 @@ describe("applyNarrativeEvent — server-authored display labels", () => {
     const s = hydrateNarrativeFromPayload({
       turnId: "turn-1",
       turnIndex: 0,
-      mode: "build",
       designStarted: true,
       designEnded: true,
       draft: null,

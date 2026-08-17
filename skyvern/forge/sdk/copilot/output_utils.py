@@ -16,7 +16,6 @@ from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES
 from skyvern.forge.sdk.copilot.failure_tracking import (
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
 )
-from skyvern.forge.sdk.copilot.loop_detection import LOOP_DETECTED_MARKER
 from skyvern.schemas.workflows import BlockType
 
 if TYPE_CHECKING:
@@ -429,7 +428,7 @@ def _structured_failure_summary_for_user(
 # Blocker kinds where the tool was redirected before it ran (a precondition/authority
 # gate), not a real failure. `tool_error` and `loop_detected` keep failure affect —
 # something actually broke or the agent is stuck.
-_NEUTRAL_REDIRECT_BLOCKER_KINDS = frozenset({"phase_gated", "missing_required_context", "authority_denied"})
+_NEUTRAL_REDIRECT_BLOCKER_KINDS = frozenset({"authority_denied"})
 
 
 def user_facing_success(
@@ -555,6 +554,15 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
             return f"Updated the workflow and ran it: {status}"
         return "Updated the workflow and ran it"
     if tool_name == "list_credentials":
+        if data.get("status") == "resolved":
+            credential = data.get("credential")
+            if isinstance(credential, dict):
+                name = credential.get("name")
+                if isinstance(name, str) and name:
+                    safe_name = sanitize_block_label_for_display(name)
+                    if safe_name:
+                        return f"Found 1 credential: {safe_name}"
+                return "Found 1 credential(s)"
         return f"Found {data.get('count', 0)} credential(s)"
     if tool_name == "list_integrations":
         return f"Found {data.get('count', 0)} connected integration(s)"
@@ -677,7 +685,6 @@ _USE_TOOL_NAME_RE = re.compile(r"use the ['\"]?[a-z_][a-z0-9_]*['\"]? tool", re.
 INTERNAL_VALIDATION_FAILURE_PREFIX = "Workflow validation failed: "
 _INTERNAL_VALIDATION_MARKERS: tuple[str, ...] = (INTERNAL_VALIDATION_FAILURE_PREFIX.strip(": ").lower(),)
 
-_USER_FACING_LOOP_MESSAGE = "The agent got stuck retrying the same step — moving on."
 _USER_FACING_JINJA_MESSAGE = "A workflow parameter could not be filled in."
 _USER_FACING_GENERIC_FAILURE = _STRUCTURED_UNSAFE_FALLBACK
 
@@ -691,15 +698,13 @@ _USER_FACING_EMPTY_SUCCESS_TOOLS: frozenset[str] = frozenset(
         # The server-authored display label already names the operation and its
         # target block; a bare "OK" summary would render instead of it.
         "edit_block",
+        "add_block",
         "delete_block",
-        "synthesize_demonstrated_block",
     }
 )
 
 
 def _translate_failure_for_user(error_text: str) -> str:
-    if LOOP_DETECTED_MARKER in error_text:
-        return _USER_FACING_LOOP_MESSAGE
     if any(marker in error_text for marker in _JINJA_ERROR_MARKERS):
         return _USER_FACING_JINJA_MESSAGE
     lowered = error_text.lower()

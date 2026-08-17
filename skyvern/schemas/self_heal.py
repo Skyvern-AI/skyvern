@@ -25,6 +25,7 @@ class HealSkipReason(StrEnum):
     timeout_class = "timeout_class"
     insecure_code = "insecure_code"
     unclassifiable = "unclassifiable"
+    user_defined_error = "user_defined_error"
 
 
 class OutputObligation(StrEnum):

@@ -14,6 +14,10 @@ from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedP
 if TYPE_CHECKING:
     from skyvern.webeye.browser_engine import BrowserEngineSelection
 
+# URLs a tab reports when it holds no document — including ":" , which Chrome reports for a tab
+# whose only navigation turned into a download.
+BLANK_PAGE_URLS = {"about:blank", ":"}
+
 
 class BrowserState(Protocol):
     browser_context: BrowserContext | None

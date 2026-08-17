@@ -20,9 +20,9 @@ DOWNLOAD_KIND_EXTENSION: DownloadKind = "extension"
 # serving a file via Content-Disposition has no extension and no ``download`` attribute, so the
 # href-shape prediction is blind to it and only the fired download proves the affordance.
 DOWNLOAD_KIND_OBSERVED: DownloadKind = "observed"
-# A document the scout's click opened as an inline render (a bill image in a new tab). No browser
-# download event ever fires for these, so the dir-diff proof above cannot see them; the popup whose
-# document is the file (image content-type, no attachment disposition) is the equivalent proof.
+# A document the scout's click opened as an inline render — a PDF statement handed to the browser's
+# viewer, or a bill image. No browser download event fires for these, so the dir-diff proof above
+# cannot see them; the popup whose response *is* the document is the equivalent proof.
 DOWNLOAD_KIND_OBSERVED_RENDER: DownloadKind = "observed_render"
 
 # S2 may only mint a prediction; ``registered`` is S1-only and must never come from a nav target.
@@ -69,6 +69,33 @@ REGISTERED_DOWNLOAD_OUTPUT_KEYS: tuple[str, ...] = (
 REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS: frozenset[str] = frozenset(
     f"output.{key}" for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS
 )
+
+# Nested mapping the completion grader also reads registration keys from; a strip that covered only
+# the root would leave `{"output": {"downloaded_files": [...]}}` gradeable as a real download.
+_NESTED_DOWNLOAD_OUTPUT_KEY = "output"
+
+
+def strip_block_authored_download_keys(output: dict[str, Any] | list | str | None) -> list[str]:
+    """Drop registration keys a block authored, returning the dotted names removed; the scopes mirror
+    ``_completion_evidence_payload`` — the root mapping and one nested ``output`` mapping — because only
+    the execution layer's storage read-back may populate these keys.
+
+    Only a truthy value is a claim, matching ``bind_downloaded_files_to_output``: an empty field is
+    schema a strict-rendering template may dereference, and the two engines must drop the same keys."""
+    dropped: list[str] = []
+    if not isinstance(output, dict):
+        return dropped
+    scopes: list[tuple[str, dict[str, Any]]] = [("", output)]
+    nested = output.get(_NESTED_DOWNLOAD_OUTPUT_KEY)
+    if isinstance(nested, dict):
+        scopes.append((f"{_NESTED_DOWNLOAD_OUTPUT_KEY}.", nested))
+    for prefix, mapping in scopes:
+        for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS:
+            if mapping.get(key):
+                mapping.pop(key)
+                dropped.append(f"{prefix}{key}")
+    return dropped
+
 
 # The keys whose typed-affordance hints flow through the scout navTargets capture.
 NAV_TARGET_DOWNLOAD_KIND_KEY = "download_kind"
@@ -184,7 +211,7 @@ def derive_from_observed_download(*, selector: str, affordance_text: str = "") -
 def derive_from_observed_render(
     *, selector: str, rendered_url: str, affordance_text: str = ""
 ) -> ReachedDownloadTarget | None:
-    """S3 sibling: mint a target from a document the scout's click opened as an inline image render,
+    """S3 sibling: mint a target from a document the scout's click opened as an inline render,
     so the guidance layer can steer the model away from the download idioms that cannot work on it."""
     selector = _summary_str(selector)
     rendered_url = _summary_str(rendered_url)
@@ -221,10 +248,13 @@ def derive_from_block_outputs(block_outputs_by_label: Any) -> ReachedDownloadTar
 
 _AUTHOR_DOWNLOAD_GUIDANCE = (
     "A correct click reached a download affordance on the current page. Author ONE terminal "
-    "download code block that fires the browser download for the captured target using the "
-    "expect_download idiom, not a static-fetch request and not another page re-evaluation. "
-    "The downloaded file is registered to the workflow output surface (downloaded_files); never "
-    "place file bytes or URLs in the chat reply."
+    "download code block as a single `await click_and_claim_download(page, selector)` call with the "
+    "captured affordance selector — not page.expect_download (the sandboxed runner cannot execute "
+    "it), not a static-fetch request, and not another page re-evaluation. The platform clicks the "
+    "affordance once, claims the fired browser download, and registers it to the workflow output "
+    "surface (downloaded_files); never place file bytes or URLs in the chat reply. The call returns "
+    "the sanitized file name as a plain string — bind it and return it as-is. It is not a Download "
+    "object, so reading `.suggested_filename` or any other attribute off it fails."
 )
 
 _CONFIRMED_DOWNLOAD_GUIDANCE = (
@@ -266,6 +296,45 @@ _DOWNLOAD_EVENT_NAME = "download"
 _REGISTERED_DOWNLOAD_OUTPUT_KEY_SET = frozenset(REGISTERED_DOWNLOAD_OUTPUT_KEYS)
 
 
+# Sandbox helper that clicks a download affordance and claims the fired browser download into the
+# run download directory — the one fired-download terminal shape both engines execute (the secure
+# runner cannot broker page.expect_download).
+DOWNLOAD_CLAIM_HELPER_NAME = "click_and_claim_download"
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadClaimHelperContract:
+    """Point-of-use CodeBlock runtime contract for the fired-download helper."""
+
+    name: str = DOWNLOAD_CLAIM_HELPER_NAME
+    call: str = f"await {DOWNLOAD_CLAIM_HELPER_NAME}(page, selector)"
+    page_type: str = "current_code_block_page"
+    # The secure runner also accepts its locator facade, but the inline engine accepts strings.
+    # This model-facing contract advertises only the shape executable by both engines.
+    selector_types: tuple[str, ...] = ("selector_string",)
+    return_type: str = "string"
+    return_value: str = "sanitized_suggested_filename"
+
+    def to_tool_data(self) -> dict[str, Any]:
+        return {
+            "call": self.call,
+            "parameters": {
+                "page": {"accepted_type": self.page_type},
+                "selector": {"accepted_types": list(self.selector_types)},
+            },
+            "returns": {"type": self.return_type, "value": self.return_value},
+        }
+
+
+_DOWNLOAD_CLAIM_HELPER_CONTRACT = DownloadClaimHelperContract()
+
+
+def download_claim_helper_contract() -> dict[str, dict[str, Any]]:
+    """Return the model-facing helper map rendered by the code-block schema surface."""
+    contract = _DOWNLOAD_CLAIM_HELPER_CONTRACT
+    return {contract.name: contract.to_tool_data()}
+
+
 def _call_is_expect_download(node: ast.expr) -> bool:
     if isinstance(node, ast.Await):
         return _call_is_expect_download(node.value)
@@ -298,11 +367,29 @@ def _dict_literal_keys(node: ast.expr) -> set[str]:
     return {key.value for key in node.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)}
 
 
+def code_uses_download_claim(code: str) -> bool:
+    """True when the code calls the worker-owned download claim, the registering terminal for a
+    fired-download affordance on both engines."""
+    if not code.strip():
+        return False
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+    except SyntaxError:
+        return False
+    return any(_call_is_download_claim(node) for node in ast.walk(tree) if isinstance(node, (ast.Call, ast.Await)))
+
+
+def _call_is_download_claim(node: ast.expr) -> bool:
+    if isinstance(node, ast.Await):
+        return _call_is_download_claim(node.value)
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == DOWNLOAD_CLAIM_HELPER_NAME
+
+
 def code_is_download_intent(code: str) -> bool:
     """True when a code block authors a download: it uses the `page.expect_download` context-manager
-    idiom or the event-based `page.wait_for_event("download")` / `page.expect_event("download")` idiom
-    anywhere, or returns/binds a dict literal carrying an execution-layer download registration key.
-    Used to require a scout-act before such a block may be authored."""
+    idiom, the event-based `page.wait_for_event("download")` / `page.expect_event("download")` idiom,
+    or the `click_and_claim_download` helper anywhere, or returns/binds a dict literal carrying an
+    execution-layer download registration key."""
     if not code.strip():
         return False
     try:
@@ -314,7 +401,9 @@ def code_is_download_intent(code: str) -> bool:
             for item in node.items:
                 if _call_is_expect_download(item.context_expr) or _call_is_download_event_capture(item.context_expr):
                     return True
-        if isinstance(node, (ast.Call, ast.Await)) and _call_is_download_event_capture(node):
+        if isinstance(node, (ast.Call, ast.Await)) and (
+            _call_is_download_event_capture(node) or _call_is_download_claim(node)
+        ):
             return True
         if isinstance(node, ast.Return) and node.value is not None:
             if _dict_literal_keys(node.value) & _REGISTERED_DOWNLOAD_OUTPUT_KEY_SET:

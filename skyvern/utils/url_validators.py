@@ -1,11 +1,11 @@
 import ipaddress
 import socket
 from http import HTTPStatus
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
 
 import httpx
-from pydantic import AnyHttpUrl, HttpUrl, ValidationError
+from pydantic import AfterValidator, AnyHttpUrl, HttpUrl, ValidationError
 
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost, InvalidUrl, SkyvernHTTPException, UnresolvableHost
@@ -326,6 +326,47 @@ def validate_url(url: str) -> str | None:
     if blocked:
         raise BlockedHost(host=host)
     return str(v)
+
+
+def _is_aws_load_balancer_host(host: str) -> bool:
+    labels = host.split(".")
+    if host.endswith(".amazonaws.com.cn"):
+        service_labels = labels[:-3]
+    elif host.endswith(".amazonaws.com"):
+        service_labels = labels[:-2]
+    else:
+        return False
+
+    if len(service_labels) < 3:
+        return False
+
+    def is_region(label: str) -> bool:
+        prefix, separator, number = label.rpartition("-")
+        return bool(separator and number.isdigit() and "-" in prefix)
+
+    return (service_labels[-2] == "elb" and is_region(service_labels[-1])) or (
+        service_labels[-1] == "elb" and is_region(service_labels[-2])
+    )
+
+
+def validate_webhook_url(url: str) -> str:
+    if not url:
+        return url
+
+    validated_url = validate_url(url)
+    if not validated_url:
+        raise InvalidUrl(url=url)
+
+    host = _normalize_host(urlparse(validated_url).hostname or "")
+    if _is_aws_load_balancer_host(host):
+        raise SkyvernHTTPException(
+            message="Webhook URL must use a stable custom hostname instead of an AWS load balancer DNS name.",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    return validated_url
+
+
+WebhookUrl = Annotated[str, AfterValidator(validate_webhook_url)]
 
 
 def validate_fetch_url_with_resolved_ips(url: str) -> tuple[str, tuple[str, ...]]:

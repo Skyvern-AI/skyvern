@@ -596,6 +596,21 @@ def test_model_call_without_provider_usage_does_not_emit_datadog_event(
     assert events == []
 
 
+def test_datadog_logging_failure_does_not_escape_or_leak_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_to_log(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("logger unavailable")
+
+    monkeypatch.setattr(model_telemetry_module.LOG, "info", fail_to_log)
+
+    with model_call_telemetry_scope(6, model="gpt-5.6-sol") as telemetry:
+        telemetry.input_tokens = 100
+        telemetry.output_tokens = 5
+
+    assert current_model_call_telemetry() is None
+
+
 @pytest.mark.asyncio
 async def test_concurrent_calls_keep_usage_and_indices_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
     release = {11: asyncio.Event(), 22: asyncio.Event()}

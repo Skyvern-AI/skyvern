@@ -21,6 +21,7 @@ from playwright.async_api import Frame, Page
 from skyvern.config import CodeBlockMode, settings
 from skyvern.constants import CUSTOMER_STORAGE_UPLOAD_MAX_BYTES, SKYVERN_ID_ATTR
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem_with_tier
+from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import (
     AzureConfigurationError,
     DisabledBlockExecutionError,
@@ -53,7 +54,7 @@ from skyvern.forge.sdk.schemas.credentials import (
 )
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskStatus
 from skyvern.forge.sdk.services import (
     google_drive_service,
     google_oauth_service,
@@ -64,20 +65,15 @@ from skyvern.forge.sdk.services import (
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
+from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
 from skyvern.utils.email_validation import normalize_identifier_if_email
 from skyvern.utils.url_validators import pinned_ip_client
-from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_state import BrowserState
-from skyvern.webeye.scraper.scraped_page import (
-    ELEMENT_NODE_ATTRIBUTES,
-    CleanupElementTreeFunc,
-    ScrapedPage,
-    json_to_html,
-)
+from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
 from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame, take_element_screenshot
 
@@ -91,6 +87,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
     from skyvern.services.otp_service import OTPValue
+    from skyvern.webeye.browser_artifacts import DownloadBinding
 
 LOG = structlog.get_logger()
 
@@ -194,7 +191,10 @@ class ScriptExecutionPolicyDecision:
     allowed: bool
     selection_reason: str
     flag_value: bool | None = None
-    env_force_on: bool = False
+    # Whether a denial must fail the run rather than degrade it. Reserved for integrity verdicts
+    # (ADR-0012 mint-time validation); a rollout verdict sets this False so the run reaches the
+    # agent instead. Defaults closed so a new denial reason has to opt into degrading.
+    fail_closed: bool = True
 
 
 class CopilotCandidateNetworkHop(TypedDict):
@@ -230,6 +230,7 @@ class CodeBlockEngineFailure:
     exception_class: str | None
     failing_line: int | None
     healability_hint: bool | None
+    accepted_user_defined_error: UserDefinedError | None = None
 
 
 @dataclass
@@ -863,6 +864,19 @@ async def _convert_css_shape_to_string(
 
 
 class AgentFunction:
+    # OSS default honors the requested engine; cloud overrides to A/B-route eligible
+    # traffic onto the native task_v3 engine.
+    async def resolve_run_engine(
+        self,
+        *,
+        requested_engine: RunEngine,
+        task: TaskRequest,
+        organization: Organization,
+        task_id: str,
+        ab_eligible: bool = True,
+    ) -> RunEngine:
+        return requested_engine
+
     async def record_run_duration(
         self,
         run_type: str,
@@ -895,86 +909,6 @@ class AgentFunction:
     def supports_sequential_credentials(self) -> bool:
         """Whether this deployment can execute credentials marked run_sequentially."""
         return False
-
-    def begin_browser_observation(self) -> None:
-        """Notify an extension that a new browser observation is starting."""
-
-    def record_browser_observation_failure(self, reason: str) -> None:
-        """Notify an extension that browser content could not be fully observed."""
-
-    async def inspect_browser_observation(
-        self,
-        inner_text: str,
-        element_tree: list[dict[str, Any]],
-        semantic_text: str | None,
-    ) -> None:
-        """Offer a complete browser observation to an extension."""
-
-    def needs_browser_observation(self) -> bool:
-        """Return whether an extension consumes browser observations at all.
-
-        Call sites use this to skip building an observation nothing will read.
-        """
-        return False
-
-    def needs_browser_observation_text(self) -> bool:
-        """Return whether the extension needs supplemental rendered text."""
-        return False
-
-    def transform_browser_elements_for_prompt(self, elements: str) -> str:
-        """Transform browser-derived elements before they enter an agent prompt."""
-        return elements
-
-    async def inspect_browser_dialog(
-        self,
-        dialog_type: str,
-        message: str,
-        default_value: str | None,
-    ) -> bool:
-        """Return whether asynchronous inspection requires the browser dialog to be dismissed."""
-        return False
-
-    def should_dismiss_browser_dialog(
-        self,
-        dialog_type: str,
-        message: str,
-        default_value: str | None,
-    ) -> bool:
-        """Return whether an extension requires the browser dialog to be dismissed."""
-        return False
-
-    def should_block_browser_action(self, action_type: ActionType) -> bool:
-        """Return whether an extension policy blocks a proposed browser action."""
-        return False
-
-    def enforce_browser_action_policy(self, action_type: ActionType) -> None:
-        """Allow an extension to stop a browser action before it mutates the page."""
-
-    def register_browser_origin_authority(
-        self,
-        *,
-        task_id: str,
-        workflow_run_id: str | None,
-        url: str,
-    ) -> None:
-        """Offer a task's explicitly declared browser origin to an extension."""
-
-    async def enforce_browser_action_egress_policy(
-        self,
-        *,
-        action: Action,
-        task: Task,
-        page: Page,
-        scraped_page: ScrapedPage,
-    ) -> None:
-        """Allow an extension to enforce browser destination policy for a proposed action."""
-
-    def enforce_cached_browser_script_policy(self) -> None:
-        """Allow an extension to stop cached browser code before it executes."""
-
-    def should_use_cached_browser_scripts(self) -> bool:
-        """Return whether cached browser code may be selected for this run."""
-        return True
 
     def is_wait_time_optimization_enabled(self) -> bool:
         return False
@@ -1153,7 +1087,7 @@ class AgentFunction:
         block_label: str | None,
         browser_session_id: str | None,
     ) -> bool:
-        """Whether a workflow CodeBlock run should execute in the secure runner sidecar.
+        """Whether a workflow CodeBlock run should execute in the secure runner.
 
         Gating lives here, at the block-execution call site, rather than inside
         execute_code_block_override so the override only runs the runner. OSS has no
@@ -1180,8 +1114,12 @@ class AgentFunction:
         organization_id: str | None,
         workflow_permanent_id: str | None = None,
         workflow_id: str | None = None,
+        pin_verdict: bool = False,
     ) -> bool:
         """Whether a run containing a CodeBlock should get an auto-provisioned browser session.
+
+        ``pin_verdict`` asks the resolver to freeze an authoritative verdict onto the run, and is
+        for the caller whose routing decision depends on it. OSS has nothing to pin.
 
         The secure CodeBlock runner brokers page operations against a live persistent browser
         session, so a run that has a CodeBlock but no caller-supplied session needs one created
@@ -1189,6 +1127,15 @@ class AgentFunction:
         consult the same env/flag gate as should_use_codeblock_runner.
         """
         return False
+
+    async def pin_secure_runner_verdict(self, *, workflow_run_id: str, enabled: bool) -> None:
+        """Record the secure-runner verdict a run was routed on, so later gates honor it.
+
+        OSS no-op: with no runner there is no routing decision to keep consistent. Cloud overrides
+        to store it on the run, because the publisher and the gates that consume the verdict run in
+        different processes and would otherwise re-resolve a rollout flag that moved in between.
+        """
+        return None
 
     async def execute_code_block_override(
         self,
@@ -1202,8 +1149,10 @@ class AgentFunction:
         parameter_values: dict[str, Any],
         credential_parameter_keys: set[str],
         recording_page: RecordingPage | None = None,
+        download_run_id: str | None = None,
+        download_binding: DownloadBinding | None = None,
     ) -> CodeBlockEngineResult | None:
-        """Run a CodeBlock through the secure runner sidecar, or return None for legacy.
+        """Run a CodeBlock through the secure runner, or return None for legacy.
 
         OSS no-op returns None so callers fall through to in-process execution. Cloud
         overrides to dispatch to the runner. Callers must gate on
@@ -2258,20 +2207,6 @@ class AgentFunction:
                 timeout=httpx.Timeout(timeout_seconds),
             )
 
-    def enforce_external_request_policy(
-        self,
-        *,
-        declared_url: str,
-        rendered_url: str,
-        destination_is_dynamic: bool,
-    ) -> str | None:
-        """Validate an external request and optionally constrain redirects to one origin.
-
-        OSS intentionally leaves this extension seam inert. Cloud deployments may return
-        the canonical origin that redirects must retain or raise to block the request.
-        """
-        return None
-
     async def post_totp_verification_request(
         self,
         url: str,
@@ -2380,7 +2315,8 @@ class AgentFunction:
     def get_copilot_security_rules(self) -> str:
         """Return security guardrails for the workflow copilot system prompt.
 
-        Extensions may provide additional policy text. The default is empty.
+        Override in cloud to inject prompt injection defenses.
+        OSS returns empty string (no hardening).
         """
         return ""
 
@@ -2420,7 +2356,6 @@ class AgentFunction:
         resolved = settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE if code_block_mode is None else code_block_mode
         return CopilotConfig(
             block_authoring_policy=block_authoring_policy_from_code_only_mode(resolved),
-            impose_synthesized_code_block=True,
         )
 
     async def get_copilot_config_for_request(

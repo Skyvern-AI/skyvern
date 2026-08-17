@@ -203,6 +203,25 @@ async def test_fail_task_without_step(agent, mock_browser_state):
 
 
 @pytest.mark.asyncio
+async def test_fail_task_preserves_completed_step_and_fails_task(agent, mock_browser_state):
+    now = datetime.now()
+    organization = make_organization(now)
+    task = make_task(now, organization, error_code_mapping=None)
+    step = make_step(now, task, step_id="step-1", status=StepStatus.completed, order=1, output=None)
+
+    with patch.object(agent, "update_step", new_callable=AsyncMock) as mock_update_step:
+        with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
+            mock_update_task.return_value = task
+
+            result = await agent.fail_task(task, step, "Post-step billing failed", mock_browser_state)
+
+            assert result is True
+            mock_update_step.assert_not_awaited()
+            mock_update_task.assert_awaited_once()
+            assert mock_update_task.await_args.kwargs["status"] == TaskStatus.failed
+
+
+@pytest.mark.asyncio
 async def test_fail_task_error_detection_fails_gracefully(agent, mock_browser_state):
     """Test that fail_task continues even if error detection fails."""
     now = datetime.now()

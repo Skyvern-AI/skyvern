@@ -1,9 +1,11 @@
-"""Tests for the deterministic active-tab pin in RealBrowserState.get_working_page."""
+"""Tests for RealBrowserState's working-page accessors: the deterministic active-tab pin in
+get_working_page, and the lost-page recovery in must_get_working_page."""
 
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern.exceptions import MissingBrowserStatePage
 from skyvern.webeye.real_browser_state import RealBrowserState
 
 
@@ -134,3 +136,37 @@ async def test_reset_working_page_clears_pin() -> None:
 
     await state.set_working_page(None)
     assert await state.get_working_page() is None
+
+
+@pytest.mark.asyncio
+async def test_must_get_working_page_reopens_tab_and_restores_url() -> None:
+    lost_page = _mock_page("https://example.test/library")
+    state = _make_state()
+    state.list_valid_pages = AsyncMock(return_value=[lost_page])
+    await state.set_working_page(lost_page)
+
+    replacement = _mock_page("about:blank")
+    state.browser_context.new_page = AsyncMock(return_value=replacement)
+    state.navigate_to_url = AsyncMock()
+    state.is_connected = MagicMock(return_value=True)
+    # The tab is gone from the context, so the working page resolves to None.
+    state.list_valid_pages = AsyncMock(return_value=[])
+
+    assert await state.must_get_working_page() is replacement
+    state.navigate_to_url.assert_awaited_once_with(page=replacement, url="https://example.test/library")
+
+
+@pytest.mark.asyncio
+async def test_must_get_working_page_raises_when_context_is_gone() -> None:
+    lost_page = _mock_page("https://example.test/library")
+    state = _make_state()
+    state.list_valid_pages = AsyncMock(return_value=[lost_page])
+    await state.set_working_page(lost_page)
+
+    state.browser_context.new_page = AsyncMock()
+    state.is_connected = MagicMock(return_value=False)
+    state.list_valid_pages = AsyncMock(return_value=[])
+
+    with pytest.raises(MissingBrowserStatePage):
+        await state.must_get_working_page()
+    state.browser_context.new_page.assert_not_awaited()

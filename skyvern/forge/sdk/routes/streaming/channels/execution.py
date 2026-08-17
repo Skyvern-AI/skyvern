@@ -24,7 +24,7 @@ from playwright.async_api import Browser, BrowserContext, Page, Playwright
 from skyvern.config import settings
 from skyvern.forge.sdk.routes.streaming.channels.cdp import CdpChannel
 from skyvern.forge.sdk.routes.streaming.payload_limits import MAX_SCREENSHOT_BYTES
-from skyvern.forge.sdk.routes.streaming.registries import get_vnc_channel
+from skyvern.forge.sdk.streaming.registries import get_vnc_channel
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.main_world_eval import evaluate_in_main_world
 

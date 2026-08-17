@@ -116,6 +116,10 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCodeAccepted, T
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+from skyvern.forge.sdk.services.credential.custom_credential_vault_service import (
+    CustomCredentialConfigurationError,
+    CustomCredentialNotConfiguredError,
+)
 from skyvern.forge.sdk.services.credentials import (
     AuthenticatorTotpErrorCode,
     AuthenticatorTotpParseResult,
@@ -712,7 +716,10 @@ async def create_credential(
     if data.browser_profile_id is not None:
         await _validate_credential_browser_profile_id(data.browser_profile_id, current_org.organization_id)
 
-    credential_service = await _get_credential_vault_service(vault_type_override=data.vault_type)
+    credential_service = await _get_credential_vault_service(
+        vault_type_override=data.vault_type,
+        organization_id=current_org.organization_id,
+    )
 
     try:
         credential = await credential_service.create_credential(organization_id=current_org.organization_id, data=data)
@@ -970,7 +977,7 @@ async def test_login(
         ),
     )
 
-    credential_service = await _get_credential_vault_service()
+    credential_service = await _get_credential_vault_service(organization_id=organization_id)
     credential = await credential_service.create_credential(
         organization_id=organization_id,
         data=create_request,
@@ -2244,6 +2251,12 @@ async def get_credential_totp_code(
             else f"Custom credential service returned HTTP {e.status_code}"
         )
         raise HTTPException(status_code=502, detail=detail)
+    except CustomCredentialNotConfiguredError as e:
+        # Already reported by the vault service; re-logging here would double-count an expected refusal.
+        raise HTTPException(
+            status_code=400,
+            detail="Custom credential service is not configured for this organization",
+        ) from e
     except Exception as e:
         LOG.exception(
             "Failed to retrieve credential item for TOTP code preview",
@@ -3338,31 +3351,47 @@ async def test_custom_credential_service_connection(
 
 async def _get_credential_vault_service(
     vault_type_override: CredentialVaultType | None = None,
+    organization_id: str | None = None,
 ) -> CredentialVaultService:
+    """Resolve the vault service for a request.
+
+    Callers about to write a secret pass ``organization_id`` so a vault configured per organization
+    is preflighted here and an unusable configuration is refused before the write is attempted.
+    """
     settings = SettingsManager.get_settings()
     vault_type = vault_type_override or settings.CREDENTIAL_VAULT_TYPE
+    service: CredentialVaultService
     if vault_type == CredentialVaultType.SKYVERN:
         if not settings.is_local_credential_vault_enabled():
             raise HTTPException(status_code=400, detail="Skyvern local credential vault is not enabled")
         if not app.SKYVERN_CREDENTIAL_VAULT_SERVICE:
             raise HTTPException(status_code=400, detail="Skyvern local credential vault is not configured")
-        return app.SKYVERN_CREDENTIAL_VAULT_SERVICE
+        service = app.SKYVERN_CREDENTIAL_VAULT_SERVICE
     elif vault_type == CredentialVaultType.BITWARDEN:
-        return app.BITWARDEN_CREDENTIAL_VAULT_SERVICE
+        service = app.BITWARDEN_CREDENTIAL_VAULT_SERVICE
     elif vault_type == CredentialVaultType.AZURE_VAULT:
         if not app.AZURE_CREDENTIAL_VAULT_SERVICE:
             raise HTTPException(status_code=400, detail="Azure Vault credential is not supported")
-        return app.AZURE_CREDENTIAL_VAULT_SERVICE
+        service = app.AZURE_CREDENTIAL_VAULT_SERVICE
     elif vault_type == CredentialVaultType.GCP:
         if not app.GCP_CREDENTIAL_VAULT_SERVICE:
             raise HTTPException(status_code=400, detail="GCP credential vault is not supported")
-        return app.GCP_CREDENTIAL_VAULT_SERVICE
+        service = app.GCP_CREDENTIAL_VAULT_SERVICE
     elif vault_type == CredentialVaultType.CUSTOM:
         if not app.CUSTOM_CREDENTIAL_VAULT_SERVICE:
             raise HTTPException(status_code=400, detail="Custom credential vault is not supported")
-        return app.CUSTOM_CREDENTIAL_VAULT_SERVICE
+        service = app.CUSTOM_CREDENTIAL_VAULT_SERVICE
     else:
         raise HTTPException(status_code=400, detail="Credential storage not supported")
+
+    if organization_id is not None:
+        try:
+            await service.validate_organization_configuration(organization_id)
+        except CustomCredentialConfigurationError as e:
+            # Already reported by the vault service; re-logging here would double-count.
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+    return service
 
 
 async def _delete_temporary_test_login_credential(

@@ -72,6 +72,8 @@ Manual config for any MCP client:
 }
 ```
 
+To narrow an install to one job, append `"--scope", "operate"` (run/monitor), `"--scope", "build"` (author workflows), `"--scope", "browser"` (direct browser control), or `"--scope", "lean"` (focused browser surface: direct actions with selector-scoped page reading) to `args`; omitting the flag serves the full default surface (`--scope all`).
+
 ## Tools
 
 ### Browser Sessions

@@ -15,6 +15,10 @@ const browserStreamProps = vi.hoisted(
     ({ last: null }) as { last: { resetRecordingOnUnmount?: boolean } | null },
 );
 
+const cdpStreamProps = vi.hoisted(
+  () => ({ last: null }) as { last: { enableUrlInput?: boolean } | null },
+);
+
 vi.mock("@/hooks/useRuntimeConfig", () => ({
   useBrowserStreamingMode: () => ({
     browserStreamingMode: runtimeConfigMock.browserStreamingMode,
@@ -34,15 +38,31 @@ vi.mock("@/components/BrowserStream", () => ({
 }));
 
 vi.mock("@/routes/browserSessions/BrowserSessionStream", () => ({
-  BrowserSessionStream: () => <div data-testid="cdp-stream" />,
+  BrowserSessionStream: (props: { enableUrlInput?: boolean }) => {
+    cdpStreamProps.last = props;
+    return <div data-testid="cdp-stream" />;
+  },
 }));
 
 describe("StreamPresenter transport-swap recording", () => {
   afterEach(() => {
     cleanup();
     browserStreamProps.last = null;
+    cdpStreamProps.last = null;
     runtimeConfigMock.browserStreamingMode = "cdp";
     runtimeConfigMock.transportPending = false;
+  });
+
+  it("forwards the URL input opt-in to the CDP stream", () => {
+    // CDP streams the page viewport only, so the navigable bar is the pane's
+    // sole way off about:blank; VNC carries the browser's own chrome (SKY-13705).
+    render(<StreamPresenter browserSessionId="pbs_test" enableUrlInput />);
+    expect(cdpStreamProps.last?.enableUrlInput).toBe(true);
+  });
+
+  it("leaves the URL bar read-only when the caller does not opt in", () => {
+    render(<StreamPresenter browserSessionId="pbs_test" />);
+    expect(cdpStreamProps.last?.enableUrlInput).toBe(false);
   });
 
   it("shows neither stream until the session's transport is known", () => {

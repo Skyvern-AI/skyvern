@@ -115,12 +115,20 @@ async def run_task(
     x_api_key: str | None = None,
     request: Request | None = None,
     background_tasks: BackgroundTasks | None = None,
-) -> Task:
+    ab_routing_eligible: bool = True,
+) -> tuple[Task, RunEngine]:
     await _validate_task_v1_model_for_org(organization, task.model)
     if task.url:
         task.url = await asyncio.to_thread(validate_fetch_url, task.url)
 
     created_task = await app.agent.create_task(task, organization.organization_id)
+    engine = await app.AGENT_FUNCTION.resolve_run_engine(
+        requested_engine=engine,
+        task=task,
+        organization=organization,
+        task_id=created_task.task_id,
+        ab_eligible=ab_routing_eligible,
+    )
     url_hash = generate_url_hash(task.url)
     run_type = RunType.task_v1
     if engine == RunEngine.openai_cua:
@@ -131,6 +139,8 @@ async def run_task(
         run_type = RunType.ui_tars
     elif engine == RunEngine.yutori_navigator:
         run_type = RunType.yutori_navigator
+    elif engine == RunEngine.skyvern_v3:
+        run_type = RunType.task_v3
     await app.DATABASE.tasks.create_task_run(
         task_run_type=run_type,
         organization_id=organization.organization_id,
@@ -156,7 +166,9 @@ async def run_task(
         browser_session_id=task.browser_session_id,
         api_key=x_api_key,
     )
-    return created_task
+    # Return the resolved engine so callers report the run_type that actually executes (the A/B
+    # hook may reroute a default request to v3), not the pre-routing request engine.
+    return created_task, engine
 
 
 async def get_task_v1_response(task_id: str, organization_id: str | None = None) -> TaskResponse:

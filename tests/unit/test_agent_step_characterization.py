@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from skyvern.exceptions import ActionPolicyBlocked, NoTOTPVerificationCodeFound
+from skyvern.exceptions import NoTOTPVerificationCodeFound
 from skyvern.forge.agent import ForgeAgent, StepPromptResult
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -233,15 +233,6 @@ async def test_no_generated_actions_marks_step_failed(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
-async def test_action_policy_block_propagates_out_of_action_loop(monkeypatch: pytest.MonkeyPatch) -> None:
-    blocked = ActionPolicyBlocked("blocked by extension policy", step_id="step-char", task_id="task-123")
-    rig = make_agent_step_rig(monkeypatch, action_handler=AsyncMock(side_effect=blocked))
-
-    with pytest.raises(ActionPolicyBlocked):
-        await rig.run()
-
-
-@pytest.mark.asyncio
 async def test_totp_polling_timeout_produces_terminate_action(monkeypatch: pytest.MonkeyPatch) -> None:
     rig = make_agent_step_rig(monkeypatch, task_overrides={"totp_identifier": "user@example.com"})
     rig.agent.handle_potential_OTP_actions = AsyncMock(side_effect=NoTOTPVerificationCodeFound(task_id="task-123"))
@@ -340,6 +331,28 @@ async def test_failed_action_skip_remaining_controls_duplicate_element_retry(
     assert action_handler.await_count == expected_calls
     assert output.actions_and_results is not None
     assert [action for action, _ in output.actions_and_results] == ([first] if skip else [first, duplicate])
+
+
+@pytest.mark.asyncio
+async def test_freetext_mismatch_failure_stops_duplicate_element_submit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression (SKY-13631 review): a free-text mismatch failure from the heal seam must terminally stop the
+    # batch even when a queued Submit targets the SAME element id (the duplicate-element-id branch). The heal
+    # builds its failures through _freetext_mismatch_failure, which sets skip_remaining_actions=True, so the
+    # loop marks the step failed and returns instead of continuing into the duplicate Submit.
+    from skyvern.exceptions import FreeTextInputMismatch
+    from skyvern.webeye.actions.handler import _freetext_mismatch_failure
+
+    input_action, submit = _click("node-1"), _click("node-1")  # same element id -> duplicate linked node
+    failure = _freetext_mismatch_failure(FreeTextInputMismatch(element_id="node-1", intended_length=30))
+    handler = AsyncMock(return_value=[failure])
+    rig = make_agent_step_rig(monkeypatch, parsed_actions=[input_action, submit], action_handler=handler)
+
+    step, output = await rig.run()
+
+    assert step.status == StepStatus.failed
+    assert handler.await_count == 1  # the duplicate Submit was NOT dispatched
+    assert output.actions_and_results is not None
+    assert [action for action, _ in output.actions_and_results] == [input_action]
 
 
 @pytest.mark.asyncio

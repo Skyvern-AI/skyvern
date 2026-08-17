@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -121,30 +121,6 @@ def make_copilot_ctx(**overrides: object) -> CopilotContext:
     )
     defaults.update(overrides)
     return CopilotContext(**defaults)
-
-
-def make_raw_loaded_result_context(
-    *,
-    include_sample_rows: bool = False,
-    include_text: bool = False,
-    include_user_goal: bool = False,
-) -> str:
-    target: dict[str, object] = {
-        "selector": '#account-123456-JaneCustomer-results[data-customer="Jane Customer"]',
-        "is_table": True,
-        "row_selector": 'tr[data-account="987654321"]',
-        "row_count": 2,
-    }
-    if include_sample_rows:
-        target["sample_rows"] = ["Jane Customer account 123456"]
-    if include_text:
-        target["text"] = "Jane Customer statement results"
-    target["structure_signature"] = "legacy-selector-derived-sig"
-    payload: dict[str, object] = {}
-    if include_user_goal:
-        payload["user_goal"] = "extract loaded results"
-    payload["loaded_result_targets"] = [target]
-    return json.dumps(payload)
 
 
 def make_verified_goal_contract(
@@ -270,3 +246,14 @@ def passing_run(run_id: str, block_labels: list[str]) -> RecordedBuildTestOutcom
         structural_failure_identity="",
         evidence_refs=["rows:1"],
     )
+
+
+InteractionFieldValue = str | int | bool | None | list[Any] | dict[str, Any]
+
+
+def carried_interaction(**fields: InteractionFieldValue) -> dict[str, Any]:
+    """One entry of the cross-turn carried trajectory.
+
+    The record is plain interaction dicts, so this only spares tests the brace noise.
+    """
+    return dict(fields)

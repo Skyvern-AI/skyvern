@@ -67,6 +67,33 @@ async def test_prompt_type_config_uses_cached_posthog_methods(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
+async def test_prompt_type_config_exposes_workflow_and_script_mode_targeting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = SimpleNamespace(
+        get_value_cached=AsyncMock(return_value="enabled"),
+        get_payload_cached=AsyncMock(return_value='{"text-prompt": "OPENAI_GPT5_4_MINI"}'),
+    )
+    monkeypatch.setattr(module, "app", SimpleNamespace(EXPERIMENTATION_PROVIDER=provider))
+    monkeypatch.setattr(
+        module.skyvern_context,
+        "current",
+        lambda: SkyvernContext(workflow_permanent_id="wpid_1", script_mode=True),
+    )
+
+    config = await module.get_llm_config_by_prompt_type("wr_1", "org_1")
+
+    assert config == {"text-prompt": "OPENAI_GPT5_4_MINI"}
+    properties = {
+        "organization_id": "org_1",
+        "workflow_permanent_id": "wpid_1",
+        "script_mode": True,
+    }
+    provider.get_value_cached.assert_awaited_once_with("LLM_CONFIG_BY_PROMPT_TYPE", "wr_1", properties=properties)
+    provider.get_payload_cached.assert_awaited_once_with("LLM_CONFIG_BY_PROMPT_TYPE", "wr_1", properties=properties)
+
+
+@pytest.mark.asyncio
 async def test_no_config_returns_none_without_warning(monkeypatch: pytest.MonkeyPatch) -> None:
     """Flag disabled → config is None → return None, no LOG.warning."""
     monkeypatch.setattr(

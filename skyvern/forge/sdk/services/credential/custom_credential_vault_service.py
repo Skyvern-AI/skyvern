@@ -3,10 +3,11 @@ import json
 import structlog
 from pydantic import ValidationError
 
-from skyvern.exceptions import SkyvernException
+from skyvern.exceptions import SkyvernException, SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.sdk.api.custom_credential_client import CustomCredentialAPIClient
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     Credential,
@@ -16,14 +17,45 @@ from skyvern.forge.sdk.schemas.credentials import (
     CreditCardCredential,
     PasswordCredential,
 )
+from skyvern.forge.sdk.schemas.organizations import CustomCredentialServiceConfig
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.services.credentials import safe_error_message
 
 LOG = structlog.get_logger()
 
+CONFIGURATION_INVALID_MESSAGE = (
+    "Custom credential service configuration for this organization is invalid. "
+    "Re-save the API base URL and API token for the custom credential service."
+)
+
 
 class CustomCredentialConfigurationError(SkyvernException):
     """Raised when custom credential service configuration is invalid or missing."""
+
+
+class CustomCredentialNotConfiguredError(CustomCredentialConfigurationError, SkyvernHTTPException):
+    """Raised when an organization has no custom credential service configured.
+
+    This is an expected refusal rather than a fault: it is logged below ERROR and carries a 4xx so
+    routes answer with a client error instead of a 500 that re-triggers error alerting.
+    """
+
+    def __init__(self, organization_id: str) -> None:
+        super().__init__(f"Custom credential service not configured for organization {organization_id}")
+
+
+def _log_vault_failure(message: str, error: Exception, **context: object) -> None:
+    """Report a vault operation failure once, keeping the expected refusal below ERROR."""
+    if isinstance(error, CustomCredentialNotConfiguredError):
+        LOG.warning(message, error=str(error), **exception_log_fields(error), **context)
+        return
+    LOG.error(
+        message,
+        error=safe_error_message(error),
+        exc_info=not isinstance(error, ValidationError),
+        **exception_log_fields(error),
+        **context,
+    )
 
 
 class CustomCredentialVaultService(CredentialVaultService):
@@ -38,6 +70,17 @@ class CustomCredentialVaultService(CredentialVaultService):
         """
         self._client = client
 
+    async def validate_organization_configuration(self, organization_id: str) -> None:
+        try:
+            await self._get_client_for_organization(organization_id)
+        except Exception as e:
+            _log_vault_failure(
+                "Failed to validate custom vault configuration",
+                e,
+                organization_id=organization_id,
+            )
+            raise
+
     async def _get_client_for_organization(self, organization_id: str) -> CustomCredentialAPIClient:
         """
         Get or create a CustomCredentialAPIClient for the given organization.
@@ -49,47 +92,39 @@ class CustomCredentialVaultService(CredentialVaultService):
             Configured API client for the organization
 
         Raises:
-            Exception: If no configuration is found for the organization
+            CustomCredentialNotConfiguredError: If the organization has no configuration.
+            CustomCredentialConfigurationError: If the stored configuration is unusable.
         """
         # If we have a global client (from environment variables), use it
         if self._client:
             return self._client
 
-        # Otherwise, get organization-specific configuration
+        # Otherwise, get organization-specific configuration. Failures are reported by the calling
+        # operation so that one request produces one log record.
+        auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
+            organization_id=organization_id,
+            token_type=OrganizationAuthTokenType.custom_credential_service.value,
+        )
+
+        if not auth_token:
+            raise CustomCredentialNotConfiguredError(organization_id)
+
         try:
-            auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
-                organization_id=organization_id,
-                token_type=OrganizationAuthTokenType.custom_credential_service.value,
-            )
-
-            if not auth_token:
-                raise CustomCredentialConfigurationError(
-                    f"Custom credential service not configured for organization {organization_id}"
-                )
-
-            # Parse the stored configuration
             config_data = json.loads(auth_token.token)
-
-            # Create and return the API client
-            return CustomCredentialAPIClient(
-                api_base_url=config_data["api_base_url"],
-                api_token=config_data["api_token"],
-            )
-
         except json.JSONDecodeError as e:
-            LOG.exception(
-                "Failed to parse custom credential service configuration",
-                organization_id=organization_id,
-            )
-            raise CustomCredentialConfigurationError(
-                f"Invalid custom credential service configuration for organization {organization_id}"
-            ) from e
-        except Exception:
-            LOG.exception(
-                "Failed to get custom credential service configuration",
-                organization_id=organization_id,
-            )
-            raise
+            raise CustomCredentialConfigurationError(CONFIGURATION_INVALID_MESSAGE) from e
+
+        try:
+            config = CustomCredentialServiceConfig.model_validate(config_data)
+        except ValidationError:
+            # Pydantic embeds the rejected input, which carries the API token, in the error. Drop the
+            # cause so it can never reach a traceback.
+            raise CustomCredentialConfigurationError(CONFIGURATION_INVALID_MESSAGE) from None
+
+        if not config.api_base_url.strip() or not config.api_token.strip():
+            raise CustomCredentialConfigurationError(CONFIGURATION_INVALID_MESSAGE)
+
+        return CustomCredentialAPIClient(api_base_url=config.api_base_url, api_token=config.api_token)
 
     async def create_credential(self, organization_id: str, data: CreateCredentialRequest) -> Credential:
         """
@@ -155,13 +190,12 @@ class CustomCredentialVaultService(CredentialVaultService):
             return credential
 
         except Exception as e:
-            LOG.error(
+            _log_vault_failure(
                 "Failed to create credential in custom vault",
+                e,
                 organization_id=organization_id,
                 name=data.name,
                 credential_type=data.credential_type,
-                error=str(e),
-                exc_info=True,
             )
             raise
 
@@ -228,12 +262,11 @@ class CustomCredentialVaultService(CredentialVaultService):
             return updated_credential
 
         except Exception as e:
-            LOG.error(
+            _log_vault_failure(
                 "Failed to update credential in custom vault",
+                e,
                 organization_id=credential.organization_id,
                 credential_id=credential.credential_id,
-                error=str(e),
-                exc_info=True,
             )
             raise
 
@@ -304,13 +337,12 @@ class CustomCredentialVaultService(CredentialVaultService):
             )
 
         except Exception as e:
-            LOG.error(
+            _log_vault_failure(
                 "Failed to delete credential from custom vault",
+                e,
                 organization_id=credential.organization_id,
                 credential_id=credential.credential_id,
                 item_id=credential.item_id,
-                error=str(e),
-                exc_info=True,
             )
             raise
 
@@ -350,12 +382,11 @@ class CustomCredentialVaultService(CredentialVaultService):
             return credential_item
 
         except Exception as e:
-            LOG.error(
+            _log_vault_failure(
                 "Failed to retrieve credential item from custom vault",
+                e,
                 organization_id=db_credential.organization_id,
                 credential_id=db_credential.credential_id,
                 item_id=db_credential.item_id,
-                error=safe_error_message(e),
-                exc_info=not isinstance(e, ValidationError),
             )
             raise

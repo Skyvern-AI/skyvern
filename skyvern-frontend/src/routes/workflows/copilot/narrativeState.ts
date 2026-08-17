@@ -233,15 +233,11 @@ export type TurnResponseKind =
 export interface TurnNarrativeState {
   turnId: string | null;
   turnIndex: number | null;
-  mode: string;
   responseType: CopilotResponseType | null;
   proposalDisposition: ProposalDisposition | null;
-  // Typed terminal adjudication of the turn (TurnOutcome.response_kind).
+  // Typed terminal response kind for the turn (TurnOutcome.response_kind).
   // Null on legacy rows and frames from an older backend.
   responseKind: TurnResponseKind | null;
-  // Outcome-evidence verdict authorizing tested-success claims (ADR 0005).
-  // Null means unknown (legacy/grafted rows) — distinct from false.
-  verifiedSuccess: boolean | null;
   // Run-outcome facts from the backend-finalized terminal envelope carried
   // in the narrative payload. Authoritative once runVerdict is set; null on
   // rows persisted before the envelope existed.
@@ -276,26 +272,13 @@ export interface TurnNarrativeState {
   lastActivityAtMs: number | null;
   draftingSignaledAt: number | null;
   // Count of AUTHORING_TOOLS tool_calls this turn, kept outside designActivity
-  // so it survives the MAX_DESIGN_ACTIVITY_ENTRIES eviction cap. Drives the
-  // redraft-iteration label ("Draft v2 — revising…") and Draft re-activation.
+  // so it survives the MAX_DESIGN_ACTIVITY_ENTRIES eviction cap.
   authoringCount: number;
-  // Monotonic count of tool_call events this turn — the only frame kind
-  // that's unambiguous evidence of new agent-initiated work (tool_result is
-  // always a trailing echo; narration can be scheduled as post-hoc
-  // reporting independent of new work — see the reducer cases). Never
-  // capped (unlike designActivity.length, which plateaus once
-  // MAX_DESIGN_ACTIVITY_ENTRIES is full).
-  activitySeq: number;
-  // Snapshot of the most recent run_outcome verdict plus the activity
-  // sequence number at the moment it arrived, so a later activity frame
-  // proves the loop kept going (a redraft), not just a slow give-up
-  // response. Not grafted across terminal — cancel-mid-redraft marks Test
-  // stopped rather than Draft (accepted).
+  // Snapshot of the most recent factual run outcome.
   lastRunOutcome: {
     verdict: BlockOutcome;
     role?: RunOutcomeRole;
     displayReason: string | null;
-    activitySeqAtVerdict: number;
   } | null;
   // Terminal-mode credential ask, from the credentialPrompt narrative signal.
   // reason is kept as a raw string — the card tolerates unknown tokens.
@@ -314,11 +297,9 @@ export interface TurnNarrativeState {
 export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   turnId: null,
   turnIndex: null,
-  mode: "unknown",
   responseType: null,
   proposalDisposition: null,
   responseKind: null,
-  verifiedSuccess: null,
   terminalEnvelope: null,
   designStarted: false,
   designEnded: false,
@@ -335,7 +316,6 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   lastActivityAtMs: null,
   draftingSignaledAt: null,
   authoringCount: 0,
-  activitySeq: 0,
   lastRunOutcome: null,
   credentialPrompt: null,
   credentialPause: null,
@@ -454,6 +434,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   list_credentials: "Checking saved credentials",
   fill_credential_field: "Entering saved credentials",
   edit_block: "Editing block",
+  add_block: "Adding block",
   delete_block: "Deleting block",
   synthesize_demonstrated_block: "Building a block from the recorded steps",
 };
@@ -771,7 +752,6 @@ export function applyNarrativeEvent(
         ...EMPTY_NARRATIVE,
         turnId: event.turn_id,
         turnIndex: event.turn_index,
-        mode: event.mode || "unknown",
         priorBlockCount: event.prior_block_count ?? null,
         startedAt: event.timestamp ?? null,
       };
@@ -887,7 +867,7 @@ export function applyNarrativeEvent(
               ...b,
               outcome: event.verdict,
               outcomeReason: event.display_reason ?? undefined,
-              outcomeRole: event.role ?? "adjudicated",
+              outcomeRole: event.role ?? "recorded",
             }
           : b,
       );
@@ -898,9 +878,8 @@ export function applyNarrativeEvent(
         // verdict from a prior run cycle within the same turn.
         lastRunOutcome: {
           verdict: event.verdict,
-          role: event.role ?? "adjudicated",
+          role: event.role ?? "recorded",
           displayReason: event.display_reason ?? null,
-          activitySeqAtVerdict: prev.activitySeq,
         },
       };
     }
@@ -949,13 +928,11 @@ export function applyNarrativeEvent(
       const entry = buildActivityFromToolCall(event);
       const authoringCount =
         prev.authoringCount + (AUTHORING_TOOLS.has(event.tool_name) ? 1 : 0);
-      const activitySeq = prev.activitySeq + 1;
       if (!entry) {
         return {
           ...prev,
           lastActivityAtMs: nowMs,
           authoringCount,
-          activitySeq,
         };
       }
       const { blocks, designActivity } = appendActivity(
@@ -969,17 +946,10 @@ export function applyNarrativeEvent(
         designActivity,
         lastActivityAtMs: nowMs,
         authoringCount,
-        activitySeq,
       };
     }
 
     case "tool_result": {
-      // Deliberately does NOT bump activitySeq: a failed run's own
-      // update_and_run_blocks call always emits its trailing tool_result
-      // right after the run_outcome verdict it produced — counting that
-      // guaranteed echo would make redrafting fire on every failed verdict
-      // before the agent has done any new work. Only tool_call/narration
-      // (agent-initiated steps) count as evidence the loop continued.
       const entry = buildActivityFromToolResult(event);
       if (!entry) return { ...prev, lastActivityAtMs: nowMs };
       const { blocks, designActivity } = appendActivity(
@@ -996,11 +966,6 @@ export function applyNarrativeEvent(
     }
 
     case "narration": {
-      // Also does NOT bump activitySeq: the narrator can schedule a
-      // "reporting on what just happened" narration right after a failed
-      // run's own tool_result (streaming_adapter.py schedule_narration),
-      // independent of whether the agent is actually going to revise —
-      // only a genuinely new tool_call is unambiguous evidence of that.
       const entry = buildActivityFromNarration(event);
       const { blocks, designActivity } = appendActivity(
         prev.blocks,
@@ -1079,8 +1044,8 @@ export function applyNarrativeEvent(
           // doesn't visually un-check the Draft phase (hydrated payloads never
           // carry these client-only fields). authoringCount is grafted too so a
           // turn whose only authoring entry aged out of the capped activity
-          // list still completes Explore at the swap; lastRunOutcome is not —
-          // a cancel-mid-redraft marks Test stopped rather than Draft.
+          // list still completes Explore at the swap. lastRunOutcome remains
+          // sourced from the hydrated terminal payload.
           draftingSignaledAt:
             hydrated.turnId === prev.turnId ? prev.draftingSignaledAt : null,
           authoringCount:
@@ -1196,7 +1161,6 @@ export function hydrateNarrativeFromPayload(
     typeof payload.turnIndex === "number" ? payload.turnIndex : 0;
   if (turnId === null) return undefined;
 
-  const mode = typeof payload.mode === "string" ? payload.mode : "unknown";
   const rawResponseType = payload.responseType;
   const responseType: CopilotResponseType | null =
     rawResponseType === "REPLY" ||
@@ -1249,8 +1213,10 @@ export function hydrateNarrativeFromPayload(
     const outcomeRole: RunOutcomeRole | undefined =
       outcome === undefined
         ? undefined
-        : obj.outcomeRole === "interim_build_test"
-          ? "interim_build_test"
+        : obj.outcomeRole === "recorded" ||
+            obj.outcomeRole === "adjudicated" ||
+            obj.outcomeRole === "interim_build_test"
+          ? obj.outcomeRole
           : "adjudicated";
     return {
       workflowRunBlockId:
@@ -1333,15 +1299,10 @@ export function hydrateNarrativeFromPayload(
     ...EMPTY_NARRATIVE,
     turnId,
     turnIndex,
-    mode: mode as TurnNarrativeState["mode"],
     responseType,
     cancelled,
     proposalDisposition,
     responseKind: parseResponseKind(payload.responseKind),
-    verifiedSuccess:
-      typeof payload.verifiedSuccess === "boolean"
-        ? payload.verifiedSuccess
-        : null,
     terminalEnvelope: parseTerminalEnvelope(payload.terminalEnvelope),
     designStarted: true,
     designEnded: true,
@@ -1370,11 +1331,8 @@ export function hydrateNarrativeFromPayload(
   };
 }
 
-// Chip mode should reflect what the turn ACTUALLY did, not the pre-turn
-// intent classifier's guess. Re-derive from observed state so a
-// classifier-said-"unknown" turn that built shows "build", and a
-// classifier-said-"draft_only" turn that only asked a clarification
-// shows "clarify".
+// The chip reflects what the turn ACTUALLY did: its blocks, its response type,
+// and the backend's evidence-derived response kind.
 export function effectiveMode(turn: TurnNarrativeState): string {
   if (turn.responseType === "ASK_QUESTION") {
     return "clarify";
@@ -1384,24 +1342,19 @@ export function effectiveMode(turn: TurnNarrativeState): string {
     const priorBlocks = turn.priorBlockCount ?? 0;
     return priorBlocks > 0 ? "edit" : "build";
   }
-  if (turn.terminal !== null) {
-    if (
-      turn.mode === "docs_answer" ||
-      turn.mode === "diagnose" ||
-      turn.mode === "refuse"
-    ) {
-      return turn.mode;
-    }
-    return "clarify";
+  if (turn.responseKind === "answer") {
+    return "docs_answer";
   }
-  return turn.mode;
+  if (turn.responseKind === "diagnose" || turn.responseKind === "refuse") {
+    return turn.responseKind;
+  }
+  return "clarify";
 }
 
 // History rows persisted before narrative_payload carried responseKind still
 // have the adjacent persisted turn_outcome; graft its response_kind so
-// adjudicated clarify/refuse/recover history corrects retroactively.
-// verifiedSuccess stays null (unknown), so grafted build-kind rows render
-// via the legacy inference chain and tested successes never downgrade.
+// clarify/refuse/recover history corrects retroactively. Build-kind rows use
+// lifecycle and run facts, so grafting a response kind cannot change them.
 export function hydrateHistoryNarrative(
   payload: Record<string, unknown> | null | undefined,
   turnOutcome: { response_kind?: string | null } | null | undefined,
@@ -1516,10 +1469,8 @@ export function notConfirmedOutcome(
   return null;
 }
 
-// Headline parts from the typed terminal adjudication. Returns null when the
-// turn predates the typed signal; a build kind without a verdict also falls
-// back to the legacy inference chain so genuinely-tested historical turns
-// never downgrade.
+// Headline parts for non-build terminal response kinds. Build rows always use
+// lifecycle and run facts rather than a separate verification stamp.
 function adjudicatedSummaryParts(
   turn: TurnNarrativeState,
   flags: {
@@ -1559,7 +1510,6 @@ function adjudicatedSummaryParts(
       glyph: "✦",
     };
   }
-  if (turn.verifiedSuccess === null) return null;
   if (flags.needsUntestedProposalReview) {
     return { headline: "Draft needs review", accent: "qa", glyph: "!" };
   }
@@ -1573,33 +1523,7 @@ function adjudicatedSummaryParts(
       glyph: "✦",
     };
   }
-  if (!turn.verifiedSuccess) {
-    if (flags.hasCleanCompletedBuild) {
-      return {
-        headline: flags.hasEdited
-          ? "Applied edits and ran the workflow"
-          : "Built and ran the workflow",
-        accent: "ok",
-        glyph: "✓",
-      };
-    }
-    return { headline: "Stopped", accent: "qa", glyph: "!" };
-  }
-  if (flags.hasEdited) {
-    return {
-      headline: "Applied edits and re-tested",
-      accent: "ok",
-      glyph: "✓",
-    };
-  }
-  if (flags.hasDrafts) {
-    return {
-      headline: "Built and tested the workflow",
-      accent: "ok",
-      glyph: "✓",
-    };
-  }
-  return { headline: "Completed the run", accent: "ok", glyph: "✓" };
+  return null;
 }
 
 export function computeTurnSummary(

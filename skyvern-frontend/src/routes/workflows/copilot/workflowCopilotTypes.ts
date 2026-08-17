@@ -149,7 +149,6 @@ export interface WorkflowCopilotTurnStartUpdate {
   type: "turn_start";
   turn_id: string;
   turn_index: number;
-  mode: string;
   timestamp: string;
   // Block count of the canonical workflow at turn entry. Drives the FE's
   // edit-vs-build chip; the snap-back source is captured client-side at
@@ -258,7 +257,7 @@ export type WorkflowCopilotRunOutcomeVerdict =
   | "not_demonstrated"
   | "not_evaluated";
 
-export type RunOutcomeRole = "adjudicated" | "interim_build_test";
+export type RunOutcomeRole = "recorded" | "adjudicated" | "interim_build_test";
 
 export interface WorkflowCopilotRunOutcomeUpdate {
   type: "run_outcome";

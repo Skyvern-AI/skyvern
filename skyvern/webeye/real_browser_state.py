@@ -31,7 +31,7 @@ from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory, resolve_artifact_path
-from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.cdp_download_interceptor import disable_download_interceptor_for_context
 from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
 from skyvern.webeye.scraper import scraper
@@ -117,9 +117,38 @@ class RealBrowserState(BrowserState):
         page = await self.get_working_page()
         if page is not None:
             return page
+        recovered_page = await self._reopen_lost_working_page()
+        if recovered_page is not None:
+            return recovered_page
         pages = (self.browser_context.pages or []) if self.browser_context else []
         LOG.error("BrowserState has no page", urls=[p.url for p in pages])
         raise MissingBrowserStatePage()
+
+    async def _reopen_lost_working_page(self) -> Page | None:
+        # A tab can die on its own (a download-turned-navigation, a renderer crash) while the
+        # context survives. Recover here rather than in each consumer: every caller that needs a
+        # page treats "no page" as fatal, so one of them recovering only relocates the failure.
+        if self.browser_context is None or not self.is_connected():
+            return None
+        lost_page = self.__page
+        restore_url = lost_page.url if lost_page is not None else ""
+        try:
+            page = await self.browser_context.new_page()
+        except Exception:
+            LOG.warning("Failed to re-open a working page after the previous one was lost", exc_info=True)
+            return None
+        await self.set_working_page(page)
+        if restore_url and restore_url not in BLANK_PAGE_URLS:
+            try:
+                await self.navigate_to_url(page=page, url=restore_url)
+            except Exception:
+                LOG.warning(
+                    "Re-opened the working page but could not restore the URL it was on",
+                    url=restore_url,
+                    exc_info=True,
+                )
+        LOG.info("Re-opened the working page after it was lost", url=restore_url)
+        return page
 
     async def _close_all_other_pages(self, discard_orphaned_videos: bool = False) -> None:
         cur_page = await self.get_working_page()
@@ -383,10 +412,7 @@ class RealBrowserState(BrowserState):
         return True
 
     async def must_get_working_page(self) -> Page:
-        page = await self.get_working_page()
-        if page is None:
-            raise MissingBrowserStatePage()
-        return page
+        return await self.__assert_page()
 
     async def set_working_page(self, page: Page | None, index: int = 0) -> None:
         self.__page = page

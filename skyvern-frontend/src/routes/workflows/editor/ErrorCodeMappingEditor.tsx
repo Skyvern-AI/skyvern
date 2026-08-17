@@ -23,7 +23,7 @@ const EXTRA_EXTENSIONS: Extension[] = [errorCodeMappingLinter, lintGutter()];
  *      keys) — same text the save-time toast shows.
  *
  * Used by every block type that edits error_code_mapping: task, validation,
- * action, navigation, login, file_download.
+ * action, navigation, login, file_download, code.
  */
 export function ErrorCodeMappingEditor({
   label,

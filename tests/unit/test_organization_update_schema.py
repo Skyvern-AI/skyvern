@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 from typer.testing import CliRunner
@@ -93,6 +94,13 @@ class TestOrganizationUpdateSchema:
         update = OrganizationUpdate(webhook_callback_url="")
         assert update.model_dump(exclude_unset=True) == {"webhook_callback_url": ""}
 
+    def test_raw_aws_load_balancer_webhook_url_is_deferred_to_the_update_route(self) -> None:
+        url = "https://service-123.us-east-1.elb.amazonaws.com/webhook"
+
+        update = OrganizationUpdate(webhook_callback_url=url)
+
+        assert update.webhook_callback_url == url
+
 
 class TestMcpUpdateFieldsDerivedFromSchema:
     def test_update_fields_match_schema(self) -> None:
@@ -104,6 +112,24 @@ class TestMcpUpdateRejectsNoneValues:
         result = asyncio.run(skyvern_org_update(updates={"max_steps_per_run": None}))
         assert not result["ok"]
         assert "None" in result["error"]["message"]
+
+    def test_raw_load_balancer_webhook_server_rejection_returns_structured_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw_http_put = AsyncMock(
+            side_effect=RuntimeError(
+                "HTTP 400: Webhook URL must use a stable custom hostname instead of an AWS load balancer DNS name."
+            )
+        )
+        monkeypatch.setattr("skyvern.cli.mcp_tools.org.raw_http_put", raw_http_put)
+
+        result = asyncio.run(
+            skyvern_org_update(updates={"webhook_callback_url": "https://service-123.elb.us-east-1.amazonaws.com/hook"})
+        )
+
+        assert not result["ok"]
+        assert "stable custom hostname" in result["error"]["message"]
+        raw_http_put.assert_awaited_once()
 
 
 class TestConfigCli:

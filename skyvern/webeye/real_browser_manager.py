@@ -19,13 +19,13 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.id import WORKFLOW_RUN_PREFIX
-from skyvern.forge.sdk.routes.streaming.registries import (
+from skyvern.forge.sdk.schemas.tasks import Task
+from skyvern.forge.sdk.streaming.registries import (
     complete_stream_teardown,
     mark_stream_closing,
     set_deferred_close_params,
     stream_ref_active,
 )
-from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_artifacts import DownloadBinding, VideoArtifact

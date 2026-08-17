@@ -31,6 +31,21 @@ function isCredentialIdWorkflowParameter(
   );
 }
 
+/**
+ * A credential_id workflow parameter with no default is an at-will credential:
+ * the run may proceed without it, so the run form must not require a value.
+ * Mirrors `_is_optional_credential_parameter` in service.py.
+ */
+export function isAtWillCredentialParameter(
+  parameter: WorkflowParameter,
+): boolean {
+  return (
+    parameter.workflow_parameter_type ===
+      WorkflowParameterValueType.CredentialId &&
+    (parameter.default_value === null || parameter.default_value === undefined)
+  );
+}
+
 export function getRotatingCredentialIds(
   parameter: CredentialParameter,
 ): Array<string> {

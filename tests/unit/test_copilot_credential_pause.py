@@ -34,10 +34,8 @@ from fastapi import HTTPException, status
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import NoopLock
-from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import credential_pause as credential_pause_module
-from skyvern.forge.sdk.copilot import tools as tools_module
-from skyvern.forge.sdk.copilot.agent import RequestPolicyGuardrailInputs, _derive_turn_intent_on_context
+from skyvern.forge.sdk.copilot.agent import RequestPolicyGuardrailInputs
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import (
     CopilotContext,
@@ -78,13 +76,6 @@ from skyvern.forge.sdk.copilot.request_policy import (
     credential_prompt_reason,
 )
 from skyvern.forge.sdk.copilot.tools._shared import TOTAL_TIMEOUT_SECONDS, _copilot_seconds_remaining
-from skyvern.forge.sdk.copilot.turn_intent import (
-    TurnIntent,
-    TurnIntentAuthority,
-    TurnIntentClassification,
-    TurnIntentClassifierResult,
-    TurnIntentMode,
-)
 from skyvern.forge.sdk.routes.workflow_copilot import (
     WorkflowCopilotCredentialResponseRequest,
     workflow_copilot_credential_response,
@@ -194,13 +185,11 @@ def test_reason_fires_on_skipped_unbound_credentials() -> None:
     assert credential_pause_module.credential_pause_reason(ctx) == "workflow_credential_inputs_unbound"
 
 
-def test_reason_ignores_skipped_unbound_credentials_when_user_explicitly_skipped_testing() -> None:
-    """_request_policy_allows_update_and_skip_run (guardrails.py) skips the run for a
-    skip_test-deferred credential too -- pausing here would contradict the same explicit
-    request the credential_deferred_draft branch already excludes skip_test for."""
+def test_reason_does_not_let_testing_intent_override_concrete_skipped_run() -> None:
+    """A classifier-produced testing label cannot erase a concrete credential boundary fact."""
     policy = RequestPolicy(testing_intent="skip_test")
     ctx = SimpleNamespace(last_run_skipped_unbound_credentials=True, request_policy=policy)
-    assert credential_pause_module.credential_pause_reason(ctx) is None
+    assert credential_pause_module.credential_pause_reason(ctx) == "workflow_credential_inputs_unbound"
 
 
 def test_reason_fires_on_missing_credential_run_failure() -> None:
@@ -235,7 +224,7 @@ def test_reason_ignores_missing_credential_or_init_when_not_categorized_as_crede
     assert credential_pause_module.credential_pause_reason(ctx) is None
 
 
-def test_reason_fires_on_credential_deferred_draft() -> None:
+def test_reason_does_not_fire_from_generic_deferred_draft_policy() -> None:
     policy = RequestPolicy(credential_draft_deferred_explicitly=True)
     ctx = SimpleNamespace(
         last_run_skipped_unbound_credentials=False,
@@ -243,7 +232,7 @@ def test_reason_fires_on_credential_deferred_draft() -> None:
         request_policy=policy,
         update_workflow_called=True,
     )
-    assert credential_pause_module.credential_pause_reason(ctx) == "credential_deferred_draft"
+    assert credential_pause_module.credential_pause_reason(ctx) is None
 
 
 def test_reason_requires_update_workflow_called_for_deferred_draft() -> None:
@@ -909,131 +898,6 @@ async def test_loop_pauses_at_finalize_and_resumes_same_turn(monkeypatch: pytest
     assert frame_types.count(WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED) == 1
 
 
-@pytest.mark.asyncio
-async def test_credential_pause_preempts_a_concurrent_synthesized_offer(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fails on old code: the finalize branch only tried the pause when nudge AND
-    synthesized_msg were both None, so a reopened synthesized-block offer coinciding
-    with a credential diagnosis sent the offer instead of the credential_required frame.
-    """
-    ctx = make_copilot_context()
-    ctx.organization_id = "org-1"
-    ctx.turn_id = "turn-offer-race"
-    ctx.client_supports_credential_pause = True
-    ctx.workflow_copilot_chat_id = "chat-1"
-    ctx.last_run_skipped_unbound_credentials = True
-    ctx.request_policy = RequestPolicy()
-
-    cache = _FakeCache()
-    cache.store[credential_response_cache_key("org-1", "chat-1", "turn-offer-race")] = encode_credential_response(
-        "skip", None
-    )
-    monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
-    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
-
-    stream = _make_stream()
-    fake_result = _fake_result()
-    calls: list[dict[str, Any]] = []
-
-    def fake_synthesized_offer(_ctx: Any) -> dict[str, Any] | None:
-        # enforcement_decision runs after the Runner call, so `calls` already has
-        # 1 entry on the pre-pause finalize check; gone by the post-resume check
-        # (2 entries), so the test isolates the preemption itself.
-        return {"role": "user", "content": "offer to add the reopened block"} if len(calls) <= 1 else None
-
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.enforcement._maybe_synthesized_block_offer_msg",
-        fake_synthesized_offer,
-    )
-
-    def fake_run_streamed(*args: Any, **kwargs: Any) -> Any:
-        calls.append(kwargs)
-        return fake_result
-
-    async def fake_stream_to_sse(result: Any, s: Any, c: Any) -> None:
-        return None
-
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.Runner.run_streamed", fake_run_streamed)
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", fake_stream_to_sse)
-
-    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
-
-    await run_with_enforcement(
-        agent=MagicMock(),
-        initial_input="hello",
-        ctx=ctx,
-        stream=stream,
-        run_config=RunConfig(),
-        copilot_config=config,
-    )
-
-    frame_types = [call.args[0].type for call in stream.send.await_args_list]
-    assert frame_types.count(WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED) == 1
-    # On old code the offer nudge wins the first check (pause only fires once the
-    # offer stops recurring), costing an extra Runner call before the skip resume
-    # text appears -- this pins that the pause wins on the very first check.
-    assert len(calls) == 2
-    second_call_input = calls[1]["input"]
-    assert any("chose not to connect a credential now" in item.get("content", "") for item in second_call_input)
-
-
-@pytest.mark.asyncio
-async def test_declined_pause_falls_back_to_the_normal_nudge_instead_of_finalizing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Fails on old code: an already-disconnected stream made maybe_credential_pause
-    return None with nothing sent, and run_with_enforcement finalized the turn as-is
-    instead of the post_update nudge this iteration would otherwise have gotten."""
-    ctx = make_copilot_context()
-    ctx.client_supports_credential_pause = True
-    ctx.last_run_skipped_unbound_credentials = True
-    ctx.update_workflow_called = True
-    ctx.test_after_update_done = False
-    ctx.request_policy = RequestPolicy()
-
-    cache = _FakeCache()
-    monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
-
-    stream = _make_stream(disconnected=True)
-    fake_result = _fake_result()
-    calls: list[dict[str, Any]] = []
-
-    def fake_run_streamed(*args: Any, **kwargs: Any) -> Any:
-        calls.append(kwargs)
-        return fake_result
-
-    async def fake_stream_to_sse(result: Any, s: Any, c: Any) -> None:
-        return None
-
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.Runner.run_streamed", fake_run_streamed)
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", fake_stream_to_sse)
-
-    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=30)
-
-    await run_with_enforcement(
-        agent=MagicMock(),
-        initial_input="hello",
-        ctx=ctx,
-        stream=stream,
-        run_config=RunConfig(),
-        copilot_config=config,
-    )
-
-    assert ctx.credential_pause_outcome == "declined"
-    stream.send.assert_not_called()
-    # On old code this returns after the first call (nudge=None, pause declined,
-    # synthesized_msg=None -> immediate finalize). The fallback must fire the
-    # post_update nudge instead; MAX_POST_UPDATE_NUDGES allows retries before the
-    # fake (which never "tests" anything) exhausts them, so >1 call is the claim.
-    assert len(calls) > 1, "the post_update nudge must fire instead of an immediate finalize"
-    second_call_input = calls[1]["input"]
-    assert any("did not test it" in item.get("content", "") for item in second_call_input)
-
-
-# ---------------------------------------------------------------------------
-# 4 - timeout credit
-# ---------------------------------------------------------------------------
-
-
 def test_elapsed_run_seconds_subtracts_pause_time() -> None:
     ctx = SimpleNamespace(copilot_credential_pause_seconds=50.0)
     start_time = time.monotonic() - 60.0
@@ -1334,100 +1198,6 @@ async def test_resolve_credential_pause_rejections_are_typed() -> None:
     assert excinfo.value.status_code == status.HTTP_404_NOT_FOUND
 
 
-# ---------------------------------------------------------------------------
-# A diagnosed missing-credential run failure must pre-empt the generic
-# failed-test nudge, or the pause hook (gated on nudge is None) never runs on
-# the turn's first credential ask.
-# ---------------------------------------------------------------------------
-
-
-def _failed_test_ctx() -> CopilotContext:
-    """A real CopilotContext (all enforcement fields defaulted) with just the
-    failed-test + missing-credential-diagnosis fields set, so enforcement_decision
-    doesn't AttributeError on some unrelated field this hand-picked set omits.
-    """
-    ctx = make_copilot_context()
-    ctx.client_supports_credential_pause = True
-    ctx.last_test_ok = False
-    ctx.test_after_update_done = True
-    ctx.latest_diagnosis_repair_contract = _repair_contract(
-        RepairNextAction.ASK, DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
-    )
-    ctx.request_policy = RequestPolicy()
-    return ctx
-
-
-def test_missing_credential_failure_suppresses_generic_failed_test_nudge_when_pause_enabled() -> None:
-    """Fails on old code: the generic 'post_failed_test' nudge fires here instead."""
-    ctx = _failed_test_ctx()
-    config = CopilotConfig(credential_pause_enabled=True)
-
-    nudge = enforcement_decision(ctx, result=None, config=config)
-
-    assert nudge is None
-    assert ctx.failed_test_nudge_count == 0
-
-
-def test_missing_credential_failure_still_nudges_when_kill_switch_off() -> None:
-    """Flag-off parity: unrelated to the fix, the generic nudge still fires as before."""
-    ctx = _failed_test_ctx()
-    config = CopilotConfig(credential_pause_enabled=False)
-
-    nudge = enforcement_decision(ctx, result=None, config=config)
-
-    assert nudge is not None
-    assert ctx.failed_test_nudge_count == 1
-
-
-def test_missing_credential_failure_nudges_normally_once_pause_already_used() -> None:
-    ctx = _failed_test_ctx()
-    ctx.credential_pause_used = True
-    config = CopilotConfig(credential_pause_enabled=True)
-
-    nudge = enforcement_decision(ctx, result=None, config=config)
-
-    assert nudge is not None
-    assert ctx.failed_test_nudge_count == 1
-
-
-def _skipped_run_ctx() -> CopilotContext:
-    """Defensive fixture: even if test_after_update_done were False after a
-    skipped run (in the real runtime it isn't -- streaming_adapter's
-    _update_enforcement_from_tool sets it True unconditionally for
-    update_and_run_blocks/run_blocks_and_collect_debug regardless of skip;
-    see test_workflow_credential_inputs_unbound_skip_does_not_nudge_post_update
-    for the real-state pin), the pause must still pre-empt the post_update
-    nudge, a second nudge that can race the pause hook.
-    """
-    ctx = make_copilot_context()
-    ctx.client_supports_credential_pause = True
-    ctx.last_run_skipped_unbound_credentials = True
-    ctx.update_workflow_called = True
-    ctx.test_after_update_done = False
-    ctx.request_policy = RequestPolicy()
-    return ctx
-
-
-def test_skipped_run_suppresses_post_update_nudge_when_pause_enabled() -> None:
-    """Fails on old code: the earlier 'post_update' nudge fires instead."""
-    ctx = _skipped_run_ctx()
-    config = CopilotConfig(credential_pause_enabled=True)
-
-    nudge = enforcement_decision(ctx, result=None, config=config)
-
-    assert nudge is None
-
-
-def test_skipped_run_still_nudges_post_update_when_kill_switch_off() -> None:
-    ctx = _skipped_run_ctx()
-    config = CopilotConfig(credential_pause_enabled=False)
-
-    nudge = enforcement_decision(ctx, result=None, config=config)
-
-    assert nudge is not None
-    assert "updated the workflow but did not test it" in nudge.message
-
-
 def test_workflow_credential_inputs_unbound_skip_does_not_nudge_post_update() -> None:
     """Pins the real post-skip state (not the defensive _skipped_run_ctx fixture):
     _update_enforcement_from_tool sets test_after_update_done=True unconditionally
@@ -1518,87 +1288,12 @@ def _skip_flag_workflow_yaml() -> str:
 
 def _skip_flag_ctx() -> CopilotContext:
     ctx = make_copilot_context()
-    ctx.turn_intent = TurnIntent(
-        mode=TurnIntentMode.BUILD,
-        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
-    )
     ctx.request_policy = RequestPolicy()
     return ctx
 
 
 async def _no_prior_definition(update_ctx: CopilotContext) -> object:
     return None
-
-
-@pytest.mark.asyncio
-async def test_last_run_skipped_flag_clears_on_a_later_successful_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    ctx = _skip_flag_ctx()
-
-    async def fake_update_workflow(payload: dict, update_ctx: CopilotContext, **kwargs: object) -> dict:
-        workflow = SimpleNamespace(workflow_definition={"blocks": [{"label": "step_one"}]})
-        update_ctx.last_workflow = workflow
-        update_ctx.last_update_block_count = 1
-        return {"ok": True, "_workflow": workflow, "data": {"block_count": 1}}
-
-    async def fake_run_blocks(params: dict, run_ctx: CopilotContext, **kwargs: object) -> dict:
-        return {"ok": True, "data": {"workflow_run_id": "wr-1", "overall_status": "completed", "blocks": []}}
-
-    monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", _no_prior_definition)
-    monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
-    monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["step_one"], {}, "step_one"))
-    monkeypatch.setattr(tools_module, "_frontier_run_size_error", lambda *args: None)
-    monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
-    monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
-
-    call_args = json.dumps(
-        {"workflow_yaml": _skip_flag_workflow_yaml(), "block_labels": ["step_one"], "parameters": {}}
-    )
-
-    monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: True)
-    result_1 = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
-        SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"), call_args
-    )
-    assert json.loads(result_1)["data"]["skip_reason"] == "workflow_credential_inputs_unbound"
-    assert ctx.last_run_skipped_unbound_credentials is True
-
-    monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
-    result_2 = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
-        SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"), call_args
-    )
-    assert json.loads(result_2)["ok"] is True
-    assert ctx.last_run_skipped_unbound_credentials is False
-    assert credential_pause_module.credential_pause_reason(ctx) is None
-
-
-@pytest.mark.asyncio
-async def test_last_run_skipped_flag_stays_false_when_update_workflow_fails_before_skip_branch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The policy would allow a skip, but the authoring failure lands first — reporting it as a
-    credential ask would misattribute an unrelated error."""
-    ctx = _skip_flag_ctx()
-
-    async def failing_update_workflow(payload: dict, update_ctx: CopilotContext, **kwargs: object) -> dict:
-        return {"ok": False, "error": "workflow_yaml is not valid: bad block reference"}
-
-    monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", _no_prior_definition)
-    monkeypatch.setattr(tools_module, "_update_workflow", failing_update_workflow)
-    monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: True)
-
-    result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
-        SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
-        json.dumps({"workflow_yaml": _skip_flag_workflow_yaml(), "block_labels": ["step_one"], "parameters": {}}),
-    )
-
-    assert json.loads(result)["ok"] is False
-    assert ctx.last_run_skipped_unbound_credentials is False
-    assert credential_pause_module.credential_pause_reason(ctx) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1828,7 +1523,6 @@ def test_credential_pause_resolution_defaults_credential_to_none() -> None:
 def _blocked_login_policy() -> RequestPolicy:
     """A policy shaped the way build_request_policy leaves an unresolved login ask."""
     return RequestPolicy(
-        login_intent=True,
         clarification_reason="login_credentials_unresolved",
         clarification_question="Connect a saved credential to sign in.",
         requires_user_clarification=True,
@@ -1857,7 +1551,7 @@ def test_reason_fires_on_unresolved_login_credentials() -> None:
 
 def test_reason_does_not_fire_for_a_login_ask_that_resolved_to_a_credential() -> None:
     ctx = make_copilot_context()
-    ctx.request_policy = RequestPolicy(login_intent=True, clarification_reason="none")
+    ctx.request_policy = RequestPolicy(clarification_reason="none")
 
     assert credential_pause_module.credential_pause_reason(ctx) is None
 
@@ -1871,7 +1565,6 @@ def _card_answerable_policy(
 ) -> RequestPolicy:
     """A disambiguation ask the credential card can answer: a different reason to the login ask."""
     return RequestPolicy(
-        login_intent=True,
         clarification_reason=clarification_reason,
         clarification_question=clarification_question,
         requires_user_clarification=True,
@@ -2030,76 +1723,7 @@ def _preflight_policy_inputs() -> RequestPolicyGuardrailInputs:
         global_llm_context="",
         organization_id="org-1",
         request_policy_handler=None,
-        turn_intent_handler=None,
     )
-
-
-@pytest.mark.asyncio
-async def test_preflight_connect_re_derives_run_authority_onto_the_turn_intent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = _preflight_ctx()
-    policy_inputs = _preflight_policy_inputs()
-    _derive_turn_intent_on_context(ctx, ctx.request_policy, policy_inputs)
-    assert ctx.turn_intent.mode is TurnIntentMode.CLARIFY
-    assert ctx.turn_intent.authority.may_update_workflow is False
-
-    cache = _FakeCache()
-    cache.store[credential_response_cache_key("org-1", "chat-1", "turn-1")] = encode_credential_response(
-        "connected", "cred_1"
-    )
-    monkeypatch.setattr(credential_pause_module.app._inst, "CACHE", cache, raising=False)
-    monkeypatch.setattr(
-        credential_pause_module.app,
-        "DATABASE",
-        SimpleNamespace(
-            credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[_make_credential()]))
-        ),
-    )
-    monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
-    classify = AsyncMock(
-        return_value=TurnIntentClassifierResult.success(
-            TurnIntentClassification(mode=TurnIntentMode.BUILD, confidence=0.95)
-        )
-    )
-    monkeypatch.setattr(agent_module, "classify_turn_intent", classify)
-    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
-
-    resolution = await preflight_credential_pause(ctx, _make_stream(), config)
-    assert resolution is not None and resolution.action == "connected"
-    await agent_module._resume_turn_intent_after_preflight_credential(ctx, ctx.request_policy, policy_inputs)
-
-    assert ctx.request_policy.clarification_reason == "none"
-    assert ctx.turn_intent.mode is TurnIntentMode.BUILD
-    assert ctx.turn_intent.authority.may_update_workflow is True
-    assert ctx.turn_intent.authority.may_run_blocks is True
-    classify.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_preflight_resume_unknown_does_not_inherit_connected_policy_authority(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = _preflight_ctx()
-    policy = ctx.request_policy
-    policy.user_response_policy = "proceed"
-    policy.clarification_reason = "none"
-    policy.allow_update_workflow = True
-    policy.allow_run_blocks = True
-    monkeypatch.setattr(
-        agent_module,
-        "classify_turn_intent",
-        AsyncMock(
-            return_value=TurnIntentClassifierResult.success(
-                TurnIntentClassification(mode=TurnIntentMode.UNKNOWN, confidence=0.95)
-            )
-        ),
-    )
-    await agent_module._resume_turn_intent_after_preflight_credential(ctx, policy, _preflight_policy_inputs())
-
-    assert ctx.turn_intent.mode is TurnIntentMode.UNKNOWN
-    assert ctx.turn_intent.authority.may_update_workflow is False
-    assert ctx.turn_intent.authority.may_run_blocks is False
 
 
 @pytest.mark.asyncio

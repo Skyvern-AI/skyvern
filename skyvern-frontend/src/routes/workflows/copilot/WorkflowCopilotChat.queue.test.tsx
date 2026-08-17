@@ -263,7 +263,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
       ),
     ).toBeTruthy();
     expect(
-      screen.getByPlaceholderText("Type a message to send next…"),
+      screen.getByPlaceholderText("Type to queue a message…"),
     ).toBeTruthy();
     expect(screen.getByRole("button", { name: "Send next" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Queue" })).toBeNull();

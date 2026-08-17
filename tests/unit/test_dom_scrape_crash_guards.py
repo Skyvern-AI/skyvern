@@ -1,9 +1,10 @@
 """
-Element-tree scraper crash-guard regression tests.
+Element-tree scraper regression tests.
 
-Runs a behavioral Node.js test that exercises the two domUtils.js crash paths:
-undefined `className` in isHoverPointerElement, and the isElementVisible
-recursion cycle on a display:contents element holding a checkbox/radio/option.
+Aggregates the behavioral Node.js suites that exercise domUtils.js against a mock DOM:
+the two crash paths (undefined `className` in isHoverPointerElement, and the
+isElementVisible recursion cycle on a display:contents element holding a
+checkbox/radio/option), plus the datepicker, aria-popup, and Kendo picker seams.
 """
 
 import shutil
@@ -51,6 +52,17 @@ class TestDomScrapeCrashGuards:
 
     def test_aria_popup_trigger_behavioral(self):
         script = Path(__file__).parent / "test_aria_popup_trigger_domutils.js"
+        assert script.exists(), f"Missing {script}"
+        result = subprocess.run(
+            [_NODE, str(script)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, f"Failed:\n{result.stdout}\n{result.stderr}"
+
+    def test_kendo_dropdown_trigger_behavioral(self):
+        script = Path(__file__).parent / "test_kendo_dropdown_trigger_interactability.js"
         assert script.exists(), f"Missing {script}"
         result = subprocess.run(
             [_NODE, str(script)],

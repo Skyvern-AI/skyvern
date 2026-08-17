@@ -24,7 +24,9 @@ from skyvern.browser_extension.errors import (
 )
 from skyvern.browser_extension.protocol import (
     EXTENSION_ID,
+    LEGACY_PROTOCOL_VERSION,
     PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
     ParsedMessage,
     build_request,
     parse_extension_message,
@@ -516,11 +518,16 @@ class ExtensionRelayServer:
         port: int,
         on_event: Callable[[str, dict], Awaitable[None]],
         on_disconnect: Callable[[], Awaitable[None]] | None = None,
+        *,
+        control_pairing_only: bool = False,
+        on_pairing_complete: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._token = token
         self._port = port
         self._on_event = on_event
         self._on_disconnect = on_disconnect
+        self._control_pairing_only = control_pairing_only
+        self._on_pairing_complete = on_pairing_complete
         self._app = web.Application()
         self._app.router.add_get("/extension/v1", self._handle_websocket)
         self._app.router.add_get("/pair", self._handle_pair_page)
@@ -534,16 +541,16 @@ class ExtensionRelayServer:
         self._connected_event = asyncio.Event()
         self._request_ids = itertools.count(1)
         self._pending: dict[str, asyncio.Future[dict]] = {}
+        self._terminal_callbacks: dict[str, Callable[[], None]] = {}
+        self._pending_empty = asyncio.Event()
+        self._pending_empty.set()
         self._pairing_nonce: str | None = None
         self._pairing_nonce_created_at: float | None = None
         self.bound_port = port
         self.scoped_tabs: list[dict] = []
-
-    def add_route(self, path: str, handler: Callable[[web.Request], Awaitable[web.StreamResponse]]) -> None:
-        """Share the relay's loopback listener with another GET endpoint. Must precede start()."""
-        if self._runner is not None:
-            raise BrowserExtensionError("Routes must be registered before the relay starts")
-        self._app.router.add_get(path, handler)
+        self.extension_protocol_version: int | None = None
+        self.extension_connection_generation = 0
+        self._pending_reset_identity: tuple[str, int] | None = None
 
     def create_pairing_nonce(self) -> str:
         nonce = secrets.token_urlsafe(32)
@@ -558,8 +565,9 @@ class ExtensionRelayServer:
             return nonce
         return self.create_pairing_nonce()
 
-    async def acquire_pairing_nonce(self) -> str:
-        return self.get_or_create_pairing_nonce()
+    def cancel_pairing_nonce(self) -> None:
+        self._pairing_nonce = None
+        self._pairing_nonce_created_at = None
 
     def _is_interactive_pairing_request(self, request: web.Request) -> bool:
         try:
@@ -630,19 +638,92 @@ class ExtensionRelayServer:
             return False
         return self.connected
 
-    async def request(self, op: str, args: dict, timeout: float = 30.0) -> dict:
+    async def cycle_connection(self, timeout: float) -> bool:
+        websocket = self._websocket
+        if websocket is None:
+            self.scoped_tabs = []
+            return True
+        try:
+            if not websocket.closed:
+                await asyncio.wait_for(
+                    websocket.close(code=1001, message=b"broker client released"),
+                    timeout,
+                )
+        except TimeoutError:
+            return False
+        await self._handle_disconnect(websocket)
+        return True
+
+    async def send_reset(self, epoch: str, generation: int) -> bool:
+        websocket = self._websocket
+        if (
+            not isinstance(epoch, str)
+            or not epoch
+            or type(generation) is not int
+            or generation < 0
+            or self.extension_protocol_version != PROTOCOL_VERSION
+            or websocket is None
+            or websocket.closed
+        ):
+            return False
+        reset_identity = (epoch, generation)
+        self._pending_reset_identity = reset_identity
+        try:
+            await self._send_json(
+                websocket,
+                {"v": PROTOCOL_VERSION, "type": "extension.reset", "epoch": epoch, "generation": generation},
+            )
+        except (ConnectionError, RuntimeError):
+            if self._pending_reset_identity == reset_identity:
+                self._pending_reset_identity = None
+            return False
+        return True
+
+    @property
+    def pending_request_count(self) -> int:
+        return len(self._pending)
+
+    async def wait_pending_requests(self, timeout: float) -> bool:
+        if not self._pending:
+            return True
+        try:
+            await asyncio.wait_for(self._pending_empty.wait(), timeout)
+        except TimeoutError:
+            return False
+        return not self._pending
+
+    async def request(
+        self,
+        op: str,
+        args: dict,
+        timeout: float = 30.0,
+        *,
+        retain_until_terminal: bool = False,
+        on_registered: Callable[[], None] | None = None,
+        on_terminal: Callable[[], None] | None = None,
+    ) -> dict:
         websocket = self._websocket
         if not self.connected or websocket is None:
             raise BrowserExtensionNotConnectedError("Skyvern browser extension is not connected")
 
         request_id = f"r-{next(self._request_ids)}"
-        frame = build_request(request_id, op, args)
+        frame = build_request(
+            request_id,
+            op,
+            args,
+            protocol_version=self.extension_protocol_version or PROTOCOL_VERSION,
+        )
         future: asyncio.Future[dict] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
+        if on_terminal is not None:
+            self._terminal_callbacks[request_id] = on_terminal
+        self._pending_empty.clear()
+        if on_registered is not None:
+            on_registered()
         try:
             await self._send_json(websocket, frame)
         except (ConnectionError, RuntimeError):
-            pending = self._pending.pop(request_id, None)
+            pending = self._pop_pending(request_id)
             if pending is not None:
                 pending.cancel()
             raise BrowserExtensionNotConnectedError("Skyvern browser extension is not connected") from None
@@ -650,14 +731,20 @@ class ExtensionRelayServer:
         try:
             return await asyncio.wait_for(asyncio.shield(future), timeout)
         except TimeoutError:
-            pending = self._pending.pop(request_id, None)
-            if pending is not None:
-                pending.cancel()
+            if retain_until_terminal:
+                future.add_done_callback(_consume_future_result)
+            else:
+                pending = self._pop_pending(request_id)
+                if pending is not None:
+                    pending.cancel()
             raise ExtensionRequestError("INTERNAL", f"extension request timed out: {op}") from None
         except asyncio.CancelledError:
-            pending = self._pending.pop(request_id, None)
-            if pending is not None:
-                pending.cancel()
+            if retain_until_terminal:
+                future.add_done_callback(_consume_future_result)
+            else:
+                pending = self._pop_pending(request_id)
+                if pending is not None:
+                    pending.cancel()
             raise
 
     async def _handle_pair_page(self, _request: web.Request) -> web.Response:
@@ -678,15 +765,19 @@ class ExtensionRelayServer:
         )
 
     async def _handle_pair_begin(self, request: web.Request) -> web.Response:
+        if self._control_pairing_only:
+            return web.json_response(
+                {"error": "broker_control_required"}, status=404, headers={"Cache-Control": "no-store"}
+            )
         payload = await _read_json_object(request)
         proof = payload.get("proof") if payload is not None else None
         expected = hmac.new(self._token.encode("utf-8"), _PAIR_BEGIN_MESSAGE, hashlib.sha256).hexdigest()
         supplied = proof if isinstance(proof, str) else ""
         valid = hmac.compare_digest(expected, supplied)
-        if payload is None or type(payload.get("v")) is not int or payload["v"] != PROTOCOL_VERSION or not valid:
+        if payload is None or type(payload.get("v")) is not int or payload["v"] != LEGACY_PROTOCOL_VERSION or not valid:
             return web.json_response({"error": "invalid_proof"}, status=403, headers={"Cache-Control": "no-store"})
         return web.json_response(
-            {"v": PROTOCOL_VERSION, "nonce": self.create_pairing_nonce()},
+            {"v": LEGACY_PROTOCOL_VERSION, "nonce": self.create_pairing_nonce()},
             headers={"Cache-Control": "no-store"},
         )
 
@@ -705,7 +796,7 @@ class ExtensionRelayServer:
         valid_payload = (
             payload is not None
             and type(payload.get("v")) is int
-            and payload["v"] == PROTOCOL_VERSION
+            and payload["v"] == LEGACY_PROTOCOL_VERSION
             and isinstance(supplied_nonce, str)
         )
         nonce_matches = secrets.compare_digest(
@@ -720,8 +811,9 @@ class ExtensionRelayServer:
             LOG.info("browser_extension_pair_claim", outcome="expired_or_unknown_nonce")
             return web.json_response({"error": "invalid_nonce"}, status=403, headers={"Cache-Control": "no-store"})
         LOG.info("browser_extension_pair_claim", outcome="ok")
+        await self._call_on_pairing_complete()
         return web.json_response(
-            {"v": PROTOCOL_VERSION, "port": self.bound_port, "token": self._token},
+            {"v": LEGACY_PROTOCOL_VERSION, "port": self.bound_port, "token": self._token},
             headers={"Cache-Control": "no-store"},
         )
 
@@ -764,13 +856,13 @@ class ExtensionRelayServer:
             await self._send_json(
                 websocket,
                 {
-                    "v": 1,
+                    "v": proof.protocol_version,
                     "type": "auth.ok",
                     "serverProof": compute_server_proof(self._token, proof.client_nonce, server_nonce),
                 },
             )
             LOG.info("browser_extension_auth_succeeded")
-            await self._activate_connection(websocket)
+            await self._activate_connection(websocket, proof.protocol_version)
 
             loop = asyncio.get_running_loop()
             last_inbound = loop.time()
@@ -799,10 +891,13 @@ class ExtensionRelayServer:
         LOG.info("browser_extension_auth_failed", reason=reason)
         await websocket.close(code=_AUTH_CLOSE_CODE, message=b"authentication failed")
 
-    async def _activate_connection(self, websocket: web.WebSocketResponse) -> None:
+    async def _activate_connection(self, websocket: web.WebSocketResponse, protocol_version: int) -> None:
         async with self._connection_lock:
             previous = self._websocket
             self._websocket = websocket
+            self.extension_protocol_version = protocol_version
+            self.extension_connection_generation += 1
+            self._pending_reset_identity = None
             self._connected_event.clear()
 
         if previous is not None and previous is not websocket:
@@ -820,14 +915,39 @@ class ExtensionRelayServer:
             LOG.warning("browser extension sent an invalid protocol frame")
             return
 
+        if self.extension_protocol_version is not None and message.protocol_version != self.extension_protocol_version:
+            LOG.warning("browser extension changed protocol version within one connection")
+            return
+
         if message.kind == "response":
             self._handle_response(message)
         elif message.kind == "event":
             await self._handle_event(message)
             if message.event == "extension.hello":
                 await self._mark_hello_processed(websocket)
+        elif message.kind == "extension.reset_ack":
+            reset_identity = self._pending_reset_identity
+            if (
+                reset_identity is not None
+                and message.reset_epoch is not None
+                and message.generation is not None
+                and (message.reset_epoch, message.generation) == reset_identity
+                and message.ok is True
+            ):
+                self._pending_reset_identity = None
+                self._fail_pending_requests()
+                self.scoped_tabs = []
+            await self._on_event(
+                "extension.reset_ack",
+                {
+                    "epoch": message.reset_epoch,
+                    "generation": message.generation,
+                    "ok": message.ok,
+                    "failedTabCount": message.failed_tab_count,
+                },
+            )
         elif message.kind == "ping":
-            await self._send_json(websocket, {"v": 1, "type": "pong"})
+            await self._send_json(websocket, {"v": message.protocol_version, "type": "pong"})
 
     async def _send_json(self, websocket: web.WebSocketResponse, frame: dict) -> None:
         async with self._send_lock:
@@ -835,13 +955,14 @@ class ExtensionRelayServer:
 
     async def _mark_hello_processed(self, websocket: web.WebSocketResponse) -> None:
         async with self._connection_lock:
-            if self._websocket is websocket and not websocket.closed:
+            current = self._websocket
+            if current is websocket and current is not None and not current.closed:
                 self._connected_event.set()
 
     def _handle_response(self, message: ParsedMessage) -> None:
         if message.request_id is None:
             return
-        future = self._pending.pop(message.request_id, None)
+        future = self._pop_pending(message.request_id)
         if future is None or future.done():
             return
         if message.ok:
@@ -896,7 +1017,10 @@ class ExtensionRelayServer:
                 return
             if now >= next_ping:
                 try:
-                    await self._send_json(websocket, {"v": 1, "type": "ping"})
+                    await self._send_json(
+                        websocket,
+                        {"v": self.extension_protocol_version or PROTOCOL_VERSION, "type": "ping"},
+                    )
                 except (ConnectionError, RuntimeError):
                     return
                 next_ping = now + _PING_INTERVAL_SECONDS
@@ -908,6 +1032,8 @@ class ExtensionRelayServer:
             if self._websocket is not websocket:
                 return
             self._websocket = None
+            self.extension_protocol_version = None
+            self._pending_reset_identity = None
             self._connected_event.clear()
 
         self._fail_pending_requests()
@@ -921,12 +1047,39 @@ class ExtensionRelayServer:
             except Exception:
                 LOG.exception("browser extension disconnect callback failed")
 
+    async def _call_on_pairing_complete(self) -> None:
+        if self._on_pairing_complete is not None:
+            try:
+                await self._on_pairing_complete()
+            except Exception:
+                LOG.exception("browser extension pairing-complete callback failed")
+
+    def _pop_pending(self, request_id: str) -> asyncio.Future[dict] | None:
+        future = self._pending.pop(request_id, None)
+        terminal_callback = self._terminal_callbacks.pop(request_id, None)
+        if not self._pending:
+            self._pending_empty.set()
+        if terminal_callback is not None:
+            terminal_callback()
+        return future
+
     def _fail_pending_requests(self) -> None:
         pending = list(self._pending.values())
+        terminal_callbacks = list(self._terminal_callbacks.values())
         self._pending.clear()
+        self._terminal_callbacks.clear()
+        self._pending_empty.set()
+        for terminal_callback in terminal_callbacks:
+            terminal_callback()
         for future in pending:
             if not future.done():
                 future.set_exception(BrowserExtensionNotConnectedError("Skyvern browser extension is not connected"))
+
+
+def _consume_future_result(future: asyncio.Future[dict]) -> None:
+    if not future.cancelled():
+        with suppress(Exception):
+            future.exception()
 
 
 def _is_extension_origin(origin: str) -> bool:
@@ -950,7 +1103,7 @@ def _auth_parse_failure_reason(raw: str) -> str:
         payload = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return "bad_payload"
-    if isinstance(payload, dict) and type(payload.get("v")) is int and payload["v"] != PROTOCOL_VERSION:
+    if isinstance(payload, dict) and type(payload.get("v")) is int and payload["v"] not in SUPPORTED_PROTOCOL_VERSIONS:
         return "protocol_mismatch"
     return "bad_payload"
 

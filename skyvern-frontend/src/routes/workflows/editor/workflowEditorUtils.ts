@@ -147,6 +147,7 @@ import {
 } from "./nodes/HttpRequestNode/httpValidation";
 import { printPageNodeDefaultData } from "./nodes/PrintPageNode/types";
 import { validateErrorCodeMapping } from "./validateErrorCodeMapping";
+import { analyzeCodeBlockErrorCodes } from "./codeBlockErrorCodeDiagnostics";
 import {
   isWorkflowTriggerNode,
   workflowTriggerNodeDefaultData,
@@ -954,6 +955,11 @@ function convertToNode(
           ...commonData,
           code: block.code,
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
+          errorCodeMapping: JSON.stringify(
+            block.error_code_mapping ?? null,
+            null,
+            2,
+          ),
           prompt: block.prompt ?? null,
           steps: block.steps ?? null,
         },
@@ -3183,6 +3189,7 @@ function getWorkflowBlock(
             path: node.data.path,
             prompt: node.data.prompt,
             continue_on_empty: node.data.continueOnEmpty ?? false,
+            google_credential_id: node.data.googleCredentialId ?? "",
             ...(node.data.downloadTarget === "s3" && {
               s3_bucket: node.data.s3Bucket ?? "",
               aws_access_key_id: node.data.awsAccessKeyId ?? "",
@@ -3196,7 +3203,6 @@ function getWorkflowBlock(
               azure_blob_container_name: node.data.azureBlobContainerName ?? "",
             }),
             ...(node.data.downloadTarget === "google_drive" && {
-              google_credential_id: node.data.googleCredentialId ?? "",
               google_drive_folder_id: node.data.googleDriveFolderId ?? "",
             }),
             ...(node.data.downloadTarget === "sftp" && {
@@ -3244,6 +3250,9 @@ function getWorkflowBlock(
         block_type: "code",
         parameter_keys: node.data.parameterKeys,
         code: node.data.code,
+        error_code_mapping: JSONParseSafe(
+          node.data.errorCodeMapping ?? "null",
+        ) as Record<string, string> | null,
         prompt: node.data.prompt,
         steps: node.data.steps,
       };
@@ -4591,6 +4600,7 @@ function convertBlocksToBlockYAML(
               path: block.path,
               prompt: block.prompt,
               continue_on_empty: block.continue_on_empty ?? false,
+              google_credential_id: block.google_credential_id ?? "",
               ...(block.download_target === "s3" && {
                 s3_bucket: block.s3_bucket ?? "",
                 aws_access_key_id: block.aws_access_key_id ?? "",
@@ -4606,7 +4616,6 @@ function convertBlocksToBlockYAML(
                   block.azure_blob_container_name ?? "",
               }),
               ...(block.download_target === "google_drive" && {
-                google_credential_id: block.google_credential_id ?? "",
                 google_drive_folder_id: block.google_drive_folder_id ?? "",
               }),
               ...(block.download_target === "sftp" && {
@@ -4656,6 +4665,7 @@ function convertBlocksToBlockYAML(
           block_type: "code",
           code: block.code,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
+          error_code_mapping: block.error_code_mapping ?? null,
           prompt: block.prompt,
           steps: block.steps,
         };
@@ -5036,6 +5046,57 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     errors.push(
       ...validateErrorCodeMapping(node.data.label, node.data.errorCodeMapping),
     );
+  });
+
+  const codeBlockNodes = nodes.filter((node) => node.type === "codeBlock");
+  const workflowStartNode = nodes
+    .filter(isStartNode)
+    .find((node) => isWorkflowStartNodeData(node.data));
+  const workflowErrorCodeMapping =
+    workflowStartNode && isWorkflowStartNodeData(workflowStartNode.data)
+      ? workflowStartNode.data.errorCodeMapping
+      : null;
+  codeBlockNodes.forEach((node) => {
+    const errorCodeMapping = node.data.errorCodeMapping || "null";
+    errors.push(...validateErrorCodeMapping(node.data.label, errorCodeMapping));
+
+    let blockErrorCodeMapping: Record<string, string> | null = null;
+    try {
+      const parsed = JSON.parse(errorCodeMapping) as unknown;
+      if (
+        parsed !== null &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed)
+      ) {
+        blockErrorCodeMapping = parsed as Record<string, string>;
+      }
+    } catch {
+      // Mapping validation above owns JSON parse errors.
+    }
+    const effectiveErrorCodeMapping = {
+      ...(workflowErrorCodeMapping ?? {}),
+      ...(blockErrorCodeMapping ?? {}),
+    };
+    const diagnostics = analyzeCodeBlockErrorCodes(
+      node.data.code,
+      Object.keys(effectiveErrorCodeMapping).length > 0
+        ? effectiveErrorCodeMapping
+        : null,
+    );
+    diagnostics.raisedButUndeclared.forEach(({ code, lines }) => {
+      errors.push(
+        `${node.data.label}: ErrorCode ${code} raised on ${
+          lines.length === 1 ? "line" : "lines"
+        } ${lines.join(", ")} is not declared.`,
+      );
+    });
+    if (diagnostics.malformedLines.length > 0) {
+      errors.push(
+        `${node.data.label}: Invalid ErrorCode use on ${
+          diagnostics.malformedLines.length === 1 ? "line" : "lines"
+        } ${diagnostics.malformedLines.join(", ")}.`,
+      );
+    }
   });
 
   const conditionalNodes = nodes.filter((node) => node.type === "conditional");

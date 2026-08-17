@@ -9,7 +9,6 @@ from fastapi import BackgroundTasks, Request
 from skyvern.exceptions import BackgroundSequentialCredentialUnsupported, OrganizationNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.custom_llm_registry import prepare_org_llm_runtime
-from skyvern.forge.sdk.browser_action_policy import UNWIRED_AUTHORITY
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
@@ -36,12 +35,12 @@ async def _run_with_own_context(
     asyncio.create_task copies the ContextVar binding but not the object it points at, and the
     caller keeps running (WorkflowTriggerBlock dispatches a child and resumes). Both would then
     write the same context — execute_workflow assigns generate_script on it, block execution
-    assigns task_id/step_id — and clobber each other. Runtime origin authority is reset because
-    each child run must establish its own authority.
+    assigns task_id/step_id — and clobber each other. Shallow-copy so scalar writes stay local
+    while inherited values survive.
     """
     parent = skyvern_context.current()
     if parent is not None:
-        skyvern_context.set(replace(parent, browser_action_authority=UNWIRED_AUTHORITY))
+        skyvern_context.set(replace(parent))
     await func(*args, **kwargs)
 
 
@@ -105,6 +104,8 @@ class BackgroundTaskExecutor(AsyncExecutor):
             engine = RunEngine.ui_tars
         elif run_obj and run_obj.task_run_type == RunType.yutori_navigator:
             engine = RunEngine.yutori_navigator
+        elif run_obj and run_obj.task_run_type == RunType.task_v3:
+            engine = RunEngine.skyvern_v3
 
         context: SkyvernContext = skyvern_context.ensure_context()
         context.task_id = task.task_id

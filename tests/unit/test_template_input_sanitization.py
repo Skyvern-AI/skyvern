@@ -7,7 +7,6 @@ from unittest.mock import patch
 import pytest
 from jinja2 import Environment
 
-from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal, unwrap_goal_fields
 from skyvern.forge.sdk.prompting import _untrusted_filter
@@ -404,68 +403,6 @@ class TestElementsSanitizationAllBuilderBranches:
         assert "` ` `pwn` ` `" in rendered
         assert "```pwn```" not in rendered
         assert builder.last_used_element_tree_html is None
-
-    def test_extension_transform_updates_builder_cache_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.utils import prompt_engine as prompt_engine_mod
-
-        builder = _FakeBuilderWithLastHtml(self._MALICIOUS_HTML)
-        extension = AgentFunction()
-        transform = patch.object(extension, "transform_browser_elements_for_prompt", return_value="transformed")
-
-        with transform as mock_transform:
-            monkeypatch.setattr(prompt_engine_mod.app, "AGENT_FUNCTION", extension)
-            result = prompt_engine_mod._sanitize_elements_for_prompt(builder, self._MALICIOUS_HTML)
-
-        escaped = "<a>foo ` ` `pwn` ` ` bar</a>"
-        assert result == "transformed"
-        assert builder.last_used_element_tree_html == "transformed"
-        mock_transform.assert_called_once_with(escaped)
-
-
-@pytest.mark.asyncio
-async def test_agent_function_browser_extension_hooks_default_to_noop() -> None:
-    extension = AgentFunction()
-
-    assert extension.begin_browser_observation() is None
-    assert extension.record_browser_observation_failure("unavailable") is None
-    assert await extension.inspect_browser_observation("text", [], None) is None
-    assert extension.needs_browser_observation_text() is False
-    assert extension.transform_browser_elements_for_prompt("elements") == "elements"
-    assert await extension.inspect_browser_dialog("confirm", "continue?", None) is False
-    assert extension.should_dismiss_browser_dialog("confirm", "continue?", None) is False
-    assert extension.should_block_browser_action(object()) is False  # type: ignore[arg-type]
-    assert extension.enforce_browser_action_policy(object()) is None  # type: ignore[arg-type]
-
-
-@pytest.mark.asyncio
-async def test_incremental_observation_fetches_text_only_when_extension_requests_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from unittest.mock import AsyncMock, MagicMock
-
-    from skyvern.utils import prompt_engine as prompt_engine_mod
-    from skyvern.webeye.scraper import scraper
-
-    extension = AgentFunction()
-    inspect_observation = AsyncMock()
-    monkeypatch.setattr(extension, "inspect_browser_observation", inspect_observation)
-    monkeypatch.setattr(prompt_engine_mod.app, "AGENT_FUNCTION", extension)
-    get_frame_text = AsyncMock(return_value="rendered text")
-    monkeypatch.setattr(scraper, "get_frame_text", get_frame_text)
-    frame = MagicMock(url="https://example.test")
-    skyvern_frame = MagicMock()
-    skyvern_frame.get_frame.return_value = frame
-    skyvern_frame.get_incremental_element_tree = AsyncMock(return_value=([], []))
-    incremental = scraper.IncrementalScrapePage(skyvern_frame)
-
-    await incremental.get_incremental_element_tree(AsyncMock(return_value=[]))
-    get_frame_text.assert_not_awaited()
-    inspect_observation.assert_awaited_once_with("https://example.test", [], None)
-
-    monkeypatch.setattr(extension, "needs_browser_observation_text", lambda: True)
-    await incremental.get_incremental_element_tree(AsyncMock(return_value=[]))
-    get_frame_text.assert_awaited_once_with(frame)
-    assert inspect_observation.await_args_list[-1].args == ("https://example.test", [], "rendered text")
 
 
 class TestEnvironmentFilterIsolation:

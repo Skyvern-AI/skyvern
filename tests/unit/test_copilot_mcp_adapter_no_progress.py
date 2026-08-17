@@ -1,7 +1,4 @@
-"""A raised ``client.call_tool`` for the click tool returns before the post-hook, so the shared
-no-progress helper must fire from the adapter exception handler exactly once, with no double-count
-against the post-hook path. OSS-synced fixture references use example.* only.
-"""
+"""MCP adapter failures and retained safety gates. Fixture references use example.* only."""
 
 from __future__ import annotations
 
@@ -12,7 +9,7 @@ import pytest
 
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
-from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 
 
 class _RaisingClient:
@@ -29,11 +26,6 @@ def _agent_ctx() -> CopilotContext:
         browser_session_id="pbs_1",
         stream=MagicMock(),
         user_message="scout",
-        turn_intent=TurnIntent(
-            mode=TurnIntentMode.EDIT,
-            user_goal="scout",
-            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
-        ),
     )
 
 
@@ -50,25 +42,66 @@ def _make_server(ctx: CopilotContext, tool_name: str) -> SkyvernOverlayMCPServer
 
 
 @pytest.mark.asyncio
-async def test_raised_click_increments_no_progress_counter_exactly_once() -> None:
+async def test_raised_click_returns_a_structured_error() -> None:
     ctx = _agent_ctx()
     server = _make_server(ctx, "click")
 
     result = await server.call_tool("click", {"selector": "#submit"})
 
     assert result.isError is True
-    assert ctx.consecutive_no_progress_interaction_count == 1
 
 
 @pytest.mark.asyncio
-async def test_raised_non_click_tool_leaves_no_progress_counter_untouched() -> None:
+async def test_mcp_browser_tool_ignores_legacy_failed_step_loop_state() -> None:
     ctx = _agent_ctx()
-    server = _make_server(ctx, "evaluate")
+    ctx.failed_tool_step_tracker = {"click:credential_error": 99}  # type: ignore[attr-defined]
+    server = _make_server(ctx, "click")
 
-    result = await server.call_tool("evaluate", {"expression": "scan()"})
+    result = await server.call_tool("click", {"selector": "#submit"})
 
     assert result.isError is True
-    assert ctx.consecutive_no_progress_interaction_count == 0
+    text = "".join(getattr(block, "text", "") for block in result.content)
+    assert "Timeout 5000ms exceeded" in text
+    assert "LOOP DETECTED" not in text
+
+
+@pytest.mark.asyncio
+async def test_mcp_browser_tool_ignores_current_page_challenge_as_an_admission_gate() -> None:
+    ctx = _agent_ctx()
+    ctx.composition_page_evidence = {
+        "observed_after_workflow_run": True,
+        "challenge_state": {
+            "detected": True,
+            "requires_human_verification": True,
+            "gates_submit_controls": True,
+        },
+    }
+    server = _make_server(ctx, "click")
+
+    result = await server.call_tool("click", {"selector": "#submit"})
+
+    text = "".join(getattr(block, "text", "") for block in result.content)
+    assert "Timeout 5000ms exceeded" in text
+    assert "verification challenge" not in text
+
+
+@pytest.mark.asyncio
+async def test_redacted_raw_secret_refuses_browser_mcp_call_at_action_seam() -> None:
+    ctx = _agent_ctx()
+    ctx.request_policy = RequestPolicy(raw_secret_detected=True, raw_secret_handling="redacted_draft")
+    server = SkyvernOverlayMCPServer(
+        transport=MagicMock(),
+        overlays={"click": SchemaOverlay(requires_browser=True)},
+        alias_map={},
+        allowlist=frozenset(),
+        context_provider=lambda: ctx,
+    )
+    server._client = _RaisingClient()
+
+    result = await server.call_tool("click", {"selector": "#submit"})
+
+    text = "".join(getattr(block, "text", "") for block in result.content)
+    assert "raw-secret draft cannot use browser tools" in text
 
 
 class _HangingClient:

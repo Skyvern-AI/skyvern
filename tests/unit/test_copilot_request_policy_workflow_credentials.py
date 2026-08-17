@@ -5,18 +5,19 @@ import pytest
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, build_request_policy_trust_floor
-from skyvern.forge.sdk.copilot.tools.credentials import _list_credentials
+from skyvern.forge.sdk.copilot.tools.credentials import _list_credentials, _serialize_credential
 from skyvern.forge.sdk.schemas.credentials import CredentialType
 
 
-def _cred(name: str, credential_id: str) -> SimpleNamespace:
+def _cred(name: str, credential_id: str, *, tested_url: str | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         name=name,
         credential_id=credential_id,
-        tested_url=None,
+        tested_url=tested_url,
         credential_type=CredentialType.PASSWORD,
         username="user@example.test",
         totp_type=None,
+        totp_identifier=None,
         card_last4=None,
         card_brand=None,
         secret_label=None,
@@ -28,7 +29,6 @@ def _ctx(policy: RequestPolicy, *credential_targets: str) -> SimpleNamespace:
         organization_id="org-1",
         user_message="expanded agent input",
         request_policy=policy,
-        turn_intent=SimpleNamespace(target_entities={"credential": list(credential_targets)}),
     )
 
 
@@ -53,7 +53,23 @@ async def test_request_policy_trust_floor_makes_only_the_narrow_safety_call() ->
 
 
 @pytest.mark.asyncio
-async def test_request_policy_trust_floor_redacts_raw_secret_before_turn_intent() -> None:
+async def test_request_policy_trust_floor_survives_a_url_with_a_malformed_authority() -> None:
+    handler = AsyncMock(return_value={"version": "1", "state": "clean", "handling": "none", "citations": []})
+
+    policy = await build_request_policy_trust_floor(
+        user_message="log into [https://broken.example](https://broken.example) then https://example.com/report",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        handler=handler,
+    )
+
+    assert policy.user_provided_site_urls == ["https://example.com/report"]
+
+
+@pytest.mark.asyncio
+async def test_request_policy_trust_floor_redacts_raw_secret_in_canonical_message() -> None:
     literal = "password=hunter2-secret-value"
     handler = AsyncMock(return_value={"version": "1", "state": "clean", "handling": "none", "citations": []})
 
@@ -67,8 +83,11 @@ async def test_request_policy_trust_floor_redacts_raw_secret_before_turn_intent(
     )
 
     handler.assert_awaited_once()
-    assert policy.raw_secret_detected is True
-    assert policy.raw_secret_handling == "redacted_draft"
+    assert policy.raw_secret_detected is False
+    assert policy.raw_secret_handling == "none"
+    assert policy.raw_secret_safety_status == "clean"
+    assert policy.raw_secret_safety_citation_count == 0
+    assert policy.allow_run_blocks is True
     assert literal not in policy.canonical_user_message
     assert "hunter2-secret-value" not in policy.canonical_user_message
 
@@ -88,6 +107,43 @@ async def test_list_credentials_exact_mode_binds_one_grounded_name() -> None:
     assert result["data"]["status"] == "resolved"
     assert policy.current_turn_named_credential_ids == {"cred_one"}
     assert [item.credential_id for item in policy.resolved_credentials] == ["cred_one"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("classifier_targets", [(), ("different-login",)])
+async def test_list_credentials_exact_mode_uses_literal_provenance_not_classifier_targets(
+    classifier_targets: tuple[str, ...],
+) -> None:
+    policy = RequestPolicy(
+        canonical_user_message="Please build the workflow with the saved credential saved-login for this site."
+    )
+    ctx = _ctx(policy, *classifier_targets)
+    credential = _cred("saved-login", "cred_one")
+
+    with patch(
+        "skyvern.forge.sdk.copilot.tools.credentials.load_credentials",
+        AsyncMock(return_value=[credential]),
+    ):
+        result = await _list_credentials({"exact_reference": "saved-login"}, ctx)
+
+    assert result["data"]["status"] == "resolved"
+    assert policy.current_turn_named_credential_ids == {"cred_one"}
+
+
+@pytest.mark.asyncio
+async def test_list_credentials_exact_mode_does_not_let_classifier_choose_between_literal_references() -> None:
+    credentials = [_cred("Prod", "cred_prod"), _cred("Backup", "cred_backup")]
+    policy = RequestPolicy(canonical_user_message="Use Prod or Backup for this workflow")
+    ctx = _ctx(policy, "Prod")
+
+    with patch(
+        "skyvern.forge.sdk.copilot.tools.credentials.load_credentials",
+        AsyncMock(return_value=credentials),
+    ):
+        result = await _list_credentials({"exact_reference": "Prod"}, ctx)
+
+    assert result["data"]["status"] == "resolved"
+    assert policy.current_turn_named_credential_ids == {"cred_prod"}
 
 
 @pytest.mark.asyncio
@@ -176,7 +232,7 @@ async def test_list_credentials_exact_mode_accepts_quoted_name_with_sentence_pun
     "message",
     ["Replace Prod with Prod Login", "Do not use Prod; use Prod Login"],
 )
-async def test_list_credentials_exact_mode_denies_selection_when_multiple_names_are_mentioned(message: str) -> None:
+async def test_list_credentials_exact_mode_leaves_selection_semantics_to_the_agent(message: str) -> None:
     credentials = [_cred("Prod", "cred_prod"), _cred("Prod Login", "cred_login")]
     policy = RequestPolicy(canonical_user_message=message)
     ctx = _ctx(policy, "Prod Login")
@@ -187,32 +243,8 @@ async def test_list_credentials_exact_mode_denies_selection_when_multiple_names_
     ):
         result = await _list_credentials({"exact_reference": "Prod"}, ctx)
 
-    assert result["data"]["status"] == "denied"
-    assert policy.resolved_credentials == []
-
-    with patch(
-        "skyvern.forge.sdk.copilot.tools.credentials.load_credentials",
-        AsyncMock(return_value=credentials),
-    ):
-        affirmative = await _list_credentials({"exact_reference": "Prod Login"}, ctx)
-
-    assert affirmative["data"]["status"] == "resolved"
-
-
-@pytest.mark.asyncio
-async def test_list_credentials_exact_mode_denies_negated_sole_name_without_affirmative_target() -> None:
-    credential = _cred("Prod", "cred_prod")
-    policy = RequestPolicy(canonical_user_message="Do not use Prod")
-    ctx = _ctx(policy)
-
-    with patch(
-        "skyvern.forge.sdk.copilot.tools.credentials.load_credentials",
-        AsyncMock(return_value=[credential]),
-    ):
-        result = await _list_credentials({"exact_reference": "Prod"}, ctx)
-
-    assert result["data"]["status"] == "denied"
-    assert policy.resolved_credentials == []
+    assert result["data"]["status"] == "resolved"
+    assert policy.current_turn_named_credential_ids == {"cred_prod"}
 
 
 @pytest.mark.asyncio
@@ -288,3 +320,87 @@ async def test_list_credentials_discovery_does_not_grant_authority(monkeypatch: 
     assert policy.resolved_credentials == []
     assert policy.current_turn_named_credential_ids == set()
     assert [item.credential_id for item in policy.discovered_credentials] == ["cred_one"]
+
+
+@pytest.mark.parametrize("tested_url", ["https://portal.example.test/login", None])
+def test_serialize_credential_includes_tested_url(tested_url: str | None) -> None:
+    serialized = _serialize_credential(_cred("Saved Login", "cred_saved_login", tested_url=tested_url))
+
+    assert "tested_url" in serialized
+    assert serialized["tested_url"] == tested_url
+
+
+@pytest.mark.asyncio
+async def test_list_credentials_exact_result_includes_tested_url() -> None:
+    credential = _cred(
+        "Saved Login",
+        "cred_saved_login",
+        tested_url="https://portal.example.test/login",
+    )
+    policy = RequestPolicy(canonical_user_message=f"Use {credential.credential_id}")
+
+    with patch(
+        "skyvern.forge.sdk.copilot.tools.credentials.load_credentials",
+        AsyncMock(return_value=[credential]),
+    ):
+        result = await _list_credentials({"exact_reference": credential.credential_id}, _ctx(policy))
+
+    assert result["data"]["credential"]["tested_url"] == credential.tested_url
+
+
+@pytest.mark.asyncio
+async def test_list_credentials_page_includes_null_tested_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    credential = _cred("Saved Login", "cred_saved_login")
+    get_credentials = AsyncMock(return_value=[credential])
+    database = SimpleNamespace(credentials=SimpleNamespace(get_credentials=get_credentials))
+    policy = RequestPolicy(canonical_user_message="List my credentials")
+
+    monkeypatch.setattr(object.__getattribute__(app, "_inst"), "DATABASE", database, raising=False)
+    result = await _list_credentials({}, _ctx(policy))
+
+    assert result["data"]["credentials"][0]["tested_url"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("params", "expected_page", "expected_page_size"),
+    [
+        ({"page": 0}, 1, 10),
+        ({"page_size": 0}, 1, 10),
+        ({"page_size": -1}, 1, 1),
+    ],
+)
+async def test_list_credentials_normalizes_pagination(
+    monkeypatch: pytest.MonkeyPatch,
+    params: dict[str, int],
+    expected_page: int,
+    expected_page_size: int,
+) -> None:
+    get_credentials = AsyncMock(return_value=[])
+    database = SimpleNamespace(credentials=SimpleNamespace(get_credentials=get_credentials))
+    policy = RequestPolicy(canonical_user_message="List my credentials")
+
+    monkeypatch.setattr(object.__getattribute__(app, "_inst"), "DATABASE", database, raising=False)
+    result = await _list_credentials(params, _ctx(policy))
+
+    get_credentials.assert_awaited_once_with(
+        organization_id="org-1",
+        page=expected_page,
+        page_size=expected_page_size,
+    )
+    assert result["data"]["page"] == expected_page
+    assert result["data"]["page_size"] == expected_page_size
+    assert result["data"]["has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_credentials_nonempty_full_page_reports_more_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    credential = _cred("Saved Login", "cred_saved_login")
+    get_credentials = AsyncMock(return_value=[credential])
+    database = SimpleNamespace(credentials=SimpleNamespace(get_credentials=get_credentials))
+    policy = RequestPolicy(canonical_user_message="List my credentials")
+
+    monkeypatch.setattr(object.__getattribute__(app, "_inst"), "DATABASE", database, raising=False)
+    result = await _list_credentials({"page_size": 1}, _ctx(policy))
+
+    assert result["data"]["has_more"] is True

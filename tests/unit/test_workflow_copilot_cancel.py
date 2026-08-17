@@ -44,6 +44,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     workflow_copilot_cancel,
     workflow_copilot_chat_post,
 )
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotCancelRequest,
     WorkflowCopilotChatRequest,
@@ -1070,4 +1071,6 @@ async def test_pre_agent_cancel_row_is_visible_to_the_turn_idempotence_check() -
     assert outcome.copilot_turn_id == "turn-a"
     assert outcome.terminal_reason == USER_CANCELLED_TERMINAL_REASON
     assert outcome.terminal_reason != "interrupted"
+    assert outcome.response_kind is ResponseKind.RECOVER
+    assert outcome.response_kind is not ResponseKind.CLARIFY
     assert await _assistant_row_exists_for_turn(chat, "turn-a") is True

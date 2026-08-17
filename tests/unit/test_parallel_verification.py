@@ -160,13 +160,11 @@ async def test_speculate_next_step_plan_skips_in_script_mode(monkeypatch: pytest
     current_step = make_step(now, task, step_id="step-cur", status=StepStatus.completed, order=0, output=None)
     next_step = make_step(now, task, step_id="step-next", status=StepStatus.created, order=1, output=None)
 
-    sleep_mock = AsyncMock(return_value=None)
-    monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", sleep_mock)
-
     build_prompt_mock = AsyncMock()
     monkeypatch.setattr(agent, "build_and_record_step_prompt", build_prompt_mock)
 
     browser_state, _scraped_page, _page = make_browser_state()
+    browser_state.get_working_page = AsyncMock(return_value=None)
 
     context = SkyvernContext(
         task_id=task.task_id,
@@ -187,17 +185,15 @@ async def test_speculate_next_step_plan_skips_in_script_mode(monkeypatch: pytest
         )
 
     assert plan is None
-    # No prompt build, no sleep — we exited before either.
+    # No prompt build — we exited before speculative work.
     build_prompt_mock.assert_not_called()
-    sleep_mock.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_speculate_next_step_plan_proceeds_when_not_in_script_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Sanity check: without ctx.script_mode, speculation proceeds past the gate
-    (builds the prompt, sleeps for the verification head-start, calls the LLM)."""
+    """Without ctx.script_mode, speculation proceeds past the gate and builds a plan."""
     agent = ForgeAgent()
     now = datetime.now(UTC)
 
@@ -205,9 +201,6 @@ async def test_speculate_next_step_plan_proceeds_when_not_in_script_mode(
     task = make_task(now, organization)
     current_step = make_step(now, task, step_id="step-cur", status=StepStatus.completed, order=0, output=None)
     next_step = make_step(now, task, step_id="step-next", status=StepStatus.created, order=1, output=None)
-
-    sleep_mock = AsyncMock(return_value=None)
-    monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", sleep_mock)
 
     browser_state, scraped_page, page = make_browser_state()
     browser_state.get_working_page = AsyncMock(return_value=page)
@@ -253,7 +246,6 @@ async def test_speculate_next_step_plan_proceeds_when_not_in_script_mode(
 
     assert plan is not None
     build_prompt_mock.assert_awaited_once()
-    sleep_mock.assert_awaited()  # verification head-start
 
 
 @pytest.mark.asyncio
@@ -410,12 +402,11 @@ async def test_speculate_next_step_plan_skips_for_cua_engine(monkeypatch: pytest
     current_step = make_step(now, task, step_id="step-cur", status=StepStatus.completed, order=0, output=None)
     next_step = make_step(now, task, step_id="step-next", status=StepStatus.created, order=1, output=None)
 
-    sleep_mock = AsyncMock(return_value=None)
-    monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", sleep_mock)
     build_prompt_mock = AsyncMock()
     monkeypatch.setattr(agent, "build_and_record_step_prompt", build_prompt_mock)
 
     browser_state, _scraped_page, _page = make_browser_state()
+    browser_state.get_working_page = AsyncMock(return_value=None)
 
     context = SkyvernContext(
         task_id=task.task_id,
@@ -438,7 +429,6 @@ async def test_speculate_next_step_plan_skips_for_cua_engine(monkeypatch: pytest
 
     assert plan is None
     build_prompt_mock.assert_not_called()
-    sleep_mock.assert_not_called()
 
 
 def test_task_validate_update_requires_extracted_information() -> None:

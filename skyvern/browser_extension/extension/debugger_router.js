@@ -35,6 +35,37 @@ export class DebuggerRouter {
     return this.attachedTabs.size > 0;
   }
 
+  async reset() {
+    const attachedTabIds = [...this.attachedTabs];
+    const results = await Promise.all(
+      attachedTabIds.map(async (tabId) => {
+        try {
+          await chrome.debugger.detach({ tabId });
+        } catch {
+          if (await this.isDebuggerStillAttached(tabId)) {
+            return false;
+          }
+        }
+        this.attachedTabs.delete(tabId);
+        this.forgetChildTargets(tabId);
+        return true;
+      }),
+    );
+    this.onAttachedChange();
+    return { failedTabCount: results.filter((detached) => !detached).length };
+  }
+
+  async isDebuggerStillAttached(tabId) {
+    try {
+      const targets = await chrome.debugger.getTargets();
+      return targets.some(
+        (target) => target.tabId === tabId && target.attached,
+      );
+    } catch {
+      return true;
+    }
+  }
+
   async attach(args) {
     const values = requireArgs(args);
     const tabId = requireTabId(values.tabId);

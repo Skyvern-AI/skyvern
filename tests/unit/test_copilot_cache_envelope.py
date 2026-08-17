@@ -13,8 +13,11 @@ from skyvern.forge.sdk.copilot.cache_envelope import (
     ExplicitCacheEnvelope,
     build_explicit_cache_envelope,
 )
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+_CODE_ONLY_HEADER = "ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE"
 
 
 @function_tool
@@ -173,5 +176,31 @@ def test_system_prompt_places_datetime_and_runtime_context_after_breakpoint(
     assert prompt.cache_namespace == "wcc_one"
     assert prompt.stable_prefix == base_prompt.stable_prefix
     assert base_prompt.dynamic_suffix in prompt.dynamic_suffix
-    assert "REQUEST POLICY" in prompt.dynamic_suffix
+    assert "TURN SAFETY AND REQUEST CONTEXT" in prompt.dynamic_suffix
     assert str(prompt) == prompt.stable_prefix + prompt.dynamic_suffix
+
+
+def test_code_only_authoring_policy_renders_into_the_dynamic_tail_only() -> None:
+    config = agent_module.CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+
+    base_prompt = agent_module._build_system_prompt(tool_usage_guide="tools", config=config)
+    prompt = agent_module._build_dynamic_system_prompt(tool_usage_guide="tools", config=config)(
+        SimpleNamespace(
+            context=CopilotContext(
+                organization_id="org_one",
+                workflow_id="workflow_one",
+                workflow_permanent_id="wpid_one",
+                workflow_yaml="",
+                browser_session_id=None,
+                stream=SimpleNamespace(),  # type: ignore[arg-type]
+                workflow_copilot_chat_id="wcc_one",
+                request_policy=RequestPolicy(),
+            )
+        ),
+        None,
+    )
+
+    assert _CODE_ONLY_HEADER not in str(base_prompt)
+    assert isinstance(prompt, CacheableSystemInstructions)
+    assert _CODE_ONLY_HEADER not in prompt.stable_prefix
+    assert _CODE_ONLY_HEADER in prompt.dynamic_suffix

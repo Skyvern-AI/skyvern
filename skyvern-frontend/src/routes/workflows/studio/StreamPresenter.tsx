@@ -8,6 +8,9 @@ type StreamPresenterProps = {
   showControlButtons?: boolean;
   isRecording?: boolean;
   hideRecordingIndicator?: boolean;
+  // CDP only: turns the read-only URL bar into a navigation input while the user
+  // holds control. VNC needs nothing here — it streams the browser's own chrome.
+  enableUrlInput?: boolean;
   // Only the CDP transport carries the page URL; VNC is pixels-only and never
   // calls this.
   onUrlChange?: (url: string) => void;
@@ -24,6 +27,7 @@ export function StreamPresenter({
   showControlButtons = false,
   isRecording = false,
   hideRecordingIndicator = false,
+  enableUrlInput = false,
   onUrlChange,
   onActivity,
 }: StreamPresenterProps) {
@@ -42,6 +46,7 @@ export function StreamPresenter({
         browserSessionId={browserSessionId}
         interactive={interactive}
         showControlButtons={showControlButtons}
+        enableUrlInput={enableUrlInput}
         onUrlChange={onUrlChange}
         onActivity={onActivity}
         centered

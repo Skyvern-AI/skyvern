@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from fastmcp import Client
 from fastmcp.server.middleware import MiddlewareContext
 
 from skyvern import analytics
+from skyvern.cli.core.perception_telemetry import (
+    PerceptionSnapshotCategory,
+    track_perception_probe,
+    track_perception_snapshot,
+)
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.blocks import skyvern_block_schema
 from skyvern.cli.mcp_tools.telemetry import (
@@ -235,6 +241,231 @@ async def test_mcp_tool_call_exception_preserves_original_error_when_telemetry_f
         pytest.raises(ValueError, match="original tool error"),
     ):
         await MCPTelemetryMiddleware().on_call_tool(context, call_next)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_perception_snapshot_emits_once_and_restores_context() -> None:
+    events: list[tuple[str, dict]] = []
+    cancelled_context = MiddlewareContext(
+        message=SimpleNamespace(name="skyvern_observe"),
+        fastmcp_context=None,
+    )
+
+    async def cancelled_call(_context: MiddlewareContext[object]) -> object:
+        async with track_perception_snapshot("stale_ref_refresh"):
+            async with track_perception_probe(evaluate_page_scan=True):
+                raise asyncio.CancelledError
+
+    following_context = MiddlewareContext(message=SimpleNamespace(name="skyvern_click"), fastmcp_context=None)
+
+    async def following_call(_context: MiddlewareContext[object]) -> object:
+        return SimpleNamespace(is_error=False, data={"ok": True}, content=[])
+
+    def capture(event: str, *, data: dict, **_kwargs: object) -> None:
+        events.append((event, data))
+
+    clock = iter([0.0, 1.0, 3.0, 4.0, 5.0, 6.0])
+    with (
+        patch("skyvern.cli.mcp_tools.telemetry.time.perf_counter", side_effect=lambda: next(clock)),
+        patch.object(analytics, "capture", side_effect=capture),
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            await MCPTelemetryMiddleware().on_call_tool(cancelled_context, cancelled_call)
+        await MCPTelemetryMiddleware().on_call_tool(following_context, following_call)
+
+    assert len(events) == 2
+    cancelled_event_name, cancelled_payload = events[0]
+    assert cancelled_event_name == "mcp_tool_call"
+    assert cancelled_payload["ok"] is False
+    assert cancelled_payload["error_type"] == "CancelledError"
+    assert cancelled_payload["top_level_mcp_calls"] == 1
+    assert cancelled_payload["perception_snapshots"] == 1
+    assert cancelled_payload["model_visible_observe_results"] == 0
+    assert cancelled_payload["automatic_observe_snapshots"] == 0
+    assert cancelled_payload["stale_ref_refresh_snapshots"] == 1
+    assert (
+        cancelled_payload["model_visible_observe_results"]
+        + cancelled_payload["automatic_observe_snapshots"]
+        + cancelled_payload["stale_ref_refresh_snapshots"]
+        == cancelled_payload["perception_snapshots"]
+    )
+    assert cancelled_payload["failed_perception_probes"] == 1
+    assert cancelled_payload["evaluate_page_scans"] == 1
+    assert cancelled_payload["browser_perception_wall_ms"] == 2000
+    assert isinstance(cancelled_payload["browser_perception_wall_ms"], int)
+    assert "response_bytes" not in cancelled_payload
+
+    following_event_name, following_payload = events[1]
+    assert following_event_name == "mcp_tool_call"
+    assert following_payload["ok"] is True
+    assert following_payload["top_level_mcp_calls"] == 1
+    assert following_payload["perception_snapshots"] == 0
+    assert following_payload["failed_perception_probes"] == 0
+    assert following_payload["evaluate_page_scans"] == 0
+    assert following_payload["browser_perception_wall_ms"] == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_tool_call_propagates_when_telemetry_fails() -> None:
+    context = MiddlewareContext(message=SimpleNamespace(name="skyvern_observe"), fastmcp_context=None)
+    cancellation = asyncio.CancelledError()
+
+    async def call_next(_context: MiddlewareContext[object]) -> object:
+        async with track_perception_snapshot("automatic"):
+            raise cancellation
+
+    with (
+        patch.object(analytics, "capture", side_effect=RuntimeError("telemetry down")),
+        pytest.raises(asyncio.CancelledError) as exc_info,
+    ):
+        await MCPTelemetryMiddleware().on_call_tool(context, call_next)
+
+    assert exc_info.value is cancellation
+
+
+@pytest.mark.asyncio
+async def test_perception_counters_emit_on_exception() -> None:
+    events: list[dict] = []
+    context = MiddlewareContext(message=SimpleNamespace(name="skyvern_observe"), fastmcp_context=None)
+
+    async def call_next(_context: MiddlewareContext[object]) -> object:
+        async with track_perception_snapshot("model_visible"):
+            raise RuntimeError("observe failed")
+
+    with (
+        patch.object(analytics, "capture", side_effect=lambda _event, *, data, **_kwargs: events.append(data)),
+        pytest.raises(RuntimeError, match="observe failed"),
+    ):
+        await MCPTelemetryMiddleware().on_call_tool(context, call_next)
+
+    assert events[0]["ok"] is False
+    assert events[0]["perception_snapshots"] == 1
+    assert events[0]["model_visible_observe_results"] == 1
+    assert events[0]["automatic_observe_snapshots"] == 0
+    assert events[0]["stale_ref_refresh_snapshots"] == 0
+    assert events[0]["failed_perception_probes"] == 1
+    assert isinstance(events[0]["browser_perception_wall_ms"], int)
+
+
+@pytest.mark.asyncio
+async def test_swallowed_evaluate_scan_failure_is_accounted() -> None:
+    from skyvern.cli.core.browser_ops import _get_dom_observe_elements
+
+    events: list[dict] = []
+    context = MiddlewareContext(message=SimpleNamespace(name="skyvern_observe"), fastmcp_context=None)
+    page = SimpleNamespace(evaluate=AsyncMock(side_effect=RuntimeError("scan failed")))
+
+    async def call_next(_context: MiddlewareContext[object]) -> object:
+        assert await _get_dom_observe_elements(page) == []
+        return SimpleNamespace(is_error=False, data={"ok": True}, content=[])
+
+    with patch.object(analytics, "capture", side_effect=lambda _event, *, data, **_kwargs: events.append(data)):
+        await MCPTelemetryMiddleware().on_call_tool(context, call_next)
+
+    assert events[0]["perception_snapshots"] == 0
+    assert events[0]["evaluate_page_scans"] == 1
+    assert events[0]["failed_perception_probes"] == 1
+    assert isinstance(events[0]["browser_perception_wall_ms"], int)
+
+
+@pytest.mark.asyncio
+async def test_document_id_cdp_failures_and_fallback_are_accounted() -> None:
+    from skyvern.cli.core.browser_ops import get_observe_document_id
+
+    events: list[dict] = []
+    context = MiddlewareContext(message=SimpleNamespace(name="skyvern_observe"), fastmcp_context=None)
+    cached_cdp = SimpleNamespace(send=AsyncMock(side_effect=RuntimeError("stale CDP session")))
+    new_cdp_session = AsyncMock(side_effect=RuntimeError("CDP attach failed"))
+    raw_page = SimpleNamespace(
+        context=SimpleNamespace(new_cdp_session=new_cdp_session),
+        _skyvern_observe_cdp_session=cached_cdp,
+    )
+    page = SimpleNamespace(
+        page=raw_page,
+        _working_frame=None,
+        evaluate=AsyncMock(return_value="doc-1"),
+    )
+
+    async def call_next(_context: MiddlewareContext[object]) -> object:
+        assert await get_observe_document_id(page) == "page:doc-1"
+        return SimpleNamespace(is_error=False, data={"ok": True}, content=[])
+
+    clock = iter([0.0, 1.0, 2.0, 3.0, 5.0, 6.0, 9.0, 10.0])
+    with (
+        patch("skyvern.cli.mcp_tools.telemetry.time.perf_counter", side_effect=lambda: next(clock)),
+        patch.object(analytics, "capture", side_effect=lambda _event, *, data, **_kwargs: events.append(data)),
+    ):
+        await MCPTelemetryMiddleware().on_call_tool(context, call_next)
+
+    cached_cdp.send.assert_awaited_once_with("Page.getFrameTree")
+    new_cdp_session.assert_awaited_once_with(raw_page)
+    page.evaluate.assert_awaited_once()
+    assert events[0]["perception_snapshots"] == 0
+    assert events[0]["failed_perception_probes"] == 2
+    assert events[0]["evaluate_page_scans"] == 0
+    assert events[0]["browser_perception_wall_ms"] == 6000
+
+
+@pytest.mark.asyncio
+async def test_nested_evaluate_scan_does_not_double_count_snapshot_wall_time() -> None:
+    events: list[dict] = []
+    context = MiddlewareContext(message=SimpleNamespace(name="skyvern_observe"), fastmcp_context=None)
+
+    async def call_next(_context: MiddlewareContext[object]) -> object:
+        async with track_perception_snapshot("model_visible"):
+            async with track_perception_probe(evaluate_page_scan=True):
+                pass
+        return SimpleNamespace(is_error=False, data={"ok": True}, content=[])
+
+    clock = iter([0.0, 0.001, 0.008, 0.010])
+    with (
+        patch("skyvern.cli.mcp_tools.telemetry.time.perf_counter", side_effect=lambda: next(clock)),
+        patch.object(analytics, "capture", side_effect=lambda _event, *, data, **_kwargs: events.append(data)),
+    ):
+        await MCPTelemetryMiddleware().on_call_tool(context, call_next)
+
+    assert events[0]["perception_snapshots"] == 1
+    assert events[0]["evaluate_page_scans"] == 1
+    assert events[0]["browser_perception_wall_ms"] == 7
+
+
+@pytest.mark.asyncio
+async def test_perception_counters_are_isolated_across_concurrent_calls() -> None:
+    events: list[dict] = []
+    both_started = asyncio.Event()
+    started = 0
+
+    async def run(tool: str, category: PerceptionSnapshotCategory) -> None:
+        context = MiddlewareContext(message=SimpleNamespace(name=tool), fastmcp_context=None)
+
+        async def call_next(_context: MiddlewareContext[object]) -> object:
+            nonlocal started
+            started += 1
+            if started == 2:
+                both_started.set()
+            await both_started.wait()
+            async with track_perception_snapshot(category):
+                if category == "automatic":
+                    async with track_perception_probe(evaluate_page_scan=True):
+                        pass
+            return SimpleNamespace(is_error=False, data={"ok": True}, content=[])
+
+        await MCPTelemetryMiddleware().on_call_tool(context, call_next)
+
+    with patch.object(analytics, "capture", side_effect=lambda _event, *, data, **_kwargs: events.append(data)):
+        await asyncio.gather(run("explicit", "model_visible"), run("bundled", "automatic"))
+
+    by_tool = {event["tool"]: event for event in events}
+    assert by_tool["explicit"]["top_level_mcp_calls"] == 1
+    assert by_tool["explicit"]["perception_snapshots"] == 1
+    assert by_tool["explicit"]["model_visible_observe_results"] == 1
+    assert by_tool["explicit"]["automatic_observe_snapshots"] == 0
+    assert by_tool["explicit"]["evaluate_page_scans"] == 0
+    assert by_tool["bundled"]["top_level_mcp_calls"] == 1
+    assert by_tool["bundled"]["perception_snapshots"] == 1
+    assert by_tool["bundled"]["model_visible_observe_results"] == 0
+    assert by_tool["bundled"]["automatic_observe_snapshots"] == 1
+    assert by_tool["bundled"]["evaluate_page_scans"] == 1
 
 
 @pytest.mark.asyncio

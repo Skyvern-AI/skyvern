@@ -20,7 +20,6 @@ import {
   ChevronDownIcon,
   CheckIcon,
   ArrowUpIcon,
-  StopIcon,
 } from "@radix-ui/react-icons";
 import { createPortal } from "react-dom";
 import { stringify as convertToYAML } from "yaml";
@@ -74,6 +73,7 @@ import {
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
 import { shouldArmDraftingGapTimer } from "./copilotPhases";
 import { InstantAckPlaceholder, NarrativeView } from "./NarrativeView";
+import { CopilotWorkingStatus } from "./CopilotWorkingStatus";
 import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
 import { DiffCard, shouldShowDiffCard } from "./cards/DiffCard";
@@ -209,6 +209,9 @@ function defaultCodeBlockRequestOverride(
 // to a tone-adaptive monochrome silhouette so both read flat on the dark UI.
 const ASK_GLYPH = "\u275D\uFE0E";
 const BUILD_GLYPH = "\uD83D\uDC09";
+
+const STOP_ORBIT_GRADIENT =
+  "conic-gradient(from 0deg, rgba(120,170,255,.08) 0deg, rgba(120,170,255,.08) 120deg, rgba(150,195,255,.55) 250deg, #dbeaff 330deg, rgba(120,170,255,.08) 360deg)";
 
 function isPictographic(glyph: string): boolean {
   try {
@@ -2950,7 +2953,9 @@ export function WorkflowCopilotChat({
       ? null
       : queuedPromptWaitingStatus
     : isLoading
-      ? "Copilot is working. Your next send will wait for the next turn."
+      ? copilotUxV1Enabled && copilotV2Enabled
+        ? null
+        : "Copilot is working. Your next send will wait for the next turn."
       : isWaitingForLiveBrowser
         ? "Live browser is starting. Your next send will wait until it connects."
         : null;
@@ -2971,6 +2976,11 @@ export function WorkflowCopilotChat({
   const gateActionable =
     Boolean(proposedWorkflow) && !isLoading && !isLoadingHistory;
   const hasComposerText = inputValue.trim().length > 0;
+  // The cycling verb row plus the stop button's orbiting ring carry the
+  // working state, so the prose status line and the queued chip stand down.
+  const showWorkingRow = Boolean(
+    copilotUxV1Enabled && copilotV2Enabled && isLoading,
+  );
   // A live_browser-reason queued prompt parks with no active turn to stop, so
   // an empty composer's morph button would render as a guaranteed no-op "Send".
   // With text typed it does act — it rewrites the parked prompt.
@@ -2983,6 +2993,7 @@ export function WorkflowCopilotChat({
     queuedPrompt.reason === "live_browser" &&
     !messages.some((message) => message.id === queuedPrompt.id),
   );
+  const showsStopGlyph = isStopping || (isLoading && !hasComposerText);
   const morphButtonLabel = isStopping
     ? "Stopping…"
     : waitingOnQueueOnly
@@ -3214,6 +3225,7 @@ export function WorkflowCopilotChat({
                       turn={message.narrative}
                       onBlockSelect={onBlockSelect}
                       uxV1={copilotUxV1Enabled}
+                      workingRowActive={showWorkingRow}
                     />
                     {showReviewGate ? (
                       <ReviewGateCard
@@ -3539,6 +3551,7 @@ export function WorkflowCopilotChat({
                   turn={narrative}
                   onBlockSelect={onBlockSelect}
                   uxV1={copilotUxV1Enabled}
+                  workingRowActive={showWorkingRow}
                 />
                 {copilotUxV1Enabled &&
                 !isLoadingHistory &&
@@ -3651,7 +3664,14 @@ export function WorkflowCopilotChat({
             pending · Review
           </button>
         ) : null}
-        {copilotUxV1Enabled &&
+        {showWorkingRow ? (
+          <CopilotWorkingStatus
+            queued={Boolean(queuedPrompt)}
+            onDismissQueued={restoreQueuedPromptToComposer}
+          />
+        ) : null}
+        {!showWorkingRow &&
+        copilotUxV1Enabled &&
         copilotV2Enabled &&
         queuedPrompt &&
         (queuedPrompt.reason === "working" || queuedBubbleOrphaned) ? (
@@ -3670,7 +3690,7 @@ export function WorkflowCopilotChat({
             </button>
           </div>
         ) : null}
-        {inputStatusText ? (
+        {inputStatusText && !showWorkingRow ? (
           <div
             className="mb-2 text-xs text-muted-foreground"
             aria-live="polite"
@@ -3700,7 +3720,7 @@ export function WorkflowCopilotChat({
               queuedPrompt
                 ? "Type to replace the queued message…"
                 : isLoading
-                  ? "Type a message to send next…"
+                  ? "Type to queue a message…"
                   : isWaitingForLiveBrowser
                     ? "Type a prompt to send when ready..."
                     : copilotUxV1Enabled && copilotV2Enabled
@@ -3748,16 +3768,38 @@ export function WorkflowCopilotChat({
                   }
                   aria-label={morphButtonLabel}
                   className={cn(
-                    "flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
-                    isStopping || (isLoading && !hasComposerText)
-                      ? "bg-slate-elevation4 text-foreground hover:bg-slate-elevation3"
+                    "group/stop relative flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.92] disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
+                    showsStopGlyph
+                      ? "bg-slate-elevation3"
                       : "bg-cta text-cta-foreground hover:bg-cta-hover",
                   )}
                 >
-                  {isStopping ? (
-                    <ReloadIcon className="h-3.5 w-3.5 animate-spin" />
-                  ) : isLoading && !hasComposerText ? (
-                    <StopIcon className="h-3 w-3" />
+                  {showsStopGlyph ? (
+                    <>
+                      <span
+                        aria-hidden
+                        data-testid="copilot-stop-orbit"
+                        className={cn(
+                          "absolute -inset-[50%] animate-copilot-stop-orbit motion-reduce:hidden",
+                          isStopping && "paused",
+                        )}
+                        style={{
+                          background: STOP_ORBIT_GRADIENT,
+                          filter: "blur(1.5px)",
+                          willChange: "transform",
+                        }}
+                      />
+                      <span
+                        aria-hidden
+                        className="absolute inset-0 hidden bg-[rgba(150,195,255,0.55)] motion-reduce:block"
+                      />
+                      <span
+                        aria-hidden
+                        className="absolute inset-[2px] flex items-center justify-center rounded-md bg-slate-elevation3 transition-colors group-hover/stop:bg-slate-elevation5"
+                      >
+                        <span className="h-[11.5px] w-[11.5px] rounded-[2.3px] bg-foreground" />
+                      </span>
+                    </>
                   ) : (
                     <ArrowUpIcon className="h-4 w-4" />
                   )}

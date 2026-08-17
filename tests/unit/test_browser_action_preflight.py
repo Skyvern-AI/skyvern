@@ -1092,7 +1092,7 @@ class TestContentFreshnessIsNotClaimed:
             assert PolicyReason.UNVERIFIED_OBSERVATION in decision.reasons, action.action_type
 
     def test_only_the_recovery_set_survives_a_replaced_document(self, observing: SkyvernContext) -> None:
-        # ADR-0013 keeps read-only and recovery actions available so a run can stop safely, and a
+        # ADR-0011 keeps read-only and recovery actions available so a run can stop safely, and a
         # DOM swap does not make "wait" or "terminate" unsafe. This pins the exact surviving set so
         # nobody widens it by accident.
         page = FakePage()
@@ -1727,7 +1727,7 @@ class TestObserveModeIsNotBehavioural:
 
     def test_decisions_carry_no_page_content(self, observing: SkyvernContext) -> None:
         # AC8: non-sensitive. A full URL can carry customer data in its query string; the canonical
-        # origin is what ADR-0013's monitoring plan actually asks for.
+        # origin is what ADR-0011's monitoring plan actually asks for.
         page = FakePage(url="https://example.com/apply?ssn=123-45-6789&name=Someone")
         scrape(page, observing)
         action = action_models.ClickAction(element_id="1")
