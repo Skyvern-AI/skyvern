@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import floor
@@ -23,6 +24,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserType,
     is_final_status,
 )
+from skyvern.forge.sdk.streaming.registries import stream_tombstone_holds_session_lease
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_state import BrowserState
@@ -207,6 +209,9 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     def watch_session_pool(self) -> None:
         """No-op in OSS: browsers run in-process, no external pool to monitor."""
 
+    def get_browser_session_startup_timeout_seconds(self) -> float:
+        return settings.BROWSER_SESSION_STARTUP_TIMEOUT_SECONDS
+
     def can_probe_registered_browser_state(self) -> bool:
         return True
 
@@ -225,7 +230,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         runnable_type: str,
         runnable_id: str,
         organization_id: str,
-    ) -> str | None:
+    ) -> str:
         """
         Attempt to begin a session.
 
@@ -245,15 +250,17 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         if is_final_status(persistent_browser_session.status):
             raise BrowserSessionClosed(browser_session_id)
 
+        runnable_generation_id = uuid.uuid4().hex
         await self.occupy_browser_session(
             session_id=browser_session_id,
             runnable_type=runnable_type,
             runnable_id=runnable_id,
             organization_id=organization_id,
+            runnable_generation_id=runnable_generation_id,
         )
 
         LOG.info("Browser session begin", browser_session_id=browser_session_id)
-        return None
+        return runnable_generation_id
 
     async def get_browser_address(self, session_id: str, organization_id: str) -> str:
         address = await wait_on_persistent_browser_address(self.database, session_id, organization_id)
@@ -313,6 +320,16 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         browser_session = self._browser_sessions.get(session_id)
         return browser_session.browser_state if browser_session else None
 
+    def get_cached_browser_state_for_release(
+        self,
+        session_id: str,
+        *,
+        expected_runnable_id: str,
+        expected_runnable_generation_id: str,
+    ) -> BrowserState | None:
+        cached = self._browser_sessions.get(session_id)
+        return cached.browser_state if cached is not None else None
+
     async def get_observer_browser_state(
         self, session_id: str, organization_id: str | None = None
     ) -> BrowserState | None:
@@ -334,6 +351,8 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         session_id: str,
         organization_id: str | None = None,
         expected: BrowserState | None = None,
+        *,
+        detach_remote_driver: bool = False,
     ) -> None:
         cached = self._browser_sessions.get(session_id)
         if cached is None:
@@ -342,7 +361,10 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             return
         self._browser_sessions.pop(session_id, None)
         try:
-            await cached.browser_state.close()
+            if detach_remote_driver:
+                await cached.browser_state.detach_remote_driver()
+            else:
+                await cached.browser_state.close()
         except TargetClosedError:
             LOG.info(
                 "Browser context already closed during evict",
@@ -374,6 +396,8 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         browser_profile_id: str | None = None,
         generate_browser_profile: bool = False,
         inherit_profile_proxy: bool = False,
+        bound_workflow_permanent_id: str | None = None,
+        bound_key: str | None = None,
         wait_for_startup: bool = True,
         needs_live_view: bool = False,
     ) -> PersistentBrowserSession:
@@ -394,6 +418,8 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             browser_profile_id=browser_profile_id,
             generate_browser_profile=generate_browser_profile,
             inherit_profile_proxy=inherit_profile_proxy,
+            bound_workflow_permanent_id=bound_workflow_permanent_id,
+            bound_key=bound_key,
         )
 
         # Launch the browser immediately for standalone sessions so the
@@ -540,14 +566,53 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         *,
         expected_runnable_id: str | None = None,
         expected_runnable_generation_id: str | None = None,
+        allow_retirement_release: bool = False,
         expected_browser_state: BrowserState | None = None,
     ) -> bool:
         """Release a specific browser session."""
+        if allow_retirement_release:
+            released = await self.database.browser_sessions.release_persistent_browser_session(
+                session_id,
+                organization_id,
+                expected_runnable_id=expected_runnable_id,
+                expected_runnable_generation_id=expected_runnable_generation_id,
+                allow_retirement_release=True,
+            )
+        else:
+            released = await self.database.browser_sessions.release_persistent_browser_session(
+                session_id,
+                organization_id,
+                expected_runnable_id=expected_runnable_id,
+                expected_runnable_generation_id=expected_runnable_generation_id,
+            )
+        return released is not None
+
+    async def release_stale_browser_session(
+        self,
+        session_id: str,
+        organization_id: str,
+        *,
+        expected_runnable_id: str,
+        expected_runnable_generation_id: str,
+        expected_browser_state: BrowserState,
+        observed_last_activity_at: datetime,
+    ) -> bool:
+        """Release a terminal owner only while wrapper, generation, and activity identities match."""
+        cached = self._browser_sessions.get(session_id)
+        if (
+            cached is None
+            or cached.browser_state is not expected_browser_state
+            or expected_runnable_id in app.BROWSER_MANAGER.live_session_runnable_ids()
+            or stream_tombstone_holds_session_lease(expected_runnable_id, session_id)
+        ):
+            return False
         released = await self.database.browser_sessions.release_persistent_browser_session(
             session_id,
             organization_id,
             expected_runnable_id=expected_runnable_id,
             expected_runnable_generation_id=expected_runnable_generation_id,
+            observed_last_activity_at=observed_last_activity_at,
+            allow_retirement_release=True,
         )
         return released is not None
 

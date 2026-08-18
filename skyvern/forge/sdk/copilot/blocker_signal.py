@@ -11,7 +11,7 @@ from typing import Any, Literal, Protocol
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
-from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODES
 
 BlockerKind = Literal[
     "authority_denied",
@@ -177,6 +177,7 @@ class _BlockerSignalCtx(_TerminalEvidenceCtx, Protocol):
 class _ActiveRunEvidenceResetCtx(Protocol):
     last_run_blocks_workflow_run_id: str | None
     last_successful_run_blocks_workflow_run_id: str | None
+    last_run_blocks_browser_session_id: str | None
     recorded_persisted_block_run_workflow_run_id: str | None
     last_run_blocks_block_ids: list[str]
     last_run_blocks_block_labels: list[str]
@@ -215,6 +216,7 @@ def clear_active_run_evidence_on_workflow_edit(ctx: _ActiveRunEvidenceResetCtx) 
     """Detach the edited draft from prior-run pointers without erasing the run archive."""
     ctx.last_run_blocks_workflow_run_id = None
     ctx.last_successful_run_blocks_workflow_run_id = None
+    ctx.last_run_blocks_browser_session_id = None
     ctx.recorded_persisted_block_run_workflow_run_id = None
     ctx.last_run_blocks_block_ids = []
     ctx.last_run_blocks_block_labels = []
@@ -241,7 +243,7 @@ SCHEMA_INCOMPATIBILITY_REASON_CODE = "schema_incompatibility"
 # halt kind over a later non-terminal trip (e.g. the code-authoring churn backstop).
 GENUINELY_TERMINAL_BLOCKER_REASON_CODES: frozenset[str] = frozenset(
     {
-        TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+        *TERMINAL_CHALLENGE_BLOCKER_REASON_CODES,
         "tool_error_run_output_terminal_blocker",
     }
 )

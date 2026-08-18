@@ -1,5 +1,6 @@
 import base64
 import hashlib
+from collections.abc import Iterable
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -30,21 +31,24 @@ class AES(BaseEncryptor):
         secret_key: str,
         salt: str | None = None,
         iv: str | None = None,
-        fallback_decrypt_keys: list[tuple[str, str]] | None = None,
+        fallback_decrypt_keys: Iterable[tuple[str | None, str | None]] | None = None,
     ) -> None:
         self.secret_key = hashlib.md5(secret_key.encode("utf-8"), usedforsecurity=False).digest()
-        self.salt = hashlib.md5(salt.encode("utf-8"), usedforsecurity=False).digest() if salt else default_salt
-        self.iv = hashlib.md5(iv.encode("utf-8")).digest() if iv else default_iv
-        self._fallback_decrypt_params: list[tuple[bytes, bytes]] = [
-            (
-                hashlib.md5(fb_salt.encode("utf-8"), usedforsecurity=False).digest(),
-                hashlib.md5(fb_iv.encode("utf-8")).digest(),
-            )
-            for fb_salt, fb_iv in (fallback_decrypt_keys or [])
+        self.salt, self.iv = self._encryption_params(salt, iv)
+        self._fallback_decrypt_params = [
+            self._encryption_params(fallback_salt, fallback_iv)
+            for fallback_salt, fallback_iv in (fallback_decrypt_keys or [])
         ]
 
     def method(self) -> EncryptMethod:
         return EncryptMethod.AES
+
+    @staticmethod
+    def _encryption_params(salt: str | None, iv: str | None) -> tuple[bytes, bytes]:
+        return (
+            hashlib.md5(salt.encode("utf-8"), usedforsecurity=False).digest() if salt else default_salt,
+            hashlib.md5(iv.encode("utf-8")).digest() if iv else default_iv,
+        )
 
     def _derive_key(self, salt: bytes | None = None) -> bytes:
         kdf = PBKDF2HMAC(

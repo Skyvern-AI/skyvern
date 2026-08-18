@@ -328,8 +328,6 @@ def _repair_context_root_cause_identity(
         payload["runtime_failure_class"] = runtime_failure_class
         payload["failed_block_status"] = _safe_text(repair_context.failed_block_status, 80)
         payload["current_origin"] = _safe_text(repair_context.current_origin, 120)
-        payload["current_url_present"] = repair_context.current_url_present
-        payload["current_title_present"] = repair_context.current_title_present
         payload["page_evidence_source"] = _safe_text(repair_context.page_evidence_source, 80)
         payload["observed_after_workflow_run"] = repair_context.observed_after_workflow_run
         payload["page_form_summaries"] = _safe_identity_list(repair_context.page_form_summaries)

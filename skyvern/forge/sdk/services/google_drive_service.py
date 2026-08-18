@@ -200,10 +200,11 @@ def _raise_for_error(response: httpx.Response) -> None:
     raise GoogleDriveAPIError(status=status, code=code, message=message)
 
 
-def extract_folder_id(value: str) -> str:
-    candidate = value.strip()
+def extract_folder_id(value: str | None) -> str | None:
+    """Normalize a user-entered folder ID or Drive folder URL. ``None`` means the account's My Drive root."""
+    candidate = (value or "").strip()
     if not candidate:
-        raise ValueError("Google Drive folder ID is required")
+        return None
 
     parsed = urlparse(candidate)
     if parsed.scheme and parsed.netloc:
@@ -256,21 +257,30 @@ def _multipart_body(
     )
 
 
+def _upload_metadata(*, file_name: str, folder_id: str | None) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"name": file_name}
+    # Drive puts the file in the account's My Drive root when ``parents`` is omitted.
+    if folder_id:
+        metadata["parents"] = [folder_id]
+    return metadata
+
+
 def build_multipart_upload_request(
     *,
     access_token: str,
     file_path: str,
-    folder_id: str,
+    folder_id: str | None,
 ) -> GoogleDriveMultipartUploadRequest:
     """Build a bounded Google Drive multipart upload request body.
 
-    ``folder_id`` is expected to be a normalized folder ID. Call
-    ``extract_folder_id`` on user-entered values before invoking this helper.
+    ``folder_id`` is expected to be a normalized folder ID, or ``None`` to upload
+    to the My Drive root. Call ``extract_folder_id`` on user-entered values
+    before invoking this helper.
     """
     _assert_multipart_upload_size(file_path)
     file_name = Path(file_path).name
     content_type = guess_type(file_path)[0] or "application/octet-stream"
-    metadata = {"name": file_name, "parents": [folder_id]}
+    metadata = _upload_metadata(file_name=file_name, folder_id=folder_id)
     boundary = f"skyvern-{uuid.uuid4().hex}"
     content = _multipart_body(
         metadata=metadata,
@@ -299,12 +309,12 @@ def build_resumable_initiate_request(
     *,
     access_token: str,
     file_path: str,
-    folder_id: str,
+    folder_id: str | None,
 ) -> GoogleDriveResumableInitiateRequest:
     path = Path(file_path)
     file_size = path.stat().st_size
     content_type = guess_type(file_path)[0] or "application/octet-stream"
-    metadata = {"name": path.name, "parents": [folder_id]}
+    metadata = _upload_metadata(file_name=path.name, folder_id=folder_id)
     query = urlencode({"uploadType": "resumable", "fields": "id,name,webViewLink", "supportsAllDrives": "true"})
     return GoogleDriveResumableInitiateRequest(
         target_url=f"{DRIVE_UPLOAD_API_BASE}/files?{query}",
@@ -526,7 +536,7 @@ async def _upload_file_resumable(
     *,
     access_token: str,
     file_path: str,
-    folder_id: str,
+    folder_id: str | None,
 ) -> UploadedDriveFile:
     initiate_request = build_resumable_initiate_request(
         access_token=access_token,
@@ -789,7 +799,7 @@ async def upload_file(
     *,
     access_token: str,
     file_path: str,
-    folder_id: str,
+    folder_id: str | None,
 ) -> UploadedDriveFile:
     if should_use_resumable_upload(file_path):
         return await _upload_file_resumable(

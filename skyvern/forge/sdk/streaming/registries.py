@@ -247,6 +247,18 @@ def stream_ref_active(workflow_run_id: str) -> bool:
     return _stream_refcounts.get(workflow_run_id, 0) > 0
 
 
+def stream_tombstone_holds_session_lease(workflow_run_id: str, browser_session_id: str) -> bool:
+    """Whether workflow cleanup still owns its persistent-session lease.
+
+    The closing tombstone is installed before terminal status publication and before cleanup can
+    populate deferred-close parameters. Therefore its presence alone holds the run's lease until
+    ``complete_stream_teardown`` removes it. ``browser_session_id`` remains in the public contract
+    because trusted release supplies both owner identities.
+    """
+    _ = browser_session_id
+    return workflow_run_id in _closing_streams
+
+
 def set_deferred_close_params(
     workflow_run_id: str,
     close_browser_on_completion: bool,

@@ -544,6 +544,9 @@ async def rebind_download_dir(browser: Browser | None, run_id: str | None, *, pa
                 "downloadPath": download_dir,
             },
         )
+        # Deliberately never detached: Chromium scopes setDownloadBehavior to the session that set
+        # it and reverts the binding when that session detaches, so this session must outlive the
+        # run's downloads. The interceptor's monitor_owns_binding is the same invariant.
         setdownloadbehavior_applied = True
     except Exception:
         # Fail open: a rebind/setDownloadBehavior failure must never break a browser launch or run.

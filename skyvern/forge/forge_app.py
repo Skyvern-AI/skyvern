@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable, Protocol
 
 import structlog
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock
@@ -31,8 +31,7 @@ from skyvern.forge.sdk.cache.base import BaseCache
 from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.core.rate_limiter import NoopRateLimiter, RateLimiter
 from skyvern.forge.sdk.db.agent_db import AgentDB
-from skyvern.forge.sdk.encrypt import encryptor
-from skyvern.forge.sdk.encrypt.aes import AES
+from skyvern.forge.sdk.encrypt.bootstrap import register_aes_encryptor
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.schemas.organizations import AzureClientSecretCredential, Organization
@@ -53,6 +52,14 @@ from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.scraper.scraper import ScrapeExcludeFunc
 
 LOG = structlog.get_logger()
+
+
+class AuthenticationFunction(Protocol):
+    def __call__(
+        self,
+        token: str,
+        attribution_header: str | None = None,
+    ) -> Awaitable[Organization]: ...
 
 
 class ForgeApp:
@@ -105,7 +112,7 @@ class ForgeApp:
     CUSTOM_CREDENTIAL_VAULT_SERVICE: CustomCredentialVaultService | None
     CREDENTIAL_VAULT_SERVICES: dict[str, CredentialVaultService | None]
     scrape_exclude: ScrapeExcludeFunc | None
-    authentication_function: Callable[[str], Awaitable[Organization]] | None
+    authentication_function: AuthenticationFunction | None
     authenticate_user_function: Callable[[str], Awaitable[str | None]] | None
     setup_api_app: Callable[[FastAPI], None] | None
     api_app_startup_event: Callable[[FastAPI], Awaitable[None]] | None
@@ -138,28 +145,10 @@ def create_forge_app() -> ForgeApp:
     app.CACHE = CacheFactory.get_cache()
 
     if settings.ENABLE_ENCRYPTION:
-        # Fail closed: a deployment that opts into encryption with the placeholder
-        # key would "encrypt" secrets with a public default — strictly worse than
-        # ENABLE_ENCRYPTION=false because operators would believe the data was
-        # protected. Salt/IV defaulting to None falls back to the deterministic
-        # ``default_salt`` / ``default_iv`` in ``aes.py`` — also a public default,
-        # so refuse the same way.
-        if not settings.ENCRYPTOR_AES_SECRET_KEY or settings.ENCRYPTOR_AES_SECRET_KEY == "fillmein":
-            raise RuntimeError(
-                "ENABLE_ENCRYPTION=true requires ENCRYPTOR_AES_SECRET_KEY to be set to a real "
-                "secret; empty values and the default placeholder 'fillmein' both fail closed."
-            )
-        if not settings.ENCRYPTOR_AES_SALT or not settings.ENCRYPTOR_AES_IV:
-            raise RuntimeError(
-                "ENABLE_ENCRYPTION=true requires both ENCRYPTOR_AES_SALT and ENCRYPTOR_AES_IV to "
-                "be configured; unset values fall back to public defaults."
-            )
-        encryptor.add_encrypt_method(
-            AES(
-                secret_key=settings.ENCRYPTOR_AES_SECRET_KEY,
-                salt=settings.ENCRYPTOR_AES_SALT,
-                iv=settings.ENCRYPTOR_AES_IV,
-            )
+        register_aes_encryptor(
+            secret_key=settings.ENCRYPTOR_AES_SECRET_KEY,
+            salt=settings.ENCRYPTOR_AES_SALT,
+            iv=settings.ENCRYPTOR_AES_IV,
         )
 
     app.ARTIFACT_MANAGER = ArtifactManager()

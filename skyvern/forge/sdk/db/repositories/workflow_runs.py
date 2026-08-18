@@ -66,7 +66,9 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunOutputParameter,
     WorkflowRunParameter,
     WorkflowRunStatus,
+    resolve_reuse_browser_session,
 )
+from skyvern.forge.sdk.workflow.sequential_key import is_reuse_admission_off
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, ProxyLocationInput, RunType
 
 LOG = structlog.get_logger()
@@ -207,6 +209,8 @@ class WorkflowRunsRepository(BaseRepository):
         organization_id: str,
         browser_session_id: str | None = None,
         browser_profile_id: str | None = None,
+        reuse_browser_session: bool | None = None,
+        reuse_bound_key: str | None = None,
         proxy_location: ProxyLocationInput = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
@@ -243,6 +247,8 @@ class WorkflowRunsRepository(BaseRepository):
                 browser_session_id=browser_session_id,
                 browser_profile_id=browser_profile_id,
                 start_fresh_browser=start_fresh_browser,
+                reuse_browser_session=reuse_browser_session,
+                reuse_bound_key=reuse_bound_key,
                 proxy_location=serialize_proxy_location(proxy_location),
                 status="created",
                 webhook_callback_url=webhook_callback_url,
@@ -302,6 +308,7 @@ class WorkflowRunsRepository(BaseRepository):
         ai_fallback: bool | None = None,
         depends_on_workflow_run_id: str | None = None,
         browser_session_id: str | None = None,
+        reuse_browser_session: bool | None = None,
         browser_runtime: str | None = None,
         waiting_for_verification_code: bool | None = None,
         verification_code_identifier: str | None = None,
@@ -329,15 +336,33 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.status = status
                 if status and status == WorkflowRunStatus.queued and workflow_run.queued_at is None:
                     credential_id = sequential_credential_id or workflow_run.sequential_credential_id
+                    active_reuse_bound_key = (
+                        workflow_run.reuse_bound_key
+                        if not is_reuse_admission_off(workflow_run.reuse_bound_key)
+                        else None
+                    )
                     serialized_publication = bool(
                         credential_id
                         or (workflow_run.browser_session_id and not workflow_run.debug_session_id)
                         or workflow_run.browser_address
                         or workflow_run.sequential_key
+                        or active_reuse_bound_key
                     )
                     if not serialized_publication and workflow_run.workflow_id:
                         workflow = await session.get(WorkflowModel, workflow_run.workflow_id)
-                        serialized_publication = bool(workflow and workflow.run_sequentially)
+                        serialized_publication = bool(
+                            workflow
+                            and (
+                                workflow.run_sequentially
+                                or (
+                                    not workflow_run.start_fresh_browser
+                                    and resolve_reuse_browser_session(
+                                        run_override=workflow_run.reuse_browser_session,
+                                        workflow_default=workflow.reuse_browser_session,
+                                    )
+                                )
+                            )
+                        )
                     if serialized_publication:
                         # The caller holds every composed publication-lane lock until this transaction
                         # commits. Advance beyond every active serialized ticket in the organization,
@@ -404,6 +429,8 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.depends_on_workflow_run_id = depends_on_workflow_run_id
                 if browser_session_id:
                     workflow_run.browser_session_id = browser_session_id
+                if reuse_browser_session is not None:
+                    workflow_run.reuse_browser_session = reuse_browser_session
                 if browser_runtime is not None:
                     workflow_run.browser_runtime = browser_runtime
                 if browser_address:
@@ -448,6 +475,47 @@ class WorkflowRunsRepository(BaseRepository):
                 return convert_to_workflow_run(workflow_run)
             else:
                 raise WorkflowRunNotFound(workflow_run_id)
+
+    @db_operation("compare_and_set_reuse_admission")
+    async def compare_and_set_reuse_admission(
+        self,
+        *,
+        workflow_run_id: str,
+        effective_reuse: bool,
+        reuse_bound_key: str,
+    ) -> WorkflowRun:
+        """Persist one immutable reuse-admission tuple, or adopt the tuple that won the race."""
+        async with self.Session() as session:
+            statement = (
+                update(WorkflowRunModel)
+                .where(
+                    WorkflowRunModel.workflow_run_id == workflow_run_id,
+                    or_(
+                        WorkflowRunModel.reuse_bound_key.is_(None),
+                        and_(
+                            WorkflowRunModel.reuse_bound_key == reuse_bound_key,
+                            WorkflowRunModel.reuse_browser_session == effective_reuse,
+                        ),
+                    ),
+                )
+                .values(
+                    reuse_browser_session=effective_reuse,
+                    reuse_bound_key=reuse_bound_key,
+                )
+                .returning(WorkflowRunModel)
+            )
+            workflow_run = (await session.scalars(statement)).first()
+            if workflow_run is not None:
+                converted = convert_to_workflow_run(workflow_run)
+                await session.commit()
+                return converted
+
+            stored = (
+                await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
+            ).first()
+            if stored is None:
+                raise WorkflowRunNotFound(workflow_run_id)
+            return convert_to_workflow_run(stored)
 
     @db_operation("increment_workflow_run_credits")
     async def increment_workflow_run_credits(
@@ -976,6 +1044,13 @@ class WorkflowRunsRepository(BaseRepository):
                         WorkflowRunModel.sequential_key == run.sequential_key,
                     )
                 )
+            if not is_reuse_admission_off(run.reuse_bound_key) and run.reuse_bound_key is not None:
+                lane_filters.append(
+                    and_(
+                        WorkflowRunModel.workflow_permanent_id == run.workflow_permanent_id,
+                        WorkflowRunModel.reuse_bound_key == run.reuse_bound_key,
+                    )
+                )
             if run.workflow_id:
                 run_workflow = await session.get(WorkflowModel, run.workflow_id)
                 if run_workflow and run_workflow.run_sequentially:
@@ -1208,14 +1283,20 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_permanent_id=run.workflow_permanent_id,
                     sequential_key=run.sequential_key,
                 )
-                # self_forced runs already saw every keyed occupant (including plain session rows), so
-                # they keep the single unfiltered lane; a non-forced run splits into the two admission
-                # candidates so a credential-composed predecessor is seen while plain session rows stay
-                # excluded — index-eligible either way.
+                # A non-forced run splits the existing lane into index-eligible candidates.
                 lane_queries = [keyed] if self_forced else list(_noncredential_lane_variants(keyed))
+            elif run.reuse_bound_key is not None:
+                lane_queries = []
             else:
                 whole = query.filter_by(workflow_permanent_id=run.workflow_permanent_id)
                 lane_queries = [whole] if self_forced else list(_noncredential_lane_variants(whole))
+            if not is_reuse_admission_off(run.reuse_bound_key) and run.reuse_bound_key is not None:
+                lane_queries.append(
+                    query.filter_by(
+                        workflow_permanent_id=run.workflow_permanent_id,
+                        reuse_bound_key=run.reuse_bound_key,
+                    )
+                )
 
             # Sequential runs are stamped queued_at before Temporal submission; the fallback
             # only guards hand-created rows (e.g. tests) from comparing against None.

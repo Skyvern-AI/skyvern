@@ -61,6 +61,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
+from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
 from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -195,22 +196,28 @@ def _screen_unavailable(
 
 
 async def _saved_credential_ids(citations: list[str], organization_id: str) -> set[str]:
-    candidate_ids = [citation for citation in citations if citation.startswith("cred_")]
-    if not candidate_ids:
-        return set()
-    credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-        candidate_ids,
-        organization_id=organization_id,
-    )
-    return {credential.credential_id for credential in credentials}
+    credential_ids = [citation for citation in citations if citation.startswith("cred_")]
+    connection_ids = {citation for citation in citations if citation.startswith("goac_")}
+    verified_ids: set[str] = set()
+    if credential_ids:
+        credentials = await app.DATABASE.credentials.get_credentials_by_ids(
+            credential_ids,
+            organization_id=organization_id,
+        )
+        verified_ids.update(credential.credential_id for credential in credentials)
+    if connection_ids:
+        connections = await google_oauth_service.get_visible_credentials_for_org(organization_id)
+        verified_ids.update(connection.id for connection in connections if connection.id in connection_ids)
+    return verified_ids
 
 
 async def _exonerate_saved_credential_citations(citations: list[str], organization_id: str) -> list[str]:
-    """Drop citations that are verified IDs of credentials this org already saved.
+    """Drop citations that are verified non-secret IDs visible to this org.
 
     Credential names are user-controlled and can equal real secret material, so equality with a
-    saved name cannot make a cited span safe. Generated credential IDs are non-secret identifiers;
-    the database lookup verifies that a cited ID belongs to this organization before exonerating it.
+    saved name cannot make a cited span safe. Generated credential and Google connection IDs are
+    non-secret identifiers; the database lookup verifies that a cited ID belongs to this organization
+    before exonerating it.
     """
     try:
         credential_ids = await _saved_credential_ids(citations, organization_id)
@@ -840,6 +847,9 @@ class RequestPolicy:
     # Read from the saved workflow row, never from the submitted YAML. The submission is the live
     # canvas, which carries a copilot proposal the user has not accepted, so it cannot grant a run.
     persisted_workflow_credential_ids: list[str] = field(default_factory=list)
+    # Active Google OAuth connections admitted only for workflow execution. These never enter
+    # resolved_credentials, which remains the password-fill authority plane from ADR 0002.
+    run_approved_google_connection_ids: list[str] = field(default_factory=list)
     # Sorted at the trace/JSON boundary; YAML traversal uses sets.
     existing_workflow_credential_origins: dict[str, list[str]] = field(default_factory=dict)
     classifier_status: str = "not_run"
@@ -868,6 +878,7 @@ class RequestPolicy:
             "allow_missing_credentials_in_draft": self.allow_missing_credentials_in_draft,
             "credential_draft_deferred_explicitly": self.credential_draft_deferred_explicitly,
             "resolved_credential_count": len(self.resolved_credentials),
+            "run_approved_google_connection_count": len(self.run_approved_google_connection_ids),
             "has_completion_contract": bool(self.completion_contract),
             "completion_criteria_count": len(self.graded_completion_criteria()),
             "completion_criteria_implicit_count": sum(
@@ -4392,6 +4403,7 @@ async def _build_request_policy_bootstrap(
     organization_id: str,
     prior_user_messages: Sequence[WorkflowCopilotChatHistoryMessage] = (),
     persisted_workflow_yaml: str | None = None,
+    selected_connected_account_id: str | None = None,
     _preclassified_policy: RequestPolicy | None = None,
 ) -> RequestPolicy:
     """Build the deterministic request safety record without model-backed policy inference."""
@@ -4412,6 +4424,23 @@ async def _build_request_policy_bootstrap(
     policy.existing_workflow_credential_origins = {
         credential_id: sorted(origins) for credential_id, origins in workflow_credential_origins(workflow_yaml).items()
     }
+    google_connection_candidates = {
+        credential_id for credential_id in policy.persisted_workflow_credential_ids if credential_id.startswith("goac_")
+    }
+    if selected_connected_account_id is not None:
+        google_connection_candidates.add(selected_connected_account_id)
+    if google_connection_candidates:
+        try:
+            active_connections = await google_oauth_service.get_credentials_for_org(organization_id)
+        except Exception:
+            LOG.warning(
+                "request-policy Google connection authority lookup failed",
+                organization_id=organization_id,
+                exc_info=True,
+            )
+        else:
+            active_ids = {connection.id for connection in active_connections}
+            policy.run_approved_google_connection_ids = sorted(google_connection_candidates & active_ids)
     _ground_user_provided_sites(policy, user_message, prior_user_messages or chat_history)
     try:
         await _seed_prior_approved_credentials(
@@ -4485,6 +4514,7 @@ async def build_request_policy_trust_floor(
     config: CopilotConfig | None = None,
     prior_user_messages: Sequence[WorkflowCopilotChatHistoryMessage] = (),
     persisted_workflow_yaml: str | None = None,
+    selected_connected_account_id: str | None = None,
 ) -> RequestPolicy:
     del config
     safety = await _screen_raw_secret_safety(user_message, handler, organization_id=organization_id)
@@ -4523,6 +4553,7 @@ async def build_request_policy_trust_floor(
         organization_id=organization_id,
         prior_user_messages=prior_user_messages,
         persisted_workflow_yaml=persisted_workflow_yaml,
+        selected_connected_account_id=selected_connected_account_id,
         _preclassified_policy=policy,
     )
     LOG.info(

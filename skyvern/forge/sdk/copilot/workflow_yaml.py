@@ -624,6 +624,7 @@ async def _process_workflow_yaml(
         totp_verification_url=workflow_yaml_request.totp_verification_url,
         totp_identifier=workflow_yaml_request.totp_identifier,
         persist_browser_session=workflow_yaml_request.persist_browser_session or False,
+        reuse_browser_session=workflow_yaml_request.reuse_browser_session,
         mask_secrets=mask_secrets,
         pin_saved_session_ip=pin_saved_session_ip,
         browser_profile_id=workflow_yaml_request.browser_profile_id,

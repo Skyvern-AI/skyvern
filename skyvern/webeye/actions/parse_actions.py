@@ -25,6 +25,7 @@ from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.trace import traced
 from skyvern.services.otp_service import (
+    describe_webhook_contract_failure,
     has_credential_totp_candidate,
     poll_otp_value,
     resolve_otp_value,
@@ -1017,8 +1018,8 @@ async def generate_cua_fallback_actions(
                     intention=reasoning,
                     is_magic_link=True,
                 )
-            except NoTOTPVerificationCodeFound:
-                reasoning_suffix = "No magic link found"
+            except NoTOTPVerificationCodeFound as e:
+                reasoning_suffix = f"No magic link found.{describe_webhook_contract_failure(e.webhook_diagnostics)}"
                 reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
                 action = TerminateAction(
                     reasoning=reasoning,
@@ -1057,9 +1058,9 @@ async def generate_cua_fallback_actions(
     elif skyvern_action_type == "get_verification_code":
         try:
             otp_value = await resolve_otp_value(task, expected_otp_type=OTPType.TOTP)
-        except NoTOTPVerificationCodeFound:
+        except NoTOTPVerificationCodeFound as e:
             otp_value = None
-            reasoning_suffix = "No verification code found"
+            reasoning_suffix = f"No verification code found.{describe_webhook_contract_failure(e.webhook_diagnostics)}"
             reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
         except FailedToGetTOTPVerificationCode as e:
             otp_value = None

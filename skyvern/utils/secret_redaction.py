@@ -106,16 +106,25 @@ def expand_secret_encodings(value: str) -> set[str]:
 
 
 @functools.lru_cache(maxsize=64)
-def _compiled_secret_pattern(variants: frozenset[str]) -> re.Pattern[str]:
+def _compiled_secret_pattern(variants: frozenset[str], boundary_all_lengths: bool = False) -> re.Pattern[str]:
     sorted_variants = sorted(variants, key=len, reverse=True)
     pattern_parts = [
-        re.escape(variant) if len(variant) >= 8 else rf"(?<![A-Za-z0-9]){re.escape(variant)}(?![A-Za-z0-9])"
+        rf"(?<![A-Za-z0-9]){re.escape(variant)}(?![A-Za-z0-9])"
+        if boundary_all_lengths or len(variant) < 8
+        else re.escape(variant)
         for variant in sorted_variants
     ]
     return re.compile("|".join(pattern_parts))
 
 
-def redact_secrets_from_text(text: str, secret_values: Collection[str]) -> str:
+def redact_secrets_from_text(text: str, secret_values: Collection[str], *, boundary_all_lengths: bool = False) -> str:
+    """Replace every registered secret variant found in ``text`` with a placeholder.
+
+    By default, secrets of 8+ characters match as a plain substring (matches inside a longer
+    alphanumeric run too), which suits free-form prose logs. ``boundary_all_lengths=True`` anchors
+    every secret length to token boundaries instead, for structured data where a short secret can
+    legitimately be a substring of an unrelated longer value (e.g. "Sunshine1" inside "MySunshine1Co").
+    """
     if not text or not secret_values:
         return text
 
@@ -124,7 +133,7 @@ def redact_secrets_from_text(text: str, secret_values: Collection[str]) -> str:
     }
     if not variants:
         return text
-    pattern = _compiled_secret_pattern(frozenset(variants))
+    pattern = _compiled_secret_pattern(frozenset(variants), boundary_all_lengths)
     segments = re.split(f"({_PLACEHOLDER_TOKEN_RE.pattern})", text)
     for index, segment in enumerate(segments):
         if _PLACEHOLDER_TOKEN_RE.fullmatch(segment):

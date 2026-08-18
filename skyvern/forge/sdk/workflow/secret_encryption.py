@@ -1,5 +1,6 @@
 import base64
 import os
+import re
 from typing import Any
 
 from cryptography.hazmat.primitives import hashes
@@ -18,6 +19,7 @@ SENSITIVE_DESTINATION_FIELDS: frozenset[str] = frozenset(
         "sftp_private_key_passphrase",
     }
 )
+SENSITIVE_SEND_EMAIL_FIELDS: frozenset[str] = frozenset({"custom_smtp_password"})
 ENCRYPTED_SECRET_PREFIX = "skyvern_enc:"
 _METHOD = "aesgcm-v1"
 _SENTINEL_PREFIX = f"{ENCRYPTED_SECRET_PREFIX}{_METHOD}:"
@@ -28,6 +30,22 @@ def is_encrypted_secret(value: str | None) -> bool:
     # Match the whole encrypted-secret namespace, not just the current method, so no sentinel
     # (including an older method) is ever re-encrypted; decrypt still accepts only the current method.
     return isinstance(value, str) and value.startswith(ENCRYPTED_SECRET_PREFIX)
+
+
+# Only a bare parameter reference may skip encryption. Arbitrary Jinja expressions
+# (e.g. "{{ 7*7 }}") are treated as literals: encrypted at rest and never rendered,
+# because rendering would corrupt a password that merely looks like a template.
+_FULL_TEMPLATE_REFERENCE_RE = re.compile(r"\s*\{\{\s*[A-Za-z_][A-Za-z0-9_]*\s*\}\}\s*")
+
+
+def is_full_template_reference(value: str | None) -> bool:
+    """True when the whole value is a single parameter reference (e.g. "{{ my_secret_param }}").
+
+    Used for secret fields where only a real parameter reference may skip encryption:
+    a literal password that merely CONTAINS Jinja-looking characters must still be
+    encrypted, and must never be rendered as a template.
+    """
+    return isinstance(value, str) and bool(_FULL_TEMPLATE_REFERENCE_RE.fullmatch(value))
 
 
 def encryption_available() -> bool:
@@ -59,8 +77,14 @@ async def encrypt_secret_field_value(
     *,
     organization_id: str | None,
     field_name: str,
+    full_template_reference_only: bool = False,
 ) -> str | None:
-    if not value or _has_jinja_syntax(value) or is_encrypted_secret(value) or not encryption_available():
+    if not value or is_encrypted_secret(value) or not encryption_available():
+        return value
+    template_skips_encryption = (
+        is_full_template_reference(value) if full_template_reference_only else _has_jinja_syntax(value)
+    )
+    if template_skips_encryption:
         return value
     nonce = os.urandom(_NONCE_LEN)
     ciphertext = AESGCM(_derive_key()).encrypt(nonce, value.encode(), _binding_aad(organization_id, field_name))
@@ -86,21 +110,31 @@ async def encrypt_workflow_definition_secrets(definition: Any, organization_id: 
     if not encryption_available():
         return
 
+    async def encrypt_block_fields(
+        block: Any, field_names: frozenset[str], *, full_template_reference_only: bool = False
+    ) -> None:
+        for field_name in field_names:
+            value = getattr(block, field_name, None)
+            setattr(
+                block,
+                field_name,
+                await encrypt_secret_field_value(
+                    value,
+                    organization_id=organization_id,
+                    field_name=field_name,
+                    full_template_reference_only=full_template_reference_only,
+                ),
+            )
+
     async def encrypt_blocks(blocks: list[Any]) -> None:
         for block in blocks:
             block_type = getattr(block, "block_type", None)
             if block_type in (BlockType.FILE_UPLOAD, BlockType.FILE_DOWNLOAD):
-                for field_name in SENSITIVE_DESTINATION_FIELDS:
-                    value = getattr(block, field_name, None)
-                    setattr(
-                        block,
-                        field_name,
-                        await encrypt_secret_field_value(
-                            value,
-                            organization_id=organization_id,
-                            field_name=field_name,
-                        ),
-                    )
+                await encrypt_block_fields(block, SENSITIVE_DESTINATION_FIELDS)
+            elif block_type == BlockType.SEND_EMAIL:
+                # A literal password that merely contains Jinja-looking characters must still
+                # be encrypted; only a full "{{ param }}" reference stays a template.
+                await encrypt_block_fields(block, SENSITIVE_SEND_EMAIL_FIELDS, full_template_reference_only=True)
             elif block_type in (BlockType.FOR_LOOP, BlockType.WHILE_LOOP):
                 await encrypt_blocks(getattr(block, "loop_blocks", []))
 

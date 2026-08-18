@@ -16,7 +16,7 @@ from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.base_repository import BaseRepository
-from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.exceptions import DuplicateCopilotTurnError, NotFoundError
 from skyvern.forge.sdk.db.models import (
     ActionModel,
     AISuggestionModel,
@@ -80,6 +80,30 @@ from skyvern.webeye.actions.actions import Action
 LOG = structlog.get_logger()
 
 PENDING_TURN_RETENTION = timedelta(days=30)
+
+
+def _pending_turn_id_for_idempotency_digest(
+    pending_turns: Mapping[str, object], idempotency_digest: str | None
+) -> str | None:
+    if not idempotency_digest:
+        return None
+    for turn_id, value in pending_turns.items():
+        if isinstance(value, Mapping) and value.get("idempotency_digest") == idempotency_digest:
+            return turn_id
+    return None
+
+
+def _completed_turn_id_for_idempotency_digest(
+    turn_outcomes: list[object], idempotency_digest: str | None
+) -> str | None:
+    if not idempotency_digest:
+        return None
+    for value in turn_outcomes:
+        if not isinstance(value, Mapping) or value.get("idempotency_digest") != idempotency_digest:
+            continue
+        turn_id = value.get("copilot_turn_id")
+        return turn_id if isinstance(turn_id, str) and turn_id else None
+    return None
 
 
 def _floor_rekeyed_association_is_coherent(item: Mapping[str, object]) -> bool:
@@ -711,15 +735,6 @@ class WorkflowParametersRepository(BaseRepository):
         message exists with no marker to reconcile it.
         """
         async with self.Session() as session:
-            new_message = WorkflowCopilotChatMessageModel(
-                workflow_copilot_chat_id=workflow_copilot_chat_id,
-                organization_id=organization_id,
-                sender=WorkflowCopilotChatSender.USER,
-                content=user_message,
-                audio_artifact_id=audio_artifact_id,
-            )
-            session.add(new_message)
-            await session.flush()
             chat = (
                 await session.scalars(
                     select(WorkflowCopilotChatModel)
@@ -731,6 +746,37 @@ class WorkflowParametersRepository(BaseRepository):
             if chat is None:
                 raise NotFoundError(f"workflow copilot chat {workflow_copilot_chat_id}")
             pending = _prune_pending_turns(chat.pending_turns)
+            existing_turn_id = _pending_turn_id_for_idempotency_digest(
+                pending,
+                pending_turn.idempotency_digest,
+            )
+            if existing_turn_id is not None:
+                raise DuplicateCopilotTurnError(existing_turn_id)
+            if pending_turn.idempotency_digest is not None:
+                completed_outcomes = list(
+                    await session.scalars(
+                        select(WorkflowCopilotChatMessageModel.turn_outcome)
+                        .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                        .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                        .where(WorkflowCopilotChatMessageModel.sender == WorkflowCopilotChatSender.AI)
+                        .where(WorkflowCopilotChatMessageModel.turn_outcome.is_not(None))
+                    )
+                )
+                completed_turn_id = _completed_turn_id_for_idempotency_digest(
+                    completed_outcomes,
+                    pending_turn.idempotency_digest,
+                )
+                if completed_turn_id is not None:
+                    raise DuplicateCopilotTurnError(completed_turn_id)
+            new_message = WorkflowCopilotChatMessageModel(
+                workflow_copilot_chat_id=workflow_copilot_chat_id,
+                organization_id=organization_id,
+                sender=WorkflowCopilotChatSender.USER,
+                content=user_message,
+                audio_artifact_id=audio_artifact_id,
+            )
+            session.add(new_message)
+            await session.flush()
             pending[pending_turn.turn_id] = pending_turn.model_copy(
                 update={"user_message_id": new_message.workflow_copilot_chat_message_id}
             ).model_dump(mode="json")

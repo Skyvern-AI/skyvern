@@ -66,6 +66,8 @@ async def _send(*, message: EmailMessage) -> bool:
 
 
 def validate_recipients(recipients: list[str]) -> None:
+    if not recipients:
+        raise ValueError("recipient list cannot be empty")
     for recipient in recipients:
         try:
             validate_email(recipient)

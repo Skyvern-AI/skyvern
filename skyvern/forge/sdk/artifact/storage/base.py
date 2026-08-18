@@ -18,6 +18,18 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 SENSITIVE_SHARE_URL_EXPIRY_HOURS = max(1, SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS // 3600)
 
 
+def key_is_org_scoped(key: str, allowed_prefixes: tuple[str, ...]) -> bool:
+    """Whether an object key sits under one of the caller's org-scoped prefixes.
+
+    A ``..`` segment is rejected rather than resolved: a bare prefix match on an
+    unnormalized key accepts ``{env}/{org_a}/../{org_b}/secret.pdf`` for org_a, and no key
+    this service writes ever contains one.
+    """
+    if any(segment == ".." for segment in key.split("/")):
+        return False
+    return any(key.startswith(prefix) for prefix in allowed_prefixes)
+
+
 async def presign_with_sensitive_cap(
     artifacts: list[Artifact],
     presign: Callable[[list[str]], Awaitable[list[str] | None]],
@@ -297,6 +309,16 @@ class BaseStorage(ABC):
         self, *, organization_id: str, filename: str, fileObj: BinaryIO
     ) -> tuple[str, str] | None:
         pass
+
+    @abstractmethod
+    async def delete_legacy_file(self, *, organization_id: str, uri: str) -> None:
+        """Delete an uploaded file's bytes.
+
+        Implementations must run ``assert_managed_file_access`` first: the URI reaches here
+        from a stored row, and this is the last place a row that points outside the
+        organization's prefix can be stopped from deleting another tenant's object. Raises
+        PermissionError when the URI is out of bounds.
+        """
 
     @abstractmethod
     async def sync_browser_session_file(

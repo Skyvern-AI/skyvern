@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 import structlog
 
 from skyvern.config import settings
+from skyvern.webeye.browser_health import BrowserHealth, BrowserOperation
 
 if TYPE_CHECKING:
     from playwright.async_api import FileChooser, Frame, Page
@@ -112,6 +113,7 @@ class SkyvernContext:
     is_sdk_inline_action: bool = False
     browser_runtime: str | None = None
     browser_address_is_server_assigned: bool = False
+    browser_health: BrowserHealth = field(default_factory=BrowserHealth)
     tz_info: ZoneInfo | None = None
     run_id: str | None = None
     copilot_session_id: str | None = None
@@ -130,6 +132,10 @@ class SkyvernContext:
     # builtins.set, not set: the module-level `set` context setter below shadows the
     # builtin for anything that resolves the name after import.
     downloaded_pdf_sources: set[str] = field(default_factory=builtins.set)
+    # Per-task secret values (e.g. a resolved verification code) to scrub from artifacts/logs. Task-
+    # scoped so bare tasks with no workflow-run context are still redacted; unioned into
+    # WorkflowContextManager.get_secret_values_for_run, which both redaction consumers read.
+    runtime_secret_values: set[str] = field(default_factory=builtins.set)
     refresh_working_page: bool = False
     frame_index_map: dict[Frame, int] = field(default_factory=dict)
     dropped_css_svg_element_map: dict[str, bool] = field(default_factory=dict)
@@ -151,7 +157,6 @@ class SkyvernContext:
     vertex_cache_key: str | None = None  # Logical cache key (includes variant + llm key)
     vertex_cache_variant: str | None = None  # Variant identifier used when creating the cache
     prompt_caching_settings: dict[str, bool] | None = None
-    use_artifact_bundling: bool = False
     # SKY-9718 Layer 1 — gates apply_lean_recipe in prompt_engine + agent.
     # PostHog flag ENABLE_LEAN_ELEMENT_TREE, evaluated once per run at scrape time
     # and read sync from prompt-build sites.
@@ -355,6 +360,11 @@ class SkyvernContext:
         if task_id in self.totp_codes:
             self.totp_codes.pop(task_id)
 
+    def register_secret_value(self, value: str | None) -> None:
+        """Mark a value for redaction from this task's artifacts/logs (task-scoped, no workflow needed)."""
+        if value:
+            self.runtime_secret_values.add(value)
+
     def record_dialog_message(self, dialog_type: str, dialog_message: str) -> None:
         """Buffer a dialog with FIFO cap; identical entries bump a count instead of duplicating."""
         if not dialog_message:
@@ -467,6 +477,20 @@ def ensure_context() -> SkyvernContext:
     if context is None:
         raise RuntimeError("No skyvern context")
     return context
+
+
+def record_browser_timeout(operation: BrowserOperation) -> None:
+    """Note that a browser-protocol operation went unanswered. Outside a run there is nothing to
+    tally against, and callers are hot paths, so a missing context is silently a no-op."""
+    context = current()
+    if context is not None:
+        context.browser_health.record_timeout(operation)
+
+
+def record_browser_success() -> None:
+    context = current()
+    if context is not None:
+        context.browser_health.record_success()
 
 
 def set(context: SkyvernContext) -> None:

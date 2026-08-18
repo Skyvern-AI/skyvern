@@ -18,6 +18,37 @@ from skyvern.exceptions import SkyvernException, redact_cdp_endpoint_urls, redac
 ExceptionType = type[BaseException]
 ErrorPredicate = Callable[[BaseException], bool]
 
+# Browser engines can report a vanished session or target through a protocol error instead of
+# closing the transport. These markers must remain disjoint from context loss below: a destroyed
+# execution context means navigation replaced the document while the page itself remains alive.
+_TARGET_CLOSED_MESSAGE_MARKERS = (
+    "connection closed while reading from the driver",
+    "session with given id not found",
+    "target closed",
+    "target page, context or browser has been closed",
+    "session closed",
+    "target with given id not found",
+    "no target with given id",
+    "inspected target navigated or closed",
+    "not attached to an active page",
+)
+_CONTEXT_LOST_MESSAGE_MARKERS = (
+    "cannot find context with specified id",
+    "execution context was destroyed",
+    "execution context is not available",
+    "uniquecontextid not found",
+)
+
+
+def is_target_closed_message(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in _TARGET_CLOSED_MESSAGE_MARKERS)
+
+
+def is_context_lost_message(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in _CONTEXT_LOST_MESSAGE_MARKERS)
+
 
 class BrowserAutomationError(SkyvernException):
     """Engine-neutral base for a browser failure classified from a driver-native error."""

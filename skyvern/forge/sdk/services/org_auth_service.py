@@ -26,6 +26,7 @@ AUTHENTICATION_TTL = 60  # one minute
 CACHE_SIZE = 128
 ALGORITHM = "HS256"
 SKYVERN_UI_USER_AGENT = "skyvern-ui"
+POSTHOG_ATTRIBUTION_HEADER = "X-PostHog-Attribution"
 _SAFE_JWT_ERROR_REASONS = {
     "Not enough segments",
     "Invalid payload padding",
@@ -155,6 +156,10 @@ async def get_current_org(
         ),
     ] = None,
     authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
+    x_posthog_attribution: Annotated[
+        str | None,
+        Header(alias=POSTHOG_ATTRIBUTION_HEADER, include_in_schema=False),
+    ] = None,
 ) -> Organization:
     if not x_api_key and not authorization:
         raise HTTPException(
@@ -165,7 +170,10 @@ async def get_current_org(
     if x_api_key:
         organization = await get_current_org_cached(x_api_key, app.DATABASE)
     elif authorization:
-        organization = await authenticate_helper(authorization)
+        organization = await authenticate_helper(
+            authorization,
+            attribution_header=x_posthog_attribution,
+        )
 
     if organization:
         apply_request_org_context(organization)
@@ -297,7 +305,10 @@ async def get_current_org_with_authentication(
     return await authenticate_helper(authorization)
 
 
-async def authenticate_helper(authorization: str) -> Organization:
+async def authenticate_helper(
+    authorization: str,
+    attribution_header: str | None = None,
+) -> Organization:
     parts = authorization.split(" ", 1)
     if len(parts) < 2 or not parts[1]:
         raise HTTPException(
@@ -305,12 +316,13 @@ async def authenticate_helper(authorization: str) -> Organization:
             detail="Invalid credentials",
         )
     token = parts[1]
-    if not app.authentication_function:
+    authentication_function = app.authentication_function
+    if not authentication_function:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid authentication method",
         )
-    organization = await app.authentication_function(token)
+    organization = await authentication_function(token, attribution_header)
     if not organization:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

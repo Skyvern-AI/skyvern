@@ -570,6 +570,10 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                         message=message,
                         **message_channel.identity,
                     )
+                    # Tell the client instead of dropping silently; it re-sends begin-exfiltration once the live view (re)connects.
+                    await send_error(
+                        message.kind, "Recording capture is not ready yet; retrying as live view connects."
+                    )
                     return
 
                 browser_session_id = (

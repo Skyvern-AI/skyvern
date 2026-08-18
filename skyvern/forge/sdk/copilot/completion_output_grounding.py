@@ -43,7 +43,7 @@ _POST_RUN_PAGE_OBSERVATION_LABEL = "post_run_page_observation"
 _REGISTERED_ARTIFACT_OBSERVATION_LABEL = "registered_artifact_observation"
 _MIN_CARRIER_VALUE_CHARS = 4
 _MAX_CARRIER_TEXT_CHARS = 20_000
-_PAGE_EVIDENCE_STAMP_KEYS = frozenset({"workflow_run_id", "observed_after_workflow_run"})
+_PAGE_EVIDENCE_STAMP_KEYS = frozenset({"workflow_run_id", "observed_after_workflow_run", "source_browser_session_id"})
 
 
 class _GroundingCtx(Protocol):

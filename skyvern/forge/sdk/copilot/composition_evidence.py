@@ -18,12 +18,15 @@ except ImportError:  # pragma: no cover - bs4 is a transitive dep but inspection
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     CHALLENGE_EVIDENCE_SOURCE_KEY,
+    CHALLENGE_KIND_KEY,
     CONSENT_OBSTRUCTION_KIND,
     ChallengeEvidenceSource,
     interactive_challenge_controls,
+    normalized_challenge_kind,
     vision_challenge_carrier,
 )
 from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
+from skyvern.forge.sdk.copilot.page_identity import page_record_matches_url, page_records_share_location
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -307,6 +310,9 @@ def merge_visual_composition_evidence(
             challenge_kind = _bounded_string(visual_summary.get("challenge_kind"), 80)
             if challenge_kind:
                 challenge_state["kind"] = challenge_kind
+            typed_kind = normalized_challenge_kind(challenge_kind)
+            if typed_kind is not None:
+                challenge_state[CHALLENGE_KIND_KEY] = typed_kind.value
             challenge_location = _bounded_string(visual_summary.get("challenge_location"), 180)
             if challenge_location:
                 challenge_state["visual_location"] = challenge_location
@@ -576,6 +582,59 @@ def _post_run_observed_url_goto_error(
     )
 
 
+def page_evidence_source_matches_run(source_browser_session_id: str | None, run_browser_session_id: str | None) -> bool:
+    """False only on a positive mismatch: both session ids known and different.
+
+    An unknown id on either side grants, so watchdog, cancellation, and reconciliation diagnosis
+    keep reading evidence captured before a run session id was ever recorded.
+    """
+    if not source_browser_session_id or not run_browser_session_id:
+        return True
+    return source_browser_session_id == run_browser_session_id
+
+
+def post_run_evidence_source_refused(
+    *,
+    run_id: str | None,
+    source_browser_session_id: str | None,
+    run_browser_session_id: str | None,
+) -> bool:
+    if not run_id or page_evidence_source_matches_run(source_browser_session_id, run_browser_session_id):
+        return False
+    LOG.info(
+        "copilot_post_run_evidence_source_mismatch_refused",
+        workflow_run_id=run_id,
+        source_browser_session_id=source_browser_session_id,
+        run_browser_session_id=run_browser_session_id,
+    )
+    return True
+
+
+def stamp_page_evidence_provenance(
+    evidence: dict[str, Any],
+    *,
+    source_browser_session_id: str | None,
+    run_id: str | None,
+    run_browser_session_id: str | None,
+) -> dict[str, Any]:
+    """Record which browser session an observation came from, and grant post-run identity for
+    ``run_id`` only when that session is the one the run executed in."""
+    stamped = {**evidence, "source_browser_session_id": source_browser_session_id or None}
+    if not run_id:
+        return stamped
+    if post_run_evidence_source_refused(
+        run_id=run_id,
+        source_browser_session_id=source_browser_session_id,
+        run_browser_session_id=run_browser_session_id,
+    ):
+        stamped.pop("workflow_run_id", None)
+        stamped["observed_after_workflow_run"] = False
+        return stamped
+    stamped["workflow_run_id"] = run_id
+    stamped["observed_after_workflow_run"] = True
+    return stamped
+
+
 def has_bounded_page_schema(evidence: dict[str, Any]) -> bool:
     for key in ("forms", "navigation_targets", "result_containers", "challenge_controls"):
         value = evidence.get(key)
@@ -677,7 +736,7 @@ def _evidence_matches_target(
     current_url = current_url if isinstance(current_url, str) else None
     inspected_url = inspected_url if isinstance(inspected_url, str) else None
     if _is_scout_interaction_evidence(evidence):
-        if _same_page(current_url, target_url) or _same_page(inspected_url, target_url):
+        if page_record_matches_url(evidence, target_url):
             return True
         if allow_post_run_browser_observation and (
             _same_origin(current_url, target_url) or _same_origin(inspected_url, target_url)
@@ -689,10 +748,10 @@ def _evidence_matches_target(
     # alone must not satisfy the gate. Require a bounded page schema for every
     # evidence source, the inspector included.
     if source_tool == _SCHEMA_EVIDENCE_TOOL and has_bounded_page_schema(evidence):
-        if _same_page(current_url, target_url) or _same_page(inspected_url, target_url):
+        if page_record_matches_url(evidence, target_url):
             return True
     if source_tool in _STRUCTURED_BROWSER_EVIDENCE_TOOLS and has_bounded_page_schema(evidence):
-        if _same_page(current_url, target_url) or _same_page(inspected_url, target_url):
+        if page_record_matches_url(evidence, target_url):
             return True
         if allow_post_run_browser_observation and (
             _same_origin(current_url, target_url) or _same_origin(inspected_url, target_url)
@@ -837,7 +896,7 @@ def _page_observed(ctx: Any, target_url: str | None, *, allow_post_run: bool) ->
     # agent never saw. The within-turn post-run same-origin continuation still
     # applies above via _evidence_matches_target.
     for page in _prior_observed_pages(ctx):
-        if page.get("had_bounded_schema") and _same_page(page.get("url"), target_url):
+        if page.get("had_bounded_schema") and page_record_matches_url(page, target_url):
             return True
     return False
 
@@ -881,7 +940,7 @@ def _current_page_evidence_has_reached_page_credit(
             continue
         if not has_bounded_page_schema(prior_evidence):
             continue
-        if _same_page(observed_url, _evidence_observed_url(prior_evidence)):
+        if page_records_share_location(evidence, prior_evidence):
             return True
     return False
 
@@ -1360,6 +1419,24 @@ def _control_label(node: Any) -> str:
 
 
 _MAX_SELECTOR_CHARS = 160
+# The rung that produced a candidate, so the model can tell a name-anchored offer from a positional
+# one. An untyped candidate is not passed on: nothing downstream can rank or grade it.
+# The rungs this side knows how to rank. Unknown values are carried, not dropped.
+_UNKNOWN_SELECTOR_SOURCE = "unknown"
+_SELECTOR_CANDIDATE_SOURCES = frozenset(
+    {
+        "id",
+        "name",
+        "name_value",
+        "class",
+        "class_value",
+        "class_type",
+        "aria_label",
+        "href",
+        "text_anchor",
+        "structural",
+    }
+)
 
 
 def _bounded_selector(selector: str) -> str:
@@ -2539,6 +2616,56 @@ def _structured_select_options(value: Any) -> list[dict[str, Any]]:
     return options
 
 
+def _structured_selector_candidates(value: Any) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    if not isinstance(value, list):
+        return candidates
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        selector = _structured_str(item.get("selector")).strip()
+        # A vocabulary shared across a language boundary keeps the record and preserves the value it
+        # does not recognise (proto3 open enums do exactly this); the known set below ranks candidates,
+        # it does not decide admission. Discarding a selector already verified unique against the live
+        # DOM, because its rung name is unfamiliar, loses evidence to a naming mismatch.
+        source = _structured_str(item.get("source"))[:40]
+        if not source or not source.replace("_", "").isalnum():
+            source = _UNKNOWN_SELECTOR_SOURCE
+        if not selector or selector in seen:
+            continue
+        if len(selector) > _MAX_SELECTOR_CHARS:
+            continue
+        seen.add(selector)
+        candidates.append({"selector": selector, "source": source})
+    return candidates
+
+
+def _structured_identity(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    tag = _structured_str(value.get("tag")).lower()[:40]
+    if not tag:
+        return None
+    return {
+        "tag": tag,
+        "role": _structured_str(value.get("role")).lower()[:40],
+        # Reported whole: this is the field a later check compares an element against, and a silently
+        # cut prefix would read as a rename. Its sources are already bounded upstream.
+        "label_context": _structured_str(value.get("label_context")),
+    }
+
+
+def _attach_node_evidence(entry: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
+    candidates = _structured_selector_candidates(node.get("selector_candidates"))
+    if candidates:
+        entry["selector_candidates"] = candidates
+    identity = _structured_identity(node.get("identity"))
+    if identity:
+        entry["identity"] = identity
+    return entry
+
+
 def _structured_form(form: Any) -> dict[str, Any] | None:
     if not isinstance(form, dict):
         return None
@@ -2564,7 +2691,7 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
         }
         if isinstance(node.get("visible"), bool):
             field["visible"] = node["visible"]
-        fields.append(field)
+        fields.append(_attach_node_evidence(field, node))
     submit_controls: list[dict[str, Any]] = []
     for control in form.get("submit_controls") or []:
         if not isinstance(control, dict):
@@ -2581,7 +2708,7 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
         }
         if isinstance(control.get("visible"), bool):
             submit_control["visible"] = control["visible"]
-        submit_controls.append(submit_control)
+        submit_controls.append(_attach_node_evidence(submit_control, control))
     return {
         "id": _structured_str(form.get("id"))[:120],
         "name": _structured_str(form.get("name"))[:120],
@@ -2611,7 +2738,7 @@ def _structured_navigation_targets(value: Any, *, base_url: str) -> list[dict[st
             "href": href[:300],
             "selector": _bounded_selector(_structured_str(link.get("selector"))),
         }
-        targets.append(entry)
+        targets.append(_attach_node_evidence(entry, link))
     return targets
 
 
@@ -2715,7 +2842,7 @@ def _structured_result_containers(value: Any) -> list[dict[str, Any]]:
                 f"{selector} tbody tr a",
                 f"{selector} tbody tr td:first-child",
             ]
-        containers.append(entry)
+        containers.append(_attach_node_evidence(entry, node))
     return containers
 
 
@@ -2779,7 +2906,7 @@ def _structured_key_value_relations(value: Any) -> list[dict[str, Any]]:
             relation["value_text_walked_count"] = value_count
         if len(str(relation.get("value_text") or "")) >= _MAX_RELATION_VALUE_CHARS:
             relation["value_truncated"] = True
-        relations.append(relation)
+        relations.append(_attach_node_evidence(relation, item))
     return relations
 
 
@@ -2801,7 +2928,7 @@ def _structured_clickable_controls(value: Any) -> list[dict[str, Any]]:
         if tag:
             entry["tag"] = tag
         if entry.get("selector") or entry.get("text"):
-            controls.append(entry)
+            controls.append(_attach_node_evidence(entry, item))
     return controls
 
 
@@ -2848,7 +2975,7 @@ def _structured_modal_dismiss_controls(value: Any) -> list[dict[str, Any]]:
             "selector": _bounded_selector(_structured_str(control.get("selector"))),
             "type": _structured_str(control.get("type"))[:40],
         }
-        controls.append({k: v for k, v in entry.items() if v})
+        controls.append(_attach_node_evidence({k: v for k, v in entry.items() if v}, control))
     return controls
 
 
@@ -2899,7 +3026,7 @@ def _structured_visual_obstruction_candidates(value: Any) -> list[dict[str, Any]
 
 
 def parse_composition_structured(data: Any, *, inspected_url: str, current_url: str) -> dict[str, Any] | None:
-    """Map the structured-evidence JSON to the same PageEvidence dict; None falls back to the get_html path."""
+    """Map bounded structured JSON to PageEvidence; None denotes an invalid structured result."""
     if not isinstance(data, dict):
         return None
     base_url = current_url or inspected_url

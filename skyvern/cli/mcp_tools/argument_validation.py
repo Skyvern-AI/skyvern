@@ -67,6 +67,9 @@ def _split_comma_separated_list(value: Any) -> Any:
 
 
 def _repair_argument_types(tool_name: str, tool: Any, arguments: dict[str, Any]) -> None:
+    if tool_name == "skyvern_browser_session_create" and arguments.get("generate_browser_profile") is None:
+        arguments.pop("generate_browser_profile", None)
+
     parameters = getattr(tool, "parameters", None)
     if not isinstance(parameters, dict):
         return

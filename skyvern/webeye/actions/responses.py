@@ -23,6 +23,10 @@ class ActionResult(BaseModel):
     interacted_with_parent: bool | None = None
     skip_remaining_actions: bool | None = None
     tool_call_result: dict[str, Any] | None = None
+    # Set by an action setup that physically performed the interaction, as opposed to one that
+    # suppressed it because the control already held the desired state. Both shapes stop the raw
+    # click, so callers mirroring the setup contract have no other way to tell them apart.
+    setup_performed: bool = False
 
     def __str__(self) -> str:
         results = [f"ActionResult(success={self.success}"]
@@ -66,6 +70,7 @@ class ActionSuccess(ActionResult):
         downloaded_files: list[str] | None = None,
         interacted_with_sibling: bool = False,
         interacted_with_parent: bool = False,
+        setup_performed: bool = False,
     ):
         super().__init__(
             success=True,
@@ -74,6 +79,7 @@ class ActionSuccess(ActionResult):
             downloaded_files=downloaded_files,
             interacted_with_sibling=interacted_with_sibling,
             interacted_with_parent=interacted_with_parent,
+            setup_performed=setup_performed,
         )
 
 
@@ -85,6 +91,7 @@ class ActionFailure(ActionResult):
         download_triggered: bool | None = None,
         interacted_with_sibling: bool = False,
         interacted_with_parent: bool = False,
+        setup_performed: bool = False,
     ):
         super().__init__(
             success=False,
@@ -94,6 +101,7 @@ class ActionFailure(ActionResult):
             download_triggered=download_triggered,
             interacted_with_sibling=interacted_with_sibling,
             interacted_with_parent=interacted_with_parent,
+            setup_performed=setup_performed,
         )
 
 
@@ -105,10 +113,12 @@ class ActionAbort(ActionResult):
         download_triggered: bool | None = None,
         interacted_with_sibling: bool = False,
         interacted_with_parent: bool = False,
+        setup_performed: bool = False,
     ):
         super().__init__(
             success=True,
             download_triggered=download_triggered,
             interacted_with_sibling=interacted_with_sibling,
             interacted_with_parent=interacted_with_parent,
+            setup_performed=setup_performed,
         )

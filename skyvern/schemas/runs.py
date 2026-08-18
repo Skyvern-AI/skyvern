@@ -336,6 +336,10 @@ class WorkflowRunRequest(BaseModel):
         default=None,
         description="ID of a Skyvern browser session to reuse, having it continue from the current screen state",
     )
+    reuse_browser_session: bool | None = Field(
+        default=None,
+        description="Override whether this run reuses the workflow's managed browser session. Null inherits the workflow setting. Without login credentials, a browser profile key, or a sequential key, reuse is workflow-scoped: every run shares one browser and its signed-in state, so treat the workflow as single-account.",
+    )
     browser_profile_id: str | None = Field(
         default=None,
         description="ID of a browser profile to reuse for this workflow run",
@@ -528,6 +532,17 @@ class ScriptRunResponse(BaseModel):
 class UploadFileResponse(BaseModel):
     s3_uri: str = Field(description="S3 URI where the file was uploaded")
     presigned_url: str = Field(description="Presigned URL to access the uploaded file")
+    file_id: str | None = Field(
+        default=None,
+        description="Identifier for this upload. Pass it to DELETE /v1/files/{file_id} to delete the file.",
+    )
+    expires_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When the file will be deleted, if a retention_days was supplied. "
+            "Null means the file has no expiry of its own and follows the organization's data retention policy."
+        ),
+    )
 
 
 class BaseRunResponse(BaseModel):

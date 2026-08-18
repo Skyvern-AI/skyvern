@@ -30,7 +30,7 @@ from skyvern.forge import app
 from skyvern.forge.agent_functions import CopilotCandidateNetworkHop
 from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
-from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
+from skyvern.forge.sdk.copilot.output_utils import mark_mcp_result_untrusted_for_llm, sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
@@ -115,6 +115,47 @@ LOG = structlog.get_logger()
 _INTERNAL_TOOL_ARG_KEYS = frozenset({"_summarized"})
 
 
+def _mapping_keys_preserved(source: Any, scrubbed: Any) -> bool:
+    if isinstance(source, dict):
+        return (
+            isinstance(scrubbed, dict)
+            and source.keys() == scrubbed.keys()
+            and all(_mapping_keys_preserved(value, scrubbed[key]) for key, value in source.items())
+        )
+    if isinstance(source, (list, tuple)):
+        return (
+            type(source) is type(scrubbed)
+            and len(source) == len(scrubbed)
+            and all(_mapping_keys_preserved(left, right) for left, right in zip(source, scrubbed, strict=True))
+        )
+    return True
+
+
+def _scrub_tool_result(ctx: AgentContext, result: Any) -> dict[str, Any]:
+    scrubbed_secrets = scrub_secrets_from_structure(ctx, result)
+    if not isinstance(scrubbed_secrets, dict) or not _mapping_keys_preserved(result, scrubbed_secrets):
+        return {}
+    parameters = getattr(ctx, "codeblock_redaction_parameters", None)
+    if not isinstance(parameters, dict) or not parameters:
+        return scrubbed_secrets
+    scrubbed = app.AGENT_FUNCTION.redact_codeblock_parameter_values(scrubbed_secrets, parameters)
+    if not isinstance(scrubbed, dict) or not _mapping_keys_preserved(scrubbed_secrets, scrubbed):
+        return {}
+    if type(scrubbed_secrets.get("ok")) is bool:
+        scrubbed["ok"] = scrubbed_secrets["ok"]
+    return scrubbed
+
+
+def _scrub_tool_exception(ctx: AgentContext, tool_name: str, exception: BaseException) -> Any:
+    try:
+        detail = str(exception)
+    except BaseException:
+        detail = ""
+    error = f"{tool_name} failed: {detail}" if detail else f"{tool_name} failed"
+    del exception, detail
+    return _scrub_tool_result(ctx, {"ok": False, "error": error})
+
+
 def _requested_output_path_choices(schema: dict[str, Any], paths: list[str]) -> dict[str, Any]:
     """Present the outputs this turn owes as the choices for the path a read claims.
 
@@ -195,8 +236,11 @@ def _transform_args(
 def _copilot_to_call_tool_result(
     copilot_result: dict[str, Any],
 ) -> CallToolResult:
+    if not copilot_result:
+        return CallToolResult(content=[], isError=True)
     sanitized = sanitize_tool_result_for_llm("", copilot_result)
-    content: list[TextContent] = [TextContent(type="text", text=json.dumps(sanitized))]
+    marked = mark_mcp_result_untrusted_for_llm(sanitized)
+    content: list[TextContent] = [TextContent(type="text", text=json.dumps(marked))]
     is_error = copilot_result.get("ok", True) is not True
     return CallToolResult(content=content, isError=is_error)
 
@@ -417,6 +461,23 @@ class SkyvernOverlayMCPServer(MCPServer):
         arguments: dict[str, Any] | None,
         meta: dict[str, Any] | None = None,
     ) -> CallToolResult:
+        propagated_error: BaseException
+        try:
+            return await self._call_tool(tool_name, arguments, meta)
+        except BaseException as exc:
+            if not app.AGENT_FUNCTION.prepare_codeblock_control_flow_exception(exc):
+                LOG.warning("MCP tool dispatch failed")
+                return CallToolResult(content=[], isError=True)
+            propagated_error = exc.with_traceback(None)
+            del self, tool_name, arguments, meta, exc
+        raise propagated_error from None
+
+    async def _call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+        meta: dict[str, Any] | None = None,
+    ) -> CallToolResult:
         if not self._client:
             raise RuntimeError("Not connected — call connect() first")
 
@@ -431,6 +492,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 "ok": False,
                 "error": "A raw-secret draft cannot use browser tools. Save only the redacted draft.",
             }
+            result = _scrub_tool_result(copilot_ctx, result)
             LOG.info("Raw-secret safety blocked MCP browser tool", tool_name=tool_name)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
             return _copilot_to_call_tool_result(result)
@@ -438,6 +500,7 @@ class SkyvernOverlayMCPServer(MCPServer):
         if overlay.pre_hook:
             hook_result = await overlay.pre_hook(arguments, copilot_ctx)
             if hook_result is not None:
+                hook_result = _scrub_tool_result(copilot_ctx, hook_result)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, hook_result)
                 return _copilot_to_call_tool_result(hook_result)
 
@@ -447,6 +510,7 @@ class SkyvernOverlayMCPServer(MCPServer):
         if overlay.requires_browser:
             err = await ensure_browser_session(copilot_ctx)
             if err:
+                err = _scrub_tool_result(copilot_ctx, err)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
                 return _copilot_to_call_tool_result(err)
             mcp_args["session_id"] = copilot_ctx.browser_session_id
@@ -477,16 +541,12 @@ class SkyvernOverlayMCPServer(MCPServer):
                     "Whether it took effect is unknown; read the page before trying it again."
                 ),
             }
+            err = _scrub_tool_result(copilot_ctx, err)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err)
-        except Exception as e:
-            LOG.warning(
-                "MCP tool call failed",
-                tool=tool_name,
-                error=str(e),
-                exc_info=True,
-            )
-            err = scrub_secrets_from_structure(copilot_ctx, {"ok": False, "error": f"{tool_name} failed: {e}"})
+        except Exception as exc:
+            LOG.warning("MCP tool call failed", tool=tool_name)
+            err = _scrub_tool_exception(copilot_ctx, tool_name, exc)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err)
 
@@ -502,30 +562,42 @@ class SkyvernOverlayMCPServer(MCPServer):
                 raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
         # Scrub before the post hook so evidence the hooks record from raw_mcp
         # (flow evidence, scout observations) is scrubbed too.
-        raw_mcp = scrub_secrets_from_structure(copilot_ctx, raw_mcp)
-        copilot_result = mcp_to_copilot(raw_mcp)
+        raw_mcp = _scrub_tool_result(copilot_ctx, raw_mcp)
+        copilot_result = mcp_to_copilot(raw_mcp) if raw_mcp else {}
 
         if overlay.post_hook:
             base_copilot_result = deepcopy(copilot_result)
             ctx_snapshot = _snapshot_post_hook_context(copilot_ctx)
             try:
                 copilot_result = await overlay.post_hook(copilot_result, raw_mcp, copilot_ctx)
-            except Exception as e:
+            except Exception:
                 # A post-hook enriches evidence only; a crash must not fail the browser action or keep partial credit.
                 _restore_post_hook_context(copilot_ctx, ctx_snapshot)
-                LOG.warning(
-                    "MCP post-hook failed; returning base tool result",
-                    tool=tool_name,
-                    error=str(e),
-                    exc_info=True,
-                )
+                LOG.warning("MCP post-hook failed; returning base tool result", tool=tool_name)
                 copilot_result = base_copilot_result
 
+        copilot_result = _scrub_tool_result(copilot_ctx, copilot_result)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, copilot_result)
         enqueue_screenshot_from_result(copilot_ctx, copilot_result)
         return _copilot_to_call_tool_result(copilot_result)
 
     async def call_internal_tool(
+        self,
+        mcp_tool_name: str,
+        mcp_args: dict[str, Any],
+    ) -> dict[str, Any]:
+        propagated_error: BaseException
+        try:
+            return await self._call_internal_tool(mcp_tool_name, mcp_args)
+        except BaseException as exc:
+            if not app.AGENT_FUNCTION.prepare_codeblock_control_flow_exception(exc):
+                LOG.warning("Internal MCP tool dispatch failed")
+                return {}
+            propagated_error = exc.with_traceback(None)
+            del self, mcp_tool_name, mcp_args, exc
+        raise propagated_error from None
+
+    async def _call_internal_tool(
         self,
         mcp_tool_name: str,
         mcp_args: dict[str, Any],
@@ -540,12 +612,12 @@ class SkyvernOverlayMCPServer(MCPServer):
         extracted error string rather than silently defaulting to
         ``ok=True``.
         """
-        if not self._client:
-            return {"ok": False, "error": "MCP client not connected"}
         ctx = self._context_provider()
+        if not self._client:
+            return _scrub_tool_result(ctx, {"ok": False, "error": "MCP client not connected"})
         err = await ensure_browser_session(ctx)
         if err:
-            return err
+            return _scrub_tool_result(ctx, err)
         merged_args = {**mcp_args, "session_id": ctx.browser_session_id}
         try:
             async with mcp_browser_context(ctx):
@@ -554,13 +626,8 @@ class SkyvernOverlayMCPServer(MCPServer):
                 await asyncio.sleep(0)
                 await self._drain_evidence_candidate_response_tasks()
         except Exception as exc:
-            LOG.warning(
-                "Internal MCP tool call failed",
-                tool=mcp_tool_name,
-                error=str(exc),
-                exc_info=True,
-            )
-            return {"ok": False, "error": f"{mcp_tool_name} failed: {exc}"}
+            LOG.warning("Internal MCP tool call failed", tool=mcp_tool_name)
+            return _scrub_tool_exception(ctx, mcp_tool_name, exc)
         raw_mcp = dict(raw.structured_content or {})
         if raw.is_error:
             raw_mcp["ok"] = False
@@ -569,7 +636,8 @@ class SkyvernOverlayMCPServer(MCPServer):
                 raw_mcp["error"] = " ".join(text_parts) if text_parts else "Unknown MCP error"
             else:
                 raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
-        return mcp_to_copilot(raw_mcp)
+        scrubbed = _scrub_tool_result(ctx, raw_mcp)
+        return mcp_to_copilot(scrubbed) if scrubbed else {}
 
     async def list_prompts(self) -> ListPromptsResult:
         return ListPromptsResult(prompts=[])

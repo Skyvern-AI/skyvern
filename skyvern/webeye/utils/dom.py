@@ -355,6 +355,28 @@ class SkyvernElement:
     async def is_file_input(self) -> bool:
         return self.get_tag_name() == InteractiveElement.INPUT and await self.get_attr("type") == "file"
 
+    async def is_explicit_submit(self) -> bool:
+        """Exact ``button[type=submit]`` / ``input[type=submit]`` from static scrape metadata.
+
+        Strict positive raw-attribute allowlist: only these two tag+type pairs
+        qualify, matched ASCII case-insensitively with no whitespace trimming. A
+        padded, empty, missing, or non-string ``type`` never qualifies because the
+        match is exact, and role=button, tag alone, and visible text are never
+        inferred. Any read failure returns False so callers fail closed onto the
+        default path.
+        """
+        try:
+            tag_name = self.get_tag_name()
+            type_attr = await self.get_attr("type", mode="static")
+        except Exception:
+            LOG.debug("is_explicit_submit read failed; treating as non-submit", element_id=self.get_id())
+            return False
+        if not isinstance(tag_name, str) or tag_name.lower() not in ("button", "input"):
+            return False
+        if not isinstance(type_attr, str):
+            return False
+        return type_attr.lower() == "submit"
+
     def is_interactable(self) -> bool:
         return self.__static_element.get("interactable", False)
 

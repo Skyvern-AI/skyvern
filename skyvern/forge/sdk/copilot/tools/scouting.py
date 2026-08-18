@@ -21,12 +21,8 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     recorded_outcome_from_scout_act_observe_hollow,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import (
-    CHALLENGE_EVIDENCE_SOURCE_KEY,
-    ChallengeEvidenceSource,
     challenge_evidence_unsettled,
     challenge_signal_regressed,
-    composition_challenge_carrier,
-    interactive_challenge_controls,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     enclosing_form_submit_controls_expression,
@@ -48,11 +44,18 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     has_actionable_steer_content,
     has_bounded_page_schema,
     has_witnessed_value_content,
+    post_run_evidence_source_refused,
+    stamp_page_evidence_provenance,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
     mint_scout_observation_contract_for_ctx,
     record_reached_terminal_action_observation,
     record_scouted_output_coverage,
+)
+from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint as _page_evidence_location_fingerprint
+from skyvern.forge.sdk.copilot.page_identity import page_record_matches_url as _page_evidence_matches_url_identity
+from skyvern.forge.sdk.copilot.page_identity import (
+    safe_page_origin,
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
@@ -62,12 +65,6 @@ from skyvern.forge.sdk.copilot.runtime import (
     resolve_browser_state_for_context,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
-from skyvern.forge.sdk.workflow.models.block import (
-    CodeBlockCaptchaError,
-    _bounded_code_block_recaptcha_token_populated,
-    _code_block_recaptcha_response_field_present,
-    _code_block_solve_captcha_builtin,
-)
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
@@ -114,9 +111,9 @@ def _consume_pending_browser_interaction_observation(
     if not _same_page_ignoring_fragment(pending.url, current_url):
         LOG.warning(
             "copilot_pending_browser_interaction_observation_page_mismatch",
-            tool_name=pending.tool_name,
-            pending_url=pending.url,
-            current_url=current_url,
+            tool_name_present=bool(pending.tool_name),
+            pending_url_present=bool(pending.url),
+            current_url_present=bool(current_url),
         )
         return False
     return True
@@ -345,7 +342,7 @@ async def _capture_scout_role_name(ctx: AgentContext, selector: str | None) -> N
             "copilot_scout_role_name_unavailable",
             reason="empty_role" if not role else "empty_name",
             source=source,
-            role=role,
+            role_present=bool(role),
         )
         return
     ctx.pending_scout_role_name = (selector, role, name)
@@ -512,6 +509,8 @@ async def _capture_post_interaction_screenshot(
     on the page" but not "did that work" -- a filled password reads as empty, and a dialog covering
     the content reads as an ordinary node. Only the most recent screenshot is retained.
     """
+    if getattr(ctx, "codeblock_redaction_parameters", None):
+        return
     # getattr mirrors screenshot_utils: this runs against contexts that predate the vision field.
     if not getattr(ctx, "supports_vision", False):
         return
@@ -573,9 +572,9 @@ def _capped_with_eviction_accounting(
         for item in items[: len(items) - _MAX_SCOUTED_INTERACTIONS]:
             event: dict[str, Any] = {
                 "collection": collection,
-                "tool_name": item.get("tool_name"),
-                "selector": item.get("selector"),
-                "source_url": item.get("source_url"),
+                "tool_name_present": bool(item.get("tool_name")),
+                "selector_present": bool(item.get("selector")),
+                "source_url_present": bool(item.get("source_url")),
             }
             if collection == "scout_trajectory":
                 event["trajectory_index"] = item.get("trajectory_index")
@@ -595,10 +594,18 @@ def _next_trajectory_index(trajectory: list[ScoutedInteraction]) -> int:
     return highest + 1 if highest >= 0 else len(trajectory)
 
 
-def _record_scout_trajectory_fact(ctx: AgentContext, artifact: ScoutedInteraction) -> ScoutedInteraction:
+def _redact_codeblock_value(ctx: AgentContext, value: Any) -> Any:
+    parameters = getattr(ctx, "codeblock_redaction_parameters", {})
+    return app.AGENT_FUNCTION.redact_codeblock_parameter_values(value, parameters) if parameters else value
+
+
+def _record_scout_trajectory_fact(ctx: AgentContext, artifact: ScoutedInteraction) -> ScoutedInteraction | None:
     """Append one observed fact with a monotone index and bounded retention."""
+    redacted = _redact_codeblock_value(ctx, artifact)
+    if not isinstance(redacted, dict) or "tool_name" not in redacted:
+        return None
     trajectory = list(ctx.scout_trajectory)
-    recorded = cast(ScoutedInteraction, artifact.copy())
+    recorded = cast(ScoutedInteraction, redacted.copy())
     recorded["trajectory_index"] = _next_trajectory_index(trajectory)
     trajectory.append(recorded)
     ctx.scout_trajectory = _capped_with_eviction_accounting(trajectory, collection="scout_trajectory")
@@ -618,8 +625,7 @@ def _observed_control_readiness(ctx: AgentContext, selector: str, source_url: st
     observed_hidden = False
     observed_disabled = False
     for packet in packets:
-        evidence_url = str(packet.get("current_url") or packet.get("inspected_url") or "").strip()
-        if not evidence_url or not _same_page_ignoring_fragment(source_url, evidence_url):
+        if not _page_evidence_matches_url_identity(packet, source_url):
             continue
         for form in packet.get("forms") or []:
             if not isinstance(form, dict):
@@ -676,7 +682,7 @@ def _record_scouted_interaction(
             "copilot_scout_capture_loss",
             tool_name=tool_name,
             reason="unresolvable_selector",
-            url=(source_url or "").strip() or None,
+            url_present=bool((source_url or "").strip()),
         )
         return
     artifact: ScoutedInteraction = {"tool_name": tool_name}
@@ -752,6 +758,10 @@ def _record_scouted_interaction(
         artifact["element_fingerprint_probed"] = element_fingerprint_probed
     if ambiguous:
         artifact["ambiguous"] = True
+    redacted_artifact = _redact_codeblock_value(ctx, artifact)
+    if not isinstance(redacted_artifact, dict) or "tool_name" not in redacted_artifact:
+        return
+    artifact = cast(ScoutedInteraction, redacted_artifact)
     interactions = [
         item
         for item in ctx.scouted_interactions
@@ -769,12 +779,12 @@ def _record_scouted_interaction(
 
     LOG.info(
         "copilot_scout_interaction_captured",
-        tool_name=tool_name,
-        selector=selector or None,
+        tool_name=artifact["tool_name"],
+        selector=artifact.get("selector"),
         source_url=artifact.get("source_url"),
-        role=role or None,
-        credential_field=credential_field or None,
-        credential_id=credential_id or None,
+        role=artifact.get("role"),
+        credential_field=artifact.get("credential_field"),
+        credential_id=artifact.get("credential_id"),
         total_scouted_interactions=len(ctx.scouted_interactions),
         total_scout_trajectory=len(ctx.scout_trajectory),
     )
@@ -797,168 +807,6 @@ def _attach_scout_observation_step(
             if interaction.get("tool_name") == tool_name and interaction.get("selector", "") == selector:
                 interaction["observation_step"] = observation_step
                 break
-
-
-_MAX_CHALLENGE_SOLVE_ATTEMPTS = 3
-# Measured: a healthy turn re-enters the ladder 4-5 times for one widget, because a token
-# expires long before a turn ends. Sized well clear of that so it bounds a page rotating its
-# identity to outspend us, without cutting a legitimate turn short.
-_MAX_CHALLENGE_SOLVE_ATTEMPTS_PER_TURN = 12
-
-
-def _challenge_identity(evidence: dict[str, Any]) -> str:
-    """Identify the challenge, not the page, so a later distinct one still gets attempts.
-
-    Deliberately ignores ``src``: the common widgets carry a per-render cache-buster there, so
-    keying on it would mint a fresh identity on every re-render and never reach the cap.
-    """
-    marks = []
-    for control in interactive_challenge_controls(evidence.get("challenge_controls")):
-        mark = control.get("data_sitekey") or control.get("selector") or control.get("id")
-        if mark:
-            marks.append(str(mark))
-    return "|".join(sorted(marks)) or str(evidence.get("current_url") or "")
-
-
-def _record_challenge_encounter(
-    ctx: AgentContext,
-    carrier: ChallengeEvidenceSource,
-    *,
-    outcome: str,
-) -> None:
-    """Record on the interaction that met the challenge, whether or not it was passed.
-
-    Synthesis derives boundaries from ``composition_challenge_carrier`` over the recorded
-    interaction itself, so the carrier has to ride on a tool_name it already emits for; a
-    standalone solve_captcha interaction has no emitter and would be dropped.
-
-    Meeting a challenge is a present-tense fact about the page this turn is on, so it may
-    only land on an interaction this turn performed. Carried interactions describe an
-    earlier turn on their own ``source_url``; stamping one would have synthesis solve a
-    captcha at a boundary where none was seen.
-    """
-    trajectory = list(ctx.scout_trajectory)
-    if not trajectory or trajectory[-1].get("carried") is True:
-        return
-    entry = trajectory[-1]
-    challenge_state = dict(entry.get("challenge_state") or {})
-    challenge_state[CHALLENGE_EVIDENCE_SOURCE_KEY] = carrier.value
-    challenge_state["outcome"] = outcome
-    stamped = dict(entry)
-    stamped["challenge_state"] = challenge_state
-    trajectory[-1] = cast(ScoutedInteraction, stamped)
-    ctx.scout_trajectory = trajectory
-
-
-async def solve_challenge_when_evidence_settles(
-    ctx: AgentContext,
-    evidence: dict[str, Any] | None,
-    *,
-    url: str | None,
-    observed_after_interaction: bool,
-) -> bool:
-    """Try the shared solve routes on a challenge in just-settled evidence; True when one landed.
-
-    Call from a capture exit, never a tool hook: a settled packet describes the page as it now
-    is, and ``observed_after_interaction`` follows from the seam — the act-observe capture runs
-    after a recorded interaction, an inspection capture has none to attribute.
-    """
-    if not evidence:
-        return False
-    carrier = composition_challenge_carrier(evidence)
-    if carrier is None:
-        return False
-
-    # Record on detection rather than on success: an unsolved challenge is a fact the draft
-    # carries forward, and exploration continues either way. Nothing below terminates the turn.
-    if observed_after_interaction:
-        _record_challenge_encounter(ctx, carrier, outcome="detected")
-
-    # Cost gate, deliberately after the record above: a challenge that cannot be solved must stop
-    # being paid for, but must never stop being reported to synthesis.
-    # Counted before the attempt, so a transient failure spends one too — deliberate, because the
-    # alternative lets a route that keeps erroring retry without bound.
-    identity = _challenge_identity(evidence)
-    attempts = ctx.challenge_solve_attempts.get(identity, 0)
-    if attempts >= _MAX_CHALLENGE_SOLVE_ATTEMPTS:
-        return False
-    # Every input to the identity is page-controlled, so a widget that rotates its sitekey or id
-    # mints a fresh one on each observation and never reaches the per-identity cap. The solver
-    # costs real money on a platform-wide account, so the turn needs a bound the page cannot move.
-    if sum(ctx.challenge_solve_attempts.values()) >= _MAX_CHALLENGE_SOLVE_ATTEMPTS_PER_TURN:
-        LOG.info(
-            "copilot_scout_captcha_turn_budget_spent",
-            url=url,
-            organization_id=ctx.organization_id,
-        )
-        return False
-    ctx.challenge_solve_attempts[identity] = attempts + 1
-
-    # Read once so the handlers below report a failure without touching the context again.
-    organization_id = ctx.organization_id
-    try:
-        # Resolving the browser is inside the guard because it can raise, and a challenge the
-        # scout merely failed to solve must never be what ends exploration.
-        browser_state = await resolve_browser_state_for_context(ctx)
-        if browser_state is None:
-            return False
-        page = await browser_state.get_working_page()
-        if page is None:
-            return False
-        # Crediting a token that was already there would let an unrelated widget's response pass
-        # this challenge off as solved, so the transition is what counts. An unreadable baseline
-        # withholds that credit rather than failing the solve that has not happened yet.
-        try:
-            token_before = await _bounded_code_block_recaptcha_token_populated(page)
-        except Exception:
-            token_before = None
-        # In-DOM checkbox, then the Turnstile extension, then the reCAPTCHA token route.
-        arm_passed = await _code_block_solve_captcha_builtin(
-            page,
-            organization_id=organization_id,
-            browser_session_id=ctx.browser_session_id,
-        )
-    except CodeBlockCaptchaError:
-        LOG.info(
-            "copilot_scout_captcha_solve_failed",
-            url=url,
-            organization_id=organization_id,
-        )
-        if observed_after_interaction:
-            _record_challenge_encounter(ctx, carrier, outcome="unsolved")
-        return False
-    except Exception:
-        LOG.warning(
-            "copilot_scout_captcha_solve_exception",
-            url=url,
-            organization_id=organization_id,
-            exc_info=True,
-        )
-        return False
-
-    # A reCAPTCHA widget stays rendered after it is satisfied, so its continued presence says
-    # nothing; the response token going from absent to present is what the platform treats as the
-    # authoritative solve signal. An unreadable read withholds the credit rather than inventing it.
-    try:
-        token_after = await _bounded_code_block_recaptcha_token_populated(page)
-        judged_by_token = await _code_block_recaptcha_response_field_present(page)
-    except Exception:
-        token_after = None
-        judged_by_token = False
-    # Turnstile and plain checkbox challenges carry no response field, so an arm passing is all
-    # there is to go on; where a field exists, the transition is what separates this solve from a
-    # response some other widget left behind.
-    solved = arm_passed and (token_before is False and token_after is True if judged_by_token else True)
-
-    if observed_after_interaction:
-        _record_challenge_encounter(ctx, carrier, outcome="solved" if solved else "attempted")
-    LOG.info(
-        "copilot_scout_captcha_solve_attempted",
-        url=url,
-        organization_id=organization_id,
-        solved=solved,
-    )
-    return solved
 
 
 def _page_evidence_has_selector(value: Any, selector: str) -> bool:
@@ -1028,14 +876,71 @@ def _evidence_list_len(packet: dict[str, Any] | None, key: str) -> int:
     return len(value) if isinstance(value, list) else 0
 
 
+_PAGE_EVIDENCE_STATE_KEYS = (
+    "page_title",
+    "forms",
+    "navigation_targets",
+    "result_containers",
+    "result_containers_truncated",
+    "key_value_relations",
+    "key_value_relations_truncated",
+    "clickable_controls",
+    "visible_text_excerpt",
+    "anti_bot_indicators",
+    "challenge_controls",
+    "modal_overlays",
+    "visual_obstruction_candidates",
+    "schema_empty_page",
+)
+
+
+def _page_evidence_state(packet: dict[str, Any]) -> dict[str, Any]:
+    """Return DOM-observed structure without visual augmentation or transport metadata."""
+    state = {key: packet.get(key) for key in _PAGE_EVIDENCE_STATE_KEYS}
+    inspection_warnings = packet.get("inspection_warnings")
+    state["reveal_relations_truncated"] = (
+        isinstance(inspection_warnings, list) and "reveal_relations_truncated" in inspection_warnings
+    )
+    return state
+
+
+def _page_evidence_is_unchanged(prior: dict[str, Any] | None, current: dict[str, Any] | None) -> bool:
+    return prior is not None and current is not None and _page_evidence_state(prior) == _page_evidence_state(current)
+
+
+def _safe_page_evidence_url(value: str | None) -> str | None:
+    return safe_page_origin(value)
+
+
+def _latest_same_page_evidence(ctx: AgentContext, *, url: str) -> dict[str, Any] | None:
+    for entry in reversed(getattr(ctx, "flow_evidence", ())):
+        if not isinstance(entry, dict):
+            continue
+        evidence = entry.get("evidence")
+        if not isinstance(evidence, dict):
+            continue
+        if not _page_evidence_matches_url_identity(evidence, url):
+            continue
+        if has_bounded_page_schema(evidence) or has_witnessed_value_content(evidence):
+            return evidence
+    return None
+
+
 async def _scout_act_observe_page_evidence(
-    ctx: AgentContext, *, url: str, observed_after_interaction: bool = False
+    ctx: AgentContext,
+    *,
+    url: str,
+    observed_after_interaction: bool = False,
+    prior_page_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Run the bounded page-side extractor right after a scout interaction.
 
     Degrades to None on timeout or error so the interaction result is never
     blocked or failed by capture problems. Hollow packets still return so an
-    interaction-proven hollow page can be recorded as a typed outcome."""
+    interaction-proven hollow page can be recorded as a typed outcome. When the
+    first packet is unchanged from the latest same-page evidence, one bounded
+    recapture prevents pre-action state from being published as the click effect.
+    """
     if getattr(ctx, "discovery_mcp_server", None) is None:
         return None
     timeout_seconds = settings.COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS
@@ -1043,72 +948,124 @@ async def _scout_act_observe_page_evidence(
     ctx.last_scout_act_observe_recapture_attempted = False
     ctx.last_scout_act_observe_recapture_result = ""
     parsed: dict[str, Any] | None = None
+    # Keep the exact URL inside turn-local evidence for structural grounding. Only
+    # model-facing/cross-turn summaries reduce it to origin plus a keyed fingerprint.
+    capture_url = url
+    capture_location_fingerprint = _page_evidence_location_fingerprint(url)
     try:
         parsed = await _composition_get_structured_evidence(
-            ctx, inspected_url=url, current_url=url, timeout_seconds=timeout_seconds
+            ctx, inspected_url=capture_url, current_url=capture_url, timeout_seconds=timeout_seconds
         )
     except Exception:
         parsed = None
         outcome = "error"
     else:
+        if parsed is not None and capture_location_fingerprint is not None:
+            parsed["current_url_location_fingerprint"] = capture_location_fingerprint
         outcome = _scout_act_observe_capture_outcome(parsed, started=started, timeout_seconds=timeout_seconds)
-        if parsed is not None and (outcome == "hollow" or challenge_evidence_unsettled(parsed)):
+        unchanged_after_interaction = observed_after_interaction and _page_evidence_is_unchanged(
+            prior_page_evidence, parsed
+        )
+        if parsed is not None and (
+            outcome == "hollow" or challenge_evidence_unsettled(parsed) or unchanged_after_interaction
+        ):
             first_packet = parsed
             first_outcome = outcome
             remaining_seconds = timeout_seconds - (time.monotonic() - started)
             if remaining_seconds <= 0:
                 ctx.last_scout_act_observe_recapture_result = "not_attempted_no_budget"
+                if unchanged_after_interaction:
+                    parsed = None
+                    outcome = "unchanged"
             else:
                 ctx.last_scout_act_observe_recapture_attempted = True
+                if unchanged_after_interaction:
+                    settle_seconds = min(
+                        settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS,
+                        remaining_seconds,
+                    )
+                    if settle_seconds > 0:
+                        await asyncio.sleep(settle_seconds)
+                    remaining_seconds = timeout_seconds - (time.monotonic() - started)
                 try:
+                    live_recapture_url = await _live_working_page_url(ctx)
+                    recapture_url = live_recapture_url or capture_url
                     recaptured = await _composition_get_structured_evidence(
-                        ctx, inspected_url=url, current_url=url, timeout_seconds=remaining_seconds
+                        ctx,
+                        inspected_url=recapture_url,
+                        current_url=recapture_url,
+                        timeout_seconds=remaining_seconds,
                     )
                 except Exception:
-                    parsed = first_packet
-                    outcome = first_outcome
                     ctx.last_scout_act_observe_recapture_result = (
                         "timeout" if time.monotonic() - started >= timeout_seconds else "error"
                     )
-                else:
-                    if recaptured is None:
+                    if unchanged_after_interaction:
+                        parsed = None
+                        outcome = "unchanged"
+                    else:
                         parsed = first_packet
                         outcome = first_outcome
+                else:
+                    recapture_location_fingerprint = _page_evidence_location_fingerprint(live_recapture_url)
+                    if recaptured is not None and recapture_location_fingerprint is not None:
+                        recaptured["current_url_location_fingerprint"] = recapture_location_fingerprint
+                    if recaptured is None:
                         ctx.last_scout_act_observe_recapture_result = _scout_act_observe_no_payload_result(
                             started=started, timeout_seconds=timeout_seconds
                         )
+                        if unchanged_after_interaction:
+                            parsed = None
+                            outcome = "unchanged"
+                        else:
+                            parsed = first_packet
+                            outcome = first_outcome
                     else:
                         recaptured_outcome = _scout_act_observe_capture_outcome(
                             recaptured, started=started, timeout_seconds=timeout_seconds
                         )
+                        recaptured_is_attachable = has_bounded_page_schema(recaptured) or has_witnessed_value_content(
+                            recaptured
+                        )
+                        if observed_after_interaction and _page_evidence_is_unchanged(prior_page_evidence, recaptured):
+                            parsed = None
+                            outcome = "unchanged"
+                            ctx.last_scout_act_observe_recapture_result = "unchanged"
+                        elif unchanged_after_interaction and not recaptured_is_attachable:
+                            parsed = None
+                            outcome = "unchanged"
+                            ctx.last_scout_act_observe_recapture_result = recaptured_outcome
                         # Never trade down: a page that navigated mid-recapture would otherwise
                         # lose the form the first capture proved, or erase the challenge signal
                         # that justified re-looking while still reporting a bounded schema.
-                        if (
-                            first_outcome == "attached" and recaptured_outcome != "attached"
-                        ) or challenge_signal_regressed(first_packet, recaptured):
+                        elif not unchanged_after_interaction and (
+                            (first_outcome == "attached" and recaptured_outcome != "attached")
+                            or challenge_signal_regressed(first_packet, recaptured)
+                        ):
                             parsed = first_packet
                             outcome = first_outcome
                         else:
                             parsed = recaptured
                             outcome = recaptured_outcome
-                        ctx.last_scout_act_observe_recapture_result = recaptured_outcome
+                        if outcome != "unchanged":
+                            ctx.last_scout_act_observe_recapture_result = recaptured_outcome
+    safe_parsed = parsed
+    if parsed is not None:
+        redacted = _redact_codeblock_value(ctx, parsed)
+        safe_parsed = cast(dict[str, Any], redacted) if isinstance(redacted, dict) else None
     ctx.last_scout_act_observe_outcome = outcome
-    ctx.last_scout_act_observe_packet = parsed
+    ctx.last_scout_act_observe_packet = safe_parsed
     LOG.info(
         "copilot_scout_act_observe",
         outcome=outcome,
         duration_ms=int((time.monotonic() - started) * 1000),
-        url=url,
+        url_present=bool(url),
         result_container_count=_evidence_list_len(parsed, "result_containers"),
         key_value_relation_count=_evidence_list_len(parsed, "key_value_relations"),
         recapture_attempted=ctx.last_scout_act_observe_recapture_attempted,
         recapture_result=ctx.last_scout_act_observe_recapture_result,
     )
-    await solve_challenge_when_evidence_settles(
-        ctx, parsed, url=url, observed_after_interaction=observed_after_interaction
-    )
-    return parsed
+    return safe_parsed
 
 
 async def _register_scout_interaction_observation(
@@ -1120,42 +1077,70 @@ async def _register_scout_interaction_observation(
     selector = _selector_text(selector)
     if not selector or not url:
         return None, None
+    redacted_identity = _redact_codeblock_value(ctx, {"selector": selector, "source_url": source_url, "url": url})
+    if not isinstance(redacted_identity, dict):
+        return None, None
+    safe_selector = _selector_text(redacted_identity.get("selector"))
+    safe_source_url = _selector_text(redacted_identity.get("source_url"))
+    safe_url = _selector_text(redacted_identity.get("url"))
+    if not safe_selector or not safe_url:
+        return None, None
     evidence: dict[str, Any] = {
-        "inspected_url": url,
-        "current_url": url,
+        "inspected_url": safe_url,
+        "current_url": safe_url,
         "source_tool": SCOUT_INTERACTION_EVIDENCE_TOOL,
         "interaction_tool": tool_name,
-        "interaction_selector": selector,
+        "interaction_selector": safe_selector,
     }
-    if source_url and source_url.strip():
-        evidence["interaction_source_url"] = source_url.strip()
+    if safe_source_url:
+        evidence["interaction_source_url"] = safe_source_url
     page_evidence: dict[str, Any] | None = None
     if tool_name in _ACT_OBSERVE_TOOLS:
-        parsed = await _scout_act_observe_page_evidence(ctx, url=url, observed_after_interaction=True)
+        # Freshness compares the first post-click DOM to the page the click acted on.
+        # Looking up only by the destination URL misses the exact stale-hydration seam:
+        # navigation commits first while the old page remains rendered underneath it.
+        prior_page_evidence = _latest_same_page_evidence(ctx, url=safe_source_url or safe_url)
+        parsed = await _scout_act_observe_page_evidence(
+            ctx,
+            url=safe_url,
+            observed_after_interaction=True,
+            prior_page_evidence=prior_page_evidence,
+        )
         # Admission (credit axis) is decoupled from the hollow outcome (no-progress axis): a page
         # that rendered witnessed value content is bindable even when it exposes no actionable schema.
         if parsed is not None and (has_bounded_page_schema(parsed) or has_witnessed_value_content(parsed)):
+            observed_url = str(parsed.get("current_url") or parsed.get("inspected_url") or safe_url).strip() or safe_url
+            evidence["inspected_url"] = observed_url
+            evidence["current_url"] = observed_url
             # Identity keys overwrite the parsed packet so the entry stays a
             # scout_interaction observation, with the schema merged before append.
             evidence = {**parsed, **evidence}
             page_evidence = evidence
-            contract = mint_scout_observation_contract_for_ctx(ctx, parsed, url=url)
+            contract = mint_scout_observation_contract_for_ctx(ctx, parsed, url=safe_url)
             ctx.scout_observation_contract = contract
             record_scouted_output_coverage(
                 ctx, parsed, contract=contract, include_lexical=has_actionable_steer_content(parsed)
             )
-            _mark_post_run_page_observed(ctx, source_tool="evaluate", url=url, page_evidence=parsed)
+            _mark_post_run_page_observed(
+                ctx,
+                source_tool="evaluate",
+                url=safe_url,
+                page_evidence=parsed,
+                source_browser_session_id=ctx.browser_session_id,
+            )
             # The schema is already attached; leaving the marker set would let a
             # later evaluate/inspect mint a second interaction credit for one click.
             _clear_pending_browser_interaction_observation(ctx)
+        elif ctx.last_scout_act_observe_outcome == "unchanged":
+            evidence["page_observation_status"] = "unchanged"
         elif parsed is not None and ctx.last_scout_act_observe_outcome == "hollow":
             record_build_test_outcome(
                 ctx,
                 recorded_outcome_from_scout_act_observe_hollow(
                     interaction_tool=tool_name,
-                    selector=selector,
-                    current_url=url,
-                    source_url=source_url,
+                    selector=safe_selector,
+                    current_url=safe_url,
+                    source_url=safe_source_url,
                     page_evidence=parsed,
                     recapture_attempted=ctx.last_scout_act_observe_recapture_attempted,
                     recapture_result=ctx.last_scout_act_observe_recapture_result,
@@ -1285,7 +1270,7 @@ def _attach_scout_page_summary(result: dict[str, Any], page_evidence: dict[str, 
                 return
     except Exception:
         data.pop("page", None)
-        LOG.warning("copilot_scout_act_observe_summary_failed", exc_info=True)
+        LOG.warning("copilot_scout_act_observe_summary_failed")
 
 
 def _page_evidence_has_password_control(page_evidence: dict[str, Any]) -> bool:
@@ -1534,9 +1519,16 @@ def _mark_post_run_page_observed(
     source_tool: str,
     url: str,
     page_evidence: dict[str, Any] | None = None,
+    source_browser_session_id: str | None,
 ) -> None:
     run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
     if not isinstance(run_id, str) or not run_id:
+        return
+    if post_run_evidence_source_refused(
+        run_id=run_id,
+        source_browser_session_id=source_browser_session_id,
+        run_browser_session_id=ctx.last_run_blocks_browser_session_id,
+    ):
         return
     ctx.post_run_page_observation_tool = source_tool
     ctx.post_run_page_observation_url = url
@@ -1553,12 +1545,12 @@ def _mark_post_run_page_observed(
         getattr(ctx, "last_test_ok", None) is False or authoritative_unsatisfied
     )
     if page_evidence is not None and ctx.post_run_page_observation_after_failed_test:
-        bound_evidence = {
-            **page_evidence,
-            "workflow_run_id": run_id,
-            "observed_after_workflow_run": True,
-            "current_url": url,
-        }
+        bound_evidence = stamp_page_evidence_provenance(
+            {**page_evidence, "current_url": url},
+            source_browser_session_id=source_browser_session_id,
+            run_id=run_id,
+            run_browser_session_id=ctx.last_run_blocks_browser_session_id,
+        )
         if bind_post_run_page_path_failure(ctx, bound_evidence):
             ctx.post_run_page_observation_generation = (
                 getattr(ctx, "post_run_page_observation_generation", 0) or 0

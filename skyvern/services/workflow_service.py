@@ -50,6 +50,7 @@ def workflow_request_body_from_existing_run(
             ),
             # The original request's fresh-browser intent propagates to the retry (re-resolves fresh).
             "start_fresh_browser": bool(workflow_run.start_fresh_browser),
+            "reuse_browser_session": workflow_run.reuse_browser_session,
             "max_screenshot_scrolls": workflow_run.max_screenshot_scrolls,
             "max_elapsed_time_minutes": workflow_run.max_elapsed_time_minutes,
             "extra_http_headers": workflow_run.extra_http_headers,

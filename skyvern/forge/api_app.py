@@ -34,7 +34,7 @@ from skyvern.cors import credentialed_cors_allow_origin_regex, credentialed_cors
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
 from skyvern.forge.forge_app_initializer import start_forge_app
-from skyvern.forge.request_logging import log_raw_request_middleware
+from skyvern.forge.request_logging import RequestLoggingMiddleware, log_raw_request_exception
 from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_from_database
 from skyvern.forge.sdk.copilot.tracing_setup import ensure_tracing_initialized
 from skyvern.forge.sdk.core import skyvern_context
@@ -493,11 +493,13 @@ def create_api_app() -> FastAPI:
         # Base-Exception handlers run inside Starlette's ServerErrorMiddleware, which sits
         # outside SecurityHeadersMiddleware, so stamp the framing headers here too.
         # Exception class only: str(exc) can carry raw SQL, bind params, or internal paths.
-        return JSONResponse(
+        response = JSONResponse(
             status_code=500,
             content={"error": f"Unexpected error: {type(exc).__name__}"},
             headers=SECURITY_HEADERS,
         )
+        log_raw_request_exception(response.status_code)
+        return response
 
     @fastapi_app.middleware("http")
     async def request_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
@@ -513,12 +515,12 @@ def create_api_app() -> FastAPI:
         finally:
             skyvern_context.reset()
 
-    @fastapi_app.middleware("http")
-    async def raw_request_logging(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
-        return await log_raw_request_middleware(request, call_next)
-
     if forge_app_instance.setup_api_app:
         forge_app_instance.setup_api_app(fastapi_app)
+
+    # Register after extensions so it stays outside cloud BaseHTTPMiddleware
+    # layers, whose child tasks do not propagate request ContextVars upstream.
+    fastapi_app.add_middleware(RequestLoggingMiddleware)
 
     # Added last so it is outermost: stamps every response, including CORS
     # preflights short-circuited by the cloud middleware registered above.

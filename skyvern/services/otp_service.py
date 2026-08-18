@@ -2,6 +2,7 @@ import asyncio
 import difflib
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -45,6 +46,35 @@ class RawOTPVerificationContext:
     observed_otp_types: set[OTPType] = field(default_factory=set)
 
 
+@dataclass
+class WebhookOTPVerificationContext:
+    """What ``totp_verification_url`` actually answered across a whole poll.
+
+    An endpoint that never once returns the documented 200 + JSON object is
+    broken, not merely slow to receive a code. Only the status codes and their
+    counts are kept, so the summary is safe to surface in a failure_reason.
+    """
+
+    responses: int = 0
+    contract_satisfied: bool = False
+    statuses: Counter[int] = field(default_factory=Counter)
+
+    def record(self, status_code: int, *, contract_satisfied: bool) -> None:
+        self.responses += 1
+        self.statuses[status_code] += 1
+        if contract_satisfied:
+            self.contract_satisfied = True
+
+    def never_conformed(self) -> bool:
+        return self.responses > 0 and not self.contract_satisfied
+
+    def summary(self) -> str:
+        breakdown = ",".join(
+            f"{status}x{count}" for status, count in sorted(self.statuses.items(), key=lambda kv: (-kv[1], kv[0]))
+        )
+        return f"webhook_responses={self.responses} http_status={breakdown}"
+
+
 _MFA_PARAMETER_KEY_HINTS = ("mfa", "otp", "verification")
 # Keys that contain an MFA hint but are TOTP *metadata*, not actual OTP codes.
 # "totpidentifier" matches "otp" but carries a lookup key, not a 6-digit code.
@@ -67,7 +97,7 @@ _CODE_SEPARATOR_PATTERN = re.compile(r"[\s\-]")
 _CODE_CANDIDATE_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])\d{3,4}(?:[ \t]\d{3,4})+(?![A-Za-z0-9])|[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*"
 )
-_EXPECTED_TOTP_WEBHOOK_RESPONSE_SHAPE = '{"verification_code":"123456"}'
+TOTP_WEBHOOK_EXPECTED_RESPONSE_SHAPE = '{"verification_code":"123456"}'
 # Recovers the verification_code value when the surrounding JSON is malformed
 # (e.g. unescaped quotes inside a relayed email). Assumes verification_code is
 # the final field, which is the common shape; the closing brace anchor is a
@@ -330,6 +360,18 @@ def _schema_only_otp_error_reason(reason: str | None) -> str:
     return _TOTP_WEBHOOK_REQUEST_FAILED_REASON
 
 
+def describe_webhook_contract_failure(webhook_diagnostics: str | None) -> str:
+    """Failure_reason clause for a totp_verification_url that answered every poll
+    without ever returning the documented body. Empty when the endpoint conformed,
+    so callers can append it unconditionally."""
+    if not webhook_diagnostics:
+        return ""
+    return (
+        f" The endpoint responded to every poll but never returned the expected "
+        f"{TOTP_WEBHOOK_EXPECTED_RESPONSE_SHAPE} body ({webhook_diagnostics})."
+    )
+
+
 def redact_otp_identifier_for_log(totp_identifier: str | None) -> str | None:
     return _REDACTED_OTP_IDENTIFIER_PLACEHOLDER if totp_identifier else None
 
@@ -345,7 +387,7 @@ def _totp_webhook_contract_error_reason(
         f"http_status={status_code} "
         f"content_type={_format_content_type_for_error(content_type)} "
         f"body_preview={_response_body_preview(response_body)!r} "
-        f"expected_response_shape={_EXPECTED_TOTP_WEBHOOK_RESPONSE_SHAPE}"
+        f"expected_response_shape={TOTP_WEBHOOK_EXPECTED_RESPONSE_SHAPE}"
     )
 
 
@@ -470,9 +512,11 @@ def has_credential_totp_candidate(workflow_run_id: str | None) -> bool:
     if not workflow_run_id:
         return False
 
-    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
-    if not workflow_run_context:
+    # has_* first: get_workflow_run_context raises (not returns falsy) when the context isn't
+    # registered, so guarding on its truthiness alone would let that raise escape the caller.
+    if not app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id):
         return False
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
 
     current_context = skyvern_context.current()
     active_credential_key = current_context.active_credential_parameter_key if current_context else None
@@ -496,9 +540,11 @@ def try_generate_totp_from_credential(workflow_run_id: str | None) -> OTPValue |
     if not workflow_run_id:
         return None
 
-    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
-    if not workflow_run_context:
+    # has_* first: get_workflow_run_context raises (not returns falsy) when the context isn't
+    # registered, so guarding on its truthiness alone would let that raise escape resolve_otp_value.
+    if not app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id):
         return None
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
 
     current_context = skyvern_context.current()
     active_credential_key = current_context.active_credential_parameter_key if current_context else None
@@ -580,6 +626,7 @@ async def poll_otp_value(
     expected_otp_type: OTPType | None = None,
     email_context: EmailOTPVerificationContext | None = None,
     raw_context: RawOTPVerificationContext | None = None,
+    webhook_context: WebhookOTPVerificationContext | None = None,
 ) -> OTPValue | None:
     """Poll until an OTP of ``expected_otp_type`` arrives or the wall-clock budget expires.
 
@@ -602,6 +649,7 @@ async def poll_otp_value(
     org_token: OrganizationAuthToken | None = None
     email_otp_context = email_context if email_context is not None else EmailOTPVerificationContext()
     raw_otp_context = raw_context if raw_context is not None else RawOTPVerificationContext()
+    webhook_otp_context = webhook_context if webhook_context is not None else WebhookOTPVerificationContext()
     while True:
         await asyncio.sleep(10)
         if datetime.utcnow() > timeout_datetime:
@@ -617,11 +665,27 @@ async def poll_otp_value(
                     workflow_id=workflow_id or workflow_permanent_id,
                     reason=last_error_reason,
                 )
-            LOG.warning("Polling otp value timed out")
+            # An endpoint that answered every poll without ever speaking the documented
+            # shape is a customer-side contract break. Without this the timeout reads as
+            # "your endpoint had no code", which is indistinguishable from never having
+            # been called at all.
+            webhook_diagnostics: str | None = None
+            if webhook_otp_context.never_conformed():
+                webhook_diagnostics = webhook_otp_context.summary()
+                LOG.warning(
+                    "Polling otp value timed out; totp_verification_url never returned the documented response",
+                    webhook_diagnostics=webhook_diagnostics,
+                    expected_response_shape=TOTP_WEBHOOK_EXPECTED_RESPONSE_SHAPE,
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                )
+            else:
+                LOG.warning("Polling otp value timed out")
             raise NoTOTPVerificationCodeFound(
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
                 workflow_id=workflow_id or workflow_permanent_id,
+                webhook_diagnostics=webhook_diagnostics,
             )
         otp_value: OTPValue | None = None
         try:
@@ -644,6 +708,7 @@ async def poll_otp_value(
                     task_id=task_id,
                     workflow_run_id=workflow_run_id,
                     workflow_permanent_id=workflow_permanent_id,
+                    context=webhook_otp_context,
                 )
             if otp_value is None and totp_identifier:
                 otp_value = await _get_otp_value_from_email(
@@ -700,6 +765,7 @@ async def _get_otp_value_from_url(
     task_id: str | None = None,
     workflow_run_id: str | None = None,
     workflow_permanent_id: str | None = None,
+    context: WebhookOTPVerificationContext | None = None,
 ) -> OTPValue | None:
     request_data = {}
     if task_id:
@@ -731,6 +797,11 @@ async def _get_otp_value_from_url(
             reason=f"{_TOTP_WEBHOOK_REQUEST_FAILED_REASON} exception_type={type(e).__name__}",
         )
     content_type = _get_header_value(response_headers, "Content-Type")
+    if context is not None:
+        context.record(
+            status_code,
+            contract_satisfied=status_code == 200 and is_json_response and isinstance(response_body, dict),
+        )
     if status_code != 200:
         LOG.warning(
             "TOTP webhook returned non-200 response",
@@ -751,7 +822,7 @@ async def _get_otp_value_from_url(
             http_status=status_code,
             content_type=content_type,
             body_preview=_response_body_preview(response_body),
-            expected_response_shape=_EXPECTED_TOTP_WEBHOOK_RESPONSE_SHAPE,
+            expected_response_shape=TOTP_WEBHOOK_EXPECTED_RESPONSE_SHAPE,
         )
         raise FailedToGetTOTPVerificationCode(
             task_id=task_id,
@@ -766,7 +837,7 @@ async def _get_otp_value_from_url(
             http_status=status_code,
             content_type=content_type,
             response_json_type=type(response_body).__name__,
-            expected_response_shape=_EXPECTED_TOTP_WEBHOOK_RESPONSE_SHAPE,
+            expected_response_shape=TOTP_WEBHOOK_EXPECTED_RESPONSE_SHAPE,
         )
         return None
 
@@ -777,7 +848,7 @@ async def _get_otp_value_from_url(
             http_status=status_code,
             content_type=content_type,
             response_keys=list(response_body.keys()),
-            expected_response_shape=_EXPECTED_TOTP_WEBHOOK_RESPONSE_SHAPE,
+            expected_response_shape=TOTP_WEBHOOK_EXPECTED_RESPONSE_SHAPE,
         )
         return None
 

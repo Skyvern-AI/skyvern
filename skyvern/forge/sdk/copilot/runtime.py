@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
+    from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
     from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 
 LOG = structlog.get_logger()
@@ -256,9 +257,6 @@ class ScoutedInteraction(TypedDict):
     element_fingerprint_test_id: NotRequired[str]
     element_fingerprint_tag: NotRequired[str]
     element_fingerprint_probed: NotRequired[str]
-    # Stamped when exploration met a challenge here; read back by composition_challenge_carrier
-    # so synthesis emits solve_captcha(page) at this boundary.
-    challenge_state: NotRequired[dict[str, Any]]
 
 
 @dataclass
@@ -269,6 +267,7 @@ class AgentContext:
     workflow_yaml: str
     browser_session_id: str | None
     stream: EventSourceStream
+    persisted_workflow_yaml: str | None = None
     api_key: str | None = None
     turn_origin: TurnOrigin = TurnOrigin.interactive
     injected_browser_state: BrowserState | None = None
@@ -296,9 +295,21 @@ class AgentContext:
     # tolerant-to-unset is the right default.
     last_requested_block_labels: list[str] = field(default_factory=list)
     last_executed_block_labels: list[str] = field(default_factory=list)
+    executed_block_labels: set[str] = field(default_factory=set)
+    executed_block_fingerprints: dict[str, set[str]] = field(default_factory=dict)
     last_frontier_start_label: str | None = None
     verified_block_outputs: dict[str, Any] = field(default_factory=dict)
     verified_prefix_labels: list[str] = field(default_factory=list)
+    # Page each verified block ended on, from the run rows the worker persisted; a block's entry is
+    # the page its successor started from. The session id is the browser they were observed in,
+    # because the same URL in a different browser is a different state.
+    verified_prefix_block_end_urls: dict[str, str] = field(default_factory=dict)
+    verified_prefix_block_end_session_id: str | None = None
+    # Label of the block that ran last, which is where the browser stopped.
+    verified_prefix_terminal_label: str | None = None
+    # Set by the planner when it proved a resume against the browser above; the next run is
+    # threaded into that browser instead of the chat's. Consumed and cleared by that run.
+    frontier_resume_session_id: str | None = None
     last_full_workflow_test_ok: bool = False
     last_unverified_block_labels: list[str] = field(default_factory=list)
     workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
@@ -325,8 +336,8 @@ class AgentContext:
     code_only_code_schema_seen: bool = False
     code_only_target_page_evidence_seen: bool = False
     code_native_pending_capability: str | None = None
-    # Climbs on each click that made no verified forward progress (failed/timed-out
-    # click or a hollow post-click observe); resets on verified progress.
+    # Captures whether the latest click produced attached, hollow, or unchanged
+    # post-action evidence; downstream repair reads the factual outcome.
     last_scout_act_observe_outcome: str | None = None
     last_scout_act_observe_packet: dict[str, Any] | None = None
     last_scout_act_observe_recapture_attempted: bool = False
@@ -354,6 +365,7 @@ class AgentContext:
     last_good_workflow: Any | None = None
     last_good_workflow_yaml: str | None = None
     last_run_blocks_workflow_run_id: str | None = None
+    last_run_blocks_browser_session_id: str | None = None
     last_artifact_health_blocker_reason: str | None = None
     last_artifact_health_blocker_labels: list[str] = field(default_factory=list)
     last_artifact_health_failure_classes: list[str] = field(default_factory=list)
@@ -364,6 +376,7 @@ class AgentContext:
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
     recorded_persisted_block_run_workflow_run_id: str | None = None
+    block_run_calls_this_turn: int = 0
     completion_verification_result: CompletionVerificationResult | None = None
     completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
     verified_terminal_proposal_ready: bool = False
@@ -411,9 +424,6 @@ class AgentContext:
     # acted order. Unlike scouted_interactions (deduped for auto-credit), this
     # preserves repeats and ordering as factual model input.
     scout_trajectory: list[ScoutedInteraction] = field(default_factory=list)
-    # Solve attempts already spent per challenge. A challenge that never passes is precisely the
-    # one re-observed on every later capture, so cost otherwise grows with how stuck the turn is.
-    challenge_solve_attempts: dict[str, int] = field(default_factory=dict)
     scouted_output_covered_paths: set[str] = field(default_factory=set)
     # Ids of active terminal_action completion criteria the scout has structurally reached past the
     # login prefix; releases the corresponding is_goal_complete terminal-action gate.
@@ -480,12 +490,15 @@ class AgentContext:
     # call-time-minted OTP codes). Page-readback tool results are exact-string
     # scrubbed against this set before being recorded or returned to the model.
     secret_scrub_values: list[str] = field(default_factory=list)
+    codeblock_redaction_parameters: dict[str, Any] = field(default_factory=dict)
 
     # Set by tool gates / loop guards / tool-side error branches when a tool
     # dispatch is blocked. The finalization shim in agent.py reads this at
     # turn end and overrides the AgentResult with a deterministic
     # product-language reply. See blocker_signal.py for the contract.
     blocker_signal: CopilotToolBlockerSignal | None = None
+    # Presentation-only recovery rows; authority remains in RequestPolicy.
+    connected_account_recovery_choices: list[ConnectedAccountChoice] = field(default_factory=list)
     turn_halt: TurnHalt | None = None
     # Most recently emitted blocker signal for the current tool output. Unlike
     # blocker_signal, this is last-wins so the activity-log projection can
@@ -522,7 +535,60 @@ def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+_HEAL_ADOPTION_FAILURE_REASONS = frozenset(
+    {
+        "injected_browser_state_missing",
+        "injected_browser_context_unusable",
+        "injected_working_page_unavailable",
+        "self_heal_workflow_run_id_missing",
+    }
+)
+
+
+def _safe_heal_adoption_failure_reason(exc: HealAdoptionFailed) -> str:
+    try:
+        reason = object.__getattribute__(exc, "message")
+    except BaseException:
+        return "injected_browser_context_unusable"
+    return (
+        reason
+        if type(reason) is str and reason in _HEAL_ADOPTION_FAILURE_REASONS
+        else "injected_browser_context_unusable"
+    )
+
+
+def _redacted_heal_adoption_failure_reason(exc: HealAdoptionFailed, parameters: dict[str, Any]) -> str:
+    reason = _safe_heal_adoption_failure_reason(exc)
+    if not parameters:
+        return reason
+    try:
+        candidate = app.AGENT_FUNCTION.redact_codeblock_parameter_values(reason, parameters)
+        return candidate if isinstance(candidate, str) else ""
+    except BaseException:
+        return ""
+
+
 async def _resolve_self_heal_browser_state(ctx: AgentContext) -> tuple[str, BrowserState, Page]:
+    propagated_error: BaseException
+    adoption_message: str | None = None
+    try:
+        return await _resolve_self_heal_browser_state_inner(ctx)
+    except BaseException as exc:
+        if type(exc) is HealAdoptionFailed:
+            adoption_message = _redacted_heal_adoption_failure_reason(
+                cast(HealAdoptionFailed, exc), ctx.codeblock_redaction_parameters
+            )
+        elif app.AGENT_FUNCTION.prepare_codeblock_control_flow_exception(exc):
+            propagated_error = exc.with_traceback(None)
+        else:
+            adoption_message = "injected_browser_context_unusable"
+        del ctx, exc
+    if adoption_message is not None:
+        raise HealAdoptionFailed(adoption_message) from None
+    raise propagated_error from None
+
+
+async def _resolve_self_heal_browser_state_inner(ctx: AgentContext) -> tuple[str, BrowserState, Page]:
     browser_state = ctx.injected_browser_state
     if browser_state is None:
         raise HealAdoptionFailed("injected_browser_state_missing")
@@ -530,14 +596,16 @@ async def _resolve_self_heal_browser_state(ctx: AgentContext) -> tuple[str, Brow
         raise HealAdoptionFailed("injected_browser_context_unusable")
     try:
         page = await browser_state.get_working_page()
-    except Exception as exc:
+    except Exception:
         LOG.warning(
             "Self-heal browser adoption failed while probing working page",
             organization_id=ctx.organization_id,
-            error_type=type(exc).__name__,
-            exc_info=True,
         )
-        raise HealAdoptionFailed("injected_working_page_unavailable") from exc
+        adoption_failed = True
+    else:
+        adoption_failed = False
+    if adoption_failed:
+        raise HealAdoptionFailed("injected_working_page_unavailable")
     if page is None:
         raise HealAdoptionFailed("injected_working_page_unavailable")
     workflow_run_id = ctx.heal_workflow_run_id

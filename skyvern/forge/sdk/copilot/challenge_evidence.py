@@ -20,6 +20,17 @@ class ChallengeEvidenceSource(StrEnum):
     KEYWORD_ONLY = "keyword_only"
 
 
+class ChallengeKind(StrEnum):
+    """Closed set the vision classifier picks from; ``challenge_state.kind`` stays free-form."""
+
+    CAPTCHA = "captcha"
+    HUMAN_VERIFICATION = "human_verification"
+    DEVICE_APPROVAL = "device_approval"
+    ACCESS_DENIED = "access_denied"
+    OTHER = "other"
+
+
+CHALLENGE_KIND_KEY = "challenge_kind"
 CHALLENGE_EVIDENCE_SOURCE_KEY = "evidence_source"
 CARRIER_CHALLENGE_EVIDENCE_SOURCES: frozenset[ChallengeEvidenceSource] = frozenset(
     {
@@ -126,6 +137,25 @@ def challenge_evidence_source_from_entry(entry: Mapping[str, Any]) -> ChallengeE
         return ChallengeEvidenceSource(raw.strip().lower())
     except ValueError:
         return None
+
+
+def normalized_challenge_kind(value: object) -> ChallengeKind | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return ChallengeKind(value.strip().lower())
+    except ValueError:
+        return None
+
+
+def typed_challenge_kind(evidence: Mapping[str, Any] | None) -> ChallengeKind | None:
+    """The closed-enum kind stamped on ``challenge_state``, or ``None`` when unclassified."""
+    if not isinstance(evidence, Mapping):
+        return None
+    challenge_state = evidence.get("challenge_state")
+    if not isinstance(challenge_state, Mapping):
+        return None
+    return normalized_challenge_kind(challenge_state.get(CHALLENGE_KIND_KEY))
 
 
 def is_carrier_backed_category_entry(entry: object) -> bool:

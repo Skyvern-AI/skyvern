@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 import structlog
 
-from skyvern.forge.sdk.copilot.challenge_evidence import challenge_evidence_unsettled
+from skyvern.forge.sdk.copilot.challenge_evidence import ChallengeKind, challenge_evidence_unsettled
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION as _COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
 )
@@ -18,12 +18,14 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     merge_visual_composition_evidence,
     page_evidence_needs_visual_fallback,
     parse_composition_html,
+    stamp_page_evidence_provenance,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.llm_config import resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     finalize_runtime_authoring_repair_context_from_page_observation,
+    post_run_inspection_cleanly_matches,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
@@ -33,12 +35,11 @@ from ._shared import (
     _append_flow_evidence,
     _composition_evidence_page_url,
     _composition_get_html,
-    _composition_get_structured_evidence,
+    _composition_get_structured_evidence_result,
     _discovery_extract_current_url,
     _discovery_navigate,
     _fallback_page_info,
     _requested_capture_targets,
-    _same_page_ignoring_fragment,
     _workflow_verification_evidence,
 )
 from .blockers import _allows_post_run_current_page_inspection_budget_bypass
@@ -49,12 +50,13 @@ from .scouting import (
     _clear_pending_browser_interaction_observation,
     _consume_pending_browser_interaction_observation,
     _mark_post_run_page_observed,
-    solve_challenge_when_evidence_settles,
+    _page_evidence_matches_url_identity,
 )
 
 LOG = structlog.get_logger()
 
 
+_POST_RUN_REPAIR_CAPTURE_TIMEOUT_SECONDS = 30.0
 _COMPOSITION_VISUAL_SUMMARY_TIMEOUT_SECONDS = 10.0
 _COMPOSITION_VISUAL_SUMMARY_PROMPT_NAME = "workflow-copilot-page-evidence-vision"
 
@@ -106,9 +108,15 @@ def _composition_visual_prompt(evidence: dict[str, Any]) -> str:
         "record rows, visible identifiers, quantities, statuses, prices, confirmations, search results, "
         "or selected values when legible. "
         "Classify any visible artificial barrier from the screenshot alone: a verification challenge is a "
-        "captcha or human-verification widget asking the visitor to prove they are human; a page "
+        "captcha or human-verification widget asking the visitor to prove they are human, an access-denied "
+        "block page, or a sign-in step waiting for a person to approve this login out of band on another "
+        "device or in an authenticator app; a page "
         "obstruction is a dismissible layer such as a cookie/privacy consent dialog, promo or newsletter "
         "modal, chat widget, or loading overlay. "
+        f"Use challenge_kind values: {', '.join(kind.value for kind in ChallengeKind)}. "
+        f"Use {ChallengeKind.DEVICE_APPROVAL.value} for a screen that can only advance when a person "
+        "approves the sign-in somewhere else, such as a 2-step verification screen waiting on a device "
+        "prompt, push notification, or authenticator approval. "
         f"Use obstruction_kind values: {CONSENT_OBSTRUCTION_KIND}, promo_modal, chat_widget, "
         "loading_overlay, other. A cookie/privacy consent dialog is always a page obstruction, never a "
         "challenge: report it with page_obstruction_detected true and obstruction_kind "
@@ -253,15 +261,32 @@ async def _composition_evidence_after_navigation_failure(
 ) -> dict[str, Any] | None:
     current_url, _ = await _fallback_page_info(ctx)
     current_url = current_url or inspected_url
-    structured = await _composition_get_structured_evidence(ctx, inspected_url=inspected_url, current_url=current_url)
+    structured, structured_error = await _composition_get_structured_evidence_result(
+        ctx, inspected_url=inspected_url, current_url=current_url
+    )
     if structured is not None and has_bounded_page_schema(structured):
         evidence = _composition_add_inspection_warning(
             structured,
-            f"navigation_error_before_html_capture: {navigation_error}",
+            "navigation_error_before_html_capture",
         )
         if page_evidence_needs_visual_fallback(evidence):
             evidence = await _augment_composition_evidence_with_visual_fallback(ctx, evidence)
         return evidence
+    if structured_error is not None:
+        # A navigation failure is the exceptional path where a screenshot can still
+        # observe the page even though the bounded DOM execution context was lost.
+        # Keep that visual path without paying for a generic full-DOM serialization.
+        evidence = parse_composition_html("", inspected_url=inspected_url, current_url=current_url)
+        evidence = _composition_add_inspection_warning(
+            evidence,
+            "navigation_error_before_evidence_capture",
+        )
+        evidence = _composition_add_inspection_warning(
+            evidence,
+            "structured_evidence_unavailable_after_navigation_error",
+        )
+        evidence = await _augment_composition_evidence_with_visual_fallback(ctx, evidence)
+        return evidence if evidence.get("screenshot_used") else None
     # Same size-cap survival as the success path: a heavy page that rendered before the nav
     # error still parses via the stripped-body evaluate instead of yielding hollow evidence.
     html, html_error, html_truncated, _ = await _composition_get_html(ctx)
@@ -274,7 +299,7 @@ async def _composition_evidence_after_navigation_failure(
         )
         evidence = _composition_add_inspection_warning(
             evidence,
-            f"navigation_error_before_html_capture: {navigation_error}",
+            "navigation_error_before_html_capture",
         )
         if html_truncated:
             evidence = _composition_add_inspection_warning(evidence, "html_sliced_at_cap")
@@ -286,11 +311,11 @@ async def _composition_evidence_after_navigation_failure(
     evidence = parse_composition_html("", inspected_url=inspected_url, current_url=current_url)
     evidence = _composition_add_inspection_warning(
         evidence,
-        f"navigation_error_before_evidence_capture: {navigation_error}",
+        "navigation_error_before_evidence_capture",
     )
     evidence = _composition_add_inspection_warning(
         evidence,
-        f"html_capture_failed_after_navigation_error: {html_error}",
+        "html_capture_failed_after_navigation_error",
     )
     evidence = await _augment_composition_evidence_with_visual_fallback(ctx, evidence)
     return evidence if evidence.get("screenshot_used") else None
@@ -337,8 +362,8 @@ def _non_current_inspection_regression_error(copilot_ctx: Any, *, entry_url: str
     latest = _latest_interaction_reached_flow_evidence(copilot_ctx)
     if latest is None:
         return None
-    observation_step, observed_url, _ = latest
-    if _same_page_ignoring_fragment(observed_url, entry_url):
+    observation_step, observed_url, evidence = latest
+    if _page_evidence_matches_url_identity(evidence, entry_url):
         return None
     return {
         "ok": False,
@@ -443,17 +468,20 @@ async def _capture_composition_evidence(
     *,
     inspected_url: str,
     current_url: str,
-    solve_challenges: bool = True,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Parse composition evidence (cheap extractor first, get_html fallback); html_error is set only on a failed HTML read."""
+    """Capture page evidence, using HTML only to enrich a valid but unsettled structured packet."""
     evidence: dict[str, Any] | None = None
     html_truncated = False
     used_structured = False
     skip_raw = False
     for attempt in range(_COMPOSITION_HOLLOW_RECAPTURE_RETRIES + 1):
-        structured = await _composition_get_structured_evidence(
+        structured, structured_error = await _composition_get_structured_evidence_result(
             copilot_ctx, inspected_url=inspected_url, current_url=current_url
         )
+        if structured_error is not None:
+            if evidence is not None:
+                break
+            return None, structured_error
         if structured is not None:
             evidence = structured
             used_structured = True
@@ -498,13 +526,64 @@ async def _capture_composition_evidence(
         or (evidence.get("schema_empty_page") is True and not has_bounded_page_schema(evidence))
     ):
         evidence = await _augment_composition_evidence_with_visual_fallback(copilot_ctx, evidence)
-    # Off for a capture that only reads a run's page: solving there would mutate the page being
-    # diagnosed and spend on a session this turn is not driving.
-    if solve_challenges:
-        await solve_challenge_when_evidence_settles(
-            copilot_ctx, evidence, url=current_url, observed_after_interaction=False
-        )
     return evidence, None
+
+
+async def _read_run_session_page_evidence(
+    ctx: CopilotContext,
+    *,
+    run_session_id: str,
+    current_url: str,
+) -> tuple[dict[str, Any] | None, str | None, str | None]:
+    """The discovery extractor reads ctx.browser_session_id per call, so the rebind targets the run
+    session and is restored in a finally. The browser layer can substitute a replacement session for a
+    closed one, so the id the capture actually observed is read back before the restore."""
+    prior_session_id = ctx.browser_session_id
+    ctx.browser_session_id = run_session_id
+    observed_session_id: str | None = run_session_id
+    observation_error: str | None = None
+    evidence: dict[str, Any] | None = None
+    try:
+        evidence, observation_error = await asyncio.wait_for(
+            _capture_composition_evidence(ctx, inspected_url=current_url, current_url=current_url),
+            timeout=_POST_RUN_REPAIR_CAPTURE_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        LOG.debug("Post-run run-session page capture failed", exc_info=True)
+        observation_error = observation_error or "Post-run page capture against the run session failed."
+        evidence = None
+    finally:
+        # Read before the restore, which is the only point where the substituted id is still visible.
+        observed_session_id = ctx.browser_session_id
+        ctx.browser_session_id = prior_session_id
+
+    if not observed_session_id:
+        # A mid-capture session create that fails clears the id, and an unknown source id grants
+        # post-run identity, so an unprovable source has to drop the packet rather than launder it.
+        return None, None, observation_error or "Post-run page capture lost its browser session."
+    return (evidence if isinstance(evidence, dict) else None), observed_session_id, observation_error
+
+
+def _post_run_page_source_session_id(ctx: CopilotContext, run_id: str | None) -> str | None:
+    """The run's own browser session, when a current-page look lands after a run that executed in a
+    different browser than the scout one."""
+    if not run_id:
+        return None
+    run_session_id = ctx.last_run_blocks_browser_session_id
+    if not run_session_id or run_session_id == ctx.browser_session_id:
+        return None
+    return run_session_id
+
+
+def _preserves_existing_post_run_page_evidence(
+    copilot_ctx: CopilotContext,
+    stamped: dict[str, Any],
+    *,
+    run_id: str,
+) -> bool:
+    if stamped.get("observed_after_workflow_run") is True and has_bounded_page_schema(stamped):
+        return False
+    return post_run_inspection_cleanly_matches(copilot_ctx.composition_page_evidence, run_id)
 
 
 def store_post_run_page_evidence(
@@ -513,15 +592,34 @@ def store_post_run_page_evidence(
     *,
     run_id: str,
     current_url: str,
-) -> dict[str, Any]:
-    stamped = {**evidence, "workflow_run_id": run_id, "observed_after_workflow_run": True}
+    source_browser_session_id: str | None,
+    run_browser_session_id: str | None,
+) -> tuple[dict[str, Any], bool]:
+    """Returns the freshly stamped packet and whether an existing same-run packet was preserved
+    instead of being replaced by it."""
+    stamped = stamp_page_evidence_provenance(
+        evidence,
+        source_browser_session_id=source_browser_session_id,
+        run_id=run_id,
+        run_browser_session_id=run_browser_session_id,
+    )
+    LOG.info(
+        "copilot_post_run_page_evidence_sourced",
+        run_id=run_id,
+        source_browser_session_id=source_browser_session_id,
+        run_browser_session_id=run_browser_session_id,
+        matched=source_browser_session_id == run_browser_session_id,
+        granted=stamped.get("observed_after_workflow_run") is True,
+    )
     if current_url and not stamped.get("current_url"):
         stamped["current_url"] = current_url
+    if _preserves_existing_post_run_page_evidence(copilot_ctx, stamped, run_id=run_id):
+        return stamped, True
     copilot_ctx.composition_page_evidence = stamped
     page_title = stamped.get("page_title")
     if isinstance(page_title, str) and page_title:
         _workflow_verification_evidence(copilot_ctx).page_title = page_title[:160]
-    return stamped
+    return stamped, False
 
 
 def _normalized_inspect_url(url: str | None) -> str | None:
@@ -582,10 +680,14 @@ async def _inspect_page_for_composition_impl(
         use_current_page=use_current_page,
     )
 
+    run_id = getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
     entry_url: str
     kind: str
+    run_page_source_session_id: str | None = None
+    observed_run_session_id: str | None = None
     if use_current_page:
-        current_url, _ = await _fallback_page_info(copilot_ctx)
+        run_page_source_session_id = _post_run_page_source_session_id(copilot_ctx, run_id)
+        current_url, _ = await _fallback_page_info(copilot_ctx, run_page_source_session_id)
         entry_url = current_url or "current_page"
         kind = "current_page"
     else:
@@ -620,7 +722,7 @@ async def _inspect_page_for_composition_impl(
     # handful of structured looks, and the turn's wall clock spent without understanding the page.
     # The calls stay counted for telemetry.
     evidence = None
-    html_error: str | None = None
+    observation_error: str | None = None
     with copilot_span(
         "inspect_page_for_composition",
         data={"target_url_kind": kind},
@@ -628,9 +730,14 @@ async def _inspect_page_for_composition_impl(
         if on_target_page:
             # current_page, or a URL target the agent is already on — capture without navigating.
             current_url = inspect_target_url or entry_url
-            evidence, html_error = await _capture_composition_evidence(
-                copilot_ctx, inspected_url=entry_url, current_url=current_url
-            )
+            if run_page_source_session_id:
+                evidence, observed_run_session_id, observation_error = await _read_run_session_page_evidence(
+                    copilot_ctx, run_session_id=run_page_source_session_id, current_url=current_url
+                )
+            else:
+                evidence, observation_error = await _capture_composition_evidence(
+                    copilot_ctx, inspected_url=entry_url, current_url=current_url
+                )
         else:
             nav_result = await _discovery_navigate(
                 copilot_ctx,
@@ -657,15 +764,15 @@ async def _inspect_page_for_composition_impl(
                 current_url = str(evidence.get("current_url") or entry_url)
             else:
                 current_url = _discovery_extract_current_url(nav_result, entry_url)
-                evidence, html_error = await _capture_composition_evidence(
+                evidence, observation_error = await _capture_composition_evidence(
                     copilot_ctx, inspected_url=entry_url, current_url=current_url
                 )
 
-    if html_error is not None:
+    if observation_error is not None:
         result = {
             "ok": False,
             "data": None,
-            "error": f"inspect_page_for_composition could not read page HTML: {html_error}",
+            "error": f"inspect_page_for_composition could not capture page evidence: {observation_error}",
         }
         record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
         return result
@@ -674,20 +781,33 @@ async def _inspect_page_for_composition_impl(
         result = {
             "ok": False,
             "data": None,
-            "error": "inspect_page_for_composition could not read page HTML.",
+            "error": "inspect_page_for_composition could not capture page evidence.",
         }
         record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
         return result
 
-    run_id = getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
     if isinstance(run_id, str) and run_id:
-        evidence = store_post_run_page_evidence(copilot_ctx, evidence, run_id=run_id, current_url=current_url)
-        _mark_post_run_page_observed(
-            copilot_ctx,
-            source_tool="inspect_page_for_composition",
-            url=current_url,
-            page_evidence=evidence,
+        source_browser_session_id = (
+            observed_run_session_id if run_page_source_session_id else copilot_ctx.browser_session_id
         )
+        evidence, preserved_stored_evidence = store_post_run_page_evidence(
+            copilot_ctx,
+            evidence,
+            run_id=run_id,
+            current_url=current_url,
+            source_browser_session_id=source_browser_session_id,
+            run_browser_session_id=copilot_ctx.last_run_blocks_browser_session_id,
+        )
+        # A capture too hollow or too foreign to store is also too weak to move the post-run
+        # observation marker; leaving the marker put keeps it describing the packet that is stored.
+        if not preserved_stored_evidence:
+            _mark_post_run_page_observed(
+                copilot_ctx,
+                source_tool="inspect_page_for_composition",
+                url=current_url,
+                page_evidence=evidence,
+                source_browser_session_id=source_browser_session_id,
+            )
     else:
         copilot_ctx.composition_page_evidence = evidence
 
@@ -705,7 +825,7 @@ async def _inspect_page_for_composition_impl(
         )
     reached_via = _inspection_reached_via(
         use_current_page=use_current_page,
-        post_run=bool(run_id),
+        post_run=evidence.get("observed_after_workflow_run") is True,
         earned_interaction=earned_interaction,
     )
     observation_step = _append_flow_evidence(copilot_ctx, evidence, reached_via=reached_via)

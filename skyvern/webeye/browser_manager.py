@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -59,6 +60,8 @@ class BrowserManager(Protocol):
         browser_session_id: str | None = None,
         organization_id: str | None = None,
     ) -> BrowserState: ...
+
+    def acquiring_session_runnable(self, runnable_id: str | None) -> AbstractAsyncContextManager[None]: ...
 
     def live_session_runnable_ids(self) -> set[str]:
         """Runnables holding a persistent session in this process — leased, or mid-acquisition — i.e.

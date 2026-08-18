@@ -50,6 +50,7 @@ class WorkflowRequestBody(BaseModel):
     browser_session_id: str | None = None
     browser_profile_id: str | None = None
     start_fresh_browser: bool = False
+    reuse_browser_session: bool | None = None
     max_screenshot_scrolls: MaxScreenshotScrolls = Field(default=None)
     max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
     extra_http_headers: dict[str, str] | None = None
@@ -192,6 +193,7 @@ class Workflow(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     persist_browser_session: bool = False
+    reuse_browser_session: bool = False
     mask_secrets: bool = False
     pin_saved_session_ip: bool = False
     browser_profile_id: str | None = None
@@ -287,6 +289,9 @@ class WorkflowRun(BaseModel):
     browser_seed_source: BrowserSeedSource | None = None
     browser_sink_profile_id: str | None = None
     start_fresh_browser: bool | None = None
+    reuse_browser_session: bool | None = None
+    # Internal admission identity. It can contain routing inputs and must never enter API payloads.
+    reuse_bound_key: str | None = Field(default=None, exclude=True)
     debug_session_id: str | None = None
     status: WorkflowRunStatus
     extra_http_headers: dict[str, str] | None = None
@@ -341,6 +346,29 @@ class WorkflowRun(BaseModel):
     @property
     def is_debug_session(self) -> bool:
         return self.debug_session_id is not None
+
+
+def resolve_reuse_browser_session(*, run_override: bool | None, workflow_default: bool) -> bool:
+    """Resolve browser-session reuse with the run override taking precedence."""
+    return workflow_default if run_override is None else run_override
+
+
+def should_acquire_reused_session(
+    *,
+    browser_session_id: str | None,
+    start_fresh_browser: bool | None,
+    run_override: bool | None,
+    workflow_default: bool,
+) -> bool:
+    """Whether this run should acquire its workflow-bound browser session."""
+    return (
+        browser_session_id is None
+        and not start_fresh_browser
+        and resolve_reuse_browser_session(
+            run_override=run_override,
+            workflow_default=workflow_default,
+        )
+    )
 
 
 def is_adaptive_caching_from_effective_state(

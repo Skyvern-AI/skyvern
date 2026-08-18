@@ -44,24 +44,46 @@ def record_span_exception(span: Any, exc: BaseException, *, set_error_status: bo
 
     Prefer this over ``span.record_exception`` everywhere: span events are exported with no
     logging processors in front of them, so ``str(exc)`` and the traceback reach the collector
-    verbatim. Caller-supplied attributes override the ones ``record_exception`` derives, which is
-    what lets the scrubbed text win.
+    verbatim.
     """
     # Lazy: this module is imported far earlier in boot than the copilot package.
     from skyvern.forge.sdk.copilot.secret_scrub import scrub_all_registered_from_text  # noqa: PLC0415
+    from skyvern.forge.sdk.forge_log import current_codeblock_log_redactor  # noqa: PLC0415
 
-    stacktrace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    message = scrub_all_registered_from_text(str(exc))
-    span.record_exception(
-        exc,
+    try:
+        exc_type = type(exc)
+        module = type.__getattribute__(exc_type, "__module__")
+        qualname = type.__getattribute__(exc_type, "__qualname__")
+        if type(module) is not str or type(qualname) is not str:
+            raise TypeError
+        exception_type = f"{module}.{qualname}" if module and module != "builtins" else qualname
+        message = str(exc)
+        traceback_value = BaseException.__getattribute__(exc, "__traceback__")
+        frames = "".join(traceback.format_tb(traceback_value))
+        stacktrace = f"Traceback (most recent call last):\n{frames}{exception_type}: {message}" if frames else message
+    except BaseException:
+        exception_type, message, stacktrace = "Exception", "", ""
+    redacted = [scrub_all_registered_from_text(value) for value in (exception_type, message, stacktrace)]
+    redactor = current_codeblock_log_redactor()
+    if redactor is not None:
+        try:
+            candidate = redactor(redacted)
+            redacted = candidate if isinstance(candidate, list) and len(candidate) == 3 else ["", "", ""]
+        except BaseException:
+            redacted = ["", "", ""]
+    exception_type, message, stacktrace = redacted
+    span.add_event(
+        "exception",
         attributes={
+            "exception.type": exception_type,
             "exception.message": message,
-            "exception.stacktrace": scrub_all_registered_from_text(stacktrace),
+            "exception.stacktrace": stacktrace,
+            "exception.escaped": "False",
         },
     )
     if set_error_status:
         # Same shape OTel's use_span would have written, minus the credential.
-        span.set_status(trace.Status(trace.StatusCode.ERROR, f"{type(exc).__name__}: {message}"))
+        span.set_status(trace.Status(trace.StatusCode.ERROR, f"{exception_type}: {message}"))
 
 
 @contextmanager
