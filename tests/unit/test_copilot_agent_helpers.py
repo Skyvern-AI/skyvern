@@ -79,6 +79,8 @@ from skyvern.forge.sdk.copilot.tools.completion import (
     _completion_verification_from_run_result,
 )
 from skyvern.forge.sdk.copilot.tools.credentials import (
+    _credential_ids_validation_error,
+    _credential_run_approval_blocker_signal,
     _credential_run_approval_error,
     _extract_credential_ids_for_labels,
 )
@@ -93,7 +95,8 @@ from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_blocks, workflow_credential_ids
 from skyvern.forge.sdk.routes.workflow_copilot import CHAT_HISTORY_CONTEXT_MESSAGES
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
@@ -493,6 +496,29 @@ workflow_definition:
                 "unresolved_names": ["confirmation_number"],
             },
         ) in info_calls
+
+    def test_runtime_repair_context_prompt_exposes_literal_page_location(self) -> None:
+        repair_context = CodeAuthoringRepairContext(
+            block_label="search_registry",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_failed",
+            current_origin="https://example.test",
+            current_url="https://example.test/search?layout=cards",
+            current_title="Search results",
+            observed_after_workflow_run=True,
+            page_result_summaries=["#results No matching records"],
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert "current_url: https://example.test/search?layout=cards" in prompt
+        assert "current_title: Search results" in prompt
+        assert "current_url_present" not in prompt
+        assert "current_title_present" not in prompt
 
     def test_missing_output_dependency_prompt_uses_available_outputs_not_workflow_parameters(self) -> None:
         repair_context = CodeAuthoringRepairContext(
@@ -1155,6 +1181,7 @@ class TestRequestPolicyInputGuardrail:
             organization_id="org-1",
             request_policy_handler=object(),
             previous_user_message="build the login workflow",
+            selected_connected_account_id="goac_selected",
         )
 
         guardrails = agent_module._build_copilot_input_guardrails(
@@ -1182,6 +1209,7 @@ class TestRequestPolicyInputGuardrail:
             config=None,
             prior_user_messages=policy_inputs.prior_user_messages,
             persisted_workflow_yaml=None,
+            selected_connected_account_id="goac_selected",
         )
 
     @pytest.mark.asyncio
@@ -3138,6 +3166,26 @@ workflow_definition:
         assert _credential_run_approval_error(["cred_bound"], policy) is None
         assert policy.resolved_credentials == []
 
+    def test_clicked_google_connection_is_run_approved_without_becoming_a_password_credential(self) -> None:
+        policy = RequestPolicy(
+            resolved_credentials=[],
+            run_approved_google_connection_ids=["goac_selected"],
+        )
+
+        assert _credential_run_approval_error(["goac_selected"], policy) is None
+        assert policy.resolved_credentials == []
+
+    def test_unclicked_google_connection_stays_unapproved(self) -> None:
+        policy = RequestPolicy(resolved_credentials=[])
+
+        signal = _credential_run_approval_blocker_signal(["goac_staged"], policy)
+
+        assert signal is not None
+        assert signal.internal_reason_code == "unapproved_google_connection_reference"
+        assert signal.recovery_hint == "ask_user_clarifying"
+        assert "goac_" not in signal.user_facing_reason
+        assert "unapproved_credential_reference" not in signal.user_facing_reason
+
     def test_credential_added_this_turn_stays_unapproved_for_a_run(self) -> None:
         policy = RequestPolicy(
             resolved_credentials=[],
@@ -3356,10 +3404,6 @@ workflow_definition:
             "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
             AsyncMock(return_value=workflow),
         )
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.tools.workflow_update.resolve_copilot_created_by_stamp",
-            AsyncMock(return_value="copilot"),
-        )
         workflow_service = MagicMock()
         workflow_service.update_workflow_definition = AsyncMock()
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.app.WORKFLOW_SERVICE", workflow_service)
@@ -3438,6 +3482,97 @@ class TestRunBlocksCredentialApproval:
             credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=credentials or [])),
             organizations=SimpleNamespace(get_organization=get_organization),
         )
+
+    @pytest.mark.asyncio
+    async def test_run_blocks_threads_a_resumed_frontier_into_the_browser_that_holds_its_state(
+        self, monkeypatch
+    ) -> None:
+        # The planner proved the resume against another browser, so the run has to go there while
+        # the chat keeps its own. Getting this wrong silently reroutes which browser a run drives.
+        from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
+        from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+
+        workflow = self._workflow()
+        organization = Organization(
+            organization_id="org-1",
+            organization_name="org",
+            created_at=datetime.now(timezone.utc),
+            modified_at=datetime.now(timezone.utc),
+        )
+        database = self._db(workflow=workflow, organization_lookup=organization)
+        dispatched: dict[str, object] = {}
+
+        async def prepare_workflow(**kwargs: object) -> object:
+            dispatched["browser_session_id"] = kwargs["workflow_request"].browser_session_id
+            raise RuntimeError("stop after the session choice")
+
+        async def never_mint(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("a fresh session was minted for a carried resume")
+
+        database.workflow_params = SimpleNamespace(get_workflow_output_parameters=AsyncMock(return_value=[]))
+        from skyvern.services import workflow_service as workflow_service_module
+
+        monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(get_workflow_parameters=AsyncMock(return_value=[])),
+        )
+        monkeypatch.setattr(workflow_service_module, "prepare_workflow", prepare_workflow)
+        monkeypatch.setattr(run_execution_module, "ensure_browser_session", never_mint)
+
+        ctx = _ctx(browser_session_id="pbs_chat")
+        ctx.frontier_resume_session_id = "pbs_carried"
+
+        with pytest.raises(RuntimeError, match="stop after the session choice"):
+            await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
+
+        assert dispatched["browser_session_id"] == "pbs_carried"
+        assert ctx.browser_session_id == "pbs_chat"
+        assert ctx.frontier_resume_session_id is None
+
+    @pytest.mark.asyncio
+    async def test_run_blocks_uses_the_resumed_browser_even_when_the_chat_has_none(self, monkeypatch) -> None:
+        # A chat that never opened its own browser must not cause a proven resume target to be
+        # dropped in favour of a newly minted one — that is the replay this whole path avoids.
+        from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
+        from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+        from skyvern.services import workflow_service as workflow_service_module
+
+        workflow = self._workflow()
+        organization = Organization(
+            organization_id="org-1",
+            organization_name="org",
+            created_at=datetime.now(timezone.utc),
+            modified_at=datetime.now(timezone.utc),
+        )
+        database = self._db(workflow=workflow, organization_lookup=organization)
+        database.workflow_params = SimpleNamespace(get_workflow_output_parameters=AsyncMock(return_value=[]))
+        dispatched: dict[str, object] = {}
+
+        async def prepare_workflow(**kwargs: object) -> object:
+            dispatched["browser_session_id"] = kwargs["workflow_request"].browser_session_id
+            raise RuntimeError("stop after the session choice")
+
+        async def never_mint(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("a fresh session was minted instead of using the resumed browser")
+
+        monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(get_workflow_parameters=AsyncMock(return_value=[])),
+        )
+        monkeypatch.setattr(workflow_service_module, "prepare_workflow", prepare_workflow)
+        monkeypatch.setattr(run_execution_module, "ensure_browser_session", never_mint)
+
+        ctx = _ctx(browser_session_id=None)
+        ctx.frontier_resume_session_id = "pbs_carried"
+
+        with pytest.raises(RuntimeError, match="stop after the session choice"):
+            await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
+
+        assert dispatched["browser_session_id"] == "pbs_carried"
 
     @pytest.mark.asyncio
     async def test_run_blocks_rejects_unapproved_workflow_credential_before_dispatch(self, monkeypatch) -> None:
@@ -3660,6 +3795,106 @@ class TestRunBlocksCredentialApproval:
         assert result["error"] == "Organization not found"
         database.credentials.get_credentials_by_ids.assert_awaited_once_with(["cred_resolved"], organization_id="org-1")
         database.organizations.get_organization.assert_awaited_once_with(organization_id="org-1")
+
+    @pytest.mark.asyncio
+    async def test_unapproved_google_connection_halts_with_verified_account_rows(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
+
+        workflow = self._workflow(
+            parameters=[],
+            blocks=[{"label": "login", "block_type": "google_sheets_read", "credential_id": "goac_staged"}],
+        )
+        database = self._db(workflow=workflow)
+        monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
+        monkeypatch.setattr(
+            credentials_module.google_oauth_service,
+            "get_visible_credentials_for_org",
+            AsyncMock(
+                return_value=[
+                    SimpleNamespace(
+                        id="goac_choice",
+                        credential_name="Google Sheets",
+                        state="active",
+                        email_address=None,
+                    )
+                ]
+            ),
+        )
+        ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[]))
+
+        result = await _run_blocks_and_collect_debug(
+            {"block_labels": ["login"], "parameters": {}},
+            ctx,
+        )
+
+        assert result["ok"] is False
+        assert "goac_" not in result["error"]
+        assert "unapproved_credential_reference" not in result["error"]
+        assert ctx.blocker_signal is not None
+        assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
+        assert ctx.connected_account_recovery_choices == [
+            ConnectedAccountChoice(
+                connection_id="goac_choice",
+                name="Google Sheets",
+                state="active",
+                email_address=None,
+            )
+        ]
+        database.organizations.get_organization.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_clicked_google_connection_uses_oauth_validation_without_password_lookup(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
+
+        workflow = self._workflow(
+            parameters=[],
+            blocks=[{"label": "login", "block_type": "google_sheets_read", "credential_id": "goac_selected"}],
+        )
+        database = self._db(workflow=workflow, organization_lookup=None)
+        active_google_connections = AsyncMock(return_value=[SimpleNamespace(id="goac_selected")])
+        monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
+        monkeypatch.setattr(
+            credentials_module.google_oauth_service,
+            "get_credentials_for_org",
+            active_google_connections,
+        )
+
+        ctx = _ctx(
+            request_policy=RequestPolicy(
+                resolved_credentials=[],
+                run_approved_google_connection_ids=["goac_selected"],
+            )
+        )
+        result = await _run_blocks_and_collect_debug(
+            {"block_labels": ["login"], "parameters": {}},
+            ctx,
+        )
+
+        assert result["error"] == "Organization not found"
+        active_google_connections.assert_awaited_once_with("org-1")
+        database.credentials.get_credentials_by_ids.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_inactive_google_connection_routes_to_reconnect_without_raw_id(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
+
+        monkeypatch.setattr(
+            credentials_module.google_oauth_service,
+            "get_credentials_for_org",
+            AsyncMock(return_value=[]),
+        )
+        database = SimpleNamespace(
+            credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(side_effect=AssertionError("called")))
+        )
+        monkeypatch.setattr(credentials_module.app, "DATABASE", database)
+
+        error = await _credential_ids_validation_error(["goac_inactive"], _ctx())
+
+        assert error is not None
+        assert "reconnect" in error.lower()
+        assert "Integrations" in error
+        assert "goac_inactive" not in error
+        assert "Credentials UI" not in error
 
 
 class TestRunBlocksCredentialApprovalFrontierScope:

@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
 from skyvern.forge.agent_functions import CopilotEntrypointCandidate, CopilotSiteOriginAssociation
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    COMPOSITION_STRIPPED_HTML_EXPRESSION,
+    COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
+    COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
+)
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _ground_user_provided_sites
 from skyvern.forge.sdk.copilot.runtime import PendingBrowserInteractionObservation
 from skyvern.forge.sdk.copilot.tools import (
@@ -39,8 +45,39 @@ class _Ctx:
         self.pending_browser_interaction_observation = None
         self.workflow_verification_evidence = WorkflowVerificationEvidence()
         self.browser_session_id = None
+        self.last_run_blocks_browser_session_id = None
         self.request_policy = None
         self.org_credentials_for_turn = None
+
+
+def _structured_search_page(*, with_obstruction: bool = False) -> dict[str, Any]:
+    return {
+        "page_title": "Results",
+        "body_has_markup": True,
+        "forms": [
+            {
+                "selector": "form",
+                "fields": [
+                    {
+                        "name": "firstName",
+                        "type": "text",
+                        "selector": 'input[name="firstName"]',
+                    }
+                ],
+                "submit_controls": [{"text": "Search", "type": "submit", "selector": "button"}],
+            }
+        ],
+        "visual_obstruction_candidates": [
+            {
+                "source": "computed_style",
+                "position": "fixed",
+                "coverage": "viewport",
+                "has_visible_controls": True,
+            }
+        ]
+        if with_obstruction
+        else [],
+    }
 
 
 class _FailingNavigateServer:
@@ -199,8 +236,8 @@ class _CurrentPageServer:
                 },
             }
         if tool_name == "skyvern_evaluate":
-            assert "getComputedStyle" in arguments["expression"]
-            return {"ok": True, "data": {"result": []}}
+            assert arguments["expression"] == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+            return {"ok": True, "data": {"result": _structured_search_page()}}
         raise AssertionError(f"unexpected tool: {tool_name}")
 
 
@@ -238,20 +275,8 @@ class _GenericBarrierServer:
                 },
             }
         if tool_name == "skyvern_evaluate":
-            assert "getComputedStyle" in arguments["expression"]
-            return {
-                "ok": True,
-                "data": {
-                    "result": [
-                        {
-                            "source": "computed_style",
-                            "position": "fixed",
-                            "coverage": "viewport",
-                            "has_visible_controls": True,
-                        }
-                    ]
-                },
-            }
+            assert arguments["expression"] == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+            return {"ok": True, "data": {"result": _structured_search_page(with_obstruction=True)}}
         if tool_name == "skyvern_screenshot":
             assert arguments == {"inline": True}
             return {"ok": True, "data": {"screenshot_base64": "aGVsbG8="}}
@@ -277,8 +302,8 @@ class _TargetThenCurrentPageServer:
                 },
             }
         if tool_name == "skyvern_evaluate":
-            assert "getComputedStyle" in arguments["expression"]
-            return {"ok": True, "data": {"result": []}}
+            assert arguments["expression"] == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+            return {"ok": True, "data": {"result": _structured_search_page()}}
         raise AssertionError(f"unexpected tool: {tool_name}")
 
 
@@ -522,7 +547,7 @@ async def test_inspect_current_page_uses_existing_browser_page(monkeypatch: pyte
     ctx.last_run_blocks_workflow_run_id = "wr_123"  # type: ignore[attr-defined]
     ctx.composition_page_evidence = None  # type: ignore[attr-defined]
 
-    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
     monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
@@ -530,8 +555,7 @@ async def test_inspect_current_page_uses_existing_browser_page(monkeypatch: pyte
     result = await _inspect_page_for_composition_impl(ctx, "current_page")
 
     assert result["ok"] is True
-    # structured extractor probe (None on the [] mock) -> get_html fallback -> obstruction-candidates probe
-    assert server.calls == ["skyvern_evaluate", "skyvern_get_html", "skyvern_evaluate"]
+    assert server.calls == ["skyvern_evaluate"]
     assert result["data"]["current_url"] == "https://www.example.com/results"
     assert result["data"]["workflow_run_id"] == "wr_123"
     assert result["data"]["observed_after_workflow_run"] is True
@@ -549,7 +573,7 @@ async def test_post_run_current_page_inspection_budget_bypass_does_not_consume_c
     ctx.last_test_ok = True  # type: ignore[attr-defined]
     ctx.composition_page_evidence = None  # type: ignore[attr-defined]
 
-    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
     monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
@@ -570,7 +594,7 @@ async def test_current_page_inspection_without_earned_interaction_is_not_click_r
     server = _CurrentPageServer()
     ctx = _Ctx(server)
 
-    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
     monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
@@ -593,7 +617,7 @@ async def test_current_page_inspection_after_browser_action_is_click_reached_onc
         url="https://www.example.com/results",
     )
 
-    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
     monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
@@ -693,7 +717,7 @@ async def test_target_url_inspection_clears_pending_interaction_credit(
     assert target_result["reached_via"] == "navigate"
     assert ctx.pending_browser_interaction_observation is None
 
-    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
     monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
@@ -759,7 +783,13 @@ class _StrippedHtmlServer:
         if tool_name == "skyvern_get_html":
             return {"ok": True, "data": {"size_capped": True}}
         if tool_name == "skyvern_evaluate":
-            return {"ok": True, "data": {"result": self._stripped}}
+            expression = arguments["expression"]
+            if expression == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION:
+                return {"ok": True, "data": {"result": {"page_title": "Loading", "forms": []}}}
+            if expression == COMPOSITION_STRIPPED_HTML_EXPRESSION:
+                return {"ok": True, "data": {"result": self._stripped}}
+            assert expression == COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION
+            return {"ok": True, "data": {"result": []}}
         raise AssertionError(f"unexpected tool: {tool_name}")
 
 
@@ -779,7 +809,7 @@ async def test_composition_get_html_flags_truncation_when_stripped_body_hits_cap
 
 
 @pytest.mark.asyncio
-async def test_capture_composition_evidence_warns_when_html_sliced_at_cap() -> None:
+async def test_capture_composition_evidence_warns_when_html_sliced_at_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     from skyvern.forge.sdk.copilot.tools import _COMPOSITION_STRIPPED_HTML_MAX_CHARS, _capture_composition_evidence
 
     # A real form near the top yields bounded schema (no hollow-recapture loop); the trailing
@@ -788,6 +818,7 @@ async def test_capture_composition_evidence_warns_when_html_sliced_at_cap() -> N
         "<body><form><input name='firstName'><button>Search</button></form>"
         + "x" * _COMPOSITION_STRIPPED_HTML_MAX_CHARS
     )
+    monkeypatch.setattr(tools_module.composition_capture.asyncio, "sleep", AsyncMock())
     evidence, error = await _capture_composition_evidence(
         _Ctx(_StrippedHtmlServer(body)),
         inspected_url="https://www.example.com/search",

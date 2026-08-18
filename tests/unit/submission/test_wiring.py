@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.config import Settings
+from skyvern.config import Settings, settings
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -45,6 +45,28 @@ def _workflow_run() -> MagicMock:
     return workflow_run
 
 
+@pytest.mark.asyncio
+async def test_workflow_debug_artifacts_use_step_archive_when_hmac_signing_is_configured() -> None:
+    service = WorkflowService()
+    browser_state = _browser_state()
+    last_task = _task()
+    last_step = _step()
+    workflow = _workflow()
+    workflow_run = _workflow_run()
+    persist_archive = AsyncMock()
+
+    with (
+        patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", '{"current_kid":"test"}'),
+        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+    ):
+        mock_app.DATABASE.tasks.get_latest_step = AsyncMock(return_value=last_step)
+        service._persist_debug_artifacts_bundled = persist_archive  # type: ignore[method-assign]
+
+        await service.persist_debug_artifacts(browser_state, last_task, workflow, workflow_run)
+
+    persist_archive.assert_awaited_once_with(browser_state, last_step, workflow, workflow_run)
+
+
 def test_submission_signal_shadow_setting_defaults_off() -> None:
     assert Settings.model_fields["SKYVERN_SUBMISSION_SIGNAL_SHADOW"].default is False
 
@@ -73,7 +95,7 @@ async def test_task_cleanup_does_not_schedule_submission_shadow_when_flag_is_off
         mock_app.BROWSER_MANAGER.get_video_artifacts = AsyncMock(return_value=[])
         mock_app.BROWSER_MANAGER.get_har_data = AsyncMock(return_value=b'{"log":{"entries":[]}}')
         mock_app.BROWSER_MANAGER.get_browser_console_log = AsyncMock(return_value=b"")
-        mock_app.ARTIFACT_MANAGER.create_artifact = AsyncMock()
+        mock_app.ARTIFACT_MANAGER.create_task_archive = AsyncMock()
 
         await agent.cleanup_browser_and_create_artifacts(
             close_browser_on_completion=True,
@@ -120,7 +142,7 @@ async def test_task_cleanup_schedules_submission_shadow_with_the_har_context() -
         mock_app.BROWSER_MANAGER.get_video_artifacts = AsyncMock(return_value=[])
         mock_app.BROWSER_MANAGER.get_har_data = AsyncMock(side_effect=get_har_data)
         mock_app.BROWSER_MANAGER.get_browser_console_log = AsyncMock(side_effect=get_browser_console_log)
-        mock_app.ARTIFACT_MANAGER.create_artifact = AsyncMock()
+        mock_app.ARTIFACT_MANAGER.create_task_archive = AsyncMock()
 
         await agent.cleanup_browser_and_create_artifacts(
             close_browser_on_completion=True,
@@ -290,7 +312,7 @@ async def test_wiring_persists_har_when_shadow_scheduler_setup_fails() -> None:
         agent_app.BROWSER_MANAGER.get_video_artifacts = AsyncMock(return_value=[])
         agent_app.BROWSER_MANAGER.get_har_data = AsyncMock(return_value=har_data)
         agent_app.BROWSER_MANAGER.get_browser_console_log = AsyncMock(return_value=b"")
-        agent_app.ARTIFACT_MANAGER.create_artifact = AsyncMock()
+        agent_app.ARTIFACT_MANAGER.create_task_archive = AsyncMock()
         workflow_app.BROWSER_MANAGER.get_browser_console_log = AsyncMock(return_value=b"")
         workflow_app.BROWSER_MANAGER.get_har_data = AsyncMock(return_value=har_data)
         workflow_app.ARTIFACT_MANAGER.create_artifact = AsyncMock()
@@ -300,8 +322,9 @@ async def test_wiring_persists_har_when_shadow_scheduler_setup_fails() -> None:
         await service.persist_har_data(browser_state, last_step, workflow, workflow_run)
         await service._persist_debug_artifacts_bundled(browser_state, last_step, workflow, workflow_run)
 
-    agent_app.ARTIFACT_MANAGER.create_artifact.assert_awaited_once_with(
-        step=last_step, artifact_type=ArtifactType.HAR, data=har_data
+    agent_app.ARTIFACT_MANAGER.create_task_archive.assert_awaited_once_with(
+        step=last_step,
+        entries={"har.har": (ArtifactType.HAR, har_data)},
     )
     workflow_app.ARTIFACT_MANAGER.create_artifact.assert_awaited_once_with(
         step=last_step, artifact_type=ArtifactType.HAR, data=har_data

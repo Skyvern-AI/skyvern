@@ -76,7 +76,7 @@ def artifact_redaction_setup(
         "WORKFLOW_CONTEXT_MANAGER",
         workflow_context_manager_factory(
             workflow_run_id="wr_redact",
-            mask_secrets=False,
+            mask_secrets=True,
             secrets={"password": "secret-value"},
         ),
     )
@@ -99,6 +99,35 @@ async def test_create_artifact_redacts_textual_artifact_data(artifact_redaction_
     await manager.wait_for_upload_aiotasks([step.task_id])
 
     assert artifact_redaction_setup.stored[0][1] == f"<html>{REDACTED_SECRET_PLACEHOLDER}</html>".encode()
+
+
+@pytest.mark.asyncio
+async def test_create_artifact_redacts_registered_bare_task_secret(
+    artifact_redaction_setup: _FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(artifact_manager_module.app, "WORKFLOW_CONTEXT_MANAGER", WorkflowContextManager())
+    manager = ArtifactManager()
+    step = create_fake_step(TEST_STEP_ID)
+    context = SkyvernContext(
+        organization_id=TEST_ORGANIZATION_ID,
+        task_id=step.task_id,
+        workflow_run_id=None,
+    )
+    context.register_secret_value("482913")
+    skyvern_context.set(context)
+
+    await manager.create_artifact(
+        step=step,
+        artifact_type=ArtifactType.LLM_REQUEST,
+        data=b'{"role": "tool", "content": "verification_code: 482913"}',
+    )
+    await manager.wait_for_upload_aiotasks([step.task_id])
+
+    artifact, stored = artifact_redaction_setup.stored[0]
+    assert artifact.workflow_run_id is None
+    assert b"482913" not in stored
+    assert REDACTED_SECRET_PLACEHOLDER.encode() in stored
 
 
 @pytest.mark.asyncio
@@ -136,7 +165,7 @@ async def test_create_artifact_redacts_using_artifact_workflow_run_id_without_co
         "WORKFLOW_CONTEXT_MANAGER",
         workflow_context_manager_factory(
             workflow_run_id="wr_redact",
-            mask_secrets=False,
+            mask_secrets=True,
             secrets={"password": "secret-value"},
         ),
     )
@@ -219,7 +248,7 @@ async def test_create_artifact_redacts_har_structured_fields_with_empty_secret_s
 
 
 @pytest.mark.asyncio
-async def test_create_artifact_redacts_har_when_workflow_opted_out(
+async def test_create_artifact_leaves_har_unchanged_when_workflow_opted_out(
     artifact_redaction_setup: _FakeStorage,
     monkeypatch: pytest.MonkeyPatch,
     workflow_context_manager_factory: Callable[..., WorkflowContextManager],
@@ -236,6 +265,4 @@ async def test_create_artifact_redacts_har_when_workflow_opted_out(
     await manager.create_artifact(step=step, artifact_type=ArtifactType.HAR, data=har_data)
     await manager.wait_for_upload_aiotasks([step.task_id])
 
-    stored = artifact_redaction_setup.stored[0][1]
-    assert REDACTED_SECRET_PLACEHOLDER.encode() in stored
-    assert b"Bearer token" not in stored
+    assert artifact_redaction_setup.stored[0][1] == har_data

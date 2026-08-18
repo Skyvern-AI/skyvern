@@ -943,11 +943,11 @@ async def wrapper({default_args}):
         assert (open_attempts, created_pages) == (1, 0)
         assert result.success is False
         assert result.status == BlockStatus.failed
-        assert result.failure_reason == f"{CODE_BLOCK_TAB_OPEN_FAILURE_REASON} (RuntimeError)"
+        assert result.failure_reason == CODE_BLOCK_TAB_OPEN_FAILURE_REASON
         assert result.failure_reason != "No page found to run the code block"
 
     @pytest.mark.asyncio
-    async def test_execute_reports_the_driver_error_name_when_the_tab_cannot_open(
+    async def test_execute_does_not_relay_the_driver_error_name_when_the_tab_cannot_open(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Playwright surfaces most driver failures as its base Error class, whose .name carries
@@ -960,7 +960,8 @@ async def wrapper({default_args}):
         result, _, _ = await self._execute_against_tabless_session(monkeypatch, open_page_error=driver_error)
 
         assert result.success is False
-        assert result.failure_reason == f"{CODE_BLOCK_TAB_OPEN_FAILURE_REASON} (TypeError)"
+        assert driver_error.name == "TypeError"
+        assert result.failure_reason == CODE_BLOCK_TAB_OPEN_FAILURE_REASON
 
     def test_poc_blocked_at_is_safe_code_gate(self) -> None:
         """The PoC payload is rejected before exec() is ever called."""
@@ -1771,6 +1772,8 @@ class TestCodeBlockOtpNoLeak:
         assert result.failure_reason is not None
         assert expected_code not in result.failure_reason
         assert _RFC_TOTP_SEED not in result.failure_reason
+        # Masking the secret must not cost the run the cause of its own failure (SKY-14294).
+        assert result.failure_reason == "Failed to execute code block. Reason: Exception: *****"
 
     @pytest.mark.asyncio
     async def test_legacy_totp_not_leaked_in_failure_reason(self, monkeypatch: pytest.MonkeyPatch) -> None:

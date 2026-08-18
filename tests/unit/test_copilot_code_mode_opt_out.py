@@ -28,7 +28,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     _resolve_copilot_code_available,
     _should_emit_copilot_code_mode_opt_out,
 )
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 
 
@@ -199,6 +199,14 @@ def test_capture_copilot_code_mode_opt_out_skips_non_transition(monkeypatch: pyt
 
 
 def test_build_recoverable_route_agent_result_sets_failure_turn_outcome() -> None:
+    choices = [
+        ConnectedAccountChoice(
+            connection_id="goac_1",
+            name="Google Sheets",
+            state="active",
+            email_address="first@example.test",
+        )
+    ]
     agent_result, failure = _build_recoverable_route_agent_result(
         RuntimeError("boom"),
         workflow_modified=False,
@@ -206,12 +214,21 @@ def test_build_recoverable_route_agent_result_sets_failure_turn_outcome() -> Non
         global_llm_context=None,
         turn_id="turn-error",
         turn_index=2,
+        prior_turn_outcome=TurnOutcome(
+            response_kind=ResponseKind.CLARIFY,
+            connected_account_choices=choices,
+        ),
     )
 
     assert agent_result.turn_outcome is not None
     assert agent_result.turn_outcome.response_kind is ResponseKind.RECOVER
     assert agent_result.turn_outcome.reason_code == failure.failure_kind
     assert agent_result.turn_outcome.terminal_reason == COPILOT_RECOVERABLE_FAILURE_TERMINAL_REASON
+    assert agent_result.turn_outcome.connected_account_choices == choices
+    assert agent_result.narrative_payload is not None
+    assert agent_result.narrative_payload["connectedAccountChoices"] == [
+        choice.model_dump(mode="json") for choice in choices
+    ]
     assert _reason_category_for_copilot_code_mode_opt_out(agent_result.turn_outcome) == "failure"
 
 

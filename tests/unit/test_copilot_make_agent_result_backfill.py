@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.context import (
     CopilotContext,
     StructuredContext,
 )
+from skyvern.forge.sdk.copilot.google_connection_notice import GoogleConnectionNotice
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage, WorkflowCopilotChatSender
@@ -72,6 +73,35 @@ def test_backfill_tolerates_turn_outcome_none() -> None:
     result = _result(_ctx(), turn_outcome=None, narrative_payload=_payload())
     assert result.narrative_payload is not None
     assert "responseKind" not in result.narrative_payload
+
+
+def test_backfill_adds_google_connection_notices_to_terminal_payload() -> None:
+    ctx = _ctx()
+    ctx.google_connection_notices = [
+        GoogleConnectionNotice(
+            connectionId="goac_needs_reconnect",
+            displayName="Sheets account",
+            condition="unusable",
+        )
+    ]
+
+    result = _result(ctx, turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=_payload())
+
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["googleConnectionNotices"] == [
+        {
+            "provider": "google",
+            "connectionId": "goac_needs_reconnect",
+            "displayName": "Sheets account",
+            "condition": "unusable",
+        }
+    ]
+
+
+def test_backfill_omits_empty_google_connection_notices() -> None:
+    result = _result(_ctx(), turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=_payload())
+    assert result.narrative_payload is not None
+    assert "googleConnectionNotices" not in result.narrative_payload
 
 
 @pytest.mark.parametrize(

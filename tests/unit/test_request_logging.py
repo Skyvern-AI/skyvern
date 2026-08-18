@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+import typing
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
-from starlette.requests import ClientDisconnect
+from starlette.requests import ClientDisconnect, Request
+from starlette.types import ASGIApp, Receive, Scope, Send
 
-from skyvern.forge import request_logging
+from skyvern.forge import api_app, request_logging
 from skyvern.forge.log_redaction import (
     REDACTED,
     SENSITIVE_FIELDS,
@@ -19,10 +23,12 @@ from skyvern.forge.log_redaction import (
 from skyvern.forge.request_logging import (
     _BINARY_PLACEHOLDER,
     _MAX_BODY_LENGTH,
+    RequestLoggingMiddleware,
     _client_ip_from_headers,
     _is_loggable_content_type,
     _sanitize_body,
     _sanitize_response_body,
+    log_raw_request_exception,
     log_raw_request_middleware,
 )
 
@@ -539,9 +545,27 @@ class TestSanitizeBody:
 # ---------------------------------------------------------------------------
 
 
-def _make_app() -> FastAPI:
+class _ScopeCopyingMiddleware:
+    """Models the ASGI scope rewrites used by the cloud MCP routes."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["path"].startswith("/mcp"):
+            scope = dict(scope)
+        await self.app(scope, receive, send)
+
+
+def _make_app(unhandled_exception_status: int = 500) -> FastAPI:
     app = FastAPI()
-    app.middleware("http")(log_raw_request_middleware)
+    app.add_middleware(RequestLoggingMiddleware)
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected_exception(request: Request, exc: Exception) -> JSONResponse:
+        response = JSONResponse(status_code=unhandled_exception_status, content={"detail": type(exc).__name__})
+        log_raw_request_exception(response.status_code)
+        return response
 
     @app.get("/heartbeat")
     async def heartbeat() -> dict:
@@ -572,9 +596,25 @@ def _make_app() -> FastAPI:
     async def get_totp() -> dict:
         return {"code": "123456", "content": "Your code is 123456"}
 
+    app.state.boom_error = ValueError("kaboom")
+
     @app.get("/boom")
     async def boom() -> dict:
-        raise ValueError("kaboom")
+        raise app.state.boom_error
+
+    @app.get("/mcp/boom")
+    async def mcp_boom() -> dict:
+        raise app.state.boom_error
+
+    app.state.stream_error = ValueError("stream failed")
+
+    @app.post("/stream-error")
+    async def stream_error() -> StreamingResponse:
+        async def body() -> typing.AsyncGenerator[bytes]:
+            yield b"first event\\n\\n"
+            raise app.state.stream_error
+
+        return StreamingResponse(body(), media_type="text/event-stream")
 
     return app
 
@@ -589,6 +629,64 @@ def log_mock(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
 
 
 class TestMiddlewareLogVolume:
+    def test_scope_rewrite_keeps_unhandled_exception_logging(self, log_mock: MagicMock) -> None:
+        app = _make_app()
+        app.add_middleware(_ScopeCopyingMiddleware)
+
+        response = TestClient(app, raise_server_exceptions=False).get("/mcp/boom")
+
+        assert response.status_code == 500
+        log_mock.error.assert_called_once()
+        assert log_mock.error.call_args.args[0] == "api.raw_request"
+        assert log_mock.error.call_args.kwargs["status_code"] == response.status_code
+
+    def test_api_app_logs_unhandled_exception_with_its_500_response(
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(api_app, "LOG", MagicMock())
+        app = api_app.create_api_app()
+
+        @app.get("/_test_request_logging_boom")
+        async def boom() -> None:
+            raise ValueError("kaboom")
+
+        response = TestClient(app, raise_server_exceptions=False).get("/_test_request_logging_boom")
+
+        assert response.status_code == 500
+        log_mock.error.assert_called_once()
+        assert log_mock.error.call_args.args[0] == "api.raw_request"
+        assert log_mock.error.call_args.kwargs["status_code"] == response.status_code
+
+    def test_api_app_logs_exception_across_outer_base_http_task_boundary(
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def outer_base_http_middleware(
+            request: Request, call_next: typing.Callable[[Request], typing.Awaitable[Response]]
+        ) -> Response:
+            return await call_next(request)
+
+        def configure_api_app(app: FastAPI) -> None:
+            app.middleware("http")(outer_base_http_middleware)
+
+        monkeypatch.setattr(api_app, "LOG", MagicMock())
+        monkeypatch.setattr(
+            api_app,
+            "start_forge_app",
+            lambda: SimpleNamespace(setup_api_app=configure_api_app),
+        )
+        app = api_app.create_api_app()
+
+        @app.get("/_test_request_logging_outer_base_http_boom")
+        async def boom() -> None:
+            raise ValueError("kaboom")
+
+        response = TestClient(app, raise_server_exceptions=False).get("/_test_request_logging_outer_base_http_boom")
+
+        assert response.status_code == 500
+        log_mock.error.assert_called_once()
+        assert log_mock.error.call_args.args[0] == "api.raw_request"
+        assert log_mock.error.call_args.kwargs["status_code"] == response.status_code
+
     def test_action_log_request_and_response_bodies_are_fully_redacted(self, log_mock: MagicMock) -> None:
         client = TestClient(_make_app())
         secret = "sk-test-action-log-secret"
@@ -637,6 +735,15 @@ class TestMiddlewareLogVolume:
         assert response.status_code == 200
         log_mock.info.assert_called_once()
         assert log_mock.info.call_args.args[0] == "api.raw_request"
+        assert log_mock.info.call_count + log_mock.warning.call_count + log_mock.error.call_count == 1
+
+    def test_successful_post_survives_log_failure(self, log_mock: MagicMock) -> None:
+        log_mock.info.side_effect = RuntimeError("log sink unavailable")
+
+        response = TestClient(_make_app()).post("/tasks")
+
+        assert response.status_code == 200
+        log_mock.info.assert_called_once()
 
     def test_failed_get_is_logged_as_warning(self, log_mock: MagicMock) -> None:
         client = TestClient(_make_app())
@@ -675,12 +782,71 @@ class TestMiddlewareLogVolume:
         assert "request-secret" not in repr(logged)
         assert "response-secret" not in repr(logged)
 
-    def test_exception_path_is_logged_as_error(self, log_mock: MagicMock) -> None:
-        client = TestClient(_make_app(), raise_server_exceptions=False)
+    @pytest.mark.parametrize("unhandled_exception_status", [500, 503])
+    def test_exception_path_logs_the_status_received_by_the_client(
+        self, log_mock: MagicMock, unhandled_exception_status: int
+    ) -> None:
+        client = TestClient(_make_app(unhandled_exception_status), raise_server_exceptions=False)
         response = client.get("/boom")
-        assert response.status_code == 500
+        assert response.status_code == unhandled_exception_status
         log_mock.error.assert_called_once()
         assert log_mock.error.call_args.args[0] == "api.raw_request"
+        assert log_mock.error.call_args.kwargs["status_code"] == response.status_code
+
+    def test_exception_path_reraises_the_original_error_if_logging_fails(self, log_mock: MagicMock) -> None:
+        log_mock.error.side_effect = RuntimeError("log sink unavailable")
+        app = _make_app()
+        client = TestClient(app)
+
+        with pytest.raises(ValueError, match="kaboom") as raised:
+            client.get("/boom")
+
+        assert raised.value is app.state.boom_error
+        log_mock.error.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_partially_started_mutating_stream_logs_once_with_client_status(self, log_mock: MagicMock) -> None:
+        app = _make_app()
+        messages: list[dict[str, typing.Any]] = []
+        request_sent = False
+
+        async def receive() -> dict[str, typing.Any]:
+            nonlocal request_sent
+            if not request_sent:
+                request_sent = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            return {"type": "http.disconnect"}
+
+        async def send(message: dict[str, typing.Any]) -> None:
+            messages.append(message)
+
+        with pytest.raises(ValueError) as raised:
+            await app(
+                {
+                    "type": "http",
+                    "asgi": {"version": "3.0", "spec_version": "2.4"},
+                    "http_version": "1.1",
+                    "method": "POST",
+                    "scheme": "http",
+                    "path": "/stream-error",
+                    "raw_path": b"/stream-error",
+                    "query_string": b"",
+                    "root_path": "",
+                    "headers": [],
+                    "client": ("testclient", 50000),
+                    "server": ("testserver", 80),
+                    "extensions": {},
+                },
+                receive,
+                send,
+            )
+
+        assert raised.value is app.state.stream_error
+        assert messages[0]["status"] == 200
+        log_mock.error.assert_called_once()
+        assert log_mock.error.call_args.args[0] == "api.raw_request"
+        assert log_mock.error.call_args.kwargs["status_code"] == messages[0]["status"]
+        assert log_mock.info.call_count + log_mock.warning.call_count + log_mock.error.call_count == 1
 
     def test_disabled_middleware_logs_nothing(self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(request_logging.settings, "LOG_RAW_API_REQUESTS", False)

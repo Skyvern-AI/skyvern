@@ -1890,6 +1890,50 @@ class TestCustomSelectMissRespectsOptionality:
         value_fallback.assert_not_awaited()
 
 
+class TestClickCustomSelectMiss:
+    @pytest.mark.asyncio
+    async def test_click_reports_the_sequential_dropdown_miss(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        element = _FakeAnchorElement()
+        element.has_attr = AsyncMock(return_value=False)
+        dom = MagicMock()
+        dom.get_skyvern_element_by_id = AsyncMock(return_value=element)
+        page = MagicMock(url="https://example.test/form")
+        page.evaluate = AsyncMock(return_value=False)
+        frame = MagicMock()
+        incremental = MagicMock()
+        incremental.start_listen_dom_increment = AsyncMock()
+        incremental.stop_listen_dom_increment = AsyncMock()
+        miss = NoAvailableOptionFoundForCustomSelection(
+            reason="target not in list", target_value="Choice", observed_options=["Alpha"]
+        )
+
+        monkeypatch.setattr(handler, "DomUtil", MagicMock(return_value=dom))
+        monkeypatch.setattr(handler, "get_or_create_wait_config", AsyncMock(return_value=None))
+        monkeypatch.setattr(handler.asyncio, "sleep", AsyncMock())
+        monkeypatch.setattr(handler, "resolve_engine_selection_for_task", MagicMock(return_value=None))
+        monkeypatch.setattr(handler.SkyvernFrame, "create_instance", AsyncMock(return_value=frame))
+        monkeypatch.setattr(handler, "IncrementalScrapePage", MagicMock(return_value=incremental))
+        monkeypatch.setattr(handler, "chain_click", AsyncMock(return_value=[handler.ActionSuccess()]))
+        monkeypatch.setattr(
+            handler,
+            "handle_sequential_click_with_submit_bypass",
+            AsyncMock(side_effect=miss),
+        )
+
+        results = await handler.handle_click_action(
+            action=handler.ClickAction(element_id="field-control"),
+            page=page,
+            scraped_page=MagicMock(),
+            task=_task(),  # type: ignore[arg-type]
+            step=MagicMock(),
+        )
+
+        assert len(results) == 2
+        assert isinstance(results[-1], handler.ActionFailure)
+        assert results[-1].exception_type == NoAvailableOptionFoundForCustomSelection.__name__
+        assert results[-1].skip_remaining_actions is True
+
+
 class TestSequentialSelectMarksWidgetMutation:
     @staticmethod
     def _level_result(*, action_result: object, action_type: object, dropdown_menu: object) -> SimpleNamespace:

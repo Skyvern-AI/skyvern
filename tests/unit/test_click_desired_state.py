@@ -11,13 +11,34 @@ state. Role never implies intent — it only chooses which observable to read.
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import AsyncIterator
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from playwright.async_api import Page, async_playwright
 
 from skyvern.webeye.actions import handler
 from skyvern.webeye.actions.actions import ClickAction, ClickContext
-from skyvern.webeye.actions.responses import ActionAbort, ActionSuccess
+from skyvern.webeye.actions.responses import ActionAbort, ActionResult, ActionSuccess
+from skyvern.webeye.utils.dom import SkyvernElement
+
+
+def _has_playwright_browser() -> bool:
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: PLC0415
+
+        with sync_playwright() as playwright:
+            return Path(playwright.chromium.executable_path).exists()
+    except Exception:
+        return False
+
+
+_skip_no_browser = pytest.mark.skipif(
+    not _has_playwright_browser(),
+    reason="Requires Playwright browsers installed (run: playwright install chromium)",
+)
 
 
 class FakeLabelLocator:
@@ -145,13 +166,49 @@ class FakeAncestorLocator:
         return self._value
 
 
+_GRID_SNAPSHOT_DEFAULT = object()
+
+
+def _non_grid_row_snapshot() -> dict[str, object]:
+    """A well-formed ``_GRID_ROW_SNAPSHOT_JS`` result for a checkbox outside any grid row-selection
+    chain, so ``_classify_grid_row_selection`` returns NOT_GRID_ROW and the resolver reads native
+    state. Lets an ordinary checkbox fake exercise the new grid probe without being a grid row."""
+    return {
+        "inHeader": False,
+        "hasGrid": False,
+        "hasRow": False,
+        "hasCell": False,
+        "sameGridChain": False,
+        "isCheckbox": True,
+        "candidateExactGridcell": False,
+        "candidateDirectRowChild": False,
+        "gridCellCount": 0,
+        "rowAriaSelected": None,
+        "rowClasses": None,
+    }
+
+
 class FakeElementLocator:
-    def __init__(self, multiselectable_ancestor: str | None) -> None:
+    def __init__(
+        self,
+        multiselectable_ancestor: str | None,
+        grid_snapshot: object = _GRID_SNAPSHOT_DEFAULT,
+        grid_snapshot_error: Exception | None = None,
+    ) -> None:
         self._multiselectable_ancestor = multiselectable_ancestor
+        self._grid_snapshot = grid_snapshot
+        self._grid_snapshot_error = grid_snapshot_error
 
     def locator(self, selector: str) -> FakeAncestorLocator:
         assert selector == "xpath=ancestor-or-self::*[@aria-multiselectable][1]"
         return FakeAncestorLocator(self._multiselectable_ancestor)
+
+    async def evaluate(self, expression: str, *args: object) -> object:
+        if self._grid_snapshot_error is not None:
+            raise self._grid_snapshot_error
+        if self._grid_snapshot is _GRID_SNAPSHOT_DEFAULT:
+            return _non_grid_row_snapshot()
+        return self._grid_snapshot
 
 
 class FakeToggleElement:
@@ -169,12 +226,14 @@ class FakeToggleElement:
         checked: bool | None = None,
         attr_error: Exception | None = None,
         multiselectable_ancestor: str | None = None,
+        grid_snapshot: object = _GRID_SNAPSHOT_DEFAULT,
+        grid_snapshot_error: Exception | None = None,
     ) -> None:
         self._tag_name = tag_name
         self._attributes = attributes or {}
         self._checked = checked
         self._attr_error = attr_error
-        self._locator = FakeElementLocator(multiselectable_ancestor)
+        self._locator = FakeElementLocator(multiselectable_ancestor, grid_snapshot, grid_snapshot_error)
 
     def get_tag_name(self) -> str:
         return self._tag_name
@@ -776,6 +835,8 @@ def _retarget_child(*, tag_name: str, attr_value: str | None, checked: bool | No
     child.get_tag_name.return_value = tag_name
     child.get_attr = AsyncMock(return_value=attr_value)
     child.is_checked = AsyncMock(return_value=checked)
+    # The checkbox guard now probes grid row-selection first; a plain retarget child is not a grid row.
+    child.get_locator.return_value.evaluate = AsyncMock(return_value=_non_grid_row_snapshot())
     child.is_disabled = AsyncMock(return_value=False)
     child.scroll_into_view = AsyncMock()
     child.get_element_handler = AsyncMock(return_value=MagicMock())
@@ -801,3 +862,1017 @@ async def test_handle_click_retargeted_child_mismatch_clicks_once() -> None:
     _results, chain = await _run_handle_click_retarget(wrapper=wrapper, child=child, desired_state=True)
 
     chain.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Grid row-selection — a selectable ARIA grid tracks row selection as app state
+# on the closest row, independent of a selection checkbox's native ``checked``.
+# The desired_state guard must read (and drive) the ROW's selection, or a
+# checked-but-unselected row reads as already satisfied and the corrective click
+# is suppressed. Detection is purely structural (a checkbox in a grid -> row ->
+# cell chain); no framework class token is used.
+# ---------------------------------------------------------------------------
+
+
+def _grid_snapshot(**overrides: object) -> dict[str, object]:
+    """A well-formed ``_GRID_ROW_SNAPSHOT_JS`` result for a checkbox that is the unique selection cell of
+    a grid -> row -> cell chain whose row is unselected: exactly one direct role=gridcell cell, and it is
+    the checkbox's closest cell. Override any field to model other DOM shapes."""
+    snapshot: dict[str, object] = {
+        "inHeader": False,
+        "hasGrid": True,
+        "hasRow": True,
+        "hasCell": True,
+        "sameGridChain": True,
+        "isCheckbox": True,
+        "candidateExactGridcell": True,
+        "candidateDirectRowChild": True,
+        "gridCellCount": 1,
+        "rowAriaSelected": None,
+        "rowClasses": [],
+        "otherRowSelected": False,
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
+# --- _classify_grid_row_selection — pure classifier, no browser --------------
+
+
+@pytest.mark.parametrize("snapshot", [None, "grid", 5, 3.2, [], ("a",)])
+def test_classify_non_dict_is_unreadable(snapshot: object) -> None:
+    assert handler._classify_grid_row_selection(snapshot) is handler._GridRowSelection.UNREADABLE
+
+
+@pytest.mark.parametrize("missing_key", ["inHeader", "hasGrid", "hasRow", "hasCell", "sameGridChain", "isCheckbox"])
+def test_classify_missing_bool_key_is_unreadable(missing_key: str) -> None:
+    snapshot = _grid_snapshot()
+    del snapshot[missing_key]
+    assert handler._classify_grid_row_selection(snapshot) is handler._GridRowSelection.UNREADABLE
+
+
+@pytest.mark.parametrize("bad_value", ["true", 1, None])
+def test_classify_wrong_typed_bool_key_is_unreadable(bad_value: object) -> None:
+    assert handler._classify_grid_row_selection(_grid_snapshot(isCheckbox=bad_value)) is (
+        handler._GridRowSelection.UNREADABLE
+    )
+
+
+@pytest.mark.parametrize("missing_key", ["rowClasses", "rowAriaSelected"])
+def test_classify_missing_state_key_is_unreadable(missing_key: str) -> None:
+    snapshot = _grid_snapshot()
+    del snapshot[missing_key]
+    assert handler._classify_grid_row_selection(snapshot) is handler._GridRowSelection.UNREADABLE
+
+
+@pytest.mark.parametrize("bad_row_classes", ["is-selected", [1, 2], [None], 5])
+def test_classify_bad_rowclasses_type_is_unreadable(bad_row_classes: object) -> None:
+    assert handler._classify_grid_row_selection(_grid_snapshot(rowClasses=bad_row_classes)) is (
+        handler._GridRowSelection.UNREADABLE
+    )
+
+
+@pytest.mark.parametrize("bad_aria", [5, True, ["true"]])
+def test_classify_bad_aria_type_is_unreadable(bad_aria: object) -> None:
+    assert handler._classify_grid_row_selection(_grid_snapshot(rowAriaSelected=bad_aria)) is (
+        handler._GridRowSelection.UNREADABLE
+    )
+
+
+def test_classify_header_checkbox_is_not_grid_row() -> None:
+    # A header select-all checkbox sits in the same grid but never represents a data row's selection.
+    assert handler._classify_grid_row_selection(_grid_snapshot(inHeader=True)) is (
+        handler._GridRowSelection.NOT_GRID_ROW
+    )
+
+
+def test_classify_not_a_checkbox_is_not_grid_row() -> None:
+    assert handler._classify_grid_row_selection(_grid_snapshot(isCheckbox=False)) is (
+        handler._GridRowSelection.NOT_GRID_ROW
+    )
+
+
+@pytest.mark.parametrize("missing", ["hasGrid", "hasRow", "hasCell"])
+def test_classify_missing_structure_is_not_grid_row(missing: str) -> None:
+    assert handler._classify_grid_row_selection(_grid_snapshot(**{missing: False})) is (
+        handler._GridRowSelection.NOT_GRID_ROW
+    )
+
+
+def test_classify_broken_grid_chain_is_not_grid_row() -> None:
+    # Row and cell exist but not in the checkbox's own closest-grid chain (e.g. a nested grid).
+    assert handler._classify_grid_row_selection(_grid_snapshot(sameGridChain=False)) is (
+        handler._GridRowSelection.NOT_GRID_ROW
+    )
+
+
+@pytest.mark.parametrize("grid_cell_count", [0, 2, 3, 5])
+def test_classify_row_without_unique_selection_cell_is_not_grid_row(grid_cell_count: int) -> None:
+    # An ordinary data-column checkbox lives in a standards-complete ARIA grid where several data cells
+    # carry role=gridcell, so the row has no single selection cell. Only a row with EXACTLY one direct
+    # role=gridcell cell (the incident's selection-cell signature) is a row-selection control; anything
+    # else preserves native checkbox behavior.
+    assert handler._classify_grid_row_selection(_grid_snapshot(gridCellCount=grid_cell_count)) is (
+        handler._GridRowSelection.NOT_GRID_ROW
+    )
+
+
+def test_classify_candidate_bare_td_not_exact_gridcell_is_not_grid_row() -> None:
+    # The checkbox's closest cell is a bare <td> (no role=gridcell); an arbitrary td is not accepted as a
+    # selection cell even when the row otherwise looks grid-shaped.
+    assert handler._classify_grid_row_selection(_grid_snapshot(candidateExactGridcell=False)) is (
+        handler._GridRowSelection.NOT_GRID_ROW
+    )
+
+
+def test_classify_candidate_not_direct_row_child_is_not_grid_row() -> None:
+    # The unique role=gridcell is not the checkbox's closest cell (e.g. a gridcell nested inside another
+    # gridcell), so the checkbox does not own the selection cell.
+    assert handler._classify_grid_row_selection(_grid_snapshot(candidateDirectRowChild=False)) is (
+        handler._GridRowSelection.NOT_GRID_ROW
+    )
+
+
+def test_classify_unique_selection_cell_signature_reads_row_state() -> None:
+    # The positive signature: exactly one direct role=gridcell cell and it is the checkbox's closest
+    # cell -> the classifier proceeds to read the row's selection state.
+    assert (
+        handler._classify_grid_row_selection(
+            _grid_snapshot(
+                candidateExactGridcell=True, candidateDirectRowChild=True, gridCellCount=1, rowAriaSelected="true"
+            )
+        )
+        is handler._GridRowSelection.SELECTED
+    )
+
+
+@pytest.mark.parametrize("missing_key", ["candidateExactGridcell", "candidateDirectRowChild"])
+def test_classify_missing_signature_bool_key_is_unreadable(missing_key: str) -> None:
+    snapshot = _grid_snapshot()
+    del snapshot[missing_key]
+    assert handler._classify_grid_row_selection(snapshot) is handler._GridRowSelection.UNREADABLE
+
+
+@pytest.mark.parametrize("bad_value", ["true", 1, None])
+def test_classify_wrong_typed_signature_bool_is_unreadable(bad_value: object) -> None:
+    assert handler._classify_grid_row_selection(_grid_snapshot(candidateExactGridcell=bad_value)) is (
+        handler._GridRowSelection.UNREADABLE
+    )
+
+
+@pytest.mark.parametrize("bad_count", ["1", None, True, 1.5])
+def test_classify_malformed_gridcellcount_is_unreadable(bad_count: object) -> None:
+    # A missing/non-integer grid-cell count means the extractor did not return its promised shape; fall
+    # open rather than guess whether the row has a unique selection cell.
+    assert handler._classify_grid_row_selection(_grid_snapshot(gridCellCount=bad_count)) is (
+        handler._GridRowSelection.UNREADABLE
+    )
+
+
+def test_classify_missing_gridcellcount_is_unreadable() -> None:
+    snapshot = _grid_snapshot()
+    del snapshot["gridCellCount"]
+    assert handler._classify_grid_row_selection(snapshot) is handler._GridRowSelection.UNREADABLE
+
+
+@pytest.mark.parametrize("aria_value", ["true", " TRUE ", "True"])
+def test_classify_aria_selected_true_is_selected(aria_value: str) -> None:
+    assert handler._classify_grid_row_selection(_grid_snapshot(rowAriaSelected=aria_value)) is (
+        handler._GridRowSelection.SELECTED
+    )
+
+
+@pytest.mark.parametrize("aria_value", ["false", " False ", "FALSE"])
+def test_classify_aria_selected_false_is_unselected(aria_value: str) -> None:
+    assert handler._classify_grid_row_selection(_grid_snapshot(rowAriaSelected=aria_value)) is (
+        handler._GridRowSelection.UNSELECTED
+    )
+
+
+@pytest.mark.parametrize("aria_value", ["yes", "", "1", "selected", "mixed"])
+def test_classify_aria_selected_malformed_is_unreadable(aria_value: str) -> None:
+    # A present but non-boolean aria-selected is ambiguous; fall open rather than guess a state.
+    assert handler._classify_grid_row_selection(_grid_snapshot(rowAriaSelected=aria_value)) is (
+        handler._GridRowSelection.UNREADABLE
+    )
+
+
+@pytest.mark.parametrize("token", ["selected", "is-selected", "k-selected", "K-Selected", " is-selected "])
+def test_classify_selected_row_class_token_is_selected(token: str) -> None:
+    assert handler._classify_grid_row_selection(_grid_snapshot(rowClasses=["data-row", token])) is (
+        handler._GridRowSelection.SELECTED
+    )
+
+
+def test_classify_no_selected_class_is_unmarked() -> None:
+    # No aria-selected and no known selected class token is absence, not a positive UNSELECTED: UNMARKED.
+    assert handler._classify_grid_row_selection(_grid_snapshot(rowClasses=["data-row", "unread"])) is (
+        handler._GridRowSelection.UNMARKED
+    )
+
+
+def test_classify_empty_and_none_row_classes_are_unmarked() -> None:
+    assert handler._classify_grid_row_selection(_grid_snapshot(rowClasses=[])) is (handler._GridRowSelection.UNMARKED)
+    assert handler._classify_grid_row_selection(_grid_snapshot(rowClasses=None)) is (handler._GridRowSelection.UNMARKED)
+
+
+def test_classify_aria_selected_takes_precedence_over_class() -> None:
+    # An explicit aria-selected="false" is authoritative even if a stale selected class lingers.
+    snapshot = _grid_snapshot(rowAriaSelected="false", rowClasses=["is-selected"])
+    assert handler._classify_grid_row_selection(snapshot) is handler._GridRowSelection.UNSELECTED
+
+
+# --- _read_grid_row_selection — snapshot read + classify ---------------------
+
+
+@pytest.mark.asyncio
+async def test_read_grid_row_selection_classifies_snapshot() -> None:
+    element = FakeToggleElement("input", {"type": "checkbox"}, grid_snapshot=_grid_snapshot(rowAriaSelected="true"))
+    assert (await handler._read_grid_row_selection(element)).state is handler._GridRowSelection.SELECTED
+
+
+@pytest.mark.asyncio
+async def test_read_grid_row_selection_snapshot_error_is_unreadable() -> None:
+    # A failed snapshot read must fall open (UNREADABLE), never quietly become NOT_GRID_ROW, or a
+    # checked-but-unselected row could still read as satisfied through the native fallback.
+    element = FakeToggleElement("input", {"type": "checkbox"}, grid_snapshot_error=RuntimeError("detached"))
+    read = await handler._read_grid_row_selection(element)
+    assert read.state is handler._GridRowSelection.UNREADABLE
+    assert read.other_row_selected is False
+
+
+# --- _resolve_live_selected_state — grid checkbox reads the ROW state --------
+
+
+@pytest.mark.asyncio
+async def test_resolve_grid_row_selected_reads_true_over_native() -> None:
+    element = FakeToggleElement(
+        "input", {"type": "checkbox"}, checked=False, grid_snapshot=_grid_snapshot(rowAriaSelected="true")
+    )
+    assert await handler._resolve_live_selected_state(element) is True
+
+
+@pytest.mark.asyncio
+async def test_resolve_grid_row_unmarked_returns_none_despite_native_checked() -> None:
+    # The incident shape (native checked=True, no positive selected signal) is UNMARKED, not a positive
+    # UNSELECTED: the shared resolver returns None so it never reports the row as unselected from absence.
+    element = FakeToggleElement("input", {"type": "checkbox"}, checked=True, grid_snapshot=_grid_snapshot())
+    assert await handler._resolve_live_selected_state(element) is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_grid_row_unreadable_returns_none() -> None:
+    element = FakeToggleElement(
+        "input", {"type": "checkbox"}, checked=True, grid_snapshot=_grid_snapshot(rowAriaSelected="maybe")
+    )
+    assert await handler._resolve_live_selected_state(element) is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_grid_snapshot_error_returns_none() -> None:
+    element = FakeToggleElement(
+        "input", {"type": "checkbox"}, checked=True, grid_snapshot_error=RuntimeError("detached")
+    )
+    assert await handler._resolve_live_selected_state(element) is None
+
+
+@pytest.mark.parametrize("checked", [True, False])
+@pytest.mark.asyncio
+async def test_resolve_non_grid_checkbox_reads_native(checked: bool) -> None:
+    element = FakeToggleElement("input", {"type": "checkbox"}, checked=checked)
+    assert await handler._resolve_live_selected_state(element) is checked
+
+
+# --- _apply_desired_click_state — routing for grid row-selection checkboxes ---
+
+
+@pytest.mark.asyncio
+async def test_apply_grid_row_already_selected_suppresses_without_driver() -> None:
+    element = FakeToggleElement("input", {"type": "checkbox"}, grid_snapshot=_grid_snapshot(rowAriaSelected="true"))
+    drive = AsyncMock()
+    with patch.object(handler, "_drive_grid_row_selection", drive):
+        result = await handler._apply_desired_click_state(_click_action(), element, True, MagicMock())
+    assert result is not None and len(result) == 1 and isinstance(result[0], ActionAbort)
+    drive.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_grid_row_unmarked_desired_false_box_off_suppresses() -> None:
+    # An UNMARKED row (no positive selected signal) with the native box positively off already matches
+    # desired=unselected, so the click is suppressed without driving the cell.
+    element = FakeToggleElement("input", {"type": "checkbox"}, checked=False, grid_snapshot=_grid_snapshot())
+    drive = AsyncMock()
+    with patch.object(handler, "_drive_grid_row_selection", drive):
+        result = await handler._apply_desired_click_state(_click_action(), element, False, MagicMock())
+    assert result is not None and len(result) == 1 and isinstance(result[0], ActionAbort)
+    drive.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_grid_row_unmarked_desired_false_box_checked_falls_open() -> None:
+    # S2 at the unit level: an UNMARKED row whose native box is checked cannot be proven unselected, so
+    # desired=False must NOT be suppressed as already-satisfied -- fall open, never claim success.
+    element = FakeToggleElement("input", {"type": "checkbox"}, checked=True, grid_snapshot=_grid_snapshot())
+    drive = AsyncMock()
+    with patch.object(handler, "_drive_grid_row_selection", drive):
+        result = await handler._apply_desired_click_state(_click_action(), element, False, MagicMock())
+    assert result is None
+    drive.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "snapshot,desired",
+    [
+        # A positively-readable mismatch: UNSELECTED -> select, or SELECTED -> deselect. Only these
+        # readable starts are driven; an UNMARKED row is never routed to the cell (see below).
+        (_grid_snapshot(rowAriaSelected="false"), True),
+        (_grid_snapshot(rowAriaSelected="true"), False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_apply_grid_row_mismatch_routes_to_driver(snapshot: dict[str, object], desired: bool) -> None:
+    element = FakeToggleElement("input", {"type": "checkbox"}, grid_snapshot=snapshot)
+    sentinel: list[ActionResult] = [ActionAbort()]
+    drive = AsyncMock(return_value=sentinel)
+    set_state = AsyncMock(return_value=True)
+    with (
+        patch.object(handler, "_drive_grid_row_selection", drive),
+        patch.object(handler, "_set_native_checkbox_state", set_state),
+    ):
+        result = await handler._apply_desired_click_state(_click_action(), element, desired, MagicMock())
+    assert result is sentinel
+    drive.assert_awaited_once()
+    assert drive.await_args.args[2] is desired
+    # A grid row-selection mismatch is driven through the cell, never a native check()/uncheck().
+    set_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_grid_row_driver_failure_falls_open() -> None:
+    # A positively-UNSELECTED row is driven; if the drive cannot prove the selection it returns None and
+    # the caller falls open to the ordinary click.
+    element = FakeToggleElement("input", {"type": "checkbox"}, grid_snapshot=_grid_snapshot(rowAriaSelected="false"))
+    drive = AsyncMock(return_value=None)
+    with patch.object(handler, "_drive_grid_row_selection", drive):
+        result = await handler._apply_desired_click_state(_click_action(), element, True, MagicMock())
+    assert result is None
+    drive.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_apply_grid_row_unmarked_desired_true_falls_open_without_driver() -> None:
+    # v3.1 invariant: an UNMARKED row (no positive selected signal) with desired=True is DOM-
+    # indistinguishable from a foreign-vocabulary already-selected row and has no readable post-state, so
+    # it is NEVER cell-driven -- it falls open to the single ordinary click.
+    element = FakeToggleElement("input", {"type": "checkbox"}, checked=True, grid_snapshot=_grid_snapshot())
+    drive = AsyncMock()
+    with patch.object(handler, "_drive_grid_row_selection", drive):
+        result = await handler._apply_desired_click_state(_click_action(), element, True, MagicMock())
+    assert result is None
+    drive.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_grid_row_unreadable_falls_open_without_driver() -> None:
+    element = FakeToggleElement("input", {"type": "checkbox"}, grid_snapshot=_grid_snapshot(rowAriaSelected="maybe"))
+    drive = AsyncMock()
+    with patch.object(handler, "_drive_grid_row_selection", drive):
+        result = await handler._apply_desired_click_state(_click_action(), element, True, MagicMock())
+    assert result is None
+    drive.assert_not_awaited()
+
+
+# --- _coerce_click_position — validate the hit-tested cell point --------------
+
+
+def test_coerce_click_position_valid_point() -> None:
+    assert handler._coerce_click_position({"x": 1, "y": 2.5}) == {"x": 1.0, "y": 2.5}
+
+
+@pytest.mark.parametrize("point", [None, "x", 5, [1, 2], {"x": 1.0}, {"y": 2.0}, {}])
+def test_coerce_click_position_bad_shape_is_none(point: object) -> None:
+    assert handler._coerce_click_position(point) is None
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_coerce_click_position_non_finite_is_none(bad: float) -> None:
+    assert handler._coerce_click_position({"x": bad, "y": 1.0}) is None
+    assert handler._coerce_click_position({"x": 1.0, "y": bad}) is None
+
+
+@pytest.mark.parametrize("value", [True, "1", None])
+def test_coerce_click_position_non_number_is_none(value: object) -> None:
+    assert handler._coerce_click_position({"x": value, "y": 1.0}) is None
+
+
+# ---------------------------------------------------------------------------
+# Real-Chromium arms — high-fidelity evidence against a live DOM. A selectable
+# grid is modeled after a document grid whose row selection is app state on the
+# closest row (aria-selected / a selected row class), driven by a click on the
+# selection cell rather than the bare checkbox. Structure is pure ARIA
+# (role=grid > role=row > role=gridcell > native checkbox); no framework token
+# is used for detection. Skipped when Playwright's Chromium is not installed.
+# ---------------------------------------------------------------------------
+
+
+_GRID_FIXTURE_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+  body { margin: 0; }
+  [role="grid"] { display: block; margin: 6px; }
+  table { border-collapse: collapse; }
+  td, th { padding: 0; border: 0; }
+  .sel-cell { position: relative; width: 140px; height: 30px; }
+  input[type="checkbox"] { margin: 0; }
+  .cover-center { position: absolute; left: 0; top: 0; width: 60%; height: 100%; }
+  .cover-mid { position: absolute; left: 30%; top: 0; width: 40%; height: 100%; }
+  .fill-cell { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+  .clip-window { width: 60px; overflow: hidden; }
+  .wide-cell { width: 400px; }
+</style></head><body>
+
+<div role="grid" id="grid-cell-selects" data-arm="cell-selects">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" class="data-row" aria-selected="false"><td role="gridcell" class="sel-cell"><input type="checkbox" id="cb-cell-selects"></td>
+      <td>Document row</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-no-select" data-arm="no-select">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" class="data-row" aria-selected="false"><td role="gridcell" class="sel-cell"><input type="checkbox" id="cb-no-select"></td>
+      <td>Document row</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-reset" data-arm="reset">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" class="data-row" aria-selected="false"><td role="gridcell" class="sel-cell"><input type="checkbox" id="cb-reset"></td>
+      <td>Document row</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-center-covered" data-arm="cell-selects">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" class="data-row" aria-selected="false"><td role="gridcell" class="sel-cell">
+      <input type="checkbox" class="cover-center" id="cb-center-covered"></td>
+      <td>Document row</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-span-covered" data-arm="cell-selects">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" class="data-row" aria-selected="false"><td role="gridcell" class="sel-cell">
+      <input type="checkbox" id="cb-span-covered"><span class="cover-mid" tabindex="0">detail</span></td>
+      <td>Document row</td></tr></tbody></table></div>
+
+<div class="clip-window">
+  <div role="grid" id="grid-clipped" data-arm="cell-selects">
+    <table role="presentation"><tbody role="rowgroup">
+      <tr role="row" class="data-row" aria-selected="false"><td role="gridcell" class="sel-cell wide-cell">
+        <input type="checkbox" id="cb-clipped"></td>
+        <td>Document row</td></tr></tbody></table></div></div>
+
+<div role="grid" id="grid-nested" data-arm="cell-selects">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" class="data-row" aria-selected="false"><td role="gridcell" class="sel-cell">
+      <input type="checkbox" id="cb-nested"><button type="button">Open</button></td>
+      <td>Document row</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-no-safe-point" data-arm="cell-selects">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" class="data-row" aria-selected="false"><td role="gridcell" class="sel-cell">
+      <input type="checkbox" class="fill-cell" id="cb-no-safe-point"></td>
+      <td>Document row</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-deselect" data-arm="deselect">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" class="data-row"><td role="gridcell" class="sel-cell">
+      <input type="checkbox" id="cb-deselect" data-preselected="true"></td>
+      <td>Document row</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-read-aria">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" aria-selected="true"><td role="gridcell"><input type="checkbox" id="cb-read-aria" checked></td>
+      <td>Document row</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-read-unselected">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row"><td role="gridcell"><input type="checkbox" id="cb-read-unselected"></td>
+      <td>Document row</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-read-kselected">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" class="data-row k-selected"><td role="gridcell"><input type="checkbox" id="cb-read-kselected"></td>
+      <td>Document row</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-read-isselected">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" class="data-row is-selected"><td role="gridcell"><input type="checkbox" id="cb-read-isselected"></td>
+      <td>Document row</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-header">
+  <table role="presentation">
+    <thead><tr role="row"><th role="columnheader"><input type="checkbox" id="cb-header-all" checked></th>
+      <th role="columnheader">Title</th></tr></thead>
+    <tbody role="rowgroup"><tr role="row"><td role="gridcell"><input type="checkbox" id="cb-header-data"></td>
+      <td>Document row</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-data-multi" data-arm="cell-selects">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" class="data-row"><td role="gridcell">Name</td>
+      <td role="gridcell" class="sel-cell"><input type="checkbox" id="cb-data-multi"></td>
+      <td role="gridcell">Active</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-data-multi-checked" data-arm="cell-selects">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" class="data-row"><td role="gridcell">Name</td>
+      <td role="gridcell" class="sel-cell"><input type="checkbox" id="cb-data-multi-checked" checked></td>
+      <td role="gridcell">Active</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-incident-checked" data-arm="native-onchange">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" class="data-row"><td role="gridcell" class="sel-cell">
+      <input type="checkbox" id="cb-incident-checked" checked></td>
+      <td>Document row</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-replace" data-arm="replace">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" class="data-row"><td role="gridcell" class="sel-cell">
+      <input type="checkbox" id="cb-replace-a" data-preselected="true"></td><td>Row A</td></tr>
+    <tr role="row" class="data-row" aria-selected="false"><td role="gridcell" class="sel-cell">
+      <input type="checkbox" id="cb-replace-b"></td><td>Row B</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-unknown-selected">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" class="data-row app-picked"><td role="gridcell" class="sel-cell">
+      <input type="checkbox" id="cb-unknown-selected" checked></td><td>Row</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-unknown-with-neighbor" data-arm="replace">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" aria-selected="true" class="is-selected"><td role="gridcell" class="sel-cell">
+      <input type="checkbox" id="cb-neighbor-selected" checked></td><td>Neighbor</td></tr>
+    <tr role="row" class="data-row app-picked"><td role="gridcell" class="sel-cell">
+      <input type="checkbox" id="cb-unknown-target" checked></td><td>Target</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-foreign-selected" data-arm="native-onchange">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" class="data-row app-picked"><td role="gridcell" class="sel-cell">
+      <input type="checkbox" id="cb-foreign-selected" checked></td><td>Document row</td></tr></tbody></table></div>
+
+<div role="grid" id="grid-foreign-replace" data-arm="foreign-replace">
+  <table role="presentation"><tbody role="rowgroup">
+    <tr role="row" class="data-row app-picked"><td role="gridcell" class="sel-cell">
+      <input type="checkbox" id="cb-foreign-a" checked></td><td>Row A</td></tr>
+    <tr role="row" class="data-row"><td role="gridcell" class="sel-cell">
+      <input type="checkbox" id="cb-foreign-b"></td><td>Row B</td></tr></tbody></table></div>
+
+<script>
+(function () {
+  var model = {};
+  function render(input) {
+    var row = input.closest('[role="row"]');
+    var selected = !!model[input.id];
+    if (selected) { row.setAttribute('aria-selected', 'true'); row.classList.add('is-selected'); }
+    else { row.removeAttribute('aria-selected'); row.classList.remove('is-selected'); }
+    input.checked = selected;
+  }
+  function select(input, on) { model[input.id] = on; render(input); }
+  // Foreign-vocabulary selection: published ONLY through a row class the handler does not recognise and
+  // with NO aria-selected anywhere -- the real incident grid's shape, whose selected rows are not
+  // positively readable. It is driven by the checkbox's OWN change event, never by a cell-space click.
+  function foreignSelected(input) { return input.closest('[role="row"]').classList.contains('app-picked'); }
+  function selectForeign(input, on) {
+    var row = input.closest('[role="row"]');
+    if (on) { row.classList.add('app-picked'); } else { row.classList.remove('app-picked'); }
+    input.checked = on;
+  }
+  Array.prototype.slice.call(document.querySelectorAll('[role="grid"][data-arm]')).forEach(function (g) {
+    var arm = g.dataset.arm;
+    Array.prototype.slice.call(g.querySelectorAll('tbody input[type=checkbox]')).forEach(function (input) {
+      if (input.dataset.preselected === 'true') { model[input.id] = true; render(input); }
+      var cell = input.closest('[role="gridcell"]');
+      // Tally every cell-space click (anything but a click on the input itself) in the capture phase, so
+      // a test can prove the recovery never clicked the selection cell -- the forbidden probe on an
+      // ambiguous row. Capture runs before any stopPropagation.
+      cell.addEventListener('click', function (e) {
+        if (e.target === input) { return; }
+        cell.dataset.cellClicks = String(parseInt(cell.dataset.cellClicks || '0', 10) + 1);
+      }, true);
+      // A bare toggle of the input never enters selection state and stops propagation, so a pointer
+      // that lands on the input can never reach the cell's selection handler (checked-only divergence).
+      input.addEventListener('click', function (e) { e.stopPropagation(); });
+      var mid = cell.querySelector('.cover-mid');
+      if (mid) { mid.addEventListener('click', function (e) { e.stopPropagation(); }); }
+      if (arm === 'native-onchange') {
+        // Controlled native checkbox: the app's row selection follows the input's OWN change event and is
+        // published only as a foreign row class. A cell-space click never selects; only the checkbox does.
+        input.addEventListener('change', function () { selectForeign(input, !foreignSelected(input)); });
+        return;
+      }
+      if (arm === 'no-select') { return; }
+      cell.addEventListener('click', function (e) {
+        if (e.target === input) { return; }
+        if (arm === 'reset') {
+          select(input, true);
+          requestAnimationFrame(function () { select(input, false); });
+        } else if (arm === 'deselect') {
+          select(input, !model[input.id]);
+        } else if (arm === 'replace') {
+          // Replace-selection semantics: clicking a row's cell clears every row's selection in
+          // this grid (including any statically-marked neighbour), then selects the clicked row.
+          Array.prototype.slice.call(g.querySelectorAll('tr[role="row"]')).forEach(function (r) {
+            r.removeAttribute('aria-selected');
+            r.classList.remove('is-selected');
+            var other = r.querySelector('input[type=checkbox]');
+            if (other) { other.checked = false; model[other.id] = false; }
+          });
+          select(input, true);
+        } else if (arm === 'foreign-replace') {
+          // Replace-selection published ONLY through the foreign class (no aria-selected): a cell click
+          // clears every row's foreign selection, then selects the clicked row.
+          Array.prototype.slice.call(g.querySelectorAll('tr[role="row"]')).forEach(function (r) {
+            r.classList.remove('app-picked');
+            var other = r.querySelector('input[type=checkbox]');
+            if (other) { other.checked = false; }
+          });
+          selectForeign(input, true);
+        } else {
+          select(input, true);
+        }
+      });
+    });
+  });
+})();
+</script>
+</body></html>"""
+
+
+def _real_checkbox_element(page: Page, css_id: str) -> SkyvernElement:
+    static = {"id": css_id.upper(), "tagName": "input", "attributes": {"type": "checkbox", "id": css_id}}
+    return SkyvernElement(page.locator(f"#{css_id}"), page, static)
+
+
+@contextlib.asynccontextmanager
+async def _grid_fixture_page() -> AsyncIterator[Page]:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            # A tall viewport keeps every stacked grid on-screen so the cell hit-test probes a
+            # visible region; per-element clip tests rely on their own `.clip-window`, not the viewport.
+            context = await browser.new_context(viewport={"width": 1280, "height": 2400})
+            page = await context.new_page()
+            await page.set_content(_GRID_FIXTURE_HTML)
+            yield page
+        finally:
+            await browser.close()
+
+
+async def _row_selected(page: Page, css_id: str) -> bool:
+    return await page.evaluate(
+        "(id) => { const el = document.getElementById(id); const row = el.closest('[role=\"row\"]');"
+        " return !!(row && row.getAttribute('aria-selected') === 'true'); }",
+        css_id,
+    )
+
+
+async def _native_checked(page: Page, css_id: str) -> bool:
+    return await page.evaluate("(id) => !!document.getElementById(id).checked", css_id)
+
+
+async def _foreign_selected(page: Page, css_id: str) -> bool:
+    # Row selection published only through the app's own class (no aria-selected) -- the incident's shape.
+    return await page.evaluate(
+        "(id) => { const el = document.getElementById(id); const row = el.closest('[role=\"row\"]');"
+        " return !!(row && row.classList.contains('app-picked')); }",
+        css_id,
+    )
+
+
+async def _cell_clicks(page: Page, css_id: str) -> int:
+    # How many cell-space clicks (not clicks on the input) the checkbox's selection cell received.
+    return await page.evaluate(
+        "(id) => { const el = document.getElementById(id); const cell = el.closest('[role=\"gridcell\"], td');"
+        " return cell ? parseInt(cell.dataset.cellClicks || '0', 10) : 0; }",
+        css_id,
+    )
+
+
+async def _apply_grid(page: Page, css_id: str, desired_state: bool) -> list[ActionResult] | None:
+    element = _real_checkbox_element(page, css_id)
+    return await handler._apply_desired_click_state(_click_action(), element, desired_state, MagicMock())
+
+
+def _is_abort(result: list[ActionResult] | None) -> bool:
+    return result is not None and len(result) == 1 and isinstance(result[0], ActionAbort)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_readable_unselected_desired_true_drives_selection() -> None:
+    # A readable grid (explicit aria-selected): a positively-UNSELECTED row with desired_state=True is
+    # driven through the cell to a positively-readable SELECTED post-state, then the duplicate click is
+    # suppressed -- the retained cell drive, legitimate because both the start and the proof are readable.
+    async with _grid_fixture_page() as page:
+        result = await _apply_grid(page, "cb-cell-selects", desired_state=True)
+        assert _is_abort(result)
+        assert await _row_selected(page, "cb-cell-selects") is True
+        assert await _native_checked(page, "cb-cell-selects") is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_row_already_selected_suppresses_without_clicking() -> None:
+    # A selected row with desired_state=True suppresses the click; the cell (which would toggle the row
+    # off) is never clicked, proving suppression rather than a redundant drive.
+    async with _grid_fixture_page() as page:
+        result = await _apply_grid(page, "cb-deselect", desired_state=True)
+        assert _is_abort(result)
+        assert await _row_selected(page, "cb-deselect") is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_no_selection_affordance_falls_open() -> None:
+    async with _grid_fixture_page() as page:
+        result = await _apply_grid(page, "cb-no-select", desired_state=True)
+        assert result is None
+        assert await _row_selected(page, "cb-no-select") is False
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_selection_reset_after_settle_falls_open() -> None:
+    # The cell click briefly selects, then the app clears it within the settle window. Re-reading after
+    # the settle must see the row unselected and fall open, never report a transient selection.
+    async with _grid_fixture_page() as page:
+        result = await _apply_grid(page, "cb-reset", desired_state=True)
+        assert result is None
+        assert await _row_selected(page, "cb-reset") is False
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_checkbox_covering_center_hit_tests_side_point() -> None:
+    # The checkbox covers the cell's center; a naive center click lands on the input (no selection).
+    # Hit-testing must find clear cell space to the side and drive the row selection there.
+    async with _grid_fixture_page() as page:
+        result = await _apply_grid(page, "cb-center-covered", desired_state=True)
+        assert _is_abort(result)
+        assert await _row_selected(page, "cb-center-covered") is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_unexamined_span_cover_hit_tests_side_point() -> None:
+    # A focusable span (matched by no control allow-list) covers the cell center; only hit-testing
+    # finds the real cell space beside it. Proves detection is by actual hit target, not a selector list.
+    async with _grid_fixture_page() as page:
+        result = await _apply_grid(page, "cb-span-covered", desired_state=True)
+        assert _is_abort(result)
+        assert await _row_selected(page, "cb-span-covered") is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_clipped_cell_hit_tests_visible_region() -> None:
+    # The selection cell is wider than its clipping ancestor, so the padding-box center is scrolled out
+    # of view. Probing must clip to the visible region and find real cell space there.
+    async with _grid_fixture_page() as page:
+        result = await _apply_grid(page, "cb-clipped", desired_state=True)
+        assert _is_abort(result)
+        assert await _row_selected(page, "cb-clipped") is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_no_safe_cell_point_falls_open() -> None:
+    # The checkbox covers the entire cell, so no point hit-tests to clear cell space. Recovery must
+    # fail closed (no click) and fall open rather than click the input.
+    async with _grid_fixture_page() as page:
+        result = await _apply_grid(page, "cb-no-safe-point", desired_state=True)
+        assert result is None
+        assert await _row_selected(page, "cb-no-safe-point") is False
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_cell_with_nested_control_falls_open() -> None:
+    # The selection cell nests a <button>; a recovery click could activate it. Detection must fail
+    # closed and never click, even though clear cell space exists and would otherwise select the row.
+    async with _grid_fixture_page() as page:
+        result = await _apply_grid(page, "cb-nested", desired_state=True)
+        assert result is None
+        assert await _row_selected(page, "cb-nested") is False
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_desired_false_deselects_selected_row() -> None:
+    async with _grid_fixture_page() as page:
+        result = await _apply_grid(page, "cb-deselect", desired_state=False)
+        assert _is_abort(result)
+        assert await _row_selected(page, "cb-deselect") is False
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_desired_false_already_unselected_suppresses() -> None:
+    async with _grid_fixture_page() as page:
+        result = await _apply_grid(page, "cb-no-select", desired_state=False)
+        assert _is_abort(result)
+        assert await _row_selected(page, "cb-no-select") is False
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_resolve_reads_grid_row_aria_selected_from_real_dom() -> None:
+    async with _grid_fixture_page() as page:
+        assert await handler._resolve_live_selected_state(_real_checkbox_element(page, "cb-read-aria")) is True
+        # No aria-selected and no known class is absence (UNMARKED) -> None, not a positive False.
+        assert await handler._resolve_live_selected_state(_real_checkbox_element(page, "cb-read-unselected")) is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_resolve_reads_selected_row_class_from_real_dom() -> None:
+    async with _grid_fixture_page() as page:
+        assert await handler._resolve_live_selected_state(_real_checkbox_element(page, "cb-read-kselected")) is True
+        assert await handler._resolve_live_selected_state(_real_checkbox_element(page, "cb-read-isselected")) is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_resolve_grid_header_select_all_reads_native_not_row() -> None:
+    # A header select-all checkbox is not a data-row selection control: it reads native `checked` (here
+    # True). The unselected data row exposes no positive selected signal (UNMARKED) -> None, not a
+    # positive False read from absence.
+    async with _grid_fixture_page() as page:
+        assert await handler._resolve_live_selected_state(_real_checkbox_element(page, "cb-header-all")) is True
+        assert await handler._resolve_live_selected_state(_real_checkbox_element(page, "cb-header-data")) is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_read_grid_row_selection_from_real_dom() -> None:
+    async with _grid_fixture_page() as page:
+        # A row with no positive signal at all (no aria-selected, no known class) is UNMARKED (absence);
+        # a row with aria-selected="false" is a positive UNSELECTED; an aria-selected row is SELECTED.
+        unmarked = await handler._read_grid_row_selection(_real_checkbox_element(page, "cb-read-unselected"))
+        assert unmarked.state is handler._GridRowSelection.UNMARKED
+        positively_unselected = await handler._read_grid_row_selection(_real_checkbox_element(page, "cb-cell-selects"))
+        assert positively_unselected.state is handler._GridRowSelection.UNSELECTED
+        selected = await handler._read_grid_row_selection(_real_checkbox_element(page, "cb-read-aria"))
+        assert selected.state is handler._GridRowSelection.SELECTED
+
+
+# ---------------------------------------------------------------------------
+# Ordinary data-column checkbox vs. selection cell — the unique-selection-cell
+# signature (exactly one direct role=gridcell cell, and it is the checkbox's
+# closest cell) separates a row-selection control from a boolean data checkbox in
+# a standards-complete ARIA grid. A data checkbox is set natively and never drives
+# row selection. The selection-cell row is driven only from a positively-readable
+# start (UNSELECTED/SELECTED); when its selection is unreadable (UNMARKED, the real
+# incident's shape) it is handled by the ordinary click, never the cell drive.
+# ---------------------------------------------------------------------------
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_data_checkbox_multi_gridcell_desired_false_unchecks_natively() -> None:
+    # Ordinary data checkbox in a grid where every data cell has role=gridcell: checked + desired=False
+    # must uncheck the native input and must not touch row selection. Before the fix the row reads
+    # unselected==False, the click is suppressed, and the box stays checked (silent false success).
+    async with _grid_fixture_page() as page:
+        result = await _apply_grid(page, "cb-data-multi-checked", desired_state=False)
+        assert _is_abort(result)
+        assert await _native_checked(page, "cb-data-multi-checked") is False
+        assert await _row_selected(page, "cb-data-multi-checked") is False
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_data_checkbox_multi_gridcell_desired_true_checks_natively_without_selecting_row() -> None:
+    # Same standards-complete grid, unchecked + desired=True: check the native input and never drive the
+    # cell. Before the fix a cell click selects the row (spurious side effect) and leaves the box
+    # unchecked.
+    async with _grid_fixture_page() as page:
+        result = await _apply_grid(page, "cb-data-multi", desired_state=True)
+        assert _is_abort(result)
+        assert await _native_checked(page, "cb-data-multi") is True
+        assert await _row_selected(page, "cb-data-multi") is False
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_incident_unmarked_native_checked_falls_open_to_ordinary_click() -> None:
+    # The real incident, vocabulary-faithful: selection is published ONLY through an app-specific row
+    # class (no aria-selected anywhere) driven by the checkbox's own onChange, and the native box is
+    # already `checked` while the row is unselected (the divergence). The row reads UNMARKED, so there is
+    # NO positive selected post-state a cell drive could ever verify. The guard must NOT probe the cell --
+    # it must fall open so the caller's single ordinary click fires onChange and enters app selection.
+    async with _grid_fixture_page() as page:
+        assert await _native_checked(page, "cb-incident-checked") is True
+        assert await _foreign_selected(page, "cb-incident-checked") is False
+        result = await _apply_grid(page, "cb-incident-checked", desired_state=True)
+        assert result is None
+        assert await _cell_clicks(page, "cb-incident-checked") == 0
+        # The one ordinary click the caller now performs is what actually enters app selection.
+        await page.locator("#cb-incident-checked").click()
+        assert await _foreign_selected(page, "cb-incident-checked") is True
+        assert await _native_checked(page, "cb-incident-checked") is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_unknown_class_selected_desired_true_not_speculatively_cell_clicked() -> None:
+    # A single row already selected through an unrecognised app class (no aria-selected), native box
+    # checked, desired=True. It reads UNMARKED and is DOM-indistinguishable from the incident, so the
+    # guard cannot prove it is already selected -- but it must NEVER speculatively drive the cell (a
+    # state-changing probe on a toggle grid could clear the very selection it should keep). It falls open
+    # without touching the cell, leaving the row's selection intact. FAILS before the fix (the cell is
+    # driven). The subsequent ordinary click's irreducible toggle is the documented residual, not tested.
+    async with _grid_fixture_page() as page:
+        assert await _foreign_selected(page, "cb-foreign-selected") is True
+        result = await _apply_grid(page, "cb-foreign-selected", desired_state=True)
+        assert result is None
+        assert await _cell_clicks(page, "cb-foreign-selected") == 0
+        assert await _foreign_selected(page, "cb-foreign-selected") is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_unknown_class_other_row_not_cleared_by_cell_drive() -> None:
+    # Row A is selected through an unrecognised app class, invisible to the other-row-selected gate (which
+    # only reads aria-selected/known tokens). Acting on the UNMARKED row B with desired=True must NOT
+    # cell-drive, because a replace-semantics cell click would silently clear A. The guard falls open
+    # without touching B's cell, so A's selection survives. FAILS before the fix (B is cell-driven, the
+    # blind gate lets the replace clear A).
+    async with _grid_fixture_page() as page:
+        assert await _foreign_selected(page, "cb-foreign-a") is True
+        result = await _apply_grid(page, "cb-foreign-b", desired_state=True)
+        assert result is None
+        assert await _cell_clicks(page, "cb-foreign-b") == 0
+        assert await _foreign_selected(page, "cb-foreign-a") is True
+
+
+# ---------------------------------------------------------------------------
+# Formal-review corrections (SKY-13695): a cell drive must never clear another
+# row's selection, absence of a selected signal is not a positive UNSELECTED,
+# and the type dispatch must fail open rather than propagate.
+# ---------------------------------------------------------------------------
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_desired_true_preserves_other_selected_row() -> None:
+    # S5: row A is already selected; selecting row B on a grid whose cell click REPLACES the selection
+    # must not silently clear A. The drive is only safe when no other row holds a readable selection, so
+    # here it must fall open (never ActionAbort) and leave A selected. FAILS before the fix (the cell
+    # drive replaces {A} with {B} and reports itself satisfied).
+    async with _grid_fixture_page() as page:
+        assert await _row_selected(page, "cb-replace-a") is True
+        result = await _apply_grid(page, "cb-replace-b", desired_state=True)
+        assert result is None
+        assert await _row_selected(page, "cb-replace-a") is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_desired_false_unknown_class_native_checked_not_suppressed() -> None:
+    # S2: a row selected via a class outside the known vocabulary, native checkbox checked, desired=False.
+    # Absence of a recognised selected signal is UNREADABLE, not a positive UNSELECTED, so the click must
+    # not be suppressed as already-satisfied. FAILS before the fix (classified UNSELECTED -> suppressed ->
+    # nothing happens and the run reports success).
+    async with _grid_fixture_page() as page:
+        assert await _native_checked(page, "cb-unknown-selected") is True
+        result = await _apply_grid(page, "cb-unknown-selected", desired_state=False)
+        assert result is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_grid_desired_true_unknown_class_preserves_readable_neighbor() -> None:
+    # S3: acting on a row whose selection is carried by an unrecognised class (desired=True) must not
+    # speculatively drive the cell and clear a neighbouring row that IS readably selected. The target
+    # reads UNMARKED (unrecognised class, no aria-selected), and an UNMARKED row is never cell-driven, so
+    # it falls open to the ordinary click and the readable neighbour survives untouched.
+    async with _grid_fixture_page() as page:
+        assert await _row_selected(page, "cb-neighbor-selected") is True
+        result = await _apply_grid(page, "cb-unknown-target", desired_state=True)
+        assert result is None
+        assert await _row_selected(page, "cb-neighbor-selected") is True
+
+
+class _RaisingTypeElement:
+    """A checkbox-tagged element whose ``get_attr`` raises (a detached/unreadable input)."""
+
+    def get_tag_name(self) -> str:
+        return "input"
+
+    def get_id(self) -> str:
+        return "el"
+
+    async def get_attr(self, attr_name: str, mode: str = "auto", timeout: float | None = None) -> str | None:
+        raise RuntimeError("element detached")
+
+    def get_locator(self) -> object:
+        raise AssertionError("must fall open before touching the locator")
+
+
+@pytest.mark.asyncio
+async def test_apply_get_attr_type_raises_falls_open() -> None:
+    # A raising get_attr("type") on the input dispatch must fall open to the ordinary click, matching the
+    # merge base, rather than propagating out of _apply_desired_click_state. FAILS before the fix.
+    result = await handler._apply_desired_click_state(_click_action(), _RaisingTypeElement(), True, MagicMock())
+    assert result is None

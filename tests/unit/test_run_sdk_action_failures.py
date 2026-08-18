@@ -9,6 +9,7 @@ from fastapi import HTTPException
 
 from skyvern.exceptions import ScrapingFailed, SkyvernActionFailed
 from skyvern.forge.sdk.routes.sdk import _sdk_action_context_refcounts, run_sdk_action
+from tests.unit.conftest import LEGACY_DOWNLOAD_ESCAPE_CASES
 
 
 @pytest.fixture
@@ -352,3 +353,56 @@ async def test_context_refcount_released_when_upload_drain_is_cancelled(
 
     assert "wr_test" not in _sdk_action_context_refcounts
     mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context.assert_called_once_with("wr_test")
+
+
+async def _run_upload_action(
+    mock_request: Any, mock_organization: Any, mock_app: Any, file_url: str
+) -> tuple[Any, HTTPException | None]:
+    """Drive the ai_upload_file route branch and report the upload sink plus any rejection."""
+    page_ai = MagicMock(ai_upload_file=AsyncMock(return_value=file_url))
+    scraped_page = MagicMock(_browser_state=MagicMock(must_get_working_page=AsyncMock()))
+    mock_request.action.type = "ai_upload_file"
+    mock_request.action.file_url = file_url
+
+    with (
+        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+        patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
+        patch("skyvern.forge.sdk.routes.sdk.RealSkyvernPageAi", return_value=page_ai),
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
+            new_callable=AsyncMock,
+            return_value=scraped_page,
+        ),
+    ):
+        mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)
+        try:
+            await run_sdk_action(mock_request, organization=mock_organization)
+        except HTTPException as exc:
+            return page_ai, exc
+    return page_ai, None
+
+
+@pytest.mark.asyncio
+async def test_ai_upload_file_route_accepts_canonical_legacy_file_url(
+    mock_request: Any, mock_organization: Any, mock_app: Any, legacy_download_uris: dict[str, str]
+) -> None:
+    """Positive control: the guard must still let a real in-root file through to the upload."""
+    page_ai, rejection = await _run_upload_action(
+        mock_request, mock_organization, mock_app, legacy_download_uris["canonical"]
+    )
+
+    assert rejection is None
+    page_ai.ai_upload_file.assert_awaited_once()
+    assert page_ai.ai_upload_file.await_args.kwargs["files"] == legacy_download_uris["canonical"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", LEGACY_DOWNLOAD_ESCAPE_CASES)
+async def test_ai_upload_file_route_rejects_legacy_file_url_escape(
+    mock_request: Any, mock_organization: Any, mock_app: Any, legacy_download_uris: dict[str, str], case: str
+) -> None:
+    page_ai, rejection = await _run_upload_action(mock_request, mock_organization, mock_app, legacy_download_uris[case])
+
+    assert rejection is not None
+    assert rejection.status_code == 400
+    page_ai.ai_upload_file.assert_not_awaited()

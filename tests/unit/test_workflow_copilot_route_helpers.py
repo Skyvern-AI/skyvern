@@ -19,9 +19,12 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
+from skyvern.forge.sdk.copilot.context import AgentResult
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids
 from skyvern.forge.sdk.routes.workflow_copilot import (
+    _assistant_execution_receipts,
     _blockless_submission_fallback,
+    _build_proposed_workflow_data,
     _effective_auto_accept,
     _ensure_terminal_frame,
     _normalize_copilot_yaml,
@@ -52,6 +55,39 @@ def test_workflow_copilot_ingress_log_fields_are_content_free() -> None:
 
     assert fields == {"message_length": len(f"The password is {literal}")}
     assert literal not in repr(fields)
+
+
+def test_proposed_workflow_persists_exact_version_execution_receipts() -> None:
+    workflow = MagicMock()
+    workflow.title = "Draft"
+    workflow.model_dump.return_value = {"workflow_id": "w_test"}
+    result = AgentResult(
+        user_response="done",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml="title: Draft\nworkflow_definition:\n  blocks: []\n",
+        executed_block_fingerprints={"step": {"version_b", "version_a"}},
+    )
+
+    proposed = _build_proposed_workflow_data(workflow, result)
+
+    assert proposed["_copilot_tested_block_fingerprints"] == {"step": ["version_a", "version_b"]}
+
+
+def test_assistant_history_retains_execution_receipts_after_proposal_clear() -> None:
+    first = MagicMock(
+        sender=WorkflowCopilotChatSender.AI,
+        narrative_payload={"testedBlockFingerprints": {"step": ["version_a"]}},
+    )
+    second = MagicMock(
+        sender=WorkflowCopilotChatSender.AI,
+        narrative_payload={"testedBlockFingerprints": {"step": ["version_b"], "other": ["version_c"]}},
+    )
+
+    assert _assistant_execution_receipts([first, second]) == {
+        "step": {"version_a", "version_b"},
+        "other": {"version_c"},
+    }
 
 
 def _agent_result(

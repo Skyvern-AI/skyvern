@@ -28,6 +28,7 @@ from skyvern.webeye.actions.actions import (
     ClickAction,
     ClickContext,
     ClosePageAction,
+    DragAction,
     ExtractAction,
     GotoUrlAction,
     InputTextAction,
@@ -94,6 +95,19 @@ def test_action_parse__with_element_id() -> None:
     action = Action.model_validate(action_no_element_id_int)
     assert action.action_type == "click"
     assert action.element_id == "1"
+
+
+def test_drag_action_rejects_oversized_path_before_validating_points() -> None:
+    valid_path = [(index, index) for index in range(1_000)]
+    assert DragAction(path=valid_path).path == valid_path
+
+    with pytest.raises(ValidationError) as exc_info:
+        DragAction.model_validate({"path": [("not-an-int", "also-not-an-int")] * 100_000})
+
+    assert exc_info.value.error_count() == 1
+    assert [(error["loc"], error["type"]) for error in exc_info.value.errors(include_input=False)] == [
+        (("path",), "too_long")
+    ]
 
 
 def test_sdk_input_text_action_repr_redacts_otp_fields() -> None:

@@ -187,51 +187,34 @@ async def test_create_workflow_run_ignores_ambient_context(agent_db: AgentDB, or
     assert run.copilot_session_id is None
 
 
-# ---------------------------------------------------------------------------
-# Stub-heuristic regression coverage
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_copilot_authorship_resolves_from_edited_by_alone(agent_db: AgentDB, org_id: str) -> None:
+    """Copilot lineage survives without a created_by='copilot' stamp: the copilot writes
+    edited_by unconditionally, while created_by keeps the user who created the workflow."""
+    workflow = await agent_db.workflows.create_workflow(
+        title="user-created-copilot-edited",
+        workflow_definition={"parameters": [], "blocks": []},
+        organization_id=org_id,
+        created_by=f"{org_id}_user",
+        edited_by="copilot",
+    )
+    assert workflow.created_by == f"{org_id}_user"
+    assert await agent_db.workflows.is_workflow_copilot_authored(
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        organization_id=org_id,
+    )
 
 
-def _make_workflow_stub(*, version: int, created_by: str | None, block_count: int) -> Any:
-    blocks = [object()] * block_count
-    definition = type("D", (), {"blocks": blocks})()
-    return type(
-        "W",
-        (),
-        {"version": version, "created_by": created_by, "workflow_definition": definition},
-    )()
-
-
-def test_is_copilot_born_stub_true_on_version_one_empty_unstamped() -> None:
-    from skyvern.forge.sdk.copilot.attribution import is_copilot_born_initial_write
-
-    wf = _make_workflow_stub(version=1, created_by=None, block_count=0)
-    assert is_copilot_born_initial_write(wf) is True
-
-
-def test_is_copilot_born_stub_false_on_later_version() -> None:
-    # v1 is the only version that can be copilot-born; cleared v2+ would otherwise false-positive.
-    from skyvern.forge.sdk.copilot.attribution import is_copilot_born_initial_write
-
-    wf = _make_workflow_stub(version=2, created_by=None, block_count=0)
-    assert is_copilot_born_initial_write(wf) is False
-
-
-def test_is_copilot_born_stub_false_on_already_stamped() -> None:
-    from skyvern.forge.sdk.copilot.attribution import is_copilot_born_initial_write
-
-    wf = _make_workflow_stub(version=1, created_by="copilot", block_count=0)
-    assert is_copilot_born_initial_write(wf) is False
-
-
-def test_is_copilot_born_stub_false_on_non_empty_definition() -> None:
-    from skyvern.forge.sdk.copilot.attribution import is_copilot_born_initial_write
-
-    wf = _make_workflow_stub(version=1, created_by=None, block_count=3)
-    assert is_copilot_born_initial_write(wf) is False
-
-
-def test_is_copilot_born_stub_false_on_none() -> None:
-    from skyvern.forge.sdk.copilot.attribution import is_copilot_born_initial_write
-
-    assert is_copilot_born_initial_write(None) is False
+@pytest.mark.asyncio
+async def test_workflow_never_touched_by_copilot_is_not_copilot_authored(agent_db: AgentDB, org_id: str) -> None:
+    workflow = await agent_db.workflows.create_workflow(
+        title="user-only",
+        workflow_definition={"parameters": [], "blocks": []},
+        organization_id=org_id,
+        created_by=f"{org_id}_user",
+        edited_by=f"{org_id}_user",
+    )
+    assert not await agent_db.workflows.is_workflow_copilot_authored(
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        organization_id=org_id,
+    )

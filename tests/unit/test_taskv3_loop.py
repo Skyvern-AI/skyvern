@@ -443,3 +443,153 @@ async def test_tool_error_stops_batch_and_skips_remaining() -> None:
     turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool"]
     assert any(m.get("name") == "type" and "skipped" in m["content"] for m in turn1_tool_msgs)
     assert any("tool_error: RuntimeError" in m["content"] for m in turn1_tool_msgs)
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_ignores_perception_rounds() -> None:
+    # A v3 "step" is an action round; perception rounds (observe/get_html) must not consume the
+    # caller's step budget, or a tight budget starves the engine before it can act.
+    obs_calls: list[tuple[str, dict[str, Any]]] = []
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    observe = _recording_tool("observe", obs_calls)  # not billable = perception
+    click = _recording_tool("click", click_calls)
+    click.billable = True
+    script = [
+        [("observe", {})],
+        [("observe", {})],
+        [("observe", {})],
+        [("observe", {})],
+        [("click", {})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, _ = await _run(script, [observe, click, make_finish_tool()], max_action_steps=2, max_turns=20)
+    assert outcome.status == "completed"  # 4 perception rounds did not burn the 2-action-step budget
+    assert len(obs_calls) == 4 and len(click_calls) == 1
+    assert outcome.action_steps == 1  # only the single action round counted
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_counts_rounds_not_individual_actions() -> None:
+    # A batched action round (many actions in one turn) is ONE step, matching a step-engine step.
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", click_calls)
+    click.billable = True
+    type_ = _recording_tool("type", type_calls)
+    type_.billable = True
+    script = [
+        [("click", {}), ("type", {"t": "a"})],  # action round 1 (2 actions)
+        [("click", {}), ("type", {"t": "b"})],  # action round 2 (2 actions)
+        [("click", {}), ("type", {"t": "c"})],  # round 3 -> blocked by the 2-step budget
+    ]
+    outcome, _ = await _run(script, [click, type_, make_finish_tool()], max_action_steps=2, max_turns=20)
+    assert outcome.status == "budget_exhausted"
+    assert "maximum steps (2)" in outcome.reason
+    assert outcome.action_steps == 2  # two action rounds counted, exposed on the outcome
+    # 2 rounds (4 actions) ran; the 3rd was blocked at the top -> per-round, not per-action, counting.
+    assert len(click_calls) == 2 and len(type_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_allows_finish_after_last_action_round() -> None:
+    # Regression: at the boundary the model must still be able to re-observe and finish (a separate
+    # turn per the system prompt). The cap bounds new action rounds, not the completion signal.
+    obs_calls: list[tuple[str, dict[str, Any]]] = []
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    observe = _recording_tool("observe", obs_calls)
+    click = _recording_tool("click", click_calls)
+    click.billable = True
+    script = [
+        [("observe", {})],
+        [("click", {})],  # action round 1 == cap
+        [("observe", {})],  # perception after the last action must NOT be blocked
+        [("finish", {"status": "completed", "reason": "done", "extracted_output": {"ok": True}})],
+    ]
+    outcome, _ = await _run(script, [observe, click, make_finish_tool()], max_action_steps=1, max_turns=20)
+    assert outcome.status == "completed"  # not budget_exhausted
+    assert outcome.extracted_output == {"ok": True}  # output not dropped
+    assert outcome.action_steps == 1
+    assert len(click_calls) == 1 and len(obs_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_terminates_only_on_action_beyond_budget() -> None:
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", click_calls)
+    click.billable = True
+    script = [[("click", {})], [("click", {})]]  # 2nd click is the (cap+1)th action round
+    outcome, _ = await _run(script, [click, make_finish_tool()], max_action_steps=1, max_turns=20)
+    assert outcome.status == "budget_exhausted"
+    assert "maximum steps (1)" in outcome.reason
+    assert outcome.action_steps == 1
+    assert len(click_calls) == 1  # the over-budget action was refused, not executed
+
+
+@pytest.mark.asyncio
+async def test_action_step_budget_counts_failed_action_rounds() -> None:
+    # A dispatched page action consumes a step even if it errors (it may mutate before failing),
+    # so a run cannot exceed the budget by repeatedly failing a mutating tool.
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", click_calls, raises=True)
+    click.billable = True
+    script = [[("click", {})], [("click", {})]]
+    outcome, _ = await _run(script, [click, make_finish_tool()], max_action_steps=1, max_turns=20)
+    assert outcome.status == "budget_exhausted"
+    assert outcome.action_steps == 1  # the failed 1st round still consumed the budget
+    assert len(click_calls) == 1  # 2nd round refused at the budget gate
+
+
+@pytest.mark.asyncio
+async def test_on_action_round_fires_once_per_action_round() -> None:
+    # The callback fires once per action ROUND (a turn with >=1 successful billable action), not per
+    # tool and not on perception-only turns, and receives that round's (name, args) list.
+    rounds: list[list[tuple[str, dict[str, Any]]]] = []
+
+    async def _on_round(actions: list[tuple[str, dict[str, Any]]]) -> None:
+        rounds.append(actions)
+
+    obs, clk, typ = [], [], []
+    observe = _recording_tool("observe", obs)  # perception, not billable
+    click = _recording_tool("click", clk)
+    click.billable = True
+    type_ = _recording_tool("type", typ)
+    type_.billable = True
+    script = [
+        [("observe", {})],  # perception-only -> no callback
+        [("click", {"selector": "#a"}), ("type", {"selector": "#b", "text": "x"})],  # 1 round, 2 tools -> 1 call
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, _ = await _run(script, [observe, click, type_, make_finish_tool()], on_action_round=_on_round)
+    assert outcome.status == "completed"
+    assert len(rounds) == 1
+    assert rounds[0] == [("click", {"selector": "#a"}), ("type", {"selector": "#b", "text": "x"})]
+
+
+@pytest.mark.asyncio
+async def test_on_action_round_skips_rounds_with_no_successful_action() -> None:
+    rounds: list[list[tuple[str, dict[str, Any]]]] = []
+
+    async def _on_round(actions: list[tuple[str, dict[str, Any]]]) -> None:
+        rounds.append(actions)
+
+    clk: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clk, raises=True)  # dispatched (consumes a step) but errors
+    click.billable = True
+    script = [[("click", {})], [("finish", {"status": "completed", "reason": "ok"})]]
+    outcome, _ = await _run(script, [click, make_finish_tool()], on_action_round=_on_round)
+    assert outcome.status == "completed"
+    assert rounds == []  # no successful billable action -> no per-action persistence
+
+
+@pytest.mark.asyncio
+async def test_on_action_round_failure_does_not_abort_run() -> None:
+    async def _boom(actions: list[tuple[str, dict[str, Any]]]) -> None:
+        raise RuntimeError("persist boom")
+
+    clk: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clk)
+    click.billable = True
+    script = [[("click", {})], [("finish", {"status": "completed", "reason": "ok"})]]
+    outcome, _ = await _run(script, [click, make_finish_tool()], on_action_round=_boom)
+    assert outcome.status == "completed"  # callback error contained; run still completes
+    assert len(clk) == 1

@@ -7,6 +7,8 @@ from playwright._impl._errors import TimeoutError as PWTimeoutError
 
 from skyvern.exceptions import SkyvernException
 from skyvern.webeye.browser_errors import (
+    _CONTEXT_LOST_MESSAGE_MARKERS,
+    _TARGET_CLOSED_MESSAGE_MARKERS,
     BrowserAutomationError,
     BrowserCdpConnectionError,
     BrowserEngineErrorFamilies,
@@ -16,6 +18,16 @@ from skyvern.webeye.browser_errors import (
     BrowserTimeoutError,
     classify_browser_error,
 )
+
+
+def test_target_closed_and_context_lost_markers_do_not_overlap() -> None:
+    overlaps = [
+        (target, context)
+        for target in _TARGET_CLOSED_MESSAGE_MARKERS
+        for context in _CONTEXT_LOST_MESSAGE_MARKERS
+        if target in context or context in target
+    ]
+    assert overlaps == []
 
 
 def _stock_families(**overrides: object) -> BrowserEngineErrorFamilies:

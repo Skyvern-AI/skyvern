@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockCaptchaError
 
@@ -120,7 +121,7 @@ class FakePage:
 async def test_real_sandbox_solve_captcha_is_fast_noop_without_challenge(monkeypatch: pytest.MonkeyPatch) -> None:
     agent_function = type(
         "AgentFunctionStub",
-        (),
+        (AgentFunction,),
         {
             "auto_solve_captchas": AsyncMock(return_value=False),
             "solve_recaptcha_token": AsyncMock(return_value=False),
@@ -143,7 +144,7 @@ async def test_real_sandbox_solve_captcha_clicks_unique_structural_checkbox(
 ) -> None:
     agent_function = type(
         "AgentFunctionStub",
-        (),
+        (AgentFunction,),
         {
             "auto_solve_captchas": AsyncMock(return_value=False),
             "solve_recaptcha_token": AsyncMock(return_value=False),
@@ -175,7 +176,7 @@ async def test_real_sandbox_solve_captcha_clicks_recaptcha_anchor_in_frame(
 ) -> None:
     agent_function = type(
         "AgentFunctionStub",
-        (),
+        (AgentFunction,),
         {
             "auto_solve_captchas": AsyncMock(return_value=False),
             "solve_recaptcha_token": AsyncMock(return_value=False),
@@ -213,7 +214,7 @@ async def test_real_sandbox_solve_captcha_does_not_click_untrusted_anchor_host(
 ) -> None:
     agent_function = type(
         "AgentFunctionStub",
-        (),
+        (AgentFunction,),
         {
             "auto_solve_captchas": AsyncMock(return_value=True),
             "solve_recaptcha_token": AsyncMock(return_value=False),
@@ -239,7 +240,7 @@ async def test_real_sandbox_solve_captcha_does_not_click_after_anchor_frame_navi
 ) -> None:
     agent_function = type(
         "AgentFunctionStub",
-        (),
+        (AgentFunction,),
         {
             "auto_solve_captchas": AsyncMock(return_value=True),
             "solve_recaptcha_token": AsyncMock(return_value=False),
@@ -278,7 +279,7 @@ async def test_real_sandbox_solve_captcha_returns_after_callback_navigation(
 ) -> None:
     agent_function = type(
         "AgentFunctionStub",
-        (),
+        (AgentFunction,),
         {
             "auto_solve_captchas": AsyncMock(return_value=not navigation_solved),
             "solve_recaptcha_token": AsyncMock(return_value=False),
@@ -317,7 +318,7 @@ async def test_real_sandbox_solve_captcha_rejects_prechecked_anchor_without_fres
 ) -> None:
     agent_function = type(
         "AgentFunctionStub",
-        (),
+        (AgentFunction,),
         {
             "auto_solve_captchas": AsyncMock(return_value=False),
             "solve_recaptcha_token": AsyncMock(return_value=True),
@@ -345,7 +346,7 @@ async def test_real_sandbox_solve_captcha_falls_through_when_anchor_stays_unchec
 ) -> None:
     agent_function = type(
         "AgentFunctionStub",
-        (),
+        (AgentFunction,),
         {
             "auto_solve_captchas": AsyncMock(return_value=True),
             "solve_recaptcha_token": AsyncMock(return_value=False),
@@ -373,7 +374,7 @@ async def test_real_sandbox_solve_captcha_falls_through_when_token_lags_checked_
 ) -> None:
     agent_function = type(
         "AgentFunctionStub",
-        (),
+        (AgentFunction,),
         {
             "auto_solve_captchas": AsyncMock(return_value=False),
             "solve_recaptcha_token": AsyncMock(return_value=True),
@@ -401,7 +402,7 @@ async def test_real_sandbox_solve_captcha_rejects_preexisting_token(
 ) -> None:
     agent_function = type(
         "AgentFunctionStub",
-        (),
+        (AgentFunction,),
         {
             "auto_solve_captchas": AsyncMock(return_value=False),
             "solve_recaptcha_token": AsyncMock(return_value=True),
@@ -429,7 +430,7 @@ async def test_real_sandbox_solve_captcha_rejects_inconclusive_token_baseline(
 ) -> None:
     agent_function = type(
         "AgentFunctionStub",
-        (),
+        (AgentFunction,),
         {
             "auto_solve_captchas": AsyncMock(return_value=False),
             "solve_recaptcha_token": AsyncMock(return_value=True),
@@ -460,7 +461,7 @@ async def test_real_sandbox_solve_captcha_bounds_unresponsive_anchor_arm(
 ) -> None:
     agent_function = type(
         "AgentFunctionStub",
-        (),
+        (AgentFunction,),
         {
             "auto_solve_captchas": AsyncMock(return_value=True),
             "solve_recaptcha_token": AsyncMock(return_value=False),
@@ -493,7 +494,7 @@ async def test_real_sandbox_solve_captcha_raises_constant_sanitized_error(
 ) -> None:
     agent_function = type(
         "AgentFunctionStub",
-        (),
+        (AgentFunction,),
         {
             "auto_solve_captchas": AsyncMock(return_value=False),
             "solve_recaptcha_token": AsyncMock(return_value=False),
@@ -528,7 +529,7 @@ async def test_builtin_reports_whether_an_arm_ran(monkeypatch: pytest.MonkeyPatc
     re-perceive after a solve do not re-perceive a page nothing touched."""
     agent_function = type(
         "AgentFunctionStub",
-        (),
+        (AgentFunction,),
         {
             "auto_solve_captchas": AsyncMock(return_value=False),
             "solve_recaptcha_token": AsyncMock(return_value=True),
@@ -563,7 +564,7 @@ async def test_extension_arm_is_bounded_and_falls_through_on_hang(
 
     agent_function = type(
         "AgentFunctionStub",
-        (),
+        (AgentFunction,),
         {
             "auto_solve_captchas": AsyncMock(side_effect=_never_returns),
             "solve_recaptcha_token": AsyncMock(return_value=False),
@@ -589,7 +590,7 @@ async def test_an_unsolved_anchor_click_closes_the_challenge_it_opened(monkeypat
     outlives the arm, so a click that won no token has to put the widget back."""
     agent_function = type(
         "AgentFunctionStub",
-        (),
+        (AgentFunction,),
         {
             "auto_solve_captchas": AsyncMock(return_value=False),
             "solve_recaptcha_token": AsyncMock(return_value=False),
@@ -619,7 +620,7 @@ async def test_an_anchor_click_that_left_a_token_is_not_reset_away(monkeypatch: 
     """A reset discards whatever response it finds, so it must not run over a token already there."""
     agent_function = type(
         "AgentFunctionStub",
-        (),
+        (AgentFunction,),
         {
             "auto_solve_captchas": AsyncMock(return_value=False),
             "solve_recaptcha_token": AsyncMock(return_value=False),

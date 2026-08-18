@@ -21,11 +21,11 @@ _DISCOVERED_BROWSER_API_CALLS = {
         {
             "bring_to_front": 2,
             "check": 2,
-            "click": 22,
+            "click": 23,
             "clear": 4,
             "close": 5,
             "dblclick": 2,
-            "evaluate": 11,
+            "evaluate": 14,
             "fill": 2,
             "focus": 2,
             "go_back": 1,
@@ -47,7 +47,7 @@ _DISCOVERED_BROWSER_API_CALLS = {
     ),
     "skyvern/webeye/actions/handler_utils.py": Counter({"down": 3, "fill": 1, "press": 1, "up": 3}),
     "skyvern/webeye/dialog_handler.py": Counter({"accept": 3, "dismiss": 1}),
-    "skyvern/webeye/dom_inspection.py": Counter({"evaluate": 4}),
+    "skyvern/webeye/dom_inspection.py": Counter({"evaluate": 5}),
     "skyvern/webeye/utils/dom.py": Counter(
         {
             "check": 2,
@@ -76,6 +76,10 @@ _EVALUATE_CALLERS = {
             "_blob_iframe_src_titles": 1,
             "_collect_inline_iframe_src_candidates": 1,
             "_evaluate_element_scoped": 1,
+            # grid row-selection snapshot read, post-click settle re-read, and cell hit-test (SKY-13695)
+            "_read_grid_row_selection": 1,
+            "_grid_row_reached_state": 1,
+            "_drive_grid_row_selection": 1,
             # detached-clone constraint check inside _static_declared_constraint_evidence's nested _inner (SKY-13631)
             "_inner": 1,
             "_normal_select_readback_contradicts": 1,
@@ -86,6 +90,8 @@ _EVALUATE_CALLERS = {
     "skyvern/webeye/dom_inspection.py": Counter(
         {
             "read_current_url": 1,
+            # locator-scoped live selected/checked read for the cached click guard (SKY-14051)
+            "read_locator_selected_state": 1,
             "read_locator_tag_name": 1,
             "read_resolved_anchor_href": 1,
             "read_whether_link_or_button": 1,
@@ -201,21 +207,21 @@ def test_discovered_browser_api_lower_bound_is_stable() -> None:
     }
 
     assert observed == _DISCOVERED_BROWSER_API_CALLS
-    assert sum(sum(methods.values()) for methods in observed.values()) == 146
+    assert sum(sum(methods.values()) for methods in observed.values()) == 151
     handler_candidates = _candidate_signatures("skyvern/webeye/actions/handler.py", _CANDIDATE_METHODS)
     classified_non_browser = Counter(
         {signature: count for signature, count in handler_candidates.items() if signature in _NON_BROWSER_CANDIDATES}
     )
     assert classified_non_browser == _NON_BROWSER_CANDIDATES
     assert sum(_NON_BROWSER_CANDIDATES.values()) == 5
-    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 141
+    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 146
 
 
 def test_every_raw_evaluate_call_is_classified() -> None:
     observed = {path: callers for path in _owned_source_paths() if (callers := _callers_for_method(path, "evaluate"))}
 
     assert observed == _EVALUATE_CALLERS
-    assert sum(sum(callers.values()) for callers in observed.values()) == 18
+    assert sum(sum(callers.values()) for callers in observed.values()) == 22
 
 
 def test_every_cdp_dispatch_is_classified_by_exact_command() -> None:

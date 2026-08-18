@@ -8,6 +8,7 @@ import pytest
 
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
+from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import LoginBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -25,6 +26,7 @@ from skyvern.webeye.browser_artifacts import BrowserArtifacts
 def _workflow(*, persist: bool = False, pick: str | None = None, key: str | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         persist_browser_session=persist,
+        reuse_browser_session=False,
         browser_profile_id=pick,
         browser_profile_key=key,
         pin_saved_session_ip=False,
@@ -39,6 +41,8 @@ def _run(retried_from_workflow_run_id: str | None = None) -> SimpleNamespace:
         workflow_run_id="wr_test",
         organization_id="o_test",
         browser_session_id=None,
+        start_fresh_browser=None,
+        reuse_browser_session=None,
         browser_profile_id=None,
         browser_seed_source=None,
         browser_sink_profile_id=None,
@@ -518,6 +522,8 @@ async def test_resolve_and_stamp_is_idempotent_when_already_stamped(monkeypatch:
         workflow_run_id="wr_test",
         organization_id="o_test",
         browser_session_id=None,
+        start_fresh_browser=None,
+        reuse_browser_session=None,
         browser_profile_id="bp_cred",
         browser_seed_source=BrowserSeedSource.credential,
         browser_sink_profile_id=None,
@@ -545,6 +551,8 @@ async def test_resolve_and_stamp_keeps_session_attached_profile(monkeypatch: pyt
         workflow_run_id="wr_test",
         organization_id="o_test",
         browser_session_id="pbs_1",
+        start_fresh_browser=None,
+        reuse_browser_session=None,
         browser_profile_id="bp_from_session",
         browser_seed_source=None,
         browser_sink_profile_id=None,
@@ -573,6 +581,8 @@ async def test_resolve_and_stamp_skips_profileless_live_session(monkeypatch: pyt
         workflow_run_id="wr_test",
         organization_id="o_test",
         browser_session_id="pbs_1",
+        start_fresh_browser=None,
+        reuse_browser_session=None,
         browser_profile_id=None,
         browser_seed_source=None,
         browser_sink_profile_id=None,
@@ -773,6 +783,7 @@ def _existing_run(
         browser_profile_id=browser_profile_id,
         browser_seed_source=browser_seed_source,
         start_fresh_browser=start_fresh_browser,
+        reuse_browser_session=None,
         max_screenshot_scrolls=None,
         max_elapsed_time_minutes=None,
         extra_http_headers=None,
@@ -1387,6 +1398,9 @@ async def test_login_block_boot_degrades_when_profile_not_applied(monkeypatch: p
     )
     degraded_run = SimpleNamespace(browser_seed_source=BrowserSeedSource.degraded_fresh, browser_profile_id=None)
 
+    log = MagicMock()
+    monkeypatch.setattr(service_module, "LOG", log)
+
     result, update, _ = await _prepare_login_block_profile_boot(
         monkeypatch,
         url="https://login.example/session",
@@ -1401,6 +1415,16 @@ async def test_login_block_boot_degrades_when_profile_not_applied(monkeypatch: p
         "browser_seed_source": BrowserSeedSource.degraded_fresh,
     }
     assert result is degraded_run
+    expected_log = next(
+        call
+        for call in log.info.call_args_list
+        if call.args[0] == "Saved browser profile was not applied; falling back to normal login"
+    )
+    assert "exc_info" not in expected_log.kwargs
+    assert not any(
+        call.args[0] == "Saved browser profile failed to load, falling back to normal login"
+        for call in log.warning.call_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -1625,6 +1649,9 @@ async def test_login_block_profile_boot_unresolved_url_degrades_without_raising(
     )
 
     raw_url = "{{ missing_url_parameter }}"
+    log = MagicMock()
+    monkeypatch.setattr(service_module, "LOG", log)
+
     result, update, _ = await _prepare_login_block_profile_boot(
         monkeypatch,
         url=raw_url,
@@ -1640,3 +1667,9 @@ async def test_login_block_profile_boot_unresolved_url_degrades_without_raising(
         "browser_seed_source": BrowserSeedSource.degraded_fresh,
     }
     assert result is degraded_run
+    unexpected_log = next(
+        call
+        for call in log.warning.call_args_list
+        if call.args[0] == "Saved browser profile failed to load, falling back to normal login"
+    )
+    assert unexpected_log.kwargs["exc_info"] is True

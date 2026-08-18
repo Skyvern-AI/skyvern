@@ -26,12 +26,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, Callable
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
 
+from skyvern.config import settings as agent_settings
 from skyvern.exceptions import (
     FailedToNavigateToUrl,
     FailedToParseActionInstruction,
@@ -309,3 +311,99 @@ async def test_failed_to_send_webhook_is_swallowed_without_cleanup(monkeypatch: 
     assert outcome.returned is not None
     assert outcome.returned[0].step_id == "step-0"
     assert outcome.returned[2] is None
+
+
+# SKY-13472: execute_step recurses into the next step via `return await self.execute_step(...)`.
+# The parent frame's ``detailed_output`` (holding that step's ``scraped_page``) would otherwise stay
+# alive on the stack for the whole recursive subtree, pinning one ``ScrapedPage`` per level. Once
+# ``record_fail_fast_shadow`` and ``handle_completed_step`` have consumed it, nothing else reads it
+# before the child runs, so it is released. These drive one real ``execute_step`` frame to each of
+# the two recursive call sites and, via a spy on the recursive entry, assert the parent's
+# ``scraped_page`` is already cleared when the child begins — while proving the pre-release consumers
+# still saw the real page and the child's return value is forwarded unchanged.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["retry", "execute_all_steps"], ids=["retry-site", "execute-all-steps-site"])
+async def test_execute_step_releases_scraped_page_before_recursion(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(now, organization)
+    step = make_step(now, task, step_id="step-0", status=StepStatus.running, order=0, output=None)
+    next_step = make_step(now, task, step_id="step-1", status=StepStatus.running, order=1, output=None)
+
+    scraped_page = object()
+    detailed_output = SimpleNamespace(scraped_page=scraped_page, cua_response=None)
+
+    step_after = make_step(
+        now,
+        task,
+        step_id="step-0",
+        status=StepStatus.failed if path == "retry" else StepStatus.completed,
+        order=0,
+        output=None,
+    )
+
+    browser_state = MagicMock()
+    browser_state.get_working_page = AsyncMock(return_value=MagicMock())
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.get_task", AsyncMock(return_value=None))
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", AsyncMock(return_value=task))
+    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.validate_step_execution", AsyncMock(return_value=None))
+    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_step_execution", AsyncMock(return_value=None))
+    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.flush_step_archive", AsyncMock(return_value=None))
+    monkeypatch.setattr(type(agent_settings), "execute_all_steps", lambda self: True)
+
+    fail_fast_spy = AsyncMock(return_value=None)
+    monkeypatch.setattr("skyvern.forge.agent.record_fail_fast_shadow", fail_fast_spy)
+
+    agent.initialize_execution_state = AsyncMock(return_value=(step, browser_state, detailed_output))  # type: ignore[method-assign]
+    agent.register_async_operations = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    agent.agent_step = AsyncMock(return_value=(step_after, detailed_output))  # type: ignore[method-assign]
+    agent.update_task_errors_from_detailed_output = AsyncMock(return_value=task)  # type: ignore[method-assign]
+    agent._sync_video_artifact_after_step = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    handle_completed_step = AsyncMock(return_value=(None, None, next_step))
+    handle_failed_step = AsyncMock(return_value=next_step)
+    agent.handle_completed_step = handle_completed_step  # type: ignore[method-assign]
+    agent.handle_failed_step = handle_failed_step  # type: ignore[method-assign]
+
+    snapshots: dict[str, Any] = {}
+    calls = {"n": 0}
+    real_execute_step = agent.execute_step
+
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return await real_execute_step(*args, **kwargs)
+        snapshots["scraped_page_at_child_entry"] = detailed_output.scraped_page
+        child_step = kwargs["step"] if "step" in kwargs else args[2]
+        return (child_step, None, None)
+
+    agent.execute_step = spy  # type: ignore[method-assign]
+
+    context = SkyvernContext(
+        organization_id=organization.organization_id, task_id=task.task_id, tz_info=ZoneInfo("UTC")
+    )
+    skyvern_context.set(context)
+    try:
+        result = await agent.execute_step(
+            organization=organization,
+            task=task,
+            step=step,
+            api_key="api-key",
+            download_baseline_files=[],
+        )
+    finally:
+        skyvern_context.reset()
+
+    # The recursion happened, and the child's return value is forwarded verbatim.
+    assert calls["n"] == 2
+    assert result == (next_step, None, None)
+
+    # The parent's scraped_page is already released when the child begins.
+    assert snapshots["scraped_page_at_child_entry"] is None
+    assert detailed_output.scraped_page is None
+
+    # Consumers that run before the release still saw the real page (behavior unchanged).
+    assert fail_fast_spy.await_args.kwargs["scraped_page"] is scraped_page
+    if path == "execute_all_steps":
+        assert handle_completed_step.await_args.kwargs["scraped_page"] is scraped_page

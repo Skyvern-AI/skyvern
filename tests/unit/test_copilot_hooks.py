@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import StructuredContext
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
+from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY, MCP_RESULT_PROVENANCE_VALUE
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import (
     _capture_scout_ambiguity,
@@ -278,7 +279,7 @@ class TestCopilotToCallToolResult:
         data = {"ok": True, "data": {"count": 5}}
         result = self._build(data)
         parsed = json.loads(result.content[0].text)
-        assert parsed == data
+        assert parsed == {**data, MCP_RESULT_PROVENANCE_KEY: MCP_RESULT_PROVENANCE_VALUE}
 
 
 class TestSchemaOverlay:
@@ -416,13 +417,15 @@ class TestMCPFailedStepLoopDetection:
 
         parsed = json.loads(result.content[0].text)
         assert result.isError is False
-        assert parsed == {
+        preserved = {
             "ok": True,
             "data": {"selector": None, "resolved_selector": "xpath=//button[2]", "status": "clicked"},
         }
+        assert parsed == {**preserved, MCP_RESULT_PROVENANCE_KEY: MCP_RESULT_PROVENANCE_VALUE}
         assert summarize_tool_result("click", parsed) == "Clicked 'xpath=//button[2]'"
-        assert recorded == [parsed]
-        assert screenshots == [parsed]
+        # The untrusted marker is model-facing only; the loop context records the result itself.
+        assert recorded == [preserved]
+        assert screenshots == [preserved]
         assert ctx.scouted_interactions == initial_scouted_interactions
         assert ctx.scout_trajectory == initial_scout_trajectory
         assert ctx.flow_evidence == initial_flow_evidence
@@ -482,8 +485,9 @@ class TestMCPFailedStepLoopDetection:
 
         parsed = json.loads(result.content[0].text)
         assert result.isError is True
-        assert parsed == {"ok": False, "error": "element not found"}
-        assert recorded == [parsed]
+        preserved = {"ok": False, "error": "element not found"}
+        assert parsed == {**preserved, MCP_RESULT_PROVENANCE_KEY: MCP_RESULT_PROVENANCE_VALUE}
+        assert recorded == [preserved]
 
     @pytest.mark.asyncio
     async def test_browser_tool_call_is_created_inside_copilot_browser_context(
@@ -1000,7 +1004,7 @@ class TestBrowserInteractionObservationHooks:
         assert result["data"] == {
             "selector": "#add-to-cart",
             "effective_target": "#add-to-cart",
-            "url": "https://example.com/results",
+            "url": "https://example.com/",
             "title": "Results",
         }
         assert ctx.pending_browser_interaction_observation is not None
@@ -1384,6 +1388,36 @@ class TestScoutedInteractionCapture:
         assert "input_value" not in facts[0]
         assert "actual-password" not in str(facts)
 
+    def test_demonstrated_step_facts_project_urls_to_safe_origins(self) -> None:
+        from skyvern.forge.sdk.copilot.tools.mcp_hooks import _demonstrated_step_facts
+
+        ctx = self._ctx()
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#submit",
+                "source_url": "https://user:password@example.com/account/5db266e1?token=7cc8f30a#billing",
+                "result_url": "https://example.com/dashboard/9f82016e?session=a857b755#overview",
+            }
+        ]
+
+        assert _demonstrated_step_facts(ctx) == [
+            {
+                "tool_name": "click",
+                "selector": "#submit",
+                "source_url": "https://example.com/",
+                "result_url": "https://example.com/",
+                "selector_candidates": None,
+                "selector_match_count": None,
+                "role": None,
+                "accessible_name": None,
+                "role_name_match_count": None,
+                "observed_effects": None,
+                "observation_step": None,
+                "input_id": None,
+            }
+        ]
+
     @pytest.mark.asyncio
     async def test_code_schema_surfaces_ordered_facts_not_synthesized_source(self) -> None:
         from skyvern.forge.sdk.copilot.tools.mcp_hooks import _get_block_schema_post_hook
@@ -1400,8 +1434,8 @@ class TestScoutedInteractionCapture:
                 "role": None,
                 "accessible_name": None,
                 "role_name_match_count": None,
-                "source_url": "https://example.com/form",
-                "result_url": "https://example.com/thanks",
+                "source_url": "https://example.com/",
+                "result_url": "https://example.com/",
                 "observed_effects": None,
                 "observation_step": None,
                 "input_id": None,
@@ -1420,8 +1454,8 @@ class TestScoutedInteractionCapture:
                 "role": None,
                 "accessible_name": None,
                 "role_name_match_count": None,
-                "source_url": "https://example.com/form",
-                "result_url": "https://example.com/thanks",
+                "source_url": "https://example.com/",
+                "result_url": "https://example.com/",
                 "observed_effects": None,
                 "observation_step": None,
                 "input_id": None,
