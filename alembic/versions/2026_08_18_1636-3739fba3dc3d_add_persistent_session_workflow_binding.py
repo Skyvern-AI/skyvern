@@ -18,6 +18,7 @@ down_revision: Union[str, None] = "9e485c4e6177"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+
 def _binding_index_valid() -> bool | None:
     return (
         op.get_bind()
