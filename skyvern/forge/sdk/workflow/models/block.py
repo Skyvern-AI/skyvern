@@ -57,6 +57,7 @@ from skyvern.constants import (
     MAX_FILE_PARSE_INPUT_TOKENS,
     MAX_PDF_OCR_PAGES,
     MAX_UPLOAD_FILE_COUNT,
+    NAVIGATION_MAX_RETRY_TIME,
     PDF_OCR_PAGE_CONCURRENCY,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
 )
@@ -126,6 +127,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_action_id
@@ -213,7 +215,7 @@ from skyvern.schemas.workflows import (
     _validate_code_block_error_code_calls,
     _validate_code_block_error_code_mapping,
 )
-from skyvern.services import otp_service, planner_levers
+from skyvern.services import otp_email, otp_service, planner_levers
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.self_heal_cap import check_and_increment_self_heal_cap
 from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
@@ -227,8 +229,10 @@ from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
 from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_factory import rebind_download_dir
+from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import normalize_download_filename, settle_browser_downloads_for_context
+from skyvern.webeye.navigation import default_navigation_settle, navigate_with_retry, redact_url_secrets
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -4131,6 +4135,36 @@ class OTPResult(str):
         return self.otp_type is OTPType.MAGIC_LINK
 
 
+_OTP_VERB_BY_TYPE = {
+    OTPType.TOTP: "await <credential>.otp()",
+    OTPType.MAGIC_LINK: "await <credential>.magic_link(page)",
+}
+
+
+def _otp_wait_failure(
+    expected_otp_type: OTPType,
+    observed_otp_types: set[OTPType],
+    budget_seconds: int,
+) -> CodeBlockOTPError:
+    """Turn a wait that produced nothing into a mismatch report when the other kind of OTP arrived.
+
+    A wrong verb otherwise looks exactly like a mailbox that stayed empty, which leaves the
+    authoring retry with nothing to act on.
+    """
+    mismatched = sorted(observed for observed in observed_otp_types if observed is not expected_otp_type)
+    if not mismatched:
+        return CodeBlockOTPError(f"OTP was not received within {budget_seconds} seconds.")
+    found = ", ".join(observed.value for observed in mismatched)
+    # .get, not [], so a future OTPType cannot turn this error path into a KeyError.
+    suggested = _OTP_VERB_BY_TYPE.get(mismatched[0], "the matching verb")
+    attempted = _OTP_VERB_BY_TYPE.get(expected_otp_type, "this verb")
+    return CodeBlockOTPError(
+        f"Waited {budget_seconds}s for an OTP of type {expected_otp_type.value}, "
+        f"but this mailbox delivered {found}. This sign-in uses the other flow: "
+        f"author {suggested} instead of {attempted}."
+    )
+
+
 async def _poll_code_block_otp(
     totp_identifier: str,
     organization_id: str | None,
@@ -4139,6 +4173,7 @@ async def _poll_code_block_otp(
     *,
     budget_seconds: int,
     subject: str,
+    expected_otp_type: OTPType,
 ) -> otp_service.OTPValue:
     if not organization_id:
         raise CodeBlockOTPError("OTP is unavailable: no organization is associated with this code block.")
@@ -4148,6 +4183,19 @@ async def _poll_code_block_otp(
     if workflow_run is None:
         raise CodeBlockOTPError("OTP is unavailable: the workflow run could not be loaded.")
 
+    # A magic link is single-use, so one minted earlier in this run may already be spent. Anchoring
+    # near call time narrows that window; it does not close it (SKY-13417 owns consumed-entry marking).
+    # The grace interval keeps a link that landed while the triggering click was still settling
+    # visible, and absorbs clock skew against the inbox's timestamps. Naive UTC, matching
+    # workflow_runs.started_at and both downstream filters: a local-clock anchor would filter
+    # every delivery east of UTC and widen the window west.
+    if expected_otp_type is OTPType.MAGIC_LINK:
+        created_after = naive_utc_now() - otp_service.MAGIC_LINK_ANCHOR_GRACE
+    else:
+        created_after = workflow_run.started_at
+
+    email_context = otp_email.EmailOTPVerificationContext()
+    raw_context = otp_service.RawOTPVerificationContext()
     try:
         polled = await asyncio.wait_for(
             otp_service.poll_otp_value(
@@ -4156,13 +4204,19 @@ async def _poll_code_block_otp(
                 workflow_run_id=workflow_run_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
                 totp_identifier=totp_identifier,
-                created_after=workflow_run.started_at,
-                expected_otp_type=OTPType.TOTP,
+                created_after=created_after,
+                expected_otp_type=expected_otp_type,
+                email_context=email_context,
+                raw_context=raw_context,
             ),
             timeout=budget_seconds,
         )
     except asyncio.TimeoutError:
-        raise CodeBlockOTPError(f"OTP was not received within {budget_seconds} seconds.")
+        raise _otp_wait_failure(
+            expected_otp_type,
+            email_context.observed_otp_types | raw_context.observed_otp_types,
+            budget_seconds,
+        )
     except (NoTOTPVerificationCodeFound, FailedToGetTOTPVerificationCode):
         raise CodeBlockOTPError(f"OTP could not be retrieved for {subject}.")
 
@@ -4216,6 +4270,43 @@ async def _resolve_code_block_otp(
         workflow_run_context,
         budget_seconds=budget_seconds,
         subject="this credential",
+        expected_otp_type=OTPType.TOTP,
+    )
+    return polled.value
+
+
+async def _resolve_code_block_magic_link(
+    credential_parameter_key: str,
+    organization_id: str | None,
+    workflow_run_id: str | None,
+    *,
+    budget_seconds: int,
+) -> str:
+    """Resolve a fresh sign-in link for one credential, for the caller to navigate to.
+
+    The authenticator-seed branch that ``_resolve_code_block_otp`` tries first is deliberately
+    skipped: a seed can only mint a 6-digit code, and returning one here would navigate to it.
+    """
+    if not workflow_run_id:
+        raise CodeBlockOTPError("A sign-in link is unavailable: no workflow run is associated with this code block.")
+    workflow_run_context = _code_block_workflow_run_context(workflow_run_id)
+
+    totp_identifier = workflow_run_context.get_credential_totp_identifier(credential_parameter_key)
+    if not totp_identifier:
+        raise CodeBlockOTPError(
+            "No email or SMS identifier is configured for this credential, so no sign-in link can be "
+            "received. Add an email/SMS identifier to the credential; an authenticator secret cannot "
+            "produce a sign-in link."
+        )
+
+    polled = await _poll_code_block_otp(
+        totp_identifier,
+        organization_id,
+        workflow_run_id,
+        workflow_run_context,
+        budget_seconds=budget_seconds,
+        subject="this credential",
+        expected_otp_type=OTPType.MAGIC_LINK,
     )
     return polled.value
 
@@ -4239,6 +4330,7 @@ async def _resolve_code_block_otp_for_identifier(
         workflow_run_context,
         budget_seconds=budget_seconds,
         subject="this address",
+        expected_otp_type=OTPType.TOTP,
     )
     return OTPResult(polled.value, polled.get_otp_type())
 
@@ -4262,6 +4354,47 @@ def _bind_code_block_otp(
     return otp
 
 
+def _bind_code_block_magic_link(
+    credential_parameter_key: str,
+    organization_id: str | None,
+    workflow_run_id: str | None,
+    expected_page: Page | RecordingPage | None = None,
+) -> Callable[[Page | RecordingPage], Awaitable[None]]:
+    """Build the awaitable ``magic_link`` method bound onto a code block's Credential.
+
+    Takes the page as an argument rather than closing over it, mirroring ``solve_captcha(page)``.
+    ``expected_page`` is the page the block will actually run on; the caller rebinds with it once
+    that page exists, so the argument can be checked by identity rather than by capability.
+    """
+
+    async def magic_link(page: Page | RecordingPage) -> None:
+        # Authored code hands the page in, and it receives the link through whatever goto() it
+        # carries. Only identity is unforgeable here: a structural capability check is satisfiable
+        # by a class the block defines itself. The structural fallback covers the bind-time window
+        # before the page exists, which no authored code can reach.
+        candidate: object = page
+        if expected_page is not None:
+            if candidate is not expected_page:
+                raise CodeBlockOTPError("magic_link requires the code block's page.")
+        elif not is_page_like(candidate):
+            raise CodeBlockOTPError("magic_link requires the code block's page.")
+        link = await _resolve_code_block_magic_link(
+            credential_parameter_key,
+            organization_id,
+            workflow_run_id,
+            budget_seconds=settings.CODE_BLOCK_OTP_POLL_TIMEOUT_SECONDS,
+        )
+        await navigate_with_retry(
+            navigate=lambda strategy: page.goto(link, timeout=settings.BROWSER_LOADING_TIMEOUT_MS, wait_until=strategy),
+            url=link,
+            retry_times=NAVIGATION_MAX_RETRY_TIME,
+            settle=default_navigation_settle,
+            log_url=redact_url_secrets(link),
+        )
+
+    return magic_link
+
+
 async def _code_block_otp_builtin(
     credential: object,
     *,
@@ -4269,8 +4402,8 @@ async def _code_block_otp_builtin(
     workflow_run_id: str | None = None,
 ) -> str:
     """Top-level ``await otp(...)`` sugar. Given a credential it forwards to that credential's
-    bound otp(); given a bare email/SMS address it resolves against the address alone and
-    returns an OTPResult that still knows whether it is a code or a link."""
+    bound otp(), which returns a bare code string; given a bare email/SMS address it resolves
+    against the address alone and returns an OTPResult that knows whether it is a code or a link."""
     if isinstance(credential, str):
         return await _resolve_code_block_otp_for_identifier(
             credential,
@@ -4616,6 +4749,14 @@ class CodeBlock(Block):
         if parameters:
             for key, value in parameters.items():
                 if key not in safe_vars:
+                    # Rebind against the page this block actually runs on. The bind above happens
+                    # before the page exists, and only object identity is unforgeable: authored code
+                    # can define a class carrying any capability a structural check looks for, and
+                    # would then receive the sign-in link through its own goto().
+                    if isinstance(value, Credential):
+                        value.magic_link = _bind_code_block_magic_link(
+                            key, organization_id, workflow_run_id, expected_page=page
+                        )
                     safe_vars[key] = value
                     if key.isidentifier() and not keyword.iskeyword(key) and not key.startswith("__"):
                         parameter_defaults[key] = value
@@ -6446,6 +6587,9 @@ async def wrapper({default_args}):
                     real_secret_values[credential_field] = real_secret_value
                 credential_namespace = Credential(**real_secret_values)
                 credential_namespace.otp = _bind_code_block_otp(parameter.key, organization_id, workflow_run_id)
+                credential_namespace.magic_link = _bind_code_block_magic_link(
+                    parameter.key, organization_id, workflow_run_id
+                )
                 parameter_values[parameter.key] = credential_namespace
             else:
                 secret_value = workflow_run_context.get_original_secret_value_or_none(value)

@@ -1810,7 +1810,12 @@ class AgentFunction:
         if "@" not in totp_identifier:
             return None
 
-        from skyvern.services.otp_service import InsufficientCreditsForOTPParse, parse_otp_login
+        from skyvern.forge.sdk.schemas.totp_codes import OTPType
+        from skyvern.services.otp_service import (
+            InsufficientCreditsForOTPParse,
+            looks_like_magic_link,
+            parse_otp_login,
+        )
 
         lookup_context = context or EmailOTPVerificationContext()
         sources = build_email_otp_sources(self)
@@ -1893,11 +1898,17 @@ class AgentFunction:
                             )
                             continue
                         source_context.remember_message(credential_id, candidate.message_id)
+                        if otp_value is None and expected_otp_type is OTPType.TOTP:
+                            # An enforced parse reports "not found" rather than the type it did see,
+                            # so a link arriving for a code-verb call is only visible by its shape.
+                            if looks_like_magic_link(candidate.content):
+                                lookup_context.observed_otp_types.add(OTPType.MAGIC_LINK)
                         if (
                             otp_value
                             and expected_otp_type is not None
                             and otp_value.get_otp_type() != expected_otp_type
                         ):
+                            lookup_context.observed_otp_types.add(otp_value.get_otp_type())
                             continue
                         if otp_value:
                             try:

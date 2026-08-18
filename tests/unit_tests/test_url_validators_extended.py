@@ -1,5 +1,7 @@
 """Extended tests for URL validators module."""
 
+import re
+
 import pytest
 
 from skyvern.exceptions import InvalidUrl
@@ -60,7 +62,9 @@ class TestEncodeUrl:
         result = encode_url(url)
         # Unicode should be percent-encoded, original characters should not appear
         assert "路径" not in result
-        assert "example.com/" in result
+        # re.search rather than ``in``: CodeQL's py/incomplete-url-substring-sanitization reads a
+        # hostname-literal ``in`` check as broken sanitization (OSS alert #89); this is an assertion.
+        assert re.search(r"example\.com/", result)
         # "路径" in UTF-8 is encoded as %E8%B7%AF%E5%BE%84
         assert "%E8%B7%AF%E5%BE%84" in result
 

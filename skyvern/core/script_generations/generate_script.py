@@ -338,6 +338,7 @@ ACTION_MAP = {
     "upload_file": "upload_file",
     "select_option": "select_option",
     "goto": "goto",
+    "goto_url": "goto",
     "scroll": "scroll",
     "keypress": "keypress",
     "type": "type",
@@ -406,7 +407,7 @@ def _build_semantic_selector(act: dict[str, Any]) -> str | None:
     return None
 
 
-ACTIONS_OPT_OUT_INTENTION_FOR_PROMPT = ["extract"]
+ACTIONS_OPT_OUT_INTENTION_FOR_PROMPT = ["extract", "goto", "magic_link"]
 
 INDENT = " " * 4
 DOUBLE_INDENT = " " * 8
@@ -1239,6 +1240,59 @@ def _action_to_stmt(
                     ),
                 )
             )
+    elif method == "goto":
+        if act.get("is_magic_link"):
+            # The recorded URL is single-use and already spent by replay time, so the cached
+            # script re-requests a link instead of navigating to the captured value.
+            method = "magic_link"
+            magic_link_identifier: cst.BaseExpression | None = None
+            if task.get("totp_identifier"):
+                magic_link_identifier = _value(task.get("totp_identifier"))
+            elif credential_key := pick_credential_root_for_block(
+                goal_template=goal_template,
+                credential_param_keys=credential_param_keys,
+            ):
+                magic_link_identifier = cst.Call(
+                    func=cst.Attribute(
+                        value=cst.Name("context"),
+                        attr=cst.Name("credential_totp_identifier"),
+                    ),
+                    args=[cst.Arg(value=_value(credential_key))],
+                )
+            if magic_link_identifier is not None:
+                args.append(
+                    cst.Arg(
+                        keyword=cst.Name("totp_identifier"),
+                        value=magic_link_identifier,
+                        whitespace_after_arg=cst.ParenthesizedWhitespace(
+                            indent=True,
+                            last_line=cst.SimpleWhitespace(INDENT),
+                        ),
+                    )
+                )
+            if task.get("totp_verification_url"):
+                args.append(
+                    cst.Arg(
+                        keyword=cst.Name("totp_url"),
+                        value=_value(task.get("totp_verification_url")),
+                        whitespace_after_arg=cst.ParenthesizedWhitespace(
+                            indent=True,
+                            last_line=cst.SimpleWhitespace(INDENT),
+                        ),
+                    )
+                )
+        elif act.get("url"):
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("url"),
+                    value=_value(act.get("url")),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
+
     elif method == "extract":
         args.append(
             cst.Arg(

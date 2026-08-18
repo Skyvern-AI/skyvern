@@ -2930,5 +2930,10 @@ def credential_otp_authoring_guidance(credential_key: str) -> str:
         "use a broad text locator as the authenticated anchor, including `page.get_by_text(...)` even with "
         '`exact=True`, `page.locator("text=...")`, or an unscoped `.first`; hidden or duplicate text can turn a '
         "successful sign-in into a timeout or strict-mode failure. If the page shows an invalid or rejected code, "
-        "raise so the run reports failure."
+        "raise so the run reports failure. "
+        f"If the scouted page offers an emailed sign-in link rather than a one-time-code field, author "
+        f"`await {credential_key}.magic_link(page)` instead of `await {credential_key}.otp()`. It polls for the "
+        "link and navigates the page itself, so there is nothing to fill or open. Choose one verb from the "
+        "scouted page; a wrong choice fails at test-run time, so switch verbs then rather than authoring a "
+        "fallback that tries both."
     )
