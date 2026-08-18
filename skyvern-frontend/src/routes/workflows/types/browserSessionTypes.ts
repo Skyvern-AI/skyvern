@@ -6,7 +6,7 @@ interface BrowserSession {
   browser_session_id: string;
   completed_at: string | null;
   downloaded_files: DownloadedFile[] | null;
-  recordings: Recording[];
+  recordings: Recording[] | null;
   runnable_id: string | null;
   runnable_type: string | null;
   started_at: string | null;
@@ -20,10 +20,12 @@ interface BrowserSession {
 }
 
 interface Recording {
+  artifact_id: string | null;
+  checksum: string | null;
+  file_size: number | null;
+  filename: string | null;
+  modified_at: string | null;
   url: string;
-  checksum: string;
-  filename: string;
-  modified_at: string;
 }
 
 interface DownloadedFile {

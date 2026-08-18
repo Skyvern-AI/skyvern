@@ -13,6 +13,26 @@ function areRecordingsIncomplete(status: string | null | undefined): boolean {
   return status === "running";
 }
 
+function getPostTerminalRecordingDeadlineMs(
+  browserSession: BrowserSessionReadiness | undefined,
+): number | null {
+  if (
+    !browserSession?.status ||
+    browserSession.status === "created" ||
+    browserSession.status === "retry" ||
+    browserSession.status === "running" ||
+    browserSession.recordings?.length
+  ) {
+    return null;
+  }
+  const completedAt = browserSession.completed_at
+    ? Date.parse(normalizeUtcTimestamp(browserSession.completed_at))
+    : Number.NaN;
+  return Number.isFinite(completedAt)
+    ? completedAt + POST_TERMINAL_REFETCH_WINDOW_MS
+    : null;
+}
+
 function getBrowserSessionRefetchIntervalMs(
   browserSession: BrowserSessionReadiness | undefined,
   now = Date.now(),
@@ -32,18 +52,19 @@ function getBrowserSessionRefetchIntervalMs(
   ) {
     return 1000;
   }
-  const completedAt = browserSession.completed_at
-    ? Date.parse(normalizeUtcTimestamp(browserSession.completed_at))
-    : Number.NaN;
-  const completedAgoMs = now - completedAt;
+  const deadline = getPostTerminalRecordingDeadlineMs(browserSession);
   if (
-    !browserSession.recordings?.length &&
-    completedAgoMs >= 0 &&
-    completedAgoMs < POST_TERMINAL_REFETCH_WINDOW_MS
+    deadline !== null &&
+    now >= deadline - POST_TERMINAL_REFETCH_WINDOW_MS &&
+    now < deadline
   ) {
     return POST_TERMINAL_REFETCH_INTERVAL_MS;
   }
   return false;
 }
 
-export { areRecordingsIncomplete, getBrowserSessionRefetchIntervalMs };
+export {
+  areRecordingsIncomplete,
+  getBrowserSessionRefetchIntervalMs,
+  getPostTerminalRecordingDeadlineMs,
+};

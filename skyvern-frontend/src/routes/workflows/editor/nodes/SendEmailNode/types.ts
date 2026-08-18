@@ -20,6 +20,10 @@ export type SendEmailNodeData = NodeBaseData & {
   smtpPortSecretParameterKey?: string;
   smtpUsernameSecretParameterKey?: string;
   smtpPasswordSecretParameterKey?: string;
+  customSmtpHost: string | null;
+  customSmtpPort: string | null;
+  customSmtpUsername: string | null;
+  customSmtpPassword: string | null;
 };
 
 export type SendEmailNode = Node<SendEmailNodeData, "sendEmail">;
@@ -37,6 +41,10 @@ export const sendEmailNodeDefaultData: SendEmailNodeData = {
   smtpPortSecretParameterKey: SMTP_PORT_PARAMETER_KEY,
   smtpUsernameSecretParameterKey: SMTP_USERNAME_PARAMETER_KEY,
   smtpPasswordSecretParameterKey: SMTP_PASSWORD_PARAMETER_KEY,
+  customSmtpHost: null,
+  customSmtpPort: null,
+  customSmtpUsername: null,
+  customSmtpPassword: null,
   continueOnFailure: false,
   model: null,
 } as const;

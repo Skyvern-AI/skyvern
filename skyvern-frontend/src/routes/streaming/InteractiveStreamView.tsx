@@ -49,6 +49,8 @@ interface InteractiveStreamViewProps {
   // width and is expected to draw the window (border, rounding, width) around us,
   // so we render flush instead. Omitted, we keep framing ourselves.
   onFrameWidthChange?: (width: number | null) => void;
+  frameToken?: number;
+  onFrameLoad?: (token: number) => void;
 }
 
 function UrlBar({
@@ -198,6 +200,8 @@ function InteractiveStreamView({
   navigateError,
   onHistoryNavigate,
   onFrameWidthChange,
+  frameToken,
+  onFrameLoad,
 }: InteractiveStreamViewProps) {
   const imgDataUrl = `data:image/${streamFormat};base64,${streamImgSrc}`;
   const imgRef = useRef<HTMLImageElement>(null);
@@ -318,6 +322,8 @@ function InteractiveStreamView({
 
     const imgInteractionProps = {
       src: imgDataUrl,
+      "data-frame-token": frameToken,
+      onLoad: () => onFrameLoad?.(frameToken ?? 0),
       onMouseDown: handlers.handleMouseDown,
       onMouseUp: handlers.handleMouseUp,
       onMouseMove: handlers.handleMouseMove,
@@ -399,6 +405,9 @@ function InteractiveStreamView({
         {currentUrl && <UrlBar url={currentUrl} />}
         <img
           src={imgDataUrl}
+          data-frame-token={frameToken}
+          onLoad={() => onFrameLoad?.(frameToken ?? 0)}
+          decoding="async"
           className={cn(
             "min-h-0 w-full flex-1 object-contain",
             currentUrl ? "rounded-b-md" : "rounded-md",

@@ -7,6 +7,7 @@ import {
   parseCredentialAutoBound,
   parseCredentialPause,
   parseCredentialPrompt,
+  parseGoogleConnectionNotices,
 } from "./narrativeState";
 import type {
   WorkflowCopilotStreamErrorUpdate,
@@ -175,5 +176,49 @@ describe("hydrateNarrativeFromPayload — credential signals", () => {
     const next = applyNarrativeEvent(live, error);
     expect(next.credentialPrompt).toBeNull();
     expect(next.credentialPause).toBeNull();
+  });
+});
+
+describe("Google connection notice hydration", () => {
+  it("keeps valid notices, deduplicates ids, and survives reload hydration", () => {
+    const raw = [
+      {
+        provider: "google",
+        connectionId: "goac_error",
+        displayName: "Work Sheets",
+        condition: "unusable",
+      },
+      {
+        provider: "google",
+        connectionId: "goac_error",
+        displayName: "duplicate",
+        condition: "missing",
+      },
+      { provider: "microsoft", connectionId: "m1", condition: "missing" },
+    ];
+
+    expect(parseGoogleConnectionNotices(raw)).toEqual([
+      {
+        provider: "google",
+        connectionId: "goac_error",
+        displayName: "Work Sheets",
+        condition: "unusable",
+      },
+    ]);
+    expect(
+      hydrateNarrativeFromPayload(basePayload({ googleConnectionNotices: raw }))
+        ?.googleConnectionNotices,
+    ).toEqual(parseGoogleConnectionNotices(raw));
+  });
+
+  it("defaults absent and malformed notice payloads to an empty list", () => {
+    expect(EMPTY_NARRATIVE.googleConnectionNotices).toEqual([]);
+    expect(parseGoogleConnectionNotices(null)).toEqual([]);
+    expect(parseGoogleConnectionNotices({})).toEqual([]);
+    expect(
+      parseGoogleConnectionNotices([
+        { provider: "google", connectionId: "", condition: "unusable" },
+      ]),
+    ).toEqual([]);
   });
 });

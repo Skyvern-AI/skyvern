@@ -18,6 +18,8 @@ import {
 } from "../../types/workflowRunTypes";
 import type { WorkflowRunOverviewActiveElement } from "../WorkflowRunOverview";
 import { ThoughtCard } from "../ThoughtCard";
+import { CodeBlockFailureDetails } from "../CodeBlockFailureDetails";
+import { describeCodeBlockFailure } from "../codeBlockFailure";
 import { stringifyTimelineValue } from "./formatValue";
 
 function TruncatedWithTooltip({
@@ -215,17 +217,33 @@ function Section({
 }
 
 function BlockDetailFailure({ block }: { block: WorkflowRunBlock }) {
-  if (!block.failure_reason) return null;
+  const codeFailure = describeCodeBlockFailure(block);
+  if (!block.failure_reason && !codeFailure) return null;
   return (
     <div className="space-y-1.5 duration-200 animate-in fade-in slide-in-from-top-2">
       <div className="text-[11px] font-medium uppercase tracking-wide text-destructive">
         Failure
       </div>
-      <div className="flex items-start gap-1.5 rounded border border-destructive/40 bg-slate-elevation1 px-2.5 py-2 text-xs leading-relaxed text-foreground">
-        <ExclamationTriangleIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
-        <span className="min-w-0 flex-1 break-words">
-          {block.failure_reason}
-        </span>
+      <div className="flex items-start gap-2.5 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs leading-relaxed text-foreground dark:bg-destructive/10">
+        <ExclamationTriangleIcon className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+        {codeFailure ? (
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-semibold leading-5">
+              {codeFailure.title}
+            </div>
+            <p className="mt-1 break-words text-muted-foreground">
+              {codeFailure.guidance}
+            </p>
+            <CodeBlockFailureDetails
+              failure={codeFailure}
+              reason={block.failure_reason}
+            />
+          </div>
+        ) : (
+          <span className="min-w-0 flex-1 break-words">
+            {block.failure_reason}
+          </span>
+        )}
       </div>
     </div>
   );

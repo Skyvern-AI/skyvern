@@ -98,6 +98,14 @@ vi.mock("react-router-dom", async (importOriginal) => {
     ...actual,
     useParams: () => routeParams.current,
     useSearchParams: () => [new URLSearchParams(), vi.fn()],
+    useNavigate: () => vi.fn(),
+    useLocation: () => ({
+      pathname: "/",
+      search: "",
+      hash: "",
+      state: null,
+      key: "default",
+    }),
   };
 });
 

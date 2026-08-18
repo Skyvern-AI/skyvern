@@ -50,6 +50,7 @@ import {
   WorkflowCopilotCondensingUpdate,
   WorkflowCopilotNarrationUpdate,
   WorkflowCopilotBlockProgressUpdate,
+  WorkflowCopilotRunStartedUpdate,
   WorkflowCopilotRunOutcomeUpdate,
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
@@ -76,9 +77,12 @@ import { InstantAckPlaceholder, NarrativeView } from "./NarrativeView";
 import { CopilotWorkingStatus } from "./CopilotWorkingStatus";
 import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
+import { ConnectedAccountChoiceCard } from "./cards/ConnectedAccountChoiceCard";
+import { connectedAccountChoiceLabel } from "./cards/connectedAccountChoiceLabel";
 import { DiffCard, shouldShowDiffCard } from "./cards/DiffCard";
 import { FixCard, shouldShowFixCard } from "./cards/FixCard";
 import { ReviewGateCard, getReviewGateVerdict } from "./cards/ReviewGateCard";
+import { GoogleReconnectCard } from "./cards/GoogleReconnectCard";
 import {
   CredentialCard,
   type CredentialRequiredFrame,
@@ -93,6 +97,7 @@ import {
   TurnNarrativeState,
   applyNarrativeEvent,
   hydrateHistoryNarrative,
+  notConfirmedOutcome,
   parseUtcIsoMs,
 } from "./narrativeState";
 import { computeFollowSignature, useStickToBottom } from "./useStickToBottom";
@@ -110,6 +115,10 @@ import {
 import { cn, formatElapsedSeconds } from "@/util/utils";
 import { COPILOT_UX_V1_FLAG } from "@/util/featureFlags";
 import { ControlTooltip } from "@/routes/workflows/studio/ControlTooltip";
+import {
+  useReleaseStudioRun,
+  useSwitchStudioRun,
+} from "@/routes/workflows/studio/runSwitchNavigation";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 // Cap on retained per-turn snap-back snapshots. A typical session has a
@@ -328,6 +337,28 @@ export interface ChatMessage {
   kind?: "run_lifecycle";
 }
 
+function connectedAccountSelectionReceipt(
+  messages: ChatMessage[],
+  index: number,
+): string | null {
+  const message = messages[index];
+  const prior = messages[index - 1];
+  if (
+    message?.sender !== "user" ||
+    prior?.sender !== "ai" ||
+    !prior.narrative
+  ) {
+    return null;
+  }
+  const choices = prior.narrative.connectedAccountChoices;
+  const selected = choices.find(
+    (choice) => choice.connection_id === message.content,
+  );
+  return selected
+    ? `Selected ${selected.name} — ${connectedAccountChoiceLabel(selected, choices)}`
+    : null;
+}
+
 const getLatestDiffCardTurnId = (messages: ChatMessage[]): string | null => {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const narrative = messages[index]?.narrative;
@@ -371,12 +402,14 @@ type QueuedPrompt = {
   // The one-shot fix-origin signal travels with the prompt it was seeded for, so
   // discarding the queue (new chat, history load, agent switch) drops it too.
   fixOrigin?: boolean;
+  idempotencyKey?: string;
 };
 
 type SendOptions = {
   queuedMessageId?: string;
   skipQueue?: boolean;
   audioBlob?: Blob | null;
+  idempotencyKey?: string;
 };
 
 type WorkflowCopilotSsePayload =
@@ -388,6 +421,7 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotCondensingUpdate
   | WorkflowCopilotNarrationUpdate
   | WorkflowCopilotBlockProgressUpdate
+  | WorkflowCopilotRunStartedUpdate
   | WorkflowCopilotRunOutcomeUpdate
   | WorkflowCopilotTurnStartUpdate
   | WorkflowCopilotDesignStartUpdate
@@ -846,9 +880,30 @@ export function WorkflowCopilotChat({
   // rapid double-submit would run a stale closure and start a second stream;
   // this ref is set before the first await and read at the top of handleSend.
   const inFlightRef = useRef(false);
+  // This latch closes the same-render double-click window before React can
+  // publish isLoading. Once a selection queues behind another turn, isLoading
+  // keeps every account row disabled until that queue drains.
+  const connectedAccountChoiceLatch = useRef<string | null>(null);
+  const [
+    connectedAccountChoicePendingTurnId,
+    setConnectedAccountChoicePendingTurnId,
+  ] = useState<string | null>(null);
   // Synchronous mirror of queuedPrompt (like inFlightRef) so a same-tick double
   // submit can't queue twice and orphan the first message. Set via updateQueuedPrompt.
   const queuedPromptRef = useRef<QueuedPrompt | null>(null);
+  // What the turn was asked to do. completedNormally starts false and is set
+  // only on a clean terminal, so every other exit drains the queue as before.
+  const lastTurnRef = useRef<{
+    content: string;
+    workflowPermanentId: string | undefined;
+    mode: "ask" | "build" | null;
+    fixOrigin: boolean;
+    hadAudio: boolean;
+    hadBlockTarget: boolean;
+    browserSessionId: string | null;
+    codeBlock: boolean | null;
+    completedNormally: boolean;
+  } | null>(null);
   const pendingMessageId = useRef<string | null>(null);
   const pendingCancelToken = useRef<string | null>(null);
   const cancelSafetyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -878,6 +933,16 @@ export function WorkflowCopilotChat({
   // itself, so useRunLifecycleAnnouncements suppresses their lifecycle lines by
   // identity (an unrelated run seen in the same window must still be narrated).
   const turnOwnedRunIds = useRef<Set<string>>(new Set());
+  // The run this turn pointed the studio's Browser pane at, so the focus is
+  // written once per run and released only if we still own it.
+  const focusedTurnRunId = useRef<string | null>(null);
+  // Focusing the turn's run is the copilot acting for the user, not a
+  // navigation they asked for, so it must not add a Back step.
+  const switchStudioRun = useSwitchStudioRun({
+    replace: true,
+    systemFocus: true,
+  });
+  const releaseStudioRun = useReleaseStudioRun();
   useEffect(() => {
     workflowCopilotChatIdRef.current = workflowCopilotChatId;
   }, [workflowCopilotChatId]);
@@ -1042,6 +1107,26 @@ export function WorkflowCopilotChat({
     actionPollRef.current.forEach((timer) => clearInterval(timer));
     actionPollRef.current.clear();
   }, []);
+  const focusTurnRun = useCallback(
+    (runId: string | null | undefined) => {
+      if (!docked || !copilotUxV1Enabled || !runId) return;
+      if (focusedTurnRunId.current === runId) return;
+      focusedTurnRunId.current = runId;
+      switchStudioRun(runId);
+    },
+    [copilotUxV1Enabled, docked, switchStudioRun],
+  );
+  const releaseTurnRun = useCallback(
+    (runId?: string) => {
+      const focused = focusedTurnRunId.current;
+      if (focused === null || (runId !== undefined && runId !== focused)) {
+        return;
+      }
+      focusedTurnRunId.current = null;
+      releaseStudioRun(focused);
+    },
+    [releaseStudioRun],
+  );
   const respondToCredentialPause = useCallback(
     async (
       frame: WorkflowCopilotCredentialRequiredUpdate,
@@ -1343,6 +1428,8 @@ export function WorkflowCopilotChat({
     turnSnapshots.current.clear();
     pendingSubmitSnapshot.current = null;
     latestTurnId.current = null;
+    connectedAccountChoiceLatch.current = null;
+    setConnectedAccountChoicePendingTurnId(null);
     repin();
   };
 
@@ -1814,9 +1901,10 @@ export function WorkflowCopilotChat({
   // True only while a block-build turn is actually in flight (not a turn it queued behind).
   const blockGenInFlightRef = useRef(false);
 
-  // The only disposal path for a queued prompt: its text goes back to the
-  // composer as an editable draft. Reads the synchronous ref, not state, so a
-  // stop can clear the queue before isLoading flips and the drain effect runs.
+  // Disposal path that hands the queued text back to the composer as an
+  // editable draft; the drain effect's duplicate drop is the one path that
+  // discards instead. Reads the synchronous ref, not state, so a stop can
+  // clear the queue before isLoading flips and the drain effect runs.
   const restoreQueuedPromptToComposer = useCallback(() => {
     const queued = queuedPromptRef.current;
     if (!queued) {
@@ -1982,6 +2070,7 @@ export function WorkflowCopilotChat({
           content: candidate,
           audioBlob: messageAudioBlob,
           fixOrigin: false,
+          idempotencyKey: undefined,
         });
         setMessages((prev) =>
           prev.map((message) =>
@@ -2012,6 +2101,7 @@ export function WorkflowCopilotChat({
           reason,
           audioBlob: messageAudioBlob,
           fixOrigin: queuedFixOrigin,
+          idempotencyKey: options.idempotencyKey,
         });
         // First queue adds the user bubble; a re-queue (a working drain that
         // then had to wait for the browser) reuses the existing bubble.
@@ -2070,6 +2160,20 @@ export function WorkflowCopilotChat({
       }
       setIsLoading(true);
       inFlightRef.current = true;
+      // Stamped here, before the awaits below consume messageAudioBlob,
+      // fixOriginPendingRef and blockBuildTargetLabelRef.
+      lastTurnRef.current = {
+        content: candidate,
+        workflowPermanentId,
+        mode: copilotV2Enabled ? composerMode : null,
+        fixOrigin: fixOriginPendingRef.current,
+        hadAudio: messageAudioBlob !== null,
+        hadBlockTarget: blockBuildTargetLabelRef.current !== null,
+        browserSessionId: liveBrowserSessionId ?? null,
+        codeBlock:
+          isBuild && codeBlockModeEnabled ? codeBlockRequestOverride : null,
+        completedNormally: false,
+      };
       if (copilotUxV1Enabled) {
         // Clear the prior turn's lingering narrative so the instant-ack placeholder's
         // turnId===null gate holds on every send, and the first frame hands off cleanly.
@@ -2134,6 +2238,7 @@ export function WorkflowCopilotChat({
             proxy_location: saveData.settings.proxyLocation,
             webhook_callback_url: saveData.settings.webhookCallbackUrl,
             persist_browser_session: saveData.settings.persistBrowserSession,
+            reuse_browser_session: saveData.settings.reuseBrowserSession,
             pin_saved_session_ip: saveData.settings.pinSavedSessionIp,
             browser_profile_id: saveData.settings.browserProfileId,
             browser_profile_key: saveData.settings.browserProfileKey,
@@ -2175,6 +2280,7 @@ export function WorkflowCopilotChat({
             proxy_location: saveData.settings.proxyLocation,
             webhook_callback_url: saveData.settings.webhookCallbackUrl,
             persist_browser_session: saveData.settings.persistBrowserSession,
+            reuse_browser_session: saveData.settings.reuseBrowserSession,
             pin_saved_session_ip: saveData.settings.pinSavedSessionIp,
             mask_secrets: saveData.settings.maskSecrets,
             browser_profile_id: saveData.settings.browserProfileId,
@@ -2235,16 +2341,20 @@ export function WorkflowCopilotChat({
           const hasNarrativePayload =
             response.narrative_payload !== null &&
             typeof response.narrative_payload === "object";
+          // A turn that streamed no narrative frames and carries no payload gets
+          // no narrative at all: the persisted chat row has none either, so
+          // fabricating one here would render this turn differently live than
+          // after a reload — and route it past the gate that keys on a turn id.
           const frozenNarrative: TurnNarrativeState | undefined =
-            responseNarrative ??
-            (liveNarrative.turnId !== null || hasNarrativePayload
-              ? applyNarrativeEvent(
+            liveNarrative.turnId !== null || hasNarrativePayload
+              ? (responseNarrative ??
+                applyNarrativeEvent(
                   liveNarrative.turnId !== null
                     ? liveNarrative
                     : EMPTY_NARRATIVE,
                   response,
-                )
-              : undefined);
+                ))
+              : undefined;
 
           const aiMessage: ChatMessage = {
             id: Date.now().toString(),
@@ -2262,6 +2372,20 @@ export function WorkflowCopilotChat({
           // back, so a canceled retry doesn't strand a false "Continuing…".
           if (!response.cancelled && !userCancelledThisTurn) {
             pendingTerminalContinuation.current = null;
+          }
+          // A failed run ends the turn with terminal "response", not "error";
+          // an identical re-send after it is a legitimate retry, so it drains.
+          const runFailed =
+            frozenNarrative !== undefined &&
+            notConfirmedOutcome(frozenNarrative) !== null;
+          if (
+            lastTurnRef.current &&
+            !response.cancelled &&
+            !userCancelledThisTurn &&
+            frozenNarrative?.terminal !== "error" &&
+            !runFailed
+          ) {
+            lastTurnRef.current.completedNormally = true;
           }
           const responseTurnId =
             response.turn_id ?? latestTurnId.current ?? null;
@@ -2319,10 +2443,9 @@ export function WorkflowCopilotChat({
           setLivePauseFrame(null);
           const liveNarrative = errorNarrative ?? narrativeRef.current;
           const frozenNarrative: TurnNarrativeState | undefined =
-            errorNarrative ??
-            (liveNarrative.turnId !== null
-              ? applyNarrativeEvent(liveNarrative, payload)
-              : undefined);
+            liveNarrative.turnId !== null
+              ? (errorNarrative ?? applyNarrativeEvent(liveNarrative, payload))
+              : undefined;
           const errorMessage: ChatMessage = {
             id: Date.now().toString(),
             sender: "ai",
@@ -2353,6 +2476,12 @@ export function WorkflowCopilotChat({
         if (targetBlockLabel != null) {
           blockGenInFlightRef.current = true;
         }
+        // Re-stamp from the values actually posted: the awaits above leave a
+        // block Generate click room to arm the ref after the entry stamp.
+        if (lastTurnRef.current) {
+          lastTurnRef.current.hadBlockTarget = targetBlockLabel !== null;
+          lastTurnRef.current.fixOrigin = fixOrigin;
+        }
         await client.postStreaming<WorkflowCopilotSsePayload>(
           "/workflow/copilot/chat-post",
           {
@@ -2368,6 +2497,7 @@ export function WorkflowCopilotChat({
             code_block:
               isBuild && codeBlockModeEnabled ? codeBlockRequestOverride : null,
             cancel_token: cancelToken,
+            idempotency_key: options.idempotencyKey ?? null,
             target_block_label: targetBlockLabel,
             fix_origin: fixOrigin,
             keep_pending_proposal:
@@ -2388,11 +2518,15 @@ export function WorkflowCopilotChat({
               case "narration":
                 applyStoredNarrativeEvent(payload);
                 return false;
+              case "run_started":
+                focusTurnRun(payload.workflow_run_id);
+                return false;
               case "block_progress":
                 applyStoredNarrativeEvent(payload);
                 // Earliest frame carrying the run id on a new backend — start
                 // the live poll here so rows appear mid-execution.
                 startRecordedActionsPoll(payload.workflow_run_id);
+                focusTurnRun(payload.workflow_run_id);
                 return false;
               case "run_outcome":
                 applyStoredNarrativeEvent(payload);
@@ -2408,10 +2542,12 @@ export function WorkflowCopilotChat({
                     // Fallback start against an old backend whose block_progress
                     // carried no run id: this is the first sighting.
                     startRecordedActionsPoll(payload.workflow_run_id);
+                    focusTurnRun(payload.workflow_run_id);
                   } else {
                     // Terminal verdict: one convergent fetch, then stop polling.
                     void fetchRecordedActions(payload.workflow_run_id);
                     finalizeRecordedActionsPoll(payload.workflow_run_id);
+                    releaseTurnRun(payload.workflow_run_id);
                   }
                 }
                 return false;
@@ -2497,12 +2633,22 @@ export function WorkflowCopilotChat({
           return;
         }
         console.error("Failed to send message:", error);
-        const errorMessage: ChatMessage = {
-          id: Date.now().toString(),
-          sender: "ai",
-          content: "Sorry, I encountered an error. Please try again.",
-        };
-        setMessages((prev) => [...prev, errorMessage]);
+        if (options.idempotencyKey !== undefined && workflowCopilotChatId) {
+          toast({
+            title: "Checking account selection",
+            description:
+              "The connection dropped, so Copilot is refreshing this chat before allowing a retry.",
+            variant: "destructive",
+          });
+          await loadChatInPlace(workflowCopilotChatId);
+        } else {
+          const errorMessage: ChatMessage = {
+            id: Date.now().toString(),
+            sender: "ai",
+            content: "Sorry, I encountered an error. Please try again.",
+          };
+          setMessages((prev) => [...prev, errorMessage]);
+        }
         // A thrown stream never emits a terminal narrative event, so clear the
         // bubble or its Working/elapsed indicator would tick forever.
         setNarrative(EMPTY_NARRATIVE);
@@ -2529,6 +2675,7 @@ export function WorkflowCopilotChat({
         // Backstop: a turn that ends without a terminal run_outcome (thrown
         // stream) would otherwise leave a live poll running past the run.
         stopAllRecordedActionsPolls();
+        releaseTurnRun();
       }
     },
     [
@@ -2543,13 +2690,16 @@ export function WorkflowCopilotChat({
       credentialGetter,
       fetchRecordedActions,
       finalizeRecordedActionsPoll,
+      focusTurnRun,
       getSaveData,
       inputValue,
       isSpeechListening,
       isBuild,
       isLiveBrowserReady,
       liveBrowserSessionId,
+      loadChatInPlace,
       pendingProposalTurnId,
+      releaseTurnRun,
       startRecordedActionsPoll,
       stopAllRecordedActionsPolls,
       requiresLiveBrowser,
@@ -2567,6 +2717,30 @@ export function WorkflowCopilotChat({
   useEffect(() => {
     handleSendRef.current = handleSend;
   }, [handleSend]);
+
+  const handleConnectedAccountChoice = useCallback(
+    (turnId: string, connectionId: string) => {
+      if (connectedAccountChoiceLatch.current !== null) {
+        return;
+      }
+      // Build this before taking the latch so an unavailable UUID API cannot
+      // leave the picker permanently disabled in a dev or embedded context.
+      const idempotencyKey = `connected-account:${turnId}:${connectionId}:${crypto.randomUUID()}`;
+      connectedAccountChoiceLatch.current = turnId;
+      setConnectedAccountChoicePendingTurnId(turnId);
+      void handleSend(connectionId, {
+        // A fresh explicit click is a fresh attempt. Transport retries retain
+        // this request body, while a recovered interrupted turn gets a new key.
+        idempotencyKey,
+      }).finally(() => {
+        if (connectedAccountChoiceLatch.current === turnId) {
+          connectedAccountChoiceLatch.current = null;
+          setConnectedAccountChoicePendingTurnId(null);
+        }
+      });
+    },
+    [handleSend],
+  );
 
   // A code block's "Generate" button asks the copilot to (re)build that one block
   // from its goal. Force build + code mode, then fire the send on the next tick.
@@ -2664,15 +2838,43 @@ export function WorkflowCopilotChat({
   };
 
   useEffect(() => {
+    if (!queuedPrompt) {
+      return;
+    }
     // isLoading (reactive state) is the in-flight signal here so the effect
     // re-runs when a turn ends; handleSend uses the synchronous ref instead.
+    const lastTurn = lastTurnRef.current;
     const drainAction = resolveDrainAction({
-      queuedReason: queuedPrompt?.reason ?? null,
+      queuedReason: queuedPrompt.reason,
       inFlight: isLoading,
       hasLiveBrowserSession: Boolean(liveBrowserSessionId),
       hasWorkflowPermanentId: Boolean(workflowPermanentId),
+      queuedContent: queuedPrompt.content,
+      turnOpeningContent: lastTurn?.content ?? null,
+      turnCompletedNormally: lastTurn?.completedNormally ?? false,
+      turnWorkflowMatches:
+        lastTurn?.workflowPermanentId === workflowPermanentId,
+      turnRequestMatches:
+        lastTurn?.mode === (copilotV2Enabled ? composerMode : null) &&
+        lastTurn?.fixOrigin === Boolean(queuedPrompt.fixOrigin) &&
+        lastTurn?.hadAudio === false &&
+        lastTurn?.hadBlockTarget === false &&
+        lastTurn?.browserSessionId === (liveBrowserSessionId ?? null) &&
+        lastTurn?.codeBlock ===
+          (isBuild && codeBlockModeEnabled ? codeBlockRequestOverride : null) &&
+        (queuedPrompt.audioBlob ?? null) === null &&
+        blockBuildTargetLabelRef.current === null,
     });
-    if (!queuedPrompt || drainAction === "wait") {
+    if (drainAction === "wait") {
+      return;
+    }
+
+    if (drainAction === "drop_duplicate") {
+      const dropped = queuedPrompt;
+      updateQueuedPrompt(null);
+      setMessages((prev) =>
+        prev.filter((message) => message.id !== dropped.id),
+      );
       return;
     }
 
@@ -2689,11 +2891,17 @@ export function WorkflowCopilotChat({
       queuedMessageId: promptToSend.id,
       skipQueue: drainAction === "drain_skip_queue",
       audioBlob: promptToSend.audioBlob,
+      idempotencyKey: promptToSend.idempotencyKey,
     }).catch((error) => {
       console.error("Queued send failed:", error);
     });
   }, [
+    codeBlockModeEnabled,
+    codeBlockRequestOverride,
+    composerMode,
+    copilotV2Enabled,
     handleSend,
+    isBuild,
     isLoading,
     liveBrowserSessionId,
     queuedPrompt,
@@ -3208,6 +3416,23 @@ export function WorkflowCopilotChat({
               // the latest message AND while the proposal is pending review.
               if (message.sender === "ai" && message.narrative) {
                 const turnId = message.narrative.turnId;
+                const choices = message.narrative.connectedAccountChoices;
+                const adjacentMessage = messages[index + 1];
+                const selectedConnectionId =
+                  adjacentMessage?.sender === "user" &&
+                  choices.some(
+                    (choice) =>
+                      choice.connection_id === adjacentMessage.content,
+                  )
+                    ? adjacentMessage.content
+                    : null;
+                // Once any later message exists, this server-verified choice turn is
+                // historical. Only an exact structured selection may render a receipt;
+                // prose must never make the old card actionable again between stream
+                // completion and the next assistant response.
+                const hasUnconsumedAdjacentMessage =
+                  adjacentMessage !== undefined &&
+                  selectedConnectionId === null;
                 const showProposalActions =
                   isLastMessage && Boolean(proposedWorkflow);
                 const showReviewGate =
@@ -3227,6 +3452,28 @@ export function WorkflowCopilotChat({
                       uxV1={copilotUxV1Enabled}
                       workingRowActive={showWorkingRow}
                     />
+                    {turnId !== null && choices.length > 0 ? (
+                      <ConnectedAccountChoiceCard
+                        choices={choices}
+                        selectedConnectionId={selectedConnectionId}
+                        disabled={
+                          !isLastMessage ||
+                          isLoading ||
+                          hasUnconsumedAdjacentMessage ||
+                          selectedConnectionId !== null ||
+                          connectedAccountChoicePendingTurnId === turnId
+                        }
+                        onSelect={(connectionId) =>
+                          handleConnectedAccountChoice(turnId, connectionId)
+                        }
+                      />
+                    ) : null}
+                    {message.narrative.googleConnectionNotices.map((notice) => (
+                      <GoogleReconnectCard
+                        key={notice.connectionId}
+                        notice={notice}
+                      />
+                    ))}
                     {showReviewGate ? (
                       <ReviewGateCard
                         turn={message.narrative}
@@ -3446,10 +3693,18 @@ export function WorkflowCopilotChat({
               const showProposedPanel = isLastMessage && proposedWorkflow;
               const isGateOwnerOrLast =
                 index === gateIndex && Boolean(proposedWorkflow);
+              const selectionReceipt = connectedAccountSelectionReceipt(
+                messages,
+                index,
+              );
               return (
                 <MessageItem
                   key={message.id}
-                  message={message}
+                  message={
+                    selectionReceipt
+                      ? { ...message, content: selectionReceipt }
+                      : message
+                  }
                   queuedStatus={
                     copilotUxV1Enabled &&
                     copilotV2Enabled &&
