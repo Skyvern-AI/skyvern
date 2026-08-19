@@ -24,17 +24,13 @@ class CreateBrowserSessionRequest(BaseModel):
             return value
         return validate_url(value)
 
+    # No le bound: the route rejects values above MAX_TIMEOUT with a 400 and an
+    # enterprise-contact message instead of pydantic's 422.
     timeout: int | None = Field(
         default=DEFAULT_TIMEOUT,
-        description=f"Timeout in minutes for the session. Timeout is applied after the session is started. Must be at least {MIN_TIMEOUT}; values above {MAX_TIMEOUT} are capped at {MAX_TIMEOUT}. Defaults to {DEFAULT_TIMEOUT}.",
+        description=f"Timeout in minutes for the session. Timeout is applied after the session is started. Must be between {MIN_TIMEOUT} and {MAX_TIMEOUT}. Defaults to {DEFAULT_TIMEOUT}.",
         ge=MIN_TIMEOUT,
     )
-
-    @field_validator("timeout")
-    @classmethod
-    def clamp_timeout_to_max(cls, timeout: int | None) -> int | None:
-        # Clamped rather than rejected so callers still sending the old 24h ceiling keep working.
-        return None if timeout is None else min(timeout, MAX_TIMEOUT)
 
     proxy_location: ProxyLocationInput = Field(
         default=None,

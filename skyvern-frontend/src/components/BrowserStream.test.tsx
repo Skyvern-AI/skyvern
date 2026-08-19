@@ -614,6 +614,9 @@ describe("BrowserStream", () => {
     const rfb = mocks.rfbInstances[0] as unknown as {
       emit: (type: string, detail?: unknown) => void;
     };
+    await waitFor(() => {
+      expect(mocks.settingsStore.setIsUsingABrowser).toHaveBeenCalledWith(true);
+    });
     mocks.autoConnect.value = false;
     rfb.emit("disconnect", { clean: false });
 

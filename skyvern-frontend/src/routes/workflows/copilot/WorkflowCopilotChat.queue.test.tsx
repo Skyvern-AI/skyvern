@@ -1275,30 +1275,6 @@ describe("WorkflowCopilotChat — a repeat of the turn's own message is not re-r
     ).toBe("ask");
   });
 
-  it("drains an identical queued prompt when the turn opened as a fix", async () => {
-    await renderChat({
-      initialMessage: "fix the failing step",
-      initialMessageFixOrigin: true,
-    });
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    expect(
-      (streamCalls[0]!.body as unknown as { fix_origin: boolean }).fix_origin,
-    ).toBe(true);
-
-    // The user retypes the same text; this one is a plain send, not a fix, so
-    // it is a different request even though the words match.
-    await submit("fix the failing step");
-    expect(postStreaming).toHaveBeenCalledTimes(1);
-
-    await completeOldestStream("fix applied");
-
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
-    expect(streamCalls[1]!.body.message).toBe("fix the failing step");
-    expect(
-      (streamCalls[1]!.body as unknown as { fix_origin: boolean }).fix_origin,
-    ).toBe(false);
-  });
-
   it("drains a queued block build that repeats the message of the turn in flight", async () => {
     await renderChat();
     await act(async () => {

@@ -359,7 +359,6 @@ describe("StudioPaneToggles run selector", () => {
     );
     renderInBrowser("/workflows/wpid_abc/studio?panes=copilot&wr=wr_other", {
       copilotMessage: "Fix run A",
-      copilotFixOrigin: true,
     });
 
     fireEvent.click(tab("Past Runs"));

@@ -56,7 +56,7 @@ export function RunTab() {
               // initialMessage), so the pane write can't race a separate
               // state-only navigation.
               openPane("copilot", {
-                state: { copilotMessage: seedMessage, copilotFixOrigin: true },
+                state: { copilotMessage: seedMessage },
               });
             }
       }

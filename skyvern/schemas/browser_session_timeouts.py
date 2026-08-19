@@ -12,6 +12,10 @@ MAX_TIMEOUT = 60 * 4  # 4 hours
 MAX_LIFETIME_SECONDS = MAX_TIMEOUT * 60
 DEFAULT_TIMEOUT = 60
 
+MAX_TIMEOUT_EXCEEDED_MESSAGE = (
+    "Longer browser durations are available on our enterprise plan, please contact sales@skyvern.com"
+)
+
 
 def seconds_until_expiry(
     *,

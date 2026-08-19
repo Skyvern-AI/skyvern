@@ -72,6 +72,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     CURRENT_DATE_FORMAT,
     DEFAULT_MAX_LOOP_ITERATIONS,
     ActionBlock,
+    BaseTaskBlock,
     CodeBlock,
     ExtractionBlock,
     FileDownloadBlock,
@@ -91,6 +92,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ValidationBlock,
     WhileLoopBlock,
     WorkflowTriggerBlock,
+    get_all_blocks,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -1310,6 +1312,15 @@ async def _detect_user_defined_errors(
         return []
 
 
+def _resolve_original_block_engine(cache_key: str, workflow: Workflow) -> RunEngine | None:
+    # Recursive: a cached block inside a for/while loop must keep its engine too (labels are
+    # validated globally unique, so the first match is the block).
+    for block in get_all_blocks(workflow.workflow_definition.blocks):
+        if block.label == cache_key:
+            return block.engine if isinstance(block, BaseTaskBlock) else None
+    return None
+
+
 async def _fallback_to_ai_run(
     block_type: BlockType,
     cache_key: str,
@@ -1551,6 +1562,28 @@ async def _fallback_to_ai_run(
             step_id=script_step_id,
         )
 
+        # Inherit the original block's engine when the caller left it at default; fail open to v1 on any miss.
+        if engine == RunEngine.skyvern_v1:
+            try:
+                resolved_engine = _resolve_original_block_engine(cache_key, workflow)
+                if resolved_engine is not None and resolved_engine != RunEngine.skyvern_v1:
+                    engine = resolved_engine
+                    LOG.debug(
+                        "Resolved original block engine for AI fallback",
+                        cache_key=cache_key,
+                        engine=engine.value,
+                        workflow_id=workflow_id,
+                        workflow_run_id=workflow_run_id,
+                    )
+            except Exception:
+                LOG.debug(
+                    "Failed to resolve original block engine for AI fallback, defaulting to v1",
+                    cache_key=cache_key,
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+
         task_block = TaskBlock(
             label=cache_key,
             url=task.url,
@@ -1576,6 +1609,9 @@ async def _fallback_to_ai_run(
             task=task,
             step=ai_step,
             task_block=task_block,
+            # The dispatch gate reads the engine PARAM, not task_block.engine — without this the
+            # inherited engine is inert and every fallback runs the default.
+            engine=engine,
         )
 
         # update workflow run to indicate that there's a script run

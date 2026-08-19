@@ -21,6 +21,7 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.secret_redaction_enabled_for_run = MagicMock(return_value=False)
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled = MagicMock(return_value=False)
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run = MagicMock(return_value=set())
+    fake_app_module.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts = MagicMock(return_value=set())
     # Sync liveness predicate — _LazyNamespace would auto-mock it as a truthy (never-awaited) AsyncMock,
     # making every wr_ alias read as a live sharer. Default to "no run is live" so tests must opt a run
     # into liveness explicitly (non-PBS ownership signal).

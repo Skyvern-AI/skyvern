@@ -199,7 +199,14 @@ class TestAttachActionTraces:
 
     @staticmethod
     def _make_action(
-        task_id: str, action_type: str, status: str, reasoning: str | None, element_id: str | None
+        task_id: str,
+        action_type: str,
+        status: str,
+        reasoning: str | None,
+        element_id: str | None,
+        *,
+        description: str | None = None,
+        output: dict[str, Any] | list | str | None = None,
     ) -> MagicMock:
         action = MagicMock()
         action.task_id = task_id
@@ -207,6 +214,8 @@ class TestAttachActionTraces:
         action.status = status
         action.reasoning = reasoning
         action.element_id = element_id
+        action.description = description
+        action.output = output
         return action
 
     @pytest.mark.asyncio
@@ -238,6 +247,90 @@ class TestAttachActionTraces:
         assert trace[0]["reasoning"] == long_reasoning[: len(trace[0]["reasoning"])]
         assert trace[0]["element"] == "elem-42"
         assert trace[1]["reasoning"] == "typed email"
+
+    @pytest.mark.asyncio
+    async def test_attach_action_traces_projects_only_valid_code_failure_fields(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.forge.sdk.copilot.tools import _attach_action_traces
+
+        block = self._make_block("task-1", "failed")
+        result: dict[str, Any] = {"label": "step1", "status": "failed"}
+        actions = [
+            self._make_action(
+                "task-1",
+                "null_action",
+                "failed",
+                None,
+                None,
+                description="code error at line 18",
+                output={"code_line": 18, "arbitrary": "must-not-survive"},
+            ),
+            self._make_action(
+                "task-1",
+                "click",
+                "failed",
+                None,
+                "button-1",
+                description="ordinary action description must not survive",
+                output={"code_line": 17},
+            ),
+            self._make_action(
+                "task-1",
+                "click",
+                "failed",
+                None,
+                "button-2",
+                description="bool is not an integer line",
+                output={"code_line": True},
+            ),
+            self._make_action(
+                "task-1",
+                "input_text",
+                "failed",
+                None,
+                "input-1",
+                description="string is not an integer line",
+                output={"code_line": "7"},
+            ),
+            self._make_action(
+                "task-1",
+                "input_text",
+                "failed",
+                None,
+                "input-2",
+                description="non-dict output",
+                output=[{"code_line": 7}],
+            ),
+        ]
+
+        mock_db = MagicMock()
+        mock_db.tasks = MagicMock()
+        mock_db.tasks.get_recent_actions_for_tasks = AsyncMock(return_value=actions)
+        _install_mock_database(monkeypatch, mock_db)
+
+        await _attach_action_traces([block], [result], "org-1")
+
+        trace = result["action_trace"]
+        assert [entry["action"] for entry in trace] == [
+            "null_action",
+            "click",
+            "click",
+            "input_text",
+            "input_text",
+        ]
+        assert trace[0]["description"] == "code error at line 18"
+        assert trace[0]["code_line"] == 18
+        assert "output" not in trace[0]
+        assert "arbitrary" not in trace[0]
+        assert "description" not in trace[1]
+        assert "code_line" not in trace[1]
+        assert "description" not in trace[2]
+        assert "code_line" not in trace[2]
+        assert "description" not in trace[3]
+        assert "code_line" not in trace[3]
+        assert "description" not in trace[4]
+        assert "code_line" not in trace[4]
 
     @pytest.mark.asyncio
     async def test_attach_action_traces_skips_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -294,6 +387,43 @@ class TestAttachActionTraces:
 
         for r in results:
             assert "action_trace" in r, f"Missing action_trace for status={r['status']}"
+
+
+class TestSummarizeActionTrace:
+    def test_selects_six_newest_entries_then_renders_them_chronologically(self) -> None:
+        from skyvern.forge.sdk.copilot.tools.run_execution import _summarize_action_trace
+
+        newest_first = [
+            {"action": "click", "status": "completed", "element": f"newest-{index}"} for index in range(8, 0, -1)
+        ]
+
+        summary = _summarize_action_trace(newest_first)
+
+        assert summary == [
+            "click newest-3 completed",
+            "click newest-4 completed",
+            "click newest-5 completed",
+            "click newest-6 completed",
+            "click newest-7 completed",
+            "click newest-8 completed",
+        ]
+
+    def test_retains_projected_failure_description_and_code_line(self) -> None:
+        from skyvern.forge.sdk.copilot.tools.run_execution import _summarize_action_trace
+
+        summary = _summarize_action_trace(
+            [
+                {
+                    "action": "goto_url",
+                    "status": "failed",
+                    "element": None,
+                    "description": "code error at line 9",
+                    "code_line": 9,
+                }
+            ]
+        )
+
+        assert summary == ["goto_url failed description=code error at line 9 code_line=9"]
 
 
 class TestSyntheticScreenshotPlaceholders:

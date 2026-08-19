@@ -15,7 +15,10 @@ from anthropic import NOT_GIVEN
 from anthropic.types.beta.beta_message import BetaMessage as AnthropicMessage
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.types.router import AllowedFailsPolicy
-from litellm.utils import CustomStreamWrapper, ModelResponse
+
+# supports_tool_choice is not re-exported on the litellm module, whose __getattr__ raises for
+# un-exported names — reading it as litellm.supports_tool_choice would AttributeError.
+from litellm.utils import CustomStreamWrapper, ModelResponse, supports_tool_choice
 from openai import APIError, AsyncOpenAI, RateLimitError
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from opentelemetry import trace as otel_trace
@@ -3027,6 +3030,8 @@ class LLMCaller:
             self.screenshot_resize_target_dimension = get_resize_target_dimension(self.browser_window_dimension)
 
         self.openai_client = None
+        self._supports_tool_choice: bool | None = None
+        self._warned_unsupported_tool_choice = False
         openrouter_model_name = LLMAPIHandlerFactory._openrouter_model_name(self.llm_key, self.llm_config)
         self._custom_openrouter = bool(openrouter_model_name and is_custom_llm_key(self.original_llm_key))
         # openrouter/ keys always resolve to LLMConfig, never LLMRouterConfig
@@ -3062,6 +3067,50 @@ class LLMCaller:
 
     def clear_tool_results(self) -> None:
         self.current_tool_results = []
+
+    def supports_tool_choice(self) -> bool:
+        """Whether the resolved model can be sent a ``tool_choice`` parameter.
+
+        Default-deny: an unrecognized model answers False. Router configs answer for their
+        deployments rather than the group name — litellm knows nothing about a router group, so
+        asking about ``model_name`` would deny every router config.
+        """
+        if self._supports_tool_choice is not None:
+            return self._supports_tool_choice
+        self._supports_tool_choice = self._resolve_tool_choice_support()
+        return self._supports_tool_choice
+
+    def _resolve_tool_choice_support(self) -> bool:
+        # Mirrors the branch order in _dispatch_llm_call. These paths build their provider kwargs
+        # from an explicit allowlist with no tool_choice entry, so the parameter cannot reach the
+        # provider however the model is set.
+        if self.openai_client is not None or self._custom_openrouter:
+            return False
+        try:
+            if isinstance(self.llm_config, LLMRouterConfig):
+                groups = {self.llm_config.main_model_group}
+                fallback_group = self.llm_config.fallback_model_group
+                if isinstance(fallback_group, str):
+                    groups.add(fallback_group)
+                elif fallback_group:
+                    groups.update(fallback_group)
+                deployments = [
+                    deployment for deployment in self.llm_config.model_list if deployment.model_name in groups
+                ]
+                if not deployments:
+                    return False
+                return all(
+                    supports_tool_choice(model=str(deployment.litellm_params.get("model") or ""))
+                    for deployment in deployments
+                )
+            # Router configs reach the provider through litellm.Router and never these branches, so
+            # this check has to sit below the router case exactly as it does in dispatch.
+            if any(marker in (self.llm_key or "") for marker in ("ANTHROPIC", "UI_TARS", "YUTORI")):
+                return False
+            return supports_tool_choice(model=self.llm_config.model_name)
+        except Exception:
+            LOG.debug("Failed to resolve tool_choice support", llm_key=self.llm_key, exc_info=True)
+            return False
 
     @traced(name=LLM_REQUEST_SPAN_NAME)
     async def call(
@@ -3104,6 +3153,18 @@ class LLMCaller:
         # Router configs carry per-deployment litellm_params inside the Router, not on the config.
         if not isinstance(self.llm_config, LLMRouterConfig) and self.llm_config.litellm_params:
             active_parameters.update(self.llm_config.litellm_params)
+        if "tool_choice" in active_parameters and not self.supports_tool_choice():
+            # Forwarding it to a provider that rejects it is the one way this parameter breaks a
+            # call rather than merely failing to help, so drop it here instead of at each caller.
+            unsupported_tool_choice = active_parameters.pop("tool_choice")
+            if not self._warned_unsupported_tool_choice:
+                self._warned_unsupported_tool_choice = True
+                LOG.warning(
+                    "Dropping tool_choice the resolved model does not support",
+                    llm_key=self.llm_key,
+                    model=self.llm_config.model_name,
+                    tool_choice=unsupported_tool_choice,
+                )
 
         context = skyvern_context.current()
         secret_values = _current_secret_values_for_redaction()

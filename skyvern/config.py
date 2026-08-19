@@ -473,6 +473,9 @@ class Settings(BaseSettings):
     ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE4.6_SONNET"
     # Task V3 native engine (skyvern-3.0) model; empty falls back to LLM_KEY. Cloud pins the validated model.
     TASK_V3_LLM_KEY: str = ""
+    # Forbid no-tool "narration" turns in the Task V3 loop. Only takes effect where the resolved
+    # model declares tool_choice support; the NO_TOOL_CALL_NUDGE fallback stays either way.
+    TASK_V3_TOOL_CHOICE_REQUIRED: bool = False
 
     # VOLCENGINE (Doubao)
     ENABLE_VOLCENGINE: bool = False

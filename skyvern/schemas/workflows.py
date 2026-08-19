@@ -1142,9 +1142,11 @@ class PDFParserBlockYAML(BlockYAML):
 class ValidationBlockYAML(BlockYAML):
     block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION  # type: ignore
 
+    engine: RunEngine = RunEngine.skyvern_v1
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     error_code_mapping: dict[str, str] | None = None
+    max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
     disable_cache: bool = False
     without_page_information: bool = False
@@ -1161,6 +1163,7 @@ class ActionBlockYAML(BlockYAML):
     ai_fallback: AIFallbackMode = AIFallbackMode.FALLBACK
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
+    max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
     complete_on_download: bool = False
     download_suffix: str | None = (

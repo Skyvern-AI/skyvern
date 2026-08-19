@@ -150,14 +150,6 @@ class WorkflowCopilotChatRequest(BaseModel):
             "other block unchanged. Used by the block-level Generate action."
         ),
     )
-    fix_origin: bool = Field(
-        False,
-        description=(
-            "True when the turn originates from the 'Fix with Copilot' action on a failed run. Carried as "
-            "provenance only: it does not change the turn's routing or tool authority, which come from the "
-            "request policy and the run the turn is grounded in."
-        ),
-    )
     supports_credential_pause: bool = Field(
         False,
         description=(

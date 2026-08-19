@@ -1,5 +1,7 @@
+import asyncio
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -882,3 +884,90 @@ async def test_speculative_plan_null_response_does_not_unbind_without_page_infor
     # is that agent_step completes (pass or fail) without raising
     # UnboundLocalError for without_page_information.
     assert step.status in (StepStatus.completed, StepStatus.failed)
+
+
+@pytest.mark.asyncio
+async def test_discarded_speculative_plan_cost_write_survives_task_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The speculative extract-actions call is billed even when its plan is thrown away, so
+    the write that attributes its cost has to reach the DB. It is started in the background
+    (the completion path must not wait on an LLM call it no longer needs) and drained in
+    clean_up_task, which is the choke point every terminal path funnels through. Before the
+    drain existed the task was orphaned: nothing held a reference and nothing awaited it, so
+    the write was dropped at teardown.
+    """
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(now, organization, navigation_goal=None, workflow_run_id="wr-1")
+
+    step = make_step(
+        now,
+        task,
+        step_id="step-123",
+        status=StepStatus.completed,
+        order=0,
+        output=AgentStepOutput(action_results=[], actions_and_results=[]),
+    )
+    next_step = make_step(now, task, step_id="step-next", status=StepStatus.created, order=1, output=None)
+
+    setup_parallel_verification_mocks(
+        agent,
+        step=step,
+        task=task,
+        monkeypatch=monkeypatch,
+        next_step=next_step,
+        complete_action=CompleteAction(reasoning="done", verified=True),
+        handle_action_responses=[[ActionSuccess()]],
+    )
+
+    # Stands in for the speculative LLM call still being in flight when the completion path
+    # returns. call_later rather than sleep: the shared mocks replace asyncio.sleep.
+    speculative_call_finished = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.2, speculative_call_finished.set)
+    persisted_steps: list[str] = []
+
+    async def slow_persist(discarded_step: Step, speculative_task: Any, *, cancel_step: bool = False) -> None:
+        await speculative_call_finished.wait()
+        persisted_steps.append(discarded_step.step_id)
+
+    monkeypatch.setattr(agent, "_persist_speculative_metadata_for_discarded_plan", slow_persist)
+
+    context = SkyvernContext(organization_id=organization.organization_id, task_id=task.task_id)
+    skyvern_context.set(context)
+    try:
+        browser_state, scraped_page, page = make_browser_state()
+        completed, _, _ = await agent._handle_completed_step_with_parallel_verification(
+            organization=organization,
+            task=task,
+            step=step,
+            page=page,
+            browser_state=browser_state,
+            scraped_page=scraped_page,
+            engine=RunEngine.skyvern_v1,
+        )
+
+        assert completed is True
+        # The completion path returned without waiting on the still-running speculative call.
+        assert persisted_steps == []
+
+        with (
+            patch("skyvern.forge.agent.analytics.capture"),
+            patch.object(agent, "_finalize_downloaded_files_for_task", AsyncMock(return_value=[])),
+            patch("skyvern.forge.agent.app") as mock_app,
+        ):
+            mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+            mock_app.STORAGE.save_downloaded_files = AsyncMock()
+            await agent.clean_up_task(
+                task,
+                last_step=step,
+                need_final_screenshot=False,
+                need_call_webhook=False,
+                close_browser_on_completion=False,
+            )
+
+        assert persisted_steps == [next_step.step_id]
+        assert context.pending_speculative_persist_tasks == []
+    finally:
+        skyvern_context.reset()

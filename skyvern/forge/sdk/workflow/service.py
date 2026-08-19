@@ -11550,6 +11550,10 @@ class WorkflowService:
         if app.WORKFLOW_CONTEXT_MANAGER.secret_redaction_enabled_for_run(workflow_run.workflow_run_id):
             secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
             har_data = await asyncio.to_thread(redact_har_bytes, har_data, secret_values)
+        else:
+            runtime_secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+            if runtime_secret_values:
+                har_data = await asyncio.to_thread(redact_har_bytes, har_data, runtime_secret_values)
         if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
             submission_shadow.schedule_submission_signal_shadow(
                 har_data=har_data,
@@ -11580,6 +11584,10 @@ class WorkflowService:
         if app.WORKFLOW_CONTEXT_MANAGER.secret_redaction_enabled_for_run(workflow_run.workflow_run_id):
             secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
             browser_log = await asyncio.to_thread(redact_console_log_bytes, browser_log, secret_values)
+        else:
+            runtime_secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+            if runtime_secret_values:
+                browser_log = await asyncio.to_thread(redact_console_log_bytes, browser_log, runtime_secret_values)
         LOG.debug("Persisting browser log", browser_log_size=len(browser_log))
         if browser_log:
             await app.ARTIFACT_MANAGER.create_artifact(
@@ -11631,9 +11639,12 @@ class WorkflowService:
         secret_values = (
             app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
             if redaction_enabled
-            else set()
+            else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
         )
-        if redaction_enabled:
+        # Opted-in runs always redact (even an empty full set); opted-out runs redact only when a
+        # runtime secret was actually registered, so the no-secrets case skips the redact call.
+        should_redact = redaction_enabled or bool(secret_values)
+        if should_redact:
             browser_log = await asyncio.to_thread(redact_console_log_bytes, browser_log, secret_values)
         LOG.debug("Persisting browser log (bundled)", browser_log_size=len(browser_log))
         if browser_log:
@@ -11644,7 +11655,7 @@ class WorkflowService:
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
         )
-        if redaction_enabled:
+        if should_redact:
             har_data = await asyncio.to_thread(redact_har_bytes, har_data, secret_values)
         if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
             submission_shadow.schedule_submission_signal_shadow(

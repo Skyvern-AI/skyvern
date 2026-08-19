@@ -838,8 +838,8 @@ async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
             try:
                 await asyncio.wait_for(
                     app.PERSISTENT_SESSIONS_MANAGER.close_session(
-                        organization_id=ctx.organization_id,
-                        browser_session_id=session.persistent_browser_session_id,
+                        ctx.organization_id,
+                        session.persistent_browser_session_id,
                     ),
                     timeout=_SESSION_CLEANUP_TIMEOUT_SECONDS,
                 )

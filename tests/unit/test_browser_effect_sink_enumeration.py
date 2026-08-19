@@ -15,7 +15,7 @@ _CANDIDATE_METHODS = frozenset(
 )
 
 _DISCOVERED_BROWSER_API_CALLS = {
-    "skyvern/forge/agent.py": Counter({"new_page": 1}),
+    "skyvern/forge/agent.py": Counter({"evaluate": 2, "new_page": 1}),
     "skyvern/forge/agent_functions.py": Counter({"close": 1, "scroll_into_view_if_needed": 1}),
     "skyvern/webeye/actions/handler.py": Counter(
         {
@@ -71,6 +71,8 @@ _DISCOVERED_BROWSER_API_CALLS = {
 }
 
 _EVALUATE_CALLERS = {
+    # Read-only DOM-shape probe for the v3 settle-before-complete check (two samples per probe).
+    "skyvern/forge/agent.py": Counter({"_settle_probe": 2}),
     "skyvern/webeye/actions/handler.py": Counter(
         {
             "_blob_iframe_src_titles": 1,
@@ -207,21 +209,21 @@ def test_discovered_browser_api_lower_bound_is_stable() -> None:
     }
 
     assert observed == _DISCOVERED_BROWSER_API_CALLS
-    assert sum(sum(methods.values()) for methods in observed.values()) == 151
+    assert sum(sum(methods.values()) for methods in observed.values()) == 153
     handler_candidates = _candidate_signatures("skyvern/webeye/actions/handler.py", _CANDIDATE_METHODS)
     classified_non_browser = Counter(
         {signature: count for signature, count in handler_candidates.items() if signature in _NON_BROWSER_CANDIDATES}
     )
     assert classified_non_browser == _NON_BROWSER_CANDIDATES
     assert sum(_NON_BROWSER_CANDIDATES.values()) == 5
-    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 146
+    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 148
 
 
 def test_every_raw_evaluate_call_is_classified() -> None:
     observed = {path: callers for path in _owned_source_paths() if (callers := _callers_for_method(path, "evaluate"))}
 
     assert observed == _EVALUATE_CALLERS
-    assert sum(sum(callers.values()) for callers in observed.values()) == 22
+    assert sum(sum(callers.values()) for callers in observed.values()) == 24
 
 
 def test_every_cdp_dispatch_is_classified_by_exact_command() -> None:
