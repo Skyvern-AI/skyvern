@@ -16,7 +16,6 @@ import {
 type StreamBody = {
   message: string;
   workflow_run_id?: string | null;
-  fix_origin?: boolean;
 };
 type StreamCall = {
   body: StreamBody;

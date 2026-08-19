@@ -381,7 +381,6 @@ function Workspace({
   const [searchParams] = useSearchParams();
   const locationState = location.state as {
     copilotMessage?: unknown;
-    copilotFixOrigin?: unknown;
   } | null;
   const routeInitialCopilotMessage =
     typeof locationState?.copilotMessage === "string"
@@ -396,7 +395,6 @@ function Workspace({
     () => routeInitialCopilotMessage ?? storedInitialCopilotMessage,
     [routeInitialCopilotMessage, storedInitialCopilotMessage],
   );
-  const initialCopilotFixOrigin = locationState?.copilotFixOrigin === true;
   const handleInitialCopilotMessageConsumed = useCallback(() => {
     if (!initialCopilotMessage) return;
     clearStoredInitialCopilotMessage();
@@ -2877,7 +2875,6 @@ function Workspace({
         requiresLiveBrowser={copilotRequiresLiveBrowser}
         isLiveBrowserReady={copilotLiveBrowserReady}
         initialMessage={initialCopilotMessage ?? undefined}
-        initialMessageFixOrigin={initialCopilotFixOrigin}
         onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
         onBlockSelect={(blockLabel) => {
           const matches = (node: AppNode) =>

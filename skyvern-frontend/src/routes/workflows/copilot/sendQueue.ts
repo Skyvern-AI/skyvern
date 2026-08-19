@@ -78,8 +78,8 @@ type ResolveDrainInput = {
   turnOpeningContent: string | null;
   turnCompletedNormally: boolean;
   turnWorkflowMatches: boolean;
-  // The chat-post carries more than the text (mode, fix origin, audio, block
-  // target, browser session, code block); a queued send that differs on any of
+  // The chat-post carries more than the text (mode, audio, block target,
+  // browser session, code block); a queued send that differs on any of
   // those is not a repeat. workflow_yaml, workflow_run_id and
   // keep_pending_proposal are deliberately excluded: they track turn state the
   // queued message was typed before, not what the user asked for.

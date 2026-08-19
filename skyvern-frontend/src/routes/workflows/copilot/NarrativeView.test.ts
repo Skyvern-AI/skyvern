@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 
-import { shouldShowFixCard } from "./cards/FixCard";
 import { getReviewGateVerdict } from "./cards/ReviewGateCard";
 import { derivePhases } from "./copilotPhases";
 import {
@@ -1630,8 +1629,8 @@ describe("humanizeJudgeText", () => {
   });
 
   it("leaves ordinary assistant prose alone, even when it ends like the instruction", () => {
-    // The trailing-prefix scan must never reach free prose: these reach FixCard and
-    // RollupCard headlines, which are not judge text.
+    // The trailing-prefix scan must never reach free prose: the same helper
+    // runs over assistant prose on the headline paths, which is not judge text.
     for (const prose of [
       "Choose option A",
       "Click the button labelled Add",
@@ -1794,9 +1793,8 @@ describe("a real cancel's backend payload still renders neutrally", () => {
     expect(summary.accent).not.toBe("fail");
   });
 
-  it("does not offer to fix a run the user stopped, or redden the rail", () => {
+  it("does not redden the rail for a run the user stopped", () => {
     const turn = hydrateNarrativeFromPayload(cancelledPayload())!;
-    expect(shouldShowFixCard(turn)).toBe(false);
     const phases = derivePhases(turn);
     const byId = Object.fromEntries(phases.map((p) => [p.id, p.status]));
     expect(byId.done).toBe("stopped");
@@ -1861,6 +1859,5 @@ describe("a real cancel's backend payload still renders neutrally", () => {
     })!;
     expect(turn.blocks[0]?.state).toBe("failed");
     expect(computeTurnSummary(turn).isFail).toBe(true);
-    expect(shouldShowFixCard(turn)).toBe(true);
   });
 });

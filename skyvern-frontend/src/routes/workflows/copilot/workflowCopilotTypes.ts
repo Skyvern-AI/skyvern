@@ -51,7 +51,6 @@ export interface WorkflowCopilotChatRequest {
   cancel_token?: string;
   idempotency_key?: string | null;
   target_block_label?: string | null;
-  fix_origin?: boolean;
   keep_pending_proposal?: boolean;
   // Opt-in: only clients that can render the credential_required frame set
   // this, so the backend never pauses a turn a client would silently drop.
