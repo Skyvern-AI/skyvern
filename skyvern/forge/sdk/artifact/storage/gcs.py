@@ -780,6 +780,7 @@ class GcsStorage(BaseStorage):
         remote_path: str,
         date: str | None = None,
         recording_finalized_at: datetime | None = None,
+        producer_run_id: str | None = None,
     ) -> str:
         """Sync a file from local browser session to GCS."""
         uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
@@ -855,6 +856,7 @@ class GcsStorage(BaseStorage):
                 filename=os.path.basename(remote_path),
                 checksum=download_checksum,
                 file_size=download_file_size,
+                run_id=None if is_partial else producer_run_id,
             )
         return uri
 

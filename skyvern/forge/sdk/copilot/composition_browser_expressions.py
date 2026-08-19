@@ -732,6 +732,7 @@ const selectOptions = (el) => {
   return out;
 };
 const controlDisabled = (el) => !!(el.hasAttribute('disabled') || lower(attr(el, 'aria-disabled')) === 'true' || lower(attr(el, 'data-disabled')) === 'true');
+const controlReadonly = (el) => !!(el.readOnly === true || el.hasAttribute('readonly') || lower(attr(el, 'aria-readonly')) === 'true');
 const modalIdentity = (el) => [
   (el.tagName || '').toLowerCase(), attr(el, 'id'), classesFor(el).join(' '), attr(el, 'role'),
   attr(el, 'aria-label'), attr(el, 'title'), attr(el, 'data-testid'), attr(el, 'data-test'), attr(el, 'data-dismiss'),
@@ -797,7 +798,7 @@ for (const form of document.querySelectorAll('form')) {
       continue;
     }
     if (fields.length >= MAX_FIELDS_PER_FORM) continue;
-    fields.push({ name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), filled: isFilled(node), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), visible: controlVisible(node), checked: node.hasAttribute('checked'), options: tag === 'select' ? selectOptions(node) : [], selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) });
+    fields.push({ name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), filled: isFilled(node), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), readonly: controlReadonly(node), visible: controlVisible(node), checked: node.hasAttribute('checked'), options: tag === 'select' ? selectOptions(node) : [], selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) });
   }
   forms.push({ id: attr(form, 'id'), name: attr(form, 'name'), action: attr(form, 'action'), method: attr(form, 'method'), fields: fields, submit_controls: submitControls });
 }

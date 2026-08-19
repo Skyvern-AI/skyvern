@@ -98,6 +98,9 @@ _EMPTY_RESULT_TEXT_PATTERNS: frozenset[str] = frozenset(
 _MAX_VISUAL_SUMMARY_CHARS = 500
 _MAX_VISUAL_OMISSIONS = 5
 _ANTI_BOT_SCAN_BYTES = 250_000
+_NON_ENTRY_FIELD_TYPES: frozenset[str] = frozenset(
+    {"hidden", "submit", "button", "reset", "checkbox", "radio", "file", "image"}
+)
 
 
 class _PostRunCompositionContext(Protocol):
@@ -162,6 +165,12 @@ def _control_disabled(node: Any) -> bool:
         or str(node.get("aria-disabled") or "").strip().lower() == "true"
         or str(node.get("data-disabled") or "").strip().lower() == "true"
     )
+
+
+def _control_readonly(node: Any) -> bool:
+    if not hasattr(node, "has_attr"):
+        return False
+    return bool(node.has_attr("readonly") or str(node.get("aria-readonly") or "").strip().lower() == "true")
 
 
 def _gated_submit_controls(forms: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -250,13 +259,71 @@ def page_evidence_needs_visual_fallback(evidence: dict[str, Any]) -> bool:
     return bool(evidence.get("anti_bot_indicators") or evidence.get("challenge_controls"))
 
 
+def _usable_control(control: Any) -> bool:
+    # Static HTML cannot see a stylesheet, so the fallback parser reports no `visible` flag at all
+    # and absent has to read as usable here; a control it never showed can still count.
+    return (
+        isinstance(control, dict)
+        and control.get("disabled") is not True
+        and control.get("readonly") is not True
+        and control.get("visible") is not False
+    )
+
+
+def _satisfiable_form_path(forms: Any) -> bool:
+    """True when the page offers an entry field plus an enabled submit control, so the turn can
+    complete it without a person.
+
+    The claim under refutation is that the submit control is gated. The page is authoritative about
+    disabled state, so a form whose own submit control it reports disabled corroborates the claim and
+    cannot refute it; matching the claim's prose to a control would be the harness interpreting prose.
+    A disabled control in some unrelated form says nothing about the form under consideration.
+    """
+    if not isinstance(forms, list):
+        return False
+    for form in forms:
+        if not isinstance(form, dict):
+            continue
+        submit_controls = [control for control in form.get("submit_controls") or [] if isinstance(control, dict)]
+        if any(control.get("disabled") is True for control in submit_controls):
+            continue
+        has_entry_field = any(
+            _usable_control(field) and str(field.get("type") or "").strip() not in _NON_ENTRY_FIELD_TYPES
+            for field in form.get("fields") or []
+        )
+        if not has_entry_field:
+            continue
+        # A bare <button> in a form already captures as "submit"; an explicit type="button" is
+        # JS-driven and indistinguishable from Cancel without reading its label, so it does not
+        # count and the claim stands.
+        if any(
+            _usable_control(control) and str(control.get("type") or "").strip() == "submit"
+            for control in submit_controls
+        ):
+            return True
+    return False
+
+
 def _confirmed_visual_challenge(evidence: dict[str, Any], visual_summary: dict[str, Any]) -> bool:
     if visual_summary.get("challenge_detected") is not True:
         return False
     if interactive_challenge_controls(evidence.get("challenge_controls")):
         return True
     obstruction_kind = str(visual_summary.get("obstruction_kind") or "").strip().lower()
-    return obstruction_kind != CONSENT_OBSTRUCTION_KIND
+    if obstruction_kind == CONSENT_OBSTRUCTION_KIND:
+        return False
+    if evidence.get("visual_obstruction_candidates") or evidence.get("modal_overlays"):
+        return True
+    # Form shape may only refute the one commensurable vision claim, that the submit control
+    # is gated; occlusion is answered by the obstruction evidence above, never by shape.
+    blocked_claims = [
+        item for item in visual_summary.get("blocked_submit_controls") or [] if isinstance(item, str) and item.strip()
+    ]
+    # submit_blocked normalizes to None whenever the model omits it, so a named blocked control
+    # carries the same gating claim; keying on the boolean alone would silently disable this.
+    if visual_summary.get("submit_blocked") is not True and not blocked_claims:
+        return True
+    return not _satisfiable_form_path(evidence.get("forms"))
 
 
 def merge_visual_composition_evidence(
@@ -298,7 +365,7 @@ def merge_visual_composition_evidence(
                 omissions.append(bounded)
         challenge_state = dict(merged.get("challenge_state") or {})
         challenge_confirmed = _confirmed_visual_challenge(evidence, visual_summary)
-        if vision_challenge_carrier(visual_summary):
+        if challenge_confirmed and vision_challenge_carrier(visual_summary):
             challenge_state.setdefault(CHALLENGE_EVIDENCE_SOURCE_KEY, ChallengeEvidenceSource.VISION.value)
         if challenge_confirmed:
             challenge_state["detected"] = True
@@ -2478,6 +2545,7 @@ def parse_composition_html(
                         node.has_attr("required") or str(node.get("aria-required") or "").lower() == "true"
                     ),
                     "disabled": _control_disabled(node),
+                    "readonly": _control_readonly(node),
                     "checked": bool(node.has_attr("checked")),
                     "options": _select_options(node) if tag_name == "select" else [],
                     "selector": _bounded_selector(_selector_for(node)),
@@ -2685,6 +2753,7 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
             "placeholder": _schema_text(_structured_str(node.get("placeholder")), 240),
             "required": node.get("required") is True,
             "disabled": node.get("disabled") is True,
+            "readonly": node.get("readonly") is True,
             "checked": node.get("checked") is True,
             "options": _structured_select_options(node.get("options")),
             "selector": _bounded_selector(_structured_str(node.get("selector"))),

@@ -45,7 +45,6 @@ class PreparedWorkflowWebhook:
     webhook_callback_url: str
     signed_payload: str
     headers: dict[str, str]
-    payload_for_log: str
 
 
 def is_retryable_status(status_code: int) -> bool:

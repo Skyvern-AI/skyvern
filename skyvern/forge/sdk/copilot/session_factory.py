@@ -36,6 +36,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     is_screenshot_message,
     is_synthetic_user_message,
     log_recent_tool_output_truncation,
+    pending_screenshot_message,
 )
 
 LOG = structlog.get_logger()
@@ -150,8 +151,25 @@ def _log_tool_pair_repair(moved: int, size_delta: int) -> None:
     LOG.info("copilot_tool_pair_repaired", moved=moved, size_delta=size_delta)
 
 
+def _run_context(data: CallModelData[Any]) -> Any:
+    """CallModelData carries the run context itself; only some entry points hand over a wrapper."""
+    return data.context.context if isinstance(data.context, RunContextWrapper) else data.context
+
+
 def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: int) -> ModelInputData:
-    budgeted = _filter_to_budget(data, token_budget=token_budget)
+    items = list(data.model_data.input)
+    # Read-only peek: the end-of-turn drain in enforcement stays the only clear, so a provider
+    # retry or model fallback re-running this filter still carries the frame.
+    screenshot_msg = pending_screenshot_message(_run_context(data))
+    if screenshot_msg is not None:
+        LOG.info(
+            "Injecting screenshot user message",
+            count=len(screenshot_msg["content"]) - 1,
+            path="model_input_filter",
+        )
+        items.append(screenshot_msg)
+
+    budgeted = _filter_to_budget(items, data.model_data.instructions, token_budget=token_budget)
     # Last thing before the request leaves: every budget rung above reorders nothing, but
     # history assembly upstream can seat a result after a later assistant turn, which the
     # provider rejects outright. Repair here so no path can emit an invalid pairing.
@@ -186,8 +204,7 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
     try:
         from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
 
-        # CallModelData carries the run context itself; only some entry points hand over a wrapper.
-        ctx = data.context.context if isinstance(data.context, RunContextWrapper) else data.context
+        ctx = _run_context(data)
         try:
             requested_output_paths = sorted(requested_output_paths_for_derivation(ctx)) if ctx else []
         except Exception:
@@ -213,7 +230,7 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
         LOG.warning("Failed to dump copilot model input")
 
 
-def _filter_to_budget(data: CallModelData[Any], *, token_budget: int) -> ModelInputData:
+def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budget: int) -> ModelInputData:
     """Token-budget enforcement applied just before each model call.
 
     Graduated pruning:
@@ -224,11 +241,8 @@ def _filter_to_budget(data: CallModelData[Any], *, token_budget: int) -> ModelIn
        then to 300 only if the softer pass was not enough.
     4. If still over budget: aggressive prune as last resort.
     """
-    model_data = data.model_data
-    items = list(model_data.input)
-
     if not items:
-        return ModelInputData(input=items, instructions=model_data.instructions)
+        return ModelInputData(input=items, instructions=instructions)
 
     est = estimate_tokens(items)
     LOG.info("Token estimate before filtering", tokens=est)
@@ -243,7 +257,7 @@ def _filter_to_budget(data: CallModelData[Any], *, token_budget: int) -> ModelIn
     est = estimate_tokens(items)
     if est <= token_budget:
         LOG.info("Within budget after tool trim", tokens=est)
-        return ModelInputData(input=items, instructions=model_data.instructions)
+        return ModelInputData(input=items, instructions=instructions)
 
     # Layer 2: Drop all screenshots except the most recent
     screenshot_indices = [i for i, item in enumerate(items) if is_screenshot_message(item)]
@@ -257,7 +271,7 @@ def _filter_to_budget(data: CallModelData[Any], *, token_budget: int) -> ModelIn
     est = estimate_tokens(items)
     if est <= token_budget:
         LOG.info("Within budget after screenshot drop", tokens=est)
-        return ModelInputData(input=items, instructions=model_data.instructions)
+        return ModelInputData(input=items, instructions=instructions)
 
     # Layer 3a: bring every tool output down to the pre-raise bound before resorting
     # to the harsher pass, so a code-bearing recent output degrades gracefully.
@@ -266,7 +280,7 @@ def _filter_to_budget(data: CallModelData[Any], *, token_budget: int) -> ModelIn
     est = estimate_tokens(items)
     if est <= token_budget:
         LOG.info("Within budget after soft emergency truncation", tokens=est)
-        return ModelInputData(input=items, instructions=model_data.instructions)
+        return ModelInputData(input=items, instructions=instructions)
 
     # Layer 3b: Truncate ALL tool outputs to 300 chars
     items = _emergency_truncate_all(items, TOOL_OUTPUT_TRUNCATE_EMERGENCY)
@@ -274,7 +288,7 @@ def _filter_to_budget(data: CallModelData[Any], *, token_budget: int) -> ModelIn
     est = estimate_tokens(items)
     if est <= token_budget:
         LOG.info("Within budget after emergency truncation", tokens=est)
-        return ModelInputData(input=items, instructions=model_data.instructions)
+        return ModelInputData(input=items, instructions=instructions)
 
     # Layer 4: Aggressive prune as last resort
     LOG.warning("Aggressive prune needed", tokens=est, budget=token_budget)
@@ -282,7 +296,7 @@ def _filter_to_budget(data: CallModelData[Any], *, token_budget: int) -> ModelIn
 
     est = estimate_tokens(items)
     LOG.info("Final token estimate after aggressive prune", tokens=est)
-    return ModelInputData(input=items, instructions=model_data.instructions)
+    return ModelInputData(input=items, instructions=instructions)
 
 
 def _truncate_tool_output(item: Any, max_chars: int) -> Any:

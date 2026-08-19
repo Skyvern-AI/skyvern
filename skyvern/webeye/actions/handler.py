@@ -163,7 +163,7 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
-from skyvern.webeye.browser_factory import initialize_download_dir, resolve_artifact_path
+from skyvern.webeye.browser_factory import initialize_download_dir, read_download_failure, resolve_artifact_path
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
     DOWNLOAD_MIME_TYPES,
@@ -227,6 +227,10 @@ UPLOAD_PENDING_FOLLOWUP_MESSAGE = "Upload is not complete yet. Continue the uplo
 DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE = (
     "No file download was observed or credited after this action. "
     "If the goal still requires this file, keep trying to download it rather than reporting the goal complete."
+)
+DOWNLOAD_ABORTED_FAILURE_MESSAGE = (
+    "The browser started this download but aborted it before any file was saved. "
+    "The download link may have expired; regenerate it before trying the download again."
 )
 SENSITIVE_CLIPBOARD_CLEAR_FAILED_FOLLOWUP_MESSAGE = (
     "The sensitive paste completed, but the clipboard could not be cleared. "
@@ -4266,6 +4270,24 @@ class ActionHandler:
                     )
             if downloaded_file_names:
                 results[-1].downloaded_files = action.downloaded_files = downloaded_file_names
+            elif (
+                captured_download is not None
+                and (aborted_reason := await read_download_failure(captured_download)) is not None
+            ):
+                # The partial file appearing is what credited download_triggered, and the browser
+                # deletes it on abort, so the settle above reads an aborted transfer as a completed
+                # one. Without this the action reports success with no file and the agent retries
+                # the already-consumed link instead of regenerating it.
+                LOG.warning(
+                    "Browser aborted the download after it was credited; no file was saved",
+                    workflow_run_id=task.workflow_run_id,
+                    download_dir=download_dir,
+                    failure=aborted_reason,
+                )
+                results[-1] = ActionFailure(
+                    Exception(f"{DOWNLOAD_ABORTED_FAILURE_MESSAGE} (browser reported: {aborted_reason})"),
+                    download_triggered=True,
+                )
             if xhr_fallback_moved_paths:
                 post_settle_extra_paths = new_file_paths - xhr_fallback_moved_paths
                 if post_settle_extra_paths:
@@ -8463,6 +8485,11 @@ async def chain_click(
     # File choosers are impossible to close if you don't expect one. Instead of dealing with it, close it!
 
     dom = DomUtil(scraped_page=scraped_page, page=page)
+    composite_source = skyvern_element
+    composite_target_id = composite_source.get_id()
+    skyvern_element = await dom.resolve_effective_click_target(composite_source)
+    if skyvern_element.get_id() != composite_target_id and await skyvern_element.is_disabled(dynamic=True):
+        return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
     locator = skyvern_element.locator
     click_count = _get_click_count(action)
     # TODO (suchintan): This should likely result in an ActionFailure -- we can figure out how to do this later!
@@ -8729,6 +8756,7 @@ async def chain_click(
             coordinate_error: Exception | None = None
             if not skip_coordinate_click:
                 try:
+                    skyvern_element = await dom.resolve_effective_click_target(composite_source)
                     await skyvern_element.coordinate_click(page=page, click_count=click_count)
                 except Exception as e:
                     coordinate_error = e
@@ -8778,6 +8806,7 @@ async def chain_click(
                 locator=locator,
             )
             try:
+                skyvern_element = await dom.resolve_effective_click_target(composite_source)
                 await skyvern_element.click_in_javascript()
             except Exception as e:
                 action_results.append(ActionFailure(FailToClick(action.element_id, anchor="self_js", msg=str(e))))
@@ -9276,7 +9305,18 @@ async def choose_auto_completion_dropdown(
     finally:
         await incremental_scraped.stop_listen_dom_increment()
         if clear_input and await skyvern_element.is_visible():
-            await skyvern_element.input_clear()
+            try:
+                await skyvern_element.input_clear()
+            except Exception:
+                # Best-effort cleanup of the probe text typed above; an exception raised here
+                # (e.g. InvalidElementForTextInput when the live node no longer matches the
+                # scraped tag) would otherwise escape this finally block and clobber whatever
+                # `result`/exception the try/except above already produced, denying the
+                # caller's designed fallback chain (retry -> full-dropdown discovery -> plain fill).
+                LOG.info(
+                    "Failed to clear the auto-completion probe text, but continue",
+                    element_id=skyvern_element.get_id(),
+                )
 
 
 def remove_duplicated_HTML_element(elements: list[dict]) -> list[dict]:
@@ -10362,7 +10402,63 @@ async def _verify_custom_select_option(
 # input_text_converted is excluded: its anchor is frequently not an <input>, so the reset path that
 # contains an unverified click does not exist for it.
 _EXECUTABLE_CUSTOM_SELECT_ENTRIES = ("select_option", "input_text")
-_CUSTOM_SELECT_VERIFY_SETTLE_RETRY_DELAYS_SECONDS = (0.15, 0.15)
+# The timer is only a liveness cap for frame-starved/background pages and vendor CDP engines. Double-rAF
+# remains the normal render-driven path; the timer does not claim that rendering has become stable.
+_CUSTOM_SELECT_RENDER_SETTLE_JS = (
+    "() => Promise.race(["
+    "new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve('raf')))),"
+    "new Promise((resolve) => setTimeout(() => resolve('liveness_fallback'), 250))"
+    "])"
+)
+
+
+class _CustomSelectRenderSettle(NamedTuple):
+    source: str
+    elapsed_ms: int
+
+
+async def _wait_custom_select_render_settle(element: SkyvernElement) -> _CustomSelectRenderSettle:
+    started_at = time.monotonic()
+    source = await _evaluate_element_scoped(element, _CUSTOM_SELECT_RENDER_SETTLE_JS)
+    return _CustomSelectRenderSettle(
+        source=source if source in {"raf", "liveness_fallback"} else "unknown",
+        elapsed_ms=int((time.monotonic() - started_at) * 1000),
+    )
+
+
+def _custom_select_settle_summary(settles: list[_CustomSelectRenderSettle]) -> tuple[str, int]:
+    source = "liveness_fallback" if any(settle.source == "liveness_fallback" for settle in settles) else "raf"
+    if not settles:
+        source = "not_run"
+    elif any(settle.source == "unknown" for settle in settles):
+        source = "unknown"
+    return source, sum(settle.elapsed_ms for settle in settles)
+
+
+def _log_custom_select_verification_outcome(
+    event: str,
+    *,
+    phase: str,
+    settles: list[_CustomSelectRenderSettle],
+    committed: bool,
+    verification_branch: str,
+    verification_reason: str,
+    recovery_attempted: bool,
+    recovery_succeeded: bool,
+) -> None:
+    render_settle_source, render_settle_elapsed_ms = _custom_select_settle_summary(settles)
+    LOG.info(
+        event,
+        phase=phase,
+        render_settle_source=render_settle_source,
+        render_settle_count=len(settles),
+        render_settle_elapsed_ms=render_settle_elapsed_ms,
+        committed=committed,
+        verification_branch=verification_branch,
+        verification_reason=verification_reason,
+        recovery_attempted=recovery_attempted,
+        recovery_succeeded=recovery_succeeded,
+    )
 
 
 async def _verify_custom_select_option_with_settle(
@@ -10373,16 +10469,14 @@ async def _verify_custom_select_option_with_settle(
     matched_element_id: str,
     matched_label: str | None,
     use_strict_verification: bool,
+    settle_outcomes: list[_CustomSelectRenderSettle] | None = None,
 ) -> tuple[bool, str]:
-    """Retry the read-back a couple of times before giving up.
-
-    Some frameworks commit ``aria-selected``/trigger-text reflection on the next render tick
-    rather than synchronously on click, so an immediate read-back can read stale state. Retries
-    only fire on the failure path; a confirmed read-back returns immediately with no added delay.
-    """
-    for delay_seconds in (0.0, *_CUSTOM_SELECT_VERIFY_SETTLE_RETRY_DELAYS_SECONDS):
-        if delay_seconds:
-            await asyncio.sleep(delay_seconds)
+    """Read back after bounded render turns so framework reconciliation is causally observable."""
+    settle_element = readback_scope_element or matched_element
+    for _ in range(2):
+        settle = await _wait_custom_select_render_settle(settle_element)
+        if settle_outcomes is not None and isinstance(settle, _CustomSelectRenderSettle):
+            settle_outcomes.append(settle)
         verified, branch = await _verify_custom_select_option(
             matched_element=matched_element,
             readback_scope_element=readback_scope_element,
@@ -10474,6 +10568,8 @@ async def _select_deterministic_custom_option(
     select_depth: int = 0,
     on_click_attempted: Callable[[], None] | None = None,
     on_reset_fallback: Callable[[Callable[[CustomSelectFamilyOutcome], None]], None] | None = None,
+    settle_outcomes: list[_CustomSelectRenderSettle] | None = None,
+    post_failed_click_commit_recovery: bool = False,
     engine_selection: BrowserEngineSelection | None = UNSET_SELECTION,
 ) -> tuple[ActionResult, str | None] | None:
     if engine_selection is UNSET_SELECTION:
@@ -10540,7 +10636,7 @@ async def _select_deterministic_custom_option(
         COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG,
         "collapse-custom-select-fanout",
     )
-    if gate.gate_error:
+    if gate.gate_error and not post_failed_click_commit_recovery:
         emit(CustomSelectFamilyOutcome.llm_fallback_gate_error)
         return None
 
@@ -10565,10 +10661,10 @@ async def _select_deterministic_custom_option(
     option_count = len(option_candidates)
     eligible = not resolution.fallback_to_llm and resolution.matched_index is not None
     match_tier = resolution.matched_tier
-    if not gate.family_enabled:
+    if not gate.family_enabled and not post_failed_click_commit_recovery:
         emit(CustomSelectFamilyOutcome.llm_fallback_family_off)
         return None
-    if gate.assigned is False:
+    if gate.assigned is False and not post_failed_click_commit_recovery:
         emit(CustomSelectFamilyOutcome.llm_fallback_control)
         return None
     if resolution.fallback_to_llm or resolution.matched_index is None:
@@ -10674,6 +10770,7 @@ async def _select_deterministic_custom_option(
             matched_element_id=element_id,
             matched_label=matched_label,
             use_strict_verification=anchor_is_combobox_input and allow_single_value_scope,
+            settle_outcomes=settle_outcomes,
         )
         if verified:
             emit(CustomSelectFamilyOutcome.success_verified)
@@ -10824,6 +10921,66 @@ def _collect_new_roots(element: dict, new_ids: set[str], out: list[dict]) -> Non
         _collect_new_roots(child, new_ids, out)
 
 
+def _custom_select_anchor_ownership(element: dict | None) -> tuple[str, frozenset[str]] | None:
+    if not element:
+        return None
+    attributes = element.get("attributes") or {}
+    role = str(attributes.get("role") or "").lower()
+    owned_ids = frozenset(
+        token
+        for attribute in ("aria-controls", "aria-owns")
+        for token in str(attributes.get(attribute) or "").split()
+        if token
+    )
+    if role != "combobox" or not owned_ids:
+        return None
+    return role, owned_ids
+
+
+def _resolve_owned_custom_select_recovery(
+    *,
+    original_anchor: dict | None,
+    refreshed_page: ScrapedPage,
+) -> tuple[str, list[dict]] | None:
+    ownership = _custom_select_anchor_ownership(original_anchor)
+    if ownership is None:
+        return None
+
+    matching_anchor_ids = _matching_custom_select_anchor_ids(ownership, refreshed_page)
+    if len(matching_anchor_ids) != 1:
+        return None
+
+    owned_ids = ownership[1]
+    matching_roots = [
+        element
+        for element in refreshed_page.elements
+        if str((element.get("attributes") or {}).get("id") or "") in owned_ids
+        and str((element.get("attributes") or {}).get("role") or "").lower() == "listbox"
+        and element.get("id")
+    ]
+    if len(matching_roots) != 1:
+        return None
+
+    owned_subtrees = _extract_new_subtrees(
+        refreshed_page.element_tree_trimmed,
+        {str(matching_roots[0]["id"])},
+    )
+    if len(owned_subtrees) != 1:
+        return None
+    return matching_anchor_ids[0], owned_subtrees
+
+
+def _matching_custom_select_anchor_ids(
+    ownership: tuple[str, frozenset[str]],
+    refreshed_page: ScrapedPage,
+) -> list[str]:
+    return [
+        str(element["id"])
+        for element in refreshed_page.elements
+        if _custom_select_anchor_ownership(element) == ownership and element.get("id")
+    ]
+
+
 @traced(name="skyvern.agent.dropdown.select_emerging")
 async def select_from_emerging_elements(
     current_element_id: str,
@@ -10959,6 +11116,17 @@ async def select_from_emerging_elements(
     # string raises ValueError and would mask the OPTION_NOT_AVAILABLE signal.
     raw_action_type: str = (json_response.get("action_type") or "").lower()
     element_id: str | None = json_response.get("id", None)
+    requested_value = options.target_value if _normalize_select_shadow_text(options.target_value) else None
+    if requested_value is None and _normalize_select_shadow_text(value):
+        requested_value = value
+    if requested_value is None and raw_action_type == ActionType.CLICK.value and element_id:
+        clicked_candidates = [
+            candidate
+            for candidate in _custom_select_candidates_from_elements(shadow_candidate_elements)
+            if candidate["element_id"] == element_id and _normalize_select_shadow_text(candidate["label"])
+        ]
+        if len(clicked_candidates) == 1:
+            requested_value = clicked_candidates[0]["label"]
     _log_select_shadow_match(
         prompt_name="custom-select/emerging",
         target_value=options.target_value,
@@ -11028,9 +11196,166 @@ async def select_from_emerging_elements(
         if await selected_element.get_attr("role") == "listbox":
             return ActionFailure(exception=InteractWithDropdownContainer(element_id=element_id))
 
+    original_anchor = scraped_page_after_open.id_to_element_dict.get(current_element_id)
     await selected_element.scroll_into_view()
     await selected_element.click(page=page, engine_selection=engine_selection)
-    return ActionSuccess()
+    readback_scope_element = await _resolve_custom_select_readback_scope_element(
+        get_readback_scope_element=get_readback_scope_element,
+        target_value=options.target_value or "",
+        matched_element_id=element_id,
+        matched_label=requested_value,
+    )
+    anchor_is_combobox_input = await _anchor_is_combobox_input(readback_scope_element)
+    initial_settles: list[_CustomSelectRenderSettle] = []
+    verification_branch = "none"
+    try:
+        verified, verification_branch = await _verify_custom_select_option_with_settle(
+            matched_element=selected_element,
+            readback_scope_element=readback_scope_element,
+            anchor_is_combobox_input=anchor_is_combobox_input,
+            matched_element_id=element_id,
+            matched_label=requested_value,
+            use_strict_verification=True,
+            settle_outcomes=initial_settles,
+        )
+        if verified:
+            final_settle = await _wait_custom_select_render_settle(readback_scope_element or selected_element)
+            if isinstance(final_settle, _CustomSelectRenderSettle):
+                initial_settles.append(final_settle)
+            verified, verification_branch = await _verify_custom_select_option(
+                matched_element=selected_element,
+                readback_scope_element=readback_scope_element,
+                anchor_is_combobox_input=anchor_is_combobox_input,
+                matched_element_id=element_id,
+                matched_label=requested_value,
+                use_strict_verification=True,
+            )
+    except Exception:
+        LOG.info(
+            "Custom-select primary commit verification exception",
+            phase="initial_click",
+            exc_info=True,
+        )
+        _log_custom_select_verification_outcome(
+            "Custom-select commit verification outcome",
+            phase="initial_click",
+            settles=initial_settles,
+            committed=False,
+            verification_branch="none",
+            verification_reason="verification_error",
+            recovery_attempted=False,
+            recovery_succeeded=False,
+        )
+        return _terminal_custom_select_failure(
+            target_value=options.target_value or requested_value or "",
+            matched_label=requested_value,
+        )[0]
+    _log_custom_select_verification_outcome(
+        "Custom-select commit verification outcome",
+        phase="initial_click",
+        settles=initial_settles,
+        committed=verified,
+        verification_branch=verification_branch,
+        verification_reason="verified" if verified else "not_committed",
+        recovery_attempted=not verified,
+        recovery_succeeded=False,
+    )
+    if verified:
+        return ActionSuccess()
+
+    recovery_settles: list[_CustomSelectRenderSettle] = []
+    recovery_reason = "not_committed"
+    try:
+        refreshed_page = await scraped_page_after_open.generate_scraped_page_without_screenshots()
+        refreshed_dom = DomUtil(scraped_page=refreshed_page, page=page, engine_selection=engine_selection)
+        ownership = _custom_select_anchor_ownership(original_anchor)
+        if ownership is None:
+            raise ValueError("Custom-select recovery ownership is missing")
+        matching_anchor_ids = _matching_custom_select_anchor_ids(ownership, refreshed_page)
+        if len(matching_anchor_ids) != 1:
+            raise ValueError("Custom-select recovery anchor is missing or ambiguous")
+        recovered_anchor_id = matching_anchor_ids[0]
+        recovered_anchor = await refreshed_dom.get_skyvern_element_by_id(recovered_anchor_id)
+        if await recovered_anchor.get_locator().get_attribute("aria-expanded") != "true":
+            await recovered_anchor.click(page=page, engine_selection=engine_selection)
+            refreshed_page = await scraped_page_after_open.generate_scraped_page_without_screenshots()
+            refreshed_dom = DomUtil(scraped_page=refreshed_page, page=page, engine_selection=engine_selection)
+        owned_recovery = _resolve_owned_custom_select_recovery(
+            original_anchor=original_anchor,
+            refreshed_page=refreshed_page,
+        )
+        if owned_recovery is None:
+            raise ValueError("Custom-select recovery ownership is missing or ambiguous")
+        recovered_anchor_id, refreshed_option_elements = owned_recovery
+        recovery_result = await _select_deterministic_custom_option(
+            execute=True,
+            target_value=requested_value,
+            get_option_candidates=lambda: _custom_select_candidates_from_elements(refreshed_option_elements),
+            field_context=options.model_dump(),
+            page=page,
+            get_skyvern_element=refreshed_dom.get_skyvern_element_by_id,
+            get_readback_scope_element=lambda: refreshed_dom.get_skyvern_element_by_id(recovered_anchor_id),
+            task=task,
+            step=step,
+            entry_action_type=entry_action_type,
+            selection_group_id=selection_group_id,
+            select_depth=1,
+            settle_outcomes=recovery_settles,
+            post_failed_click_commit_recovery=True,
+            engine_selection=engine_selection,
+        )
+    except Exception:
+        LOG.info(
+            "Custom-select deterministic recovery exception",
+            phase="recovery",
+            exc_info=True,
+        )
+        recovery_reason = "recovery_error"
+        recovery_result = None
+
+    recovery_committed = False
+    recovery_branch = "none"
+    if recovery_result is not None and isinstance(recovery_result[0], ActionSuccess):
+        try:
+            recovered_label = requested_value if requested_value is not None else recovery_result[1]
+            expected_label = _normalize_select_shadow_text(recovered_label)
+            recovered_scope = await refreshed_dom.get_skyvern_element_by_id(recovered_anchor_id)
+            recovery_settle = await _wait_custom_select_render_settle(recovered_scope)
+            if isinstance(recovery_settle, _CustomSelectRenderSettle):
+                recovery_settles.append(recovery_settle)
+            recovery_committed, recovery_branch = await _custom_select_scope_confirms_committed(
+                readback_scope_element=recovered_scope,
+                anchor_is_combobox_input=await _anchor_is_combobox_input(recovered_scope),
+                matched_element_id=element_id,
+                matched_label=recovered_label,
+                expected_label=expected_label,
+                allow_aria_selected_option_tokens=False,
+                allow_single_value_scope=True,
+            )
+        except Exception:
+            LOG.info(
+                "Custom-select recovery commit verification exception",
+                phase="recovery",
+                exc_info=True,
+            )
+            recovery_reason = "verification_error"
+            recovery_committed = False
+    _log_custom_select_verification_outcome(
+        "Custom-select recovery outcome",
+        phase="recovery",
+        settles=recovery_settles,
+        committed=recovery_committed,
+        verification_branch=recovery_branch,
+        verification_reason="verified" if recovery_committed else recovery_reason,
+        recovery_attempted=True,
+        recovery_succeeded=recovery_committed,
+    )
+    if recovery_committed and recovery_result is not None:
+        return recovery_result[0]
+    return _terminal_custom_select_failure(
+        target_value=requested_value or "",
+        matched_label=requested_value,
+    )[0]
 
 
 @traced(name="skyvern.agent.dropdown.select")

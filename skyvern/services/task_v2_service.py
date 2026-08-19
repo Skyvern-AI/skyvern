@@ -2840,7 +2840,6 @@ async def send_task_v2_webhook(task_v2: TaskV2, *, success_marker: str = "") -> 
             LOG.info(
                 "Task v2 webhook failed",
                 task_v2_id=task_v2.observer_cruise_id,
-                resp=resp,
                 resp_code=resp.status_code,
                 resp_text=resp.text,
             )

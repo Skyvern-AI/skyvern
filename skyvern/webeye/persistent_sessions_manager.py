@@ -164,6 +164,7 @@ class PersistentSessionsManager(Protocol):
         organization_id: str,
         *,
         runnable_generation_id: str | None = None,
+        download_run_id: str | None = None,
     ) -> None:
         """Occupy a browser session for use."""
         ...

@@ -605,18 +605,20 @@ def _summarize_action_trace(action_trace: list[dict[str, Any]] | None) -> list[s
 
 # Watchdog exit reasons. ``success`` means the run reached a trustworthy
 # terminal status inside the poll loop OR after the post-drain reconcile.
-# The three non-success reasons share the reconcile path but produce distinct
+# The run-ending reasons share the reconcile path but produce distinct
 # error messages: ``stagnation`` is the primary trip (no progress signals
 # for ``RUN_BLOCKS_STAGNATION_WINDOW_SECONDS`` seconds), ``ceiling`` is the
 # last-resort budget-exhausted branch, and ``task_exit_unfinalized`` is the
 # rare race where ``execute_workflow`` naturally exits before writing a
-# terminal row.
+# terminal row. ``paused`` is the exception: the run is alive and waiting on a
+# person, so it is neither cancelled nor reconciled.
 WatchdogExitReason = Literal[
     "success",
     "stagnation",
     "ceiling",
     "per_tool_budget",
     "task_exit_unfinalized",
+    "paused",
 ]
 
 
@@ -741,6 +743,16 @@ async def _watchdog_error_message(
             f"hidden validation error, or an infinite-retry loop on an action the agent "
             f"cannot detect is failing."
         )
+    elif exit_reason == "paused":
+        # A pause is a healthy waiting state rather than an uncertain outcome, so it returns here
+        # instead of picking up the shared "outcome is uncertain, do not re-invoke" tail below. This
+        # is the one arm that directs the model to relay its own text, so it carries no run id.
+        return (
+            "The run is paused at a human_interaction block, waiting for a person to approve or "
+            "reject it. It stays paused until someone acts on it in Skyvern or the block's timeout "
+            "elapses; nothing was cancelled. Tell the user the run is paused and what it is waiting "
+            "for, and do not re-run these blocks."
+        )
     elif exit_reason == "per_tool_budget":
         message = (
             f"The run exceeded the {budget_seconds}s per-tool-call budget while still "
@@ -796,6 +808,8 @@ def _watchdog_user_failure_reason(
     budget_seconds: int,
     run: WorkflowRun | None,
 ) -> str:
+    if exit_reason == "paused":
+        return "The run is paused, waiting for a person to approve or reject it."
     if exit_reason == "stagnation":
         body = f"The run stopped after no observable progress for {RUN_BLOCKS_STAGNATION_WINDOW_SECONDS}s."
     elif exit_reason == "per_tool_budget":
@@ -815,6 +829,8 @@ def _watchdog_user_facing_summary(
 ) -> str:
     if exit_reason == "stagnation":
         return f"The run stopped after no observable progress for {RUN_BLOCKS_STAGNATION_WINDOW_SECONDS}s."
+    if exit_reason == "paused":
+        return "The run is paused, waiting for a person to approve or reject it."
     if exit_reason == "per_tool_budget":
         return f"The run exceeded the {budget_seconds}s per-tool-call budget while still making progress."
     if exit_reason == "ceiling":
@@ -2084,6 +2100,7 @@ async def _run_blocks_and_collect_debug(
         raise
 
     active_run_association: ActiveRunSessionAssociation | None = None
+    run_paused = False
     if run_detached_from_chat and debug_session_id and run_session_id:
         try:
             active_run_association = await publish_active_run_session(
@@ -2201,11 +2218,18 @@ async def _run_blocks_and_collect_debug(
                     exit_reason = "stagnation"
                     break
 
+                if is_paused:
+                    exit_reason = "paused"
+                    run_paused = True
+                    break
+
                 if now - started_monotonic >= budget_seconds:
                     exit_reason = budget_exit_reason
                     break
 
-            if exit_reason is not None and exit_reason != "success":
+            if exit_reason is not None and exit_reason not in ("success", "paused"):
+                # A paused run is waiting for a person, so it is deliberately excluded here:
+                # cancelling it would destroy the very state the person was asked to act on.
                 # Pre-cancel read first: a legitimate self-finalize (user/block
                 # cancel, or any terminal the run wrote itself) can land between
                 # the last poll and here, and trusting it avoids the
@@ -2300,6 +2324,12 @@ async def _run_blocks_and_collect_debug(
                     result[_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY] = True
                 return result
         except asyncio.CancelledError:
+            # A pause is detected several awaits before the result is returned, so a tool timeout
+            # landing in that window reaches here with the run alive and waiting on a person.
+            # Cancelling it would destroy the state the person was asked to act on, so leave the
+            # run to the ``finally`` below, which adopts the executor instead.
+            if run_paused:
+                raise
             # The SDK's @function_tool(timeout=...) cancelled us mid-poll. Shield
             # the cleanup so the parent cancellation can't interrupt it mid-await.
             # If the shield itself is cancelled, fall back to a detached task
@@ -2328,7 +2358,14 @@ async def _run_blocks_and_collect_debug(
             # poll loop — signal the run_task so we don't leak it. Dispatched runs have no in-process
             # task, so there is nothing to signal.
             if run_task is not None and not run_task.done():
-                run_task.cancel()
+                if run_paused:
+                    # The inline executor coroutine is what observes the approval and resumes the
+                    # run, so it has to outlive this tool call instead of being cancelled.
+                    _DETACHED_CLEANUP_TASKS.add(run_task)
+                    run_task.add_done_callback(_DETACHED_CLEANUP_TASKS.discard)
+                    run_task.add_done_callback(_log_detached_cleanup_failure)
+                else:
+                    run_task.cancel()
             # Soft-delete the pinned draft so it never lingers as the latest version. Gated on a final
             # run state: on the normal path the poll loop only exits once the run is terminal, but an
             # unexpected exception can reach here before the worker has loaded the draft, and deleting
@@ -2539,7 +2576,9 @@ async def _run_blocks_and_collect_debug(
 
         return build_run_blocks_response(run_ok, result_data)
     finally:
-        if active_run_association is not None:
+        # A paused run keeps its association so the pane still follows the run the person was
+        # asked to act on; the next run's generation replaces it.
+        if active_run_association is not None and not run_paused:
             try:
                 await clear_active_run_session(
                     organization_id=active_run_association.organization_id,
@@ -2979,7 +3018,11 @@ def _record_run_blocks_result(
     # timeout softens to ``None`` to keep the unvalidated WIP rescue open.
     cancelled_by_watchdog = result.get(_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY) is True
     timeout_latched = bool(copilot_ctx.copilot_total_timeout_exceeded)
-    copilot_ctx.last_test_ok = None if (cancelled_by_watchdog and timeout_latched) else run_ok
+    # A pause softens the same way: left at False the generic failed-test nudge rewrites the reply
+    # into "the test failed" about a run that is alive and waiting, and ``None`` still bars a
+    # verified proposal because that gate requires ``is True``.
+    run_paused = isinstance(data, dict) and (data.get("control_signal") or {}).get("kind") == "watchdog_paused"
+    copilot_ctx.last_test_ok = None if run_paused or (cancelled_by_watchdog and timeout_latched) else run_ok
     copilot_ctx.last_full_workflow_test_ok = False
     # Re-affirmed per run below only when this run satisfies completion; never let a
     # prior run's terminal-ready latch leak into a run that did not verify.

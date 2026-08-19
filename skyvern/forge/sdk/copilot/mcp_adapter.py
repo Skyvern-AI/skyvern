@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlparse
 
 import structlog
@@ -29,6 +30,7 @@ from skyvern.cli.core.session_manager import request_session_scope
 from skyvern.forge import app
 from skyvern.forge.agent_functions import CopilotCandidateNetworkHop
 from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
+from skyvern.forge.sdk.copilot.hooks import _copilot_log_fields
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.output_utils import mark_mcp_result_untrusted_for_llm, sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
@@ -42,6 +44,9 @@ from skyvern.forge.sdk.copilot.runtime import (
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.webeye.browser_state import BrowserState
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.context import CopilotContext
 
 PreHook = Callable[[dict[str, Any], AgentContext], Awaitable[dict[str, Any] | None]]
 PostHook = Callable[[dict[str, Any], dict[str, Any], AgentContext], Awaitable[dict[str, Any]]]
@@ -154,6 +159,34 @@ def _scrub_tool_exception(ctx: AgentContext, tool_name: str, exception: BaseExce
     error = f"{tool_name} failed: {detail}" if detail else f"{tool_name} failed"
     del exception, detail
     return _scrub_tool_result(ctx, {"ok": False, "error": error})
+
+
+def _elapsed_ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)
+
+
+def _log_mcp_timing(
+    ctx: CopilotContext,
+    tool_name: str,
+    mcp_tool_name: str,
+    wall_clock_ms: int,
+    raw_mcp: dict[str, Any],
+    call_path: Literal["model", "internal"],
+    call_status: Literal["ok", "timeout", "error", "session_error", "cancelled", "not_connected"] = "ok",
+) -> None:
+    timing = raw_mcp.get("timing_ms")
+    total = timing.get("total") if isinstance(timing, dict) else None
+    reported = total if isinstance(total, int) and not isinstance(total, bool) else None
+    LOG.info(
+        "MCP tool timing",
+        tool_name=tool_name,
+        mcp_tool_name=mcp_tool_name,
+        wall_clock_ms=wall_clock_ms,
+        server_timing_ms=reported,
+        call_path=call_path,
+        call_status=call_status,
+        **_copilot_log_fields(ctx),
+    )
 
 
 def _requested_output_path_choices(schema: dict[str, Any], paths: list[str]) -> dict[str, Any]:
@@ -504,12 +537,21 @@ class SkyvernOverlayMCPServer(MCPServer):
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, hook_result)
                 return _copilot_to_call_tool_result(hook_result)
 
+        started = time.monotonic()
         mcp_name = self._alias_map.get(tool_name, tool_name)
         mcp_args = _transform_args(arguments, overlay)
 
         if overlay.requires_browser:
-            err = await ensure_browser_session(copilot_ctx)
+            try:
+                err = await ensure_browser_session(copilot_ctx)
+            except asyncio.CancelledError:
+                _log_mcp_timing(copilot_ctx, tool_name, mcp_name, _elapsed_ms(started), {}, "model", "cancelled")
+                raise
+            except Exception:
+                _log_mcp_timing(copilot_ctx, tool_name, mcp_name, _elapsed_ms(started), {}, "model", "session_error")
+                raise
             if err:
+                _log_mcp_timing(copilot_ctx, tool_name, mcp_name, _elapsed_ms(started), {}, "model", "session_error")
                 err = _scrub_tool_result(copilot_ctx, err)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
                 return _copilot_to_call_tool_result(err)
@@ -532,6 +574,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 )
         except TimeoutError:
             LOG.warning("MCP tool call timed out", tool=tool_name, ceiling_seconds=overlay.timeout)
+            _log_mcp_timing(copilot_ctx, tool_name, mcp_name, _elapsed_ms(started), {}, "model", "timeout")
             # The call is cancelled where it stands, so a tool that changes the page may already have
             # changed it. Reporting a plain failure invites a retry that acts on the page twice.
             err = {
@@ -544,11 +587,16 @@ class SkyvernOverlayMCPServer(MCPServer):
             err = _scrub_tool_result(copilot_ctx, err)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err)
+        except asyncio.CancelledError:
+            _log_mcp_timing(copilot_ctx, tool_name, mcp_name, _elapsed_ms(started), {}, "model", "cancelled")
+            raise
         except Exception as exc:
             LOG.warning("MCP tool call failed", tool=tool_name)
+            _log_mcp_timing(copilot_ctx, tool_name, mcp_name, _elapsed_ms(started), {}, "model", "error")
             err = _scrub_tool_exception(copilot_ctx, tool_name, exc)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err)
+        wall_clock_ms = _elapsed_ms(started)
 
         # Copy fastmcp's structured_content so mutations below stay local to
         # this call — the client may reuse or cache the response object.
@@ -560,6 +608,8 @@ class SkyvernOverlayMCPServer(MCPServer):
                 raw_mcp["error"] = " ".join(text_parts) if text_parts else "Unknown MCP error"
             else:
                 raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
+        failed = raw_result.is_error or raw_mcp.get("ok", True) is not True
+        _log_mcp_timing(copilot_ctx, tool_name, mcp_name, wall_clock_ms, raw_mcp, "model", "error" if failed else "ok")
         # Scrub before the post hook so evidence the hooks record from raw_mcp
         # (flow evidence, scout observations) is scrubbed too.
         raw_mcp = _scrub_tool_result(copilot_ctx, raw_mcp)
@@ -612,21 +662,37 @@ class SkyvernOverlayMCPServer(MCPServer):
         extracted error string rather than silently defaulting to
         ``ok=True``.
         """
+        started = time.monotonic()
+        copilot_name = self._reverse_alias.get(mcp_tool_name, mcp_tool_name)
         ctx = self._context_provider()
         if not self._client:
+            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, _elapsed_ms(started), {}, "internal", "not_connected")
             return _scrub_tool_result(ctx, {"ok": False, "error": "MCP client not connected"})
-        err = await ensure_browser_session(ctx)
+        try:
+            err = await ensure_browser_session(ctx)
+        except asyncio.CancelledError:
+            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, _elapsed_ms(started), {}, "internal", "cancelled")
+            raise
+        except Exception:
+            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, _elapsed_ms(started), {}, "internal", "session_error")
+            raise
         if err:
+            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, _elapsed_ms(started), {}, "internal", "session_error")
             return _scrub_tool_result(ctx, err)
         merged_args = {**mcp_args, "session_id": ctx.browser_session_id}
         try:
             async with mcp_browser_context(ctx):
                 raw = await self._client.call_tool(mcp_tool_name, merged_args, raise_on_error=False)
+            wall_clock_ms = _elapsed_ms(started)
             if self._evidence_candidate_origin is not None:
                 await asyncio.sleep(0)
                 await self._drain_evidence_candidate_response_tasks()
+        except asyncio.CancelledError:
+            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, _elapsed_ms(started), {}, "internal", "cancelled")
+            raise
         except Exception as exc:
             LOG.warning("Internal MCP tool call failed", tool=mcp_tool_name)
+            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, _elapsed_ms(started), {}, "internal", "error")
             return _scrub_tool_exception(ctx, mcp_tool_name, exc)
         raw_mcp = dict(raw.structured_content or {})
         if raw.is_error:
@@ -636,6 +702,10 @@ class SkyvernOverlayMCPServer(MCPServer):
                 raw_mcp["error"] = " ".join(text_parts) if text_parts else "Unknown MCP error"
             else:
                 raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
+        failed = raw.is_error or raw_mcp.get("ok", True) is not True
+        _log_mcp_timing(
+            ctx, copilot_name, mcp_tool_name, wall_clock_ms, raw_mcp, "internal", "error" if failed else "ok"
+        )
         scrubbed = _scrub_tool_result(ctx, raw_mcp)
         return mcp_to_copilot(scrubbed) if scrubbed else {}
 
