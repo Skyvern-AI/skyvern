@@ -457,6 +457,11 @@ def user_facing_success(
     by a precondition/authority blocker signal — the agent was redirected, not broken."""
     if result.get("ok", True):
         return True
+    # A run waiting on a human approval is the designed outcome of a human_interaction block, not a
+    # break, so it must not stream with failure affect.
+    data = result.get("data")
+    if isinstance(data, dict) and (data.get("control_signal") or {}).get("kind") == "watchdog_paused":
+        return True
     return any(
         signal.blocker_kind in _NEUTRAL_REDIRECT_BLOCKER_KINDS and _blocker_signal_matches_result(signal, result)
         for signal in _iter_blocker_signals(blocker_signal)

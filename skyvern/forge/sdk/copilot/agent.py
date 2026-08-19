@@ -1912,23 +1912,29 @@ def _build_turn_halt_exit_result(
     )
 
 
-_TIMEOUT_REPLY_DEFAULT = "I ran out of time processing your request. Here's what I have so far."
+_TIMEOUT_REPLY_DEFAULT = (
+    "I ran out of time processing your request, and I don't have a draft workflow to hand over. "
+    "Tell me what to focus on and I'll try again."
+)
 _TIMEOUT_REPLY_UNVALIDATED = (
-    "I ran out of time before I could finish testing. I have a draft workflow you can keep — "
+    "I ran out of time. I have a draft workflow you can keep — "
     "accept it to save (note: it hasn't been verified end-to-end), or discard."
 )
 _TIMEOUT_REPLY_TESTED = "I ran out of time, but I have a tested draft for you. Accept it to save, or discard."
 
-_MAX_TURNS_REPLY_DEFAULT = "I've reached the maximum number of steps. Here's what I have so far."
+_MAX_TURNS_REPLY_DEFAULT = (
+    "I've reached the maximum number of steps, and I don't have a draft workflow to hand over. "
+    "Tell me what to focus on and I'll try again."
+)
 _MAX_TURNS_REPLY_UNVALIDATED = (
-    "I've reached the maximum number of steps before I could finish testing. I have a draft "
+    "I've reached the maximum number of steps. I have a draft "
     "workflow you can keep — accept it to save (note: it hasn't been verified end-to-end), or discard."
 )
 _MAX_TURNS_REPLY_TESTED = (
     "I've reached the maximum number of steps, but I have a tested draft for you. Accept it to save, or discard."
 )
 _UNEXPECTED_ERROR_REPLY_UNVALIDATED = (
-    "I hit an unexpected issue before I could finish testing. I have a draft workflow you can keep — "
+    "I hit an unexpected issue. I have a draft workflow you can keep — "
     "accept it to save (note: it hasn't been verified end-to-end), or discard."
 )
 _UNEXPECTED_ERROR_REPLY_TESTED = (
@@ -2465,7 +2471,7 @@ def _build_wip_exit_result(
     cancelled: bool = False,
     terminal_reason: str | None = None,
 ) -> AgentResult:
-    """Selected non-success exits surface the most recent successfully parsed workflow."""
+    """Non-success exits surface the most recent successfully parsed workflow."""
     internal_tool_instruction_failure = _recorded_failure_is_internal_tool_instruction(ctx)
     halted_mid_progress = _halted_mid_progress(ctx, internal_tool_instruction_failure)
     recorded_failure_reply = _recorded_failure_reply(
@@ -2572,13 +2578,10 @@ def _build_wip_exit_result(
             ),
             exit_site="wip_last_good_workflow",
         )
-    if (
-        ctx.last_workflow is not None
-        and ctx.last_workflow_yaml
-        and (ctx.last_test_ok is not False or halted_mid_progress)
-        and not ctx.last_test_suspicious_success
-    ):
-        full_test_ok = ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True
+    if ctx.last_workflow is not None and ctx.last_workflow_yaml:
+        full_test_ok = (
+            ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True and not ctx.last_test_suspicious_success
+        )
         unvalidated = not full_test_ok
         if unvalidated and recorded_failure_reply:
             reply = _deadline_owned_or(unvalidated_reply, recorded_failure_reply) or unvalidated_reply
@@ -2616,13 +2619,16 @@ def _build_wip_exit_result(
             ),
             exit_site="wip_last_workflow",
         )
+    # This branch carries no draft and its reply says so, so it must not report a
+    # disposition auto-accept can act on -- that would commit a staged workflow to
+    # canonical on the same turn the user is told there is nothing to hand over.
     return _build_exit_result(
         ctx,
         _deadline_owned_or(default_reply, recorded_failure_reply) or default_reply,
         global_llm_context,
         cancelled=cancelled,
         terminal_reason=effective_terminal,
-        proposal_disposition="auto_applicable",
+        proposal_disposition="no_proposal",
     )
 
 

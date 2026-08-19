@@ -292,7 +292,8 @@ ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE
 Rules:
 - Browser/page/session durable steps must be focused `code` blocks.
 - Allowed non-browser helper blocks remain available: `conditional`, `for_loop`,
-  `while_loop`, `send_email`, S3/Google Sheets helpers, file parsers, and triggers.
+  `while_loop`, `send_email`, `human_interaction`, S3/Google Sheets helpers, file
+  parsers, and triggers.
 - {_code_only_browser_validation_guidance()}
 
 {pending}

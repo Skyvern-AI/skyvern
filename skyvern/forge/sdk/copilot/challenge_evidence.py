@@ -215,7 +215,7 @@ def composition_challenge_carrier(evidence: Mapping[str, Any] | None) -> Challen
     if stamped in CARRIER_CHALLENGE_EVIDENCE_SOURCES:
         return stamped
     # gates_submit_controls is only ever derived from rendered controls or a
-    # vision confirmation, so it carries the same weight as either.
+    # structurally corroborated vision confirmation, so it carries the same weight as either.
     if (
         challenge_state.get("requires_human_verification") is True
         or challenge_state.get("gates_submit_controls") is True

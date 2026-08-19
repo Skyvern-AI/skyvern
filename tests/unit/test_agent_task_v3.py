@@ -24,6 +24,7 @@ from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.block import (
@@ -739,11 +740,13 @@ async def test_execute_step_v3_standalone_flushes_llm_artifacts(cancelled: bool)
         with (
             patch("skyvern.forge.agent.app") as mock_app,
             patch("skyvern.forge.sdk.artifact.manager.app", mock_app),
+            patch("skyvern.forge.sdk.experimentation.workflow_block_engine.app") as mock_wbe_app,
         ):
             mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=None)
             mock_app.DATABASE.tasks.update_task = AsyncMock(return_value=task)
             mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
             mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+            mock_wbe_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
             mock_app.ARTIFACT_MANAGER = manager
             mock_app.STORAGE = storage
             mock_app.DATABASE.artifacts = database.artifacts
@@ -862,6 +865,7 @@ async def _run_execute_step_gate(
     *,
     engine: agent_module.RunEngine,
     task_block: BaseTaskBlock | None,
+    experimentation_provider: BaseExperimentationProvider | None = None,
     **task_overrides: Any,
 ) -> tuple[AsyncMock, AsyncMock]:
     """Drive ForgeAgent.execute_step through the v3 dispatch gate.
@@ -886,11 +890,20 @@ async def _run_execute_step_gate(
     context = SkyvernContext(task_id=task.task_id, step_id=step.step_id, organization_id=task.organization_id)
     skyvern_context.set(context)
     try:
-        with patch("skyvern.forge.agent.app") as mock_app:
+        with (
+            patch("skyvern.forge.agent.app") as mock_app,
+            patch("skyvern.forge.sdk.experimentation.workflow_block_engine.app") as mock_wbe_app,
+        ):
             mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=None)
             mock_app.DATABASE.tasks.update_task = AsyncMock()
+            mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=None)
             mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
-            mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+            if experimentation_provider is not None:
+                mock_app.EXPERIMENTATION_PROVIDER = experimentation_provider
+                mock_wbe_app.EXPERIMENTATION_PROVIDER = experimentation_provider
+            else:
+                mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+                mock_wbe_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
             mock_app.ARTIFACT_MANAGER.flush_step_archive = AsyncMock()
             try:
                 await agent.execute_step(

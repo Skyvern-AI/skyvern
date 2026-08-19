@@ -8,8 +8,28 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
+from skyvern.forge.sdk.copilot.session_factory import (
+    copilot_call_model_input_filter,
+    make_copilot_call_model_input_filter,
+)
 from tests.unit.copilot_test_helpers import make_model_input_data as _mk_input_data
+
+
+def _image_parts(item: Any) -> list[Any]:
+    content = item.get("content") if isinstance(item, dict) else None
+    if not isinstance(content, list):
+        return []
+    return [part for part in content if part.get("type") == "input_image"]
+
+
+def _ctx_with_staged_frame(*, supports_vision: bool = True) -> SimpleNamespace:
+    return SimpleNamespace(
+        pending_screenshots=[ScreenshotEntry(b64="dGVzdA==", mime="image/jpeg")],
+        supports_vision=supports_vision,
+    )
 
 
 class TestFirstTurnCompaction:
@@ -261,3 +281,61 @@ def test_model_input_pipeline_has_no_generated_offer_special_case() -> None:
     from skyvern.forge.sdk.copilot import enforcement
 
     assert not hasattr(enforcement, "collapse_superseded_synthesized_offers")
+
+
+class TestStagedScreenshotBinding:
+    """A frame a tool captured mid-run must reach the acting model on the same turn."""
+
+    def test_staged_frame_rides_as_the_last_item(self) -> None:
+        ctx = _ctx_with_staged_frame()
+        items = [{"role": "user", "content": "clear the modal on this page"}]
+
+        with capture_logs() as logs:
+            result = copilot_call_model_input_filter(_mk_input_data(items, context=ctx))
+
+        assert [len(_image_parts(item)) for item in result.input] == [0, 1]
+        assert any(log["event"] == "Injecting screenshot user message" for log in logs)
+
+    def test_a_second_pass_over_the_same_context_still_carries_the_frame(self) -> None:
+        ctx = _ctx_with_staged_frame()
+        items = [{"role": "user", "content": "clear the modal on this page"}]
+
+        first = copilot_call_model_input_filter(_mk_input_data(items, context=ctx))
+        second = copilot_call_model_input_filter(_mk_input_data(items, context=ctx))
+
+        assert len(_image_parts(first.input[-1])) == 1
+        assert len(_image_parts(second.input[-1])) == 1
+        assert len(ctx.pending_screenshots) == 1
+
+    def test_a_non_vision_fallback_model_gets_no_image(self) -> None:
+        # The frame was staged while the primary was still vision-capable; a retriable failure
+        # can swap in a fallback that cannot accept images.
+        ctx = _ctx_with_staged_frame(supports_vision=False)
+        items = [{"role": "user", "content": "clear the modal on this page"}]
+
+        result = copilot_call_model_input_filter(_mk_input_data(items, context=ctx))
+
+        assert not any(_image_parts(item) for item in result.input)
+        assert len(ctx.pending_screenshots) == 1
+
+    def test_call_with_nothing_staged_carries_no_image(self) -> None:
+        ctx = SimpleNamespace(pending_screenshots=[])
+        items = [{"role": "user", "content": "clear the modal on this page"}]
+
+        with capture_logs() as logs:
+            result = copilot_call_model_input_filter(_mk_input_data(items, context=ctx))
+
+        assert result.input == items
+        assert not any(_image_parts(item) for item in result.input)
+        assert not any(log["event"] == "Injecting screenshot user message" for log in logs)
+
+    def test_aggressive_prune_drops_the_bound_frame_like_any_other_screenshot(self) -> None:
+        ctx = _ctx_with_staged_frame()
+        items: list[dict[str, Any]] = [{"role": "user", "content": "build me a workflow"}]
+        for i in range(12):
+            items.append({"type": "function_call", "call_id": f"call-{i}", "name": "observe", "arguments": "{}"})
+            items.append({"type": "function_call_output", "call_id": f"call-{i}", "output": "y" * 4000})
+
+        result = make_copilot_call_model_input_filter(1)(_mk_input_data(items, context=ctx))
+
+        assert not any(_image_parts(item) for item in result.input)

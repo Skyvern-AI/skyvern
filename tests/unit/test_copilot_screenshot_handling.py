@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import base64
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+from skyvern.forge.sdk.copilot.enforcement import _consume_pending_screenshots
+from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
+from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+from tests.unit.copilot_test_helpers import make_model_input_data
 
 
 def _install_mock_database(monkeypatch: pytest.MonkeyPatch, mock_db: Any) -> None:
@@ -168,6 +174,36 @@ class TestConsumePendingScreenshots:
 
         ctx = MagicMock(spec=[])
         assert _consume_pending_screenshots(ctx) is None
+
+
+class TestNudgeDrainAndFilterExclusivity:
+    def test_nudge_delivery_binds_the_frame_and_the_next_filter_pass_adds_nothing(self) -> None:
+        ctx = SimpleNamespace(
+            pending_screenshots=[ScreenshotEntry(b64="dGVzdA==", mime="image/jpeg")],
+            supports_vision=True,
+        )
+
+        nudge_msg = _consume_pending_screenshots(ctx)
+
+        assert nudge_msg is not None
+        assert [part["type"] for part in nudge_msg["content"]] == ["input_text", "input_image"]
+        assert ctx.pending_screenshots == []
+
+        items = [{"role": "user", "content": "clear the modal on this page"}]
+        result = copilot_call_model_input_filter(make_model_input_data(items, context=ctx))
+
+        assert result.input == items
+
+    def test_the_nudge_path_also_withholds_the_frame_from_a_non_vision_model(self) -> None:
+        # The vision check lives in the shared builder so every delivery path inherits it;
+        # the drain still empties the queue.
+        ctx = SimpleNamespace(
+            pending_screenshots=[ScreenshotEntry(b64="dGVzdA==", mime="image/jpeg")],
+            supports_vision=False,
+        )
+
+        assert _consume_pending_screenshots(ctx) is None
+        assert ctx.pending_screenshots == []
 
 
 class TestExtractScreenshotB64:

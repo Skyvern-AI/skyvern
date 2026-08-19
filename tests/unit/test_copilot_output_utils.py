@@ -916,6 +916,14 @@ class TestUserFacingSuccess:
         result = {"ok": False, "error": signal.agent_steering_text}
         assert user_facing_success(result, blocker_signal=signal) is True
 
+    def test_true_for_paused_run(self) -> None:
+        result = {"ok": False, "data": {"control_signal": {"kind": "watchdog_paused"}}}
+        assert user_facing_success(result) is True
+
+    def test_false_for_other_watchdog_exits(self) -> None:
+        result = {"ok": False, "data": {"control_signal": {"kind": "watchdog_ceiling"}}}
+        assert user_facing_success(result) is False
+
     def test_false_for_genuine_tool_error(self) -> None:
         """Regression guard: real tool errors keep failure affect."""
         blocker_kind = "tool_error"

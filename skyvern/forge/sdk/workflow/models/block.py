@@ -140,6 +140,7 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_action_id
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
+from skyvern.forge.sdk.experimentation.workflow_block_engine import workflow_block_engine_override
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
@@ -1148,7 +1149,7 @@ class Block(BaseModel, abc.ABC):
         engine: RunEngine | None = None
         try:
             if isinstance(self, BaseTaskBlock):
-                engine = self.engine
+                engine = self.resolve_engine(workflow_run_id)
 
             workflow_run_block = await app.DATABASE.observer.create_workflow_run_block(
                 workflow_run_id=workflow_run_id,
@@ -1303,6 +1304,31 @@ class BaseTaskBlock(Block):
     include_action_history_in_verification: bool = False
     download_timeout: float | None = None  # minutes
     include_extracted_text: bool = True
+    # Blocks built at runtime for internal machinery (loop-value and branch-condition extraction)
+    # are not part of the workflow definition, so the run-level engine A/B never saw them and must
+    # not reroute them. Private so an internal experiment toggle stays out of the published block
+    # schemas and out of stored workflow definitions.
+    _exclude_from_engine_ab: bool = PrivateAttr(default=False)
+
+    def resolve_engine(self, workflow_run_id: str | None) -> RunEngine:
+        """The engine this block dispatches to, after the per-run A/B.
+
+        Both the persisted workflow_run_blocks.engine and the execute_step dispatch read this, so
+        the recorded engine cannot disagree with the one that ran. A block pinned to a non-default
+        engine is honored as-authored, and a block the eligibility check never saw is left alone;
+        neither is ever rerouted.
+        """
+        if (
+            self.engine != RunEngine.skyvern_v1
+            or self._exclude_from_engine_ab
+            # Mirrors run_is_eligible_for_v3_ab: a block eligibility skipped as engine-inert must
+            # not be labeled v3 here either, or its row claims an engine that never ran. It does not
+            # re-check _task_block_supports_v3 because run-level eligibility already rejected the
+            # whole run if any block failed it; loosening that predicate means revisiting this.
+            or self.block_type in _ENGINE_INERT_BLOCK_TYPES
+        ):
+            return self.engine
+        return workflow_block_engine_override(workflow_run_id) or self.engine
 
     def get_all_parameters(
         self,
@@ -1786,7 +1812,7 @@ class BaseTaskBlock(Block):
                     browser_session_id=browser_session_id,
                     close_browser_on_completion=close_browser_on_completion,
                     complete_verification=self.complete_verification,
-                    engine=self.engine,
+                    engine=self.resolve_engine(workflow_run.workflow_run_id),
                 )
             except Exception as e:
                 # Make sure the task is marked as failed in the database before raising the exception
@@ -2563,12 +2589,14 @@ class ForLoopBlock(Block):
             description="Natural language extraction result",
         )
 
-        return ExtractionBlock(
+        extraction_block = ExtractionBlock(
             label=f"natural_lang_extraction_{generate_random_string()}",
             data_extraction_goal=extraction_goal,
             data_schema=data_schema,
             output_parameter=output_param,
         )
+        extraction_block._exclude_from_engine_ab = True
+        return extraction_block
 
     def _build_loop_graph(
         self,
@@ -4624,13 +4652,14 @@ async def _code_block_click_and_claim_download_builtin(
     except CodeBlockDownloadClaimError:
         raise
     except Exception as exc:
+        # Whether a monitor owned the binding is the first question asked of a claim that saw no
+        # event, and it is unanswerable after the fact.
+        claim_monitor_owns_binding = _download_monitor_owns_binding(page)
         LOG.info(
             "codeblock.download_claim_decision",
             engaged=False,
             binding=download_binding.value,
-            # Recorded on the failure path too: whether a monitor owned the binding is the first
-            # question asked of a claim that saw no event, and it is unanswerable after the fact.
-            monitor_owns_binding=_download_monitor_owns_binding(page),
+            monitor_owns_binding=claim_monitor_owns_binding,
             clicked=click_error is None,
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
@@ -4639,11 +4668,12 @@ async def _code_block_click_and_claim_download_builtin(
             # A selector that no longer matches is a page failure, not a download that failed to
             # fire. Re-raise Playwright's own error so the healing path still recognises its type.
             raise click_error
-        if download_binding is DownloadBinding.SESSION_DIR:
-            # The click landed and this binding's delivery is the session watcher's and the
-            # finalization claim's to prove, not this page's to witness. Failing here would fail a
-            # download that succeeded; the execution layer still reports an unregistered intent when
-            # nothing arrives.
+        if download_binding is DownloadBinding.SESSION_DIR or claim_monitor_owns_binding:
+            # The click landed, and this binding's delivery belongs to the session watcher or to the
+            # monitor -- which denies browser-native downloads and fetches the bytes itself, so no
+            # Download event need ever reach this page. Failing here would fail a download that
+            # succeeded; the execution layer still reports an unregistered intent when nothing
+            # arrives.
             return _DOWNLOAD_CLAIM_FALLBACK_STEM
         raise CodeBlockDownloadClaimError("Clicking the affordance did not fire a browser download.") from exc
 
@@ -5075,9 +5105,10 @@ async def wrapper({default_args}):
         run_id: str,
         session_bound: bool,
     ) -> None:
-        """Tag this run's session-keyed DOWNLOAD artifacts so a run-scoped read can see them.
-        The watcher writes them with ``run_id`` NULL because it cannot know which run is active, and
-        the window is this block's own row so a co-tenant run's earlier downloads stay unclaimed."""
+        """Reconcile this run's session-keyed DOWNLOAD artifacts so a run-scoped read can see them.
+        The watcher binds the producing run when it observes a download; this picks up rows an older
+        watcher left unbound, windowed on this block's own row so a co-tenant run's earlier downloads
+        stay unclaimed."""
         context = skyvern_context.current()
         browser_session_id = context.browser_session_id if context else None
         if not session_bound:
@@ -14106,6 +14137,7 @@ async def _evaluate_prompt_branch_conditions_batch(
             data_schema=data_schema,
             output_parameter=output_param,
         )
+        extraction_block._exclude_from_engine_ab = True
 
         LOG.info(
             "Conditional branch ExtractionBlock created (batched)",
@@ -15036,6 +15068,78 @@ class WorkflowTriggerBlock(Block):
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
         )
+
+
+_TASK_V3_SUPPORTED_BLOCK_TYPES = frozenset(
+    {
+        BlockType.TASK,
+        BlockType.NAVIGATION,
+        BlockType.LOGIN,
+        BlockType.ACTION,
+        BlockType.VALIDATION,
+        BlockType.EXTRACTION,
+    }
+)
+
+
+# Task blocks whose engine field never reaches a dispatch decision: a GOTO_URL block's task has no
+# goal or criterion, so execute_step completes it before the v3 gate, and HumanInteractionBlock
+# overrides execute and never calls execute_step at all. They neither qualify nor disqualify a run.
+_ENGINE_INERT_BLOCK_TYPES = frozenset({BlockType.GOTO_URL, BlockType.HUMAN_INTERACTION})
+
+
+def _task_block_supports_v3(task_block: BaseTaskBlock) -> bool:
+    """Whether a workflow task block is eligible to dispatch to the Task V3 native engine.
+
+    v3 doesn't implement download-completion semantics yet, so a block relying on them
+    (complete_on_download / download_suffix / download_timeout) stays on the step engine.
+    """
+    if task_block.block_type not in _TASK_V3_SUPPORTED_BLOCK_TYPES:
+        return False
+    if task_block.complete_on_download or task_block.download_suffix or task_block.download_timeout is not None:
+        return False
+    return True
+
+
+def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool) -> bool:
+    """Whether a whole workflow run may be rerouted onto v3 by the A/B.
+
+    Eligibility is a property of the RUN, not of a block: a run whose blocks disagreed about the
+    engine would drive one browser session with two engines, so no per-run outcome would be
+    attributable to either arm. One participating block v3 cannot execute therefore disqualifies
+    the run, and so does one block pinned to a non-default engine -- that block is honored
+    as-authored in both arms, but it would leave the control arm mixed.
+
+    ``blocks`` must be the flattened definition (``get_all_blocks``), i.e. the superset of task
+    blocks the run could reach. A ``block_labels`` re-run executes only a whitelisted subset of
+    that definition but is still judged against all of it, so one ineligible block elsewhere in the
+    workflow keeps the re-run on control. That is deliberate: scoping eligibility to the subset
+    would have to reproduce exactly which blocks the whitelist reaches, and getting it wrong is the
+    mixed-arm run this predicate exists to prevent -- and a partial re-run is not comparable to a
+    full run in the cohort anyway.
+
+    Script runs are excluded: their blocks execute as cached code and never reach engine dispatch,
+    so treatment would land only on the ai_fallback subset -- the blocks that already failed cached
+    execution.
+    """
+    if is_script_run:
+        return False
+    reroutable_blocks = 0
+    for block in blocks:
+        if not isinstance(block, BaseTaskBlock):
+            continue
+        if block.block_type in _ENGINE_INERT_BLOCK_TYPES:
+            continue
+        if block.engine != RunEngine.skyvern_v1:
+            return False
+        if not _task_block_supports_v3(block):
+            return False
+        if block.totp_verification_url:
+            return False
+        reroutable_blocks += 1
+    # A run with nothing to reroute would be bucketed and recorded as an exposure while both arms
+    # execute identically, diluting the experiment.
+    return reroutable_blocks > 0
 
 
 def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:

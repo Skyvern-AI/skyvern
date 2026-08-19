@@ -1,5 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import { WorkflowRunStatusApiResponse } from "@/api/types";
+import { Status, WorkflowRunStatusApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useFirstParam } from "@/hooks/useFirstParam";
 import {
@@ -14,6 +14,27 @@ import {
   getOrgScopedQueryKey,
   useActiveOrgId,
 } from "@/store/ActiveOrgContext";
+
+const RUN_STATUS_POLL_INTERVAL_MS = 5000;
+
+// Data from before a failed refetch is retained, so a run whose workflow stops
+// resolving mid-run would keep a non-finalized stale payload and poll its error
+// every 5s forever; the error state has to stop the poll first.
+function getRunStatusRefetchInterval(state: {
+  status: "pending" | "error" | "success";
+  data?: { status: Status };
+}): number | false {
+  if (state.status === "error") {
+    return false;
+  }
+  if (!state.data) {
+    return false;
+  }
+  if (statusIsNotFinalized(state.data)) {
+    return RUN_STATUS_POLL_INTERVAL_MS;
+  }
+  return false;
+}
 
 function useWorkflowRunQuery(options?: {
   workflowRunId?: string;
@@ -48,15 +69,7 @@ function useWorkflowRunQuery(options?: {
         })
         .then((response) => response.data);
     },
-    refetchInterval: (query) => {
-      if (!query.state.data) {
-        return false;
-      }
-      if (statusIsNotFinalized(query.state.data)) {
-        return 5000;
-      }
-      return false;
-    },
+    refetchInterval: (query) => getRunStatusRefetchInterval(query.state),
     // required for OS-level notifications to work (workflow run completion)
     refetchIntervalInBackground: true,
     placeholderData: keepPreviousData,
@@ -80,4 +93,8 @@ function useWorkflowRunQuery(options?: {
   });
 }
 
-export { useWorkflowRunQuery };
+export {
+  getRunStatusRefetchInterval,
+  RUN_STATUS_POLL_INTERVAL_MS,
+  useWorkflowRunQuery,
+};

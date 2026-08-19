@@ -46,9 +46,9 @@ def create_aes_encryptor(
             "secret; empty values and the default placeholder 'fillmein' both fail closed."
         )
     fallback_parameters = list(fallback_decrypt_keys or ())
-    # Legacy ciphertext has no version marker. Always retry the pre-SHA-normalization
-    # parameters on decrypt, including explicit deployment salt/IV settings.
-    fallback_parameters.insert(0, (salt, iv))
+    if not (salt and iv):
+        # Legacy ciphertext has no version marker, so retry the pre-derivation parameters on decrypt.
+        fallback_parameters.insert(0, (salt, iv))
     return AES(
         secret_key=secret_key,
         salt=salt or _derive_from_secret_key(secret_key, _SALT_DERIVATION_LABEL),

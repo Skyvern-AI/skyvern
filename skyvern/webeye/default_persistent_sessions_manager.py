@@ -15,6 +15,8 @@ from skyvern.cli.core.session_manager import active_copilot_session_ids
 from skyvern.config import settings
 from skyvern.exceptions import BrowserSessionClosed, BrowserSessionNotRenewable, MissingBrowserAddressError
 from skyvern.forge import app
+from skyvern.forge.sdk.api.files import resolve_run_download_id
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.polls import wait_on_persistent_browser_address
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
@@ -257,6 +259,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             runnable_id=runnable_id,
             organization_id=organization_id,
             runnable_generation_id=runnable_generation_id,
+            download_run_id=resolve_run_download_id(skyvern_context.current(), fallback_run_id=runnable_id),
         )
 
         LOG.info("Browser session begin", browser_session_id=browser_session_id)
@@ -420,6 +423,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             inherit_profile_proxy=inherit_profile_proxy,
             bound_workflow_permanent_id=bound_workflow_permanent_id,
             bound_key=bound_key,
+            download_run_id=resolve_run_download_id(skyvern_context.current(), fallback_run_id=runnable_id),
         )
 
         # Launch the browser immediately for standalone sessions so the
@@ -523,6 +527,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         organization_id: str,
         *,
         runnable_generation_id: str | None = None,
+        download_run_id: str | None = None,
     ) -> None:
         """Occupy a specific browser session."""
         await self.database.browser_sessions.occupy_persistent_browser_session(
@@ -531,6 +536,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             runnable_id=runnable_id,
             organization_id=organization_id,
             runnable_generation_id=runnable_generation_id,
+            download_run_id=download_run_id,
         )
 
     async def renew_or_close_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession:

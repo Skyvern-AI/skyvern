@@ -359,7 +359,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
             if selector is None:
                 raise
             LOG.warning(
-                f"Failed to do ai click. Falling back to original selector={selector}, intention={intention}, data={data}",
+                "AI click failed unexpectedly; falling back to original selector",
+                selector=selector,
                 exc_info=True,
             )
 
@@ -720,13 +721,17 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     if not action.option:
                         raise ValueError("SelectOptionAction requires an 'option' field")
                     option_value = action.option.value or action.option.label or ""
-                    await handle_select_option_action(
+                    result = await handle_select_option_action(
                         action=action,
                         page=self.page,
                         scraped_page=self.scraped_page,
                         task=task,
                         step=step,
                     )
+                    if result and result[-1].success is False:
+                        raise SkyvernActionFailed(
+                            result[-1].exception_message or "Select option action returned success=False"
+                        )
                     return option_value
                 except Exception:
                     # Nothing has been selected at this point, so returning option_value here would

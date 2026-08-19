@@ -131,6 +131,7 @@ from skyvern.forge.sdk.experimentation.transient_ui_capture import (
     resolve_transient_ui_capture_arm,
     transient_ui_capture_arm,
 )
+from skyvern.forge.sdk.experimentation.workflow_block_engine import task_v3_disabled
 from skyvern.forge.sdk.fail_fast.shadow import record_fail_fast_shadow
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
@@ -147,6 +148,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     CodeBlock,
     FileDownloadBlock,
     ValidationBlock,
+    _task_block_supports_v3,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.validation_evidence_router import (
@@ -156,7 +158,6 @@ from skyvern.forge.validation_evidence_router import (
 )
 from skyvern.schemas.runs import CUA_ENGINES, RunEngine
 from skyvern.schemas.steps import AgentStepOutput
-from skyvern.schemas.workflows import BlockType
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
@@ -595,31 +596,6 @@ async def _resolve_task_v3_llm_key(task: Task) -> str:
         return task.llm_key
     override = await _read_task_v3_llm_name_override(task.task_id, task.organization_id)
     return override or settings.TASK_V3_LLM_KEY or settings.LLM_KEY
-
-
-_TASK_V3_SUPPORTED_BLOCK_TYPES = frozenset(
-    {
-        BlockType.TASK,
-        BlockType.NAVIGATION,
-        BlockType.LOGIN,
-        BlockType.ACTION,
-        BlockType.VALIDATION,
-        BlockType.EXTRACTION,
-    }
-)
-
-
-def _task_block_supports_v3(task_block: BaseTaskBlock) -> bool:
-    """Whether a workflow task block is eligible to dispatch to the Task V3 native engine.
-
-    v3 doesn't implement download-completion semantics yet, so a block relying on them
-    (complete_on_download / download_suffix / download_timeout) stays on the step engine.
-    """
-    if task_block.block_type not in _TASK_V3_SUPPORTED_BLOCK_TYPES:
-        return False
-    if task_block.complete_on_download or task_block.download_suffix or task_block.download_timeout is not None:
-        return False
-    return True
 
 
 def _redact_extracted_information(value: Any, secret_values: set[str]) -> Any:
@@ -1724,11 +1700,7 @@ class ForgeAgent:
                 # v3 now resolves TOTP via get_verification_code; only a totp_verification_url task
                 # (needs step-engine webhook delivery) stays excluded on that axis.
                 and not task.totp_verification_url
-                and not await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                    "DISABLE_TASK_V3",
-                    task.workflow_run_id or task.task_id,
-                    properties={"organization_id": task.organization_id},
-                )
+                and not await task_v3_disabled(task.workflow_run_id or task.task_id, task.organization_id)
             ):
                 try:
                     step, task = await self._execute_task_v3(
@@ -5802,10 +5774,8 @@ class ForgeAgent:
                             )
                             artifact_outcome = "partial"
                             artifact_error = "storage_partial"
-                        # Tag any session-scoped DOWNLOAD artifacts created during
-                        # this run with run_id, so GET /v1/runs/{id} surfaces them
-                        # (the watcher in browser_controller can't know the active
-                        # run at upload time — see
+                        # Reconcile session-scoped DOWNLOAD rows the watcher left unbound, so
+                        # GET /v1/runs/{id} surfaces them (see
                         # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md).
                         browser_session_id = context.browser_session_id if context else None
                         if browser_session_id and task.organization_id and finalization_run_id:
@@ -5971,7 +5941,6 @@ class ForgeAgent:
                 "Sending task response to webhook callback url",
                 task_id=task.task_id,
                 webhook_callback_url=task.webhook_callback_url,
-                payload=signed_data.payload_for_log,
                 headers=signed_data.headers,
             )
 
@@ -6023,7 +5992,6 @@ class ForgeAgent:
                 LOG.info(
                     "Webhook failed",
                     task_id=task.task_id,
-                    resp=resp,
                     resp_code=resp.status_code,
                     resp_text=resp.text,
                 )

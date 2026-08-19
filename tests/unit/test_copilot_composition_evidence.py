@@ -16,6 +16,7 @@ import yaml
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.challenge_evidence import (
+    CHALLENGE_EVIDENCE_SOURCE_KEY,
     CHALLENGE_KIND_KEY,
     ChallengeEvidenceSource,
     ChallengeKind,
@@ -4517,3 +4518,242 @@ def test_selector_candidate_source_vocabulary_matches_the_page_side_ladder() -> 
     # Drift detection, not enforcement: an emitted rung the parser cannot rank still reaches the model,
     # but the two lists diverging means someone added a rung and left it unrankable.
     assert emitted == set(_SELECTOR_CANDIDATE_SOURCES) - {_UNKNOWN_SELECTOR_SOURCE}
+
+
+_VISION_CHALLENGE_SUMMARY = {
+    "summary": "A centered Two-Factor Authentication card requests an authenticator token; a Login button is shown.",
+    "challenge_detected": True,
+    "challenge_kind": "other",
+    "challenge_location": "Centered page card",
+    "submit_blocked": True,
+    "blocked_submit_controls": ["Login button requires successful two-factor authentication"],
+}
+
+_SATISFIABLE_TOTP_HTML = (
+    "<html><head><title>Two-Factor Authentication</title></head><body>"
+    "<p>Complete the challenge to continue.</p>"
+    "<form><label for='token'>Authenticator token</label>"
+    "<input id='token' name='token' type='text' placeholder='123456' />"
+    "<button type='submit' class='btn--login'>Login</button></form></body></html>"
+)
+_CAPTCHA_HTML = (
+    "<html><head><title>Security Verification</title></head><body>"
+    "<form><input id='lastName' name='lastName' type='text' />"
+    "<div class='captcha-box'><p id='captchaInstruction'>Enter all the digits from 'c7MDRxt'</p>"
+    "<input id='captchaAnswer' name='captchaAnswer' type='text' /></div>"
+    "<button type='submit'>Search</button></form></body></html>"
+)
+_ACCESS_DENIED_HTML = (
+    "<html><head><title>Access Denied</title></head><body>"
+    "<h1>Access denied</h1><p>You do not have permission to view this page.</p></body></html>"
+)
+_DEVICE_APPROVAL_HTML = (
+    "<html><head><title>Approve this sign-in</title></head><body>"
+    "<p>Open your authenticator app and approve this sign-in to complete verification.</p>"
+    "<form><button type='submit'>Resend request</button></form></body></html>"
+)
+_CANCEL_ONLY_HTML = (
+    "<html><head><title>Verification required</title></head><body>"
+    "<p>Complete the challenge to continue.</p>"
+    "<form><input id='token' name='token' type='text' />"
+    "<button type='button'>Cancel</button><button type='reset'>Clear</button></form></body></html>"
+)
+
+_STRUCTURED_TOTP_EVIDENCE: dict[str, Any] = {
+    "current_url": "https://example.test/login",
+    "page_title": "Two-Factor Authentication",
+    "anti_bot_indicators": ["captcha", "challenge"],
+    "challenge_controls": [],
+    "visual_obstruction_candidates": [],
+    "modal_overlays": [],
+    "page_obstructions": [],
+    "navigation_targets": [],
+    "result_containers": [],
+    "forms": [
+        {
+            "id": "",
+            "fields": [
+                {
+                    "name": "token",
+                    "id": "token",
+                    "label": "Authenticator token",
+                    "type": "text",
+                    "disabled": False,
+                    "visible": True,
+                    "selector": "#token",
+                }
+            ],
+            "submit_controls": [
+                {
+                    "text": "Login",
+                    "type": "submit",
+                    "disabled": False,
+                    "visible": True,
+                    "selector": "button.btn--login",
+                }
+            ],
+        }
+    ],
+    "challenge_state": {
+        "detected": True,
+        "kind": "captcha",
+        "source": "dom_html",
+        "indicators": ["captcha", "challenge"],
+        "requires_human_verification": False,
+        "visual_location": "",
+        "gates_submit_controls": False,
+        "gated_submit_controls": [],
+    },
+}
+
+
+def _merged_from_html(html: str, **evidence_overrides: Any) -> dict[str, Any]:
+    parsed = parse_composition_html(
+        html,
+        inspected_url="https://example.test/login",
+        current_url="https://example.test/login",
+    )
+    parsed.update(evidence_overrides)
+    return merge_visual_composition_evidence(parsed, visual_summary=dict(_VISION_CHALLENGE_SUMMARY))
+
+
+@pytest.mark.parametrize(
+    ("case", "merged", "expected_promotion"),
+    [
+        ("satisfiable_totp_form", _merged_from_html(_SATISFIABLE_TOTP_HTML), False),
+        (
+            "satisfiable_totp_form_structured_capture",
+            merge_visual_composition_evidence(
+                dict(_STRUCTURED_TOTP_EVIDENCE), visual_summary=dict(_VISION_CHALLENGE_SUMMARY)
+            ),
+            False,
+        ),
+        ("captcha_with_rendered_control", _merged_from_html(_CAPTCHA_HTML), True),
+        ("access_denied_no_form", _merged_from_html(_ACCESS_DENIED_HTML), True),
+        ("device_approval_no_entry_field", _merged_from_html(_DEVICE_APPROVAL_HTML), True),
+        ("cancel_and_reset_controls_only", _merged_from_html(_CANCEL_ONLY_HTML), True),
+        (
+            "visual_obstruction_over_enabled_form",
+            _merged_from_html(
+                _SATISFIABLE_TOTP_HTML,
+                visual_obstruction_candidates=[{"tag": "canvas", "selector": "canvas#widget"}],
+            ),
+            True,
+        ),
+    ],
+)
+def test_vision_challenge_promotion_requires_structural_corroboration(
+    case: str, merged: dict[str, Any], expected_promotion: bool
+) -> None:
+    del case
+    challenge_state = merged["challenge_state"]
+
+    assert challenge_state["requires_human_verification"] is expected_promotion
+    assert challenge_state["gates_submit_controls"] is expected_promotion
+    assert bool(challenge_state["gated_submit_controls"]) is expected_promotion
+    assert (composition_challenge_carrier(merged) is not None) is expected_promotion
+
+
+def test_vision_challenge_without_a_submit_claim_is_not_refuted_by_form_shape() -> None:
+    occlusion_only = {
+        key: value
+        for key, value in _VISION_CHALLENGE_SUMMARY.items()
+        if key not in {"submit_blocked", "blocked_submit_controls"}
+    }
+    merged = merge_visual_composition_evidence(
+        parse_composition_html(
+            _SATISFIABLE_TOTP_HTML,
+            inspected_url="https://example.test/login",
+            current_url="https://example.test/login",
+        ),
+        visual_summary=occlusion_only,
+    )
+
+    assert merged["challenge_state"]["requires_human_verification"] is True
+    assert composition_challenge_carrier(merged) is ChallengeEvidenceSource.VISION
+
+
+def test_named_blocked_control_carries_the_gating_claim_without_the_boolean() -> None:
+    named_only = {key: value for key, value in _VISION_CHALLENGE_SUMMARY.items() if key != "submit_blocked"}
+    merged = merge_visual_composition_evidence(
+        parse_composition_html(
+            _SATISFIABLE_TOTP_HTML,
+            inspected_url="https://example.test/login",
+            current_url="https://example.test/login",
+        ),
+        visual_summary=named_only,
+    )
+
+    assert merged["challenge_state"].get("requires_human_verification") is not True
+    assert composition_challenge_carrier(merged) is None
+
+
+def test_a_disabled_submit_in_the_same_form_corroborates_the_gating_claim() -> None:
+    page_with_disabled_submit = _SATISFIABLE_TOTP_HTML.replace(
+        "</form>",
+        "<button type='submit' disabled>Verify</button></form>",
+    )
+    merged = merge_visual_composition_evidence(
+        parse_composition_html(
+            page_with_disabled_submit,
+            inspected_url="https://example.test/login",
+            current_url="https://example.test/login",
+        ),
+        visual_summary=dict(_VISION_CHALLENGE_SUMMARY),
+    )
+
+    assert merged["challenge_state"]["requires_human_verification"] is True
+    assert composition_challenge_carrier(merged) is ChallengeEvidenceSource.VISION
+
+
+def test_a_disabled_control_in_an_unrelated_form_does_not_corroborate_the_claim() -> None:
+    page_with_disabled_footer_form = _SATISFIABLE_TOTP_HTML.replace(
+        "</body>",
+        "<form><input type='email' name='news'><button type='submit' disabled>Subscribe</button></form></body>",
+    )
+    merged = merge_visual_composition_evidence(
+        parse_composition_html(
+            page_with_disabled_footer_form,
+            inspected_url="https://example.test/login",
+            current_url="https://example.test/login",
+        ),
+        visual_summary=dict(_VISION_CHALLENGE_SUMMARY),
+    )
+
+    assert merged["challenge_state"].get("requires_human_verification") is not True
+    assert composition_challenge_carrier(merged) is None
+
+
+def test_readonly_entry_field_is_not_a_satisfiable_path() -> None:
+    readonly_token = _SATISFIABLE_TOTP_HTML.replace("id='token'", "id='token' readonly")
+    merged = merge_visual_composition_evidence(
+        parse_composition_html(
+            readonly_token,
+            inspected_url="https://example.test/login",
+            current_url="https://example.test/login",
+        ),
+        visual_summary=dict(_VISION_CHALLENGE_SUMMARY),
+    )
+
+    assert merged["challenge_state"]["requires_human_verification"] is True
+    assert composition_challenge_carrier(merged) is ChallengeEvidenceSource.VISION
+
+
+def test_withheld_vision_challenge_keeps_the_observation_the_model_reads() -> None:
+    merged = _merged_from_html(_SATISFIABLE_TOTP_HTML)
+
+    assert merged["challenge_state"]["detected"] is True
+    assert merged["visual_evidence_summary"] == _VISION_CHALLENGE_SUMMARY["summary"]
+    assert merged["evidence_sources"] == ["dom_html", "screenshot", "vision_summary"]
+    assert CHALLENGE_EVIDENCE_SOURCE_KEY not in merged["challenge_state"]
+
+
+def test_html_fallback_capture_carries_no_visibility_flags() -> None:
+    parsed = parse_composition_html(
+        _SATISFIABLE_TOTP_HTML,
+        inspected_url="https://example.test/login",
+        current_url="https://example.test/login",
+    )
+    form = parsed["forms"][0]
+
+    assert [control for control in form["fields"] + form["submit_controls"] if "visible" in control] == []

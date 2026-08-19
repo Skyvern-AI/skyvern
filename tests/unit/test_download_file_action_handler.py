@@ -1472,6 +1472,66 @@ async def test_handle_action_crdownload_signal_enters_completion_before_reportin
 
 
 @pytest.mark.asyncio
+async def test_handle_action_aborted_download_is_reported_as_failure_not_success() -> None:
+    # The browser deletes the partial file when it aborts a transfer, so the settle sees the same
+    # empty directory a completed download leaves behind. Reporting success here tells the agent the
+    # file arrived, and it retries the already-consumed link instead of regenerating it.
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/download",
+    )
+    task.download_timeout = 0.05
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        partial_path = Path(temp_dir) / "bundle.zip.crdownload"
+        aborted_download = _download(path=partial_path, failure="canceled")
+        aborted_download.url = "https://example.com/bundle.zip"
+
+        async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
+            partial_path.write_bytes(b"in progress")
+            capture = next(call_.args[1] for call_ in page.on.call_args_list if call_.args[0] == "download")
+            capture(aborted_download)
+            return [ActionSuccess()]
+
+        async def abort_download(**kwargs: object) -> None:
+            partial_path.unlink()
+
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=AsyncMock(side_effect=abort_download),
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            results = await asyncio.wait_for(
+                ActionHandler.handle_action(
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                    page=page,
+                    action=action,
+                ),
+                timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
+            )
+
+    assert results[-1].success is False
+    assert results[-1].download_triggered is True
+    assert not results[-1].downloaded_files
+    assert "canceled" in (results[-1].exception_message or "")
+
+
+@pytest.mark.asyncio
 async def test_handle_action_remote_crdownload_signal_enters_completion_before_reporting_final_artifact() -> None:
     now = datetime.now(UTC)
     organization = make_organization(now)

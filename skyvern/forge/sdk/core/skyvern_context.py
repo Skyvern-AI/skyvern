@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 import structlog
 
 from skyvern.config import settings
+from skyvern.schemas.run_enums import RunEngine
 from skyvern.webeye.browser_health import BrowserHealth, BrowserOperation
 
 if TYPE_CHECKING:
@@ -180,6 +181,15 @@ class SkyvernContext:
     # Both sites for a run run sequentially, so the read-modify-write needs no lock; verification /
     # extraction / error-detection scrapes never touch it.
     transient_ui_consecutive_suppressions: int = 0
+    # WORKFLOW_TASK_V3_AB arm, resolved once per workflow run: the engine every default-engine
+    # task block of that run dispatches to, or None for control.
+    workflow_block_engine_override: RunEngine | None = None
+    # The workflow run the override above was resolved for. A nested execution sharing this context
+    # (an inline child workflow run) has its own id and its own definition, so it must re-resolve
+    # rather than inherit an arm that was never checked against its blocks.
+    workflow_block_engine_resolved_run_id: str | None = None
+    # Single-flight the first-use provider resolution when parallel branches share one context.
+    workflow_block_engine_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     enrich_tree_mode: EnrichTreeMode = EnrichTreeMode.CONTROL
     step_retry_index: int = 0
 

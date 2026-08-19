@@ -322,6 +322,23 @@ def _consume_abandoned_task_result(task: asyncio.Task) -> None:
         task.exception()
 
 
+DOWNLOAD_FAILURE_READ_TIMEOUT_SECONDS = 5.0
+
+
+async def read_download_failure(download: Download) -> str | None:
+    """Return the browser's failure string for a download, or None if it finished or is unreadable.
+
+    Chromium deletes the partial file when it aborts a transfer, so an aborted download and a
+    completed one look identical from a directory listing; this is the only authoritative signal.
+    Never raises — callers use it to report an outcome, not to control the download.
+    """
+    try:
+        async with asyncio.timeout(DOWNLOAD_FAILURE_READ_TIMEOUT_SECONDS):
+            return await download.failure()
+    except Exception:
+        return None
+
+
 def set_popup_video_listener(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> None:
     tracked_paths: set[str] = set()
 
@@ -452,6 +469,18 @@ def set_download_file_listener(
             # TODO: maybe should try to parse it from URL response
 
         except Exception:
+            # An aborted transfer surfaces here as a path() error; reporting it as a rename failure
+            # sends triage to the wrong subsystem and hides that no file was ever saved.
+            failure = await read_download_failure(download)
+            if failure is not None:
+                LOG.warning(
+                    "Browser aborted the download before any file was saved",
+                    workflow_run_id=workflow_run_id,
+                    task_id=task_id,
+                    failure=failure,
+                    url=_redact_url_query(download.url),
+                )
+                return
             LOG.exception(
                 "Failed to add file extension name to downloaded file",
                 workflow_run_id=workflow_run_id,

@@ -1370,6 +1370,9 @@ class PersistentBrowserSessionModel(Base):
     runnable_type = Column(String, nullable=True)
     runnable_id = Column(String, nullable=True, index=True)
     runnable_generation_id = Column(String, nullable=True)
+    # Canonical download-dir key of the occupying run (``resolve_run_download_id``). Distinct from
+    # ``runnable_id``, the lease id, which diverges on nested/inherited runs.
+    download_run_id = Column(String, nullable=True)
     browser_id = Column(String, nullable=True)
     browser_address = Column(String, nullable=True, unique=True)
     status = Column(String, nullable=True, default="created")
