@@ -370,3 +370,27 @@ async def test_fail_task_with_task_already_canceled(agent, mock_browser_state):
 
                 # Error detection should not be called
                 mock_detect.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fail_task_with_task_already_timed_out(agent, mock_browser_state):
+    """A reaper-timed-out task cannot be failed: return False, same as already-canceled."""
+    now = datetime.now()
+    organization = make_organization(now)
+    task = make_task(
+        now,
+        organization,
+        status=TaskStatus.timed_out,
+        error_code_mapping=None,
+    )
+    step = make_step(now, task, step_id="step-1", status=StepStatus.running, order=1, output=None)
+
+    with patch.object(agent, "update_step", new_callable=AsyncMock):
+        with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
+            from skyvern.exceptions import TaskAlreadyTimeout
+
+            mock_update_task.side_effect = TaskAlreadyTimeout(task.task_id)
+
+            result = await agent.fail_task(task, step, "Task failed", mock_browser_state)
+
+            assert result is False

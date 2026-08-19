@@ -273,7 +273,7 @@ class TestSanitization:
                 "frontier_start_label": "b",
                 "current_url": "https://example.test",
                 "page_title": "Example",
-                "action_trace_summary": ["click #submit failed"],
+                "action_trace_summary": ["click #submit failed description=code error at line 18 code_line=18"],
                 "blocks": [{"label": "b", "block_type": "EXTRACTION", "status": "failed"}],
             },
         }
@@ -283,7 +283,7 @@ class TestSanitization:
         assert data["requested_block_labels"] == ["a", "b"]
         assert data["executed_block_labels"] == ["b"]
         assert data["frontier_start_label"] == "b"
-        assert data["action_trace_summary"] == ["click #submit failed"]
+        assert data["action_trace_summary"] == ["click #submit failed description=code error at line 18 code_line=18"]
         assert data["current_url"] == "https://example.test"
 
 

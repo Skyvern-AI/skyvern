@@ -1,10 +1,16 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 
+from skyvern.forge.sdk.routes import browser_sessions as browser_sessions_routes
 from skyvern.schemas.browser_session_timeouts import (
     DEFAULT_TIMEOUT,
     MAX_LIFETIME_SECONDS,
     MAX_TIMEOUT,
+    MAX_TIMEOUT_EXCEEDED_MESSAGE,
     MIN_TIMEOUT,
     seconds_until_expiry,
     session_is_active,
@@ -130,10 +136,46 @@ def test_session_is_active_matches_positive_remaining_time() -> None:
         ) is (remaining > 0)
 
 
-def test_requested_timeout_above_the_cap_is_clamped() -> None:
-    # Callers that still send the old 24h ceiling get the cap, not a 422.
-    assert CreateBrowserSessionRequest(timeout=1440).timeout == MAX_TIMEOUT
-    assert CreateBrowserSessionRequest(timeout=MAX_TIMEOUT + 1).timeout == MAX_TIMEOUT
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [MAX_TIMEOUT + 1, 1440])
+async def test_requested_timeout_above_the_cap_returns_400(timeout: int) -> None:
+    app_mock = MagicMock()
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock()
+
+    with patch.object(browser_sessions_routes, "app", app_mock):
+        with pytest.raises(HTTPException) as exc_info:
+            await browser_sessions_routes.create_browser_session(
+                CreateBrowserSessionRequest(timeout=timeout),
+                current_org=SimpleNamespace(organization_id="org_1"),
+            )
+
+    assert exc_info.value.status_code == 400
+    assert (
+        exc_info.value.detail
+        == "Longer browser durations are available on our enterprise plan, please contact sales@skyvern.com"
+    )
+    assert exc_info.value.detail == MAX_TIMEOUT_EXCEEDED_MESSAGE
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_requested_timeout_at_the_cap_creates_the_session() -> None:
+    created_session = SimpleNamespace(persistent_browser_session_id="pbs_1")
+    app_mock = MagicMock()
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=created_session)
+    from_browser_session = AsyncMock(return_value=SimpleNamespace(browser_session_id="pbs_1"))
+
+    with (
+        patch.object(browser_sessions_routes, "app", app_mock),
+        patch.object(browser_sessions_routes.BrowserSessionResponse, "from_browser_session", from_browser_session),
+    ):
+        await browser_sessions_routes.create_browser_session(
+            CreateBrowserSessionRequest(timeout=MAX_TIMEOUT),
+            current_org=SimpleNamespace(organization_id="org_1"),
+        )
+
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session.assert_awaited_once()
+    assert app_mock.PERSISTENT_SESSIONS_MANAGER.create_session.await_args.kwargs["timeout_minutes"] == MAX_TIMEOUT
 
 
 def test_requested_timeout_at_or_below_the_cap_is_preserved() -> None:

@@ -13,8 +13,11 @@ from typing import Any
 
 import pytest
 
+from skyvern.exceptions import SkyvernContextWindowExceededError
+from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.taskv3.loop import (
     NO_TOOL_CALL_NUDGE,
+    ToolHandler,
     ToolResult,
     ToolSpec,
     make_finish_tool,
@@ -31,6 +34,9 @@ class _ScriptedCaller:
         self.message_history: list[dict[str, Any]] = []
         self.sent_tools: list[dict[str, Any]] | None = None
 
+    def supports_tool_choice(self) -> bool:
+        return True
+
     async def call(
         self,
         *,
@@ -40,6 +46,7 @@ class _ScriptedCaller:
         tools: list[dict[str, Any]] | None = None,
         use_message_history: bool = False,
         raw_response: bool = False,
+        tool_choice: str | None = None,
     ) -> dict[str, Any]:
         self.sent_tools = tools
         turn = self._script[self.calls] if self.calls < len(self._script) else []
@@ -562,14 +569,16 @@ async def test_on_action_round_fires_once_per_action_round() -> None:
     outcome, _ = await _run(script, [observe, click, type_, make_finish_tool()], on_action_round=_on_round)
     assert outcome.status == "completed"
     assert len(rounds) == 1
-    assert rounds[0] == [("click", {"selector": "#a"}), ("type", {"selector": "#b", "text": "x"})]
+    assert rounds[0] == [("click", {"selector": "#a"}, True), ("type", {"selector": "#b", "text": "x"}, True)]
 
 
 @pytest.mark.asyncio
-async def test_on_action_round_skips_rounds_with_no_successful_action() -> None:
-    rounds: list[list[tuple[str, dict[str, Any]]]] = []
+async def test_on_action_round_fires_for_all_failed_round_with_failure_flag() -> None:
+    # A dispatched billable round consumes budget even when every call errors; it must reach the
+    # callback (flagged unsuccessful) so the round persists into the workflow-run step budget.
+    rounds: list[list[tuple[str, dict[str, Any], bool]]] = []
 
-    async def _on_round(actions: list[tuple[str, dict[str, Any]]]) -> None:
+    async def _on_round(actions: list[tuple[str, dict[str, Any], bool]]) -> None:
         rounds.append(actions)
 
     clk: list[tuple[str, dict[str, Any]]] = []
@@ -578,7 +587,8 @@ async def test_on_action_round_skips_rounds_with_no_successful_action() -> None:
     script = [[("click", {})], [("finish", {"status": "completed", "reason": "ok"})]]
     outcome, _ = await _run(script, [click, make_finish_tool()], on_action_round=_on_round)
     assert outcome.status == "completed"
-    assert rounds == []  # no successful billable action -> no per-action persistence
+    assert rounds == [[("click", {}, False)]]
+    assert outcome.billable_actions == []  # billing still counts successes only
 
 
 @pytest.mark.asyncio
@@ -593,3 +603,296 @@ async def test_on_action_round_failure_does_not_abort_run() -> None:
     outcome, _ = await _run(script, [click, make_finish_tool()], on_action_round=_boom)
     assert outcome.status == "completed"  # callback error contained; run still completes
     assert len(clk) == 1
+
+
+def _tool_msg(tool_call_id: str, name: str, content: str) -> dict[str, Any]:
+    return {"role": "tool", "tool_call_id": tool_call_id, "name": name, "content": content}
+
+
+def _assistant_turn(*ids: str) -> dict[str, Any]:
+    return {"role": "assistant", "content": None, "tool_calls": [{"id": i} for i in ids]}
+
+
+def test_compact_transcript_elides_superseded_perception() -> None:
+    # Keep the newest snapshot of each tracked tool; elide older ones' content (never remove the message),
+    # and leave untracked results untouched. Round 2 (after the last assistant) supersedes round 1's
+    # observe/get_html. `snapshot_indices` names the successful-perception message indices the loop records.
+    from skyvern.forge.taskv3.loop import _compact_transcript
+
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "goal"},
+        _assistant_turn("a", "b", "c"),  # round 1
+        _tool_msg("a", "observe", "OBSERVE_1 " + "x" * 300),  # idx 3
+        _tool_msg("b", "get_html", "HTML_1 " + "y" * 300),  # idx 4
+        _tool_msg("c", "click", "clicked #x"),  # idx 5 (not a snapshot)
+        _assistant_turn("d", "e"),  # round 2 (latest)
+        _tool_msg("d", "observe", "OBSERVE_2 latest " + "z" * 300),  # idx 7
+        _tool_msg("e", "get_html", "HTML_2 latest " + "w" * 300),  # idx 8
+    ]
+    snapshots = {3, 4, 7, 8}  # the observe/get_html successes; the click (5) is not a snapshot
+    _compact_transcript(messages, snapshots)
+    by_id = {m["tool_call_id"]: m["content"] for m in messages if m.get("role") == "tool"}
+    assert by_id["a"].startswith("[superseded observe")  # older observe elided
+    assert by_id["b"].startswith("[superseded get_html")  # older get_html elided
+    assert by_id["c"] == "clicked #x"  # untracked result untouched
+    assert by_id["d"].startswith("OBSERVE_2 latest")  # newest observe kept intact
+    assert by_id["e"].startswith("HTML_2 latest")  # newest get_html kept intact
+    assert snapshots == {7, 8}  # elided indices are dropped so a re-run can't re-anchor them
+
+    # Idempotent: a second pass over the (now-reduced) index set changes nothing.
+    snapshot = [m.get("content") for m in messages]
+    _compact_transcript(messages, snapshots)
+    assert [m.get("content") for m in messages] == snapshot
+
+
+def test_compact_transcript_keeps_unread_latest_round() -> None:
+    # A single turn can batch several perception calls; compaction runs before the model reads them, so
+    # the latest round must be kept intact even when it repeats a compactable tool (would otherwise drop
+    # a result the model requested but never saw).
+    from skyvern.forge.taskv3.loop import _compact_transcript
+
+    messages = [
+        {"role": "user", "content": "goal"},
+        _assistant_turn("a", "b"),
+        _tool_msg("a", "get_html", "HTML_A " + "a" * 300),  # idx 2
+        _tool_msg("b", "get_html", "HTML_B " + "b" * 300),  # idx 3
+    ]
+    _compact_transcript(messages, {2, 3})
+    assert messages[2]["content"].startswith("HTML_A")  # both unread → neither elided
+    assert messages[3]["content"].startswith("HTML_B")
+
+
+def test_compact_transcript_skip_stub_does_not_shadow_real_snapshot() -> None:
+    # A skipped/errored perception result is never recorded as a snapshot, so it can't shadow the real
+    # observe from an earlier round — else a failed batch would leave the agent with no page view. The
+    # skip stub (idx 4) is simply absent from the index set regardless of its content.
+    from skyvern.forge.taskv3.loop import _compact_transcript
+
+    messages = [
+        _assistant_turn("o1"),
+        _tool_msg("o1", "observe", "REAL_OBSERVE " + "p" * 300),  # idx 1 (the only real snapshot)
+        _assistant_turn("c1", "o2"),  # latest round: a click that failed, so the batched observe was skipped
+        _tool_msg("c1", "click", "tool_error: TimeoutError: click failed"),  # idx 3
+        _tool_msg("o2", "observe", "skipped: earlier tool call in this batch failed"),  # idx 4 (not tracked)
+    ]
+    _compact_transcript(messages, {1})
+    assert messages[1]["content"].startswith("REAL_OBSERVE")  # real snapshot preserved as the live view
+    assert messages[4]["content"].startswith("skipped:")  # skip stub left as-is, never elided or promoted
+
+
+def test_compact_transcript_noop_without_tracked_snapshots() -> None:
+    from skyvern.forge.taskv3.loop import _compact_transcript
+
+    messages = [_assistant_turn("a"), _tool_msg("a", "observe", "big " + "x" * 500)]
+    _compact_transcript(messages, set())
+    assert messages[1]["content"].startswith("big ")  # nothing elided when nothing is tracked
+
+
+def _observe_tool(handler: ToolHandler) -> ToolSpec:
+    spec = ToolSpec(
+        name="observe", description="observe", parameters={"type": "object", "properties": {}}, handler=handler
+    )
+    spec.compactable = True
+    return spec
+
+
+def _big_observe_tool() -> ToolSpec:
+    async def handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("OBSERVE " + "x" * 300)  # a real, snapshot-sized perception result
+
+    return _observe_tool(handler)
+
+
+@pytest.mark.asyncio
+async def test_loop_compacts_superseded_observe_snapshots() -> None:
+    # Across a multi-observe run the loop keeps only the latest snapshot in the re-sent transcript,
+    # eliding earlier ones — this is what bounds context growth on perception-heavy pages.
+    script = [
+        [("observe", {})],
+        [("observe", {})],
+        [("observe", {})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, _ = await _run(script, [_big_observe_tool(), make_finish_tool()])
+    assert outcome.status == "completed"
+    obs_msgs = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "observe"]
+    assert len(obs_msgs) == 3
+    elided = [m for m in obs_msgs if m["content"].startswith("[superseded ")]
+    intact = [m for m in obs_msgs if m["content"].startswith("OBSERVE ")]
+    assert len(elided) == 2 and len(intact) == 1  # only the most-recent observe snapshot survives
+
+
+@pytest.mark.asyncio
+async def test_loop_elides_superseded_short_snapshots() -> None:
+    # A genuine but tiny snapshot is still elided once superseded: snapshots are tracked by success
+    # status, not size, so perception-light pages compact too (the old length heuristic missed these).
+    async def handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("OBS")  # 3 chars — well under any size threshold, but a real snapshot
+
+    script = [[("observe", {})], [("observe", {})], [("finish", {"status": "completed", "reason": "ok"})]]
+    outcome, _ = await _run(script, [_observe_tool(handler), make_finish_tool()])
+    obs = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "observe"]
+    assert len(obs) == 2
+    assert obs[0]["content"].startswith("[superseded ")  # older short snapshot elided
+    assert obs[1]["content"] == "OBS"  # newest kept
+
+
+@pytest.mark.asyncio
+async def test_loop_verbose_error_never_shadows_real_snapshot() -> None:
+    # A verbose tool error (e.g. a multi-line Playwright timeout, well over any length threshold) must
+    # never be treated as the live snapshot: it has error status, so it is never tracked and the last
+    # good snapshot survives. This is the failure a size-based heuristic would have gotten wrong.
+    calls = {"n": 0}
+
+    async def handler(_args: dict[str, Any]) -> ToolResult:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ToolResult.ok("OBSERVE " + "x" * 300)  # real snapshot
+        return ToolResult.error("tool_error: TimeoutError: " + "waiting for selector\n" * 40)  # long error
+
+    script = [[("observe", {})], [("observe", {})], [("finish", {"status": "completed", "reason": "ok"})]]
+    outcome, _ = await _run(script, [_observe_tool(handler), make_finish_tool()])
+    obs = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "observe"]
+    assert len(obs) == 2
+    assert obs[0]["content"].startswith("OBSERVE ")  # last good snapshot preserved, not shadowed by the error
+    assert obs[1]["content"].startswith("tool_error:")  # the long error left intact, never promoted or elided
+
+
+@pytest.mark.asyncio
+async def test_finish_completed_defers_until_page_settles() -> None:
+    # A finish(completed) on a still-rendering page (delayed data load) is deferred so the model
+    # re-verifies against the settled state; the deferral is an ordinary tool error, and the
+    # follow-up finish on the settled page is terminal.
+    probe_results = iter([False, True])
+
+    async def probe() -> bool:
+        return next(probe_results)
+
+    script = [
+        [("finish", {"status": "completed", "reason": "looks done"})],
+        [("finish", {"status": "completed", "reason": "confirmed on settled page"})],
+    ]
+    outcome, _ = await _run(script, [make_finish_tool(settle_probe=probe)])
+    assert outcome.status == "completed"
+    assert outcome.reason == "confirmed on settled page"
+    deferral_messages = [
+        m for m in outcome.messages if m.get("role") == "tool" and "still rendering" in str(m.get("content"))
+    ]
+    assert len(deferral_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_finish_settle_deferrals_are_bounded_and_scoped_to_completed() -> None:
+    # A permanently-unsettled probe cannot livelock the run: after the deferral cap the verdict is
+    # accepted. terminated/failed finishes never consult the probe.
+    async def never_settled() -> bool:
+        return False
+
+    script = [
+        [("finish", {"status": "completed", "reason": "try 1"})],
+        [("finish", {"status": "completed", "reason": "try 2"})],
+        [("finish", {"status": "completed", "reason": "try 3"})],
+    ]
+    outcome, _ = await _run(script, [make_finish_tool(settle_probe=never_settled, max_settle_deferrals=2)])
+    assert outcome.status == "completed"
+    assert outcome.reason == "try 3"
+
+    probe_calls = 0
+
+    async def counting_probe() -> bool:
+        nonlocal probe_calls
+        probe_calls += 1
+        return False
+
+    script = [[("finish", {"status": "terminated", "reason": "blocked"})]]
+    outcome, _ = await _run(script, [make_finish_tool(settle_probe=counting_probe)])
+    assert outcome.status == "terminated"
+    assert probe_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_finish_settle_probe_error_counts_as_settled() -> None:
+    # A raising probe (e.g. execution context destroyed mid-navigation) must never block a
+    # legitimate completion: the verdict is accepted immediately.
+    async def exploding_probe() -> bool:
+        raise RuntimeError("execution context was destroyed")
+
+    script = [[("finish", {"status": "completed", "reason": "done"})]]
+    outcome, _ = await _run(script, [make_finish_tool(settle_probe=exploding_probe)])
+    assert outcome.status == "completed"
+    assert outcome.reason == "done"
+
+
+@pytest.mark.asyncio
+async def test_no_tool_call_turn_is_counted_and_nudged() -> None:
+    tools = [make_finish_tool()]
+    script = [[], [("finish", {"status": "completed", "reason": "ok"})]]
+    outcome, _ = await _run(script, tools)
+
+    assert outcome.status == "completed"
+    assert outcome.no_tool_call_turns == 1
+    nudges = [m for m in outcome.messages if m.get("role") == "user" and m.get("content") == NO_TOOL_CALL_NUDGE]
+    assert len(nudges) == 1
+
+
+class _ToolChoiceSensitiveCaller(_ScriptedCaller):
+    """Rejects any call carrying ``tool_choice``, as a provider that does not accept it would."""
+
+    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]]) -> None:
+        super().__init__(script)
+        self.tool_choice_per_call: list[str | None] = []
+
+    async def call(self, **kwargs: Any) -> dict[str, Any]:
+        self.tool_choice_per_call.append(kwargs.get("tool_choice"))
+        if kwargs.get("tool_choice") is not None:
+            # The LLM layer maps a provider 400 onto the retryable type, so that -- not a bare
+            # exception -- is what the loop actually has to degrade from.
+            raise LLMProviderErrorRetryableTask("TEST_KEY")
+        return await super().call(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_loop_drops_tool_choice_and_retries_the_turn_after_a_call_failure() -> None:
+    caller = _ToolChoiceSensitiveCaller([[("finish", {"status": "completed", "reason": "ok"})]])
+    outcome = await run_agent_tool_loop(
+        llm_caller=caller,
+        system_prompt="sys",
+        user_prompt="goal",
+        tools=[make_finish_tool()],
+        max_turns=5,
+        max_tool_calls=10,
+        call_kwargs={"tool_choice": "required"},
+        retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
+        max_call_retries=2,
+        call_retry_base_delay=0.0,
+    )
+
+    assert outcome.status == "completed"
+    assert outcome.tool_choice_in_effect is False
+    # The transient budget is spent first, then the parameter is dropped and the turn re-issued.
+    assert caller.tool_choice_per_call == ["required", "required", "required", None]
+
+
+@pytest.mark.asyncio
+async def test_loop_does_not_blame_tool_choice_for_a_context_window_overflow() -> None:
+    # Dropping a parameter cannot shrink a transcript, so re-issuing would burn a second oversized
+    # request and mislabel the failure.
+    class _OverflowingCaller(_ScriptedCaller):
+        async def call(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls += 1
+            raise SkyvernContextWindowExceededError(model="test-model")
+
+    caller = _OverflowingCaller([])
+    outcome = await run_agent_tool_loop(
+        llm_caller=caller,
+        system_prompt="sys",
+        user_prompt="goal",
+        tools=[make_finish_tool()],
+        max_turns=5,
+        max_tool_calls=10,
+        call_kwargs={"tool_choice": "required"},
+    )
+
+    assert outcome.status == "loop_error"
+    assert caller.calls == 1

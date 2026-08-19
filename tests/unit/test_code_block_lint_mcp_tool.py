@@ -97,3 +97,15 @@ async def test_syntax_error_is_caught_by_preflight() -> None:
     assert result["ok"] is False
     assert result["data"]["lint_ok"] is False
     assert _has_diagnostic(result, section="preflight_diagnostics", code="SYNTAX_ERROR")
+
+
+@pytest.mark.asyncio
+async def test_body_readiness_advisory_warns_without_failing_the_lint_gate() -> None:
+    code = 'body = page.locator("body")\nawait body.wait_for(state="visible", timeout=30000)\nreturn {"ok": True}'
+
+    result = await skyvern_code_block_lint(code=code)
+
+    assert result["ok"] is True
+    assert result["data"]["lint_ok"] is True
+    assert result["data"]["preflight_diagnostics"] == []
+    assert _has_diagnostic(result, section="author_time_diagnostics", code="ROOT_CONTAINER_READINESS_WAIT")

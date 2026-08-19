@@ -10,11 +10,11 @@ import contextlib
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import pytest
 
-from skyvern.forge.taskv3.tools import build_browser_tools
+from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR, build_browser_tools
 
 
 def _has_playwright_browser() -> bool:
@@ -52,6 +52,13 @@ class _FakePage:
         self.url = "https://example.test/apply"
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.element = _FakeElement()
+
+    async def eval_on_selector(self, selector: str, js: str) -> str:
+        # Field-type probe: report a non-typeahead type so legacy tests exercise the plain fill path.
+        return "password"
+
+    async def hover(self, selector: str, timeout: int | None = None) -> None:
+        self.calls.append(("hover", {"selector": selector}))
 
     async def evaluate(self, _js: str) -> str:
         return json.dumps(
@@ -142,13 +149,22 @@ class _FakePage:
         return _FakePage._Mouse(self)
 
 
+def _fixed_page_provider(page: Any) -> Callable[[], Awaitable[Any]]:
+    """A provider that always resolves to the same `page` object (today's bound-once shape)."""
+
+    async def _provider() -> Any:
+        return page
+
+    return _provider
+
+
 def _tool(tools, name):
     return next(t for t in tools if t.name == name)
 
 
 @pytest.mark.asyncio
 async def test_tool_set_and_no_task_ecosystem_tools() -> None:
-    tools = build_browser_tools(_FakePage())
+    tools = build_browser_tools(_fixed_page_provider(_FakePage()))
     names = {t.name for t in tools}
     assert {
         "observe",
@@ -168,7 +184,7 @@ async def test_tool_set_and_no_task_ecosystem_tools() -> None:
 
 @pytest.mark.asyncio
 async def test_observe_renders_selectors_labels_options() -> None:
-    tools = build_browser_tools(_FakePage())
+    tools = build_browser_tools(_fixed_page_provider(_FakePage()))
     r = await _tool(tools, "observe").handler({})
     assert r.status == "ok"
     assert "#first" in r.content and "First name" in r.content
@@ -179,7 +195,7 @@ async def test_observe_renders_selectors_labels_options() -> None:
 @pytest.mark.asyncio
 async def test_observe_renders_checkbox_checked_state() -> None:
     # observe must surface checked-state so a required consent box can be re-verified.
-    tools = build_browser_tools(_FakePage())
+    tools = build_browser_tools(_fixed_page_provider(_FakePage()))
     r = await _tool(tools, "observe").handler({})
     assert "#agree" in r.content and "checked=" in r.content
 
@@ -188,7 +204,7 @@ async def test_observe_renders_checkbox_checked_state() -> None:
 async def test_observe_renders_group_context() -> None:
     # Controls whose meaning lives in surrounding text (radio/checkbox groups, weak labels) carry a
     # `group` field with the question text, so the agent can answer without fetching raw HTML.
-    tools = build_browser_tools(_FakePage())
+    tools = build_browser_tools(_fixed_page_provider(_FakePage()))
     r = await _tool(tools, "observe").handler({})
     assert "group=" in r.content
     assert "Consent: I agree to the terms" in r.content
@@ -200,13 +216,13 @@ async def test_click_type_select_dispatch_raw_ops(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(_a, "sleep", _instant_sleep)  # the typeahead probe polls; skip real waiting in tests
     page = _FakePage()
-    tools = build_browser_tools(page)
+    tools = build_browser_tools(_fixed_page_provider(page))
     await _tool(tools, "click").handler({"selector": "#submit"})
     await _tool(tools, "type").handler({"selector": "#first", "text": "John"})
     await _tool(tools, "select_option").handler({"selector": "#country", "label": "United States"})
     assert ("click", {"selector": "#submit"}) in page.calls
     # `type` keystroke-types the value (typeahead-safe path) — the value is entered via page.type
-    assert ("type", {"selector": "#first", "text": "John"}) in page.calls
+    assert ("fill", {"selector": "#first", "text": "John"}) in page.calls
     assert ("select_option", {"selector": "#country", "value": None, "label": "United States"}) in page.calls
 
 
@@ -216,7 +232,7 @@ async def test_navigate_and_wait(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)  # no DNS in unit tests
     page = _FakePage()
-    tools = build_browser_tools(page)
+    tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "navigate").handler({"url": "https://jobs.example.test/acme/123"})
     assert r.status == "ok" and page.url.endswith("/acme/123")
     r2 = await _tool(tools, "wait").handler({"selector": "#next", "state": "visible"})
@@ -234,7 +250,7 @@ async def test_navigate_validates_url_before_goto(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(urlv, "validate_fetch_url", _reject)
     page = _FakePage()
-    tools = build_browser_tools(page)
+    tools = build_browser_tools(_fixed_page_provider(page))
     with pytest.raises(ValueError):
         await _tool(tools, "navigate").handler({"url": "http://169.254.169.254/latest/meta-data/"})
     assert not any(c[0] == "goto" for c in page.calls)  # never navigated
@@ -248,11 +264,53 @@ async def test_handler_error_is_captured_not_raised() -> None:
         raise RuntimeError("detached")
 
     page.click = boom  # type: ignore[assignment]
-    tools = build_browser_tools(page)
+    tools = build_browser_tools(_fixed_page_provider(page))
     # ToolSpec handlers may raise; the loop converts to an error result. Here we assert the
     # handler itself raises so the loop's try/except path is what catches it (parity with loop.py).
     with pytest.raises(RuntimeError):
         await _tool(tools, "click").handler({"selector": "#x"})
+
+
+@pytest.mark.asyncio
+async def test_tool_resolves_page_at_call_time_not_bound_once() -> None:
+    # The core fix: a call must resolve the CURRENT page from the provider, not a page captured
+    # once when the tools were built — so a click landing on a new tab/popup is followed.
+    page_a, page_b = _FakePage(), _FakePage()
+    current: dict[str, Any] = {"page": page_a}
+
+    async def provider() -> Any:
+        return current["page"]
+
+    tools = build_browser_tools(provider)
+    await _tool(tools, "click").handler({"selector": "#first"})
+    current["page"] = page_b
+    await _tool(tools, "click").handler({"selector": "#second"})
+
+    assert any(c[0] == "click" and c[1]["selector"] == "#first" for c in page_a.calls)
+    assert not any(c[1].get("selector") == "#second" for c in page_a.calls)
+    assert any(c[0] == "click" and c[1]["selector"] == "#second" for c in page_b.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name,args",
+    [
+        ("observe", {}),
+        ("get_html", {}),
+        ("click", {"selector": "#x"}),
+        ("type", {"selector": "#x", "text": "y"}),
+        ("wait", {"time_ms": 10}),
+        ("navigate", {"url": "https://example.test/x"}),
+    ],
+)
+async def test_tool_reports_page_unavailable_when_provider_returns_none(tool_name: str, args: dict[str, Any]) -> None:
+    async def gone_provider() -> Any:
+        return None
+
+    tools = build_browser_tools(gone_provider)
+    r = await _tool(tools, tool_name).handler(args)
+    assert r.status == "error"
+    assert r.content == PAGE_UNAVAILABLE_ERROR
 
 
 def test_build_action_maps_each_tool_to_action_model() -> None:
@@ -296,7 +354,7 @@ async def test_wrapped_tool_skips_preflight_when_policy_disabled(monkeypatch: py
     monkeypatch.setattr("skyvern.forge.taskv3.preflight.preflight_action", lambda *a, **k: calls.append(a))
 
     page = _FakePage()
-    tools = build_browser_tools(page)
+    tools = build_browser_tools(_fixed_page_provider(page))
     await _tool(tools, "click").handler({"selector": "#submit"})
 
     # No policy call when disabled, but the underlying browser op still runs.
@@ -314,7 +372,7 @@ async def test_wrapped_tool_runs_preflight_when_observation_enabled(monkeypatch:
     )
 
     page = _FakePage()
-    tools = build_browser_tools(page)
+    tools = build_browser_tools(_fixed_page_provider(page))
     await _tool(tools, "click").handler({"selector": "#submit"})
 
     assert len(seen) == 1
@@ -328,7 +386,7 @@ async def test_wrapped_tool_runs_preflight_when_observation_enabled(monkeypatch:
 @pytest.mark.asyncio
 async def test_wait_caps_selector_timeout() -> None:
     page = _FakePage()
-    tools = build_browser_tools(page)
+    tools = build_browser_tools(_fixed_page_provider(page))
     wait = _tool(tools, "wait")
 
     await wait.handler({"selector": "#ready", "timeout_ms": 999999})
@@ -348,6 +406,7 @@ def test_preflight_tool_set_matches_builder() -> None:
 
     assert PREFLIGHT_TOOL_NAMES == {
         "click",
+        "hover",
         "type",
         "select_combobox",
         "select_option",
@@ -357,6 +416,7 @@ def test_preflight_tool_set_matches_builder() -> None:
     }
     rep = {
         "click": {"selector": "#x"},
+        "hover": {"selector": "#x"},
         "type": {"selector": "#x", "text": "y"},
         "select_combobox": {"selector": "#x", "value": "v"},
         "select_option": {"selector": "#x", "value": "v"},
@@ -383,13 +443,76 @@ async def test_navigate_runs_preflight_when_observation_enabled(monkeypatch: pyt
         lambda action, page, *, site: seen.append((action, site)),
     )
     page = _FakePage()
-    tools = build_browser_tools(page)
+    tools = build_browser_tools(_fixed_page_provider(page))
     await _tool(tools, "navigate").handler({"url": "https://jobs.example.test/acme/1"})
 
     assert len(seen) == 1
     action, site = seen[0]
     assert site == "taskv3-navigate"
     assert action.url == "https://jobs.example.test/acme/1"  # PAGE target the origin check can act on
+
+
+@pytest.mark.asyncio
+async def test_type_resolves_secret_placeholder_at_fill_time() -> None:
+    # Workflow credentials reach the model only as placeholders; the real value must be what
+    # lands in the page, while the tool result echoes neither.
+    page = _FakePage()
+    tools = build_browser_tools(
+        _fixed_page_provider(page),
+        resolve_typed_text=lambda text: "real-secret" if text == "placeholder_abc" else text,
+    )
+    result = await _tool(tools, "type").handler({"selector": "#password", "text": "placeholder_abc"})
+    kinds = {c[0]: c[1] for c in page.calls}
+    assert kinds["fill"] == {"selector": "#password", "text": "real-secret"}
+    assert "real-secret" not in result.content
+    assert "placeholder_abc" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_type_resolver_failure_or_non_string_falls_back_to_literal() -> None:
+    page = _FakePage()
+
+    def _raises(_text: str) -> str:
+        raise RuntimeError("resolver blew up")
+
+    tools = build_browser_tools(_fixed_page_provider(page), resolve_typed_text=_raises)
+    await _tool(tools, "type").handler({"selector": "#a", "text": "literal-1"})
+    tools = build_browser_tools(_fixed_page_provider(page), resolve_typed_text=lambda _t: None)
+    await _tool(tools, "type").handler({"selector": "#b", "text": "literal-2"})
+    filled = [c[1] for c in page.calls if c[0] == "fill"]
+    assert filled == [
+        {"selector": "#a", "text": "literal-1"},
+        {"selector": "#b", "text": "literal-2"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_file_upload_resolves_secret_placeholder_and_does_not_echo() -> None:
+    # A secret-bound file value reaches the model as a placeholder; the upload must resolve it
+    # the same way type does (the step engine resolves UploadFileAction.file_url), and neither
+    # the placeholder nor the resolved source may echo in the tool result.
+    page = _FakePage()
+    captured: dict[str, str] = {}
+
+    async def fake_download_file(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+        captured["source"] = source
+        return "/tmp/downloaded-file.pdf"
+
+    tools = build_browser_tools(
+        _fixed_page_provider(page),
+        resolve_typed_text=lambda text: "https://files.internal/real.pdf" if text == "placeholder_file" else text,
+    )
+    import skyvern.forge.sdk.api.files as files_module
+
+    original = files_module.download_file
+    files_module.download_file = fake_download_file  # type: ignore[assignment]
+    try:
+        result = await _tool(tools, "file_upload").handler({"selector": "#upload", "file": "placeholder_file"})
+    finally:
+        files_module.download_file = original
+    assert captured["source"] == "https://files.internal/real.pdf"
+    assert "placeholder_file" not in result.content
+    assert "real.pdf" not in result.content
 
 
 class _TypeaheadFakePage:
@@ -452,7 +575,7 @@ async def test_type_auto_commits_reacting_typeahead(monkeypatch: pytest.MonkeyPa
         suggestion={"text": "San Francisco, CA, USA", "score": 2},
         committed="San Francisco, CA, USA",
     )
-    tools = build_browser_tools(page)
+    tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "type").handler({"selector": "#location-input", "text": "San Francisco, California"})
     assert r.status == "ok"
     assert "San Francisco, CA, USA" in r.content  # the value the widget committed (normalized), not raw text
@@ -467,7 +590,7 @@ async def test_type_leaves_raw_text_when_no_suggestion_reacts(monkeypatch: pytes
 
     monkeypatch.setattr(_a, "sleep", _instant_sleep)
     page = _TypeaheadFakePage(field_type="text", suggestion=None)
-    tools = build_browser_tools(page)
+    tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "type").handler({"selector": "#notes", "text": "Springfield"})
     assert r.status == "ok"
     assert ("type", ("#notes", "Springfield")) in page.calls  # keystroke-typed; raw text left in place
@@ -479,7 +602,7 @@ async def test_type_non_text_input_skips_probe_fast_path() -> None:
     # A non-text input (email/tel/…) is never a typeahead: fast fill, no suggestion probe, no click —
     # even if a suggestion would have been offered.
     page = _TypeaheadFakePage(field_type="email", suggestion={"text": "x@y.com", "score": 9})
-    tools = build_browser_tools(page)
+    tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "type").handler({"selector": "#email", "text": "john.smith@example.com"})
     assert r.status == "ok"
     assert ("fill", ("#email", "john.smith@example.com")) in page.calls
@@ -494,7 +617,7 @@ async def test_select_combobox_commits_reacting_suggestion(monkeypatch: pytest.M
     page = _TypeaheadFakePage(
         field_type="text", suggestion={"text": "San Francisco, CA, USA", "score": 2}, committed="San Francisco, CA, USA"
     )
-    tools = build_browser_tools(page)
+    tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "select_combobox").handler({"selector": "#loc", "value": "San Francisco, California"})
     assert r.status == "ok" and "San Francisco, CA, USA" in r.content
     assert page.clicked_suggestion
@@ -507,7 +630,7 @@ async def test_select_combobox_fails_loud_when_no_suggestion_reacts(monkeypatch:
 
     monkeypatch.setattr(_a, "sleep", _instant_sleep)
     page = _TypeaheadFakePage(field_type="text", suggestion=None)
-    tools = build_browser_tools(page)
+    tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "select_combobox").handler({"selector": "#loc", "value": "San Francisco, California"})
     assert r.status == "error" and "NOT filled" in r.content
 
@@ -672,3 +795,45 @@ async def test_autocomplete_flag_requires_real_combobox_semantics() -> None:
             assert await page.eval_on_selector("#haspopup", _IS_AUTOCOMPLETE_JS) is True
         finally:
             await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_hover_tool_dispatches_and_is_billable() -> None:
+    # ActionBlocks can carry hover goals; without a hover tool a v3 action block would churn its
+    # budget trying to hover with clicks.
+    page = _FakePage()
+    tools = build_browser_tools(_fixed_page_provider(page))
+    spec = _tool(tools, "hover")
+    result = await spec.handler({"selector": "#menu"})
+    assert result.status == "ok"
+    assert ("hover", {"selector": "#menu"}) in page.calls
+    assert spec.billable is True
+
+
+def test_perception_tools_are_compactable_and_actions_are_not() -> None:
+    # Compaction only elides tools flagged `compactable` on the real factory output. If a rename or a
+    # refactor of the flag loop in tools.py stops flagging observe/get_html, the transcript stops being
+    # bounded and the token-runaway returns — this asserts the production wiring, not a hand-built spec.
+    tools = build_browser_tools(_fixed_page_provider(_FakePage()))
+    assert _tool(tools, "observe").compactable is True
+    assert _tool(tools, "get_html").compactable is True
+    assert _tool(tools, "click").compactable is False  # a page action is never elided
+
+
+@pytest.mark.asyncio
+async def test_preflighted_tool_resolves_page_once_per_call() -> None:
+    # The preflight wrapper hands its resolved page to the handler; a preflighted call must not
+    # resolve twice (each resolution is a must_get_working_page with its recovery path).
+    page = _FakePage()
+    calls = 0
+
+    async def counting_provider() -> Any:
+        nonlocal calls
+        calls += 1
+        return page
+
+    tools = build_browser_tools(counting_provider)
+    await _tool(tools, "click").handler({"selector": "#a"})
+    assert calls == 1
+    await _tool(tools, "click").handler({"selector": "#b"})
+    assert calls == 2

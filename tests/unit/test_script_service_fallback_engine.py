@@ -1,0 +1,192 @@
+"""Tests for engine inheritance in script_service._fallback_to_ai_run.
+
+When a cached script block fails and falls back to the agent, the fallback TaskBlock must
+inherit the engine configured on the original block in the run-bound workflow definition,
+not silently pin to skyvern_v1.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.workflow.models.block import TaskBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
+from skyvern.schemas.runs import RunEngine
+from skyvern.schemas.workflows import BlockType
+from skyvern.services import script_service
+
+MODULE = "skyvern.services.script_service"
+
+
+def _make_output_parameter(key: str) -> OutputParameter:
+    now = datetime.now(timezone.utc)
+    return OutputParameter(
+        parameter_type=ParameterType.OUTPUT,
+        key=key,
+        output_parameter_id=f"op_{key}",
+        workflow_id="w_test",
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def _make_task_block(label: str, engine: RunEngine = RunEngine.skyvern_v1) -> TaskBlock:
+    return TaskBlock(
+        label=label,
+        output_parameter=_make_output_parameter(f"{label}_output"),
+        title=label,
+        engine=engine,
+    )
+
+
+def _make_workflow(blocks: list[TaskBlock]) -> Workflow:
+    now = datetime.now(timezone.utc)
+    return Workflow(
+        workflow_id="w_test",
+        organization_id="o_test",
+        title="test workflow",
+        workflow_permanent_id="wpid_test",
+        version=1,
+        is_saved_task=False,
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=blocks),
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def _make_context() -> SkyvernContext:
+    return SkyvernContext(
+        organization_id="o_test",
+        workflow_run_id="wr_test",
+        workflow_id="w_test",
+        task_id="tsk_test",
+        step_id="stp_test",
+    )
+
+
+def _make_app(workflow: Workflow) -> MagicMock:
+    app = MagicMock()
+    app.DATABASE.tasks.update_step = AsyncMock(return_value=SimpleNamespace(order=0))
+    app.DATABASE.organizations.get_organization = AsyncMock(return_value=SimpleNamespace())
+    app.DATABASE.tasks.get_task = AsyncMock(return_value=SimpleNamespace(url="https://example.com"))
+    app.DATABASE.workflows.get_workflow = AsyncMock(return_value=workflow)
+    app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=SimpleNamespace(ai_fallback=True))
+    app.DATABASE.tasks.create_step = AsyncMock(return_value=SimpleNamespace(step_id="stp_ai_1"))
+    app.DATABASE.workflow_runs.update_workflow_run = AsyncMock()
+    app.agent.execute_step = AsyncMock()
+    return app
+
+
+async def _run_fallback(cache_key: str, workflow: Workflow, engine: RunEngine = RunEngine.skyvern_v1) -> MagicMock:
+    """Run `_fallback_to_ai_run` against `workflow` and return the mocked app for assertions."""
+    app = _make_app(workflow)
+    with (
+        patch(f"{MODULE}.app", app),
+        patch(f"{MODULE}.skyvern_context.current", return_value=_make_context()),
+    ):
+        await script_service._fallback_to_ai_run(
+            block_type=BlockType.NAVIGATION,
+            cache_key=cache_key,
+            prompt="do the thing",
+            engine=engine,
+        )
+    return app
+
+
+def _fallback_task_block(app: MagicMock) -> TaskBlock:
+    # The dispatch gate reads the engine PARAM, not task_block.engine — assert both stay in sync
+    # so an inert-inheritance regression (block carries v3, dispatch gets default) cannot pass.
+    kwargs = app.agent.execute_step.call_args.kwargs
+    assert kwargs["engine"] == kwargs["task_block"].engine
+    return kwargs["task_block"]
+
+
+@pytest.mark.asyncio
+async def test_fallback_inherits_engine_from_run_bound_definition() -> None:
+    workflow = _make_workflow([_make_task_block("my_block", engine=RunEngine.skyvern_v3)])
+
+    app = await _run_fallback("my_block", workflow)
+
+    assert _fallback_task_block(app).engine == RunEngine.skyvern_v3
+
+
+@pytest.mark.asyncio
+async def test_fallback_keeps_default_engine_when_block_engine_is_default() -> None:
+    workflow = _make_workflow([_make_task_block("my_block", engine=RunEngine.skyvern_v1)])
+
+    app = await _run_fallback("my_block", workflow)
+
+    assert _fallback_task_block(app).engine == RunEngine.skyvern_v1
+
+
+@pytest.mark.asyncio
+async def test_fallback_keeps_default_engine_when_block_missing_from_definition() -> None:
+    workflow = _make_workflow([_make_task_block("other_block", engine=RunEngine.skyvern_v3)])
+
+    app = await _run_fallback("my_block", workflow)
+
+    assert _fallback_task_block(app).engine == RunEngine.skyvern_v1
+
+
+@pytest.mark.asyncio
+async def test_fallback_fails_open_to_default_when_engine_lookup_raises() -> None:
+    workflow = _make_workflow([_make_task_block("my_block", engine=RunEngine.skyvern_v3)])
+    app = _make_app(workflow)
+
+    with (
+        patch(f"{MODULE}.app", app),
+        patch(f"{MODULE}.skyvern_context.current", return_value=_make_context()),
+        patch(f"{MODULE}._resolve_original_block_engine", side_effect=RuntimeError("boom")),
+    ):
+        await script_service._fallback_to_ai_run(
+            block_type=BlockType.NAVIGATION,
+            cache_key="my_block",
+            prompt="do the thing",
+        )
+
+    assert _fallback_task_block(app).engine == RunEngine.skyvern_v1
+
+
+@pytest.mark.asyncio
+async def test_fallback_respects_explicit_engine_without_lookup() -> None:
+    workflow = _make_workflow([_make_task_block("my_block", engine=RunEngine.skyvern_v3)])
+    app = _make_app(workflow)
+
+    with (
+        patch(f"{MODULE}.app", app),
+        patch(f"{MODULE}.skyvern_context.current", return_value=_make_context()),
+        patch(f"{MODULE}._resolve_original_block_engine") as resolve_mock,
+    ):
+        await script_service._fallback_to_ai_run(
+            block_type=BlockType.NAVIGATION,
+            cache_key="my_block",
+            prompt="do the thing",
+            engine=RunEngine.skyvern_v2,
+        )
+
+    resolve_mock.assert_not_called()
+    assert _fallback_task_block(app).engine == RunEngine.skyvern_v2
+
+
+def test_resolver_finds_loop_nested_block_engine() -> None:
+    # A cached block inside a for-loop must keep its configured engine on fallback; the lookup
+    # is recursive (labels are globally unique, nested included).
+    from skyvern.forge.sdk.workflow.models.block import ForLoopBlock
+
+    nested = _make_task_block("inner_block", RunEngine.skyvern_v3)
+    loop = ForLoopBlock(
+        label="outer_loop",
+        loop_blocks=[nested],
+        loop_over=None,
+        loop_variable_reference="items",
+        output_parameter=nested.output_parameter,
+    )
+    workflow = _make_workflow([loop])
+    assert script_service._resolve_original_block_engine("inner_block", workflow) == RunEngine.skyvern_v3
+    assert script_service._resolve_original_block_engine("missing", workflow) is None

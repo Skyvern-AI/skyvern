@@ -27,7 +27,11 @@ from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     build_authoring_parameter_binding_directive,
     build_authoring_parameter_binding_snapshot,
 )
-from skyvern.forge.sdk.copilot.code_block_preflight import preflight_code_block
+from skyvern.forge.sdk.copilot.code_block_preflight import (
+    advisory_code_block_diagnostics,
+    author_time_code_block_diagnostics,
+    preflight_code_block,
+)
 from skyvern.forge.sdk.copilot.code_block_security import author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _DOWNLOAD_VAR_BASE,
@@ -42,6 +46,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     INPUT_TEMPLATED_PROVENANCE_SOURCE,
     LOCATOR_WITNESS_PARAM_SOURCE,
     SynthesisDiagnostics,
+    SynthesizedCodeBlock,
     _get_by_role_expr_strict,
     _is_submit_interaction,
     _strict_period_date_pattern,
@@ -88,6 +93,10 @@ def real_mypy() -> None:
 
 def _interaction(tool_name: str, **fields: Any) -> dict[str, Any]:
     return {"tool_name": tool_name, **fields}
+
+
+def _dropped_root_targets(result: SynthesizedCodeBlock) -> list[dict[str, Any]]:
+    return [d for d in result.diagnostics.dropped_interactions if d.get("reason_code") == "root_locator_target"]
 
 
 def test_authoring_parameter_snapshot_rebinds_captured_fill_without_duplicate() -> None:
@@ -732,11 +741,11 @@ class TestLocatorSynthesis:
         assert result.code.count('await page.locator("button").first.click()') == 2
         ast.parse("async def _block(page):\n" + result.code)
 
-    def test_universal_selector_offered_with_first(self) -> None:
+    def test_universal_selector_dropped_as_a_root_container(self) -> None:
         result = synthesize_code_block([_interaction("click", selector="*", source_url="https://example.com/p")])
         assert result is not None
-        assert 'await page.locator("*").first.click()' in result.code
-        assert 'await page.locator("*").click()' not in result.code
+        assert 'page.locator("*")' not in result.code
+        assert [d["selector"] for d in _dropped_root_targets(result)] == ["*"]
 
     def test_strict_imposed_refuses_universal_selector(self) -> None:
         trajectory = [
@@ -746,7 +755,7 @@ class TestLocatorSynthesis:
         result = synthesize_code_block(trajectory, strict_selectors=True)
         assert result is not None
         assert 'page.locator("*")' not in result.code
-        assert [d for d in result.diagnostics.dropped_interactions if d.get("reason_code") == "ambiguous_bare_selector"]
+        assert [d["selector"] for d in _dropped_root_targets(result)] == ["*"]
 
     def test_attribute_qualified_universal_selector_not_disambiguated(self) -> None:
         result = synthesize_code_block(
@@ -831,6 +840,87 @@ class TestLocatorSynthesis:
         assert "exact=True" in emitted
         assert "\n" not in emitted
         assert f"await {emitted}.click()" in result.code
+
+    def test_observed_readiness_wait_never_targets_the_document_body(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open", source_url="https://example.com/home"),
+            _interaction(
+                "click",
+                selector="body",
+                source_url="https://example.com/report",
+                observed_hidden=True,
+            ),
+        ]
+        result = synthesize_code_block(trajectory)
+        assert result is not None
+        assert 'page.locator("body").first.wait_for(state="visible"' not in result.code
+        assert 'page.locator("body")' not in result.code
+        assert [d["selector"] for d in _dropped_root_targets(result)] == ["body"]
+
+    def test_root_container_interaction_dropped_while_anchored_sibling_survives(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open", source_url="https://example.com/home"),
+            _interaction(
+                "click",
+                selector=":root",
+                source_url="https://example.com/report",
+                observed_hidden=True,
+            ),
+            _interaction(
+                "click",
+                selector="body",
+                source_url="https://example.com/report",
+                observed_hidden=True,
+                role="button",
+                accessible_name="Run query",
+            ),
+        ]
+        result = synthesize_code_block(trajectory)
+        assert result is not None
+        for root_selector in (":root", "body", "html"):
+            assert f'page.locator("{root_selector}")' not in result.code
+        assert 'await page.get_by_role("button", name="Run query").wait_for(state="visible"' in result.code
+        assert [d["selector"] for d in _dropped_root_targets(result)] == [":root"]
+
+    def test_dropped_leading_root_interaction_never_forgives_a_read_out_of_the_block(self) -> None:
+        trajectory = [
+            _interaction("click", selector="body", source_url="https://example.com/report", trajectory_index=0),
+            _interaction(
+                "read_value",
+                read_expression="document.querySelector('#count').textContent",
+                read_output_path="output.error_count",
+                trajectory_index=1,
+            ),
+            _interaction("type_text", selector="#query", value="errors", trajectory_index=2),
+        ]
+        result = synthesize_code_block(trajectory)
+        assert result is not None
+        assert not any(f.get("tool_name") == "read_value" for f in result.diagnostics.forgiven_interactions)
+        assert "_read_value_0 = await page.evaluate(" in result.code
+        assert '"error_count"' in result.code
+        assert [d["selector"] for d in _dropped_root_targets(result)] == ["body"]
+
+    def test_strict_dynamic_row_gate_outranks_the_root_container_role_retarget(self) -> None:
+        interaction = _interaction(
+            "click",
+            selector="body",
+            source_url="https://example.com/statements",
+            role="button",
+            accessible_name="Run query",
+            dynamic_row_evidence={"row_selector": "div.statement-row", "evidence_fingerprint": "tampered"},
+        )
+        result = synthesize_code_block(
+            [_interaction("click", selector="#open", source_url="https://example.com/home"), interaction],
+            strict_selectors=True,
+        )
+        assert result is not None
+        assert 'get_by_role("button", name="Run query")' not in result.code
+        assert _dropped_root_targets(result) == []
+        assert [
+            d["selector"]
+            for d in result.diagnostics.dropped_interactions
+            if d.get("reason_code") == "invalid_dynamic_row_evidence"
+        ] == ["body"]
 
 
 class TestActionSynthesis:
@@ -2550,6 +2640,39 @@ class TestDownloadRungSynthesis:
         # A download does not navigate, so no trailing load-wait inside the appended step.
         assert 'wait_for_load_state("load")' not in download_step
 
+    def test_root_container_download_target_drop_is_named_in_the_returned_notes(self) -> None:
+        result = synthesize_code_block([_nav_click()], reached_download_target=_download_target(selector="body"))
+        assert result is not None
+        assert any("root container" in note and "download" in note for note in result.notes)
+
+    def test_root_container_download_target_compiles_no_entry_readiness_wait(self) -> None:
+        result = synthesize_code_block([_nav_click()], reached_download_target=_download_target(selector="body"))
+        assert result is not None
+        for root_selector in ("body", "html", ":root"):
+            assert f'page.locator("{root_selector}")' not in result.code
+        assert '_scout_entry_target = page.locator("div.stmt-row")' in result.code
+        assert "click_and_claim_download" not in result.code
+        assert 'await page.goto("https://example.com/bills", wait_until="domcontentloaded")' in result.code
+        assert [d["trajectory_index"] for d in _dropped_root_targets(result)] == [-1]
+        ast.parse("async def _block(page):\n" + result.code)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"already_registered": True},
+            {"download_kind": "observed_render"},
+        ],
+    )
+    def test_root_container_download_target_already_disqualified_records_no_root_drop(
+        self, overrides: dict[str, Any]
+    ) -> None:
+        result = synthesize_code_block(
+            [_nav_click()], reached_download_target=_download_target(selector="body", **overrides)
+        )
+        assert result is not None
+        assert 'page.locator("body")' not in result.code
+        assert _dropped_root_targets(result) == []
+
     def test_already_registered_emits_no_download_step(self, monkeypatch: pytest.MonkeyPatch) -> None:
         result = synthesize_code_block(
             [_nav_click()], reached_download_target=_download_target(already_registered=True, selector="")
@@ -4051,3 +4174,83 @@ def test_entry_anchors_on_what_the_flow_fills_not_the_link_it_clicks_away_from()
     # The click is still demonstrated, it just no longer decides where the flow starts.
     assert 'a[href=\\"/account/forgot_password\\"]").click()' in block.code
     assert [step["action_type"] for step in block.steps][:4] == ["goto_url", "click", "input_text", "input_text"]
+
+
+class TestBodyReadinessWaitAdvisory:
+    _CUSTODY_BLOCK = (
+        'body = page.locator("body")\n'
+        'await body.wait_for(state="visible", timeout=30000)\n'
+        "await page.wait_for_timeout(3000)\n"
+        "page_text = await body.inner_text()\n"
+        "summary = next(\n"
+        '    (line.strip() for line in page_text.splitlines() if line.strip().lower().endswith("results found")),\n'
+        "    None,\n"
+        ")\n"
+        "if not summary:\n"
+        '    raise RuntimeError("Could not find the results summary.")\n'
+        'return {"summary": summary}\n'
+    )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            _CUSTODY_BLOCK,
+            'await page.locator("body").wait_for(state="visible", timeout=30000)\n',
+            'body = page.locator("body")\nawait body.wait_for(timeout=15000)\n',
+            'body = page.locator("BODY")\nawait body.wait_for(state="attached")\n',
+            'body = page.locator("body")\nif ready:\n    await body.wait_for(state="visible")\n',
+            'await page.locator("html").wait_for(state="visible")\n',
+            'await page.locator(":root").wait_for(state="visible")\n',
+            'await page.locator("*").wait_for(state="visible")\n',
+            'await page.wait_for_selector("body", state="visible", timeout=30000)\n',
+            'await page.wait_for_selector("html")\n',
+            'await expect(page.locator("body")).to_be_visible()\n',
+            'await expect(page.locator(":root")).to_be_attached()\n',
+            'await page.locator("body").first.wait_for(state="visible")\n',
+            'await page.locator("body").nth(0).wait_for(state="visible")\n',
+            'body = page.locator("body").nth(0)\nawait body.wait_for(state="visible")\n',
+        ],
+    )
+    def test_contentless_body_readiness_wait_surfaces_advisory(self, code: str) -> None:
+        diagnostics = advisory_code_block_diagnostics(code)
+
+        assert sum(1 for d in diagnostics if d.code == "ROOT_CONTAINER_READINESS_WAIT") == 1
+
+    def test_advisory_names_the_principle_without_authoring_a_replacement_selector(self) -> None:
+        diagnostics = advisory_code_block_diagnostics(self._CUSTODY_BLOCK)
+
+        assert {d.code for d in diagnostics} == {"ROOT_CONTAINER_READINESS_WAIT", "ROOT_CONTAINER_TEXT_READ"}
+        assert all("results found" not in d.message for d in diagnostics)
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            'body = page.locator("body")\ntext = await body.inner_text()\n',
+            'body = page.locator("body")\nawait body.wait_for(state="hidden", timeout=30000)\n',
+            'await page.locator("body").wait_for(state="detached")\n',
+            'summary = page.locator("body").locator(".summary")\nawait summary.wait_for(state="visible")\n',
+            'summary = page.locator("body").get_by_text("results found")\nawait summary.wait_for(state="visible")\n',
+            'body = page.locator("body")\nbody = page.locator("#results")\nawait body.wait_for(state="visible")\n',
+            'await page.wait_for_selector("body", state="detached")\n',
+            'await page.wait_for_selector("#results", state="visible")\n',
+            'await expect(page.locator("body").get_by_text("results found")).to_be_visible()\n',
+            'await expect(page.locator("#results")).to_be_visible()\n',
+        ],
+    )
+    def test_narrowed_disappearance_and_read_only_body_use_stays_silent(self, code: str) -> None:
+        assert not any(d.code == "ROOT_CONTAINER_READINESS_WAIT" for d in advisory_code_block_diagnostics(code))
+
+    def test_advisory_reaches_author_time_diagnostics_but_not_the_preflight_gate(self) -> None:
+        assert any(
+            d.code == "ROOT_CONTAINER_READINESS_WAIT" for d in author_time_code_block_diagnostics(self._CUSTODY_BLOCK)
+        )
+        assert preflight_code_block(self._CUSTODY_BLOCK, parameter_keys=()) == []
+
+    def test_whole_page_read_is_named_alongside_the_wait_it_drives(self) -> None:
+        codes = {d.code for d in author_time_code_block_diagnostics(self._CUSTODY_BLOCK)}
+        assert "ROOT_CONTAINER_TEXT_READ" in codes
+        assert preflight_code_block(self._CUSTODY_BLOCK, parameter_keys=()) == []
+
+    def test_a_read_targeting_the_value_is_not_flagged(self) -> None:
+        targeted = 'v = await page.get_by_text("logs found").inner_text()'
+        assert author_time_code_block_diagnostics(targeted) == []

@@ -32,7 +32,9 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_browser_profile_update": "e83c3227ef13e827bd0c7d6e23bb0e03fefe2fe83e73bfa4b3ca696d151b2b61",
     "skyvern_browser_session_close": "d0923948805b1bbccd7803df1a3748426263a8bf630cf9fcbee5a21f2f463825",
     "skyvern_browser_session_connect": "7c21d99fbb35dc0199e59367373387dca0e8f8d9dd4615303a3f09f579db2d06",
-    "skyvern_browser_session_create": "25665a100837ea7336ffc0a328136906a932d24360d58bb2094e62064d20af09",
+    # Re-frozen for SKY-13272: `timeout` is now rejected above MAX_TIMEOUT instead of clamped, so the param
+    # description says "max 240" rather than "capped at 240". Description text only; the schema is unchanged.
+    "skyvern_browser_session_create": "6244d9614c04f403ee9db0c6b0cdee10f5be121cf85979b069a106044b08b161",
     "skyvern_browser_session_get": "fdf579ac23ce28eea5e243a407a8f810fdcca6ed491c2da7fbe56836b1474109",
     "skyvern_browser_session_list": "dac429184440a1f76d2a787fb81793e37220408d749f0d3cacfbd29222e55f19",
     "skyvern_clear_local_storage": "8a6b80bfdbe3b1e2e36f7f485cb5bb7ff527594e37536816c2f6b614852078f5",
